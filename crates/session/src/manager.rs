@@ -231,6 +231,7 @@ impl SessionManager {
                 kind: aura_model::LineageKind::SystemMaintenance,
             }),
             bound_soul_version: parent.bound_soul_version.clone(),
+            hidden: false,
         };
         self.store.save(&session).await.map_err(wrap)?;
         debug!(
@@ -311,6 +312,7 @@ impl SessionManager {
             trigger: parent.trigger.clone(),
             lineage: Some(lineage),
             bound_soul_version: self.default_soul_version.clone(),
+            hidden: false,
         };
         self.store.save(&session).await.map_err(wrap)?;
         debug!(
@@ -340,6 +342,7 @@ impl SessionManager {
             trigger,
             lineage: None,
             bound_soul_version: self.default_soul_version.clone(),
+            hidden: false,
         };
         self.store.save(&session).await.map_err(wrap)?;
         debug!(session_id = %session.id, "created new session");
@@ -381,6 +384,18 @@ impl SessionManager {
         Ok(sessions)
     }
 
+    /// Live sessions whose `channel` matches `channel`, newest-active
+    /// first. Delegates to the store's `list_by_channel`, which
+    /// pushes the predicate into SQL on the libsql backend so a
+    /// long-running gateway with thousands of bot sessions doesn't
+    /// pay an O(all) round-trip when the caller only wants the
+    /// http channel.
+    pub async fn list_by_channel(&self, channel: &aura_model::ChannelType) -> Result<Vec<Session>> {
+        let mut sessions = self.store.list_by_channel(channel).await.map_err(wrap)?;
+        sessions.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        Ok(sessions)
+    }
+
     /// Return the active transcript for the session — non-superseded
     /// rows of the append-only `session_messages` log, in order.
     /// Errors with `SessionError::NotFound` if the session itself
@@ -396,15 +411,63 @@ impl SessionManager {
             .map_err(wrap)
     }
 
+    /// Reverse-paginated slice of the active transcript: the
+    /// most-recent `limit` rows whose `ordinal` is strictly below
+    /// `before_ordinal` (or the tail when `before_ordinal` is `None`),
+    /// returned in ascending ordinal order paired with each row's
+    /// absolute ordinal. Errors with `SessionError::NotFound` when
+    /// the session itself does not exist. Used by the chat REST
+    /// surface to avoid round-tripping a long-running session's full
+    /// transcript on every initial load.
+    pub async fn history_tail(
+        &self,
+        session_id: &SessionId,
+        before_ordinal: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<(i64, ChatMessage)>> {
+        if self.store.get(session_id).await.map_err(wrap)?.is_none() {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        self.store
+            .load_active_session_messages_tail(session_id, before_ordinal, limit)
+            .await
+            .map_err(wrap)
+    }
+
+    /// Forward catch-up slice: at most `limit` active rows with
+    /// `ordinal > after_ordinal`, ascending. Powers the WS
+    /// `Subscribe { since_ordinal }` cursor — the gateway streams the
+    /// result back as `Frame::Message` to a reconnecting client that
+    /// missed some persisted rows. `SessionError::NotFound` when the
+    /// session itself does not exist; an empty slice is the legitimate
+    /// "nothing missed" answer.
+    pub async fn history_since(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, ChatMessage)>> {
+        if self.store.get(session_id).await.map_err(wrap)?.is_none() {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        self.store
+            .load_active_session_messages_since(session_id, after_ordinal, limit)
+            .await
+            .map_err(wrap)
+    }
+
     /// Append a single message to the session's transcript log.
     /// Called by `AgentLoop` from the `&mut self` append paths so
     /// every turn's worth of messages reaches storage incrementally
-    /// rather than via a per-turn full-blob rewrite.
+    /// rather than via a per-turn full-blob rewrite. Returns the
+    /// ordinal the store assigned to this row — callers stamp it onto
+    /// the outbound `Frame::Message` so reconnecting clients can
+    /// advance their cursor past live emissions.
     pub async fn append_session_message(
         &self,
         session_id: &SessionId,
         message: &ChatMessage,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         self.store
             .append_session_message(session_id, message)
             .await
@@ -510,6 +573,24 @@ impl SessionManager {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
         debug!(session_id = %session_id, "deleted session");
+        Ok(())
+    }
+
+    /// Flip the session's `hidden` flag. The row is **not** removed
+    /// — the chat list API filters `hidden = true` out, but the
+    /// session itself, its transcript, channel token, and any
+    /// running actor stay live. Returns `Err(NotFound)` when the
+    /// session id is unknown.
+    pub async fn set_hidden(&self, session_id: &SessionId, hidden: bool) -> Result<()> {
+        let updated = self
+            .store
+            .set_hidden(session_id, hidden)
+            .await
+            .map_err(wrap)?;
+        if !updated {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        debug!(session_id = %session_id, hidden, "toggled session hidden");
         Ok(())
     }
 

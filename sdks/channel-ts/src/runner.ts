@@ -10,12 +10,14 @@ import {
   type NoticeLevel,
 } from "./channel.js";
 import { defaultLogger, type Logger } from "./logger.js";
-import {
-  PROTOCOL_VERSION,
-  decodeFrame,
-  encodeFrame,
-  type Frame,
-} from "./wire.js";
+import { decodeFrame, encodeFrame, type Frame } from "./wire.js";
+
+/** App-level Ping cadence. See [`Frame::Ping`] in
+ *  `crates/channels/src/wire.rs` for the half-open-WS rationale —
+ *  same trade-offs as the web chat client. */
+const HEARTBEAT_PING_INTERVAL_MS = 20_000;
+const HEARTBEAT_LIVENESS_TIMEOUT_MS = 45_000;
+const HEARTBEAT_TICK_MS = 5_000;
 
 /**
  * Run a {@link Channel} implementation. Handles the full WebSocket +
@@ -129,8 +131,10 @@ async function runOnce(
   const ws = new WebSocket(dialUrl, { handshakeTimeout: 5_000 });
   ws.binaryType = "arraybuffer";
   const frames = new FrameQueue();
-  attachWsHandlers(ws, frames, logger);
+  const liveness: Liveness = { lastFrameAt: Date.now() };
+  attachWsHandlers(ws, frames, logger, liveness);
 
+  let stopHeartbeat: (() => void) | null = null;
   try {
     await waitOpen(ws);
     await performRegister(ws, frames, channel.channelType, token);
@@ -139,11 +143,16 @@ async function runOnce(
     connAbort.signal.addEventListener("abort", () => safeClose(ws), {
       once: true,
     });
+    // RegisterAck already bumped lastFrameAt; arming after the
+    // handshake means a hung Register surfaces through
+    // `handshakeTimeout` rather than the liveness watchdog.
+    stopHeartbeat = startHeartbeat(ws, liveness, connAbort, logger);
 
     const outbound = pumpOutbound(channel, ws, connAbort.signal, logger);
     const inbound = pumpInbound(channel, ws, frames, connAbort, logger);
     await Promise.all([outbound, inbound]);
   } finally {
+    if (stopHeartbeat) stopHeartbeat();
     connAbort.abort();
     safeClose(ws);
     rootSignal.removeEventListener("abort", onRootAbort);
@@ -272,7 +281,6 @@ async function performRegister(
       kind: "register",
       token,
       channel_type: channelType,
-      protocol_version: PROTOCOL_VERSION,
     }),
   );
   const ack = await frames.pop();
@@ -346,12 +354,21 @@ class FrameQueue {
   }
 }
 
+interface Liveness {
+  /** Epoch ms of the last MessagePack frame the WS delivered. Bumped
+   *  on every `message` event regardless of payload — the watchdog
+   *  only cares that *some* byte arrived from the peer recently. */
+  lastFrameAt: number;
+}
+
 function attachWsHandlers(
   ws: WebSocket,
   frames: FrameQueue,
   logger: Logger,
+  liveness: Liveness,
 ): void {
   ws.on("message", (data) => {
+    liveness.lastFrameAt = Date.now();
     const bytes = normalizeBinary(data);
     if (!bytes) {
       frames.fail(
@@ -378,6 +395,47 @@ function attachWsHandlers(
       new RunnerError(`transport error: ${err.message}`, "transport"),
     );
   });
+}
+
+/**
+ * Tick interval that probes the WS with an app-level Ping and
+ * aborts the connection when no frame has arrived within
+ * {@link HEARTBEAT_LIVENESS_TIMEOUT_MS}. Aborting routes through the
+ * existing `connAbort` plumbing so the outer reconnect ladder runs
+ * the same way as any other transient failure. Returns a teardown
+ * function the caller invokes from `finally`.
+ */
+function startHeartbeat(
+  ws: WebSocket,
+  liveness: Liveness,
+  connAbort: AbortController,
+  logger: Logger,
+): () => void {
+  const timer = setInterval(() => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    if (now - liveness.lastFrameAt > HEARTBEAT_LIVENESS_TIMEOUT_MS) {
+      logger.warn(
+        `heartbeat: no frame in ${Math.round((now - liveness.lastFrameAt) / 1000)}s; aborting half-open ws`,
+      );
+      connAbort.abort();
+      return;
+    }
+    if (now - liveness.lastFrameAt >= HEARTBEAT_PING_INTERVAL_MS) {
+      try {
+        ws.send(encodeFrame({ kind: "ping" }));
+      } catch (err) {
+        logger.warn("heartbeat ping send failed", err);
+      }
+    }
+  }, HEARTBEAT_TICK_MS);
+  // Unref so a running heartbeat doesn't block process exit when the
+  // sidecar is otherwise idle. `setInterval` returns `Timeout` on
+  // Node but `number` on the DOM lib types; guard the unref call.
+  if (typeof (timer as { unref?: () => void }).unref === "function") {
+    (timer as { unref: () => void }).unref();
+  }
+  return () => clearInterval(timer);
 }
 
 function normalizeBinary(data: WebSocket.RawData): Uint8Array | null {
@@ -421,6 +479,10 @@ async function pumpOutbound(
           session_id: msg.sessionId,
           user_id: msg.userId,
           channel_type: channel.channelType,
+          // Sidecar inbound is always user-authored. The server's
+          // echo path uses this to render the message correctly when
+          // it fans out to other subscribers of the same session.
+          role: "user",
           ...(msg.botId ? { bot_id: msg.botId } : {}),
           ...(msg.platformMsgId
             ? { platform_msg_id: msg.platformMsgId }
@@ -475,6 +537,22 @@ function dispatchFrame(
 ): void {
   switch (frame.kind) {
     case "message": {
+      // Defensive: a `Frame::Message` with `role: "user"` should only
+      // ever reach a Subscribed-kind subscriber (the web SPA, the
+      // TUI). It must NOT reach a Multiplexed-kind sidecar — the
+      // SDK's `onMessage` forwards to `platform.sendText`, which
+      // would echo the user's own input back to the upstream
+      // platform. The gateway already guards this at the source (see
+      // `Channel::echo_inbound` early-return on Multiplexed), so a
+      // user-role message reaching this point is a protocol violation
+      // / regression; drop it loudly rather than forwarding it.
+      if (frame.role === "user") {
+        logger.warn(
+          "dropping user-role Message frame; sidecars should only receive agent-authored messages",
+          { sessionId: frame.session_id, userId: frame.user_id },
+        );
+        return;
+      }
       void safeInvoke(
         () =>
           channel.onMessage({
@@ -579,6 +657,50 @@ function dispatchFrame(
     // History frames are TUI-only; sidecars silently drop them.
     case "history_append":
     case "history_snapshot":
+      return;
+    // SessionUpdated / SessionActivity drive the web chat sidebar;
+    // sidecars don't have a session list and silently drop them.
+    case "session_updated":
+    case "session_activity":
+      return;
+    // Subscribe / Unsubscribe are selective-channel client→server
+    // frames. Broadcast-kind sidecars never send them, and the
+    // gateway never sends them in this direction. If one shows up
+    // it's protocol noise — log and ignore.
+    case "subscribe":
+    case "unsubscribe":
+      logger.warn("unexpected subscribe/unsubscribe on sidecar", frame.kind);
+      return;
+    // PendingApprovalsSnapshot is the server's reply to a Subscribe;
+    // broadcast-kind sidecars don't subscribe so they never see it.
+    case "pending_approvals_snapshot":
+      logger.warn("unexpected pending_approvals_snapshot on sidecar", frame.kind);
+      return;
+    // Reset means "your live stream is stale". For a broadcast
+    // sidecar the right reaction is to log and rely on auto-reconnect
+    // (subsequent server output will flow normally after the WS
+    // re-handshakes).
+    case "reset": {
+      logger.warn("server requested reset", frame.reason);
+      safeClose(ws);
+      return;
+    }
+    case "ping": {
+      // Forward-compat: a future server-initiated keepalive should
+      // still see a Pong from the sidecar so its own watchdog can
+      // tell the connection apart from a stuck client.
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(encodeFrame({ kind: "pong" }));
+        } catch (err) {
+          logger.warn("reply pong failed", err);
+        }
+      }
+      return;
+    }
+    case "pong":
+      // Pure liveness signal — `attachWsHandlers` already bumped
+      // `lastFrameAt` on receipt, which is what the watchdog reads.
       return;
     // These are client->server shapes the sidecar will never receive.
     case "register":

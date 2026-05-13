@@ -87,9 +87,11 @@ async fn authorize_upload(
     headers: &HeaderMap,
 ) -> UploadAuth {
     match authed {
-        // TUI and tool-sidecar uploads are session-scoped (not
-        // per-bot/per-user) — pairing doesn't apply.
-        AuthedClient::Tui | AuthedClient::Tool { .. } => UploadAuth::Bypass,
+        // TUI, web chat, and tool-sidecar uploads are session-scoped
+        // (not per-bot/per-user) — pairing doesn't apply.
+        AuthedClient::Tui | AuthedClient::Tool { .. } | AuthedClient::Web { .. } => {
+            UploadAuth::Bypass
+        }
         AuthedClient::Subprocess {
             channel_type: None, ..
         } => UploadAuth::Reject(

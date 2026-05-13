@@ -87,7 +87,7 @@ impl AgentTestHarness {
     pub async fn send_text(&mut self, text: impl Into<String>) -> anyhow::Result<()> {
         let message = Message {
             id: format!("msg-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)),
-            session_id: self.session.id.to_string(),
+            session_id: self.session.id.clone(),
             channel: self.session.channel.clone(),
             sender: self.session.user.clone(),
             content: vec![ContentBlock::Text(text.into())],
@@ -95,7 +95,11 @@ impl AgentTestHarness {
             reply_to: None,
             metadata: MessageMetadata::default(),
         };
-        self.send_message(IncomingMessage { message }).await
+        self.send_message(IncomingMessage {
+            message,
+            platform_msg_id: String::new(),
+        })
+        .await
     }
 
     /// Sanitize and push an arbitrary `IncomingMessage` onto the actor

@@ -649,6 +649,17 @@ impl SessionStore for MemorySessionStore {
         Ok(())
     }
 
+    async fn set_hidden(&self, session_id: &SessionId, hidden: bool) -> SessionStoreResult<bool> {
+        let mut data = self.data.lock();
+        match data.get_mut(session_id) {
+            Some(s) => {
+                s.hidden = hidden;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn delete(&self, session_id: &SessionId) -> SessionStoreResult<bool> {
         self.transcripts.lock().remove(session_id);
         Ok(self.data.lock().remove(session_id).is_some())
@@ -708,7 +719,7 @@ impl SessionStore for MemorySessionStore {
         &self,
         session_id: &SessionId,
         message: &ChatMessage,
-    ) -> SessionStoreResult<()> {
+    ) -> SessionStoreResult<i64> {
         let mut guard = self.transcripts.lock();
         let log = guard.entry(session_id.clone()).or_default();
         let ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
@@ -718,7 +729,9 @@ impl SessionStore for MemorySessionStore {
             superseded_by: None,
             created_at: Utc::now(),
         });
-        Ok(())
+        i64::try_from(ordinal).map_err(|_| {
+            StorageError::Internal(anyhow::anyhow!("ordinal {ordinal} exceeds i64::MAX"))
+        })
     }
 
     async fn apply_session_compaction(
@@ -836,6 +849,66 @@ impl SessionStore for MemorySessionStore {
                     .collect();
                 active.sort_by_key(|m| m.ordinal);
                 active.into_iter().map(|m| m.message.clone()).collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn load_active_session_messages_tail(
+        &self,
+        session_id: &SessionId,
+        before_ordinal: Option<i64>,
+        limit: usize,
+    ) -> SessionStoreResult<Vec<(i64, ChatMessage)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .transcripts
+            .lock()
+            .get(session_id)
+            .map(|log| {
+                let mut active: Vec<&StoredMessageRow> = log
+                    .iter()
+                    .filter(|m| {
+                        m.superseded_by.is_none()
+                            && before_ordinal.is_none_or(|b| (m.ordinal as i64) < b)
+                    })
+                    .collect();
+                active.sort_by_key(|m| m.ordinal);
+                let skip = active.len().saturating_sub(limit);
+                active
+                    .into_iter()
+                    .skip(skip)
+                    .map(|m| (m.ordinal as i64, m.message.clone()))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn load_active_session_messages_since(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+        limit: usize,
+    ) -> SessionStoreResult<Vec<(i64, ChatMessage)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .transcripts
+            .lock()
+            .get(session_id)
+            .map(|log| {
+                let mut active: Vec<&StoredMessageRow> = log
+                    .iter()
+                    .filter(|m| m.superseded_by.is_none() && (m.ordinal as i64) > after_ordinal)
+                    .collect();
+                active.sort_by_key(|m| m.ordinal);
+                active
+                    .into_iter()
+                    .take(limit)
+                    .map(|m| (m.ordinal as i64, m.message.clone()))
+                    .collect()
             })
             .unwrap_or_default())
     }

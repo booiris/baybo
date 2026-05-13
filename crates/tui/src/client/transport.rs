@@ -9,11 +9,12 @@
 //! same socket as [`wire::Frame::ResolveApproval`] so the gateway's
 //! per-connection approval gate releases the pending tool call.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use aura_channels::wire::{Frame, Message as WireMessage};
-use aura_channels::{ChannelError, IncomingMessage, NoticeLevel, Result};
-use aura_model::{ChannelType, ContentBlock};
+use aura_channels::{ChannelError, IncomingMessage, MessageRole, NoticeLevel, Result};
+use aura_model::{ChannelType, ContentBlock, SessionId};
 use aura_tools::{ApprovalQueue, ApprovalRequest};
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -38,7 +39,7 @@ pub struct WsTransport {
     /// Pinned session this TUI registered against. Used as the frame
     /// `session_id` on [`WsTransport::append_history`] so the gateway
     /// can attribute writes and enforce per-session auth invariants.
-    session_id: String,
+    session_id: SessionId,
     /// One-shot history ring the gateway pushed right after
     /// `RegisterAck`. The TUI consumes it once during bootstrap — see
     /// [`WsTransport::take_history_snapshot`].
@@ -46,14 +47,19 @@ pub struct WsTransport {
 }
 
 impl WsTransport {
-    /// Dial the gateway's loopback TCP channel listener with the TUI
-    /// vault-token and register as the built-in `"tui"` channel.
-    /// `session_id` pins this TUI instance to one session so multiple
-    /// concurrent TUI processes can share the same gateway — the
-    /// gateway routes events for that session to this connection only.
-    pub async fn connect(port: u16, tui_token: String, session_id: String) -> Result<Self> {
+    /// Dial the gateway's admin TCP listener (which co-hosts
+    /// `/v1/channel-ws`) with the TUI vault-token and register as the
+    /// built-in `"tui"` channel. `session_id` pins this TUI instance
+    /// to one session so multiple concurrent TUI processes can share
+    /// the same gateway — the gateway routes events for that session
+    /// to this connection only.
+    pub async fn connect(
+        addr: SocketAddr,
+        tui_token: String,
+        session_id: SessionId,
+    ) -> Result<Self> {
         let (client, initial_history) = WsClient::connect_tui(
-            port,
+            addr,
             &tui_token,
             ChannelType::from("tui"),
             session_id.clone(),
@@ -116,14 +122,19 @@ impl WsTransport {
             session_id: msg.message.session_id,
             user_id: msg.message.sender.id,
             channel_type: msg.message.channel,
-            // TUI is session-scoped and bypasses the bot-pairing gate.
+            // TUI subscribes to its own session and bypasses the
+            // bot-pairing gate.
             bot_id: String::new(),
             // The TUI is text-only on the input side; media attachments
             // arrive via the agent and are rendered by the chat view's
             // own placeholder logic.
             attachments: Vec::new(),
-            // TUI is session-scoped — dedup is not relevant.
+            // TUI is selective-kind — dedup is not relevant.
             platform_msg_id: String::new(),
+            role: aura_channels::MessageRole::User,
+            // Inbound to gateway — server picks up the ordinal on
+            // persistence; outbound frames never need it set here.
+            ordinal: None,
         };
 
         self.client
@@ -134,11 +145,11 @@ impl WsTransport {
 
     /// Open a long-lived subscription to gateway events for
     /// `session_id`. The returned stream ends when the peer closes.
-    pub async fn subscribe(&self, session_id: &str) -> Result<TransportEventStream> {
+    pub async fn subscribe(&self, session_id: &SessionId) -> Result<TransportEventStream> {
         let (tx, rx) = mpsc::channel::<Result<TransportEvent>>(EVENT_CHAN_CAPACITY);
         let client: Arc<WsClient> = Arc::clone(&self.client);
         let queue = self.approval_queue.clone();
-        let target = session_id.to_owned();
+        let target = session_id.clone();
         let subscribe_lock = Arc::clone(&self.subscribe_lock);
 
         tokio::spawn(async move {
@@ -201,18 +212,32 @@ impl WsTransport {
     }
 }
 
-fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Option<TransportEvent> {
+fn map_frame(
+    frame: Frame,
+    target_session: &SessionId,
+    queue: &ApprovalQueue,
+) -> Option<TransportEvent> {
     match frame {
         Frame::Delta {
             session_id, text, ..
         } => {
-            if session_id != target_session {
+            if &session_id != target_session {
                 return None;
             }
             Some(TransportEvent::StreamDelta(text))
         }
         Frame::Message(msg) => {
-            if msg.session_id != target_session {
+            if &msg.session_id != target_session {
+                return None;
+            }
+            // `tui` is a `Subscribed` channel, so the gateway echoes
+            // inbound user messages back to every subscriber — including
+            // the sender. The TUI already rendered the prompt locally
+            // via `state.push_user` before dispatch, so the echo would
+            // duplicate the row (and render with the wrong role). Drop
+            // user echoes; only assistant rows are agent output we
+            // haven't already shown.
+            if matches!(msg.role, MessageRole::User) {
                 return None;
             }
             Some(TransportEvent::Response(vec![ContentBlock::Text(
@@ -225,7 +250,7 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
             text,
             ..
         } => {
-            if session_id != target_session {
+            if &session_id != target_session {
                 return None;
             }
             let level = match level.as_str() {
@@ -244,7 +269,7 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
             params_preview,
             description,
         } => {
-            if session_id != target_session {
+            if &session_id != target_session {
                 debug!(
                     call_id,
                     tool,
@@ -269,8 +294,32 @@ fn map_frame(frame: Frame, target_session: &str, queue: &ApprovalQueue) -> Optio
             let _ = queue.drop_call(&call_id);
             Some(TransportEvent::ApprovalResolved { call_id, decision })
         }
+        Frame::SessionUpdated { .. } | Frame::SessionActivity { .. } => {
+            // Web-chat sidebar signals — TUI tracks a single session
+            // of its own and has no list view, so it ignores rather
+            // than warning.
+            None
+        }
+        Frame::PendingApprovalsSnapshot { .. } => {
+            // Web reconciles stale ApprovalCard state against this;
+            // the TUI's `ApprovalQueue` is already keyed by the live
+            // `ApprovalRequested` / `ApprovalResolved` fan-out and
+            // doesn't keep cards across disconnects, so the snapshot
+            // is redundant here.
+            None
+        }
+        Frame::Ping | Frame::Pong => {
+            // The TUI doesn't currently drive the heartbeat itself —
+            // its tokio task is already idle-aware. Accept either
+            // direction silently so a future server-initiated probe
+            // doesn't have to negotiate per-client.
+            None
+        }
         Frame::Register { .. }
         | Frame::RegisterAck { .. }
+        | Frame::Subscribe { .. }
+        | Frame::Unsubscribe { .. }
+        | Frame::Reset { .. }
         | Frame::ResolveApproval { .. }
         | Frame::HistoryAppend { .. }
         | Frame::HistorySnapshot { .. }

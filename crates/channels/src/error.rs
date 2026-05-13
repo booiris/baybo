@@ -5,15 +5,6 @@ pub enum ChannelError {
     #[error("channel send error: {0}")]
     Send(String),
 
-    #[error("channel receive error: {0}")]
-    Receive(String),
-
-    #[error("channel not started")]
-    NotStarted,
-
-    #[error("channel already started")]
-    AlreadyStarted,
-
     #[error("channel configuration error: {0}")]
     Config(String),
 
@@ -25,18 +16,17 @@ pub enum ChannelError {
     #[error("channel endpoint not reachable: {0}")]
     NotReachable(String),
 
-    #[error("channel {0} already registered")]
+    #[error("channel {0} already installed")]
     DuplicateChannel(String),
-
-    #[error("session {0} already has an attached client")]
-    DuplicateSessionClient(String),
-
-    #[error("channel {0} not found")]
-    NotFound(String),
-
-    #[error("session client {0} not found")]
-    SessionClientNotFound(String),
-
-    #[error(transparent)]
-    Internal(#[from] anyhow::Error),
 }
+
+/// Dedicated, narrow error returned by
+/// [`crate::SubscribedView::subscribe`]. The previous broader
+/// [`ChannelError`] return type had three structurally-unreachable
+/// variants in this context (`WrongKind` was killed alongside the
+/// view migration; `Send` / `Config` / `NotReachable` / `Duplicate`
+/// never originate from `subscribe`'s body). Surfacing only the one
+/// real failure mode keeps `match` arms honest at the call site.
+#[derive(Debug, Error)]
+#[error("connection {0} not found on channel")]
+pub struct ConnectionNotFoundError(pub String);

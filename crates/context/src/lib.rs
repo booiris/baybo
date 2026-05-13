@@ -380,30 +380,42 @@ impl ContextManager {
     /// also record the compression LLM call's cost. Auto-compressing
     /// here would silently bypass that cost-recording path.
     ///
+    /// Returns the persisted `session_messages.ordinal` the store
+    /// assigned to the row. `None` means persistence failed and was
+    /// logged but the in-memory transcript still has the message —
+    /// callers that need the ordinal to stamp it onto an outbound
+    /// `Frame::Message` should just skip the stamp in that case (the
+    /// client will fall back to the next assistant turn's ordinal to
+    /// re-anchor its cursor).
+    ///
     /// Safe because the agent loop runs `maybe_compress` at the top
     /// of every iteration, so any over-budget state from intermediate
     /// `append` calls is resolved before the next LLM request is
     /// built.
-    pub async fn append(&mut self, msg: &ChatMessage) {
+    pub async fn append(&mut self, msg: &ChatMessage) -> Option<i64> {
         let count = self.tokenizer.count_message(msg);
         record_skill_calls(&mut self.called_skills, msg);
         self.messages.push(msg.clone());
         self.per_message_tokens.push(count);
         self.budget.update(self.count_tokens());
-        self.persist_appended(msg).await;
+        self.persist_appended(msg).await
     }
 
-    async fn persist_appended(&self, msg: &ChatMessage) {
-        if let Err(e) = self
+    async fn persist_appended(&self, msg: &ChatMessage) -> Option<i64> {
+        match self
             .sessions
             .append_session_message(&self.session_id, msg)
             .await
         {
-            warn!(
-                session_id = %self.session_id,
-                error = %e,
-                "failed to append message to session_messages log"
-            );
+            Ok(ordinal) => Some(ordinal),
+            Err(e) => {
+                warn!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    "failed to append message to session_messages log"
+                );
+                None
+            }
         }
     }
 

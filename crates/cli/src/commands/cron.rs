@@ -84,8 +84,8 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         map.insert(
             "origin_session_id".into(),
             job.origin_session_id
-                .clone()
-                .map(Value::String)
+                .as_ref()
+                .map(|s| Value::String(s.as_str().to_owned()))
                 .unwrap_or(Value::Null),
         );
         map.insert(
@@ -111,7 +111,10 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
             .unwrap_or_else(|| "(disabled)".into()),
         job.format_time_opt(job.last_triggered_at)
             .unwrap_or_else(|| "(never)".into()),
-        job.origin_session_id.as_deref().unwrap_or("(none)"),
+        job.origin_session_id
+            .as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or("(none)"),
         job.created_at.to_rfc3339(),
         job.updated_at.to_rfc3339(),
         job.prompt,

@@ -137,6 +137,12 @@ impl LibsqlPool {
                     -- pickers; opt-in helpers exist for the spawn-serialization
                     -- lookup and the orphan reaper.
                     is_normal_session     INTEGER NOT NULL DEFAULT 1,
+                    -- User-facing chat-list hide flag, set by
+                    -- DELETE /v1/chat/sessions/:id. Filtered at the
+                    -- chat API layer only; SessionStore::list_all
+                    -- does NOT exclude hidden rows, so admin / trace
+                    -- surfaces still see them.
+                    hidden                INTEGER NOT NULL DEFAULT 0,
                     data                  TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_root

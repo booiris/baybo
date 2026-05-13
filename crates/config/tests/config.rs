@@ -1,7 +1,4 @@
-use aura_config::{
-    AuraConfig, ConfigError, DiscordChannelConfig, HttpChannelConfig, LlmEntry,
-    TelegramChannelConfig,
-};
+use aura_config::{AuraConfig, ConfigError, DiscordChannelConfig, LlmEntry, TelegramChannelConfig};
 
 fn has_field(errors: &[aura_config::ValidationError], field: &str) -> bool {
     errors.iter().any(|e| e.field == field)
@@ -174,19 +171,6 @@ fn channel_buffer_bounds() {
 }
 
 #[test]
-fn http_channel_requires_bind_address_and_port() {
-    let mut c = AuraConfig::default();
-    c.channels.http = Some(HttpChannelConfig {
-        enabled: true,
-        bind_address: String::new(),
-        port: 0,
-    });
-    let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "channels.http.bind_address"));
-    assert!(has_field(&errors, "channels.http.port"));
-}
-
-#[test]
 fn spending_limits_must_be_positive() {
     let mut c = AuraConfig::default();
     c.cost.spending_limits.daily_usd = Some(aura_model::MicroUsd::from_usd_decimal(-1.0));
@@ -257,18 +241,6 @@ fn missing_file_returns_file_read_error() {
         )))
         .unwrap_err();
     assert!(matches!(err, ConfigError::FileRead { .. }));
-}
-
-#[test]
-fn http_channel_disabled_flag_is_rejected() {
-    let mut c = AuraConfig::default();
-    c.channels.http = Some(HttpChannelConfig {
-        enabled: false,
-        bind_address: "127.0.0.1".into(),
-        port: 8080,
-    });
-    let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "channels.http"));
 }
 
 #[test]

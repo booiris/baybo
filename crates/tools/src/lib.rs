@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use aura_model::User;
+use aura_model::{SessionId, User};
 use aura_trace::ToolEventPayload;
 use aura_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
@@ -70,7 +70,7 @@ pub trait Tool: Send + Sync {
 
 /// Context injected into tool execution by the agent layer.
 pub struct ToolContext {
-    pub session_id: String,
+    pub session_id: SessionId,
     pub user: User,
     pub timeout: Duration,
     pub cancellation_token: tokio_util::sync::CancellationToken,
@@ -254,14 +254,14 @@ impl ApprovalHandle {
     pub async fn request_uncached(
         &self,
         tool: &str,
-        session_id: &str,
+        session_id: &SessionId,
         user: &User,
         accesses: Vec<ResourceAccess>,
         params_preview: String,
     ) -> ApprovalDecision {
         let req = ApprovalRequest {
             call_id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
+            session_id: session_id.clone(),
             user_id: user.id.clone(),
             tool: tool.to_string(),
             accesses,
@@ -278,7 +278,7 @@ impl ApprovalHandle {
     pub async fn request(
         &self,
         tool: &str,
-        session_id: &str,
+        session_id: &SessionId,
         user: &User,
         accesses: Vec<ResourceAccess>,
         params_preview: String,
@@ -307,7 +307,7 @@ impl ApprovalHandle {
 
         let req = ApprovalRequest {
             call_id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
+            session_id: session_id.clone(),
             user_id: user.id.clone(),
             tool: tool.to_string(),
             accesses: uncovered.clone(),

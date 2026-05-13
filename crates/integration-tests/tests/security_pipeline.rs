@@ -47,6 +47,7 @@ fn outgoing_with(text: &str) -> OutgoingMessage {
         content: vec![ContentBlock::Text(text.into())],
         reply_to: None,
         metadata: MessageMetadata::default(),
+        ordinal: None,
     }
 }
 

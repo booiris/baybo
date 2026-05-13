@@ -56,6 +56,42 @@ impl From<String> for SessionId {
     }
 }
 
+impl From<SessionId> for String {
+    fn from(value: SessionId) -> Self {
+        value.0
+    }
+}
+
+impl From<&SessionId> for String {
+    fn from(value: &SessionId) -> Self {
+        value.0.clone()
+    }
+}
+
+impl AsRef<str> for SessionId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for SessionId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for SessionId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<String> for SessionId {
+    fn eq(&self, other: &String) -> bool {
+        self.0 == *other
+    }
+}
+
 /// Macro to declare a ULID-backed newtype with the standard surface
 /// (constructors, accessors, `Display`, `FromStr`, serde transparent string).
 macro_rules! ulid_newtype {

@@ -69,7 +69,7 @@ async fn create_cron(
             schedule,
             req.text,
             req.timezone,
-            req.origin_session_id,
+            req.origin_session_id.map(Into::into),
         )
         .await
         .map_err(|e| GatewayError::Cron(e.to_string()))?;

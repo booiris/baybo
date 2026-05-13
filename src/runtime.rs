@@ -250,6 +250,10 @@ pub async fn build_managers(
     };
     let workspace = Arc::new(WorkspaceManager::new(workspace_root.clone()));
     let channels_registry = Arc::new(ChannelRegistry::new());
+    // Eagerly install every enabled channel from config so connections
+    // can attach to a pre-existing slot rather than racing on lazy
+    // first-connect creation. See docs/modules/channels-protocol-refactor.md.
+    aura_gateway::channel::boot::install_channels(&channels_registry, &config.channels)?;
 
     // --- storage + domain managers. `stores` is kept whole: every Arc
     // handed to a manager is a cheap `stores.xxx.clone()` so the bundle

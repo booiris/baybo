@@ -2,7 +2,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_model::ChannelType;
+use aura_model::{ChannelType, SessionId};
 use aura_storage::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -90,7 +90,7 @@ pub struct CronTriggerEvent {
     /// downstream actor stamp `TriggerSource::Cron { origin_session_id }`
     /// on the produced session so trace queries can walk back to
     /// "what user action created this cron job."
-    pub origin_session_id: Option<String>,
+    pub origin_session_id: Option<SessionId>,
 }
 
 /// Manages cron job lifecycle and runs a background tick loop
@@ -132,7 +132,7 @@ impl CronScheduler {
         schedule: CronSchedule,
         prompt: impl Into<String>,
         timezone: String,
-        origin_session_id: Option<String>,
+        origin_session_id: Option<SessionId>,
     ) -> Result<CronJob> {
         let prompt = prompt.into();
         validate_schedule(&schedule)?;
@@ -1323,7 +1323,10 @@ mod tests {
             .unwrap();
         scheduler.trigger_now(&job.id).await.unwrap();
         let event = rx.try_recv().expect("trigger event must land");
-        assert_eq!(event.origin_session_id.as_deref(), Some("sess-creator"));
+        assert_eq!(
+            event.origin_session_id.as_ref().map(|s| s.as_str()),
+            Some("sess-creator"),
+        );
     }
 
     #[tokio::test]

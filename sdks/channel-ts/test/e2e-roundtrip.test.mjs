@@ -19,7 +19,7 @@ import {
   runChannel,
   defaultLogger,
 } from "../dist/index.js";
-import { decodeFrame, encodeFrame, PROTOCOL_VERSION } from "../dist/wire.js";
+import { decodeFrame, encodeFrame } from "../dist/wire.js";
 
 const TOKEN = "fixture-token-abc";
 
@@ -87,6 +87,22 @@ function startFixture() {
                 session_id: "sess-1",
                 user_id: "",
                 channel_type: "fixture",
+              }),
+            );
+            // Defensive: a user-role Message frame must not reach
+            // `onMessage` on a sidecar — the SDK forwards onMessage to
+            // `platform.sendText` and would echo the user's own input
+            // back to the upstream platform. The gateway already
+            // guards this at `Channel::echo_inbound`; the SDK guard is
+            // belt-and-suspenders against a future regression.
+            ws.send(
+              encodeFrame({
+                kind: "message",
+                content: "echo-of-user-input",
+                session_id: "sess-1",
+                user_id: "tg_42",
+                channel_type: "fixture",
+                role: "user",
               }),
             );
             break;
@@ -207,7 +223,6 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
   assert.equal(fixture.recorded.register.kind, "register");
   assert.equal(fixture.recorded.register.token, TOKEN);
   assert.equal(fixture.recorded.register.channel_type, "fixture");
-  assert.equal(fixture.recorded.register.protocol_version, PROTOCOL_VERSION);
 
   // ---- Server → client -------------------------------------------
   assert.equal(gotDelta.count, 1);
@@ -223,6 +238,10 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
     level: "warn",
     text: "low battery",
   });
+  // Only the assistant-role message reaches onMessage — the role:"user"
+  // frame the fixture also sent is dropped by the runner's defensive
+  // guard. Without the guard `count` would be 2 and the bot SDK would
+  // forward "echo-of-user-input" back to the platform.
   assert.equal(gotMessage.count, 1);
   assert.equal(gotMessage.last.content, "pong");
   assert.equal(gotMessage.last.sessionId, "sess-1");

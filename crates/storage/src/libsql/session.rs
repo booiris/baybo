@@ -49,7 +49,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM sessions WHERE id = ?1",
+                "SELECT data, hidden FROM sessions WHERE id = ?1",
                 libsql::params![session_id.as_str().to_string()],
             )
             .await
@@ -65,8 +65,15 @@ impl SessionStore for LibsqlSessionStore {
                 let data: String = row
                     .get(0)
                     .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                let session: Session = serde_json::from_str(&data)
+                let hidden_col: i64 = row
+                    .get(1)
+                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                let mut session: Session = serde_json::from_str(&data)
                     .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
+                // Flat column is authoritative — `set_hidden` updates
+                // it directly while leaving the JSON blob untouched
+                // to avoid load/save races against `touch`.
+                session.hidden = hidden_col != 0;
                 Ok(Some(session))
             }
             None => Ok(None),
@@ -93,12 +100,13 @@ impl SessionStore for LibsqlSessionStore {
             .map(|l| l.parent_job_id.to_string());
         let lineage_kind = lineage_kind_str(session).map(|s| s.to_string());
         let is_normal = is_normal_session_flag(session);
+        let hidden_flag: i64 = if session.hidden { 1 } else { 0 };
         conn.execute(
             "INSERT OR REPLACE INTO sessions \
              (id, root_session_id, trigger_kind, parent_session_id, parent_job_id, \
               lineage_kind, bound_soul_version, created_at, last_active, \
-              is_normal_session, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              is_normal_session, hidden, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             libsql::params![
                 session.id.as_str().to_string(),
                 session.root_session_id.as_str().to_string(),
@@ -110,12 +118,31 @@ impl SessionStore for LibsqlSessionStore {
                 super::time::to_us(session.created_at),
                 super::time::to_us(session.last_active),
                 is_normal,
+                hidden_flag,
                 data,
             ],
         )
         .await
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql insert session: {e}")))?;
         Ok(())
+    }
+
+    async fn set_hidden(&self, session_id: &SessionId, hidden: bool) -> Result<bool> {
+        let conn = self.pool.conn();
+        let flag: i64 = if hidden { 1 } else { 0 };
+        // Targeted UPDATE on the flat column only — the JSON `data`
+        // blob is left alone so a concurrent `touch` (which goes
+        // through load + save) can't lose this write. `get` patches
+        // `Session.hidden` from the column on read, so observers see
+        // the up-to-date value regardless of blob staleness.
+        let affected = conn
+            .execute(
+                "UPDATE sessions SET hidden = ?2 WHERE id = ?1",
+                libsql::params![session_id.as_str().to_string(), flag],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_hidden: {e}")))?;
+        Ok(affected > 0)
     }
 
     async fn delete(&self, session_id: &SessionId) -> Result<bool> {
@@ -222,9 +249,13 @@ impl SessionStore for LibsqlSessionStore {
         // (e.g. `BackgroundCompression`) stay invisible to user-facing
         // listings (CLI session picker, web UI). Use
         // `list_all_maintenance_sessions` for the maintenance set.
+        //
+        // Also project the flat `hidden` column — `set_hidden` writes
+        // there directly without rewriting the JSON `data` blob, so
+        // trusting only the blob would read stale values.
         let mut rows = conn
             .query(
-                "SELECT data FROM sessions \
+                "SELECT data, hidden FROM sessions \
                  WHERE is_normal_session = 1 \
                  ORDER BY last_active DESC",
                 (),
@@ -241,8 +272,53 @@ impl SessionStore for LibsqlSessionStore {
             let data: String = row
                 .get(0)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let session: Session = serde_json::from_str(&data)
+            let hidden_col: i64 = row
+                .get(1)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let mut session: Session = serde_json::from_str(&data)
                 .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
+            session.hidden = hidden_col != 0;
+            sessions.push(session);
+        }
+        Ok(sessions)
+    }
+
+    async fn list_by_channel(&self, channel: &aura_model::ChannelType) -> Result<Vec<Session>> {
+        // Push the channel filter into SQL via `json_extract` — the
+        // sessions table doesn't carry `channel` as a flat column
+        // (it rides inside the JSON `data` blob), so a real index
+        // isn't available without a schema migration. This is still
+        // a full table scan, but non-matching rows never ship their
+        // `data` blob over the libsql wire or pay the serde decode
+        // in userland, which is the cost we actually care about for
+        // a long-running gateway with thousands of bot sessions.
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT data, hidden FROM sessions \
+                 WHERE is_normal_session = 1 \
+                   AND json_extract(data, '$.channel') = ?1 \
+                 ORDER BY last_active DESC",
+                libsql::params![channel.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query by channel: {e}")))?;
+
+        let mut sessions = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let data: String = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let hidden_col: i64 = row
+                .get(1)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let mut session: Session = serde_json::from_str(&data)
+                .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
+            session.hidden = hidden_col != 0;
             sessions.push(session);
         }
         Ok(sessions)
@@ -425,34 +501,49 @@ impl SessionStore for LibsqlSessionStore {
         &self,
         session_id: &SessionId,
         message: &ChatMessage,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let conn = self.pool.conn();
         let role = message.role.as_str();
         let content = serde_json::to_string(&message.content)
             .map_err(|e| StorageError::Storage(format!("serialize message content: {e}")))?;
         let now_us = super::time::to_us(chrono::Utc::now());
-        // `INSERT … SELECT COALESCE(MAX(ordinal),-1)+1` keeps ordinals
-        // contiguous without an explicit sequence. The actor model
+        // `INSERT … SELECT COALESCE(MAX(ordinal),-1)+1 … RETURNING` keeps
+        // ordinals contiguous without an explicit sequence and hands
+        // back the assigned value in one round trip. The actor model
         // serialises writes per session, so there's no concurrent-
         // append race to defend against here.
-        conn.execute(
-            "INSERT INTO session_messages \
+        let mut rows = conn
+            .query(
+                "INSERT INTO session_messages \
              (session_id, ordinal, role, content, created_at, from_user) \
              SELECT ?1, COALESCE(MAX(ordinal), -1) + 1, ?2, ?3, ?4, ?5 \
-             FROM session_messages WHERE session_id = ?1",
-            libsql::params![
-                session_id.as_str().to_string(),
-                role.to_string(),
-                content,
-                now_us,
-                i64::from(message.from_user),
-            ],
-        )
-        .await
-        .map_err(|e| {
-            StorageError::Internal(anyhow::anyhow!("libsql append session_message: {e}"))
-        })?;
-        Ok(())
+             FROM session_messages WHERE session_id = ?1 \
+             RETURNING ordinal",
+                libsql::params![
+                    session_id.as_str().to_string(),
+                    role.to_string(),
+                    content,
+                    now_us,
+                    i64::from(message.from_user),
+                ],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql append session_message: {e}"))
+            })?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+            .ok_or_else(|| {
+                StorageError::Internal(anyhow::anyhow!(
+                    "INSERT … RETURNING returned no rows for session_messages"
+                ))
+            })?;
+        let ordinal: i64 = row
+            .get(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ordinal: {e}")))?;
+        Ok(ordinal)
     }
 
     async fn apply_session_compaction(
@@ -727,6 +818,140 @@ impl SessionStore for LibsqlSessionStore {
         Ok(out)
     }
 
+    async fn load_active_session_messages_tail(
+        &self,
+        session_id: &SessionId,
+        before_ordinal: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<(i64, aura_model::ChatMessage)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.pool.conn();
+        // `before_ordinal IS NULL OR ordinal < before_ordinal` so a
+        // single SQL string handles both the "fresh tail" and the
+        // scroll-up "next page" calls. The partial active index
+        // (`session_id, ordinal WHERE superseded_by IS NULL`) makes
+        // the DESC+LIMIT a back-of-the-index walk — never reads more
+        // than `limit` row contents off disk even on a million-row
+        // session.
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut rows = conn
+            .query(
+                "SELECT ordinal, role, content, from_user FROM session_messages \
+                 WHERE session_id = ?1 AND superseded_by IS NULL \
+                   AND (?2 IS NULL OR ordinal < ?2) \
+                 ORDER BY ordinal DESC \
+                 LIMIT ?3",
+                libsql::params![session_id.as_str().to_string(), before_ordinal, limit_i64,],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql query active tail: {e}"))
+            })?;
+
+        let mut out: Vec<(i64, aura_model::ChatMessage)> = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let ordinal: i64 = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ord: {e}")))?;
+            let role: String = row
+                .get(1)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get role: {e}")))?;
+            let content_json: String = row
+                .get(2)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
+            let from_user_flag: i64 = row.get(3).map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql get from_user: {e}"))
+            })?;
+            let content = serde_json::from_str(&content_json)
+                .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
+            out.push((
+                ordinal,
+                aura_model::ChatMessage {
+                    role: role
+                        .parse::<aura_model::Role>()
+                        .map_err(StorageError::Storage)?,
+                    content,
+                    from_user: from_user_flag != 0,
+                },
+            ));
+        }
+        // Caller expects ascending ordinal order — the SQL pulled the
+        // newest rows first so the LIMIT bites the tail rather than the
+        // head, but the consumer renders top-to-bottom.
+        out.reverse();
+        Ok(out)
+    }
+
+    async fn load_active_session_messages_since(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, aura_model::ChatMessage)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.pool.conn();
+        // Forward catch-up: rows with ordinal strictly greater than the
+        // client's cursor, capped at `limit`. The partial active index
+        // bites the front of the range (`ordinal > N`) so a session
+        // with hundreds of older rows pays nothing for them — only the
+        // catch-up window is read.
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut rows = conn
+            .query(
+                "SELECT ordinal, role, content, from_user FROM session_messages \
+                 WHERE session_id = ?1 AND superseded_by IS NULL \
+                   AND ordinal > ?2 \
+                 ORDER BY ordinal ASC \
+                 LIMIT ?3",
+                libsql::params![session_id.as_str().to_string(), after_ordinal, limit_i64,],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql query active since: {e}"))
+            })?;
+
+        let mut out: Vec<(i64, aura_model::ChatMessage)> = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let ordinal: i64 = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ord: {e}")))?;
+            let role: String = row
+                .get(1)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get role: {e}")))?;
+            let content_json: String = row
+                .get(2)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
+            let from_user_flag: i64 = row.get(3).map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql get from_user: {e}"))
+            })?;
+            let content = serde_json::from_str(&content_json)
+                .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
+            out.push((
+                ordinal,
+                aura_model::ChatMessage {
+                    role: role
+                        .parse::<aura_model::Role>()
+                        .map_err(StorageError::Storage)?,
+                    content,
+                    from_user: from_user_flag != 0,
+                },
+            ));
+        }
+        Ok(out)
+    }
+
     async fn load_session_messages_with_supersede(
         &self,
         session_id: &SessionId,
@@ -814,6 +1039,7 @@ mod tests {
             trigger: TriggerSource::User,
             lineage: None,
             bound_soul_version: "soul-v1".into(),
+            hidden: false,
         }
     }
 
@@ -841,6 +1067,7 @@ mod tests {
                 },
             }),
             bound_soul_version: "soul-v1".into(),
+            hidden: false,
         }
     }
 
@@ -910,5 +1137,179 @@ mod tests {
         let cutoff = Utc::now() - chrono::Duration::hours(1);
         let expired = store.list_expired(cutoff).await.unwrap();
         assert_eq!(expired, vec![SessionId::from("old")]);
+    }
+
+    #[tokio::test]
+    async fn list_by_channel_pushes_predicate_into_sql() {
+        // Mixed-channel fixture: two http sessions, one telegram. The
+        // chat REST surface only wants http; the push-down keeps
+        // telegram rows out of the libsql round-trip entirely so a
+        // gateway hosting thousands of bot sessions doesn't pay an
+        // O(all-sessions) cost on every chat-list refresh.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let mut http_a = make_root_session("http-a");
+        http_a.channel = ChannelType::http();
+        store.save(&http_a).await.unwrap();
+
+        let mut tg = make_root_session("tg-1");
+        tg.channel = ChannelType::telegram();
+        store.save(&tg).await.unwrap();
+
+        let mut http_b = make_root_session("http-b");
+        http_b.channel = ChannelType::http();
+        store.save(&http_b).await.unwrap();
+
+        let http = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        let http_ids: Vec<&str> = http.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(http_ids.len(), 2);
+        assert!(http_ids.contains(&"http-a"));
+        assert!(http_ids.contains(&"http-b"));
+        assert!(!http_ids.contains(&"tg-1"));
+
+        let telegram = store
+            .list_by_channel(&ChannelType::telegram())
+            .await
+            .unwrap();
+        assert_eq!(telegram.len(), 1);
+        assert_eq!(telegram[0].id.as_str(), "tg-1");
+
+        // A channel with no rows comes back empty, not as an error.
+        let empty = store.list_by_channel(&ChannelType::weixin()).await.unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_by_channel_reflects_hidden_column() {
+        // `list_by_channel` must project the flat `hidden` column the
+        // same way `list_all` does — `set_hidden` writes only that
+        // column without rewriting the JSON `data` blob, so trusting
+        // the deserialised `Session.hidden` alone would read stale
+        // values.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let mut s = make_root_session("hide-me");
+        s.channel = ChannelType::http();
+        store.save(&s).await.unwrap();
+        assert!(store.set_hidden(&s.id, true).await.unwrap());
+
+        let listed = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].hidden, "hidden flag must reflect the column");
+    }
+
+    #[tokio::test]
+    async fn load_active_session_messages_tail_paginates_reverse() {
+        // Seven user messages on one session, ordinals 0..=6. The
+        // tail loader is the path the chat REST surface uses to ship
+        // a long-running session's transcript a page at a time
+        // without fetching the whole row stream up-front.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+        let session = make_root_session("paginate-me");
+        store.save(&session).await.unwrap();
+        for i in 0..7 {
+            let msg = aura_model::ChatMessage {
+                role: aura_model::Role::User,
+                content: vec![aura_model::ContentBlock::Text(format!("msg-{i}"))],
+                from_user: true,
+            };
+            store
+                .append_session_message(&session.id, &msg)
+                .await
+                .unwrap();
+        }
+
+        // Tail page: last 3 messages, ordinals 4..=6 in ascending order.
+        let tail = store
+            .load_active_session_messages_tail(&session.id, None, 3)
+            .await
+            .unwrap();
+        let ordinals: Vec<i64> = tail.iter().map(|(o, _)| *o).collect();
+        assert_eq!(ordinals, vec![4, 5, 6]);
+
+        // Scroll-up page: the 3 messages strictly before ordinal 4,
+        // i.e. 1..=3 in ascending order.
+        let older = store
+            .load_active_session_messages_tail(&session.id, Some(4), 3)
+            .await
+            .unwrap();
+        let older_ords: Vec<i64> = older.iter().map(|(o, _)| *o).collect();
+        assert_eq!(older_ords, vec![1, 2, 3]);
+
+        // Final page: only ordinal 0 is older than 1, so a `limit=3`
+        // request returns a single row (not three).
+        let head = store
+            .load_active_session_messages_tail(&session.id, Some(1), 3)
+            .await
+            .unwrap();
+        let head_ords: Vec<i64> = head.iter().map(|(o, _)| *o).collect();
+        assert_eq!(head_ords, vec![0]);
+
+        // Beyond the start: empty result, no error.
+        let empty = store
+            .load_active_session_messages_tail(&session.id, Some(0), 3)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_active_session_messages_since_forward_pages_above_cursor() {
+        // Same 7-row fixture as the `_tail` test, but exercising the
+        // catch-up cursor path the WS `Subscribe { since_ordinal }`
+        // route uses to replay missed rows to a reconnecting client.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+        let session = make_root_session("catch-up-me");
+        store.save(&session).await.unwrap();
+        for i in 0..7 {
+            let msg = aura_model::ChatMessage {
+                role: aura_model::Role::User,
+                content: vec![aura_model::ContentBlock::Text(format!("msg-{i}"))],
+                from_user: true,
+            };
+            store
+                .append_session_message(&session.id, &msg)
+                .await
+                .unwrap();
+        }
+
+        // From cursor 3, ask for up to 10: every row with ordinal > 3,
+        // ascending — i.e. 4, 5, 6.
+        let after_3 = store
+            .load_active_session_messages_since(&session.id, 3, 10)
+            .await
+            .unwrap();
+        let ords: Vec<i64> = after_3.iter().map(|(o, _)| *o).collect();
+        assert_eq!(ords, vec![4, 5, 6]);
+
+        // `limit` is the cap: from cursor 0, ask for 2 — the first
+        // two missed rows (1, 2), not the whole tail.
+        let cap = store
+            .load_active_session_messages_since(&session.id, 0, 2)
+            .await
+            .unwrap();
+        let cap_ords: Vec<i64> = cap.iter().map(|(o, _)| *o).collect();
+        assert_eq!(cap_ords, vec![1, 2]);
+
+        // Caught up: the cursor is at (or past) the latest row, so
+        // the slice is empty. `limit + 1` over-fetch sees zero ⇒
+        // server's "no catch-up needed" branch.
+        let none = store
+            .load_active_session_messages_since(&session.id, 6, 10)
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+
+        // From before the first row: returns every row in order.
+        let all = store
+            .load_active_session_messages_since(&session.id, -1, 10)
+            .await
+            .unwrap();
+        let all_ords: Vec<i64> = all.iter().map(|(o, _)| *o).collect();
+        assert_eq!(all_ords, vec![0, 1, 2, 3, 4, 5, 6]);
     }
 }

@@ -247,5 +247,9 @@ function formatAccess(acc: ResourceAccess): string {
         : `will reach ${acc.host}`;
     case "exec_command":
       return `will run: ${acc.command}`;
+    case "env":
+      return acc.vars.length === 0
+        ? "will read environment"
+        : `will read env: ${acc.vars.join(", ")}`;
   }
 }

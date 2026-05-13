@@ -134,7 +134,7 @@ fn push_bounded<I: IntoIterator<Item = ContentBlock>>(dst: &mut Vec<ContentBlock
 /// than losing the line.
 struct DeltaTxNotifier {
     tx: tokio::sync::mpsc::Sender<AgentOutput>,
-    session_id: String,
+    session_id: aura_model::SessionId,
     user_id: String,
     channel: aura_model::ChannelType,
 }
@@ -400,7 +400,7 @@ impl AgentLoop {
         let notifier: Option<Arc<dyn aura_tools::SessionNotifier>> = delta_tx.as_ref().map(|tx| {
             Arc::new(DeltaTxNotifier {
                 tx: tx.clone(),
-                session_id: session.id.to_string(),
+                session_id: session.id.clone(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
             }) as Arc<dyn aura_tools::SessionNotifier>
@@ -436,38 +436,12 @@ impl AgentLoop {
         };
 
         // Append user message (auto-compresses if over token budget).
-        // `from_user = true` distinguishes the genuine prompt from the
-        // `Role::User` skill reminder appended below — trace replay
-        // uses this flag to surface the actual user input in the job
-        // summary panel.
         let user_msg = ChatMessage {
             role: Role::User,
             content: user_content.clone(),
             from_user: true,
         };
         self.append_context_message(session, &user_msg).await?;
-
-        // Skill reminder is emitted as `Role::User` (some providers reject
-        // `system` outside the leading slot). The helper compares against
-        // `session.state.active_skills` (last turn's set): if it changed,
-        // the *full* current list is rebroadcast so the model sees
-        // authoritative state without having to reconcile a delta; if
-        // unchanged, no reminder is injected and the turn pays zero token
-        // cost. Consecutive `Role::User` messages produced this way are
-        // coalesced by `merge_for_llm` before dispatch for providers that
-        // require strict user/assistant alternation.
-        if let Some(reminder) =
-            build_skill_reminder_if_changed(&session.state.active_skills, &skills_for_turn)
-        {
-            let reminder_msg = ChatMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text(reminder)],
-                from_user: false,
-            };
-            self.append_context_message(session, &reminder_msg).await?;
-        }
-
-        session.state.active_skills = skills_for_turn.iter().map(|s| s.name.clone()).collect();
 
         if let Some((skill_name, args)) = detect_slash_invocation(&user_text, &skills_for_turn) {
             let synthesized_id = format!("synthskill-{}", uuid::Uuid::new_v4());
@@ -675,13 +649,18 @@ impl AgentLoop {
             "I've reached the maximum number of processing steps. Please try again with a simpler request.".to_string(),
         )];
         content.extend(std::mem::take(&mut accumulated_attachments));
+        // Max-iterations fallback. No assistant row was persisted at
+        // the loop end — the early-return path inside `run_iteration`
+        // is the only one that calls `append_context_message`, so
+        // there's no ordinal to stamp here.
         Ok(OutgoingMessage {
-            session_id: session.id.to_string(),
+            session_id: session.id.clone(),
             user_id: session.user.id.clone(),
             channel: session.channel.clone(),
             content,
             reply_to: None,
             metadata: Default::default(),
+            ordinal: None,
         })
     }
 
@@ -743,13 +722,15 @@ impl AgentLoop {
 
             // Append only the final response blocks to context —
             // intermediate tool_use blocks were already appended in
-            // prior iterations.
+            // prior iterations. Capture the persisted ordinal so the
+            // channel adapter can stamp it onto the live `Frame::Message`
+            // and reconnecting clients advance their cursor past it.
             let assistant_msg = ChatMessage {
                 role: Role::Assistant,
                 content: response_blocks,
                 from_user: false,
             };
-            self.append_context_message(session, &assistant_msg).await?;
+            let ordinal = self.append_context_message(session, &assistant_msg).await?;
 
             // Maybe store memory.
             if let Err(e) = self.memory_manager.maybe_store(session, &final_text).await {
@@ -757,12 +738,13 @@ impl AgentLoop {
             }
 
             return Ok(IterationOutcome::Final(OutgoingMessage {
-                session_id: session.id.to_string(),
+                session_id: session.id.clone(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
                 content: final_blocks,
                 reply_to: None,
                 metadata: Default::default(),
+                ordinal,
             }));
         }
 
@@ -1165,7 +1147,7 @@ impl AgentLoop {
         };
         let record = LlmCallRecord {
             timestamp: chrono::Utc::now(),
-            session_id: session.id.to_string(),
+            session_id: session.id.clone(),
             provider: info.provider.clone(),
             model: info.id.clone(),
             request,
@@ -1180,17 +1162,17 @@ impl AgentLoop {
         &mut self,
         session: &Session,
         message: &ChatMessage,
-    ) -> anyhow::Result<()> {
-        self.context_manager.append(message).await;
+    ) -> anyhow::Result<Option<i64>> {
+        let ordinal = self.context_manager.append(message).await;
         self.write_session_message_log(session, message).await;
-        Ok(())
+        Ok(ordinal)
     }
 
     async fn write_session_message_log(&self, session: &Session, message: &ChatMessage) {
         let Some(logger) = self.session_log.as_ref() else {
             return;
         };
-        if let Err(e) = logger.log_message(session.id.as_str(), message).await {
+        if let Err(e) = logger.log_message(&session.id, message).await {
             warn!(error = %e, "failed to append session message log");
         }
     }
@@ -1327,7 +1309,7 @@ impl AgentLoop {
 
         if delta_tx
             .send(AgentOutput::Delta {
-                session_id: session.id.to_string(),
+                session_id: session.id.clone(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
                 text: sanitized,
@@ -1850,21 +1832,42 @@ impl AgentLoop {
         result
     }
 
-    async fn ensure_system_prompt(&mut self, session: &Session) -> anyhow::Result<()> {
-        if self
-            .context_manager
-            .messages()
-            .first()
-            .is_some_and(|m| m.role == Role::System)
-        {
-            return Ok(());
-        }
-        let msg = ChatMessage {
-            role: Role::System,
-            content: vec![ContentBlock::Text(self.soul.system_prompt().to_string())],
-            from_user: false,
+    /// Seed the transcript with the soul system prompt and — once,
+    /// adjacent to it — the authoritative skill reminder. Both are
+    /// idempotent on the leading-system check: if `messages[0]` is
+    /// already a system row, this is a no-op (restored sessions keep
+    /// whatever they persisted; compression re-attaches the reminder
+    /// via [`aura_context::insert_skill_trailer`] when the kept slice
+    /// drops it).
+    ///
+    /// The reminder rides as `Role::User` because some providers reject
+    /// `system` outside the leading slot; `merge_for_llm` folds it into
+    /// the first real user message before dispatch. Placing it here
+    /// (rather than per-turn after each user message) keeps the model's
+    /// "what skills are available" context adjacent to its instructions
+    /// and avoids appending a fresh reminder row every turn.
+    async fn ensure_system_prompt(&mut self, session: &mut Session) -> anyhow::Result<()> {
+        let skills = if self.skill_registry.is_empty() {
+            Vec::new()
+        } else {
+            self.invocable_skills()
         };
-        self.append_context_message(session, &msg).await
+        let to_seed = initial_seed_messages(
+            self.context_manager.messages().first(),
+            self.soul.system_prompt(),
+            &skills,
+        );
+        for msg in &to_seed {
+            self.append_context_message(session, msg).await?;
+        }
+        // active_skills mirrors the reminder we actually seeded; on the
+        // re-entry path (leading system already present) `to_seed` is
+        // empty and we leave the field unchanged so the prior value
+        // carries forward.
+        if !to_seed.is_empty() {
+            session.state.active_skills = skills.iter().map(|s| s.name.clone()).collect();
+        }
+        Ok(())
     }
 
     /// Rebuild [`Soul`] from disk and swap the result into
@@ -1915,38 +1918,41 @@ impl AgentLoop {
     }
 }
 
-/// Format a single skill's body (`name: description [hint]`), without any
-/// leading bullet/diff marker. Callers prepend `- ` for full listings or
-/// `+ ` for diff additions so the output isn't double-marked.
+/// Pure decision logic for [`AgentLoop::ensure_system_prompt`]: given the
+/// current leading message (if any), the resolved soul prompt, and the
+/// invocable skill set, return the messages that should be appended.
 ///
-/// Uses the skill *name* (the value the model passes as `Skill`'s `skill`
-/// argument), not the slash command — slash commands are a user-input
-/// affordance, while reminders direct the model's tool invocation.
-///
-/// Compare `current` against `previous` (last turn's `active_skills`
-/// names) and return a `<system-reminder>`-wrapped *full* skill list when
-/// the set has changed, or `None` when it has not.
-///
-/// Re-broadcasts the entire list rather than a delta whenever anything
-/// changed: simpler for the model to act on (it sees the authoritative
-/// state, not a patch it has to apply against history) and avoids drift
-/// if an earlier reminder was compressed out of context. The dedupe
-/// against `previous` keeps the steady-state cost at zero.
-///
-/// Wrapped in `<system-reminder>...</system-reminder>` so the model
-/// treats it as out-of-band guidance rather than user-authored content,
-/// matching the convention used by Claude Code's own skill announcements.
-fn build_skill_reminder_if_changed(
-    previous: &[String],
-    current: &[SkillSummary],
-) -> Option<String> {
-    let prev_set: std::collections::HashSet<&str> = previous.iter().map(String::as_str).collect();
-    let cur_set: std::collections::HashSet<&str> =
-        current.iter().map(|s| s.name.as_str()).collect();
-    if prev_set == cur_set {
-        return None;
+/// Invariants:
+/// - A leading `Role::System` message inhibits all seeding — empty vec.
+/// - No leading system → exactly one system row is seeded.
+/// - The skill reminder is appended **only** alongside a freshly-seeded
+///   system row, never on the early-return path. This is what makes the
+///   reminder fire exactly once per session: any subsequent call observes
+///   the system row and short-circuits.
+fn initial_seed_messages(
+    leading: Option<&ChatMessage>,
+    soul_prompt: &str,
+    skills: &[SkillSummary],
+) -> Vec<ChatMessage> {
+    if leading.is_some_and(|m| m.role == Role::System) {
+        return Vec::new();
     }
-    Some(aura_skills::render::render_skill_reminder(current))
+    let mut out = Vec::with_capacity(if skills.is_empty() { 1 } else { 2 });
+    out.push(ChatMessage {
+        role: Role::System,
+        content: vec![ContentBlock::Text(soul_prompt.to_string())],
+        from_user: false,
+    });
+    if !skills.is_empty() {
+        out.push(ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text(
+                aura_skills::render::render_skill_reminder(skills),
+            )],
+            from_user: false,
+        });
+    }
+    out
 }
 
 /// Strip leading/trailing whitespace from the LLM response's text fields.
@@ -2351,108 +2357,6 @@ mod trim_response_text_edges_tests {
 }
 
 #[cfg(test)]
-mod skill_reminder_tests {
-    use super::build_skill_reminder_if_changed;
-    use aura_model::TrustLevel;
-    use aura_skills::SkillSummary;
-
-    fn skill(name: &str, command: Option<&str>, desc: &str) -> SkillSummary {
-        SkillSummary {
-            name: name.into(),
-            command: command.map(str::to_string),
-            description: desc.into(),
-            argument_hint: None,
-            agent_invocable: true,
-            trust_level: TrustLevel::Trusted,
-        }
-    }
-
-    #[test]
-    fn empty_state_returns_none() {
-        assert!(build_skill_reminder_if_changed(&[], &[]).is_none());
-    }
-
-    #[test]
-    fn first_turn_lists_full_set() {
-        let cur = vec![skill("foo", Some("foo"), "Foo desc")];
-        let out = build_skill_reminder_if_changed(&[], &cur).expect("should emit");
-        assert!(out.starts_with("<system-reminder>\n"));
-        assert!(out.ends_with("</system-reminder>"));
-        assert!(out.contains("The following skills are available for use with the Skill tool:"));
-        assert!(out.contains("- foo: Foo desc"));
-    }
-
-    #[test]
-    fn unchanged_set_returns_none() {
-        let cur = vec![
-            skill("foo", Some("foo"), "Foo desc"),
-            skill("bar", Some("bar"), "Bar desc"),
-        ];
-        let prev = vec!["foo".to_string(), "bar".to_string()];
-        assert!(build_skill_reminder_if_changed(&prev, &cur).is_none());
-    }
-
-    #[test]
-    fn unchanged_set_is_order_insensitive() {
-        let cur = vec![
-            skill("bar", Some("bar"), "Bar"),
-            skill("foo", Some("foo"), "Foo"),
-        ];
-        let prev = vec!["foo".to_string(), "bar".to_string()];
-        assert!(build_skill_reminder_if_changed(&prev, &cur).is_none());
-    }
-
-    #[test]
-    fn addition_emits_full_set() {
-        let cur = vec![
-            skill("foo", Some("foo"), "Foo desc"),
-            skill("bar", Some("bar"), "Bar desc"),
-        ];
-        let prev = vec!["foo".to_string()];
-        let out = build_skill_reminder_if_changed(&prev, &cur).expect("should emit");
-        assert!(out.contains("The following skills are available for use with the Skill tool:"));
-        assert!(out.contains("- foo: Foo desc"));
-        assert!(out.contains("- bar: Bar desc"));
-        // Re-broadcast, not a delta — no `+`/`-` markers.
-        assert!(!out.contains("\n+ "));
-        assert!(!out.contains("(no longer available)"));
-    }
-
-    #[test]
-    fn removal_emits_full_remaining_set() {
-        let cur = vec![skill("foo", Some("foo"), "Foo desc")];
-        let prev = vec!["foo".to_string(), "bar".to_string()];
-        let out = build_skill_reminder_if_changed(&prev, &cur).expect("should emit");
-        assert!(out.contains("- foo: Foo desc"));
-        assert!(!out.contains("bar"));
-        assert!(!out.contains("(no longer available)"));
-    }
-
-    #[test]
-    fn full_clear_emits_no_skills_marker() {
-        let prev = vec!["foo".to_string()];
-        let out = build_skill_reminder_if_changed(&prev, &[]).expect("should emit");
-        assert!(out.starts_with("<system-reminder>\n"));
-        assert!(out.contains("No skills are currently available."));
-        assert!(out.ends_with("</system-reminder>"));
-    }
-
-    #[test]
-    fn first_turn_uses_name_when_command_missing() {
-        let cur = vec![skill("only-name", None, "Mute desc")];
-        let out = build_skill_reminder_if_changed(&[], &cur).expect("should emit");
-        assert!(out.contains("- only-name: Mute desc"));
-    }
-
-    #[test]
-    fn namespaced_skill_name_preserved() {
-        let cur = vec![skill("codex:rescue", Some("rescue"), "Delegate to Codex")];
-        let out = build_skill_reminder_if_changed(&[], &cur).expect("should emit");
-        assert!(out.contains("- codex:rescue: Delegate to Codex"));
-    }
-}
-
-#[cfg(test)]
 mod merge_for_llm_tests {
     use super::merge_for_llm;
     use aura_model::{BlobRef, ChatMessage, ContentBlock, Role};
@@ -2591,5 +2495,106 @@ mod merge_for_llm_tests {
         assert_eq!(out.len(), 3);
         assert_eq!(out[1], assistant);
         assert_eq!(out[2], tool);
+    }
+}
+
+#[cfg(test)]
+mod initial_seed_tests {
+    use super::initial_seed_messages;
+    use aura_model::{ChatMessage, ContentBlock, Role};
+    use aura_skills::SkillSummary;
+
+    const SOUL: &str = "You are Aura.";
+
+    fn skill(name: &str) -> SkillSummary {
+        SkillSummary {
+            name: name.into(),
+            command: None,
+            description: format!("{name} description"),
+            argument_hint: None,
+            agent_invocable: true,
+            trust_level: aura_model::TrustLevel::Trusted,
+        }
+    }
+
+    fn system_row() -> ChatMessage {
+        ChatMessage {
+            role: Role::System,
+            content: vec![ContentBlock::Text(SOUL.into())],
+            from_user: false,
+        }
+    }
+
+    fn user_row() -> ChatMessage {
+        ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("hi".into())],
+            from_user: true,
+        }
+    }
+
+    #[test]
+    fn fresh_start_no_skills_seeds_system_only() {
+        let out = initial_seed_messages(None, SOUL, &[]);
+        assert_eq!(out.len(), 1, "expected one system row, got {out:?}");
+        assert_eq!(out[0].role, Role::System);
+        assert!(matches!(out[0].content[0], ContentBlock::Text(ref t) if t == SOUL));
+    }
+
+    #[test]
+    fn fresh_start_with_skills_seeds_system_then_reminder() {
+        let skills = vec![skill("alpha"), skill("beta")];
+        let out = initial_seed_messages(None, SOUL, &skills);
+        assert_eq!(out.len(), 2, "expected system + reminder, got {out:?}");
+        assert_eq!(out[0].role, Role::System);
+        assert_eq!(
+            out[1].role,
+            Role::User,
+            "reminder rides as Role::User because some providers reject mid-stream system rows",
+        );
+        assert!(!out[1].from_user, "synthetic rows are never from_user");
+        let reminder_text = match &out[1].content[0] {
+            ContentBlock::Text(t) => t,
+            _ => panic!("reminder should be a text block"),
+        };
+        assert!(reminder_text.contains("alpha"));
+        assert!(reminder_text.contains("beta"));
+    }
+
+    #[test]
+    fn leading_system_short_circuits_even_with_skills() {
+        let leading = system_row();
+        let skills = vec![skill("alpha")];
+        let out = initial_seed_messages(Some(&leading), SOUL, &skills);
+        assert!(
+            out.is_empty(),
+            "re-entry must not append anything; got {out:?}",
+        );
+    }
+
+    #[test]
+    fn leading_non_system_does_not_short_circuit() {
+        // Defensive — a transcript whose first row is a user message
+        // (test fixture, restored partial state) still gets seeded so
+        // the LLM sees a leading system row.
+        let leading = user_row();
+        let out = initial_seed_messages(Some(&leading), SOUL, &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, Role::System);
+    }
+
+    #[test]
+    fn second_call_after_first_seeds_nothing() {
+        // The exactly-once invariant: simulate two consecutive calls by
+        // feeding the previously-seeded system row as the leading
+        // message on the second call.
+        let first = initial_seed_messages(None, SOUL, &[skill("alpha")]);
+        let leading = first[0].clone();
+        let second = initial_seed_messages(Some(&leading), SOUL, &[skill("alpha")]);
+        assert_eq!(first.len(), 2);
+        assert!(
+            second.is_empty(),
+            "second call must short-circuit on the leading system row",
+        );
     }
 }

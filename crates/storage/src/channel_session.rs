@@ -12,7 +12,7 @@
 //! `session_id`.
 
 use async_trait::async_trait;
-use aura_model::ChannelType;
+use aura_model::{ChannelType, SessionId};
 
 use crate::StorageError;
 
@@ -22,13 +22,18 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 pub trait ChannelSessionStore: Send + Sync {
     /// Look up the aura `session_id` for `(channel_type, user_id)`.
     /// Returns `Ok(None)` when no mapping exists.
-    async fn get(&self, channel_type: &ChannelType, user_id: &str) -> Result<Option<String>>;
+    async fn get(&self, channel_type: &ChannelType, user_id: &str) -> Result<Option<SessionId>>;
 
     /// Persist `session_id` under `(channel_type, user_id)`. On
     /// conflict with a live row carrying a *different* `session_id`,
     /// the existing mapping wins — callers should call `get` first and
     /// only `put` on a cache miss.
-    async fn put(&self, channel_type: &ChannelType, user_id: &str, session_id: &str) -> Result<()>;
+    async fn put(
+        &self,
+        channel_type: &ChannelType,
+        user_id: &str,
+        session_id: &SessionId,
+    ) -> Result<()>;
 
     /// Hard-delete the mapping. Later `put`s for the same pair create
     /// a fresh row.

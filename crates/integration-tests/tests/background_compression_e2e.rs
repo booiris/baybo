@@ -55,6 +55,7 @@ fn root_session(id: &str) -> Session {
         trigger: TriggerSource::User,
         lineage: None,
         bound_soul_version: "soul".into(),
+        hidden: false,
     }
 }
 
@@ -402,6 +403,7 @@ async fn lineage_kind_round_trips_for_system_maintenance() {
             kind: LineageKind::SystemMaintenance,
         }),
         bound_soul_version: "soul".into(),
+        hidden: false,
     };
     store.session.save(&maint).await.unwrap();
 

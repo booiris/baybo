@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use aura_model::ChannelType;
+use aura_model::{ChannelType, SessionId};
 
 use super::LibsqlPool;
 use crate::StorageError;
@@ -17,7 +17,7 @@ impl LibsqlChannelSessionStore {
 
 #[async_trait]
 impl ChannelSessionStore for LibsqlChannelSessionStore {
-    async fn get(&self, channel_type: &ChannelType, user_id: &str) -> Result<Option<String>> {
+    async fn get(&self, channel_type: &ChannelType, user_id: &str) -> Result<Option<SessionId>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
@@ -36,13 +36,18 @@ impl ChannelSessionStore for LibsqlChannelSessionStore {
                 let session_id: String = row
                     .get(0)
                     .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                Ok(Some(session_id))
+                Ok(Some(SessionId::from(session_id)))
             }
             None => Ok(None),
         }
     }
 
-    async fn put(&self, channel_type: &ChannelType, user_id: &str, session_id: &str) -> Result<()> {
+    async fn put(
+        &self,
+        channel_type: &ChannelType,
+        user_id: &str,
+        session_id: &SessionId,
+    ) -> Result<()> {
         let now = super::time::now_us();
         let conn = self.pool.conn();
         // Live row wins: `INSERT OR IGNORE` keeps the existing
@@ -53,7 +58,7 @@ impl ChannelSessionStore for LibsqlChannelSessionStore {
             libsql::params![
                 channel_type.as_str().to_string(),
                 user_id.to_string(),
-                session_id.to_string(),
+                session_id.as_str().to_string(),
                 now,
             ],
         )
@@ -79,6 +84,10 @@ impl ChannelSessionStore for LibsqlChannelSessionStore {
 mod tests {
     use super::*;
 
+    fn sid(s: &str) -> SessionId {
+        SessionId::from(s)
+    }
+
     #[tokio::test]
     async fn get_returns_none_for_missing_mapping() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
@@ -92,11 +101,11 @@ mod tests {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlChannelSessionStore::new(pool);
         store
-            .put(&ChannelType::telegram(), "tg_42", "sess-abc")
+            .put(&ChannelType::telegram(), "tg_42", &sid("sess-abc"))
             .await
             .unwrap();
         let got = store.get(&ChannelType::telegram(), "tg_42").await.unwrap();
-        assert_eq!(got.as_deref(), Some("sess-abc"));
+        assert_eq!(got, Some(sid("sess-abc")));
     }
 
     #[tokio::test]
@@ -104,15 +113,15 @@ mod tests {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlChannelSessionStore::new(pool);
         store
-            .put(&ChannelType::telegram(), "tg_42", "sess-first")
+            .put(&ChannelType::telegram(), "tg_42", &sid("sess-first"))
             .await
             .unwrap();
         store
-            .put(&ChannelType::telegram(), "tg_42", "sess-second")
+            .put(&ChannelType::telegram(), "tg_42", &sid("sess-second"))
             .await
             .unwrap();
         let got = store.get(&ChannelType::telegram(), "tg_42").await.unwrap();
-        assert_eq!(got.as_deref(), Some("sess-first"));
+        assert_eq!(got, Some(sid("sess-first")));
     }
 
     #[tokio::test]
@@ -120,7 +129,7 @@ mod tests {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlChannelSessionStore::new(pool);
         store
-            .put(&ChannelType::telegram(), "tg_42", "sess-a")
+            .put(&ChannelType::telegram(), "tg_42", &sid("sess-a"))
             .await
             .unwrap();
         store
@@ -139,11 +148,11 @@ mod tests {
         // (On a live-row conflict `INSERT OR IGNORE` keeps the existing
         // row, preserving concurrent-writer determinism.)
         store
-            .put(&ChannelType::telegram(), "tg_42", "sess-b")
+            .put(&ChannelType::telegram(), "tg_42", &sid("sess-b"))
             .await
             .unwrap();
         let got = store.get(&ChannelType::telegram(), "tg_42").await.unwrap();
-        assert_eq!(got.as_deref(), Some("sess-b"));
+        assert_eq!(got, Some(sid("sess-b")));
     }
 
     #[tokio::test]
@@ -151,28 +160,20 @@ mod tests {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlChannelSessionStore::new(pool);
         store
-            .put(&ChannelType::telegram(), "tg_42", "sess-tg")
+            .put(&ChannelType::telegram(), "tg_42", &sid("sess-tg"))
             .await
             .unwrap();
         store
-            .put(&ChannelType::discord(), "tg_42", "sess-dc")
+            .put(&ChannelType::discord(), "tg_42", &sid("sess-dc"))
             .await
             .unwrap();
         assert_eq!(
-            store
-                .get(&ChannelType::telegram(), "tg_42")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("sess-tg"),
+            store.get(&ChannelType::telegram(), "tg_42").await.unwrap(),
+            Some(sid("sess-tg")),
         );
         assert_eq!(
-            store
-                .get(&ChannelType::discord(), "tg_42")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("sess-dc"),
+            store.get(&ChannelType::discord(), "tg_42").await.unwrap(),
+            Some(sid("sess-dc")),
         );
     }
 }

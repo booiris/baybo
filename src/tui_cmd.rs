@@ -1,16 +1,17 @@
 //! CLI entrypoint for the interactive chat loop (`aura tui`).
 //!
 //! `aura tui` is a thin UI on top of a WS+MessagePack [`WsTransport`]
-//! pointed at `aura gateway`'s channel listener — the gateway holds
-//! the workspace singleton, the manager graph, and the router.
+//! pointed at `aura gateway`'s admin listener (which co-hosts the
+//! `/v1/channel-ws` upgrade alongside the bearer-auth admin REST API).
+//! Same address the browser-side web chat page uses — one public bind
+//! per gateway, no port-file discovery needed.
 //!
-//! Port discovery: the gateway writes `<workspace>/state/channel.port`
-//! on bind; both sides read the same file so they agree on the
-//! loopback port without any config roundtrip. TUI auth is a per-start
-//! temporary token the gateway publishes to the secret vault at
-//! `gateway.tui_token` (rotated on every `aura gateway start`); the
-//! TUI opens the same vault, reads the token, and presents it on the
-//! channel WebSocket upgrade.
+//! TUI auth is a per-start temporary token the gateway publishes to
+//! the secret vault at `gateway.tui_token` (rotated on every
+//! `aura gateway start`); the TUI opens the same vault, reads the
+//! token, and presents it in the `x-aura-channel-token` header on the
+//! WS upgrade. The token is bound to the `tui` label, so the channel-
+//! auth middleware admits it through the same path as a sidecar.
 //!
 //! If the connect fails the command prints a concrete block telling
 //! the operator how to start a gateway and exits. The dev-only
@@ -18,7 +19,7 @@
 //! one as a subprocess — compiled in only under
 //! `cfg(debug_assertions)`, so release builds never see it.
 
-use std::path::{Path, PathBuf};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 
 use aura_agent::service::ShutdownSignal;
@@ -51,12 +52,13 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     });
     info!("Aura - Intelligent Assistant Framework starting");
 
-    let port_file = port_file_path(&config);
+    let admin_addr = admin_addr_from_config(&config)?;
 
-    let session_id = opts
-        .session
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_id = aura_model::SessionId::from(
+        opts.session
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+    );
 
     // Keep the auto-spawned child alive for the lifetime of the TUI.
     // Dropping the guard sends SIGTERM (with a SIGKILL fallback) so
@@ -66,17 +68,17 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
 
     // Read the per-start TUI token from the vault. Done once up front
     // so a missing token (gateway not running yet) flows into the same
-    // `NotReachable`-style fallback as a missing port file. In
+    // `NotReachable`-style fallback as an unreachable admin port. In
     // `--dev-auto-gateway` mode the spawned child writes the token
-    // before publishing the port; we re-read after spawn to pick up
-    // the freshly-rotated value.
+    // before the admin listener accepts connections; we re-read after
+    // spawn to pick up the freshly-rotated value.
     let mut tui_token = read_tui_token(&config).await;
 
     let transport =
-        match try_connect_with_token(&port_file, tui_token.as_deref(), &session_id).await {
+        match try_connect_with_token(admin_addr, tui_token.as_deref(), &session_id).await {
             Ok(t) => Arc::new(t),
             Err(err) if !matches!(err, ChannelError::NotReachable(_)) => {
-                return Err(unreachable_gateway_error(&port_file, &err.to_string()));
+                return Err(unreachable_gateway_error(admin_addr, &err.to_string()));
             }
             Err(err) => {
                 #[cfg(debug_assertions)]
@@ -84,32 +86,29 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
                     // Propagate the parent's resolved config path so the
                     // spawned gateway reads the same workspace — otherwise
                     // a `--config` flag on the TUI would point the child
-                    // at a different vault, and they'd disagree on the
-                    // port file.
+                    // at a different vault, and they'd disagree on bind
+                    // address.
                     let config_path = crate::boot::resolve_config_path();
                     _auto_gateway =
-                        Some(dev_auto::spawn_and_wait_ready(&port_file, config_path).await?);
+                        Some(dev_auto::spawn_and_wait_ready(admin_addr, config_path).await?);
                     // Reread the freshly-rotated token the spawned gateway
                     // just published.
                     tui_token = read_tui_token(&config).await;
                     Arc::new(
-                        try_connect_with_token(&port_file, tui_token.as_deref(), &session_id)
+                        try_connect_with_token(admin_addr, tui_token.as_deref(), &session_id)
                             .await
-                            .map_err(|e| unreachable_gateway_error(&port_file, &e.to_string()))?,
+                            .map_err(|e| unreachable_gateway_error(admin_addr, &e.to_string()))?,
                     )
                 } else {
-                    return Err(unreachable_gateway_error(&port_file, &err.to_string()));
+                    return Err(unreachable_gateway_error(admin_addr, &err.to_string()));
                 }
                 #[cfg(not(debug_assertions))]
                 {
-                    return Err(unreachable_gateway_error(&port_file, &err.to_string()));
+                    return Err(unreachable_gateway_error(admin_addr, &err.to_string()));
                 }
             }
         };
-    info!(
-        port_file = %port_file.display(),
-        "connected to gateway"
-    );
+    info!(%admin_addr, "connected to gateway");
 
     let slash_handler = Arc::new(TuiSlashHandler::new());
     let dashboard_provider = Arc::new(TuiDashboardProvider::new());
@@ -126,7 +125,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
 
     tui.start().await?;
 
-    info!(session_id, "TUI session started");
+    info!(%session_id, "TUI session started");
 
     let mut task_tracker = aura_agent::service::TaskTracker::new();
     install_signal_handler(&mut task_tracker, shutdown.clone());
@@ -144,11 +143,21 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the channel port-file path. Fixed at
-/// `<workspace>/state/channel.port` — not configurable, so gateway
-/// and TUI resolve it identically.
-fn port_file_path(config: &AuraConfig) -> PathBuf {
-    aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path)).channel_port()
+/// Resolve the admin listener address from the loaded config. When
+/// the gateway is bound to a wildcard interface (`0.0.0.0` / `::`), a
+/// same-host TUI rewrites it to loopback — the wildcard is a server-
+/// side bind directive, not a dialable target.
+fn admin_addr_from_config(config: &AuraConfig) -> anyhow::Result<SocketAddr> {
+    let host = config.gateway.bind_address.as_str();
+    let ip: IpAddr = host
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid gateway.bind_address {host:?}: {e}"))?;
+    let dial_ip = match ip {
+        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        other => other,
+    };
+    Ok(SocketAddr::new(dial_ip, config.gateway.port))
 }
 
 /// Best-effort read of the per-start TUI token from the secret vault.
@@ -184,37 +193,27 @@ async fn read_tui_token(config: &AuraConfig) -> Option<String> {
     }
 }
 
-/// Read the gateway's published port and dial the channel listener
-/// with the supplied TUI token. Absence of either the port file or
-/// the token is treated as `NotReachable` so the caller's existing
-/// fallback paths (dev auto-gateway, user-facing error) cover both.
+/// Dial the gateway's admin listener with the supplied TUI token.
+/// A missing token (vault key absent / gateway not running yet) is
+/// surfaced as `NotReachable` so the caller's existing fallback paths
+/// (dev auto-gateway, user-facing error) cover it the same way as a
+/// `connect refused`.
 async fn try_connect_with_token(
-    port_file: &Path,
+    admin_addr: SocketAddr,
     tui_token: Option<&str>,
-    session_id: &str,
+    session_id: &aura_model::SessionId,
 ) -> Result<WsTransport, ChannelError> {
-    let port = read_port(port_file).ok_or_else(|| {
-        ChannelError::NotReachable(format!(
-            "no channel.port at {} (is the gateway running?)",
-            port_file.display(),
-        ))
-    })?;
     let token = tui_token.ok_or_else(|| {
         ChannelError::NotReachable(format!(
             "no {TUI_TOKEN_VAULT_KEY} in vault (is the gateway running?)",
         ))
     })?;
-    WsTransport::connect(port, token.to_owned(), session_id.to_owned()).await
+    WsTransport::connect(admin_addr, token.to_owned(), session_id.clone()).await
 }
 
-fn read_port(port_file: &Path) -> Option<u16> {
-    std::fs::read_to_string(port_file).ok()?.trim().parse().ok()
-}
-
-fn unreachable_gateway_error(port_file: &Path, underlying: &str) -> anyhow::Error {
+fn unreachable_gateway_error(admin_addr: SocketAddr, underlying: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "no aura gateway reachable (port file: {port})\n  - start it with:       aura gateway start\n  (underlying error: {underlying})",
-        port = port_file.display()
+        "no aura gateway reachable at {admin_addr}\n  - start it with:       aura gateway start\n  (underlying error: {underlying})"
     )
 }
 
@@ -225,16 +224,14 @@ mod dev_auto {
     //! Deliberately isolated in its own module so stripping the
     //! feature also strips the `std::process::Command` call site.
 
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::path::{Path, PathBuf};
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
     use std::process::Stdio;
     use std::time::Duration;
 
     use tokio::net::TcpStream;
     use tokio::process::{Child, Command};
     use tracing::info;
-
-    use super::read_port;
 
     /// RAII guard that kills the spawned gateway when dropped.
     pub struct AutoGatewayGuard {
@@ -254,14 +251,13 @@ mod dev_auto {
         }
     }
 
-    /// Spawn `aura gateway start` as a subprocess and poll the
-    /// channel.port file + the loopback TCP port until a connection
-    /// succeeds (or the timeout elapses). A successful
-    /// `TcpStream::connect` is enough evidence that the listener is
-    /// accepting — the caller follows up with the real WS handshake
-    /// after this returns.
+    /// Spawn `aura gateway start` as a subprocess and poll the admin
+    /// listener until a TCP connection succeeds (or the timeout
+    /// elapses). A successful `TcpStream::connect` is enough evidence
+    /// that the listener is accepting — the caller follows up with
+    /// the real WS handshake after this returns.
     pub async fn spawn_and_wait_ready(
-        port_file: &Path,
+        admin_addr: SocketAddr,
         config_path: Option<PathBuf>,
     ) -> anyhow::Result<AutoGatewayGuard> {
         // Loud banner so nobody mistakes the dev convenience for a
@@ -291,20 +287,14 @@ mod dev_auto {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let mut wait = Duration::from_millis(100);
         loop {
-            if let Some(port) = read_port(port_file) {
-                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-                if TcpStream::connect(addr).await.is_ok() {
-                    info!(port, port_file = %port_file.display(), "auto-gateway ready");
-                    return Ok(guard);
-                }
+            if TcpStream::connect(admin_addr).await.is_ok() {
+                info!(%admin_addr, "auto-gateway ready");
+                return Ok(guard);
             }
             if tokio::time::Instant::now() >= deadline {
                 // Drop guard kills the child as we bail.
                 let _ = guard.child.take().map(|mut c| c.start_kill());
-                anyhow::bail!(
-                    "auto-gateway did not become reachable (port file: {}) within 15s",
-                    port_file.display()
-                );
+                anyhow::bail!("auto-gateway did not become reachable at {admin_addr} within 15s",);
             }
             tokio::time::sleep(wait).await;
             wait = (wait * 2).min(Duration::from_secs(1));

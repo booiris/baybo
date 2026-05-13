@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use aura_agent::SessionManager;
-use aura_model::{ChannelType, User};
+use aura_model::{ChannelType, SessionId, User};
 use aura_storage::ChannelSessionStore;
 
 /// Errors surfaced from [`ChannelSessionResolver::resolve_or_create`].
@@ -49,7 +49,7 @@ impl ChannelSessionResolver {
         &self,
         channel_type: &ChannelType,
         user_id: &str,
-    ) -> Result<String, ResolverError> {
+    ) -> Result<SessionId, ResolverError> {
         if let Some(existing) = self
             .store
             .get(channel_type, user_id)
@@ -75,7 +75,7 @@ impl ChannelSessionResolver {
         // one wins (see `LibsqlChannelSessionStore::put`), so a re-read
         // here is what the caller should trust.
         self.store
-            .put(channel_type, user_id, session.id.as_str())
+            .put(channel_type, user_id, &session.id)
             .await
             .map_err(|e| ResolverError::Store(e.to_string()))?;
 
@@ -86,7 +86,7 @@ impl ChannelSessionResolver {
             .get(channel_type, user_id)
             .await
             .map_err(|e| ResolverError::Store(e.to_string()))?
-            .unwrap_or_else(|| session.id.to_string());
+            .unwrap_or_else(|| session.id.clone());
         Ok(canonical)
     }
 
@@ -101,7 +101,7 @@ impl ChannelSessionResolver {
         &self,
         channel_type: &ChannelType,
         user_id: &str,
-    ) -> Result<String, ResolverError> {
+    ) -> Result<SessionId, ResolverError> {
         self.store
             .delete(channel_type, user_id)
             .await
@@ -119,7 +119,7 @@ impl ChannelSessionResolver {
             .map_err(|e| ResolverError::SessionManager(e.to_string()))?;
 
         self.store
-            .put(channel_type, user_id, session.id.as_str())
+            .put(channel_type, user_id, &session.id)
             .await
             .map_err(|e| ResolverError::Store(e.to_string()))?;
 
@@ -129,7 +129,7 @@ impl ChannelSessionResolver {
             session_id = %session.id,
             "channel mapping repointed to fresh session (/new)",
         );
-        Ok(session.id.to_string())
+        Ok(session.id.clone())
     }
 }
 

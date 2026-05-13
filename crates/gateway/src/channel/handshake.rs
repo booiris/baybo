@@ -1,40 +1,28 @@
 //! Pure handshake validator for the WS channel server. Separated
 //! from the route handler so it can be unit-tested without spinning
 //! a TCP listener.
+//!
+//! After the Channel / Connection / Subscription refactor a Register
+//! frame names only the channel a connection serves; per-session
+//! interest is expressed by later `Subscribe` / `Unsubscribe` frames
+//! on the same connection. The validator therefore no longer parses
+//! or returns a `session_id`.
 
-use aura_channels::wire::{Frame, PROTOCOL_VERSION};
+use aura_channels::wire::Frame;
 use aura_model::ChannelType;
 
 use crate::auth::{AuthedClient, ChannelTokenTable, TOOL_CLIENT_LABEL_PREFIX};
 
-/// Channel type strings reserved for in-process adapters. Sidecars may
-/// not claim these — they would shadow the real adapter. `tui` is not
-/// reserved here because the bundled TUI registers as that exact
-/// channel type via the vault-token auth path; subprocess sidecars are
-/// blocked from claiming `"tui"` further down inside `validate_register`.
+/// Channel type strings that subprocess sidecars may not claim — they
+/// would shadow an in-process adapter. `"tui"` is enforced separately
+/// (only the vault-token TUI auth path may claim it).
 const RESERVED_CHANNEL_TYPES: &[&str] = &[ChannelType::HTTP];
 
-/// Validate the first frame received on a `/v1/channel-ws` upgrade and
-/// produce the `ChannelType` the sidecar is registering as.
-///
-/// `authed` is the [`AuthedClient`] the auth middleware already attached
-/// to the request via [`ChannelAuthState`](crate::auth::channel::ChannelAuthState).
-/// `tokens` is the live capability table — we consult it to confirm the
-/// `Register.token` that a subprocess embedded in the frame names the
-/// same identity that the header-based auth already validated. The
-/// built-in TUI authenticates with the vault-issued TUI token, which
-/// the middleware already verified, so its `Register.token` field is
-/// ignored and it must claim the `"tui"` channel type.
-/// Outcome of a successful Register handshake.
-///
-/// `session_id` is `Some` only for session-scoped clients (today: the
-/// built-in TUI). Sidecars leave it `None` and register as
-/// type-level channels — the registry enforces the historical 1:1
-/// `ChannelType → Channel` mapping for those.
+/// Outcome of a successful Register handshake. Only the channel type
+/// is reported; subscriptions are negotiated post-handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegisterOutcome {
     pub channel_type: ChannelType,
-    pub session_id: Option<String>,
 }
 
 pub(crate) fn validate_register(
@@ -45,18 +33,10 @@ pub(crate) fn validate_register(
     let Frame::Register {
         token,
         channel_type,
-        protocol_version,
-        session_id,
     } = frame
     else {
         return Err("expected Register frame".to_string());
     };
-
-    if protocol_version != PROTOCOL_VERSION {
-        return Err(format!(
-            "protocol version mismatch: server {PROTOCOL_VERSION}, client {protocol_version}"
-        ));
-    }
 
     let normalized = channel_type.as_str().trim().to_string();
     if normalized.is_empty() {
@@ -74,23 +54,24 @@ pub(crate) fn validate_register(
                     ChannelType::TUI
                 ));
             }
-            if session_id.as_deref().is_none_or(str::is_empty) {
-                return Err(
-                    "tui clients must declare a session_id in the Register frame".to_string(),
-                );
-            }
         }
         // Tool sidecars (browser MCP server today; future code_exec,
         // db_query, …) live in the same `ChannelTokenTable` for
         // `/v1/blobs` auth, but must never register on `/v1/channel-ws`
         // — a leaked tool token would otherwise impersonate a channel.
-        // Both arms reject by label prefix; the duplication is
-        // intentional defence in depth (a future refactor that
-        // constructs `Subprocess` directly bypasses `from_identity`).
         AuthedClient::Tool { label } => {
             return Err(format!(
                 "label '{label}' is reserved for tool sidecars and may not register on /v1/channel-ws",
             ));
+        }
+        AuthedClient::Web { label, token } => {
+            if normalized != ChannelType::HTTP {
+                return Err(format!(
+                    "web chat token must register as channel_type '{}', got '{normalized}'",
+                    ChannelType::HTTP,
+                ));
+            }
+            let _ = (label, token);
         }
         AuthedClient::Subprocess { pid, label, .. } => {
             if label.starts_with(TOOL_CLIENT_LABEL_PREFIX) {
@@ -121,31 +102,11 @@ pub(crate) fn validate_register(
             if normalized == ChannelType::TUI {
                 return Err("channel_type 'tui' is reserved for the built-in TUI".to_string());
             }
-            // Subprocess sidecars are type-scoped, not session-scoped.
-            // Letting them self-supply a session_id would (a) bypass
-            // the pairing gate and (b) let them attach to or impersonate
-            // any session whose id they can guess. The Register frame
-            // must therefore leave session_id empty.
-            if session_id.as_deref().is_some_and(|s| !s.trim().is_empty()) {
-                return Err(
-                    "subprocess sidecars must not declare a session_id in Register".to_string(),
-                );
-            }
         }
     }
 
-    let session_id = session_id.and_then(|s| {
-        let trimmed = s.trim().to_owned();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    });
-
     Ok(RegisterOutcome {
         channel_type: ChannelType::from(normalized),
-        session_id,
     })
 }
 
@@ -153,6 +114,7 @@ pub(crate) fn validate_register(
 mod tests {
     use super::*;
     use crate::auth::ClientIdentity;
+    use aura_channels::MessageRole;
     use aura_channels::wire::Message as WireMessage;
 
     fn subprocess(pid: u32, label: &str) -> AuthedClient {
@@ -163,21 +125,10 @@ mod tests {
         }
     }
 
-    fn register(token: &str, channel_type: &str, version: u16) -> Frame {
-        register_with_session(token, channel_type, version, None)
-    }
-
-    fn register_with_session(
-        token: &str,
-        channel_type: &str,
-        version: u16,
-        session_id: Option<&str>,
-    ) -> Frame {
+    fn register(token: &str, channel_type: &str) -> Frame {
         Frame::Register {
             token: token.to_string(),
             channel_type: ChannelType::from(channel_type),
-            protocol_version: version,
-            session_id: session_id.map(ToOwned::to_owned),
         }
     }
 
@@ -189,31 +140,16 @@ mod tests {
             label: "slack".into(),
             bound_channel_type: Some("slack".into()),
         });
-        let frame = register(handle.token(), "slack", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "slack");
         let authed = subprocess(42, "slack");
         let outcome = validate_register(frame, &authed, &tokens).unwrap();
         assert_eq!(outcome.channel_type.as_str(), "slack");
-        assert!(outcome.session_id.is_none(), "sidecars register type-level");
-    }
-
-    #[test]
-    fn rejects_wrong_protocol_version() {
-        let tokens = ChannelTokenTable::new();
-        let handle = tokens.mint(ClientIdentity {
-            pid: 1,
-            label: "slack".into(),
-            bound_channel_type: Some("slack".into()),
-        });
-        let frame = register(handle.token(), "slack", PROTOCOL_VERSION + 1);
-        let authed = subprocess(1, "slack");
-        let err = validate_register(frame, &authed, &tokens).unwrap_err();
-        assert!(err.contains("protocol version"));
     }
 
     #[test]
     fn rejects_unknown_token() {
         let tokens = ChannelTokenTable::new();
-        let frame = register("deadbeef", "slack", PROTOCOL_VERSION);
+        let frame = register("deadbeef", "slack");
         let authed = subprocess(1, "slack");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert_eq!(err, "token not registered");
@@ -227,7 +163,7 @@ mod tests {
             label: "slack".into(),
             bound_channel_type: Some("slack".into()),
         });
-        let frame = register(handle.token(), "slack", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "slack");
         let authed = subprocess(999, "slack");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert_eq!(err, "token identity mismatch");
@@ -241,7 +177,7 @@ mod tests {
             label: "slack".into(),
             bound_channel_type: Some("slack".into()),
         });
-        let frame = register(handle.token(), "slack", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "slack");
         let authed = subprocess(42, "discord");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert_eq!(err, "token identity mismatch");
@@ -250,24 +186,15 @@ mod tests {
     #[test]
     fn accepts_tui_auth_claiming_tui_channel() {
         let tokens = ChannelTokenTable::new();
-        let frame = register_with_session("", ChannelType::TUI, PROTOCOL_VERSION, Some("sess-123"));
+        let frame = register("", ChannelType::TUI);
         let outcome = validate_register(frame, &AuthedClient::Tui, &tokens).unwrap();
         assert_eq!(outcome.channel_type.as_str(), ChannelType::TUI);
-        assert_eq!(outcome.session_id.as_deref(), Some("sess-123"));
-    }
-
-    #[test]
-    fn rejects_tui_auth_without_session_id() {
-        let tokens = ChannelTokenTable::new();
-        let frame = register("", ChannelType::TUI, PROTOCOL_VERSION);
-        let err = validate_register(frame, &AuthedClient::Tui, &tokens).unwrap_err();
-        assert!(err.contains("must declare a session_id"));
     }
 
     #[test]
     fn rejects_tui_auth_claiming_other_channel() {
         let tokens = ChannelTokenTable::new();
-        let frame = register("", "slack", PROTOCOL_VERSION);
+        let frame = register("", "slack");
         let err = validate_register(frame, &AuthedClient::Tui, &tokens).unwrap_err();
         assert!(err.contains("tui token must register"));
     }
@@ -280,7 +207,7 @@ mod tests {
             label: "tui".into(),
             bound_channel_type: Some("tui".into()),
         });
-        let frame = register(handle.token(), ChannelType::TUI, PROTOCOL_VERSION);
+        let frame = register(handle.token(), ChannelType::TUI);
         let authed = subprocess(1, "tui");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(err.contains("reserved for the built-in TUI"));
@@ -294,7 +221,7 @@ mod tests {
             label: "http".into(),
             bound_channel_type: Some("http".into()),
         });
-        let frame = register(handle.token(), "http", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "http");
         let authed = subprocess(1, "http");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(err.contains("reserved"));
@@ -308,7 +235,7 @@ mod tests {
             label: "slack".into(),
             bound_channel_type: Some("slack".into()),
         });
-        let frame = register(handle.token(), "   ", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "   ");
         let authed = subprocess(1, "slack");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(err.contains("empty"));
@@ -319,12 +246,14 @@ mod tests {
         let tokens = ChannelTokenTable::new();
         let frame = Frame::Message(WireMessage {
             content: String::new(),
-            session_id: String::new(),
+            session_id: aura_model::SessionId::from(""),
             user_id: String::new(),
             channel_type: ChannelType::from("slack"),
             bot_id: String::new(),
             attachments: Vec::new(),
             platform_msg_id: String::new(),
+            role: MessageRole::User,
+            ordinal: None,
         });
         let authed = subprocess(1, "slack");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
@@ -333,17 +262,13 @@ mod tests {
 
     #[test]
     fn rejects_subprocess_claiming_other_bound_channel_type() {
-        // Token was minted for "slack" (the supervisor knows the
-        // channel_type at spawn time). The sidecar must not be able
-        // to register as "discord" and steal that channel's bot
-        // secrets.
         let tokens = ChannelTokenTable::new();
         let handle = tokens.mint(ClientIdentity {
             pid: 7,
             label: "sidecar-slack".into(),
             bound_channel_type: Some("slack".into()),
         });
-        let frame = register(handle.token(), "discord", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "discord");
         let authed = subprocess(7, "sidecar-slack");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(
@@ -354,27 +279,72 @@ mod tests {
 
     #[test]
     fn rejects_subprocess_with_tool_label_on_channel_ws() {
-        // The browser tool sidecar mints a token under label
-        // "tool/browser" (see gateway_cmd::start). That token lives in
-        // the same ChannelTokenTable so /v1/tool-ws can accept it via
-        // the channel-auth middleware. If the sidecar (or anyone who
-        // leaked the token) presented it at /v1/channel-ws, the
-        // identity check would pass and `bound_channel_type=None`
-        // would let it through the binding gate too. The label
-        // prefix rule fences this off.
         let tokens = ChannelTokenTable::new();
         let handle = tokens.mint(ClientIdentity {
             pid: 0,
             label: "tool/browser".into(),
             bound_channel_type: None,
         });
-        let frame = register(handle.token(), "telegram", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "telegram");
         let authed = subprocess(0, "tool/browser");
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(
             err.contains("tool/browser") && err.contains("reserved for tool sidecars"),
             "got: {err}",
         );
+    }
+
+    #[test]
+    fn accepts_web_auth_claiming_http_channel() {
+        // The web chat page mints a token under `WEB_CLIENT_LABEL_PREFIX`
+        // via the admin POST /v1/chat/sessions handler; the auth
+        // middleware turns it into AuthedClient::Web. That identity is
+        // the *only* path allowed to claim the otherwise-reserved
+        // "http" channel type.
+        let tokens = ChannelTokenTable::new();
+        let frame = register("", ChannelType::HTTP);
+        let authed = AuthedClient::Web {
+            label: "web/abc".to_string(),
+            token: "test-token".to_string(),
+        };
+        let outcome = validate_register(frame, &authed, &tokens).unwrap();
+        assert_eq!(outcome.channel_type.as_str(), ChannelType::HTTP);
+    }
+
+    #[test]
+    fn rejects_web_auth_claiming_other_channel() {
+        // A web token must not be redirectable to telegram (or any
+        // other channel). The handshake fixes the channel type for
+        // this auth variant.
+        let tokens = ChannelTokenTable::new();
+        let frame = register("", "telegram");
+        let authed = AuthedClient::Web {
+            label: "web/abc".to_string(),
+            token: "test-token".to_string(),
+        };
+        let err = validate_register(frame, &authed, &tokens).unwrap_err();
+        assert!(
+            err.contains("web chat token must register as channel_type"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn rejects_subprocess_claiming_http_even_with_matching_bound_type() {
+        // Reserved-channel-types is a hard floor: even a sidecar
+        // whose token was minted with bound_channel_type=Some("http")
+        // can't claim it. Only AuthedClient::Web is allowed past the
+        // RESERVED gate.
+        let tokens = ChannelTokenTable::new();
+        let handle = tokens.mint(ClientIdentity {
+            pid: 99,
+            label: "sidecar-http".into(),
+            bound_channel_type: Some("http".into()),
+        });
+        let frame = register(handle.token(), "http");
+        let authed = subprocess(99, "sidecar-http");
+        let err = validate_register(frame, &authed, &tokens).unwrap_err();
+        assert!(err.contains("reserved"), "got: {err}");
     }
 
     #[test]
@@ -385,55 +355,9 @@ mod tests {
             label: "sidecar-slack".into(),
             bound_channel_type: Some("slack".into()),
         });
-        let frame = register(handle.token(), "slack", PROTOCOL_VERSION);
+        let frame = register(handle.token(), "slack");
         let authed = subprocess(7, "sidecar-slack");
         let outcome = validate_register(frame, &authed, &tokens).unwrap();
         assert_eq!(outcome.channel_type.as_str(), "slack");
-        assert!(outcome.session_id.is_none());
-    }
-
-    #[test]
-    fn rejects_subprocess_supplying_session_id() {
-        // Subprocess sidecars are type-scoped, never session-scoped:
-        // letting them name a session_id would bypass pairing AND
-        // let them attach to any guessable session.
-        let tokens = ChannelTokenTable::new();
-        let handle = tokens.mint(ClientIdentity {
-            pid: 7,
-            label: "sidecar-slack".into(),
-            bound_channel_type: Some("slack".into()),
-        });
-        let frame = register_with_session(
-            handle.token(),
-            "slack",
-            PROTOCOL_VERSION,
-            Some("session-i-want-to-hijack"),
-        );
-        let authed = subprocess(7, "sidecar-slack");
-        let err = validate_register(frame, &authed, &tokens).unwrap_err();
-        assert!(err.contains("must not declare a session_id"), "got: {err}");
-    }
-
-    #[test]
-    fn rejects_subprocess_supplying_whitespace_session_id() {
-        // Whitespace-only is treated as empty by the trimmer below
-        // the auth checks, but we want the explicit rejection to
-        // happen *before* trimming so an attacker can't slip a value
-        // past the gate by padding it with spaces.
-        let tokens = ChannelTokenTable::new();
-        let handle = tokens.mint(ClientIdentity {
-            pid: 7,
-            label: "sidecar-slack".into(),
-            bound_channel_type: Some("slack".into()),
-        });
-        let frame = register_with_session(
-            handle.token(),
-            "slack",
-            PROTOCOL_VERSION,
-            Some(" some-session "),
-        );
-        let authed = subprocess(7, "sidecar-slack");
-        let err = validate_register(frame, &authed, &tokens).unwrap_err();
-        assert!(err.contains("must not declare a session_id"), "got: {err}");
     }
 }

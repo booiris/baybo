@@ -393,6 +393,24 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         }));
     }
 
+    // Stash for web-chat token handles. Built here so the TTL
+    // janitor task and the GatewayDeps both clone the same Arc;
+    // mint-side (admin chat) and take-side (channel WS) share this
+    // map.
+    let web_chat_tokens = Arc::new(Default::default());
+
+    // TTL reaper for web_chat_tokens. Drops `StashedTokenHandle`
+    // entries that a WS upgrade never claimed within
+    // `WebTokenJanitor::DEFAULT_TTL`. Without this, mints that never
+    // reach a `/v1/channel-ws` upgrade leak until process exit.
+    {
+        let janitor = aura_gateway::channel::WebTokenJanitor::new(Arc::clone(&web_chat_tokens));
+        let shutdown_for_janitor = shutdown.clone();
+        task_tracker.track(tokio::spawn(async move {
+            janitor.run(shutdown_for_janitor).await;
+        }));
+    }
+
     // Build the axum server from the assembled graph.
     let deps = GatewayDeps {
         config: Arc::clone(&graph.config),
@@ -410,6 +428,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         log_buffer: Arc::clone(&log_buffer),
         incoming_tx: run_handle.incoming_tx.clone(),
         channel_tokens: channel_tokens.clone(),
+        web_chat_tokens,
         secret_vault: Arc::clone(&graph.secret_vault),
         stores: graph.stores.clone(),
         channel_control,

@@ -26,7 +26,7 @@
 
 use super::token::{
     CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TOOL_CLIENT_LABEL_PREFIX,
-    TUI_CLIENT_LABEL,
+    TUI_CLIENT_LABEL, WEB_CLIENT_LABEL_PREFIX,
 };
 use axum::body::Body;
 use axum::extract::State;
@@ -60,15 +60,36 @@ pub enum AuthedClient {
         /// in that case.
         channel_type: Option<String>,
     },
+    /// Admin-side web chat tab. The token was minted by
+    /// `POST /v1/chat/session` after the operator presented a valid
+    /// admin bearer; the channel-WS handshake accepts this identity
+    /// only when it claims `ChannelType::HTTP`.
+    Web {
+        /// Full label string starting with [`WEB_CLIENT_LABEL_PREFIX`]
+        /// (e.g. `"web/<uuid>"`). The suffix uniquely identifies the
+        /// minted session so logs and metrics can attribute traffic.
+        label: String,
+        /// Raw token string the caller presented. The channel WS
+        /// route uses this to take the matching `TokenHandle` out of
+        /// `web_chat_tokens` on successful upgrade so the handle
+        /// rides the connection lifetime (and revokes the token on
+        /// close).
+        token: String,
+    },
 }
 
 impl AuthedClient {
-    fn from_identity(identity: ClientIdentity) -> Self {
+    fn from_identity(identity: ClientIdentity, token: &str) -> Self {
         if identity.label == TUI_CLIENT_LABEL {
             AuthedClient::Tui
         } else if identity.label.starts_with(TOOL_CLIENT_LABEL_PREFIX) {
             AuthedClient::Tool {
                 label: identity.label,
+            }
+        } else if identity.label.starts_with(WEB_CLIENT_LABEL_PREFIX) {
+            AuthedClient::Web {
+                label: identity.label,
+                token: token.to_owned(),
             }
         } else {
             AuthedClient::Subprocess {
@@ -135,6 +156,12 @@ pub async fn require_channel_auth(
                         "channel auth: accepted via subprocess token",
                     );
                 }
+                AuthedClient::Web { label, .. } => {
+                    tracing::debug!(
+                        %path, label = %label,
+                        "channel auth: accepted via web chat token",
+                    );
+                }
             }
             req.extensions_mut().insert(authed);
             // Strip `?token=` from the URI before TraceLayer logs it.
@@ -191,7 +218,7 @@ fn check_channel_token(
         return Ok(None);
     };
     match state.tokens.lookup(token.as_ref()) {
-        Some(identity) => Ok(Some(AuthedClient::from_identity(identity))),
+        Some(identity) => Ok(Some(AuthedClient::from_identity(identity, token.as_ref()))),
         None => {
             tracing::debug!(
                 token_prefix = %short_token(token.as_ref()),

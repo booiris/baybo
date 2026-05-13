@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_model::ChannelType;
+use aura_model::{ChannelType, SessionId};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ pub struct ApprovalRequest {
     pub call_id: String,
     /// Session the tool call runs under. Lets HTTP clients (e.g. the
     /// gateway-backed TUI) render approvals alongside the session they belong to.
-    pub session_id: String,
+    pub session_id: SessionId,
     /// Aura user id the tool call is running on behalf of. Sidecars
     /// that route prompts by platform user (Telegram chat, Discord DM)
     /// use this instead of reverse-mapping from `session_id`. Empty
@@ -109,7 +109,7 @@ impl ApprovalGate for AutoDenyGate {
 /// `AutoDenyGate` (fail-closed).
 pub struct ApprovalGateMap {
     type_level: DashMap<ChannelType, Arc<dyn ApprovalGate>>,
-    session_level: DashMap<(ChannelType, String), Arc<dyn ApprovalGate>>,
+    session_level: DashMap<(ChannelType, SessionId), Arc<dyn ApprovalGate>>,
 }
 
 impl ApprovalGateMap {
@@ -132,7 +132,7 @@ impl ApprovalGateMap {
     pub fn insert_session(
         &self,
         channel: ChannelType,
-        session_id: String,
+        session_id: SessionId,
         gate: Arc<dyn ApprovalGate>,
     ) {
         self.session_level.insert((channel, session_id), gate);
@@ -148,9 +148,9 @@ impl ApprovalGateMap {
 
     /// Evict a session-scoped gate. Called on session-scoped client
     /// unregister. Cheap no-op if the entry is already gone.
-    pub fn remove_session(&self, channel: &ChannelType, session_id: &str) {
+    pub fn remove_session(&self, channel: &ChannelType, session_id: &SessionId) {
         self.session_level
-            .remove(&(channel.clone(), session_id.to_owned()));
+            .remove(&(channel.clone(), session_id.clone()));
     }
 
     /// Resolve the gate for one tool call. Tries the session-scoped
@@ -158,10 +158,10 @@ impl ApprovalGateMap {
     /// session) and falls back to the type-level gate (a sidecar that
     /// answers for every session). When neither is registered returns
     /// `AutoDenyGate` (fail-closed).
-    pub fn get(&self, channel: &ChannelType, session_id: &str) -> Arc<dyn ApprovalGate> {
+    pub fn get(&self, channel: &ChannelType, session_id: &SessionId) -> Arc<dyn ApprovalGate> {
         if let Some(entry) = self
             .session_level
-            .get(&(channel.clone(), session_id.to_owned()))
+            .get(&(channel.clone(), session_id.clone()))
         {
             return Arc::clone(entry.value());
         }
@@ -269,18 +269,25 @@ impl ApprovalQueue {
     /// Resolve a pending approval by its `call_id`. Used by REST
     /// clients (e.g. the HTTP gateway) where FIFO ordering on the
     /// wire is not guaranteed and the UI may resolve approvals out
-    /// of submission order. Returns `true` when an entry matched.
-    pub fn resolve_by_call_id(&self, call_id: &str, decision: ApprovalDecision) -> bool {
+    /// of submission order. Returns the resolved entry's
+    /// `session_id` on a hit — callers stamp it onto the follow-up
+    /// `dispatch_approval_resolved` so the fan-out reaches the
+    /// session's other subscribers instead of dispatching with an
+    /// empty id (which on a `ChannelKind::Subscribed` channel would
+    /// silently match no subscribers).
+    pub fn resolve_by_call_id(
+        &self,
+        call_id: &str,
+        decision: ApprovalDecision,
+    ) -> Option<SessionId> {
         let mut q = self.inner.lock();
-        if let Some(pos) = q.iter().position(|e| e.req.call_id == call_id)
-            && let Some(pending) = q.remove(pos)
-        {
-            if let Some(responder) = pending.responder {
-                let _ = responder.send(decision);
-            }
-            return true;
+        let pos = q.iter().position(|e| e.req.call_id == call_id)?;
+        let pending = q.remove(pos)?;
+        let session_id = pending.req.session_id.clone();
+        if let Some(responder) = pending.responder {
+            let _ = responder.send(decision);
         }
-        false
+        Some(session_id)
     }
 
     /// Append a display-only mirror entry (no oneshot). Used by the

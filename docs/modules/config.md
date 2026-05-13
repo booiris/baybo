@@ -37,12 +37,6 @@ Every **top-level** section carries `#[serde(default)]` and a matching `Default`
 
 This does **not** extend uniformly into nested structs. The following nested types have required serde fields — supplying the parent object without them fails at deserialization, not in `validate()`:
 
-- `HttpChannelConfig` (`enabled`, `bind_address`, `port`) — under `channels.http`
-  **Deprecated**: the `channels.http` stub is retained for one release for
-  back-compatibility with older configs, but the HTTP surface is now owned by
-  the top-level `gateway` section (`aura-gateway` crate; see
-  [`gateway.md`](gateway.md)). Setting `channels.http.enabled = true` has no
-  runtime effect — use `gateway.enabled` and run `aura gateway start`.
 - `TelegramChannelConfig` (`enabled`, `bot_token_env`) — under `channels.telegram`
 - `DiscordChannelConfig` (`enabled`, `bot_token_env`) — under `channels.discord`
 - `LlmEntry` (`name`, `provider`, `model`) — every element of the top-level `llm` array
@@ -117,7 +111,7 @@ Principle: a module earns a config section when operators need to tune it in pro
 
 When hot reload is implemented, the following contract must be in place **before** reload code lands:
 
-- **Hot-updatable fields** — an explicit whitelist. Plausible candidates: `cost.rate_limit.*`, `cost.spending_limits.*`, `security.leak_detection_enabled`. Clearly not hot-updatable: `channels.http.port`, `channels.http.bind_address`, anything influencing `llm` client identity.
+- **Hot-updatable fields** — an explicit whitelist. Plausible candidates: `cost.rate_limit.*`, `cost.spending_limits.*`, `security.leak_detection_enabled`. Clearly not hot-updatable: `gateway.port`, `gateway.bind_address`, anything influencing `llm` client identity.
 - **Atomic swap** — a successful reload swaps a single `Arc<AuraConfig>` holding all whitelisted changes together. Partial application is forbidden.
 - **Validation rollback** — a reload that fails `validate()` leaves the running config untouched and returns `ConfigError::Validation` to the caller; no partial state is exposed.
 - **In-flight behavior** — requests already running against the old config continue with its values; only new requests pick up the new config.
@@ -142,7 +136,6 @@ When hot reload is implemented, the following contract must be in place **before
 | `session.timeout_minutes`             | ≥ 1                                                  |
 | `session.cleanup_interval_minutes`    | no constraint; `0` disables cleanup                  |
 | `channels.message_buffer_size`        | in `1..=65536`                                       |
-| `channels.http.*`                     | non-empty `bind_address`, non-zero `port`            |
 | `channels.telegram.bot_token_env`     | non-empty                                            |
 | `channels.discord.bot_token_env`      | non-empty                                            |
 | `cost.spending_limits.daily_usd`      | if set, strictly positive, finite                    |

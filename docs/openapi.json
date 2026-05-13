@@ -120,6 +120,329 @@
         }
       }
     },
+    "/v1/chat/sessions": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "list_sessions",
+        "parameters": [
+          {
+            "name": "include_hidden",
+            "in": "query",
+            "description": "Include hidden sessions in the response. Defaults to false.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Web chat sessions, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSessionsList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "create_session",
+        "responses": {
+          "200": {
+            "description": "New session id + freshly-minted channel-token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSessionCredential"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Session creation or token mint failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/sessions/{session_id}": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "get_session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to fetch",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "before_ordinal",
+            "in": "query",
+            "description": "Return only rows whose `ordinal` is strictly less than this\nvalue. Omit on the initial fetch; pass the lowest ordinal from\nthe prior page to scroll further back. Maps to a primary-key\nrange scan over the `session_messages` active index.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum rows to return. Defaults to\n[`DEFAULT_HISTORY_LIMIT`], clamped to [`MAX_HISTORY_LIMIT`].",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session detail + transcript slice",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSessionDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "delete_session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to hide",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Hidden (row preserved on the server)"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/sessions/{session_id}/token": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "refresh_session_token",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id whose token to refresh",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Fresh channel-token (old one revoked)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatSessionCredential"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/sessions/{session_id}/unhide": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "unhide_session",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to restore",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Unhidden"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/slash-manifest": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "slash_manifest",
+        "responses": {
+          "200": {
+            "description": "Slash command list for /-autocomplete",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResponse_SlashCommandEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/config": {
       "get": {
         "tags": [
@@ -2001,6 +2324,135 @@
         "type": "string",
         "description": "Admin-surface mirror of [`aura_model::ChannelType`]. Transparent\nwrapper around a snake_case string so the OpenAPI surface stays\nstable while the core type is open-ended (runtime-registered\nsidecars like `\"slack\"` pass through unchanged)."
       },
+      "ChatSessionCredential": {
+        "type": "object",
+        "description": "Response from `POST /v1/chat/sessions` and the\n`POST /v1/chat/sessions/:id/token` token-refresh endpoint. Carries\nthe freshly-minted channel-token the web client presents on its\n`/v1/channel-ws` upgrade via the\n[`CHANNEL_TOKEN_HEADER`](crate::auth::CHANNEL_TOKEN_HEADER) header\n(or the `?token=` query when the browser's WebSocket API can't set\ncustom headers — which it never can).",
+        "required": [
+          "session_id",
+          "channel_token",
+          "channel_token_header"
+        ],
+        "properties": {
+          "channel_token": {
+            "type": "string",
+            "description": "Capability token bound to a `web/<uuid>` identity. Live for the\nlifetime of the session row; calling\n`POST /v1/chat/sessions/:id/token` revokes the previous token\nand returns a new one."
+          },
+          "channel_token_header": {
+            "type": "string",
+            "description": "Header name the web client must use when presenting the\nchannel-token on the channel listener."
+          },
+          "session_id": {
+            "type": "string",
+            "description": "New (or existing) session id."
+          }
+        }
+      },
+      "ChatSessionDetail": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "created_at",
+          "last_active",
+          "hidden",
+          "transcript",
+          "has_more"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "has_more": {
+            "type": "boolean",
+            "description": "`true` when at least one older active row exists below the\nslice's lowest ordinal — i.e. the client should keep\nscroll-up pagination armed. `false` when the slice already\nincludes the session's first message."
+          },
+          "hidden": {
+            "type": "boolean"
+          },
+          "last_active": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "transcript": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatTranscriptItem"
+            },
+            "description": "Active transcript slice, oldest-first within the page. The\nserver returns at most `limit` rows; older rows are fetched\nby passing the lowest `ordinal` here back as the next\nrequest's `before_ordinal`."
+          }
+        }
+      },
+      "ChatSessionSummary": {
+        "type": "object",
+        "required": [
+          "session_id",
+          "created_at",
+          "last_active"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "hidden": {
+            "type": "boolean",
+            "description": "True when the user has hidden this session from their chat\nlist. Only ever populated in responses when\n`include_hidden=true` was requested."
+          },
+          "last_active": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ChatSessionsList": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatSessionSummary"
+            }
+          }
+        }
+      },
+      "ChatTranscriptItem": {
+        "type": "object",
+        "description": "One transcript row, flattened from `ChatMessage` into a shape the\nweb client can render without re-implementing the content-block\nmatcher.",
+        "required": [
+          "ordinal",
+          "role",
+          "text",
+          "has_attachments"
+        ],
+        "properties": {
+          "has_attachments": {
+            "type": "boolean",
+            "description": "`true` when this row had non-text content (image / audio /\nfile). The web client currently shows a placeholder."
+          },
+          "ordinal": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Absolute `session_messages.ordinal` of this row. Stable for the\nlifetime of the session and used both as a React key and as\nthe `before_ordinal` cursor for the next-older page request."
+          },
+          "role": {
+            "type": "string",
+            "description": "`\"user\"` or `\"assistant\"` (or `\"system\"`). String rather than\nenum to keep the wire forgiving."
+          },
+          "text": {
+            "type": "string",
+            "description": "Plain text content, newline-joined when multiple text blocks\nwere present. Empty when the message was media-only."
+          }
+        }
+      },
       "CreateCronRequest": {
         "type": "object",
         "description": "`POST /v1/cron` body. Schedule format is the standard 5-field cron\nstring accepted by [`aura_cron`].",
@@ -2287,6 +2739,40 @@
           "failed",
           "completed"
         ]
+      },
+      "ListResponse_SlashCommandEntry": {
+        "type": "object",
+        "description": "Envelope for list endpoints. `next_cursor` is opaque — clients\npass it back as `?cursor=` to fetch the next page, and treat\n`None` as \"no more pages.\" The cursor's internal scheme may change\nacross releases; clients must not parse it.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "Wire DTO for slash command entries. Mirror of\n[`aura_channels::wire::SlashCommandSpec`] so the OpenAPI surface\nstays inside this crate's DTOs (the wire type lives in\n`aura-channels` for sidecar reuse).",
+              "required": [
+                "command",
+                "description"
+              ],
+              "properties": {
+                "command": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
       },
       "LlmInfo": {
         "type": "object",
@@ -2817,6 +3303,22 @@
           }
         }
       },
+      "SlashCommandEntry": {
+        "type": "object",
+        "description": "Wire DTO for slash command entries. Mirror of\n[`aura_channels::wire::SlashCommandSpec`] so the OpenAPI surface\nstays inside this crate's DTOs (the wire type lives in\n`aura-channels` for sidecar reuse).",
+        "required": [
+          "command",
+          "description"
+        ],
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          }
+        }
+      },
       "StatusResponse": {
         "type": "object",
         "description": "Minimal gateway health/status payload.",
@@ -3079,6 +3581,10 @@
     {
       "name": "channels",
       "description": "Registered channel plugins"
+    },
+    {
+      "name": "chat",
+      "description": "Web chat sessions + channel-token mint"
     },
     {
       "name": "llm",

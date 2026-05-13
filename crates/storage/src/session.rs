@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use aura_model::{ChatMessage, LineageKind, Session, SessionId};
+use aura_model::{ChannelType, ChatMessage, LineageKind, Session, SessionId};
 use chrono::{DateTime, Utc};
 
 use crate::error::StorageError;
@@ -37,6 +37,20 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 pub trait SessionStore: Send + Sync {
     async fn get(&self, session_id: &SessionId) -> Result<Option<Session>>;
     async fn save(&self, session: &Session) -> Result<()>;
+    /// Flip the `hidden` flag on the session row. Used by the
+    /// chat-list "delete" UI — the row is **not** removed, just
+    /// hidden from the list. Returns `Ok(true)` when the row existed
+    /// and was updated, `Ok(false)` if no row matched.
+    ///
+    /// Implementations write only the flat `hidden` column and leave
+    /// the JSON `data` blob's `hidden` field untouched: a concurrent
+    /// `save` (which rewrites the full blob from a stale in-memory
+    /// `Session`) would otherwise clobber the update. `get` patches
+    /// `Session.hidden` from the column at read time, so observers
+    /// always see the authoritative value regardless of blob
+    /// staleness.
+    async fn set_hidden(&self, session_id: &SessionId, hidden: bool) -> Result<bool>;
+
     /// Hard-delete the session.
     ///
     /// Returns `Ok(true)` if the row existed and was removed, `Ok(false)`
@@ -62,6 +76,21 @@ pub trait SessionStore: Send + Sync {
     /// = 0`) are filtered out; use [`Self::list_all_maintenance_sessions`]
     /// to enumerate those. Operator-facing: drives `aura session list`.
     async fn list_all(&self) -> Result<Vec<Session>>;
+
+    /// Return live user-facing sessions whose `channel` equals
+    /// `channel`, newest-active first. Used by the chat REST surface
+    /// (`GET /v1/chat/sessions`) so a long-running gateway with
+    /// thousands of telegram / weixin sessions doesn't ship every
+    /// row over the wire only to discard the non-http ones in
+    /// userland.
+    ///
+    /// Default impl is the naive `list_all() → filter` fallback so
+    /// mock / in-memory stores work without overriding; the libsql
+    /// impl pushes the predicate into SQL.
+    async fn list_by_channel(&self, channel: &ChannelType) -> Result<Vec<Session>> {
+        let all = self.list_all().await?;
+        Ok(all.into_iter().filter(|s| &s.channel == channel).collect())
+    }
     /// Return the live forks (sessions with `LineageKind::UserFork`)
     /// whose `parent_session_id` equals the given session.
     async fn list_live_forks(&self, source_session_id: &SessionId) -> Result<Vec<SessionId>>;
@@ -113,14 +142,17 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<Vec<(SessionId, LineageKind)>>;
 
     /// Append one message to the session's transcript log. The store
-    /// assigns the next ordinal; concurrent callers on the same
-    /// session must be serialized by the caller (the actor model
-    /// already does this — one actor per session).
+    /// assigns the next ordinal and returns it so callers can stamp
+    /// it onto live channel frames (see `Frame::Message.ordinal`),
+    /// which is how clients advance their reconnect cursor.
+    /// Concurrent callers on the same session must be serialized by
+    /// the caller (the actor model already does this — one actor per
+    /// session).
     async fn append_session_message(
         &self,
         session_id: &SessionId,
         message: &ChatMessage,
-    ) -> Result<()>;
+    ) -> Result<i64>;
 
     /// Apply a `/compact`-style compression: mark every currently-
     /// active row as superseded by the first newly-inserted row, then
@@ -201,4 +233,35 @@ pub trait SessionStore: Send + Sync {
         session_id: &SessionId,
         up_to_ordinal: i64,
     ) -> Result<Vec<ChatMessage>>;
+
+    /// Reverse-paginated slice of the active transcript: at most
+    /// `limit` rows whose `ordinal` is strictly below `before_ordinal`
+    /// (or the tail of the transcript when `before_ordinal` is `None`),
+    /// returned in **ascending** ordinal order. Each row is paired with
+    /// its absolute ordinal so the caller can request the next-older
+    /// page without a second lookup.
+    ///
+    /// Used by the chat REST surface so a long-running session doesn't
+    /// pay an O(transcript-length) round-trip on every initial load;
+    /// the web client streams older slices in on scroll-up.
+    async fn load_active_session_messages_tail(
+        &self,
+        session_id: &SessionId,
+        before_ordinal: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<(i64, ChatMessage)>>;
+
+    /// Forward catch-up slice: the next at most `limit` active rows
+    /// whose `ordinal` is strictly **greater than** `after_ordinal`,
+    /// returned in ascending order alongside each row's absolute
+    /// ordinal. Powers the WS `Subscribe { since_ordinal }` cursor —
+    /// when a client reconnects after a network dip the gateway uses
+    /// this to replay every persisted Message row the client missed
+    /// while disconnected, without forcing a REST round-trip.
+    async fn load_active_session_messages_since(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, ChatMessage)>>;
 }

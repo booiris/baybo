@@ -285,7 +285,7 @@ impl SubagentRuntime for LocalSubagentRuntime {
                     "subagent-init-{}",
                     Utc::now().timestamp_nanos_opt().unwrap_or(0)
                 ),
-                session_id: child_session.id.to_string(),
+                session_id: child_session.id.clone(),
                 channel: child_channel.clone(),
                 sender: child_user.clone(),
                 content: initial_content,
@@ -293,6 +293,7 @@ impl SubagentRuntime for LocalSubagentRuntime {
                 reply_to: None,
                 metadata: MessageMetadata::default(),
             },
+            platform_msg_id: String::new(),
         };
         if let Err(e) = mailbox
             .send(AgentMessage::SubagentSpawned {
