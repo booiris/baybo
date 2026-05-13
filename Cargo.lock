@@ -734,6 +734,7 @@ dependencies = [
  "aura-model",
  "aura-security",
  "aura-storage",
+ "aura-trace",
  "aura-workspace",
  "axum",
  "base64",

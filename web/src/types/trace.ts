@@ -177,6 +177,22 @@ export type ResourceAccess =
   | { kind: 'http'; host: string }
   | { kind: 'exec_command'; command: string };
 
+export type ToolEventPayload =
+  | { type: 'phase'; duration_ms: number }
+  | {
+      type: 'http_fetch';
+      status: number;
+      bytes: number;
+      content_type: string | null;
+      body_preview: string | null;
+    }
+  | {
+      type: 'llm_call';
+      model: string;
+      input: string;
+      output: string;
+    };
+
 export type SpanEventKind =
   | {
       kind: 'sanitize_hit';
@@ -188,6 +204,11 @@ export type SpanEventKind =
       kind: 'approval';
       decision: ApprovalDecision;
       resource: ResourceAccess;
+    }
+  | {
+      kind: 'tool_event';
+      action: string;
+      payload: ToolEventPayload;
     };
 
 export interface SpanEvent {

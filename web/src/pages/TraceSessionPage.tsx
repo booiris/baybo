@@ -32,6 +32,7 @@ import type {
   SpanKindTag,
   Step,
   StepKindTag,
+  ToolEventPayload,
 } from '../types/trace';
 import { isTerminal } from '../types/trace';
 import { MessageList } from '../components/trace/MessageList';
@@ -612,6 +613,72 @@ function MetaTab({ span }: { span: Span }) {
   );
 }
 
+function ToolEventRow({
+  action,
+  payload,
+}: {
+  action: string;
+  payload: ToolEventPayload;
+}) {
+  if (payload.type === 'phase') {
+    return (
+      <div className="flex items-baseline justify-between font-mono text-[0.85rem] gap-3">
+        <span className="break-all">{action}</span>
+        <span className="font-bold tabular-nums shrink-0">{payload.duration_ms} ms</span>
+      </div>
+    );
+  }
+  if (payload.type === 'http_fetch') {
+    return (
+      <div className="space-y-1 font-mono text-[0.85rem]">
+        <div className="flex items-baseline justify-between gap-3">
+          <span className="break-all">{action}</span>
+          <span className="font-bold tabular-nums shrink-0">
+            {payload.status} · {payload.bytes} B
+          </span>
+        </div>
+        {payload.content_type && (
+          <div className="text-ink-soft break-all">{payload.content_type}</div>
+        )}
+        {payload.body_preview && (
+          <details>
+            <summary className="cursor-pointer text-[0.75rem] uppercase font-bold tracking-wider text-ink-soft">
+              Body preview ({payload.body_preview.length} chars)
+            </summary>
+            <pre className="mt-1 whitespace-pre-wrap break-words text-[0.75rem] text-ink-soft">
+              {payload.body_preview}
+            </pre>
+          </details>
+        )}
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-1 font-mono text-[0.85rem]">
+      <div className="flex items-baseline justify-between gap-3">
+        <span className="break-all">{action}</span>
+        <span className="font-bold shrink-0">{payload.model}</span>
+      </div>
+      <details>
+        <summary className="cursor-pointer text-[0.75rem] uppercase font-bold tracking-wider text-ink-soft">
+          Input ({payload.input.length} chars)
+        </summary>
+        <pre className="mt-1 whitespace-pre-wrap break-words text-[0.75rem] text-ink-soft">
+          {payload.input}
+        </pre>
+      </details>
+      <details>
+        <summary className="cursor-pointer text-[0.75rem] uppercase font-bold tracking-wider text-ink-soft">
+          Output ({payload.output.length} chars)
+        </summary>
+        <pre className="mt-1 whitespace-pre-wrap break-words text-[0.75rem] text-ink-soft">
+          {payload.output}
+        </pre>
+      </details>
+    </div>
+  );
+}
+
 function EventsTab({ events }: { events: SpanEvent[] }) {
   if (events.length === 0) {
     return <div className="text-ink-soft text-[0.85rem]">No events.</div>;
@@ -625,7 +692,15 @@ function EventsTab({ events }: { events: SpanEvent[] }) {
         >
           <div className="flex items-center justify-between mb-2">
             <span className="font-bold uppercase tracking-wider text-[0.75rem]">
-              {e.kind.kind === 'sanitize_hit' ? 'sanitize hit' : 'approval'}
+              {e.kind.kind === 'sanitize_hit'
+                ? 'sanitize hit'
+                : e.kind.kind === 'approval'
+                  ? 'approval'
+                  : e.kind.payload.type === 'phase'
+                    ? 'timer'
+                    : e.kind.payload.type === 'http_fetch'
+                      ? 'http fetch'
+                      : 'llm call'}
             </span>
             <span className="text-ink-soft font-mono text-[0.75rem]">{formatTime(e.at)}</span>
           </div>
@@ -654,7 +729,7 @@ function EventsTab({ events }: { events: SpanEvent[] }) {
                 </details>
               )}
             </div>
-          ) : (
+          ) : e.kind.kind === 'approval' ? (
             <div className="space-y-1 font-mono text-[0.85rem]">
               <div>
                 Decision:{' '}
@@ -679,6 +754,8 @@ function EventsTab({ events }: { events: SpanEvent[] }) {
                     : e.kind.resource.command}
               </div>
             </div>
+          ) : (
+            <ToolEventRow action={e.kind.action} payload={e.kind.payload} />
           )}
         </div>
       ))}
