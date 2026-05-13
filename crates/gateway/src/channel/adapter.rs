@@ -23,7 +23,7 @@ use aura_channels::{
     AgentOutput, Channel, ChannelError, ChannelRegistry, Connection, ConnectionId, ConnectionSink,
     MessageRole, NoticeLevel, SendOutcome, SessionEvent,
 };
-use aura_model::{ChannelType, ContentBlock, SessionId};
+use aura_model::{ChannelType, ContentBlock};
 use aura_storage::BlobStore;
 use aura_tools::ApprovalDecision;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket};
@@ -149,23 +149,22 @@ impl Sidecar {
     /// Resolve a pending approval and broadcast `ApprovalResolved` to
     /// every subscriber of the call's session. Called from the inbound
     /// loop when the client sends `ResolveApproval`. Returns `true` if
-    /// a pending entry matched the call id.
-    pub(crate) fn resolve_approval(
-        &self,
-        call_id: &str,
-        session_id: &SessionId,
-        decision: ApprovalDecision,
-    ) -> bool {
-        let resolved = self.channel.resolve_approval(call_id, decision);
-        if resolved {
-            super::boot::broadcast_approval_resolved(
-                &self.channel,
-                call_id.to_owned(),
-                session_id.clone(),
-                decision,
-            );
-        }
-        resolved
+    /// a pending entry matched the call id. The session id is read off
+    /// the resolved queue entry — the connection-side frame doesn't
+    /// carry one, and dispatching with an empty id on a
+    /// [`ChannelKind::Subscribed`] channel would silently fan out to
+    /// nobody.
+    pub(crate) fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> bool {
+        let Some(session_id) = self.channel.resolve_approval(call_id, decision) else {
+            return false;
+        };
+        super::boot::broadcast_approval_resolved(
+            &self.channel,
+            call_id.to_owned(),
+            session_id,
+            decision,
+        );
+        true
     }
 
     /// Detach the connection from its channel and return the pump
@@ -313,7 +312,10 @@ async fn agent_output_to_frame(
                 attachments,
                 platform_msg_id: String::new(),
                 role: MessageRole::Assistant,
-                ordinal: None,
+                // Carry the persisted assistant ordinal so the client's
+                // reconnect cursor can advance past this row. See
+                // `OutgoingMessage::ordinal` for why it can be `None`.
+                ordinal: response.ordinal,
             })
         }
         AgentOutput::Notice {

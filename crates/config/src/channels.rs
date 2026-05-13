@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Channel adapter configuration.
+///
+/// The `http` channel powers the embedded web dashboard / chat page and
+/// is always installed — it has no operator-facing knobs (the bind
+/// address and port live on [`crate::GatewayConfig`], not here), so
+/// there's nothing to configure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ChannelsConfig {
@@ -12,9 +17,6 @@ pub struct ChannelsConfig {
     /// Optional Discord channel settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discord: Option<DiscordChannelConfig>,
-    /// Optional HTTP channel settings.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub http: Option<HttpChannelConfig>,
     /// Optional Weixin (WeChat iLink bot) channel settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weixin: Option<WeixinChannelConfig>,
@@ -28,7 +30,6 @@ impl Default for ChannelsConfig {
             cli: CliChannelConfig::default(),
             telegram: None,
             discord: None,
-            http: None,
             weixin: None,
             message_buffer_size: 256,
         }
@@ -59,13 +60,6 @@ pub struct DiscordChannelConfig {
     pub enabled: bool,
     /// Name of the environment variable holding the bot token.
     pub bot_token_env: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HttpChannelConfig {
-    pub enabled: bool,
-    pub bind_address: String,
-    pub port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

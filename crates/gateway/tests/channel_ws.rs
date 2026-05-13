@@ -160,12 +160,7 @@ async fn web_token_attaches_subscribes_and_receives_dispatch() {
 
     // Eagerly install the http channel — production wires this from
     // ChannelsConfig at boot via `aura_gateway::channel::boot`.
-    let mut cfg = ChannelsConfig::default();
-    cfg.http = Some(aura_config::HttpChannelConfig {
-        enabled: true,
-        bind_address: "127.0.0.1".into(),
-        port: 0,
-    });
+    let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
@@ -217,6 +212,7 @@ async fn web_token_attaches_subscribes_and_receives_dispatch() {
         content: vec![ContentBlock::Text("hello".into())],
         reply_to: None,
         metadata: MessageMetadata::default(),
+        ordinal: Some(7),
     };
     http_channel.dispatch_agent(AgentOutput::Message(outgoing));
 
@@ -249,12 +245,7 @@ async fn two_subscribers_to_same_session_both_receive_dispatch() {
         aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    let mut cfg = ChannelsConfig::default();
-    cfg.http = Some(aura_config::HttpChannelConfig {
-        enabled: true,
-        bind_address: "127.0.0.1".into(),
-        port: 0,
-    });
+    let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
@@ -340,12 +331,7 @@ async fn unsubscribed_session_does_not_receive_dispatch() {
         aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    let mut cfg = ChannelsConfig::default();
-    cfg.http = Some(aura_config::HttpChannelConfig {
-        enabled: true,
-        bind_address: "127.0.0.1".into(),
-        port: 0,
-    });
+    let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
@@ -434,12 +420,7 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
         aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    let mut cfg = ChannelsConfig::default();
-    cfg.http = Some(aura_config::HttpChannelConfig {
-        enabled: true,
-        bind_address: "127.0.0.1".into(),
-        port: 0,
-    });
+    let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
@@ -527,12 +508,7 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
         aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    let mut cfg = ChannelsConfig::default();
-    cfg.http = Some(aura_config::HttpChannelConfig {
-        enabled: true,
-        bind_address: "127.0.0.1".into(),
-        port: 0,
-    });
+    let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
     let channel_registry = Arc::clone(&tg.deps.channel_registry);
@@ -640,12 +616,7 @@ async fn duplicate_platform_msg_id_drops_retry_on_subscribed_channel() {
         aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    let mut cfg = ChannelsConfig::default();
-    cfg.http = Some(aura_config::HttpChannelConfig {
-        enabled: true,
-        bind_address: "127.0.0.1".into(),
-        port: 0,
-    });
+    let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
     let channel_tokens = tg.channel_tokens.clone();
@@ -752,12 +723,7 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
     let port_file =
         aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    let mut cfg = ChannelsConfig::default();
-    cfg.http = Some(aura_config::HttpChannelConfig {
-        enabled: true,
-        bind_address: "127.0.0.1".into(),
-        port: 0,
-    });
+    let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
     let session_manager = Arc::clone(&tg.deps.session_manager);
@@ -896,12 +862,7 @@ async fn web_ws_upgrade_takes_handle_and_revokes_on_close() {
         aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
 
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    let mut cfg = ChannelsConfig::default();
-    cfg.http = Some(aura_config::HttpChannelConfig {
-        enabled: true,
-        bind_address: "127.0.0.1".into(),
-        port: 0,
-    });
+    let cfg = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
 
     let channel_tokens = tg.channel_tokens.clone();

@@ -500,9 +500,16 @@ export function ChatPage() {
           const oldestOrdinal = data.transcript.length > 0
             ? data.transcript[0].ordinal
             : null;
-          // Highest ordinal we just observed — seed the WS cursor so a
-          // reconnect after a network dip asks the server for anything
-          // newer rather than dropping it on the floor.
+          // Seed the WS cursor so a reconnect after a network dip asks
+          // the server for anything newer rather than dropping it on
+          // the floor. The `-1` sentinel handles a brand-new session
+          // whose transcript is empty: without it the cursor would
+          // stay `undefined`, the next Subscribe would omit
+          // `since_ordinal`, and the server would skip replay
+          // entirely — any messages persisted during the disconnect
+          // would be lost. `recordOrdinal` ignores backwards moves so
+          // the non-empty branch's higher ordinal still wins.
+          wsRef.current?.recordOrdinal(sessionId, -1);
           if (data.transcript.length > 0) {
             const newest = data.transcript[data.transcript.length - 1].ordinal;
             wsRef.current?.recordOrdinal(sessionId, newest);
@@ -1051,18 +1058,23 @@ function routeInboundFrame(
       // reconciles against rows the REST history fetch already laid
       // down with the same shape, and a duplicate replay is a no-op.
       // Reconciles against locally-leftover rows from a WS drop in
-      // the narrow window between local emit and the live frame:
+      // the window between local emit and the live frame:
       // * a `streaming` assistant row (drop mid-Delta-stream) is
       //   swallowed by the replay's finalized Message;
       // * a `pending` user row (drop between handleSend and the
-      //   live UserEcho) is matched by text. The gateway zeros
-      //   `platform_msg_id` on replay (see
-      //   `crates/gateway/src/channel/route.rs`), so text is the
-      //   best discriminator we have client-side — sending the same
-      //   text twice within the drop window would mis-match, but
-      //   the failure mode (one duplicate row) is no worse than the
-      //   pre-fix baseline. Without these two paths the leftover
-      //   row would sit alongside the replay forever.
+      //   live UserEcho) is matched by text;
+      // * a *finalized* `msg-*` row (drop after the live frame was
+      //   already rendered — this is the common case when only the
+      //   assistant `Frame::Message` carries an ordinal and reconnect
+      //   replays the user echo that landed during the previous
+      //   session) is also matched by role+text within the recent
+      //   tail. The gateway zeros `platform_msg_id` on replay (see
+      //   `crates/gateway/src/channel/route.rs`), so text is the best
+      //   discriminator we have client-side — sending the same text
+      //   twice within the drop window would mis-match, but the
+      //   failure mode (one duplicate row) is no worse than the
+      //   pre-fix baseline. Without these paths the leftover row
+      //   would sit alongside the replay forever.
       if (frame.ordinal !== undefined) {
         const replayKey = `hist-${sid}-${frame.ordinal}`;
         setViews((prev) => {
@@ -1086,6 +1098,23 @@ function routeInboundFrame(
               next[matchIdx] = { key: replayKey, role: 'user', text: frame.content };
               return { ...prev, [sid]: { ...view, transcript: next } };
             }
+          }
+          // Finalized live row from a prior connection: scan the
+          // tail for a non-keyed (`msg-*` / no `hist-` prefix), non-
+          // streaming, non-pending row of the same role+text. Window
+          // capped at the last 16 rows so we don't replay-walk a
+          // 10k-message scrollback.
+          const TAIL_WINDOW = 16;
+          const start = Math.max(0, view.transcript.length - TAIL_WINDOW);
+          for (let i = view.transcript.length - 1; i >= start; i--) {
+            const row = view.transcript[i];
+            if (row.streaming || row.pending) continue;
+            if (row.key.startsWith('hist-')) continue;
+            if (row.role !== role) continue;
+            if (row.text !== frame.content) continue;
+            const next = view.transcript.slice();
+            next[i] = { ...row, key: replayKey, text: frame.content };
+            return { ...prev, [sid]: { ...view, transcript: next } };
           }
           return {
             ...prev,

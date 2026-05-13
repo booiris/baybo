@@ -269,18 +269,25 @@ impl ApprovalQueue {
     /// Resolve a pending approval by its `call_id`. Used by REST
     /// clients (e.g. the HTTP gateway) where FIFO ordering on the
     /// wire is not guaranteed and the UI may resolve approvals out
-    /// of submission order. Returns `true` when an entry matched.
-    pub fn resolve_by_call_id(&self, call_id: &str, decision: ApprovalDecision) -> bool {
+    /// of submission order. Returns the resolved entry's
+    /// `session_id` on a hit — callers stamp it onto the follow-up
+    /// `dispatch_approval_resolved` so the fan-out reaches the
+    /// session's other subscribers instead of dispatching with an
+    /// empty id (which on a `ChannelKind::Subscribed` channel would
+    /// silently match no subscribers).
+    pub fn resolve_by_call_id(
+        &self,
+        call_id: &str,
+        decision: ApprovalDecision,
+    ) -> Option<SessionId> {
         let mut q = self.inner.lock();
-        if let Some(pos) = q.iter().position(|e| e.req.call_id == call_id)
-            && let Some(pending) = q.remove(pos)
-        {
-            if let Some(responder) = pending.responder {
-                let _ = responder.send(decision);
-            }
-            return true;
+        let pos = q.iter().position(|e| e.req.call_id == call_id)?;
+        let pending = q.remove(pos)?;
+        let session_id = pending.req.session_id.clone();
+        if let Some(responder) = pending.responder {
+            let _ = responder.send(decision);
         }
-        false
+        Some(session_id)
     }
 
     /// Append a display-only mirror entry (no oneshot). Used by the

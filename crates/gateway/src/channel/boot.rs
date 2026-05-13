@@ -68,32 +68,35 @@ pub fn install_channels(
     if config.weixin.as_ref().is_some_and(|c| c.enabled) {
         install_channel(registry, ChannelType::weixin())?;
     }
-    if config.http.as_ref().is_some_and(|c| c.enabled) {
-        install_channel(registry, ChannelType::http())?;
-        // Activity-pulse observer: every UserEcho / Agent dispatch
-        // through the http channel triggers a throttled
-        // `Frame::SessionActivity` broadcast so sidebar tabs not
-        // subscribed to the session still get the unread signal.
-        // Installed exactly once at boot; subsequent registry
-        // lookups return the same `Arc<Channel>` with the observer
-        // already wired.
-        if let Some(http) = registry.get(&ChannelType::http())
-            && let Some(sub) = http.as_subscribed()
-        {
-            SessionPulse::new().install(sub);
-        }
-    }
+    // HTTP is the embedded web dashboard / chat channel and is always
+    // installed — it has no operator-facing knobs. The SessionPulse
+    // hookup that fires `Frame::SessionActivity` lives inside
+    // [`install_channel`] so the lazy-install fallback in
+    // [`super::adapter::Sidecar::build`] can never miss it either.
+    install_channel(registry, ChannelType::http())?;
     Ok(())
 }
 
-/// Install one channel with its approval gate.
+/// Install one channel with its approval gate. For the `http` channel
+/// the [`SessionPulse`] observer is attached too: every `UserEcho` /
+/// `Agent` dispatch then emits a throttled `Frame::SessionActivity` so
+/// sidebar tabs not subscribed to the affected session still get the
+/// unread signal.
 pub(crate) fn install_channel(
     registry: &Arc<ChannelRegistry>,
     channel_type: ChannelType,
 ) -> ChannelResult<()> {
     let kind = kind_for(&channel_type);
-    let channel = build_channel(channel_type, kind);
-    registry.install(channel)
+    let channel = build_channel(channel_type.clone(), kind);
+    let is_http = channel_type == ChannelType::http();
+    registry.install(channel)?;
+    if is_http
+        && let Some(http) = registry.get(&channel_type)
+        && let Some(sub) = http.as_subscribed()
+    {
+        SessionPulse::new().install(sub);
+    }
+    Ok(())
 }
 
 /// Build a `Channel` with a per-channel approval gate whose waker

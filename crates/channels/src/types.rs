@@ -45,6 +45,14 @@ pub struct OutgoingMessage {
     pub content: Vec<ContentBlock>,
     pub reply_to: Option<String>,
     pub metadata: MessageMetadata,
+    /// Persisted `session_messages.ordinal` of this assistant row.
+    /// `Some` when the agent loop captured it from the storage append
+    /// before dispatching; gateway adapters stamp it onto
+    /// `Frame::Message.ordinal` so reconnecting web/TUI clients
+    /// advance their catch-up cursor past this row. `None` only when
+    /// persistence failed (logged) or the producer doesn't go through
+    /// the persisted-message path (cron stubs, test fixtures).
+    pub ordinal: Option<i64>,
 }
 
 /// Role discriminator on a wire-shape [`crate::wire::Message`].

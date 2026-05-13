@@ -226,8 +226,21 @@ export class ChatWs {
    *  `sessionId` — typically from a REST history fetch or a catch-up
    *  `Frame::Message`. Lifts the per-session cursor so the next
    *  Subscribe after a reconnect tells the server what we've already
-   *  seen. Lower ordinals are ignored (cursor never goes backwards). */
+   *  seen. Lower ordinals are ignored (cursor never goes backwards).
+   *
+   *  The sentinel `-1` is meaningful: callers seed it after the REST
+   *  history fetch settles (even when the transcript is empty) so a
+   *  brand-new session's reconnect carries `since_ordinal: -1`, which
+   *  tells the server to replay every persisted row. Without it the
+   *  next Subscribe would omit `since_ordinal` and miss messages
+   *  that landed during the disconnect.
+   *
+   *  No-op if the caller hasn't subscribed to this session — we
+   *  refuse to silently insert a phantom subscription entry that
+   *  would later cause `subscribe(sessionId)` to skip its `if
+   *  this.subscriptions.has(...)` early-return. */
   recordOrdinal(sessionId: string, ordinal: number): void {
+    if (!this.subscriptions.has(sessionId)) return;
     const current = this.subscriptions.get(sessionId);
     if (current !== undefined && current >= ordinal) return;
     this.subscriptions.set(sessionId, ordinal);

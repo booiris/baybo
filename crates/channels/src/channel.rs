@@ -112,15 +112,14 @@ impl Channel {
             .collect()
     }
 
-    /// Resolve a pending approval by `call_id`. Returns `true` if the
-    /// queue contained a matching entry and it was resolved. Caller
-    /// is expected to follow up with
-    /// [`Channel::dispatch_approval_resolved`] so concurrent
-    /// subscribers see the dismissal.
-    pub fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> bool {
-        let Some(approvals) = self.approvals.as_ref() else {
-            return false;
-        };
+    /// Resolve a pending approval by `call_id`. Returns the matched
+    /// entry's `session_id` so the caller can follow up with
+    /// [`Channel::dispatch_approval_resolved`] targeting the right
+    /// subscriber set — the connection-side `ResolveApproval` frame
+    /// doesn't carry `session_id` itself. `None` when no queue entry
+    /// matched (or the channel has no approval surface).
+    pub fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> Option<SessionId> {
+        let approvals = self.approvals.as_ref()?;
         approvals.queue.resolve_by_call_id(call_id, decision)
     }
 

@@ -447,12 +447,15 @@ impl SessionManager {
     /// Append a single message to the session's transcript log.
     /// Called by `AgentLoop` from the `&mut self` append paths so
     /// every turn's worth of messages reaches storage incrementally
-    /// rather than via a per-turn full-blob rewrite.
+    /// rather than via a per-turn full-blob rewrite. Returns the
+    /// ordinal the store assigned to this row — callers stamp it onto
+    /// the outbound `Frame::Message` so reconnecting clients can
+    /// advance their cursor past live emissions.
     pub async fn append_session_message(
         &self,
         session_id: &SessionId,
         message: &ChatMessage,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         self.store
             .append_session_message(session_id, message)
             .await

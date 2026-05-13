@@ -23,12 +23,7 @@ use tower::ServiceExt;
 #[tokio::test]
 async fn chat_api_round_trip() {
     let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
-    let mut http_config = ChannelsConfig::default();
-    http_config.http = Some(aura_config::HttpChannelConfig {
-        enabled: true,
-        bind_address: "127.0.0.1".into(),
-        port: 0,
-    });
+    let http_config = ChannelsConfig::default();
     boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
 
     let state = build_admin_state(&tg);
@@ -283,12 +278,7 @@ async fn get(router: &axum::Router, uri: &str, expected: StatusCode) -> Value {
 #[test]
 fn http_channel_kind_is_subscribed() {
     let reg = Arc::new(aura_channels::ChannelRegistry::new());
-    let mut cfg = ChannelsConfig::default();
-    cfg.http = Some(aura_config::HttpChannelConfig {
-        enabled: true,
-        bind_address: "127.0.0.1".into(),
-        port: 0,
-    });
+    let cfg = ChannelsConfig::default();
     boot::install_channels(&reg, &cfg).expect("install");
     let ch = reg
         .get(&aura_model::ChannelType::http())
@@ -353,6 +343,7 @@ async fn channel_multi_attach_fans_out_to_all_subscribers() {
         content: vec![aura_model::ContentBlock::Text("hi".into())],
         reply_to: None,
         metadata: MessageMetadata::default(),
+        ordinal: None,
     };
     channel.dispatch_agent(AgentOutput::Message(outgoing));
 

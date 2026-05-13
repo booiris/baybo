@@ -924,6 +924,7 @@ mod tests {
             )],
             reply_to: None,
             metadata: Default::default(),
+            ordinal: None,
         };
 
         gw.sanitize_output(&mut response, &session).await.unwrap();

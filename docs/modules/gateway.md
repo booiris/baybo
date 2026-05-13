@@ -37,10 +37,10 @@ both listeners in the foreground; `install` / `enable` / `disable` /
 intercepts `Commands::Gateway` in `src/main.rs` before the CLI dispatcher
 and routes it to `src/gateway_cmd.rs` — same pattern as `Commands::Tui`.
 
-Configuration lives in `aura_config::GatewayConfig` (a new section on
-`AuraConfig`). The stub `HttpChannelConfig` is kept for one release for
-backwards compatibility but is no longer read; the gateway owns its own
-settings.
+Configuration lives in `aura_config::GatewayConfig` (a top-level
+section on `AuraConfig`). The gateway owns its own bind address /
+port; the `http` channel itself has no operator-facing knobs and is
+unconditionally installed at boot.
 
 ## Design Decisions
 

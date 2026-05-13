@@ -124,14 +124,17 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<Vec<(SessionId, LineageKind)>>;
 
     /// Append one message to the session's transcript log. The store
-    /// assigns the next ordinal; concurrent callers on the same
-    /// session must be serialized by the caller (the actor model
-    /// already does this — one actor per session).
+    /// assigns the next ordinal and returns it so callers can stamp
+    /// it onto live channel frames (see `Frame::Message.ordinal`),
+    /// which is how clients advance their reconnect cursor.
+    /// Concurrent callers on the same session must be serialized by
+    /// the caller (the actor model already does this — one actor per
+    /// session).
     async fn append_session_message(
         &self,
         session_id: &SessionId,
         message: &ChatMessage,
-    ) -> Result<()>;
+    ) -> Result<i64>;
 
     /// Apply a `/compact`-style compression: mark every currently-
     /// active row as superseded by the first newly-inserted row, then

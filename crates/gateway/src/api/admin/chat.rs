@@ -284,13 +284,14 @@ async fn get_session(
     Path(session_id): Path<String>,
     Query(query): Query<GetSessionQuery>,
 ) -> Result<Json<ChatSessionDetail>> {
-    let sid = SessionId::from(session_id.as_str());
-    let session = state
-        .session_manager
-        .get(&sid)
-        .await
-        .map_err(|e| GatewayError::Internal(format!("load session: {e}")))?
-        .ok_or_else(|| GatewayError::NotFound(format!("chat session {session_id}")))?;
+    // `load_web_chat_session` rejects non-`http` channels with the
+    // same `NotFound` shape `session_manager.get(...)` would, so a
+    // caller probing a telegram/weixin id can't tell whether the
+    // session exists at all — the surface stays scoped to browser-
+    // originated chats just like list/token/hide/unhide above. The
+    // bare `session_manager.get(...)` path that used to live here
+    // would happily serve any persisted transcript.
+    let (sid, session) = load_web_chat_session(&state, &session_id).await?;
 
     let limit = query
         .limit
@@ -517,9 +518,9 @@ async fn load_web_chat_session(
 /// `http` channel — every open chat tab, whether in this browser or
 /// another. The patch carries the truth (no refetch round-trip); see
 /// the variant's doc comment for receiver-side merge rules. No-op
-/// when the `http` channel isn't installed (e.g. `channels.http.
-/// enabled = false`); in that case no web clients can be connected
-/// to receive it anyway.
+/// when the `http` channel isn't installed (only possible in test
+/// fixtures that skipped `install_channels`); in that case no web
+/// clients can be connected to receive it anyway.
 pub(crate) fn broadcast_session_patch(
     state: &AdminState,
     session_id: &SessionId,

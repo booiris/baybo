@@ -984,17 +984,17 @@ mod tests {
             &self,
             id: &SessionId,
             message: &aura_model::ChatMessage,
-        ) -> std::result::Result<(), StorageError> {
+        ) -> std::result::Result<i64, StorageError> {
             let mut guard = self.messages.lock();
             let log = guard.entry(id.clone()).or_default();
-            let ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
+            let ordinal: i64 = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
             log.push(aura_storage::StoredMessage {
                 ordinal,
                 superseded_by: None,
                 created_at: chrono::Utc::now(),
                 message: message.clone(),
             });
-            Ok(())
+            Ok(ordinal)
         }
         async fn apply_session_compaction(
             &self,

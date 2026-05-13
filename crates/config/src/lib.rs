@@ -34,8 +34,7 @@ use serde::{Deserialize, Serialize};
 pub use crate::agent::{AgentConfig, ContextConfig};
 pub use crate::browser::{BrowserConfig, BrowserDockerConfig};
 pub use crate::channels::{
-    ChannelsConfig, CliChannelConfig, DiscordChannelConfig, HttpChannelConfig,
-    TelegramChannelConfig,
+    ChannelsConfig, CliChannelConfig, DiscordChannelConfig, TelegramChannelConfig,
 };
 pub use crate::cost::{CostConfig, RateLimitConfig, SpendingLimitsConfig};
 pub use crate::error::{ConfigError, Result, ValidationError};

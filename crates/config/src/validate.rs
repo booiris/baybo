@@ -131,23 +131,6 @@ fn validate_channels(channels: &ChannelsConfig, errors: &mut Vec<ValidationError
             "must be <= 65536",
         ));
     }
-    if let Some(http) = &channels.http {
-        if !http.enabled {
-            errors.push(ValidationError::new(
-                "channels.http",
-                "set enabled=true or omit the http section entirely",
-            ));
-        }
-        if http.bind_address.trim().is_empty() {
-            errors.push(ValidationError::new(
-                "channels.http.bind_address",
-                "must be non-empty",
-            ));
-        }
-        if http.port == 0 {
-            errors.push(ValidationError::new("channels.http.port", "must be > 0"));
-        }
-    }
     if let Some(tg) = &channels.telegram {
         if !tg.enabled {
             errors.push(ValidationError::new(

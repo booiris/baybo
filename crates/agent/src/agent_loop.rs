@@ -649,6 +649,10 @@ impl AgentLoop {
             "I've reached the maximum number of processing steps. Please try again with a simpler request.".to_string(),
         )];
         content.extend(std::mem::take(&mut accumulated_attachments));
+        // Max-iterations fallback. No assistant row was persisted at
+        // the loop end — the early-return path inside `run_iteration`
+        // is the only one that calls `append_context_message`, so
+        // there's no ordinal to stamp here.
         Ok(OutgoingMessage {
             session_id: session.id.clone(),
             user_id: session.user.id.clone(),
@@ -656,6 +660,7 @@ impl AgentLoop {
             content,
             reply_to: None,
             metadata: Default::default(),
+            ordinal: None,
         })
     }
 
@@ -717,13 +722,15 @@ impl AgentLoop {
 
             // Append only the final response blocks to context —
             // intermediate tool_use blocks were already appended in
-            // prior iterations.
+            // prior iterations. Capture the persisted ordinal so the
+            // channel adapter can stamp it onto the live `Frame::Message`
+            // and reconnecting clients advance their cursor past it.
             let assistant_msg = ChatMessage {
                 role: Role::Assistant,
                 content: response_blocks,
                 from_user: false,
             };
-            self.append_context_message(session, &assistant_msg).await?;
+            let ordinal = self.append_context_message(session, &assistant_msg).await?;
 
             // Maybe store memory.
             if let Err(e) = self.memory_manager.maybe_store(session, &final_text).await {
@@ -737,6 +744,7 @@ impl AgentLoop {
                 content: final_blocks,
                 reply_to: None,
                 metadata: Default::default(),
+                ordinal,
             }));
         }
 
@@ -1154,10 +1162,10 @@ impl AgentLoop {
         &mut self,
         session: &Session,
         message: &ChatMessage,
-    ) -> anyhow::Result<()> {
-        self.context_manager.append(message).await;
+    ) -> anyhow::Result<Option<i64>> {
+        let ordinal = self.context_manager.append(message).await;
         self.write_session_message_log(session, message).await;
-        Ok(())
+        Ok(ordinal)
     }
 
     async fn write_session_message_log(&self, session: &Session, message: &ChatMessage) {

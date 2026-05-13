@@ -719,7 +719,7 @@ impl SessionStore for MemorySessionStore {
         &self,
         session_id: &SessionId,
         message: &ChatMessage,
-    ) -> SessionStoreResult<()> {
+    ) -> SessionStoreResult<i64> {
         let mut guard = self.transcripts.lock();
         let log = guard.entry(session_id.clone()).or_default();
         let ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
@@ -729,7 +729,9 @@ impl SessionStore for MemorySessionStore {
             superseded_by: None,
             created_at: Utc::now(),
         });
-        Ok(())
+        i64::try_from(ordinal).map_err(|_| {
+            StorageError::Internal(anyhow::anyhow!("ordinal {ordinal} exceeds i64::MAX"))
+        })
     }
 
     async fn apply_session_compaction(

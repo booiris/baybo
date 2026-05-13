@@ -460,34 +460,49 @@ impl SessionStore for LibsqlSessionStore {
         &self,
         session_id: &SessionId,
         message: &ChatMessage,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let conn = self.pool.conn();
         let role = message.role.as_str();
         let content = serde_json::to_string(&message.content)
             .map_err(|e| StorageError::Storage(format!("serialize message content: {e}")))?;
         let now_us = super::time::to_us(chrono::Utc::now());
-        // `INSERT … SELECT COALESCE(MAX(ordinal),-1)+1` keeps ordinals
-        // contiguous without an explicit sequence. The actor model
+        // `INSERT … SELECT COALESCE(MAX(ordinal),-1)+1 … RETURNING` keeps
+        // ordinals contiguous without an explicit sequence and hands
+        // back the assigned value in one round trip. The actor model
         // serialises writes per session, so there's no concurrent-
         // append race to defend against here.
-        conn.execute(
-            "INSERT INTO session_messages \
+        let mut rows = conn
+            .query(
+                "INSERT INTO session_messages \
              (session_id, ordinal, role, content, created_at, from_user) \
              SELECT ?1, COALESCE(MAX(ordinal), -1) + 1, ?2, ?3, ?4, ?5 \
-             FROM session_messages WHERE session_id = ?1",
-            libsql::params![
-                session_id.as_str().to_string(),
-                role.to_string(),
-                content,
-                now_us,
-                i64::from(message.from_user),
-            ],
-        )
-        .await
-        .map_err(|e| {
-            StorageError::Internal(anyhow::anyhow!("libsql append session_message: {e}"))
-        })?;
-        Ok(())
+             FROM session_messages WHERE session_id = ?1 \
+             RETURNING ordinal",
+                libsql::params![
+                    session_id.as_str().to_string(),
+                    role.to_string(),
+                    content,
+                    now_us,
+                    i64::from(message.from_user),
+                ],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql append session_message: {e}"))
+            })?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+            .ok_or_else(|| {
+                StorageError::Internal(anyhow::anyhow!(
+                    "INSERT … RETURNING returned no rows for session_messages"
+                ))
+            })?;
+        let ordinal: i64 = row
+            .get(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ordinal: {e}")))?;
+        Ok(ordinal)
     }
 
     async fn apply_session_compaction(

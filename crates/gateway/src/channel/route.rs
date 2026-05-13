@@ -308,6 +308,34 @@ async fn run_inbound_loop(
                             tracing::warn!(error = %e, %session_id, "subscribe failed");
                             continue;
                         }
+                        // TUI clients get a one-shot input-history ring
+                        // from the gateway-owned vault when they
+                        // subscribe so they can rehydrate scrollback.
+                        // MUST go first: the TUI client's handshake
+                        // (`WsClient::connect_tui`) strictly expects
+                        // `HistorySnapshot` as the next frame after
+                        // RegisterAck-then-Subscribe and treats anything
+                        // else as a protocol violation. Any failure is
+                        // surfaced as an empty ring — a broken history
+                        // store must not keep the user from chatting.
+                        if channel_type.as_str() == ChannelType::TUI {
+                            let entries = match state.tui_history.load().await {
+                                Ok(entries) => entries,
+                                Err(e) => {
+                                    tracing::warn!(error = %format!("{e:#}"), "load tui input history; sending empty snapshot");
+                                    Vec::new()
+                                }
+                            };
+                            if let Err(e) = sidecar
+                                .send_frame(Frame::HistorySnapshot {
+                                    session_id: session_id.clone(),
+                                    entries,
+                                })
+                                .await
+                            {
+                                tracing::warn!(error = %e, "failed to send HistorySnapshot");
+                            }
+                        }
                         // Ship the authoritative pending-approvals
                         // snapshot for this session so the client can
                         // reconcile any locally-cached ApprovalCard
@@ -330,30 +358,6 @@ async fn run_inbound_loop(
                                 %session_id,
                                 "failed to send PendingApprovalsSnapshot"
                             );
-                        }
-                        // TUI clients get a one-shot history ring from
-                        // the gateway-owned vault when they subscribe
-                        // so they can rehydrate their scrollback. Any
-                        // failure here is surfaced as an empty ring —
-                        // a broken history store must not keep the
-                        // user from chatting.
-                        if channel_type.as_str() == ChannelType::TUI {
-                            let entries = match state.tui_history.load().await {
-                                Ok(entries) => entries,
-                                Err(e) => {
-                                    tracing::warn!(error = %format!("{e:#}"), "load tui input history; sending empty snapshot");
-                                    Vec::new()
-                                }
-                            };
-                            if let Err(e) = sidecar
-                                .send_frame(Frame::HistorySnapshot {
-                                    session_id: session_id.clone(),
-                                    entries,
-                                })
-                                .await
-                            {
-                                tracing::warn!(error = %e, "failed to send HistorySnapshot");
-                            }
                         }
                         // Catch-up: if the client carried a cursor,
                         // replay the persisted Messages it missed
@@ -431,18 +435,15 @@ async fn run_inbound_loop(
                         }
                     }
                     Frame::ResolveApproval { call_id, decision } => {
-                        // The connection-side message doesn't carry
-                        // the session_id; we look it up best-effort
-                        // through the broadcast path (the
-                        // ApprovalResolved fan-out below targets every
-                        // connection subscribed to the call's session,
-                        // which the gate already knows). Empty
-                        // session_id is acceptable: dispatch uses it
-                        // only for the selective-channel reverse
-                        // index, and broadcast channels iterate
-                        // connections directly.
-                        let resolved =
-                            sidecar.resolve_approval(&call_id, &SessionId::from(""), decision);
+                        // The connection-side frame doesn't carry the
+                        // `session_id`; the queue entry does, and
+                        // `Sidecar::resolve_approval` reads it off the
+                        // removed entry so the follow-up broadcast
+                        // targets the right subscribers (a Subscribed
+                        // channel's `dispatch_event` keys on
+                        // `session_id`; an empty placeholder would
+                        // dispatch to nobody).
+                        let resolved = sidecar.resolve_approval(&call_id, decision);
                         if !resolved {
                             tracing::debug!(
                                 call_id = %call_id,
