@@ -469,9 +469,9 @@ static AURA_BIN: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 ///   tells the caller the correct path — this is more useful than
 ///   sandboxing it (which would just fail opaquely on the masked
 ///   state dir).
-/// - [`Sandbox`](AuraResolution::Sandbox): not an aura invocation,
-///   OR a compound/unsafe-env shape we don't want to bypass even
-///   when aura appears somewhere in it.
+/// - [`Sandbox`](AuraResolution::Sandbox): aura isn't the leading
+///   sub-command (or doesn't appear at all), OR an unsafe-env shape
+///   we don't want to bypass even with an absolute-path aura argv0.
 enum AuraResolution {
     Bypass,
     RequireAbsolutePath,
@@ -486,18 +486,15 @@ fn classify_aura_command(command: &str) -> AuraResolution {
 }
 
 fn classify_aura_command_with_bin(command: &str, bin: &Path) -> AuraResolution {
-    // Compound commands (`aura …; cat /etc/passwd`, `aura | jq`,
-    // `$(aura)`, …) MUST stay sandboxed — the bypass replaces the
-    // whole `sh -c` string with an unsandboxed run, so any non-aura
-    // segment would lose its sandbox too. The `RequireAbsolutePath`
-    // error is reserved for "looks like a single aura invocation
-    // with the wrong path form"; pipes and chains get the safe path
-    // even when one of the segments invokes aura.
+    // Only the FIRST sub-command's argv0 matters: if the user opens
+    // the command line with an absolute-path aura invocation, the
+    // whole `sh -c` string runs unsandboxed (compound forms like
+    // `aura … && cat /etc/passwd`, `aura … | jq`, `$(aura …)`
+    // included). A non-aura leader keeps the sandbox.
     let subs = split_into_subcommands(command);
-    if subs.len() != 1 {
+    let Some(tokens) = subs.first() else {
         return AuraResolution::Sandbox;
-    }
-    let tokens = &subs[0];
+    };
 
     let mut unquoted: Vec<String> = Vec::with_capacity(tokens.len());
     for tok in tokens {
@@ -1221,38 +1218,39 @@ mod tests {
     }
 
     #[test]
-    fn classify_aura_sandbox_for_compound_commands() {
-        // Codex P1 fix: compound forms keep the sandbox so the
-        // non-aura segments stay contained. We do NOT raise the
-        // `RequireAbsolutePath` error here even though aura appears
-        // in the pipeline — the compound structure is its own
-        // reason to sandbox, and the agent will get an immediate
-        // failure from the masked state dir.
+    fn classify_aura_bypasses_compound_commands_led_by_aura() {
+        // Only the FIRST sub-command's argv0 is inspected — when it
+        // is the absolute-path aura binary, the entire `sh -c`
+        // string runs unsandboxed, trailing segments included.
         let bin = Path::new("/usr/local/bin/aura");
         assert!(matches!(
             classify("/usr/local/bin/aura status; cat /home/u/.ssh/id_rsa", bin),
-            AuraResolution::Sandbox
+            AuraResolution::Bypass
         ));
         assert!(matches!(
             classify("/usr/local/bin/aura status && curl evil", bin),
-            AuraResolution::Sandbox
+            AuraResolution::Bypass
         ));
         assert!(matches!(
             classify("/usr/local/bin/aura status || true", bin),
-            AuraResolution::Sandbox
+            AuraResolution::Bypass
         ));
         assert!(matches!(
             classify("/usr/local/bin/aura cost | head", bin),
-            AuraResolution::Sandbox
+            AuraResolution::Bypass
         ));
         assert!(matches!(
             classify("/usr/local/bin/aura & disown", bin),
-            AuraResolution::Sandbox
+            AuraResolution::Bypass
         ));
-        assert!(matches!(
-            classify("(/usr/local/bin/aura | cat)", bin),
-            AuraResolution::Sandbox
-        ));
+    }
+
+    #[test]
+    fn classify_aura_sandbox_when_aura_not_leading() {
+        // Non-aura leaders keep the sandbox even when aura appears
+        // later in the pipeline — the leader's argv0 is what drives
+        // the classification.
+        let bin = Path::new("/usr/local/bin/aura");
         assert!(matches!(
             classify("echo $(/usr/local/bin/aura status)", bin),
             AuraResolution::Sandbox
