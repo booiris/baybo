@@ -1,7 +1,5 @@
 use thiserror::Error;
 
-use crate::kind::ChannelKind;
-
 #[derive(Debug, Error)]
 pub enum ChannelError {
     #[error("channel send error: {0}")]
@@ -23,11 +21,4 @@ pub enum ChannelError {
 
     #[error("connection {0} not found on channel")]
     ConnectionNotFound(String),
-
-    #[error("channel {channel_type} has kind {actual:?}, operation requires kind {expected:?}")]
-    WrongKind {
-        channel_type: String,
-        expected: ChannelKind,
-        actual: ChannelKind,
-    },
 }

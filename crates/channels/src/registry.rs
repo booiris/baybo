@@ -138,7 +138,10 @@ mod tests {
         let conn = Arc::new(Connection::new(Arc::new(DiscardSink)));
         let id = conn.id();
         ch.attach(Arc::clone(&conn));
-        ch.subscribe(id, "sess-a".into()).unwrap();
+        ch.as_subscribed()
+            .unwrap()
+            .subscribe(id, "sess-a".into())
+            .unwrap();
         assert!(ch.has_subscribers(&SessionId::from("sess-a")));
         assert!(!ch.has_subscribers(&SessionId::from("sess-b")));
     }
@@ -149,19 +152,26 @@ mod tests {
         let conn = Arc::new(Connection::new(Arc::new(DiscardSink)));
         let id = conn.id();
         ch.attach(Arc::clone(&conn));
-        ch.subscribe(id, "sess-a".into()).unwrap();
+        ch.as_subscribed()
+            .unwrap()
+            .subscribe(id, "sess-a".into())
+            .unwrap();
         ch.detach(id);
         assert!(!ch.has_subscribers(&SessionId::from("sess-a")));
         assert_eq!(ch.connection_count(), 0);
     }
 
     #[test]
-    fn subscribe_on_broadcast_errors() {
+    fn subscribe_unreachable_on_broadcast_channel() {
+        // Subscribe is now an operation on `SubscribedView`, which is
+        // unobtainable from a Multiplexed channel. The runtime
+        // `WrongKind` error variant the previous version returned is
+        // structurally unreachable. We lock in the new invariant by
+        // asserting `as_subscribed()` returns `None`.
         let ch = channel(ChannelType::telegram(), ChannelKind::Multiplexed);
-        let conn = Arc::new(Connection::new(Arc::new(DiscardSink)));
-        let id = conn.id();
-        ch.attach(conn);
-        let err = ch.subscribe(id, "sess-a".into()).unwrap_err();
-        assert!(matches!(err, ChannelError::WrongKind { .. }));
+        assert!(
+            ch.as_subscribed().is_none(),
+            "Multiplexed channels expose no Subscribed view, so subscribe is uncallable",
+        );
     }
 }

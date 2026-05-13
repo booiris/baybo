@@ -342,8 +342,9 @@ async fn channel_multi_attach_fans_out_to_all_subscribers() {
 
     channel.attach(Arc::clone(&conn_a));
     channel.attach(Arc::clone(&conn_b));
-    channel.subscribe(id_a, "sess-shared".into()).unwrap();
-    channel.subscribe(id_b, "sess-shared".into()).unwrap();
+    let view = channel.as_subscribed().expect("http channel is Subscribed");
+    view.subscribe(id_a, "sess-shared".into()).unwrap();
+    view.subscribe(id_b, "sess-shared".into()).unwrap();
 
     let outgoing = OutgoingMessage {
         session_id: "sess-shared".into(),

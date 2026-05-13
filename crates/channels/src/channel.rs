@@ -112,10 +112,10 @@ impl Channel {
     }
 
     /// Resolve a pending approval by `call_id`. Returns `true` if the
-    /// queue contained a matching entry and it was resolved. Caller is
-    /// expected to follow up with [`Channel::dispatch`] of
-    /// `SessionEvent::ApprovalResolved` so concurrent subscribers see
-    /// the dismissal.
+    /// queue contained a matching entry and it was resolved. Caller
+    /// is expected to follow up with
+    /// [`Channel::dispatch_approval_resolved`] so concurrent
+    /// subscribers see the dismissal.
     pub fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> bool {
         let Some(approvals) = self.approvals.as_ref() else {
             return false;
@@ -146,39 +146,6 @@ impl Channel {
             // Drop now-empty subscription buckets so the map shrinks.
             self.subscriptions.retain(|_, set| !set.is_empty());
         }
-    }
-
-    /// Subscribe a connection to one session. `Subscribed`-kind only.
-    /// Returns `ChannelError::WrongKind` if the channel is `Multiplexed`,
-    /// and `ChannelError::ConnectionNotFound` if the id never attached.
-    pub fn subscribe(&self, id: ConnectionId, session_id: SessionId) -> Result<()> {
-        if self.kind.is_multiplexed() {
-            return Err(ChannelError::WrongKind {
-                channel_type: self.channel_type.to_string(),
-                expected: ChannelKind::Subscribed,
-                actual: ChannelKind::Multiplexed,
-            });
-        }
-        let conn = self
-            .connections
-            .get(&id)
-            .ok_or_else(|| ChannelError::ConnectionNotFound(id.to_string()))?;
-        conn.subscribed().insert(session_id.clone());
-        self.subscriptions.entry(session_id).or_default().insert(id);
-        Ok(())
-    }
-
-    /// Unsubscribe a connection from one session. No-op if it wasn't
-    /// subscribed; never errors.
-    pub fn unsubscribe(&self, id: ConnectionId, session_id: &SessionId) {
-        if let Some(conn) = self.connections.get(&id) {
-            conn.subscribed().remove(session_id);
-        }
-        if let Some(entry) = self.subscriptions.get(session_id) {
-            entry.remove(&id);
-        }
-        // Don't bother shrinking — empty buckets cost ~24 bytes; they
-        // get cleaned up on the next detach pass.
     }
 
     /// Fan an [`AgentOutput`] (delta / message / notice) out to every
@@ -393,6 +360,41 @@ impl Channel {
 pub struct SubscribedView<'a>(&'a Channel);
 
 impl<'a> SubscribedView<'a> {
+    /// Subscribe a connection to one session. The only failure mode
+    /// is [`ChannelError::ConnectionNotFound`] (the id never
+    /// `attach`-ed or was already `detach`-ed) — the previous
+    /// `WrongKind` variant is structurally unreachable once you hold
+    /// a `SubscribedView`.
+    pub fn subscribe(&self, id: ConnectionId, session_id: SessionId) -> Result<()> {
+        let channel = self.0;
+        let conn = channel
+            .connections
+            .get(&id)
+            .ok_or_else(|| ChannelError::ConnectionNotFound(id.to_string()))?;
+        conn.subscribed().insert(session_id.clone());
+        channel
+            .subscriptions
+            .entry(session_id)
+            .or_default()
+            .insert(id);
+        Ok(())
+    }
+
+    /// Unsubscribe a connection from one session. No-op if it wasn't
+    /// subscribed; never errors. Empty subscription buckets are
+    /// cleaned up on the next [`Channel::detach`] pass — leaving
+    /// them in place here costs ~24 bytes per bucket but avoids
+    /// pinging the shard on every unsubscribe.
+    pub fn unsubscribe(&self, id: ConnectionId, session_id: &SessionId) {
+        let channel = self.0;
+        if let Some(conn) = channel.connections.get(&id) {
+            conn.subscribed().remove(session_id);
+        }
+        if let Some(entry) = channel.subscriptions.get(session_id) {
+            entry.remove(&id);
+        }
+    }
+
     /// Echo an inbound user message back out to every connection
     /// subscribed to the message's `session_id`. The receiving tab(s)
     /// render the user's own input through the same code path as
@@ -555,11 +557,9 @@ mod tests {
         let conn = Arc::new(Connection::new(sink.clone()));
         let conn_id = conn.id();
         channel.attach(Arc::clone(&conn));
-        channel
-            .subscribe(conn_id, SessionId::from("session-x"))
-            .expect("subscribe");
-
         let view = channel.as_subscribed().expect("Subscribed view available");
+        view.subscribe(conn_id, SessionId::from("session-x"))
+            .expect("subscribe");
         view.echo_inbound(fake_inbound("session-x", ChannelType::http()));
 
         assert_eq!(

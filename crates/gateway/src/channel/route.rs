@@ -296,15 +296,15 @@ async fn run_inbound_loop(
                         session_id,
                         since_ordinal,
                     } => {
-                        if kind == ChannelKind::Multiplexed {
+                        let Some(sub) = sidecar.channel.as_subscribed() else {
                             tracing::warn!(
                                 %channel_type,
                                 "Subscribe frame on Multiplexed channel; ignoring (kind auto-wildcards)",
                             );
                             continue;
-                        }
+                        };
                         let conn_id = sidecar.connection_id();
-                        if let Err(e) = sidecar.channel.subscribe(conn_id, session_id.clone()) {
+                        if let Err(e) = sub.subscribe(conn_id, session_id.clone()) {
                             tracing::warn!(error = %e, %session_id, "subscribe failed");
                             continue;
                         }
@@ -365,12 +365,10 @@ async fn run_inbound_loop(
                         }
                     }
                     Frame::Unsubscribe { session_id } => {
-                        if kind == ChannelKind::Multiplexed {
+                        let Some(sub) = sidecar.channel.as_subscribed() else {
                             continue;
-                        }
-                        sidecar
-                            .channel
-                            .unsubscribe(sidecar.connection_id(), &session_id);
+                        };
+                        sub.unsubscribe(sidecar.connection_id(), &session_id);
                     }
                     Frame::Message(wire_msg) => {
                         let session_id = match resolve_inbound_session(
