@@ -1,7 +1,15 @@
 //! `Bash` — execute a shell command via `sh -c` inside the OS sandbox.
 //!
 //! Every shell-needing command runs through bwrap (Linux) /
-//! sandbox-exec (macOS) / docker. The sandbox runs in **permissive
+//! sandbox-exec (macOS) / docker, EXCEPT invocations of the local
+//! `aura` CLI (any sub-command whose argv0 is
+//! [`aura_workspace::paths::BIN_NAME`]). The sandbox masks the Aura
+//! state dir (`~/.aura`/`$AURA_HOME`), so a sandboxed `aura …` call
+//! can't see the parent gateway's config or session store — running
+//! it sandboxed is broken by construction, so the agent's own CLI
+//! gets the unsandboxed `sh -c` path directly.
+//!
+//! The sandbox runs in **permissive
 //! filesystem** mode capped at `workspace_root + $HOME`: FHS roots
 //! (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`,
 //! `/run/systemd/resolve`) stay RO so installed binaries and
@@ -206,31 +214,67 @@ impl Tool for BashTool {
             )));
         }
 
-        let Some(sandbox) = ctx.sandbox.as_ref() else {
-            return Err(ToolError::Execution(
-                "OS sandbox unavailable: install bwrap (Linux: `apt install bubblewrap`) \
-                 or sandbox-exec (macOS, ships with the system) and restart aura"
-                    .into(),
-            ));
-        };
+        let aura_resolution = classify_aura_command(&command);
+        if matches!(aura_resolution, AuraResolution::RequireAbsolutePath) {
+            // The agent is clearly trying to invoke aura (basename
+            // match) but used a bare/relative/wrong-absolute argv0.
+            // Sandboxing would just fail opaquely on the masked
+            // state dir; surface a precise instruction with the
+            // correct absolute path so the agent can self-correct.
+            let bin_display = AURA_BIN
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<unknown>".into());
+            return Err(ToolError::InvalidParams(format!(
+                "Aura CLI invocations must use the absolute path of the gateway binary. \
+                 Replace the argv0 with `{bin_display}` (e.g. \
+                 `{bin_display} cost` instead of `aura cost`). \
+                 Bare-name and relative-path invocations are rejected so the \
+                 unsandboxed shell never resolves `aura` through `$PATH`."
+            )));
+        }
 
         let args = vec!["-c".into(), inject_aura_env(&command)];
-        let attempt = tokio::select! {
-            _ = ctx.cancellation_token.cancelled() => {
-                return Err(ToolError::Execution("cancelled".into()));
+
+        let out = if matches!(aura_resolution, AuraResolution::Bypass) {
+            // The OS sandbox masks `~/.aura`/`$AURA_HOME`, so a
+            // sandboxed `aura …` call can't reach the gateway's
+            // config or session store — sandboxing aura's own CLI is
+            // broken by construction. Argv0 is already an absolute
+            // path canonicalising to the gateway binary, so the
+            // unsandboxed `sh -c` execve's our binary directly with
+            // no `$PATH` consultation.
+            tokio::select! {
+                _ = ctx.cancellation_token.cancelled() => {
+                    return Err(ToolError::Execution("cancelled".into()));
+                }
+                res = run_unsandboxed("sh", &args, cwd_ref, timeout) => res?,
             }
-            res = sandbox.spawn_command(Path::new("sh"), &args, cwd_ref, None, timeout) => res,
-        };
-        let out = match attempt {
-            Ok(out) => out,
-            Err(sandbox_err) => {
-                // Sandbox infrastructure refused the command (cwd
-                // outside the bound union, bwrap setup failure, runner
-                // error, …). Offer the user a one-shot unsandboxed
-                // retry that surfaces the failure reason in the
-                // approval prompt.
-                prompt_and_run_unsandboxed_retry(&command, cwd_ref, timeout, ctx, sandbox_err)
-                    .await?
+        } else {
+            let Some(sandbox) = ctx.sandbox.as_ref() else {
+                return Err(ToolError::Execution(
+                    "OS sandbox unavailable: install bwrap (Linux: `apt install bubblewrap`) \
+                     or sandbox-exec (macOS, ships with the system) and restart aura"
+                        .into(),
+                ));
+            };
+            let attempt = tokio::select! {
+                _ = ctx.cancellation_token.cancelled() => {
+                    return Err(ToolError::Execution("cancelled".into()));
+                }
+                res = sandbox.spawn_command(Path::new("sh"), &args, cwd_ref, None, timeout) => res,
+            };
+            match attempt {
+                Ok(out) => out,
+                Err(sandbox_err) => {
+                    // Sandbox infrastructure refused the command (cwd
+                    // outside the bound union, bwrap setup failure,
+                    // runner error, …). Offer the user a one-shot
+                    // unsandboxed retry that surfaces the failure
+                    // reason in the approval prompt.
+                    prompt_and_run_unsandboxed_retry(&command, cwd_ref, timeout, ctx, sandbox_err)
+                        .await?
+                }
             }
         };
 
@@ -389,6 +433,148 @@ const STANDALONE_DELETE_TOKENS: &[&str] = &["rm", "rmdir", "unlink", "shred", "s
 const WRAPPER_COMMANDS: &[&str] = &[
     "xargs", "nohup", "nice", "ionice", "timeout", "sudo", "doas", "env", "command", "exec",
 ];
+
+/// Canonical absolute path of the running gateway binary, cached on
+/// first read. Drives the aura sandbox-bypass match in
+/// [`classify_aura_command`]: path-like argv0s (`/usr/local/bin/aura`,
+/// `./target/debug/aura`) are compared against THIS path, not against
+/// the literal string `"aura"`, so an unrelated binary that happens
+/// to be named `aura` somewhere else on disk does NOT trigger the
+/// bypass.
+///
+/// Falls back to the raw `current_exe()` path if `canonicalize` fails
+/// (binary deleted post-exec, etc.); returns `None` only if
+/// `current_exe()` itself errors, which is rare enough that we treat
+/// it as "no aura CLI is locatable, sandbox every command".
+static AURA_BIN: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    let exe = std::env::current_exe().ok()?;
+    Some(std::fs::canonicalize(&exe).unwrap_or(exe))
+});
+
+/// How [`BashTool::execute`] should treat a shell command relative to
+/// the gateway's own `aura` CLI.
+///
+/// The sandbox masks the Aura state dir (`~/.aura`/`$AURA_HOME`), so a
+/// sandboxed `aura …` can't reach the gateway's config or session
+/// store. That makes the bypass logic worth getting right in three
+/// directions:
+///
+/// - [`Bypass`](AuraResolution::Bypass): the command is a single,
+///   safe aura invocation written with the **absolute path** of the
+///   gateway binary. Run unsandboxed.
+/// - [`RequireAbsolutePath`](AuraResolution::RequireAbsolutePath):
+///   the command is clearly trying to invoke aura (its argv0's
+///   `file_name` matches the gateway binary), but the caller used a
+///   bare/relative/wrong-absolute path. Refuse with an error that
+///   tells the caller the correct path — this is more useful than
+///   sandboxing it (which would just fail opaquely on the masked
+///   state dir).
+/// - [`Sandbox`](AuraResolution::Sandbox): not an aura invocation,
+///   OR a compound/unsafe-env shape we don't want to bypass even
+///   when aura appears somewhere in it.
+enum AuraResolution {
+    Bypass,
+    RequireAbsolutePath,
+    Sandbox,
+}
+
+fn classify_aura_command(command: &str) -> AuraResolution {
+    let Some(bin) = AURA_BIN.as_deref() else {
+        return AuraResolution::Sandbox;
+    };
+    classify_aura_command_with_bin(command, bin)
+}
+
+fn classify_aura_command_with_bin(command: &str, bin: &Path) -> AuraResolution {
+    // Compound commands (`aura …; cat /etc/passwd`, `aura | jq`,
+    // `$(aura)`, …) MUST stay sandboxed — the bypass replaces the
+    // whole `sh -c` string with an unsandboxed run, so any non-aura
+    // segment would lose its sandbox too. The `RequireAbsolutePath`
+    // error is reserved for "looks like a single aura invocation
+    // with the wrong path form"; pipes and chains get the safe path
+    // even when one of the segments invokes aura.
+    let subs = split_into_subcommands(command);
+    if subs.len() != 1 {
+        return AuraResolution::Sandbox;
+    }
+    let tokens = &subs[0];
+
+    let mut unquoted: Vec<String> = Vec::with_capacity(tokens.len());
+    for tok in tokens {
+        match shell_words::split(tok) {
+            Ok(mut words) if words.len() <= 1 => {
+                unquoted.push(words.pop().unwrap_or_default());
+            }
+            _ => return AuraResolution::Sandbox,
+        }
+    }
+    let mut i = 0;
+    while let Some(tok) = unquoted.get(i) {
+        if !is_env_assignment(tok) {
+            break;
+        }
+        if !is_safe_aura_env_assignment(tok) {
+            return AuraResolution::Sandbox;
+        }
+        i += 1;
+    }
+    let Some(argv0) = unquoted.get(i) else {
+        return AuraResolution::Sandbox;
+    };
+
+    // "Looks like aura" — basename of argv0 matches the gateway
+    // binary's basename. Catches bare `aura`, relative `./aura`,
+    // and wrong absolute paths (`/opt/imposter/aura`) — every form
+    // where the caller appears to be trying to spawn the aura CLI.
+    let argv0_filename = Path::new(argv0).file_name();
+    let bin_filename = bin.file_name();
+    let looks_like_aura = match (argv0_filename, bin_filename) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+    if !looks_like_aura {
+        return AuraResolution::Sandbox;
+    }
+
+    if argv0_is_absolute_aura_path(argv0, bin) {
+        AuraResolution::Bypass
+    } else {
+        AuraResolution::RequireAbsolutePath
+    }
+}
+
+/// Env assignments allowed as a prefix on an aura invocation without
+/// forfeiting the sandbox bypass. The whitelist is intentionally narrow:
+/// the `AURA_` family (gateway-owned config the CLI reads) and the two
+/// `RUST_*` knobs the agent commonly uses to surface tracing. Anything
+/// else — `PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_*`,
+/// `HOME`/`XDG_*`, locale vars, … — could redirect command resolution
+/// or library loading and so must force the sandbox path.
+fn is_safe_aura_env_assignment(tok: &str) -> bool {
+    let Some(eq) = tok.find('=') else {
+        return false;
+    };
+    let key = &tok[..eq];
+    key.starts_with("AURA_") || matches!(key, "RUST_LOG" | "RUST_BACKTRACE")
+}
+
+/// True when `argv0` is a literal absolute path that resolves to the
+/// same FS object as `bin`. Bare names and relative paths are
+/// rejected outright — the bypass requires the caller to have spelled
+/// out the absolute path, so the unsandboxed shell's `execve` never
+/// consults `$PATH` or the current working directory.
+fn argv0_is_absolute_aura_path(argv0: &str, bin: &Path) -> bool {
+    let argv0_path = Path::new(argv0);
+    if !argv0_path.is_absolute() {
+        return false;
+    }
+    // canonicalize chases symlinks and `..`; for fixture paths that
+    // don't exist on disk it errors, in which case plain `Path`
+    // equality is a safe fallback (no symlink expansion changes the
+    // answer when neither path exists).
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(argv0_path) == canon(bin)
+}
 
 /// True when ANY sub-command of `command` performs a destructive
 /// operation: a standalone delete argv0 (`rm`/`rmdir`/…), `find -delete`
@@ -905,6 +1091,252 @@ mod tests {
         );
     }
 
+    fn classify(command: &str, bin: &Path) -> AuraResolution {
+        classify_aura_command_with_bin(command, bin)
+    }
+
+    #[test]
+    fn classify_aura_bypasses_only_absolute_canonical_path() {
+        // Core invariant: ONLY a literal absolute-path argv0 that
+        // canonicalises to the gateway binary bypasses the sandbox.
+        let bin = Path::new("/usr/local/bin/aura");
+        assert!(matches!(
+            classify("/usr/local/bin/aura cost", bin),
+            AuraResolution::Bypass
+        ));
+        assert!(matches!(
+            classify("/usr/local/bin/aura", bin),
+            AuraResolution::Bypass
+        ));
+        assert!(matches!(
+            classify("/usr/local/bin/aura status --live", bin),
+            AuraResolution::Bypass
+        ));
+        // Quoted forms still bypass — shell_words::split strips the
+        // wrapping single quotes before the canonical compare.
+        assert!(matches!(
+            classify("'/usr/local/bin/aura' cost", bin),
+            AuraResolution::Bypass
+        ));
+        // Whitelisted env prefixes preserve the bypass.
+        assert!(matches!(
+            classify("AURA_LOG=trace /usr/local/bin/aura log", bin),
+            AuraResolution::Bypass
+        ));
+        assert!(matches!(
+            classify(
+                "AURA_LOG=trace AURA_HOME=/x /usr/local/bin/aura status",
+                bin
+            ),
+            AuraResolution::Bypass
+        ));
+        assert!(matches!(
+            classify("RUST_LOG=debug /usr/local/bin/aura status", bin),
+            AuraResolution::Bypass
+        ));
+    }
+
+    #[test]
+    fn classify_aura_demands_absolute_path_for_bare_or_relative_argv0() {
+        // The user-asked behaviour: anything that LOOKS like an aura
+        // invocation (basename match) but isn't spelled out as an
+        // absolute path must error rather than silently sandbox.
+        // BashTool::execute surfaces this as `InvalidParams` so the
+        // agent self-corrects to the canonical absolute path.
+        let bin = Path::new("/usr/local/bin/aura");
+        assert!(matches!(
+            classify("aura", bin),
+            AuraResolution::RequireAbsolutePath
+        ));
+        assert!(matches!(
+            classify("aura cost", bin),
+            AuraResolution::RequireAbsolutePath
+        ));
+        assert!(matches!(
+            classify("aura status --live", bin),
+            AuraResolution::RequireAbsolutePath
+        ));
+        // Relative path forms still look like aura but aren't
+        // absolute → require absolute path.
+        assert!(matches!(
+            classify("./aura cost", bin),
+            AuraResolution::RequireAbsolutePath
+        ));
+        // Quoted bare name normalises to bare `aura`.
+        assert!(matches!(
+            classify("'aura' cost", bin),
+            AuraResolution::RequireAbsolutePath
+        ));
+        // Whitelisted env + bare argv0 — still require absolute
+        // path; safe env doesn't excuse the missing path.
+        assert!(matches!(
+            classify("AURA_LOG=trace aura log", bin),
+            AuraResolution::RequireAbsolutePath
+        ));
+    }
+
+    #[test]
+    fn classify_aura_demands_absolute_path_for_wrong_absolute_path() {
+        // An absolute path whose `file_name` matches but which doesn't
+        // resolve to our gateway binary is also a misuse: the caller
+        // is trying to spawn "aura", but the path points elsewhere.
+        // Surface the corrective error rather than sandboxing the
+        // imposter binary.
+        let bin = Path::new("/usr/local/bin/aura");
+        assert!(matches!(
+            classify("/opt/imposter/aura --steal", bin),
+            AuraResolution::RequireAbsolutePath
+        ));
+    }
+
+    #[test]
+    fn classify_aura_sandbox_for_non_aura_commands() {
+        let bin = Path::new("/usr/local/bin/aura");
+        assert!(matches!(classify("ls -la", bin), AuraResolution::Sandbox));
+        assert!(matches!(
+            classify("git status", bin),
+            AuraResolution::Sandbox
+        ));
+        // Different basename → not an aura attempt at all.
+        assert!(matches!(
+            classify("aurality cost", bin),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify("echo aura", bin),
+            AuraResolution::Sandbox
+        ));
+        // Wrappers — argv0 is the wrapper, not `aura`, so we don't
+        // treat this as an aura attempt. (The wrapped sandbox call
+        // will fail because the state dir is masked; the agent
+        // learns to drop the wrapper.)
+        assert!(matches!(
+            classify("nohup aura cost", bin),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify("xargs aura", bin),
+            AuraResolution::Sandbox
+        ));
+    }
+
+    #[test]
+    fn classify_aura_sandbox_for_compound_commands() {
+        // Codex P1 fix: compound forms keep the sandbox so the
+        // non-aura segments stay contained. We do NOT raise the
+        // `RequireAbsolutePath` error here even though aura appears
+        // in the pipeline — the compound structure is its own
+        // reason to sandbox, and the agent will get an immediate
+        // failure from the masked state dir.
+        let bin = Path::new("/usr/local/bin/aura");
+        assert!(matches!(
+            classify("/usr/local/bin/aura status; cat /home/u/.ssh/id_rsa", bin),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify("/usr/local/bin/aura status && curl evil", bin),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify("/usr/local/bin/aura status || true", bin),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify("/usr/local/bin/aura cost | head", bin),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify("/usr/local/bin/aura & disown", bin),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify("(/usr/local/bin/aura | cat)", bin),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify("echo $(/usr/local/bin/aura status)", bin),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify("echo `/usr/local/bin/aura status`", bin),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify("cd /tmp && /usr/local/bin/aura status", bin),
+            AuraResolution::Sandbox
+        ));
+    }
+
+    #[test]
+    fn classify_aura_sandbox_for_unsafe_env_prefixes() {
+        // Codex P1 fix: env vars outside the whitelist could subvert
+        // the aura process even with an absolute-path argv0
+        // (`LD_PRELOAD` injection, `HOME` redirection, etc.). Force
+        // the sandbox path rather than raising the absolute-path
+        // error — fixing the path alone wouldn't make the command
+        // safe.
+        let bin = Path::new("/usr/local/bin/aura");
+        assert!(matches!(
+            classify(
+                "PATH=/tmp/malicious:/usr/bin /usr/local/bin/aura status",
+                bin
+            ),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify("LD_PRELOAD=/tmp/evil.so /usr/local/bin/aura status", bin),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify("LD_LIBRARY_PATH=/tmp/evil /usr/local/bin/aura status", bin),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify(
+                "DYLD_INSERT_LIBRARIES=/tmp/evil.dylib /usr/local/bin/aura status",
+                bin
+            ),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify("HOME=/tmp /usr/local/bin/aura status", bin),
+            AuraResolution::Sandbox
+        ));
+        // Quote-stripped form must reach the same conclusion.
+        assert!(matches!(
+            classify("'PATH=/tmp' /usr/local/bin/aura status", bin),
+            AuraResolution::Sandbox
+        ));
+        // Mixed prefix: an unsafe key anywhere in the chain kills
+        // the bypass.
+        assert!(matches!(
+            classify("AURA_LOG=trace PATH=/tmp /usr/local/bin/aura status", bin),
+            AuraResolution::Sandbox
+        ));
+    }
+
+    #[test]
+    fn classify_aura_uses_bin_file_name() {
+        // If the gateway was installed under a different file_name
+        // (`aura2`), `aura` is no longer an aura attempt — it's just
+        // an unrelated command → sandbox. The new basename drives
+        // both the `looks like aura` check and the canonical-path
+        // bypass.
+        let bin = Path::new("/usr/local/bin/aura2");
+        assert!(matches!(
+            classify("aura cost", bin),
+            AuraResolution::Sandbox
+        ));
+        assert!(matches!(
+            classify("aura2 cost", bin),
+            AuraResolution::RequireAbsolutePath
+        ));
+        assert!(matches!(
+            classify("/usr/local/bin/aura2 cost", bin),
+            AuraResolution::Bypass
+        ));
+    }
+
     fn ctx_with(sandbox: Option<Arc<dyn crate::ExecSandbox>>) -> ToolContext {
         ToolContext {
             session_id: "t".into(),
@@ -999,6 +1431,89 @@ mod tests {
             calls[0].args,
             vec!["-c".to_string(), "echo hello".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_bare_aura_with_absolute_path_error() {
+        // When the agent invokes the gateway binary by bare name
+        // (basename match, no leading `/`), `execute` must refuse
+        // with an `InvalidParams` error that names the correct
+        // absolute path. Sandboxing it would just fail opaquely on
+        // the masked state dir; the explicit error trains the agent
+        // to use the canonical path.
+        let exe = std::env::current_exe().expect("current_exe in test");
+        let exe_name = exe
+            .file_name()
+            .expect("test binary has a file_name")
+            .to_string_lossy()
+            .to_string();
+        let exe_canon = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+
+        let err = BashTool
+            .execute(
+                json!({ "command": format!("{exe_name} --probe") }),
+                &ctx_with(None),
+            )
+            .await
+            .unwrap_err();
+        let ToolError::InvalidParams(msg) = err else {
+            panic!("expected InvalidParams, got {err:?}");
+        };
+        assert!(
+            msg.contains("absolute path") && msg.contains(&exe_canon.display().to_string()),
+            "error must teach the canonical absolute path: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn aura_invocations_bypass_the_sandbox() {
+        // `aura …` commands must NOT consult the sandbox: the sandbox
+        // masks `~/.aura`/`$AURA_HOME`, so a sandboxed aura process
+        // can't see the gateway's config or session store. Two
+        // assertions:
+        //   1. The fake sandbox is never invoked.
+        //   2. Even without ANY sandbox configured, the command still
+        //      runs (no "OS sandbox unavailable" error).
+        //
+        // The match is keyed off the running binary's `current_exe()`
+        // — under `cargo test` that's the test harness binary (e.g.
+        // `aura_tools-XXXX`), NOT `aura`. So we drive the bypass with
+        // the absolute test-binary path; the underlying `sh -c` will
+        // try to run the test binary with a non-existent arg, which
+        // exits quickly without re-entering test discovery.
+        let exe = std::env::current_exe().expect("current_exe in test");
+        let exe_path = exe.to_string_lossy().to_string();
+
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let cmd = format!("{exe_path} --aura-bypass-probe-nonexistent-arg");
+        let out = BashTool
+            .execute(
+                json!({ "command": cmd, "timeout_ms": 5000 }),
+                &ctx_with(Some(sandbox)),
+            )
+            .await
+            .expect("aura command must run unsandboxed");
+        let ToolOutput::Json(_) = out else { panic!() };
+        assert!(
+            fake.calls().is_empty(),
+            "aura invocations must skip the sandbox: {:?}",
+            fake.calls()
+        );
+
+        // And the bypass works even when no sandbox is installed.
+        let cmd = format!("{exe_path} --aura-bypass-probe-nonexistent-arg");
+        BashTool
+            .execute(
+                json!({ "command": cmd, "timeout_ms": 5000 }),
+                &ctx_with(None),
+            )
+            .await
+            .expect("aura command must run even without a sandbox");
     }
 
     #[tokio::test]
