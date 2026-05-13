@@ -1,23 +1,35 @@
-//! `WebFetch` — GET an `http(s)` URL, render the body as Markdown, return text.
+//! `WebFetch` — GET an `http(s)` URL, extract the article body, return text.
 //!
 //! Matches Claude Code's WebFetch tool shape: `{ url, prompt? }`. The
 //! side-LLM extraction path fires when ALL three hold: a `prompt` is
 //! supplied, [`ToolContext::llm`] is populated (the agent layer binds
 //! a per-call [`BilledChat`] handle to the running
 //! `(user, session, job, span)` so cost lands in `cost_records`
-//! against the WebFetch tool span), AND the rendered markdown is at
+//! against the WebFetch tool span), AND the extracted text is at
 //! least `SUMMARY_MIN_CHARS` long. Smaller pages fit in the agent's
-//! own context, so the raw markdown is returned verbatim — a side-LLM
-//! call would cost tokens for output that is almost always less
-//! faithful than the original. Argv-mode boot and tests without an
-//! LLM binding also fall through to the raw path.
+//! own context, so the text is returned verbatim — a side-LLM call
+//! would cost tokens for output that is almost always less faithful
+//! than the original. Argv-mode boot and tests without an LLM binding
+//! also fall through to the raw path.
 //!
 //! Raw output is capped at 256 KiB on a UTF-8 char boundary, matching the
 //! per-tool cap documented in `docs/modules/security.md`. LLM input is capped
 //! independently at 96 KiB so a giant page can't blow the side LLM's context.
 //! The gateway applies a final cap on top of this; injection scanning and
 //! `<tool_output>` wrapping are also the gateway's job — this tool just
-//! returns the rendered (or summarised) text.
+//! returns the extracted (or summarised) text.
+//!
+//! HTML bodies are run through `dom_smoothie` — a Rust port of
+//! Mozilla's Readability.js. It evaluates each candidate subtree by
+//! text density and class/id signals, picks the article body, and
+//! drops navigation chrome, sidebars, comments, scripts, and styles
+//! in one pass. We ask for `TextMode::Formatted` so block boundaries
+//! survive as newlines without injecting markdown syntax (the user
+//! asked for plain text, not markdown). When the heuristic can't
+//! identify an article (list pages, very short bodies, malformed
+//! markup), the raw page text is returned as a fallback so the agent
+//! still sees *something* — script tags are inert in plain text
+//! output, so the security floor we lose is essentially nil.
 //!
 //! SSRF guard runs at two layers:
 //!  1. URL parse: `validate_url_with` rejects non-http(s) schemes, literal-IP
@@ -42,6 +54,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use aura_llm::{BilledChat, ChatRequest};
 use aura_model::{ChatMessage, ContentBlock, Role};
+use dom_smoothie::{Config, Readability, TextMode};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect;
 use serde::Deserialize;
@@ -78,10 +91,11 @@ const REDIRECT_LIMIT: usize = 5;
 const CALL_LABEL_MAX: usize = 120;
 
 const SUMMARY_SYSTEM_PROMPT: &str = "You are extracting information from a fetched web page. \
-The user supplies a prompt describing what they want to know, followed by the page content rendered \
-as Markdown. Respond with a concise extraction or summary that directly answers the prompt. \
-Quote short fragments verbatim when accuracy matters; do not invent details. If the page does not \
-contain the requested information, say so explicitly.";
+The user supplies a prompt describing what they want to know, followed by the article text \
+extracted from the page (chrome and scripts already stripped). Respond with a concise extraction \
+or summary that directly answers the prompt. Quote short fragments verbatim when accuracy \
+matters; do not invent details. If the page does not contain the requested information, say so \
+explicitly.";
 
 fn host_to_literal_ip(host: &str) -> Option<IpAddr> {
     if let Ok(addr) = host.parse::<IpAddr>() {
@@ -228,14 +242,14 @@ impl Tool for WebFetchTool {
         r#"
 - Fetches content from a specified URL
 - Takes a URL and an optional prompt as input
-- Fetches the URL content, converts HTML to markdown
-- When a prompt is supplied the rendered page is run through a side LLM that extracts a focused answer; otherwise the raw markdown is returned
+- Fetches the URL content, extracts the article body as plain text (navigation, sidebars, scripts, and styles are removed)
+- When a prompt is supplied the extracted text is run through a side LLM that produces a focused answer; otherwise the text is returned verbatim
 - Use this tool when you need to retrieve and analyze web content
 Usage notes:
   - The URL must be a fully-formed valid URL
   - HTTP URLs will be automatically upgraded to HTTPS
   - This tool is read-only and does not modify any files
-  - If no LLM is configured the prompt is ignored and the raw body is returned
+  - If no LLM is configured the prompt is ignored and the extracted text is returned
 "#
     }
 
@@ -383,14 +397,8 @@ Usage notes:
         let raw_text = String::from_utf8_lossy(&body);
 
         let rendered = if is_html {
-            let _t = start_timer(&ctx.events, "html_to_markdown");
-            match htmd::convert(&raw_text) {
-                Ok(md) => md,
-                Err(e) => {
-                    tracing::warn!(host = %host, error = %e, "WebFetch html2md failed; returning raw");
-                    raw_text.into_owned()
-                }
-            }
+            let _t = start_timer(&ctx.events, "extract_article");
+            extract_article(&raw_text, &host)
         } else {
             raw_text.into_owned()
         };
@@ -424,7 +432,7 @@ Usage notes:
         {
             let summary_page = truncate_utf8(rendered.as_bytes(), MAX_SUMMARY_INPUT_BYTES);
             let summary_user_text =
-                format!("Prompt: {prompt_text}\n\nPage content (Markdown):\n{summary_page}");
+                format!("Prompt: {prompt_text}\n\nPage content:\n{summary_page}");
             let summary = {
                 let _t = start_timer(&ctx.events, "llm_summary");
                 run_summary(llm.as_ref(), &summary_user_text, ctx).await
@@ -552,6 +560,44 @@ async fn read_body(
         }
     }
     Ok(buf)
+}
+
+/// Run dom_smoothie's Readability over the HTML body and return the
+/// article text. Title (when non-empty) is prefixed on its own line so
+/// the agent has it without re-parsing. `TextMode::Formatted` keeps
+/// block boundaries as newlines without injecting markdown markers.
+///
+/// On failure (list pages, very short bodies, malformed markup that
+/// makes the readability heuristic give up), the raw page bytes are
+/// returned verbatim — a noisy text dump still beats an empty
+/// `ToolOutput::Text`, and scripts in plain text are inert.
+fn extract_article(raw_html: &str, host: &str) -> String {
+    let cfg = Config {
+        text_mode: TextMode::Formatted,
+        ..Config::default()
+    };
+    let mut readability = match Readability::new(raw_html, None, Some(cfg)) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(host = %host, error = %e, "WebFetch readability init failed; returning raw");
+            return raw_html.to_string();
+        }
+    };
+    match readability.parse() {
+        Ok(article) => {
+            let title = article.title.trim();
+            let body = article.text_content.trim();
+            if title.is_empty() {
+                body.to_string()
+            } else {
+                format!("{title}\n\n{body}")
+            }
+        }
+        Err(e) => {
+            tracing::warn!(host = %host, error = %e, "WebFetch readability parse failed; returning raw");
+            raw_html.to_string()
+        }
+    }
 }
 
 fn reqwest_error_chain(e: &reqwest::Error) -> String {
@@ -846,15 +892,41 @@ mod tests {
         assert_eq!(s.trim(), "ok");
     }
 
+    /// Build an HTML body that comfortably exceeds dom_smoothie's
+    /// `char_threshold` (500) so the readability heuristic actually
+    /// commits to a top candidate. Used by the tests that need a real
+    /// article-shaped page rather than the fallback path.
+    fn article_html(title: &str, body_paragraph: &str) -> String {
+        let filler = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod \
+                      tempor incididunt ut labore et dolore magna aliqua. ".repeat(8);
+        format!(
+            r#"<html><head><title>{title}</title></head><body>
+                <nav><a href="/x">menu link</a></nav>
+                <header>brand header</header>
+                <article>
+                  <h1>{title}</h1>
+                  <p>{body_paragraph}</p>
+                  <p>{filler}</p>
+                  <p>{filler}</p>
+                  <script>window.tracking = true;</script>
+                  <style>.x{{color:red}}</style>
+                </article>
+                <aside>related links</aside>
+                <footer>copyright footer</footer>
+            </body></html>"#
+        )
+    }
+
     #[tokio::test]
-    async fn html_body_is_converted_to_markdown() {
+    async fn html_body_is_extracted_as_plain_text() {
+        let body = article_html("Real Title", "Hello body world");
         let server = spawn(Router::new().route(
             "/",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                    "<h1>Title</h1><p>Hello <b>world</b></p>",
-                )
+            get(move || {
+                let body = body.clone();
+                async move {
+                    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body)
+                }
             }),
         ))
         .await;
@@ -863,19 +935,50 @@ mod tests {
             .await
             .unwrap();
         let ToolOutput::Text(s) = out else { panic!() };
-        assert!(s.contains("# Title"), "missing markdown heading: {s:?}");
-        assert!(s.contains("**world**"), "missing markdown bold: {s:?}");
+        assert!(s.contains("Real Title"), "title missing: {s:?}");
+        assert!(s.contains("Hello body world"), "body missing: {s:?}");
+        // dom_smoothie returns plain text — no markdown markers.
+        assert!(!s.contains("# Real Title"), "unexpected md heading: {s:?}");
+        assert!(!s.contains("<h1"), "raw html leaked: {s:?}");
+    }
+
+    #[tokio::test]
+    async fn extracted_text_excludes_chrome_scripts_and_styles() {
+        let body = article_html("Real Title", "real body text continues here.");
+        let server = spawn(Router::new().route(
+            "/",
+            get(move || {
+                let body = body.clone();
+                async move {
+                    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body)
+                }
+            }),
+        ))
+        .await;
+        let out = WebFetchTool::for_testing()
+            .execute(json!({ "url": url_to(&server, "/") }), &ctx())
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else { panic!() };
+        assert!(s.contains("Real Title"), "main content missing: {s}");
+        assert!(!s.contains("menu link"), "nav leaked: {s}");
+        assert!(!s.contains("brand header"), "header leaked: {s}");
+        assert!(!s.contains("copyright footer"), "footer leaked: {s}");
+        assert!(!s.contains("window.tracking"), "script body leaked: {s}");
+        assert!(!s.contains("color:red"), "style body leaked: {s}");
+        assert!(!s.contains("related links"), "aside leaked: {s}");
     }
 
     #[tokio::test]
     async fn timer_metrics_record_phases_for_html() {
+        let body = article_html("Phase Title", "phase body for timer metrics.");
         let server = spawn(Router::new().route(
             "/",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                    "<h1>Hi</h1>",
-                )
+            get(move || {
+                let body = body.clone();
+                async move {
+                    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body)
+                }
             }),
         ))
         .await;
@@ -902,8 +1005,8 @@ mod tests {
             "missing read_body in {phases:?}"
         );
         assert!(
-            phases.iter().any(|p| p == "html_to_markdown"),
-            "missing html_to_markdown in {phases:?}"
+            phases.iter().any(|p| p == "extract_article"),
+            "missing extract_article in {phases:?}"
         );
         assert!(
             !phases.iter().any(|p| p == "llm_summary"),
@@ -926,8 +1029,12 @@ mod tests {
                 assert_eq!(content_type.as_deref(), Some("text/html; charset=utf-8"));
                 let preview = body_preview.as_deref().expect("missing body preview");
                 assert!(
-                    preview.contains("# Hi"),
-                    "preview does not look like rendered markdown: {preview:?}"
+                    preview.contains("Phase Title"),
+                    "preview missing extracted title: {preview:?}"
+                );
+                assert!(
+                    !preview.contains("<h1"),
+                    "preview still contains raw html: {preview:?}"
                 );
             }
             other => panic!("expected HttpFetch payload, got {other:?}"),
@@ -1038,7 +1145,10 @@ mod tests {
         let ToolOutput::Text(s) = out else {
             panic!("expected Text, got: {out:?}")
         };
-        assert!(s.contains("# Hi"), "raw markdown should be returned: {s:?}");
+        // Short pages fail dom_smoothie's char_threshold, so we hit the
+        // raw-html fallback. The agent still gets the page contents;
+        // what we care about here is that the LLM short-circuit fired.
+        assert!(s.contains("Hi"), "page content missing: {s:?}");
         assert!(
             stub.captured_requests().is_empty(),
             "LLM should not be called for short content"
@@ -1362,25 +1472,27 @@ mod tests {
             panic!("expected text block")
         };
         assert!(user_text.contains("what's the title?"));
-        assert!(user_text.contains("# Hello"));
+        assert!(user_text.contains("Hello"), "extracted title missing: {user_text}");
+        assert!(!user_text.contains("<h1"), "raw html leaked to LLM: {user_text}");
     }
 
     /// Without a prompt the LLM is *not* called even when one is wired
-    /// in — raw markdown still wins. Guards against spending tokens on
-    /// every fetch.
+    /// in — the extracted text still wins. Guards against spending
+    /// tokens on every fetch.
     #[tokio::test]
     async fn no_prompt_skips_llm_even_when_wired() {
         use aura_llm::test_support::StubLlm;
 
         let stub = Arc::new(StubLlm::new());
         // Intentionally no `push_response`: a stray call would 500.
+        let body = article_html("Plain Title", "the body of an article goes here.");
         let server = spawn(Router::new().route(
             "/",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                    "<h1>Hi</h1>",
-                )
+            get(move || {
+                let body = body.clone();
+                async move {
+                    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body)
+                }
             }),
         ))
         .await;
@@ -1396,12 +1508,12 @@ mod tests {
         let ToolOutput::Text(s) = out else {
             panic!("expected Text, got: {out:?}")
         };
-        assert!(s.contains("# Hi"));
+        assert!(s.contains("Plain Title"), "title missing: {s:?}");
         assert!(stub.captured_requests().is_empty());
     }
 
     /// Empty/whitespace-only prompts are equivalent to no prompt — same
-    /// raw-markdown short-circuit, no LLM call.
+    /// short-circuit to extracted text, no LLM call.
     #[tokio::test]
     async fn whitespace_prompt_skips_llm() {
         use aura_llm::test_support::StubLlm;
