@@ -108,6 +108,14 @@ pub struct ToolContext {
     /// real sink wire [`noop_event_sink`] so tool bodies never have
     /// to branch on `Option`.
     pub events: Arc<dyn ToolEventSink>,
+    /// Per-call billed-LLM handle for tools that need in-flow LLM
+    /// access (today: WebFetch's prompt-driven extraction). The agent
+    /// layer binds it to the current `(user, session, job, span)` so
+    /// `chat()` records cost against the running tool's span. `None`
+    /// when no LLM is wired (argv-mode boots, tests that don't
+    /// exercise the side LLM); tools must fail-closed by ignoring
+    /// their LLM-dependent code path.
+    pub llm: Option<Arc<dyn aura_llm::BilledChat>>,
 }
 
 /// Severity of a [`SessionNotifier`] event. Matches

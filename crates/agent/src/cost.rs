@@ -308,7 +308,8 @@ impl CostManager {
         }
     }
 
-    /// Record one finished LLM call. Memory first, disk second:
+    /// Record one finished LLM call and return the cost that was
+    /// billed against the budget. Memory first, disk second:
     /// 1. The in-memory budget state updates synchronously so the
     ///    next [`Self::check`] sees the new spend before this method
     ///    returns.
@@ -318,7 +319,9 @@ impl CostManager {
     ///    between in-memory and on-disk totals.
     ///
     /// `user_id` is recorded on the row for provenance only — budget
-    /// is global, never per-user.
+    /// is global, never per-user. The returned [`MicroUsd`] lets a
+    /// caller surface the billed amount (e.g. as `LlmCallResult.cost_micros`)
+    /// without recomputing pricing.
     #[allow(clippy::too_many_arguments)]
     pub fn record_call(
         self: &Arc<Self>,
@@ -331,7 +334,7 @@ impl CostManager {
         output_tokens: usize,
         cached_input_tokens: usize,
         cache_creation_input_tokens: usize,
-    ) {
+    ) -> MicroUsd {
         let now = Utc::now();
         let cost = compute_cost_usd(
             &self.pricing.read(),
@@ -366,6 +369,7 @@ impl CostManager {
         tokio::spawn(async move {
             me.persist(record).await;
         });
+        cost
     }
 
     async fn persist(self: Arc<Self>, record: CostRecord) {

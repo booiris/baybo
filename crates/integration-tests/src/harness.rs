@@ -324,6 +324,7 @@ impl AgentTestHarnessBuilder {
             std::path::PathBuf::from("/tmp"),
             aura_workspace::WorkspacePaths::new(std::path::PathBuf::from("/tmp")),
             None,
+            None,
         ));
 
         // Tokenizer model id must match the LLM client's so

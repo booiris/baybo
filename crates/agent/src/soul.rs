@@ -75,6 +75,15 @@ impl Soul {
         self.system_prompt
             .replace(SESSION_ID_PLACEHOLDER, session_id)
     }
+
+    /// Raw prompt template with the `{{session_id}}` placeholder
+    /// intact. Used by boot paths that capture the prompt before any
+    /// session exists (e.g. runtime startup) and then hand the
+    /// captured string to a per-session [`Self::custom`] so each
+    /// session's [`Self::system_prompt`] does the substitution.
+    pub fn raw_template(&self) -> &str {
+        &self.system_prompt
+    }
 }
 
 const SESSION_ID_PLACEHOLDER: &str = "{{session_id}}";

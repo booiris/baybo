@@ -754,6 +754,7 @@ mod tests {
             approval: None,
             notifier: None,
             events: aura_tools::noop_event_sink(),
+            llm: None,
         }
     }
 
@@ -1322,6 +1323,7 @@ mod tests {
             approval: Some(handle),
             notifier: None,
             events: aura_tools::noop_event_sink(),
+            llm: None,
         }
     }
 

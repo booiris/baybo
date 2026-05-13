@@ -134,6 +134,38 @@ impl SecurityGateway {
         Ok(())
     }
 
+    /// Walk every text leaf in an [`LlmResponse`] and reveal any
+    /// embedded placeholders to their plaintext originals. Used at
+    /// the tool-side LLM boundary so a tool reads the model's reply
+    /// as plaintext — the same view [`Self::reveal_in_value`] gives
+    /// tool args coming out of the main agent loop's LLM response.
+    /// The main loop deliberately keeps placeholders in its session
+    /// transcript; this is the tool-path exception.
+    pub async fn reveal_llm_response(&self, response: &mut LlmResponse) -> Result<()> {
+        response.content = self.reveal_in_text(&response.content).await?;
+        if let Some(thinking) = response.thinking.as_mut() {
+            *thinking = self.reveal_in_text(thinking).await?;
+        }
+        for block in response.content_blocks.iter_mut() {
+            match block {
+                ContentBlock::Text(text) => {
+                    *text = self.reveal_in_text(text).await?;
+                }
+                ContentBlock::ToolUse { input, .. } => {
+                    self.reveal_in_value(input).await?;
+                }
+                ContentBlock::ToolResult { content, .. } => {
+                    *content = self.reveal_in_text(content).await?;
+                }
+                _ => {}
+            }
+        }
+        for tc in response.tool_calls.iter_mut() {
+            self.reveal_in_value(&mut tc.arguments).await?;
+        }
+        Ok(())
+    }
+
     /// Scan an `LlmResponse` in place: content, content_blocks text leaves,
     /// thinking, and all tool-call argument string leaves. Used defensively
     /// before the response is written to trace / memory / session history.

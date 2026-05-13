@@ -347,7 +347,6 @@ pub async fn build_managers(
 
     let mut tool_registry = ToolRegistry::with_defaults(
         stores.blob.clone(),
-        Some(llm_client.clone()),
         aura_workspace::WorkspacePaths::new(workspace_root.clone()),
     );
 
@@ -510,6 +509,11 @@ pub async fn build_managers(
         work_dir
     });
     info!(path = %sandbox_root.display(), "sandbox FS scope rooted at workspace work/");
+    let billed_chat_factory = aura_agent::BilledChatFactory::new(
+        llm_client.clone(),
+        Arc::clone(&cost_manager),
+        Arc::clone(&security_gateway),
+    );
     let tool_executor = Arc::new(ToolExecutor::new(
         Arc::clone(&tool_registry),
         gate_map,
@@ -517,6 +521,7 @@ pub async fn build_managers(
         sandbox_root,
         workspace_paths.clone(),
         sandbox_runner,
+        Some(billed_chat_factory),
     ));
 
     let memory_manager = Arc::new(MemoryManager::without_embedder(stores.memory.clone()));
@@ -623,7 +628,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let soul = Soul::from_workspace(&graph.workspace)
         .await
         .unwrap_or_else(|_| Soul::custom("You are Aura, an intelligent assistant.".to_string()));
-    let system_prompt = soul.system_prompt().to_string();
+    let system_prompt = soul.raw_template().to_string();
 
     let policy = boot::to_execution_policy(&graph.config.agent);
     let token_budget = boot::to_token_budget(&graph.config.agent.context);

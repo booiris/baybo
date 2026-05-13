@@ -23,7 +23,6 @@
 
 use std::sync::Arc;
 
-use aura_llm::GuardedLlm;
 use aura_model::TrustLevel;
 use aura_storage::BlobStore;
 use aura_workspace::WorkspacePaths;
@@ -62,22 +61,17 @@ pub use write::WriteTool;
 /// its governance ceiling. `ToolExecutor::validate_trust` compares this
 /// manifest against the runtime trust policy before executing.
 ///
-/// `llm` is the side-LLM client wired into `WebFetch` for prompt-driven
-/// extraction. Pass `None` from argv-mode boot or tests where no model is
-/// configured — `WebFetch` then ignores the `prompt` field and returns the
-/// raw rendered markdown.
+/// `WebFetch`'s prompt-driven extraction now reads its LLM handle from
+/// the per-call [`crate::ToolContext::llm`] slot that the agent layer
+/// binds at tool-call time, so no LLM client needs to be threaded
+/// through this factory.
 ///
 /// Browser tools are not listed here — they arrive dynamically when
 /// the embedded browser MCP server connects through the reconciler.
 pub fn default_tools(
     blob_store: Arc<dyn BlobStore>,
-    llm: Option<Arc<GuardedLlm>>,
     workspace_paths: WorkspacePaths,
 ) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
-    let web_fetch = match llm {
-        Some(llm) => WebFetchTool::default().with_llm(llm),
-        None => WebFetchTool::default(),
-    };
     #[allow(unused_mut)]
     let mut tools: Vec<(Arc<dyn Tool>, ToolManifest)> = vec![
         trusted(ReadTool, vec![ToolCapability::ReadFile]),
@@ -92,7 +86,7 @@ pub fn default_tools(
         trusted(BashTool, vec![ToolCapability::ExecCommand]),
         trusted(GlobTool, vec![ToolCapability::ReadFile]),
         trusted(GrepTool, vec![ToolCapability::ReadFile]),
-        trusted(web_fetch, vec![ToolCapability::Http]),
+        trusted(WebFetchTool::default(), vec![ToolCapability::Http]),
         send_local_file::tool(blob_store.clone()),
         trusted(NowTool, vec![]),
     ];

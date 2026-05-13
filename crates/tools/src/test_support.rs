@@ -16,10 +16,43 @@ use aura_model::TrustLevel;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
+use aura_llm::{BilledChat, BilledChatResponse};
+
 use crate::{
     ApprovalDecision, ApprovalGate, ApprovalRequest, ExecSandbox, SandboxedOutput, Tool,
     ToolContext, ToolManifest, ToolOutput,
 };
+
+/// Wraps a [`aura_llm::GuardedLlm`] in a [`BilledChat`] handle that
+/// reports `cost_micros: MicroUsd::ZERO` — bridges tests that drive
+/// `LlmCompletion` stubs into the per-call `ctx.llm` slot WebFetch
+/// (and any future tool) reads from. No real `CostManager` is
+/// involved; budget assertions belong in agent-crate tests.
+pub fn unbilled_chat(inner: Arc<aura_llm::GuardedLlm>) -> Arc<dyn BilledChat> {
+    struct UnbilledChat {
+        inner: Arc<aura_llm::GuardedLlm>,
+    }
+    #[async_trait]
+    impl BilledChat for UnbilledChat {
+        fn model_info(&self) -> &aura_llm::ModelInfo {
+            self.inner.model_info()
+        }
+        async fn chat(
+            &self,
+            request: &aura_llm::ChatRequest,
+        ) -> std::result::Result<BilledChatResponse, String> {
+            self.inner
+                .chat(request)
+                .await
+                .map(|response| BilledChatResponse {
+                    response,
+                    cost_micros: aura_model::MicroUsd::ZERO,
+                })
+                .map_err(|e| e.to_string())
+        }
+    }
+    Arc::new(UnbilledChat { inner })
+}
 
 /// `Tool` that returns its serialized parameters as text. Trust level
 /// is `Trusted` by default so the tool isn't blocked by approval gates
@@ -236,6 +269,7 @@ mod tests {
             approval: None,
             notifier: None,
             events: crate::noop_event_sink(),
+            llm: None,
         }
     }
 

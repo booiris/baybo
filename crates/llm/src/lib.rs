@@ -1,3 +1,4 @@
+pub mod billed;
 pub mod credentials;
 mod error;
 pub mod guard;
@@ -29,6 +30,7 @@ use rig::streaming::{self, StreamedAssistantContent};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+pub use crate::billed::{BilledChat, BilledChatResponse};
 pub use crate::error::LlmError;
 pub(crate) use crate::error::{reqwest_to_error, rig_completion_to_error, status_to_error};
 pub use crate::guard::{GuardedLlm, LlmCallGuard};

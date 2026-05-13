@@ -190,6 +190,11 @@ pub struct ToolExecutor {
     /// Forwarded to [`ToolContext::workspace_paths`].
     workspace_paths: aura_workspace::WorkspacePaths,
     sandbox_runner: Option<Arc<dyn SandboxRunner>>,
+    /// Mint per-call billed-LLM handles into [`ToolContext::llm`] so
+    /// in-tool LLM calls (today: `WebFetch`'s prompt-driven extraction)
+    /// record cost against the running tool span. `None` from argv-mode
+    /// boots and tests that don't exercise side-LLM tool paths.
+    billed_chat_factory: Option<Arc<crate::billed_chat::BilledChatFactory>>,
 }
 
 impl ToolExecutor {
@@ -200,6 +205,7 @@ impl ToolExecutor {
         workspace_root: PathBuf,
         workspace_paths: aura_workspace::WorkspacePaths,
         sandbox_runner: Option<Arc<dyn SandboxRunner>>,
+        billed_chat_factory: Option<Arc<crate::billed_chat::BilledChatFactory>>,
     ) -> Self {
         Self {
             tool_registry,
@@ -208,6 +214,7 @@ impl ToolExecutor {
             workspace_root,
             workspace_paths,
             sandbox_runner,
+            billed_chat_factory,
         }
     }
 
@@ -466,7 +473,19 @@ impl ToolExecutor {
                 // Build tool context. The token comes from the agent
                 // loop's per-job cancel tree — tripping it (via
                 // JobLifecycle::cancel or a parent subagent's cascade)
-                // signals the running tool.
+                // signals the running tool. The billed-LLM handle (if
+                // any) is bound to this exact tool span so a tool that
+                // makes a side-LLM call (e.g. `WebFetch`'s extraction)
+                // sees its `cost_records` row attributed to the running
+                // tool span, not a synthetic placeholder.
+                let llm = self.billed_chat_factory.as_ref().map(|factory| {
+                    factory.bind(
+                        user.id.clone(),
+                        session_id.clone(),
+                        job_id,
+                        span_handle.span_id,
+                    )
+                });
                 let ctx = ToolContext {
                     session_id: session_id.clone(),
                     user: user.clone(),
@@ -478,6 +497,7 @@ impl ToolExecutor {
                     approval: Some(approval),
                     notifier: notifier.clone(),
                     events: Arc::clone(&event_sink) as Arc<dyn aura_tools::ToolEventSink>,
+                    llm,
                 };
 
                 // Reveal placeholders in the tool's arguments just

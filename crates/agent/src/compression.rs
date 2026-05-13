@@ -40,6 +40,7 @@ use aura_workspace::WorkspacePaths;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::billed_chat::{BilledAttribution, chat_billed_core};
 use crate::cost::CostManager;
 use crate::security::SecurityGateway;
 use crate::trace::SpanRecorder;
@@ -126,70 +127,46 @@ impl CompressionRunner {
                     cancel_ctx,
                     |span| async move {
                         let span_id_str = span.span_id.to_string();
-                        match llm_client.chat(&request).await {
-                            Ok(mut response) => {
-                                if let Err(e) =
-                                    security_gateway.sanitize_llm_response(&mut response).await
-                                {
-                                    warn!(
-                                        error = %e,
-                                        "failed to sanitize compression LLM response"
-                                    );
-                                }
-                                cost_manager.record_call(
-                                    &user_id,
-                                    session_id.clone(),
-                                    job_id,
-                                    span.span_id,
-                                    &model_info.id,
-                                    response.usage.input_tokens,
-                                    response.usage.output_tokens,
-                                    response.usage.cached_input_tokens,
-                                    response.usage.cache_creation_input_tokens,
-                                );
-                                let cost_micros = cost_manager
-                                    .cost_usd_for(
-                                        &model_info.id,
-                                        response.usage.input_tokens,
-                                        response.usage.output_tokens,
-                                        response.usage.cached_input_tokens,
-                                        response.usage.cache_creation_input_tokens,
-                                    )
-                                    .into_micros();
+                        let attribution = BilledAttribution {
+                            user_id: user_id.clone(),
+                            session_id: session_id.clone(),
+                            job_id,
+                            span_id: span.span_id,
+                        };
+                        match chat_billed_core(
+                            &llm_client,
+                            &security_gateway,
+                            &cost_manager,
+                            &model_info,
+                            &attribution,
+                            &request,
+                        )
+                        .await
+                        {
+                            Ok(run) => {
                                 let call_result = LlmCallResult {
-                                    output_content: response.content.clone(),
-                                    thinking: response.thinking.clone(),
+                                    output_content: run.response.content.clone(),
+                                    thinking: run.response.thinking.clone(),
                                     tool_calls: vec![],
-                                    input_tokens: response.usage.input_tokens,
-                                    output_tokens: response.usage.output_tokens,
-                                    cached_input_tokens: response.usage.cached_input_tokens,
-                                    cache_creation_input_tokens: response
+                                    input_tokens: run.response.usage.input_tokens,
+                                    output_tokens: run.response.usage.output_tokens,
+                                    cached_input_tokens: run.response.usage.cached_input_tokens,
+                                    cache_creation_input_tokens: run
+                                        .response
                                         .usage
                                         .cache_creation_input_tokens,
                                 };
                                 (
                                     call_result,
                                     Ok(aura_context::SummaryChatRun {
-                                        response,
+                                        response: run.response,
                                         span_id: span_id_str,
-                                        cost_micros,
+                                        cost_micros: run.cost_micros.into_micros(),
                                     }),
                                 )
                             }
-                            Err(e) => {
-                                let raw = e.to_string();
-                                let error_msg =
-                                    security_gateway.sanitize_error(&raw).await.unwrap_or(raw);
-                                let call_result = LlmCallResult {
-                                    output_content: String::new(),
-                                    thinking: None,
-                                    tool_calls: vec![],
-                                    input_tokens: 0,
-                                    output_tokens: 0,
-                                    cached_input_tokens: 0,
-                                    cache_creation_input_tokens: 0,
-                                };
-                                (call_result, Err(anyhow::anyhow!(error_msg)))
+                            Err(error_msg) => {
+                                (LlmCallResult::default(), Err(anyhow::anyhow!(error_msg)))
                             }
                         }
                     },

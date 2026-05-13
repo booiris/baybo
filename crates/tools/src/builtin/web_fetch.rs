@@ -2,14 +2,15 @@
 //!
 //! Matches Claude Code's WebFetch tool shape: `{ url, prompt? }`. The
 //! side-LLM extraction path fires when ALL three hold: a `prompt` is
-//! supplied, the tool was constructed with an `Arc<dyn LlmCompletion>`
-//! via [`WebFetchTool::with_llm`] (the `default_tools` factory threads
-//! one in when an LLM is available), AND the rendered markdown is at
+//! supplied, [`ToolContext::llm`] is populated (the agent layer binds
+//! a per-call [`BilledChat`] handle to the running
+//! `(user, session, job, span)` so cost lands in `cost_records`
+//! against the WebFetch tool span), AND the rendered markdown is at
 //! least `SUMMARY_MIN_CHARS` long. Smaller pages fit in the agent's
 //! own context, so the raw markdown is returned verbatim — a side-LLM
 //! call would cost tokens for output that is almost always less
-//! faithful than the original. Argv-mode boot and tests also fall
-//! through to the raw path.
+//! faithful than the original. Argv-mode boot and tests without an
+//! LLM binding also fall through to the raw path.
 //!
 //! Raw output is capped at 256 KiB on a UTF-8 char boundary, matching the
 //! per-tool cap documented in `docs/modules/security.md`. LLM input is capped
@@ -39,7 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_llm::{ChatRequest, GuardedLlm};
+use aura_llm::{BilledChat, ChatRequest};
 use aura_model::{ChatMessage, ContentBlock, Role};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect;
@@ -151,10 +152,6 @@ impl Resolve for SafeResolver {
 pub struct WebFetchTool {
     client: reqwest::Client,
     validator_allow_loopback: bool,
-    /// Optional side LLM for prompt-driven extraction. `None` falls back
-    /// to returning the raw rendered markdown verbatim — the prompt is
-    /// then silently ignored, matching the pre-LLM behaviour.
-    llm: Option<Arc<GuardedLlm>>,
 }
 
 impl WebFetchTool {
@@ -194,18 +191,7 @@ impl WebFetchTool {
         Self {
             client,
             validator_allow_loopback,
-            llm: None,
         }
-    }
-
-    /// Attach a side LLM client. When the caller passes a non-empty
-    /// `prompt`, the rendered markdown is forwarded to this LLM with a
-    /// fixed extraction system prompt and the model's reply replaces the
-    /// raw body in the tool output. Without it the prompt is silently
-    /// ignored.
-    pub fn with_llm(mut self, llm: Arc<GuardedLlm>) -> Self {
-        self.llm = Some(llm);
-        self
     }
 
     #[cfg(test)]
@@ -423,15 +409,16 @@ Usage notes:
         );
 
         // Side-channel summary path: only when the caller asked for one
-        // (`prompt` is non-empty), an LLM was wired in, AND the rendered
-        // content is large enough to be worth summarising. Pages under
-        // `SUMMARY_MIN_CHARS` are returned as raw markdown — they fit
-        // in the agent's own context, and a side-LLM round-trip would
-        // cost tokens for output that is almost always less faithful
-        // than the original. Argv-mode boot, tests, and any deployment
-        // that hasn't configured a model also get the raw output.
+        // (`prompt` is non-empty), the agent layer bound a billed LLM
+        // into `ctx.llm`, AND the rendered content is large enough to
+        // be worth summarising. Pages under `SUMMARY_MIN_CHARS` are
+        // returned as raw markdown — they fit in the agent's own
+        // context, and a side-LLM round-trip would cost tokens for
+        // output that is almost always less faithful than the
+        // original. Argv-mode boot, tests, and any deployment that
+        // hasn't configured a model also get the raw output.
         if let (Some(llm), Some(prompt_text)) = (
-            self.llm.as_ref(),
+            ctx.llm.as_ref(),
             p.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()),
         ) && rendered.chars().count() > SUMMARY_MIN_CHARS
         {
@@ -440,7 +427,7 @@ Usage notes:
                 format!("Prompt: {prompt_text}\n\nPage content (Markdown):\n{summary_page}");
             let summary = {
                 let _t = start_timer(&ctx.events, "llm_summary");
-                run_summary(llm, &summary_user_text, ctx).await
+                run_summary(llm.as_ref(), &summary_user_text, ctx).await
             };
             return match summary {
                 Ok(text) => {
@@ -486,9 +473,12 @@ Usage notes:
 
 /// Run the side LLM with the fixed extraction system prompt and the user's
 /// `(prompt, page)` pair. Honours `ctx.cancellation_token` and `ctx.timeout`
-/// so a slow model can't pin the outer deadline.
+/// so a slow model can't pin the outer deadline. Cost is recorded inside
+/// the [`BilledChat::chat`] impl that the agent layer binds into
+/// `ctx.llm`, so a successful return here implies the spend already
+/// landed in `cost_records`.
 async fn run_summary(
-    llm: &GuardedLlm,
+    llm: &dyn BilledChat,
     user_text: &str,
     ctx: &ToolContext,
 ) -> Result<String, String> {
@@ -515,9 +505,9 @@ async fn run_summary(
         res = tokio::time::timeout(ctx.timeout, llm.chat(&request)) => {
             match res {
                 Err(_) => Err(format!("summary timed out after {:?}", ctx.timeout)),
-                Ok(Err(e)) => Err(e.to_string()),
-                Ok(Ok(resp)) => {
-                    let trimmed = resp.content.trim();
+                Ok(Err(msg)) => Err(msg),
+                Ok(Ok(billed)) => {
+                    let trimmed = billed.response.content.trim();
                     if trimmed.is_empty() {
                         Err("model returned empty content".to_string())
                     } else {
@@ -602,7 +592,8 @@ fn truncate_utf8(bytes: &[u8], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_llm::LlmCompletion;
+    use crate::test_support::unbilled_chat;
+    use aura_llm::{GuardedLlm, LlmCompletion};
     use aura_model::{ChannelType, User};
     use axum::{
         Router,
@@ -616,6 +607,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
     use tokio_util::sync::CancellationToken;
+
+    fn billed(stub: Arc<dyn LlmCompletion>) -> Arc<dyn BilledChat> {
+        unbilled_chat(GuardedLlm::passthrough(stub))
+    }
 
     fn ctx_with_timeout(timeout: Duration) -> ToolContext {
         ToolContext {
@@ -633,6 +628,7 @@ mod tests {
             approval: None,
             notifier: None,
             events: crate::noop_event_sink(),
+            llm: None,
         }
     }
 
@@ -963,12 +959,14 @@ mod tests {
             }),
         ))
         .await;
-        let llm = GuardedLlm::passthrough(stub.clone() as Arc<dyn LlmCompletion>);
-        let tool = WebFetchTool::for_testing().with_llm(llm);
+        let tool = WebFetchTool::for_testing();
+        let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
         let metrics = Arc::new(RecorderStub::default());
+        let mut tctx = ctx_with_event_sink(Arc::clone(&metrics));
+        tctx.llm = Some(llm);
         tool.execute(
             json!({ "url": url_to(&server, "/"), "prompt": "what's the title?" }),
-            &ctx_with_event_sink(Arc::clone(&metrics)),
+            &tctx,
         )
         .await
         .unwrap();
@@ -1025,12 +1023,15 @@ mod tests {
             }),
         ))
         .await;
-        let llm = GuardedLlm::passthrough(stub.clone() as Arc<dyn LlmCompletion>);
-        let tool = WebFetchTool::for_testing().with_llm(llm);
+        let tool = WebFetchTool::for_testing();
+
+        let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
+        let mut tctx = ctx();
+        tctx.llm = Some(llm);
         let out = tool
             .execute(
                 json!({ "url": url_to(&server, "/"), "prompt": "summarise" }),
-                &ctx(),
+                &tctx,
             )
             .await
             .unwrap();
@@ -1327,12 +1328,16 @@ mod tests {
         ))
         .await;
 
-        let llm = GuardedLlm::passthrough(stub.clone() as Arc<dyn LlmCompletion>);
-        let tool = WebFetchTool::for_testing().with_llm(llm);
+        let tool = WebFetchTool::for_testing();
+
+
+        let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
+        let mut tctx = ctx();
+        tctx.llm = Some(llm);
         let out = tool
             .execute(
                 json!({ "url": url_to(&server, "/"), "prompt": "what's the title?" }),
-                &ctx(),
+                &tctx,
             )
             .await
             .unwrap();
@@ -1379,10 +1384,13 @@ mod tests {
             }),
         ))
         .await;
-        let llm = GuardedLlm::passthrough(stub.clone() as Arc<dyn LlmCompletion>);
-        let tool = WebFetchTool::for_testing().with_llm(llm);
+        let tool = WebFetchTool::for_testing();
+
+        let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
+        let mut tctx = ctx();
+        tctx.llm = Some(llm);
         let out = tool
-            .execute(json!({ "url": url_to(&server, "/") }), &ctx())
+            .execute(json!({ "url": url_to(&server, "/") }), &tctx)
             .await
             .unwrap();
         let ToolOutput::Text(s) = out else {
@@ -1404,12 +1412,15 @@ mod tests {
             get(|| async { ([(header::CONTENT_TYPE, "text/plain")], "ok") }),
         ))
         .await;
-        let llm = GuardedLlm::passthrough(stub.clone() as Arc<dyn LlmCompletion>);
-        let tool = WebFetchTool::for_testing().with_llm(llm);
+        let tool = WebFetchTool::for_testing();
+
+        let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
+        let mut tctx = ctx();
+        tctx.llm = Some(llm);
         let out = tool
             .execute(
                 json!({ "url": url_to(&server, "/"), "prompt": "   \t\n  " }),
-                &ctx(),
+                &tctx,
             )
             .await
             .unwrap();
@@ -1440,12 +1451,15 @@ mod tests {
             }),
         ))
         .await;
-        let llm = GuardedLlm::passthrough(stub.clone() as Arc<dyn LlmCompletion>);
-        let tool = WebFetchTool::for_testing().with_llm(llm);
+        let tool = WebFetchTool::for_testing();
+
+        let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
+        let mut tctx = ctx();
+        tctx.llm = Some(llm);
         let out = tool
             .execute(
                 json!({ "url": url_to(&server, "/"), "prompt": "?" }),
-                &ctx(),
+                &tctx,
             )
             .await
             .unwrap();

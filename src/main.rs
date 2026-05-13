@@ -140,12 +140,11 @@ async fn main() -> anyhow::Result<()> {
     };
     let stores = aura_storage::Store::open(boot::storage_db_path(&config.workspace)).await?;
     // Argv-mode commands (`llm probe`, `doctor`, `status`, `channel add`,
-    // …) don't drive WebFetch through an agent loop, so wiring a side
-    // LLM here would just be paperwork. Keep it `None` and let the few
-    // boot paths that *do* use tools (gateway/runtime) opt in.
+    // …) don't drive WebFetch through an agent loop; the per-call
+    // `ToolContext::llm` is left `None` in those paths, so WebFetch
+    // silently falls back to raw markdown.
     let tool_registry = Arc::new(aura_tools::ToolRegistry::with_defaults(
         stores.blob.clone(),
-        None,
         workspace_paths.clone(),
     ));
     let workspace = Arc::new(aura_workspace::WorkspaceManager::new(

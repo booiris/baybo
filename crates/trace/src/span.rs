@@ -172,7 +172,7 @@ impl LlmCallInputs {
 /// End-time result for an `LlmCall` span — set when the response is
 /// received. `None` while the span is `Pending` or if it cancelled
 /// before producing a result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LlmCallResult {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub output_content: String,

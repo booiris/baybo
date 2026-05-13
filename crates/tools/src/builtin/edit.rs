@@ -315,6 +315,7 @@ mod tests {
             approval: None,
             notifier: None,
             events: crate::noop_event_sink(),
+            llm: None,
         }
     }
 
@@ -334,6 +335,7 @@ mod tests {
             approval: None,
             notifier: None,
             events: crate::noop_event_sink(),
+            llm: None,
         }
     }
 
