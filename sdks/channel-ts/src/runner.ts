@@ -537,6 +537,22 @@ function dispatchFrame(
 ): void {
   switch (frame.kind) {
     case "message": {
+      // Defensive: a `Frame::Message` with `role: "user"` should only
+      // ever reach a Subscribed-kind subscriber (the web SPA, the
+      // TUI). It must NOT reach a Multiplexed-kind sidecar — the
+      // SDK's `onMessage` forwards to `platform.sendText`, which
+      // would echo the user's own input back to the upstream
+      // platform. The gateway already guards this at the source (see
+      // `Channel::echo_inbound` early-return on Multiplexed), so a
+      // user-role message reaching this point is a protocol violation
+      // / regression; drop it loudly rather than forwarding it.
+      if (frame.role === "user") {
+        logger.warn(
+          "dropping user-role Message frame; sidecars should only receive agent-authored messages",
+          { sessionId: frame.session_id, userId: frame.user_id },
+        );
+        return;
+      }
       void safeInvoke(
         () =>
           channel.onMessage({
