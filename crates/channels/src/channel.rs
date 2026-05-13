@@ -17,20 +17,21 @@ use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
 
 use crate::connection::{Connection, ConnectionId, SendOutcome};
+use crate::error::ConnectionNotFoundError;
 use crate::kind::ChannelKind;
 use crate::types::{AgentOutput, IncomingMessage, SessionEvent};
 use crate::wire::{ActivityKind, Frame, SessionPatch};
-use crate::{ChannelError, Result};
 
 /// Side-effect callback invoked at the top of [`Channel::dispatch_event`],
 /// before any fan-out. The observer receives the event by reference
 /// (so it can't take ownership and the dispatch path keeps running)
-/// and the channel itself (so it can call back into the channel's
-/// broadcast path to emit derived frames). Installable only via
-/// [`SubscribedView::set_dispatch_observer`] — multiplexed channels
-/// cannot register one, which matches the only production use today
-/// (the `http` channel's `SessionActivity` pulse).
-pub type DispatchObserver = Arc<dyn Fn(&SessionEvent, &Channel) + Send + Sync>;
+/// and a [`SubscribedView`] of the channel (so it can call back into
+/// the typed broadcast path to emit derived frames). The view-typed
+/// second argument is what makes "observer fired on a multiplexed
+/// channel" structurally impossible — installation goes through
+/// [`SubscribedView::set_dispatch_observer`], and dispatch only
+/// invokes the observer after re-narrowing to a `SubscribedView`.
+pub type DispatchObserver = Arc<dyn for<'a> Fn(&SessionEvent, SubscribedView<'a>) + Send + Sync>;
 
 /// Bundle of the channel's approval gate (the `ApprovalGate` trait
 /// object the agent / tool path calls through) and the underlying
@@ -239,10 +240,17 @@ impl Channel {
         // Fire the pre-dispatch hook before fan-out so the observer
         // sees every event — including those that drop below because
         // no subscribers exist for the session (the activity-broadcast
-        // case relies on this exact property).
+        // case relies on this exact property). Observers can only be
+        // installed via `SubscribedView::set_dispatch_observer`, so
+        // when the slot is `Some` the channel is structurally
+        // Subscribed — `as_subscribed()` is always `Some` here. The
+        // narrowing produces the `SubscribedView` the observer
+        // signature demands without resorting to `unsafe`.
         let observer = self.dispatch_observer.lock().clone();
-        if let Some(obs) = observer {
-            obs(&event, self);
+        if let Some(obs) = observer
+            && let Some(view) = self.as_subscribed()
+        {
+            obs(&event, view);
         }
         let session_id = event.session_id().clone();
         let mut to_drop = Vec::new();
@@ -361,16 +369,22 @@ pub struct SubscribedView<'a>(&'a Channel);
 
 impl<'a> SubscribedView<'a> {
     /// Subscribe a connection to one session. The only failure mode
-    /// is [`ChannelError::ConnectionNotFound`] (the id never
-    /// `attach`-ed or was already `detach`-ed) — the previous
-    /// `WrongKind` variant is structurally unreachable once you hold
-    /// a `SubscribedView`.
-    pub fn subscribe(&self, id: ConnectionId, session_id: SessionId) -> Result<()> {
+    /// is [`ConnectionNotFoundError`] (the id never `attach`-ed or
+    /// was already `detach`-ed) — the previous `WrongKind` variant
+    /// is structurally unreachable once you hold a `SubscribedView`,
+    /// and the other [`ChannelError`] variants never originate from
+    /// this code path. Surfacing only the one real failure mode
+    /// keeps `match` arms honest at the call site.
+    pub fn subscribe(
+        &self,
+        id: ConnectionId,
+        session_id: SessionId,
+    ) -> std::result::Result<(), ConnectionNotFoundError> {
         let channel = self.0;
         let conn = channel
             .connections
             .get(&id)
-            .ok_or_else(|| ChannelError::ConnectionNotFound(id.to_string()))?;
+            .ok_or_else(|| ConnectionNotFoundError(id.to_string()))?;
         conn.subscribed().insert(session_id.clone());
         channel
             .subscriptions
@@ -449,19 +463,10 @@ impl<'a> SubscribedView<'a> {
 /// goes through the gateway's `ChannelControlRegistry`, not directly
 /// through `Channel`. The type exists so a future multiplexed-only
 /// method has a natural home and so `Channel::as_multiplexed()` can
-/// stand symmetric to `as_subscribed()`.
+/// stand symmetric to `as_subscribed()`. The held `&Channel` is
+/// `#[allow(dead_code)]` until the first method that needs it lands.
 #[derive(Copy, Clone)]
-pub struct MultiplexedView<'a>(&'a Channel);
-
-impl<'a> MultiplexedView<'a> {
-    /// Borrow the underlying channel. Mostly here to keep the field
-    /// from triggering dead-code lints until the first multiplexed-
-    /// only method lands; remove once the view has its own
-    /// operations.
-    pub fn channel(&self) -> &'a Channel {
-        self.0
-    }
-}
+pub struct MultiplexedView<'a>(#[allow(dead_code)] &'a Channel);
 
 #[cfg(test)]
 mod tests {

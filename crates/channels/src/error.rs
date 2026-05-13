@@ -18,7 +18,15 @@ pub enum ChannelError {
 
     #[error("channel {0} already installed")]
     DuplicateChannel(String),
-
-    #[error("connection {0} not found on channel")]
-    ConnectionNotFound(String),
 }
+
+/// Dedicated, narrow error returned by
+/// [`crate::SubscribedView::subscribe`]. The previous broader
+/// [`ChannelError`] return type had three structurally-unreachable
+/// variants in this context (`WrongKind` was killed alongside the
+/// view migration; `Send` / `Config` / `NotReachable` / `Duplicate`
+/// never originate from `subscribe`'s body). Surfacing only the one
+/// real failure mode keeps `match` arms honest at the call site.
+#[derive(Debug, Error)]
+#[error("connection {0} not found on channel")]
+pub struct ConnectionNotFoundError(pub String);

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aura_channels::wire::ActivityKind;
-use aura_channels::{Channel, SessionEvent, SubscribedView};
+use aura_channels::{SessionEvent, SubscribedView};
 use aura_model::SessionId;
 use chrono::Utc;
 use dashmap::DashMap;
@@ -52,8 +52,8 @@ impl SessionPulse {
     /// so dropping the caller's handle is safe.
     pub fn install(self: &Arc<Self>, channel: SubscribedView<'_>) {
         let pulse = Arc::clone(self);
-        channel.set_dispatch_observer(Arc::new(move |event, channel| {
-            pulse.observe(event, channel);
+        channel.set_dispatch_observer(Arc::new(move |event, view| {
+            pulse.observe(event, view);
         }));
     }
 
@@ -61,7 +61,7 @@ impl SessionPulse {
     /// throttle, and broadcast a `Frame::SessionActivity` on hit.
     /// `pub(crate)` for direct testing; production callers go through
     /// the dispatch hook installed by [`SessionPulse::install`].
-    pub(crate) fn observe(&self, event: &SessionEvent, channel: &Channel) {
+    pub(crate) fn observe(&self, event: &SessionEvent, view: SubscribedView<'_>) {
         let (session_id, source) = match event {
             SessionEvent::UserEcho(msg) => (msg.message.session_id.clone(), ActivityKind::User),
             SessionEvent::Agent(out) => (out.session_id().clone(), ActivityKind::Assistant),
@@ -101,19 +101,6 @@ impl SessionPulse {
         if !should_emit {
             return;
         }
-        // Observer install is gated to Subscribed via
-        // `SubscribedView::set_dispatch_observer`, so this path can
-        // only fire on a Subscribed channel — the `as_subscribed()`
-        // unwrap is structurally `Some`. Defensive guard kept so a
-        // future relocation of the install API can't silently corrupt
-        // the invariant.
-        let Some(sub) = channel.as_subscribed() else {
-            tracing::error!(
-                channel_type = %channel.channel_type(),
-                "SessionPulse observer fired on non-Subscribed channel; dropping pulse",
-            );
-            return;
-        };
-        sub.broadcast_session_activity(session_id, source, Utc::now());
+        view.broadcast_session_activity(session_id, source, Utc::now());
     }
 }

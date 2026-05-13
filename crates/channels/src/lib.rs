@@ -12,7 +12,7 @@ pub mod wire;
 
 pub use channel::{ApprovalSurface, Channel, DispatchObserver, MultiplexedView, SubscribedView};
 pub use connection::{Connection, ConnectionId, ConnectionSink, SendOutcome};
-pub use error::ChannelError;
+pub use error::{ChannelError, ConnectionNotFoundError};
 pub use kind::ChannelKind;
 pub use registration::{Prompter, RegistrationResult};
 pub use registry::ChannelRegistry;
