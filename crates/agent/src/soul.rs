@@ -66,11 +66,27 @@ impl Soul {
         }
     }
 
-    /// Get the system prompt.
-    pub fn system_prompt(&self) -> &str {
-        &self.system_prompt
+    /// Render the system prompt for `session_id`, substituting the
+    /// session placeholder embedded in the env block. The Soul is
+    /// built before any session exists, so the env block carries a
+    /// `{{session_id}}` token that gets replaced here. Custom prompts
+    /// without the placeholder pass through unchanged.
+    pub fn system_prompt(&self, session_id: &str) -> String {
+        self.system_prompt
+            .replace(SESSION_ID_PLACEHOLDER, session_id)
     }
 }
+
+const SESSION_ID_PLACEHOLDER: &str = "{{session_id}}";
+const WORK_DIR_PLACEHOLDER: &str = "{{work_dir}}";
+const PLATFORM_PLACEHOLDER: &str = "{{platform}}";
+
+const ENV_BLOCK_TEMPLATE: &str = r#"# Environment
+- Working directory: {{work_dir}}
+- Platform: {{platform}}
+- Session ID: {{session_id}}
+
+Tool results and user messages may include <system-reminder> or other tags. Tags contain information from the system. They bear no direct relation to the specific tool results or user messages in which they appear."#;
 
 /// Wrap an identity-file body in an XML tag carrying the absolute
 /// on-disk path. Explicit boundaries keep arbitrary user-authored
@@ -93,19 +109,15 @@ fn wrap_section(tag: &str, path: &Path, body: &str) -> String {
 /// dir is absolutised before rendering — a relative workspace root
 /// (e.g. the debug-build default `./.aura`) would otherwise leak a
 /// cwd-relative path into the prompt and the agent has no way to
-/// know what cwd the runtime started from.
+/// know what cwd the runtime started from. The session-id placeholder
+/// is left intact here so [`Soul::system_prompt`] can substitute the
+/// per-conversation id at call time.
 fn build_env_block(workspace: &WorkspaceManager) -> String {
     let paths = WorkspacePaths::new(workspace.root.clone());
     let work_dir = absolutise(&paths.work_dir());
-    format!(
-        "# Environment\n\
-         - Working directory: {work_dir}\n\
-         - Platform: {platform}\n\
-         \n\
-         Tool results and user messages may include <system-reminder> or other tags. Tags contain information from the system. They bear no direct relation to the specific tool results or user messages in which they appear.",
-        work_dir = work_dir.display(),
-        platform = std::env::consts::OS,
-    )
+    ENV_BLOCK_TEMPLATE
+        .replace(WORK_DIR_PLACEHOLDER, &work_dir.display().to_string())
+        .replace(PLATFORM_PLACEHOLDER, std::env::consts::OS)
 }
 
 #[cfg(test)]
@@ -114,13 +126,15 @@ mod tests {
     use aura_workspace::IdentityKind;
     use std::path::PathBuf;
 
+    const TEST_SESSION_ID: &str = "sess-test-123";
+
     #[tokio::test]
     async fn from_workspace_seeds_defaults_and_wraps_every_section() {
         let dir = tempfile::tempdir().expect("tempdir");
         let workspace = WorkspaceManager::new(dir.path().to_path_buf());
         let soul = Soul::from_workspace(&workspace).await.expect("soul");
 
-        let prompt = soul.system_prompt();
+        let prompt = soul.system_prompt(TEST_SESSION_ID);
         let expected_work_dir =
             absolutise(&WorkspacePaths::new(dir.path().to_path_buf()).work_dir())
                 .display()
@@ -171,7 +185,7 @@ mod tests {
         // commit 046c664 ("update env prompt").
         let workspace = WorkspaceManager::new(PathBuf::from("./relative-soul-test/.aura"));
         let soul = Soul::from_workspace(&workspace).await.expect("soul");
-        let prompt = soul.system_prompt();
+        let prompt = soul.system_prompt(TEST_SESSION_ID);
 
         let mut saw_work_dir = false;
         for line in prompt.lines() {
@@ -205,7 +219,7 @@ mod tests {
             .expect("write identity");
 
         let soul = Soul::from_workspace(&workspace).await.expect("soul");
-        let prompt = soul.system_prompt();
+        let prompt = soul.system_prompt(TEST_SESSION_ID);
 
         let env_pos = prompt.find("# Environment").expect("env block present");
         let soul_pos = prompt.find("I am thoughtful.").expect("soul text present");
@@ -239,6 +253,26 @@ mod tests {
     #[test]
     fn custom_does_not_inject_env_block() {
         let soul = Soul::custom("just this".to_string());
-        assert_eq!(soul.system_prompt(), "just this");
+        assert_eq!(soul.system_prompt(TEST_SESSION_ID), "just this");
+    }
+
+    #[tokio::test]
+    async fn from_workspace_substitutes_session_id_in_env_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = WorkspaceManager::new(dir.path().to_path_buf());
+        let soul = Soul::from_workspace(&workspace).await.expect("soul");
+
+        let prompt = soul.system_prompt("sess-abc-42");
+        assert!(
+            prompt.contains("- Session ID: sess-abc-42"),
+            "session id should be substituted into env block: {prompt}"
+        );
+        assert!(
+            !prompt.contains(SESSION_ID_PLACEHOLDER),
+            "raw placeholder must not survive substitution: {prompt}"
+        );
+
+        let other = soul.system_prompt("sess-xyz");
+        assert!(other.contains("- Session ID: sess-xyz"));
     }
 }
