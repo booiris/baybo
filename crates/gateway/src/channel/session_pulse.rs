@@ -62,9 +62,7 @@ impl SessionPulse {
     /// [`SessionPulse::install`].
     pub(crate) fn observe(&self, event: &SessionEvent, channel: &Channel) {
         let (session_id, source) = match event {
-            SessionEvent::UserEcho(msg) => {
-                (msg.message.session_id.clone(), ActivityKind::User)
-            }
+            SessionEvent::UserEcho(msg) => (msg.message.session_id.clone(), ActivityKind::User),
             SessionEvent::Agent(out) => (out.session_id().clone(), ActivityKind::Assistant),
             // Approval prompts already have their own dedicated frame
             // (`ApprovalRequested`) that reaches every subscriber to

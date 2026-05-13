@@ -2,10 +2,11 @@
 //!
 //! Spins a tower-style admin router (no TCP listener) and walks the
 //! happy path: create session → mint credential → list shows it →
-//! get returns transcript → refresh issues a fresh token (revoking
-//! the previous one) → DELETE hides the row (the session itself
-//! stays on the server, only the chat list filters it) → unhide
-//! restores it to the default listing.
+//! get returns transcript → refresh issues a fresh token (the old
+//! one stays live so concurrent tabs don't revoke each other) →
+//! DELETE hides the row (the session itself stays on the server,
+//! only the chat list filters it) → unhide restores it to the
+//! default listing.
 
 use std::sync::Arc;
 
@@ -83,7 +84,11 @@ async fn chat_api_round_trip() {
         "transcript is empty on a fresh session",
     );
 
-    // ── 4. Refresh issues a new token + revokes the old one ─────────
+    // ── 4. Refresh issues a fresh token, leaves the old one live ────
+    // Two tabs against the same anchor session must each keep their
+    // own working token — keying the handle map by token (not
+    // session_id) is what prevents the second mint from revoking the
+    // first tab's bearer.
     let refreshed = post(
         &router,
         &format!("/v1/chat/sessions/{session_id}/token"),
@@ -96,8 +101,8 @@ async fn chat_api_round_trip() {
         .expect("refreshed token");
     assert_ne!(new_token, token, "refresh must mint a fresh token");
     assert!(
-        state.channel_tokens.lookup(&token).is_none(),
-        "old token must be revoked after refresh",
+        state.channel_tokens.lookup(&token).is_some(),
+        "old token must stay live after refresh so the sibling tab's WS keeps working",
     );
     assert!(
         state.channel_tokens.lookup(new_token).is_some(),

@@ -116,6 +116,16 @@ const HEARTBEAT_LIVENESS_TIMEOUT_MS = 45_000;
  *  the actual deadline without busy-spinning. */
 const HEARTBEAT_TICK_MS = 5_000;
 
+/** How many consecutive WS attempts that closed before reaching
+ *  `register_ack` constitute a "token presumed dead" signal that
+ *  triggers {@link ChatWsOptions.onTokenRejected}. A browser
+ *  WebSocket can't see the HTTP upgrade status, so a 401 from the
+ *  gateway's channel-auth middleware reaches us only as `onclose`
+ *  with no prior frames. Two in a row rules out a one-off transient
+ *  (DNS hiccup, server still booting) while still recovering in
+ *  ~3 seconds via the existing backoff ladder. */
+const PRESUME_TOKEN_DEAD_THRESHOLD = 2;
+
 export type ConnectionStatus =
   | { state: 'connecting' }
   | { state: 'connected' }
@@ -183,6 +193,20 @@ export class ChatWs {
    *  {@link HEARTBEAT_LIVENESS_TIMEOUT_MS} to detect half-open TCP
    *  state that the browser would otherwise hide. */
   private lastFrameAt = 0;
+  /** True once the current connect attempt received `register_ack
+   *  { ok: true }`. Reset on every {@link connect}; consulted by
+   *  {@link onClose} to tell apart "WS closed mid-session" from "WS
+   *  never came up". A 401 on the HTTP upgrade closes the socket
+   *  before a single frame arrives, so the only signal we have for
+   *  auth-time rejection from a browser WebSocket is "connect → close
+   *  without ever flipping `reachedConnectedThisAttempt = true`". */
+  private reachedConnectedThisAttempt = false;
+  /** Consecutive WS attempts that died before reaching RegisterAck.
+   *  Reset on a successful RegisterAck. When it crosses
+   *  {@link PRESUME_TOKEN_DEAD_THRESHOLD} we presume the channel
+   *  token is dead (revoked, gateway restart, …) and route to
+   *  `onTokenRejected` so the caller can re-mint. */
+  private consecutivePreAckCloses = 0;
 
   constructor(private readonly opts: ChatWsOptions) {
     this.channelToken = opts.channelToken;
@@ -268,6 +292,7 @@ export class ChatWs {
     this.channelToken = newToken;
     this.suspended = false;
     this.retryAttempt = 0;
+    this.consecutivePreAckCloses = 0;
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
@@ -346,6 +371,7 @@ export class ChatWs {
 
   private connect(): void {
     if (this.closed || this.suspended) return;
+    this.reachedConnectedThisAttempt = false;
     this.notifyStatus({ state: 'connecting' });
     const url = buildWsUrl(this.opts.baseUrl, this.channelToken);
     let ws: WebSocket;
@@ -403,6 +429,8 @@ export class ChatWs {
           return;
         }
         this.retryAttempt = 0;
+        this.reachedConnectedThisAttempt = true;
+        this.consecutivePreAckCloses = 0;
         this.notifyStatus({ state: 'connected' });
         // Replay every subscription. Cursor (if any) tells the server
         // what we've already seen so it can stream catch-up frames for
@@ -464,7 +492,31 @@ export class ChatWs {
     this.stopHeartbeat();
     this.ws = null;
     if (this.closed) return;
-    this.scheduleReconnect(`ws close (${e.code}${e.reason ? `: ${e.reason}` : ''})`);
+    const reason = `ws close (${e.code}${e.reason ? `: ${e.reason}` : ''})`;
+    // A close that lands before `register_ack { ok: true }` arrived
+    // is suspicious. The most common cause in production is the
+    // gateway's HTTP upgrade rejecting our token (401) — browsers
+    // surface that as a plain `onclose` with no preceding frames, so
+    // we can't distinguish it from a generic socket failure. After
+    // two such attempts in a row we presume the token is dead and
+    // route to `onTokenRejected` so the page can re-mint, mirroring
+    // the explicit `register_ack { ok: false }` path. The threshold
+    // rules out one-off transients (DNS, server still booting).
+    if (!this.reachedConnectedThisAttempt) {
+      this.consecutivePreAckCloses += 1;
+      if (this.consecutivePreAckCloses >= PRESUME_TOKEN_DEAD_THRESHOLD) {
+        this.consecutivePreAckCloses = 0;
+        this.suspended = true;
+        this.notifyStatus({
+          state: 'disconnected',
+          retryInMs: 0,
+          lastError: `token presumed dead after upgrade close: ${reason}`,
+        });
+        this.opts.onTokenRejected?.(`upgrade-time close: ${reason}`);
+        return;
+      }
+    }
+    this.scheduleReconnect(reason);
   }
 
   private scheduleReconnect(reason: string): void {

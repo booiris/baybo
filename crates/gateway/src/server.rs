@@ -139,11 +139,14 @@ pub struct AdminState {
     /// can mint short-lived web channel-tokens that the same
     /// `require_channel_auth` middleware accepts on `/v1/channel-ws`.
     pub channel_tokens: crate::auth::ChannelTokenTable,
-    /// Per-session [`TokenHandle`]s for web chat sessions. Holding
-    /// them here is what keeps the minted tokens live; dropping an
-    /// entry revokes the bearer immediately. Bounded only by the
-    /// number of live web chat sessions.
-    pub web_chat_tokens: Arc<dashmap::DashMap<aura_model::SessionId, crate::auth::TokenHandle>>,
+    /// Live [`TokenHandle`]s for web chat tabs, keyed by the token
+    /// string. Holding them here is what keeps the minted tokens
+    /// live; dropping an entry revokes the bearer immediately. Keyed
+    /// by token (not session_id) so two tabs anchored to the same
+    /// session don't trample each other — the previous keying caused
+    /// the second tab's mint to revoke the first tab's token, which
+    /// then 401-loops on any reconnect.
+    pub web_chat_tokens: Arc<dashmap::DashMap<String, crate::auth::TokenHandle>>,
     /// Pretty form of the admin bind address for `/v1/status`.
     pub bind_display: String,
 }

@@ -453,10 +453,16 @@ async fn slash_manifest(
 // ── helpers ──────────────────────────────────────────────────────────
 
 /// Mint a fresh web channel-token for `session_id`, store the handle
-/// on [`AdminState::web_chat_tokens`] (revoking any previous one), and
+/// on [`AdminState::web_chat_tokens`] keyed by the token itself, and
 /// return the credential. Caller is responsible for any "session
 /// must exist" check; `create_session` issues a fresh session row
 /// directly above this call so it doesn't bother.
+///
+/// The map is keyed by the token string so concurrent tabs anchored
+/// to the same session each get their own live `TokenHandle` — keying
+/// by `session_id` would make the second tab's mint drop (and
+/// revoke) the first tab's handle, breaking the first tab's
+/// reconnect path.
 fn mint_credential(state: &AdminState, session_id: &SessionId) -> ChatSessionCredential {
     let label = format!("{WEB_CLIENT_LABEL_PREFIX}{}", uuid::Uuid::new_v4());
     let handle = state.channel_tokens.mint(ClientIdentity {
@@ -465,9 +471,7 @@ fn mint_credential(state: &AdminState, session_id: &SessionId) -> ChatSessionCre
         bound_channel_type: Some(ChannelType::http().to_string()),
     });
     let token = handle.token().to_owned();
-    // Replacing an existing entry drops the previous `TokenHandle`,
-    // which in turn revokes the previous token from the live table.
-    state.web_chat_tokens.insert(session_id.clone(), handle);
+    state.web_chat_tokens.insert(token.clone(), handle);
     ChatSessionCredential {
         session_id: session_id.to_string(),
         channel_token: token,
