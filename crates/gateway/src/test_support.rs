@@ -142,6 +142,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         log_buffer: LogBuffer::new(256),
         incoming_tx,
         channel_tokens: channel_tokens.clone(),
+        web_chat_tokens: Arc::new(dashmap::DashMap::new()),
         secret_vault,
         stores,
         channel_control,

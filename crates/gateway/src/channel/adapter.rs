@@ -32,6 +32,8 @@ use futures::stream::SplitSink;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::auth::TokenHandle;
+
 pub(crate) type WsSink = SplitSink<WebSocket, AxumWsMessage>;
 
 /// Outbound mpsc buffer. Large enough to absorb a short burst of
@@ -47,6 +49,18 @@ pub(crate) struct Sidecar {
     pub connection: Arc<Connection>,
     frame_tx: mpsc::Sender<Frame>,
     pump: JoinHandle<()>,
+    /// `Some` for `AuthedClient::Web` connections: the `TokenHandle`
+    /// owned by this WS. Held purely for its `Drop` side effect —
+    /// when the `Sidecar` drops (WS close), the handle drops, which
+    /// revokes the token from [`crate::auth::ChannelTokenTable`].
+    /// `None` for other auth variants whose handles are owned
+    /// elsewhere (gateway-issued TUI token, `spawn::ChildHandle` for
+    /// sidecars). Race-tolerant: if a second WS upgrades with the
+    /// same token (e.g. dev StrictMode double-mount) and the handle
+    /// is already owned by the first `Sidecar`, the second gets
+    /// `None` here — the token stays alive as long as either
+    /// `Sidecar` does.
+    _token_handle: Option<TokenHandle>,
 }
 
 impl Sidecar {
@@ -59,6 +73,7 @@ impl Sidecar {
         registry: &Arc<ChannelRegistry>,
         sink: WsSink,
         blob_store: Arc<dyn BlobStore>,
+        token_handle: Option<TokenHandle>,
     ) -> Result<Self, ChannelError> {
         let channel = match registry.get(&channel_type) {
             Some(ch) => ch,
@@ -104,6 +119,7 @@ impl Sidecar {
             connection,
             frame_tx,
             pump,
+            _token_handle: token_handle,
         })
     }
 

@@ -64,14 +64,14 @@ pub(crate) fn validate_register(
                 "label '{label}' is reserved for tool sidecars and may not register on /v1/channel-ws",
             ));
         }
-        AuthedClient::Web { label } => {
+        AuthedClient::Web { label, token } => {
             if normalized != ChannelType::HTTP {
                 return Err(format!(
                     "web chat token must register as channel_type '{}', got '{normalized}'",
                     ChannelType::HTTP,
                 ));
             }
-            let _ = label;
+            let _ = (label, token);
         }
         AuthedClient::Subprocess { pid, label, .. } => {
             if label.starts_with(TOOL_CLIENT_LABEL_PREFIX) {
@@ -305,6 +305,7 @@ mod tests {
         let frame = register("", ChannelType::HTTP);
         let authed = AuthedClient::Web {
             label: "web/abc".to_string(),
+            token: "test-token".to_string(),
         };
         let outcome = validate_register(frame, &authed, &tokens).unwrap();
         assert_eq!(outcome.channel_type.as_str(), ChannelType::HTTP);
@@ -319,6 +320,7 @@ mod tests {
         let frame = register("", "telegram");
         let authed = AuthedClient::Web {
             label: "web/abc".to_string(),
+            token: "test-token".to_string(),
         };
         let err = validate_register(frame, &authed, &tokens).unwrap_err();
         assert!(

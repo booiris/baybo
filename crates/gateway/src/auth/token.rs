@@ -43,9 +43,14 @@ pub const TOOL_CLIENT_LABEL_PREFIX: &str = "tool/";
 /// short-lived channel-token under this label; the channel auth
 /// middleware turns it into [`crate::AuthedClient::Web`] which is the
 /// sole identity allowed to claim the otherwise-reserved `"http"`
-/// channel type on `/v1/channel-ws`. Tokens are held by the admin
-/// chat module for the session's lifetime and revoked on
-/// `DELETE /v1/chat/sessions/:id`.
+/// channel type on `/v1/channel-ws`.
+///
+/// Lifecycle: the admin mint stashes the [`TokenHandle`] in
+/// `AdminState::web_chat_tokens` keyed by token string. The channel
+/// WS route removes the matching entry on successful upgrade and
+/// moves the handle into the `Sidecar`, so the token revokes itself
+/// when the WS closes. Handles still in the map (mint without a
+/// follow-up WS upgrade) are released at process exit.
 pub const WEB_CLIENT_LABEL_PREFIX: &str = "web/";
 
 /// Synthetic `User.id` the chat API stamps on sessions originated from

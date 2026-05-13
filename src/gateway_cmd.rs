@@ -410,6 +410,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         log_buffer: Arc::clone(&log_buffer),
         incoming_tx: run_handle.incoming_tx.clone(),
         channel_tokens: channel_tokens.clone(),
+        web_chat_tokens: Arc::new(Default::default()),
         secret_vault: Arc::clone(&graph.secret_vault),
         stores: graph.stores.clone(),
         channel_control,

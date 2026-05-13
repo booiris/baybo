@@ -69,11 +69,17 @@ pub enum AuthedClient {
         /// (e.g. `"web/<uuid>"`). The suffix uniquely identifies the
         /// minted session so logs and metrics can attribute traffic.
         label: String,
+        /// Raw token string the caller presented. The channel WS
+        /// route uses this to take the matching `TokenHandle` out of
+        /// `web_chat_tokens` on successful upgrade so the handle
+        /// rides the connection lifetime (and revokes the token on
+        /// close).
+        token: String,
     },
 }
 
 impl AuthedClient {
-    fn from_identity(identity: ClientIdentity) -> Self {
+    fn from_identity(identity: ClientIdentity, token: &str) -> Self {
         if identity.label == TUI_CLIENT_LABEL {
             AuthedClient::Tui
         } else if identity.label.starts_with(TOOL_CLIENT_LABEL_PREFIX) {
@@ -83,6 +89,7 @@ impl AuthedClient {
         } else if identity.label.starts_with(WEB_CLIENT_LABEL_PREFIX) {
             AuthedClient::Web {
                 label: identity.label,
+                token: token.to_owned(),
             }
         } else {
             AuthedClient::Subprocess {
@@ -149,7 +156,7 @@ pub async fn require_channel_auth(
                         "channel auth: accepted via subprocess token",
                     );
                 }
-                AuthedClient::Web { label } => {
+                AuthedClient::Web { label, .. } => {
                     tracing::debug!(
                         %path, label = %label,
                         "channel auth: accepted via web chat token",
@@ -211,7 +218,7 @@ fn check_channel_token(
         return Ok(None);
     };
     match state.tokens.lookup(token.as_ref()) {
-        Some(identity) => Ok(Some(AuthedClient::from_identity(identity))),
+        Some(identity) => Ok(Some(AuthedClient::from_identity(identity, token.as_ref()))),
         None => {
             tracing::debug!(
                 token_prefix = %short_token(token.as_ref()),

@@ -74,11 +74,29 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
 
     let channel_type = outcome.channel_type;
 
+    // For web-chat connections, take the `TokenHandle` stashed at
+    // mint time and move it into the `Sidecar` so the token's
+    // lifetime is bound to this WS. When the `Sidecar` drops on WS
+    // close, the handle drops with it and the token revokes itself
+    // out of `state.tokens`. `None` for non-web auth (TUI / sidecars
+    // own their handles elsewhere) and for the rare race where a
+    // second WS upgrades with the same token before the first has
+    // closed — that second `Sidecar` runs without ownership; the
+    // token stays alive as long as either sidecar does.
+    let token_handle = match &authed {
+        AuthedClient::Web { token, .. } => state
+            .web_chat_tokens
+            .remove(token)
+            .map(|(_, handle)| handle),
+        _ => None,
+    };
+
     let sidecar = match Sidecar::build(
         channel_type.clone(),
         &state.registry,
         sink,
         std::sync::Arc::clone(&state.blob_store),
+        token_handle,
     ) {
         Ok(s) => s,
         Err(err) => {

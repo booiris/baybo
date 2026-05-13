@@ -887,3 +887,80 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
     shutdown.trigger();
     let _ = server_handle.await;
 }
+
+/// The web mint endpoint stashes a `TokenHandle` in
+/// `web_chat_tokens`; the channel-WS upgrade is supposed to remove it
+/// from that stash and bind the handle to the connection's `Sidecar`,
+/// so closing the WS revokes the token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_ws_upgrade_takes_handle_and_revokes_on_close() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let port_file =
+        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let mut cfg = ChannelsConfig::default();
+    cfg.http = Some(aura_config::HttpChannelConfig {
+        enabled: true,
+        bind_address: "127.0.0.1".into(),
+        port: 0,
+    });
+    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+
+    let channel_tokens = tg.channel_tokens.clone();
+    let web_chat_tokens = Arc::clone(&tg.deps.web_chat_tokens);
+    let shutdown = tg.shutdown.clone();
+    let server =
+        ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone()).expect("bind server");
+    let port = server.port();
+    let server_shutdown = shutdown.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run(server_shutdown).await;
+    });
+
+    // Mimic the admin mint path: mint a token and stash the handle
+    // keyed by token string.
+    let handle = channel_tokens.mint(ClientIdentity {
+        pid: std::process::id(),
+        label: format!("{WEB_CLIENT_LABEL_PREFIX}lifecycle-test"),
+        bound_channel_type: Some(ChannelType::http().to_string()),
+    });
+    let token = handle.token().to_owned();
+    web_chat_tokens.insert(token.clone(), handle);
+    assert!(
+        channel_tokens.lookup(&token).is_some(),
+        "fresh mint is live"
+    );
+    assert!(web_chat_tokens.contains_key(&token), "handle stashed");
+
+    let client = connect_register(port, &token, ChannelType::http())
+        .await
+        .expect("handshake");
+
+    // After upgrade, the stash entry is gone — the handle has been
+    // moved into the Sidecar — but the token itself stays live for
+    // the duration of the WS.
+    assert!(
+        !web_chat_tokens.contains_key(&token),
+        "WS upgrade should have removed the stashed handle",
+    );
+    assert!(
+        channel_tokens.lookup(&token).is_some(),
+        "token stays live while the WS is open (Sidecar owns the handle)",
+    );
+
+    drop(client);
+
+    // Server-side close detection is async — poll until the Sidecar
+    // drops its handle (or fail the test after a generous deadline).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while channel_tokens.lookup(&token).is_some() {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("token should have been revoked after WS close");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    shutdown.trigger();
+    let _ = server_handle.await;
+}
