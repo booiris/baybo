@@ -6,7 +6,7 @@
 //! [`Channel`] (`channel.attach` / `channel.detach`) and are not the
 //! registry's concern.
 //!
-//! See [`docs/modules/channels-protocol-refactor.md`](../../../docs/modules/channels-protocol-refactor.md)
+//! See [`docs/modules/channels.md`](../../../docs/modules/channels.md)
 //! for the surrounding model.
 
 use std::sync::Arc;

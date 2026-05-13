@@ -211,7 +211,7 @@ fn build_admin_state(
         channel_control: Arc::clone(&tg.deps.channel_control),
         secret_vault: Arc::clone(&tg.deps.secret_vault),
         channel_tokens: tg.deps.channel_tokens.clone(),
-        web_chat_tokens: Arc::new(dashmap::DashMap::new()),
+        web_chat_tokens: Arc::clone(&tg.deps.web_chat_tokens),
         bind_display: tg.deps.runtime_config.admin_bind.to_string(),
     }
 }

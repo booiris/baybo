@@ -42,10 +42,13 @@ pub trait SessionStore: Send + Sync {
     /// hidden from the list. Returns `Ok(true)` when the row existed
     /// and was updated, `Ok(false)` if no row matched.
     ///
-    /// Implementations must update the flat `hidden` column and the
-    /// JSON `data` blob's `hidden` field atomically (one SQL
-    /// statement), so concurrent `touch` / `save` calls don't lose
-    /// the update.
+    /// Implementations write only the flat `hidden` column and leave
+    /// the JSON `data` blob's `hidden` field untouched: a concurrent
+    /// `save` (which rewrites the full blob from a stale in-memory
+    /// `Session`) would otherwise clobber the update. `get` patches
+    /// `Session.hidden` from the column at read time, so observers
+    /// always see the authoritative value regardless of blob
+    /// staleness.
     async fn set_hidden(&self, session_id: &SessionId, hidden: bool) -> Result<bool>;
 
     /// Hard-delete the session.

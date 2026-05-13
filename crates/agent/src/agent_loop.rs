@@ -1847,36 +1847,26 @@ impl AgentLoop {
     /// "what skills are available" context adjacent to its instructions
     /// and avoids appending a fresh reminder row every turn.
     async fn ensure_system_prompt(&mut self, session: &mut Session) -> anyhow::Result<()> {
-        if self
-            .context_manager
-            .messages()
-            .first()
-            .is_some_and(|m| m.role == Role::System)
-        {
-            return Ok(());
-        }
-        let msg = ChatMessage {
-            role: Role::System,
-            content: vec![ContentBlock::Text(self.soul.system_prompt().to_string())],
-            from_user: false,
-        };
-        self.append_context_message(session, &msg).await?;
-
         let skills = if self.skill_registry.is_empty() {
             Vec::new()
         } else {
             self.invocable_skills()
         };
-        if !skills.is_empty() {
-            let reminder = aura_skills::render::render_skill_reminder(&skills);
-            let reminder_msg = ChatMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text(reminder)],
-                from_user: false,
-            };
-            self.append_context_message(session, &reminder_msg).await?;
+        let to_seed = initial_seed_messages(
+            self.context_manager.messages().first(),
+            self.soul.system_prompt(),
+            &skills,
+        );
+        for msg in &to_seed {
+            self.append_context_message(session, msg).await?;
         }
-        session.state.active_skills = skills.iter().map(|s| s.name.clone()).collect();
+        // active_skills mirrors the reminder we actually seeded; on the
+        // re-entry path (leading system already present) `to_seed` is
+        // empty and we leave the field unchanged so the prior value
+        // carries forward.
+        if !to_seed.is_empty() {
+            session.state.active_skills = skills.iter().map(|s| s.name.clone()).collect();
+        }
         Ok(())
     }
 
@@ -1926,6 +1916,43 @@ impl AgentLoop {
             })
             .collect()
     }
+}
+
+/// Pure decision logic for [`AgentLoop::ensure_system_prompt`]: given the
+/// current leading message (if any), the resolved soul prompt, and the
+/// invocable skill set, return the messages that should be appended.
+///
+/// Invariants:
+/// - A leading `Role::System` message inhibits all seeding — empty vec.
+/// - No leading system → exactly one system row is seeded.
+/// - The skill reminder is appended **only** alongside a freshly-seeded
+///   system row, never on the early-return path. This is what makes the
+///   reminder fire exactly once per session: any subsequent call observes
+///   the system row and short-circuits.
+fn initial_seed_messages(
+    leading: Option<&ChatMessage>,
+    soul_prompt: &str,
+    skills: &[SkillSummary],
+) -> Vec<ChatMessage> {
+    if leading.is_some_and(|m| m.role == Role::System) {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(if skills.is_empty() { 1 } else { 2 });
+    out.push(ChatMessage {
+        role: Role::System,
+        content: vec![ContentBlock::Text(soul_prompt.to_string())],
+        from_user: false,
+    });
+    if !skills.is_empty() {
+        out.push(ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text(
+                aura_skills::render::render_skill_reminder(skills),
+            )],
+            from_user: false,
+        });
+    }
+    out
 }
 
 /// Strip leading/trailing whitespace from the LLM response's text fields.
@@ -2468,5 +2495,106 @@ mod merge_for_llm_tests {
         assert_eq!(out.len(), 3);
         assert_eq!(out[1], assistant);
         assert_eq!(out[2], tool);
+    }
+}
+
+#[cfg(test)]
+mod initial_seed_tests {
+    use super::initial_seed_messages;
+    use aura_model::{ChatMessage, ContentBlock, Role};
+    use aura_skills::SkillSummary;
+
+    const SOUL: &str = "You are Aura.";
+
+    fn skill(name: &str) -> SkillSummary {
+        SkillSummary {
+            name: name.into(),
+            command: None,
+            description: format!("{name} description"),
+            argument_hint: None,
+            agent_invocable: true,
+            trust_level: aura_model::TrustLevel::Trusted,
+        }
+    }
+
+    fn system_row() -> ChatMessage {
+        ChatMessage {
+            role: Role::System,
+            content: vec![ContentBlock::Text(SOUL.into())],
+            from_user: false,
+        }
+    }
+
+    fn user_row() -> ChatMessage {
+        ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("hi".into())],
+            from_user: true,
+        }
+    }
+
+    #[test]
+    fn fresh_start_no_skills_seeds_system_only() {
+        let out = initial_seed_messages(None, SOUL, &[]);
+        assert_eq!(out.len(), 1, "expected one system row, got {out:?}");
+        assert_eq!(out[0].role, Role::System);
+        assert!(matches!(out[0].content[0], ContentBlock::Text(ref t) if t == SOUL));
+    }
+
+    #[test]
+    fn fresh_start_with_skills_seeds_system_then_reminder() {
+        let skills = vec![skill("alpha"), skill("beta")];
+        let out = initial_seed_messages(None, SOUL, &skills);
+        assert_eq!(out.len(), 2, "expected system + reminder, got {out:?}");
+        assert_eq!(out[0].role, Role::System);
+        assert_eq!(
+            out[1].role,
+            Role::User,
+            "reminder rides as Role::User because some providers reject mid-stream system rows",
+        );
+        assert!(!out[1].from_user, "synthetic rows are never from_user");
+        let reminder_text = match &out[1].content[0] {
+            ContentBlock::Text(t) => t,
+            _ => panic!("reminder should be a text block"),
+        };
+        assert!(reminder_text.contains("alpha"));
+        assert!(reminder_text.contains("beta"));
+    }
+
+    #[test]
+    fn leading_system_short_circuits_even_with_skills() {
+        let leading = system_row();
+        let skills = vec![skill("alpha")];
+        let out = initial_seed_messages(Some(&leading), SOUL, &skills);
+        assert!(
+            out.is_empty(),
+            "re-entry must not append anything; got {out:?}",
+        );
+    }
+
+    #[test]
+    fn leading_non_system_does_not_short_circuit() {
+        // Defensive — a transcript whose first row is a user message
+        // (test fixture, restored partial state) still gets seeded so
+        // the LLM sees a leading system row.
+        let leading = user_row();
+        let out = initial_seed_messages(Some(&leading), SOUL, &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, Role::System);
+    }
+
+    #[test]
+    fn second_call_after_first_seeds_nothing() {
+        // The exactly-once invariant: simulate two consecutive calls by
+        // feeding the previously-seeded system row as the leading
+        // message on the second call.
+        let first = initial_seed_messages(None, SOUL, &[skill("alpha")]);
+        let leading = first[0].clone();
+        let second = initial_seed_messages(Some(&leading), SOUL, &[skill("alpha")]);
+        assert_eq!(first.len(), 2);
+        assert!(
+            second.is_empty(),
+            "second call must short-circuit on the leading system row",
+        );
     }
 }
