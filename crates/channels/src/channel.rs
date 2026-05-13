@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use aura_model::{ChannelType, ResourceAccess, SessionId};
-use aura_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue};
+use aura_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ApprovalRequest};
 use chrono::{DateTime, Utc};
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
@@ -91,15 +91,20 @@ impl Channel {
         self.approvals.as_ref().map(|a| Arc::clone(&a.gate))
     }
 
-    /// Snapshot the `call_id`s of currently-pending approvals scoped to
-    /// `session_id`. Used by route layers on (re)subscribe to ship a
-    /// reconciliation frame so clients can drop locally-cached prompt
-    /// cards whose underlying approvals were resolved while their
-    /// connection was down — `Frame::ApprovalResolved` is in-band
-    /// fan-out only, not persisted, not replayed on catch-up. Returns
-    /// empty when this channel has no approval surface (the queue is
-    /// optional per channel) or no entries match the session.
-    pub fn pending_approval_call_ids(&self, session_id: &SessionId) -> Vec<String> {
+    /// Snapshot the full pending [`ApprovalRequest`] entries scoped to
+    /// `session_id`. Used by route layers on (re)subscribe so a
+    /// reconnecting client can both
+    ///   * **recover** approval cards it never received (or lost to a
+    ///     full reload) by replaying the originating
+    ///     `Frame::ApprovalRequested`, and
+    ///   * **reconcile** locally-cached cards against the queue's
+    ///     truth via [`Self::pending_approval_call_ids`] — entries
+    ///     already resolved by another tab are absent from the list
+    ///     and so the stale card is dropped on the client side.
+    ///
+    /// Returns empty when this channel has no approval surface or no
+    /// entries match the session.
+    pub fn pending_approvals(&self, session_id: &SessionId) -> Vec<ApprovalRequest> {
         let Some(approvals) = self.approvals.as_ref() else {
             return Vec::new();
         };
@@ -108,6 +113,14 @@ impl Channel {
             .list()
             .into_iter()
             .filter(|req| req.session_id == *session_id)
+            .collect()
+    }
+
+    /// Just the `call_id`s of [`Self::pending_approvals`]. Kept for
+    /// the reconciliation-only path that ships `PendingApprovalsSnapshot`.
+    pub fn pending_approval_call_ids(&self, session_id: &SessionId) -> Vec<String> {
+        self.pending_approvals(session_id)
+            .into_iter()
             .map(|req| req.call_id)
             .collect()
     }

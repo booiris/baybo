@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use aura_channels::wire::{Frame, Message as WireMessage};
-use aura_channels::{ChannelError, IncomingMessage, NoticeLevel, Result};
+use aura_channels::{ChannelError, IncomingMessage, MessageRole, NoticeLevel, Result};
 use aura_model::{ChannelType, ContentBlock, SessionId};
 use aura_tools::{ApprovalQueue, ApprovalRequest};
 use tokio::sync::{Mutex, mpsc};
@@ -228,6 +228,16 @@ fn map_frame(
         }
         Frame::Message(msg) => {
             if &msg.session_id != target_session {
+                return None;
+            }
+            // `tui` is a `Subscribed` channel, so the gateway echoes
+            // inbound user messages back to every subscriber — including
+            // the sender. The TUI already rendered the prompt locally
+            // via `state.push_user` before dispatch, so the echo would
+            // duplicate the row (and render with the wrong role). Drop
+            // user echoes; only assistant rows are agent output we
+            // haven't already shown.
+            if matches!(msg.role, MessageRole::User) {
                 return None;
             }
             Some(TransportEvent::Response(vec![ContentBlock::Text(

@@ -1138,6 +1138,7 @@ function routeInboundFrame(
       // to the normal append path. Decision is made inside the
       // updater because state setters are batched — checking outside
       // can't observe whether the updater found a match.
+      const hasAttachments = (frame.attachments?.length ?? 0) > 0;
       if (role === 'user' && frame.platform_msg_id) {
         const clientMsgId = frame.platform_msg_id;
         setViews((prev) => {
@@ -1151,6 +1152,7 @@ function routeInboundFrame(
               ...view.transcript[idx],
               text: frame.content,
               pending: false,
+              hasAttachments: hasAttachments || next[idx].hasAttachments,
             };
             return { ...prev, [sid]: { ...view, transcript: next } };
           }
@@ -1158,7 +1160,7 @@ function routeInboundFrame(
             ...prev,
             [sid]: {
               ...view,
-              transcript: finalizeMessage(view.transcript, role, frame.content),
+              transcript: finalizeMessage(view.transcript, role, frame.content, hasAttachments),
             },
           };
         });
@@ -1168,7 +1170,10 @@ function routeInboundFrame(
         const view = prev[sid] ?? EMPTY_VIEW;
         return {
           ...prev,
-          [sid]: { ...view, transcript: finalizeMessage(view.transcript, role, frame.content) },
+          [sid]: {
+            ...view,
+            transcript: finalizeMessage(view.transcript, role, frame.content, hasAttachments),
+          },
         };
       });
       return;
@@ -1296,10 +1301,22 @@ function finalizeMessage(
   prev: TranscriptRow[],
   role: 'user' | 'assistant',
   content: string,
+  hasAttachments: boolean,
 ): TranscriptRow[] {
   const last = prev[prev.length - 1];
   if (role === 'assistant' && last?.streaming && last.role === 'assistant') {
-    return [...prev.slice(0, -1), { ...last, text: content, streaming: false }];
+    return [
+      ...prev.slice(0, -1),
+      {
+        ...last,
+        text: content,
+        streaming: false,
+        // Live attachments stay observable on the streaming row — the
+        // bubble's `row.text || [attachment]` fallback then renders
+        // correctly even when the assistant produced only media.
+        hasAttachments: hasAttachments || last.hasAttachments,
+      },
+    ];
   }
   return [
     ...prev,
@@ -1307,6 +1324,7 @@ function finalizeMessage(
       key: `msg-${prev.length}-${Date.now()}`,
       role,
       text: content,
+      hasAttachments: hasAttachments || undefined,
     },
   ];
 }

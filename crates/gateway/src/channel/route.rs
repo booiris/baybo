@@ -153,8 +153,14 @@ async fn run_connection(socket: WebSocket, state: WsChannelState, authed: Authed
     run_inbound_loop(source, &state, &channel_type, &sidecar).await;
 
     if kind.is_multiplexed() {
-        state.control.unregister(&channel_type);
-        state.bot_reconciler.forget(&channel_type);
+        // Only clean up if this connection still owns the slot — a
+        // fast sidecar reconnect can have already swapped the entry
+        // to the new pump, in which case blindly evicting here would
+        // silently kill control delivery to the live sidecar.
+        let our_tx = sidecar.frame_tx_clone();
+        if state.control.unregister_if_owned(&channel_type, &our_tx) {
+            state.bot_reconciler.forget(&channel_type);
+        }
     }
     let _ = sidecar.into_pump().await;
     tracing::info!(
@@ -336,16 +342,43 @@ async fn run_inbound_loop(
                                 tracing::warn!(error = %e, "failed to send HistorySnapshot");
                             }
                         }
-                        // Ship the authoritative pending-approvals
-                        // snapshot for this session so the client can
-                        // reconcile any locally-cached ApprovalCard
-                        // against the queue's truth — covers the case
-                        // where an approval was resolved by another tab
-                        // while this connection was down (the
-                        // `ApprovalResolved` fan-out is fire-and-forget
-                        // and not replayed on catch-up).
-                        let pending_call_ids =
-                            sidecar.channel.pending_approval_call_ids(&session_id);
+                        // Recover any pending approvals the client
+                        // missed (or lost to a reload) by replaying
+                        // the originating `ApprovalRequested` for each.
+                        // `Frame::ApprovalResolved` is fire-and-forget
+                        // and the queue itself is the canonical record,
+                        // so a reconnecting client can render the full
+                        // prompt only if we resend the request data;
+                        // shipping just the `call_id` list lets the
+                        // tool call block until timeout. The follow-up
+                        // `PendingApprovalsSnapshot` then handles the
+                        // mirror case — dropping locally-cached cards
+                        // whose approvals were resolved while this
+                        // connection was down.
+                        let pending = sidecar.channel.pending_approvals(&session_id);
+                        let pending_call_ids: Vec<String> =
+                            pending.iter().map(|r| r.call_id.clone()).collect();
+                        for req in pending {
+                            if let Err(e) = sidecar
+                                .send_frame(Frame::ApprovalRequested {
+                                    call_id: req.call_id,
+                                    session_id: req.session_id,
+                                    user_id: req.user_id,
+                                    tool: req.tool,
+                                    accesses: req.accesses,
+                                    params_preview: req.params_preview,
+                                    description: req.description,
+                                })
+                                .await
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    %session_id,
+                                    "failed to replay pending ApprovalRequested"
+                                );
+                                break;
+                            }
+                        }
                         if let Err(e) = sidecar
                             .send_frame(Frame::PendingApprovalsSnapshot {
                                 session_id: session_id.clone(),
@@ -571,7 +604,14 @@ async fn replay_catch_up(
         return;
     }
     for (ordinal, msg) in rows {
-        let Some(wire) = chat_to_visible_wire_message(channel_type, session_id, ordinal, msg)
+        let Some(wire) = chat_to_visible_wire_message(
+            channel_type,
+            session_id,
+            ordinal,
+            msg,
+            &*state.blob_store,
+        )
+        .await
         else {
             continue;
         };
@@ -595,11 +635,12 @@ async fn replay_catch_up(
 /// REST transcript path's "what counts as a chat bubble" view so a
 /// reconnecting client doesn't see internal turns it wouldn't have
 /// seen if it had stayed connected.
-fn chat_to_visible_wire_message(
+async fn chat_to_visible_wire_message(
     channel_type: &ChannelType,
     session_id: &SessionId,
     ordinal: i64,
     msg: ChatMessage,
+    blob_store: &dyn aura_storage::BlobStore,
 ) -> Option<WireMessage> {
     let role = match msg.role {
         Role::User if msg.from_user => MessageRole::User,
@@ -609,19 +650,16 @@ fn chat_to_visible_wire_message(
         // Role::Tool rows are tool results — internal.
         _ => return None,
     };
-    let mut text = String::new();
-    for block in &msg.content {
-        if let ContentBlock::Text(t) = block {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(t);
-        }
-    }
-    // Empty-text rows that were just tool-use / thinking blocks
-    // (assistant turn with no prose) aren't worth surfacing as a
-    // bubble — the client would render an empty row.
-    if text.is_empty() {
+    // Mirror `adapter::split_content`'s text+attachments shape so a
+    // row with only Image/Audio/File blocks still surfaces as a wire
+    // Message — the REST transcript path keeps such rows visible via
+    // `has_attachments`, and dropping them on WS catch-up would let
+    // attachment-only messages vanish until a full REST refetch.
+    let (text, attachments) = super::adapter::split_content(&msg.content, blob_store).await;
+    // A row with neither text nor attachments is structurally an
+    // assistant tool-call-only turn or a thinking-only turn; render
+    // nothing.
+    if text.is_empty() && attachments.is_empty() {
         return None;
     }
     Some(WireMessage {
@@ -633,7 +671,7 @@ fn chat_to_visible_wire_message(
         user_id: String::new(),
         channel_type: channel_type.clone(),
         bot_id: String::new(),
-        attachments: Vec::new(),
+        attachments,
         platform_msg_id: String::new(),
         role,
         ordinal: Some(ordinal),

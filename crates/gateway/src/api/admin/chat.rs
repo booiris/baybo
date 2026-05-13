@@ -492,24 +492,25 @@ fn web_operator_user() -> User {
 }
 
 /// Load the session row for `session_id` and verify it lives on the
-/// `http` channel. Both branches return `NotFound` so a request for a
-/// Telegram/WeChat session id through the chat API doesn't reveal the
-/// existence of non-chat sessions.
+/// `http` channel. Both branches return the **same** `NotFound` body so
+/// a request for a Telegram/WeChat session id through the chat API
+/// can't be distinguished from a request for a nonexistent id —
+/// `GatewayError::NotFound` serialises its `to_string()` into the JSON
+/// response, so differing messages would otherwise leak existence.
 async fn load_web_chat_session(
     state: &AdminState,
     session_id: &str,
 ) -> Result<(SessionId, Session)> {
     let sid = SessionId::from(session_id);
+    let not_found = || GatewayError::NotFound(format!("chat session {session_id}"));
     let session = state
         .session_manager
         .get(&sid)
         .await
         .map_err(|e| GatewayError::Internal(format!("load session: {e}")))?
-        .ok_or_else(|| GatewayError::NotFound(format!("chat session {session_id}")))?;
+        .ok_or_else(not_found)?;
     if session.channel != ChannelType::http() {
-        return Err(GatewayError::NotFound(format!(
-            "session {session_id} is not a web chat session"
-        )));
+        return Err(not_found());
     }
     Ok((sid, session))
 }

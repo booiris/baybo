@@ -47,8 +47,24 @@ impl ChannelControlRegistry {
         self.senders.insert(channel_type, tx);
     }
 
-    pub fn unregister(&self, channel_type: &ChannelType) {
-        self.senders.remove(channel_type);
+    /// Drop the registration **only if** the currently-stored sender
+    /// matches `tx`. A blind `remove(channel_type)` would evict the
+    /// live entry when an old WS task fires its cleanup *after* a
+    /// reconnect already overwrote the slot — the live sidecar would
+    /// then go silent on `StartBot` / `StopBot` until the next bounce.
+    /// `mpsc::Sender::same_channel` compares the underlying queue, so
+    /// a clone of the live sender will still match and a stale one
+    /// won't. Returns `true` iff the entry was removed; callers chain
+    /// reconciler `forget` on the same gate so a stale cleanup can't
+    /// clobber the live seed.
+    pub fn unregister_if_owned(
+        &self,
+        channel_type: &ChannelType,
+        tx: &mpsc::Sender<Frame>,
+    ) -> bool {
+        self.senders
+            .remove_if(channel_type, |_, stored| stored.same_channel(tx))
+            .is_some()
     }
 
     /// Push `frame` into the sidecar's outbound pump. Returns
@@ -83,5 +99,49 @@ impl ChannelControlRegistry {
             .iter()
             .map(|entry| entry.key().clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unregister_if_owned_removes_only_matching_sender() {
+        let reg = ChannelControlRegistry::new();
+        let ct = ChannelType::telegram();
+        let (tx_a, _rx_a) = mpsc::channel(4);
+        let (tx_b, _rx_b) = mpsc::channel(4);
+
+        // First WS comes up.
+        reg.register(ct.clone(), tx_a.clone());
+        assert!(reg.is_connected(&ct));
+
+        // Second WS reconnects fast and overwrites the slot.
+        reg.register(ct.clone(), tx_b.clone());
+
+        // The old WS's cleanup now fires with its stale sender — it
+        // must *not* evict the live entry. This is the exact reconnect
+        // race the connection-scoped unregister was added to fix.
+        let removed = reg.unregister_if_owned(&ct, &tx_a);
+        assert!(!removed, "stale unregister must not match");
+        assert!(reg.is_connected(&ct), "live entry survives stale cleanup");
+
+        // The live WS's own cleanup (with the matching sender) evicts.
+        let removed = reg.unregister_if_owned(&ct, &tx_b);
+        assert!(removed, "owning unregister returns true");
+        assert!(!reg.is_connected(&ct));
+    }
+
+    #[test]
+    fn unregister_if_owned_matches_clone_of_same_sender() {
+        let reg = ChannelControlRegistry::new();
+        let ct = ChannelType::telegram();
+        let (tx, _rx) = mpsc::channel(4);
+        // The route hands `frame_tx_clone()` (a clone) to register and
+        // a separate clone on exit; both must compare equal via
+        // `same_channel`.
+        reg.register(ct.clone(), tx.clone());
+        assert!(reg.unregister_if_owned(&ct, &tx.clone()));
     }
 }
