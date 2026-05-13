@@ -353,36 +353,30 @@ async fn channel_multi_attach_fans_out_to_all_subscribers() {
         reply_to: None,
         metadata: MessageMetadata::default(),
     };
-    channel.dispatch(AgentOutput::Message(outgoing).into());
+    channel.dispatch_agent(AgentOutput::Message(outgoing));
 
     assert_eq!(bucket_a.lock().len(), 1, "tab A received the dispatch");
     assert_eq!(bucket_b.lock().len(), 1, "tab B received the dispatch");
 
     // After detach the remaining subscriber still receives.
     channel.detach(id_b);
-    channel.dispatch(
-        AgentOutput::Delta {
-            session_id: "sess-shared".into(),
-            user_id: "u1".into(),
-            channel: ChannelType::http(),
-            text: "chunk".into(),
-        }
-        .into(),
-    );
+    channel.dispatch_agent(AgentOutput::Delta {
+        session_id: "sess-shared".into(),
+        user_id: "u1".into(),
+        channel: ChannelType::http(),
+        text: "chunk".into(),
+    });
     assert_eq!(bucket_a.lock().len(), 2);
     assert_eq!(bucket_b.lock().len(), 1, "detached tab no longer receives");
 
     // Emission to a session with zero subscribers is silently dropped.
-    channel.dispatch(
-        AgentOutput::Notice {
-            session_id: "nobody-here".into(),
-            user_id: String::new(),
-            channel: ChannelType::http(),
-            level: aura_channels::NoticeLevel::Info,
-            text: "ignored".into(),
-        }
-        .into(),
-    );
+    channel.dispatch_agent(AgentOutput::Notice {
+        session_id: "nobody-here".into(),
+        user_id: String::new(),
+        channel: ChannelType::http(),
+        level: aura_channels::NoticeLevel::Info,
+        text: "ignored".into(),
+    });
     assert_eq!(
         bucket_a.lock().len(),
         2,

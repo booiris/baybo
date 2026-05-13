@@ -494,7 +494,7 @@ impl Router {
         // subscriber, drops on full (signalling Reset to the slow
         // peer), and detaches closed transports. No await — backpressure
         // is per-connection, not agent-wide.
-        channel_handle.dispatch(output.into());
+        channel_handle.dispatch_agent(output);
     }
 
     /// Run the security gateway over an outgoing message. Returns the

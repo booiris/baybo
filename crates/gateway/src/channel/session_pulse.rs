@@ -2,12 +2,13 @@
 //!
 //! Wired as a `DispatchObserver` on the `http` channel (see
 //! [`SessionPulse::install`]). Every `SessionEvent::UserEcho` /
-//! `SessionEvent::Agent(_)` flowing through `Channel::dispatch` is
-//! collapsed by `(session_id, source)` and, if the throttle window has
-//! elapsed, emits a `Frame::SessionActivity` to every connection on
-//! the channel — subscribed or not. That's the whole point: a sidebar
-//! tab parked on session A still wants the cheap "F had activity"
-//! signal without paying for F's full Delta stream.
+//! `SessionEvent::Agent(_)` flowing through the channel's event
+//! dispatch is collapsed by `(session_id, source)` and, if the
+//! throttle window has elapsed, emits a `Frame::SessionActivity` to
+//! every connection on the channel — subscribed or not. That's the
+//! whole point: a sidebar tab parked on session A still wants the
+//! cheap "F had activity" signal without paying for F's full Delta
+//! stream.
 //!
 //! The two pulse streams (user / assistant) throttle independently
 //! so a user sending in F doesn't suppress the immediately-following
@@ -22,8 +23,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aura_channels::wire::{ActivityKind, Frame};
-use aura_channels::{Channel, SessionEvent};
+use aura_channels::wire::ActivityKind;
+use aura_channels::{Channel, SessionEvent, SubscribedView};
 use aura_model::SessionId;
 use chrono::Utc;
 use dashmap::DashMap;
@@ -44,11 +45,12 @@ impl SessionPulse {
         Arc::new(Self::default())
     }
 
-    /// Install `self` as the dispatch observer on `channel`. The
-    /// returned `Arc<Channel>`-attached closure clones `Arc::clone(&
-    /// self)` so dropping the original handle is safe (the channel
-    /// keeps the pulse alive as long as it's installed).
-    pub fn install(self: &Arc<Self>, channel: &Channel) {
+    /// Install `self` as the dispatch observer on a Subscribed
+    /// channel. Taking [`SubscribedView`] (instead of `&Channel`)
+    /// encodes the constraint at the call site: only Subscribed
+    /// channels can carry a pulse. The closure clones an `Arc<Self>`
+    /// so dropping the caller's handle is safe.
+    pub fn install(self: &Arc<Self>, channel: SubscribedView<'_>) {
         let pulse = Arc::clone(self);
         channel.set_dispatch_observer(Arc::new(move |event, channel| {
             pulse.observe(event, channel);
@@ -58,8 +60,7 @@ impl SessionPulse {
     /// Observer body. Inspect the event, derive the activity source,
     /// throttle, and broadcast a `Frame::SessionActivity` on hit.
     /// `pub(crate)` for direct testing; production callers go through
-    /// the [`Channel::dispatch`] hook installed by
-    /// [`SessionPulse::install`].
+    /// the dispatch hook installed by [`SessionPulse::install`].
     pub(crate) fn observe(&self, event: &SessionEvent, channel: &Channel) {
         let (session_id, source) = match event {
             SessionEvent::UserEcho(msg) => (msg.message.session_id.clone(), ActivityKind::User),
@@ -100,10 +101,19 @@ impl SessionPulse {
         if !should_emit {
             return;
         }
-        channel.broadcast_frame(Frame::SessionActivity {
-            session_id,
-            source,
-            at: Utc::now(),
-        });
+        // Observer install is gated to Subscribed via
+        // `SubscribedView::set_dispatch_observer`, so this path can
+        // only fire on a Subscribed channel — the `as_subscribed()`
+        // unwrap is structurally `Some`. Defensive guard kept so a
+        // future relocation of the install API can't silently corrupt
+        // the invariant.
+        let Some(sub) = channel.as_subscribed() else {
+            tracing::error!(
+                channel_type = %channel.channel_type(),
+                "SessionPulse observer fired on non-Subscribed channel; dropping pulse",
+            );
+            return;
+        };
+        sub.broadcast_session_activity(session_id, source, Utc::now());
     }
 }

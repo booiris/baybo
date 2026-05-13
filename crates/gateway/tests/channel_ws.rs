@@ -218,7 +218,7 @@ async fn web_token_attaches_subscribes_and_receives_dispatch() {
         reply_to: None,
         metadata: MessageMetadata::default(),
     };
-    http_channel.dispatch(AgentOutput::Message(outgoing).into());
+    http_channel.dispatch_agent(AgentOutput::Message(outgoing));
 
     let frame = recv_frame_skip_activity(&mut client, Duration::from_secs(2))
         .await
@@ -302,15 +302,12 @@ async fn two_subscribers_to_same_session_both_receive_dispatch() {
     expect_empty_pending_snapshot(&mut tab_a, "shared").await;
     expect_empty_pending_snapshot(&mut tab_b, "shared").await;
 
-    http_channel.dispatch(
-        AgentOutput::Delta {
-            session_id: "shared".into(),
-            user_id: WEB_OPERATOR_USER_ID.into(),
-            channel: ChannelType::http(),
-            text: "stream chunk".into(),
-        }
-        .into(),
-    );
+    http_channel.dispatch_agent(AgentOutput::Delta {
+        session_id: "shared".into(),
+        user_id: WEB_OPERATOR_USER_ID.into(),
+        channel: ChannelType::http(),
+        text: "stream chunk".into(),
+    });
 
     let a = recv_frame_skip_activity(&mut tab_a, Duration::from_secs(2))
         .await
@@ -386,16 +383,13 @@ async fn unsubscribed_session_does_not_receive_dispatch() {
     // connection regardless of subscription — that's the deliberate
     // sidebar signal — so we should receive exactly the pulse and
     // *nothing else*.
-    http_channel.dispatch(
-        AgentOutput::Notice {
-            session_id: "unrelated".into(),
-            user_id: String::new(),
-            channel: ChannelType::http(),
-            level: aura_channels::NoticeLevel::Info,
-            text: "for some other tab".into(),
-        }
-        .into(),
-    );
+    http_channel.dispatch_agent(AgentOutput::Notice {
+        session_id: "unrelated".into(),
+        user_id: String::new(),
+        channel: ChannelType::http(),
+        level: aura_channels::NoticeLevel::Info,
+        text: "for some other tab".into(),
+    });
 
     let activity = recv_frame(&mut client, Duration::from_secs(1))
         .await
@@ -484,14 +478,17 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
 
     let http_channel = channel_registry.get(&ChannelType::http()).expect("http");
     let created_at = chrono::Utc::now();
-    http_channel.broadcast_frame(Frame::SessionUpdated {
-        session_id: "new-session".into(),
-        patch: SessionPatch {
-            created_at: Some(created_at),
-            last_active: Some(created_at),
-            hidden: Some(false),
-        },
-    });
+    http_channel
+        .as_subscribed()
+        .expect("http channel is Subscribed")
+        .broadcast_session_patch(
+            "new-session".into(),
+            SessionPatch {
+                created_at: Some(created_at),
+                last_active: Some(created_at),
+                hidden: Some(false),
+            },
+        );
 
     for (label, ws) in [
         ("subscriber", &mut subscriber),
@@ -559,15 +556,12 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
     // Assistant-side: dispatch a Delta for a session the client never
     // subscribed to. Content frame drops on the floor for this
     // connection; the activity pulse broadcasts to every http tab.
-    http_channel.dispatch(
-        AgentOutput::Delta {
-            session_id: "sess-bg".into(),
-            user_id: String::new(),
-            channel: ChannelType::http(),
-            text: "agent reply".into(),
-        }
-        .into(),
-    );
+    http_channel.dispatch_agent(AgentOutput::Delta {
+        session_id: "sess-bg".into(),
+        user_id: String::new(),
+        channel: ChannelType::http(),
+        text: "agent reply".into(),
+    });
     let activity = recv_frame(&mut client, Duration::from_secs(1))
         .await
         .expect("assistant activity pulse");
@@ -585,7 +579,7 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
     }
 
     // User-side: a UserEcho also runs through the same observer. Drive
-    // it via `Channel::echo_inbound`, which dispatches a
+    // it via `SubscribedView::echo_inbound`, which dispatches a
     // `SessionEvent::UserEcho` — exactly the path the WS receive loop
     // takes when the agent router forwards an inbound `Frame::Message`.
     let incoming = aura_channels::IncomingMessage {
@@ -608,7 +602,10 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
     // 1.5s throttle window: wait it out so the second pulse isn't
     // coalesced into the first.
     tokio::time::sleep(Duration::from_millis(1600)).await;
-    http_channel.echo_inbound(incoming);
+    http_channel
+        .as_subscribed()
+        .expect("http channel is Subscribed")
+        .echo_inbound(incoming);
     let activity = recv_frame(&mut client, Duration::from_secs(1))
         .await
         .expect("user activity pulse");

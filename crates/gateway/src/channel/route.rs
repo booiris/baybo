@@ -407,18 +407,26 @@ async fn run_inbound_loop(
                             },
                             platform_msg_id: wire_msg.platform_msg_id,
                         };
-                        // Echo to all subscribers of this session
+                        // Echo to every subscriber of this session
                         // (including the sender) so multi-tab views
                         // converge on identical transcripts through
                         // the same render path as agent output.
-                        // The http channel's `DispatchObserver`
-                        // (installed at boot, see
+                        // Subscribed-only by design: a multiplexed
+                        // sidecar (telegram, weixin, …) would receive
+                        // its own input back and forward it to the
+                        // upstream platform; getting the
+                        // `SubscribedView` here makes that
+                        // structurally impossible (`None` for
+                        // multiplexed). The dispatch observer
+                        // installed on the http channel (see
                         // `channel/session_pulse.rs`) sees this echo
                         // and fans out a throttled
                         // `Frame::SessionActivity{User}` so sidebar
                         // tabs not subscribed to the session still
                         // pick up the unread signal.
-                        sidecar.channel.echo_inbound(incoming.clone());
+                        if let Some(sub) = sidecar.channel.as_subscribed() {
+                            sub.echo_inbound(incoming.clone());
+                        }
                         if let Err(e) = state.incoming_tx.send(incoming).await {
                             tracing::error!(error = %e, "router intake closed; tearing down");
                             break;

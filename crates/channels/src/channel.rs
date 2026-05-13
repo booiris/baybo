@@ -10,24 +10,26 @@
 
 use std::sync::Arc;
 
-use aura_model::{ChannelType, SessionId};
+use aura_model::{ChannelType, ResourceAccess, SessionId};
 use aura_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue};
+use chrono::{DateTime, Utc};
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
 
 use crate::connection::{Connection, ConnectionId, SendOutcome};
 use crate::kind::ChannelKind;
-use crate::types::{IncomingMessage, SessionEvent};
-use crate::wire::Frame;
+use crate::types::{AgentOutput, IncomingMessage, SessionEvent};
+use crate::wire::{ActivityKind, Frame, SessionPatch};
 use crate::{ChannelError, Result};
 
-/// Side-effect callback invoked at the top of [`Channel::dispatch`],
+/// Side-effect callback invoked at the top of [`Channel::dispatch_event`],
 /// before any fan-out. The observer receives the event by reference
 /// (so it can't take ownership and the dispatch path keeps running)
-/// and the channel itself (so it can call back into
-/// [`Channel::broadcast_frame`] to emit derived frames). Used by the
-/// gateway to fire `Frame::SessionActivity` broadcasts for the
-/// `http` channel without coupling this crate to web-sidebar concerns.
+/// and the channel itself (so it can call back into the channel's
+/// broadcast path to emit derived frames). Installable only via
+/// [`SubscribedView::set_dispatch_observer`] — multiplexed channels
+/// cannot register one, which matches the only production use today
+/// (the `http` channel's `SessionActivity` pulse).
 pub type DispatchObserver = Arc<dyn Fn(&SessionEvent, &Channel) + Send + Sync>;
 
 /// Bundle of the channel's approval gate (the `ApprovalGate` trait
@@ -74,13 +76,6 @@ impl Channel {
             subscriptions: DashMap::new(),
             dispatch_observer: Mutex::new(None),
         }
-    }
-
-    /// Install (or replace) the pre-dispatch observer. Idempotent —
-    /// a second call swaps the previous closure. Pass-through callers
-    /// don't need this; only the http-channel pulse wiring uses it.
-    pub fn set_dispatch_observer(&self, observer: DispatchObserver) {
-        *self.dispatch_observer.lock() = Some(observer);
     }
 
     pub fn channel_type(&self) -> &ChannelType {
@@ -186,12 +181,94 @@ impl Channel {
         // get cleaned up on the next detach pass.
     }
 
-    /// Dispatch a [`SessionEvent`] to every connection that should see
-    /// it. Non-blocking. Drops the frame for any connection whose
-    /// outbound queue is full (and sends a `Reset` frame to nudge the
-    /// client to re-fetch history); connections whose transport is
-    /// gone are detached.
-    pub fn dispatch(&self, event: SessionEvent) {
+    /// Fan an [`AgentOutput`] (delta / message / notice) out to every
+    /// connection that should see it. Kind-agnostic — the agent
+    /// router stamps this on whatever channel a session lives on, no
+    /// matter the channel kind.
+    pub fn dispatch_agent(&self, output: AgentOutput) {
+        self.dispatch_event(SessionEvent::Agent(output));
+    }
+
+    /// Publish an `ApprovalRequested` event to subscribers of the
+    /// call's session (or to every connection on a multiplexed
+    /// channel). Approval surfaces are channel-agnostic; both kinds
+    /// can carry one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_approval_requested(
+        &self,
+        call_id: String,
+        session_id: SessionId,
+        user_id: String,
+        tool: String,
+        accesses: Vec<ResourceAccess>,
+        params_preview: String,
+        description: Option<String>,
+    ) {
+        self.dispatch_event(SessionEvent::ApprovalRequested {
+            call_id,
+            session_id,
+            user_id,
+            tool,
+            accesses,
+            params_preview,
+            description,
+        });
+    }
+
+    /// Publish an `ApprovalResolved` event so concurrent UIs drop the
+    /// prompt. Caller must have already resolved the queue entry via
+    /// [`Channel::resolve_approval`].
+    pub fn dispatch_approval_resolved(
+        &self,
+        call_id: String,
+        session_id: SessionId,
+        decision: ApprovalDecision,
+    ) {
+        self.dispatch_event(SessionEvent::ApprovalResolved {
+            call_id,
+            session_id,
+            decision,
+        });
+    }
+
+    /// Kind-typed access for [`ChannelKind::Subscribed`] operations
+    /// (per-session subscribe / unsubscribe, user-echo, sidebar
+    /// broadcasts). Returns `None` on multiplexed channels — and that
+    /// `None` is the whole point: a caller holding a [`Channel`]
+    /// reference can't accidentally invoke a Subscribed-only operation
+    /// on a telegram-shape channel.
+    pub fn as_subscribed(&self) -> Option<SubscribedView<'_>> {
+        if matches!(self.kind, ChannelKind::Subscribed) {
+            Some(SubscribedView(self))
+        } else {
+            None
+        }
+    }
+
+    /// Symmetric counterpart to [`Self::as_subscribed`]. Returns
+    /// `None` on subscribed channels. Currently the multiplexed view
+    /// has no exclusive operations (telegram/weixin start-bot pushes
+    /// flow through [`crate::Channel`] common methods + the gateway's
+    /// `ChannelControlRegistry`), but the type exists as a symmetric
+    /// home for future multiplexed-only API surface.
+    pub fn as_multiplexed(&self) -> Option<MultiplexedView<'_>> {
+        if matches!(self.kind, ChannelKind::Multiplexed) {
+            Some(MultiplexedView(self))
+        } else {
+            None
+        }
+    }
+
+    /// Internal event fan-out — the raw broadcast/subscription
+    /// machinery. External callers go through [`Self::dispatch_agent`]
+    /// / [`Self::dispatch_approval_requested`] /
+    /// [`Self::dispatch_approval_resolved`] (kind-agnostic) or
+    /// through [`SubscribedView::echo_inbound`]
+    /// (Subscribed-exclusive). Non-blocking. Drops the frame for any
+    /// connection whose outbound queue is full (and sends a `Reset`
+    /// frame to nudge the client to re-fetch history); connections
+    /// whose transport is gone are detached.
+    pub(crate) fn dispatch_event(&self, event: SessionEvent) {
         // Fire the pre-dispatch hook before fan-out so the observer
         // sees every event — including those that drop below because
         // no subscribers exist for the session (the activity-broadcast
@@ -248,36 +325,16 @@ impl Channel {
         }
     }
 
-    /// Echo an inbound user message to every connection subscribed to
-    /// the message's `session_id`. The receiving tab(s) render the
-    /// user message through the same code path as agent-emitted
-    /// frames so multi-tab views stay consistent.
-    ///
-    /// **No-op on [`ChannelKind::Multiplexed`] channels.** Multiplexed
-    /// channels (telegram, weixin, discord, …) fan out to every
-    /// attached connection rather than to a session-scoped subset,
-    /// and they typically have only one attached sidecar — the very
-    /// one that just delivered the inbound. Echoing would route the
-    /// user's own message back to the sidecar, which the bot SDK
-    /// dispatches into `onMessage` and forwards back to the upstream
-    /// platform, producing a feedback loop. Multi-tab consistency is
-    /// a `Subscribed` concern; `Multiplexed` callers do not need it.
-    pub fn echo_inbound(&self, message: IncomingMessage) {
-        if matches!(self.kind, ChannelKind::Multiplexed) {
-            return;
-        }
-        self.dispatch(SessionEvent::UserEcho(message));
-    }
-
     /// Best-effort broadcast of a raw frame to every attached
     /// connection, ignoring per-session subscriptions and channel
-    /// kind. For non-session-scoped events that every client of a
-    /// channel should see — today the web chat sidebar's
-    /// `Frame::ChatSessionListChanged` pulse so concurrent tabs (on
-    /// the same machine or across devices) refresh their session list
-    /// without polling. Connections whose outbound queue is full are
-    /// sent a `Reset`; closed transports are detached.
-    pub fn broadcast_frame(&self, frame: Frame) {
+    /// kind. Internal — external callers go through
+    /// [`SubscribedView::broadcast_session_patch`] /
+    /// [`SubscribedView::broadcast_session_activity`] which encode
+    /// the "this frame is meaningful on Subscribed channels only"
+    /// constraint in the type system. Connections whose outbound
+    /// queue is full are sent a `Reset`; closed transports are
+    /// detached.
+    pub(crate) fn broadcast_frame(&self, frame: Frame) {
         let mut to_drop = Vec::new();
         let mut to_reset = Vec::new();
         for entry in self.connections.iter() {
@@ -324,6 +381,83 @@ impl Channel {
                 reason: reason.to_owned(),
             });
         }
+    }
+}
+
+/// Kind-typed access to operations that only make sense on a
+/// [`ChannelKind::Subscribed`] channel. Obtained via
+/// [`Channel::as_subscribed`]; cheap to copy (just borrows the
+/// underlying channel reference). Methods on this view cannot be
+/// called against a multiplexed channel — that's the entire point.
+#[derive(Copy, Clone)]
+pub struct SubscribedView<'a>(&'a Channel);
+
+impl<'a> SubscribedView<'a> {
+    /// Echo an inbound user message back out to every connection
+    /// subscribed to the message's `session_id`. The receiving tab(s)
+    /// render the user's own input through the same code path as
+    /// agent-emitted frames, so multi-tab views stay consistent.
+    ///
+    /// Multiplexed channels (telegram, weixin, …) must not reach this
+    /// — the SDK's `onMessage` would echo the user's input back to
+    /// the upstream platform. The type system enforces it: a caller
+    /// holding `Option<SubscribedView>` from a multiplexed channel
+    /// gets `None`.
+    pub fn echo_inbound(&self, message: IncomingMessage) {
+        self.0.dispatch_event(SessionEvent::UserEcho(message));
+    }
+
+    /// Broadcast a [`Frame::SessionUpdated`] patch to every
+    /// connection on this channel. Used by the admin chat API to
+    /// keep concurrent web tabs' sidebars converged on create / hide
+    /// / unhide / last_active changes.
+    pub fn broadcast_session_patch(&self, session_id: SessionId, patch: SessionPatch) {
+        self.0
+            .broadcast_frame(Frame::SessionUpdated { session_id, patch });
+    }
+
+    /// Broadcast a [`Frame::SessionActivity`] pulse for sidebar
+    /// freshness / unread accounting. Fan-out is best-effort and
+    /// throttled by the caller (see `SessionPulse`).
+    pub fn broadcast_session_activity(
+        &self,
+        session_id: SessionId,
+        source: ActivityKind,
+        at: DateTime<Utc>,
+    ) {
+        self.0.broadcast_frame(Frame::SessionActivity {
+            session_id,
+            source,
+            at,
+        });
+    }
+
+    /// Install (or replace) the pre-dispatch observer. Idempotent —
+    /// a second call swaps the previous closure. Only Subscribed
+    /// channels can carry an observer today; multiplexed channels
+    /// have no use for one and the `&Channel` cb body would have
+    /// nowhere to fan a derived frame.
+    pub fn set_dispatch_observer(&self, observer: DispatchObserver) {
+        *self.0.dispatch_observer.lock() = Some(observer);
+    }
+}
+
+/// Symmetric placeholder for multiplexed-only operations. Empty
+/// today — the bot-control surface (StartBot / StopBot / SlashManifest)
+/// goes through the gateway's `ChannelControlRegistry`, not directly
+/// through `Channel`. The type exists so a future multiplexed-only
+/// method has a natural home and so `Channel::as_multiplexed()` can
+/// stand symmetric to `as_subscribed()`.
+#[derive(Copy, Clone)]
+pub struct MultiplexedView<'a>(&'a Channel);
+
+impl<'a> MultiplexedView<'a> {
+    /// Borrow the underlying channel. Mostly here to keep the field
+    /// from triggering dead-code lints until the first multiplexed-
+    /// only method lands; remove once the view has its own
+    /// operations.
+    pub fn channel(&self) -> &'a Channel {
+        self.0
     }
 }
 
@@ -379,12 +513,14 @@ mod tests {
         }
     }
 
-    /// Telegram-shaped channels must NOT echo inbound user messages
-    /// back to attached sidecars — the bot SDK would forward the echo
-    /// to the upstream platform as if it were an agent reply, producing
-    /// a feedback loop where the user sees their own message resent.
+    /// Telegram-shaped channels can't even construct a `SubscribedView`
+    /// — `as_subscribed()` returns `None` — so the misdirected
+    /// UserEcho fan-out is unreachable by construction. The
+    /// counting-sink assertion locks in that this stays true; if a
+    /// future refactor re-exposes user-echo on `&Channel` directly
+    /// the count check catches it.
     #[test]
-    fn echo_inbound_is_noop_on_multiplexed_channel() {
+    fn multiplexed_channel_has_no_subscribed_view() {
         let channel = Channel::new(
             ChannelType::from("telegram"),
             ChannelKind::Multiplexed,
@@ -394,20 +530,26 @@ mod tests {
         let conn = Arc::new(Connection::new(sink.clone()));
         channel.attach(Arc::clone(&conn));
 
-        channel.echo_inbound(fake_inbound("session-x", ChannelType::from("telegram")));
-
+        assert!(
+            channel.as_subscribed().is_none(),
+            "telegram-shape (Multiplexed) channels expose no Subscribed view",
+        );
+        assert!(
+            channel.as_multiplexed().is_some(),
+            "multiplexed view is the symmetric counterpart",
+        );
         assert_eq!(
             sink.count(),
             0,
-            "Multiplexed channels must not fan UserEcho back to the sender sidecar",
+            "no fan-out happened — view-typed API made user-echo unreachable",
         );
     }
 
-    /// The cross-tab sync semantics for Subscribed channels (http,
-    /// tui) still need echo_inbound to reach every subscriber so
-    /// concurrent tabs render the same transcript.
+    /// Subscribed channels obtain their view and fan UserEcho through
+    /// it. Cross-tab consistency works as before; just the route to
+    /// the dispatch path goes through the typed view.
     #[test]
-    fn echo_inbound_reaches_subscribers_on_subscribed_channel() {
+    fn echo_inbound_reaches_subscribers_via_subscribed_view() {
         let channel = Channel::new(ChannelType::http(), ChannelKind::Subscribed, None);
         let sink = CountingSink::new();
         let conn = Arc::new(Connection::new(sink.clone()));
@@ -417,7 +559,8 @@ mod tests {
             .subscribe(conn_id, SessionId::from("session-x"))
             .expect("subscribe");
 
-        channel.echo_inbound(fake_inbound("session-x", ChannelType::http()));
+        let view = channel.as_subscribed().expect("Subscribed view available");
+        view.echo_inbound(fake_inbound("session-x", ChannelType::http()));
 
         assert_eq!(
             sink.count(),

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_channels::{
-    ApprovalSurface, Channel, ChannelKind, ChannelRegistry, Result as ChannelResult, SessionEvent,
+    ApprovalSurface, Channel, ChannelKind, ChannelRegistry, Result as ChannelResult,
 };
 use aura_config::ChannelsConfig;
 use aura_model::{ChannelType, SessionId};
@@ -77,8 +77,10 @@ pub fn install_channels(
         // Installed exactly once at boot; subsequent registry
         // lookups return the same `Arc<Channel>` with the observer
         // already wired.
-        if let Some(http) = registry.get(&ChannelType::http()) {
-            SessionPulse::new().install(&http);
+        if let Some(http) = registry.get(&ChannelType::http())
+            && let Some(sub) = http.as_subscribed()
+        {
+            SessionPulse::new().install(sub);
         }
     }
     Ok(())
@@ -113,15 +115,15 @@ pub(crate) fn build_channel(channel_type: ChannelType, kind: ChannelKind) -> Arc
         let Some(entry) = queue_for_waker.list().into_iter().next_back() else {
             return;
         };
-        channel.dispatch(SessionEvent::ApprovalRequested {
-            call_id: entry.call_id,
-            session_id: entry.session_id,
-            user_id: entry.user_id,
-            tool: entry.tool,
-            accesses: entry.accesses,
-            params_preview: entry.params_preview,
-            description: entry.description,
-        });
+        channel.dispatch_approval_requested(
+            entry.call_id,
+            entry.session_id,
+            entry.user_id,
+            entry.tool,
+            entry.accesses,
+            entry.params_preview,
+            entry.description,
+        );
     });
 
     let gate: Arc<dyn ApprovalGate> = Arc::new(ChannelApprovalGate::new(
@@ -144,11 +146,7 @@ pub(crate) fn broadcast_approval_resolved(
     session_id: SessionId,
     decision: aura_tools::ApprovalDecision,
 ) {
-    channel.dispatch(SessionEvent::ApprovalResolved {
-        call_id,
-        session_id,
-        decision,
-    });
+    channel.dispatch_approval_resolved(call_id, session_id, decision);
 }
 
 #[cfg(test)]

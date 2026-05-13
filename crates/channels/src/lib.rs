@@ -10,7 +10,7 @@ pub mod register_wire;
 pub mod registration;
 pub mod wire;
 
-pub use channel::{ApprovalSurface, Channel};
+pub use channel::{ApprovalSurface, Channel, DispatchObserver, MultiplexedView, SubscribedView};
 pub use connection::{Connection, ConnectionId, ConnectionSink, SendOutcome};
 pub use error::ChannelError;
 pub use kind::ChannelKind;

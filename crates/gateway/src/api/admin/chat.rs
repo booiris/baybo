@@ -27,7 +27,7 @@
 //! The channel-auth middleware turns the token into
 //! [`crate::auth::AuthedClient::Web`].
 
-use aura_channels::wire::{Frame, SessionPatch, SlashCommandSpec};
+use aura_channels::wire::{SessionPatch, SlashCommandSpec};
 use aura_model::{ChannelType, ChatMessage, ContentBlock, Role, Session, SessionId, User};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -528,10 +528,13 @@ pub(crate) fn broadcast_session_patch(
     let Some(channel) = state.channel_registry.get(&ChannelType::http()) else {
         return;
     };
-    channel.broadcast_frame(Frame::SessionUpdated {
-        session_id: session_id.clone(),
-        patch,
-    });
+    // http is always Subscribed by construction; the `if let Some`
+    // makes the typed-view constraint explicit at the call site
+    // rather than reaching for an `expect` we'd never want to panic
+    // on.
+    if let Some(sub) = channel.as_subscribed() {
+        sub.broadcast_session_patch(session_id.clone(), patch);
+    }
 }
 
 fn chat_to_transcript_item(ordinal: i64, msg: ChatMessage) -> Option<ChatTranscriptItem> {
