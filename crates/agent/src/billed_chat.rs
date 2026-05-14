@@ -247,7 +247,10 @@ mod tests {
 
         let billed_response = billed.chat(&request).await.expect("chat ok");
         assert!(
-            billed_response.response.content.contains("SECRET_TOKEN_abc123"),
+            billed_response
+                .response
+                .content
+                .contains("SECRET_TOKEN_abc123"),
             "tool must see revealed plaintext in content: {}",
             billed_response.response.content
         );

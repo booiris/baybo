@@ -95,7 +95,12 @@ impl RateLimiter {
 /// parent's per-job cancel token is passed instead, so admin
 /// `cancel_job(parent)` trips the entire descendant subtree.
 pub type ActorSpawner = Box<
-    dyn Fn(Session, mpsc::Sender<AgentOutput>, &CancellationToken) -> mpsc::Sender<AgentMessage>
+    dyn Fn(
+            Session,
+            /* initial_llm */ Option<String>,
+            mpsc::Sender<AgentOutput>,
+            &CancellationToken,
+        ) -> mpsc::Sender<AgentMessage>
         + Send
         + Sync,
 >;
@@ -277,11 +282,14 @@ impl Router {
             "routing system-spawn request to fresh maintenance session"
         );
 
-        // `&parent_actor_token` becomes the cancel parent so the new
-        // actor's `actor_token` is a grandchild of the originating
-        // parent — Shutdown of the parent cascades automatically.
+        // Maintenance spawns always run on `default-llm`. The parent
+        // session itself has no `last_llm` to inherit — LLM pinning
+        // is subagent-only (`SubagentSpawnRequest.llm`), and
+        // subagents do not currently trigger background compression
+        // on their own transcripts. If that changes, plumb the
+        // parent's effective LLM through `SystemSpawnRequest`.
         let response_tx = self.supervisor.response_tx().clone();
-        let mailbox = (self.actor_spawner)(maint, response_tx, &parent_actor_token);
+        let mailbox = (self.actor_spawner)(maint, None, response_tx, &parent_actor_token);
 
         if let Err(e) = mailbox
             .send(AgentMessage::SystemTrigger(
@@ -341,7 +349,7 @@ impl Router {
         );
 
         let response_tx = self.supervisor.response_tx().clone();
-        let sender = (self.actor_spawner)(session, response_tx, &self.actor_parent_token);
+        let sender = (self.actor_spawner)(session, None, response_tx, &self.actor_parent_token);
 
         let trigger_msg = AgentMessage::CronTrigger {
             job_id: event.job_id.clone(),
@@ -435,8 +443,14 @@ impl Router {
 
         if !routed {
             info!(session_id = %session_id, "creating new actor for session");
+            // User-channel actors are not allowed to override the LLM
+            // at spawn time. The spawner reads `session.state.last_llm`
+            // (set by admin-side session creation) for hydration, or
+            // falls back to the pool default. Mid-session swaps are
+            // not exposed to user-channel callers — `SubagentSpawnRequest`
+            // is the only path that pins a non-default model.
             let response_tx = self.supervisor.response_tx().clone();
-            let sender = (self.actor_spawner)(session, response_tx, &self.actor_parent_token);
+            let sender = (self.actor_spawner)(session, None, response_tx, &self.actor_parent_token);
             self.supervisor.register(session_id.clone(), sender);
 
             // Retry routing now that the actor exists.

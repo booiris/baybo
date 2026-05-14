@@ -180,6 +180,10 @@ enum IterationOutcome {
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
 pub struct AgentLoop {
     llm_client: Arc<GuardedLlm>,
+    /// Plumbed into [`crate::tool_executor::ToolExecutor::execute`] so
+    /// in-tool LLM calls bill against the same model the surrounding
+    /// actor is using.
+    billed_chat_factory: Arc<crate::billed_chat::BilledChatFactory>,
     tool_registry: Arc<ToolRegistry>,
     skill_registry: Arc<SkillRegistry>,
     tool_executor: Arc<ToolExecutor>,
@@ -237,7 +241,15 @@ pub struct AgentLoop {
 /// it to [`AgentLoop::from_config`] — no chained setters, no
 /// post-construction mutability.
 pub struct AgentLoopConfig {
-    pub llm_client: Arc<GuardedLlm>,
+    /// Process-wide pool of guarded LLM clients keyed by entry name.
+    /// The active client is resolved from this pool at construction
+    /// (using `initial_llm`) and on every subsequent
+    /// [`AgentLoop::set_current_llm`].
+    pub llm_pool: Arc<crate::llm_pool::LlmClientPool>,
+    /// Initial pick for the active LLM. `None` ⇒ pool default.
+    /// Typically sourced from `Session.state.last_llm` for cold-start
+    /// hydration; can be overridden by the spawner for fresh actors.
+    pub initial_llm: Option<String>,
     pub tool_registry: Arc<ToolRegistry>,
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
@@ -272,7 +284,8 @@ pub struct AgentLoopConfig {
 impl AgentLoop {
     pub fn from_config(config: AgentLoopConfig) -> Self {
         let AgentLoopConfig {
-            llm_client,
+            llm_pool,
+            initial_llm,
             tool_registry,
             skill_registry,
             tool_executor,
@@ -289,8 +302,17 @@ impl AgentLoop {
             workspace_paths,
             sessions,
         } = config;
+        let (llm_client, _effective_name) = llm_pool.resolve(initial_llm.as_deref());
+        let billed_chat_factory = crate::billed_chat::BilledChatFactory::new(
+            llm_client.clone(),
+            cost_manager.clone(),
+            Arc::clone(&security_gateway),
+        );
+        let mut context_manager = context_manager;
+        context_manager.set_active_model_context_window(llm_client.model_info().context_window);
         Self {
             llm_client,
+            billed_chat_factory,
             tool_registry,
             skill_registry,
             tool_executor,
@@ -475,6 +497,7 @@ impl AgentLoop {
             let input_clone = input.clone();
             let cancel_token_clone = cancel_token.clone();
             let notifier_clone = notifier.clone();
+            let factory_clone = Arc::clone(&self.billed_chat_factory);
 
             let result_text = crate::scope::with_step(
                 span_recorder.as_ref(),
@@ -497,6 +520,7 @@ impl AgentLoop {
                             Some(job_id),
                             cancel_token_clone.child_token(),
                             notifier_clone,
+                            Some(&factory_clone),
                         )
                         .await;
                     let text = match res {
@@ -824,6 +848,7 @@ impl AgentLoop {
                     Some(job_id),
                     cancel_token.child_token(),
                     notifier.clone(),
+                    Some(&self.billed_chat_factory),
                 )
                 .await;
 
@@ -1549,7 +1574,8 @@ impl AgentLoop {
             })
             .await?;
         if matches!(outcome, aura_context::CompressionOutcome::Compressed) {
-            self.reload_soul_after_compaction(session.id.as_ref()).await?;
+            self.reload_soul_after_compaction(session.id.as_ref())
+                .await?;
         }
         Ok(())
     }

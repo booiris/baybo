@@ -324,7 +324,6 @@ impl AgentTestHarnessBuilder {
             std::path::PathBuf::from("/tmp"),
             aura_workspace::WorkspacePaths::new(std::path::PathBuf::from("/tmp")),
             None,
-            None,
         ));
 
         // Tokenizer model id must match the LLM client's so
@@ -373,11 +372,23 @@ impl AgentTestHarnessBuilder {
             cost_manager.as_guard(),
         );
 
+        // Single-entry pool keyed by the stub model's id; tests that
+        // exercise mid-session swap can extend this by registering
+        // extra stubs under different names via a builder method.
+        let stub_entry_name = stub_llm.model_info().id.clone();
+        let mut pool_clients = std::collections::HashMap::new();
+        pool_clients.insert(stub_entry_name.clone(), guarded_llm);
+        let llm_pool = Arc::new(
+            aura_agent::LlmClientPool::new(pool_clients, stub_entry_name.clone())
+                .expect("stub pool default present"),
+        );
+
         let actor_parent_token = tokio_util::sync::CancellationToken::new();
         let actor_token = actor_parent_token.child_token();
 
         let agent_loop = AgentLoop::from_config(aura_agent::agent_loop::AgentLoopConfig {
-            llm_client: guarded_llm,
+            llm_pool,
+            initial_llm: None,
             tool_registry: tool_registry.clone(),
             skill_registry: skill_registry.clone(),
             tool_executor: tool_executor.clone(),

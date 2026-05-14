@@ -170,6 +170,10 @@ pub struct ManagerGraph {
     /// the type signature alone is enough to refuse a raw
     /// `Arc<dyn LlmCompletion>` at the call site.
     pub llm_client: Arc<GuardedLlm>,
+    /// `llm_client` is `pool.default_client()`. The pool exists so the
+    /// actor spawner can resolve a per-session pick from
+    /// `Session.state.last_llm`.
+    pub llm_pool: Arc<aura_agent::LlmClientPool>,
     /// Owner of cost-record persistence and the budget gate used by
     /// `llm_client` above. Kept on the graph so `wire_router` can
     /// hand it to `AgentLoop` without reconstructing — and so the
@@ -323,26 +327,58 @@ pub async fn build_managers(
         });
     }
 
-    // One gate covers the main loop, the in-process summarizer, and
-    // every side-LLM consumer below (tool_registry's WebFetchTool,
-    // skill_assessor, code_builder). `boot::build_llm_client` returns
-    // an `Arc<GuardedLlm>` directly — the raw `LlmClient` never
-    // surfaces above the boot boundary, so a future side consumer
-    // can't accidentally pull a raw client and bypass the gate.
-    let llm_client = boot::build_llm_client(
-        config.as_ref(),
-        &provider_registry,
-        Some(stores.blob.clone()),
-        Some(Arc::clone(&secret_vault)),
-        cost_manager.as_guard(),
-    )
-    .await?;
+    // One `Arc<GuardedLlm>` per `cfg.llm[*]` entry, built concurrently.
+    // Entries that fail to build are absent from the pool; the default
+    // entry failing is a hard error.
+    let entry_results = futures::future::join_all(config.llm.iter().map(|entry| {
+        let provider_registry = &provider_registry;
+        let blob = stores.blob.clone();
+        let vault = Arc::clone(&secret_vault);
+        let cost_guard = cost_manager.as_guard();
+        async move {
+            let result = boot::build_llm_client_for_entry(
+                entry,
+                provider_registry,
+                Some(blob),
+                Some(vault),
+                cost_guard,
+            )
+            .await;
+            (entry.name.clone(), result)
+        }
+    }))
+    .await;
+    let mut pool_clients: std::collections::HashMap<String, Arc<aura_llm::GuardedLlm>> =
+        std::collections::HashMap::new();
+    for (name, result) in entry_results {
+        match result {
+            Ok(client) => {
+                pool_clients.insert(name, client);
+            }
+            Err(e) => {
+                if name == config.default_llm {
+                    return Err(e);
+                }
+                tracing::warn!(
+                    entry = %name,
+                    error = %e,
+                    "failed to build LLM client for entry; the entry is unavailable until the issue is resolved"
+                );
+            }
+        }
+    }
+    let llm_pool = Arc::new(
+        aura_agent::LlmClientPool::new(pool_clients, config.default_llm.clone())
+            .map_err(|e| anyhow::anyhow!("build LLM client pool: {e}"))?,
+    );
+    let llm_client = llm_pool.default_client();
     let info = llm_client.model_info();
     info!(
         provider = %info.provider,
         model = %info.id,
+        pool_entries = %llm_pool.entry_names().join(", "),
         supports_vision = info.supports_vision,
-        "configured LLM client"
+        "configured LLM client pool"
     );
 
     let mut tool_registry = ToolRegistry::with_defaults(
@@ -471,15 +507,17 @@ pub async fn build_managers(
         }
     };
 
-    // --- code-builder tool: needs the LLM client (for codegen), the
-    // sandbox runner (to execute generated code under per-call caps),
-    // and the leak detector + vault so revealed tool args can be
-    // re-sanitized before they reach the nested planning LLM. Skip
+    // --- code-builder tool: needs the sandbox runner (to execute
+    // generated code under per-call caps) and the leak detector +
+    // vault so revealed tool args can be re-sanitized before they
+    // reach the nested planning LLM. The planner LLM is NOT captured
+    // here — CodeBuilder reads `ctx.llm` (per-call billed handle
+    // bound to the surrounding actor's current LLM) so a session
+    // pinned to a non-default model cascades into the planner. Skip
     // registration if the sandbox is unavailable — CodeBuilder would
     // refuse every call without it.
     if let Some(runner) = sandbox_runner.as_ref() {
         let (tool, manifest) = aura_code_builder::agent_tool(
-            llm_client.clone(),
             Arc::clone(runner),
             Arc::clone(&leak_detector),
             Arc::clone(&secret_vault),
@@ -509,11 +547,10 @@ pub async fn build_managers(
         work_dir
     });
     info!(path = %sandbox_root.display(), "sandbox FS scope rooted at workspace work/");
-    let billed_chat_factory = aura_agent::BilledChatFactory::new(
-        llm_client.clone(),
-        Arc::clone(&cost_manager),
-        Arc::clone(&security_gateway),
-    );
+    // The per-actor `BilledChatFactory` now lives on each
+    // `AgentLoop` (constructed by the spawner once the actor's
+    // chosen LLM is resolved), so `ToolExecutor` no longer stores
+    // one — it's passed in per `execute` call.
     let tool_executor = Arc::new(ToolExecutor::new(
         Arc::clone(&tool_registry),
         gate_map,
@@ -521,7 +558,6 @@ pub async fn build_managers(
         sandbox_root,
         workspace_paths.clone(),
         sandbox_runner,
-        Some(billed_chat_factory),
     ));
 
     let memory_manager = Arc::new(MemoryManager::without_embedder(stores.memory.clone()));
@@ -580,6 +616,7 @@ pub async fn build_managers(
         tool_registry,
         tool_executor,
         llm_client,
+        llm_pool,
         cost_manager,
         workspace,
         channels_registry,
@@ -651,7 +688,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     // the same gate. Re-binding here just to keep the local name
     // changes below minimal.
     let cost_manager = Arc::clone(&graph.cost_manager);
-    let guarded_llm = graph.llm_client.clone();
+    let llm_pool = Arc::clone(&graph.llm_pool);
 
     // Spawner-vs-runtime build cycle: closure captures the slot and is
     // built first, then `LocalSubagentRuntime` patches itself in.
@@ -661,7 +698,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     // Single Arc-shared factory: router's `ActorSpawner` and
     // `LocalSubagentRuntime` both spawn the same fully-wired actor.
     let spawn_actor_for: aura_agent::subagent::SubagentActorSpawner = {
-        let llm_client = guarded_llm.clone();
+        let llm_pool = Arc::clone(&llm_pool);
         let tool_registry = Arc::clone(&graph.tool_registry);
         let skill_registry = Arc::clone(&graph.skill_registry);
         let tool_executor = Arc::clone(&graph.tool_executor);
@@ -686,6 +723,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let system_spawn_tx = graph.system_spawn_tx.clone();
         Arc::new(
             move |session: aura_model::Session,
+                  initial_llm: Option<String>,
                   response_tx: mpsc::Sender<AgentOutput>,
                   parent_token: &CancellationToken| {
                 // Derive the actor's lifetime token here, threaded
@@ -694,13 +732,21 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // actor itself.
                 let actor_token = parent_token.child_token();
 
+                // LLM pinning is exclusively a subagent-spawn affair —
+                // user-channel actors always run on `default-llm`.
+                // `initial_llm` is `Some` only when
+                // `LocalSubagentRuntime::run` forwards a
+                // `SubagentSpawnRequest.llm`.
+                let effective_initial = initial_llm;
+
                 // `summary_state_dir` connects the compressor's
                 // fast-path to the background refresh runner's output.
                 // Without it the background passes still run and bill
                 // LLM, but their summaries never reach the hot path.
                 // See `docs/background-compression.md`.
                 let agent_loop = AgentLoop::from_config(AgentLoopConfig {
-                    llm_client: llm_client.clone(),
+                    llm_pool: Arc::clone(&llm_pool),
+                    initial_llm: effective_initial,
                     tool_registry: Arc::clone(&tool_registry),
                     skill_registry: Arc::clone(&skill_registry),
                     tool_executor: Arc::clone(&tool_executor),
@@ -782,8 +828,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         channels: Arc::clone(&graph.channels_registry),
         security_gateway: Arc::clone(&graph.security_gateway),
         cost_manager: Arc::clone(&cost_manager),
-        actor_spawner: Box::new(move |session, response_tx, parent_token| {
-            spawn_actor_for(session, response_tx, parent_token)
+        actor_spawner: Box::new(move |session, initial_llm, response_tx, parent_token| {
+            spawn_actor_for(session, initial_llm, response_tx, parent_token)
         }),
         cron_trigger_rx,
         system_trigger_rx,

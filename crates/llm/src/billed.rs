@@ -32,8 +32,5 @@ pub struct BilledChatResponse {
 #[async_trait]
 pub trait BilledChat: Send + Sync {
     fn model_info(&self) -> &ModelInfo;
-    async fn chat(
-        &self,
-        request: &ChatRequest,
-    ) -> Result<BilledChatResponse, String>;
+    async fn chat(&self, request: &ChatRequest) -> Result<BilledChatResponse, String>;
 }

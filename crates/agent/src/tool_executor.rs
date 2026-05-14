@@ -190,11 +190,6 @@ pub struct ToolExecutor {
     /// Forwarded to [`ToolContext::workspace_paths`].
     workspace_paths: aura_workspace::WorkspacePaths,
     sandbox_runner: Option<Arc<dyn SandboxRunner>>,
-    /// Mint per-call billed-LLM handles into [`ToolContext::llm`] so
-    /// in-tool LLM calls (today: `WebFetch`'s prompt-driven extraction)
-    /// record cost against the running tool span. `None` from argv-mode
-    /// boots and tests that don't exercise side-LLM tool paths.
-    billed_chat_factory: Option<Arc<crate::billed_chat::BilledChatFactory>>,
 }
 
 impl ToolExecutor {
@@ -205,7 +200,6 @@ impl ToolExecutor {
         workspace_root: PathBuf,
         workspace_paths: aura_workspace::WorkspacePaths,
         sandbox_runner: Option<Arc<dyn SandboxRunner>>,
-        billed_chat_factory: Option<Arc<crate::billed_chat::BilledChatFactory>>,
     ) -> Self {
         Self {
             tool_registry,
@@ -214,7 +208,6 @@ impl ToolExecutor {
             workspace_root,
             workspace_paths,
             sandbox_runner,
-            billed_chat_factory,
         }
     }
 
@@ -314,6 +307,8 @@ impl ToolExecutor {
         _parent_job_for_log: Option<JobId>,
         cancel_token: CancellationToken,
         notifier: Option<Arc<dyn aura_tools::SessionNotifier>>,
+        // `None` ⇒ tool's `ctx.llm` is unset (argv-mode / older tests).
+        billed_chat_factory: Option<&Arc<crate::billed_chat::BilledChatFactory>>,
     ) -> anyhow::Result<ToolOutput> {
         debug!(tool = tool_name, "executing tool");
 
@@ -478,7 +473,7 @@ impl ToolExecutor {
                 // makes a side-LLM call (e.g. `WebFetch`'s extraction)
                 // sees its `cost_records` row attributed to the running
                 // tool span, not a synthetic placeholder.
-                let llm = self.billed_chat_factory.as_ref().map(|factory| {
+                let llm = billed_chat_factory.map(|factory| {
                     factory.bind(
                         user.id.clone(),
                         session_id.clone(),

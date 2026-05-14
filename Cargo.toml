@@ -198,6 +198,7 @@ uuid = { workspace = true }
 clap = { workspace = true }
 parking_lot = { workspace = true }
 regex = { workspace = true }
+futures = { workspace = true }
 
 [profile.release]
 opt-level = 3

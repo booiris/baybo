@@ -57,6 +57,7 @@ use crate::job::JobLifecycle;
 pub type SubagentActorSpawner = Arc<
     dyn Fn(
             aura_model::Session,
+            /* initial_llm */ Option<String>,
             mpsc::Sender<AgentOutput>,
             &CancellationToken,
         ) -> mpsc::Sender<AgentMessage>
@@ -81,6 +82,15 @@ pub struct SubagentSpawnRequest {
     /// token (derived from the parent's), so the child's descendant
     /// tokens cascade automatically.
     pub timeout: Duration,
+    /// Optional LLM entry-name override for the spawned child.
+    /// `None` ⇒ fall back to the pool default at spawn time (the
+    /// parent's `current_llm` is intentionally NOT inherited so a
+    /// parent that swapped models mid-turn doesn't drag the child
+    /// into a model the spawn request didn't ask for). The parser
+    /// accepts this field today; advertising it in the soul prompt
+    /// is a follow-up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm: Option<String>,
 }
 
 /// What the parent receives back from the runtime.
@@ -266,7 +276,12 @@ impl SubagentRuntime for LocalSubagentRuntime {
         // mailbox path below, so the child starts with whatever the
         // store has for `child_session.id` — empty for a freshly
         // minted child.
-        let mailbox = (self.spawn_actor)(child_session.clone(), output_tx, &parent_token);
+        let mailbox = (self.spawn_actor)(
+            child_session.clone(),
+            request.llm.clone(),
+            output_tx,
+            &parent_token,
+        );
 
         // Subscribe to terminal events *before* dispatching the
         // initial message — a fast child whose `agent_loop.run`
@@ -495,10 +510,15 @@ pub fn parse_spawn_request(value: &serde_json::Value) -> Result<SubagentSpawnReq
         .and_then(|v| v.as_u64())
         .unwrap_or(600);
     let timeout = Duration::from_secs(timeout_secs.max(1));
+    let llm = value
+        .get("llm")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     Ok(SubagentSpawnRequest {
         task_description: task,
         must_include_context: context,
         timeout,
+        llm,
     })
 }
 

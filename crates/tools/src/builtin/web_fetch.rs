@@ -898,7 +898,8 @@ mod tests {
     /// article-shaped page rather than the fallback path.
     fn article_html(title: &str, body_paragraph: &str) -> String {
         let filler = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod \
-                      tempor incididunt ut labore et dolore magna aliqua. ".repeat(8);
+                      tempor incididunt ut labore et dolore magna aliqua. "
+            .repeat(8);
         format!(
             r#"<html><head><title>{title}</title></head><body>
                 <nav><a href="/x">menu link</a></nav>
@@ -924,9 +925,7 @@ mod tests {
             "/",
             get(move || {
                 let body = body.clone();
-                async move {
-                    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body)
-                }
+                async move { ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body) }
             }),
         ))
         .await;
@@ -949,9 +948,7 @@ mod tests {
             "/",
             get(move || {
                 let body = body.clone();
-                async move {
-                    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body)
-                }
+                async move { ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body) }
             }),
         ))
         .await;
@@ -976,9 +973,7 @@ mod tests {
             "/",
             get(move || {
                 let body = body.clone();
-                async move {
-                    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body)
-                }
+                async move { ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body) }
             }),
         ))
         .await;
@@ -1440,7 +1435,6 @@ mod tests {
 
         let tool = WebFetchTool::for_testing();
 
-
         let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
         let mut tctx = ctx();
         tctx.llm = Some(llm);
@@ -1472,8 +1466,14 @@ mod tests {
             panic!("expected text block")
         };
         assert!(user_text.contains("what's the title?"));
-        assert!(user_text.contains("Hello"), "extracted title missing: {user_text}");
-        assert!(!user_text.contains("<h1"), "raw html leaked to LLM: {user_text}");
+        assert!(
+            user_text.contains("Hello"),
+            "extracted title missing: {user_text}"
+        );
+        assert!(
+            !user_text.contains("<h1"),
+            "raw html leaked to LLM: {user_text}"
+        );
     }
 
     /// Without a prompt the LLM is *not* called even when one is wired
@@ -1490,9 +1490,7 @@ mod tests {
             "/",
             get(move || {
                 let body = body.clone();
-                async move {
-                    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body)
-                }
+                async move { ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body) }
             }),
         ))
         .await;
@@ -1569,10 +1567,7 @@ mod tests {
         let mut tctx = ctx();
         tctx.llm = Some(llm);
         let out = tool
-            .execute(
-                json!({ "url": url_to(&server, "/"), "prompt": "?" }),
-                &tctx,
-            )
+            .execute(json!({ "url": url_to(&server, "/"), "prompt": "?" }), &tctx)
             .await
             .unwrap();
         let ToolOutput::Error(s) = out else {

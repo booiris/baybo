@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use aura_llm::{ChatRequest, GuardedLlm};
+use aura_llm::{BilledChat, ChatRequest};
 use aura_model::{ChatMessage, ContentBlock, ResourceAccess, Role};
 use aura_sandbox::{NetworkPolicy, SandboxRunner};
 use aura_security::{LeakDetector, PlaceholderMinter, SecretVault};
@@ -28,7 +28,12 @@ const INLINE_OUTPUT_THRESHOLD: usize = 4 * 1024;
 const PREVIEW_BYTES: usize = 512;
 
 pub struct CodeBuilderTool {
-    llm: Arc<GuardedLlm>,
+    // No stored LLM client: planning runs through the per-call
+    // `ToolContext.llm` (an `Arc<dyn BilledChat>`) so each invocation
+    // bills against the surrounding actor's currently-selected model
+    // — pinning a session to a non-default LLM correctly cascades
+    // into CodeBuilder's planner instead of silently falling back to
+    // the process default's provider/credentials/cost profile.
     sandbox_runner: Arc<dyn SandboxRunner>,
     leak_detector: Arc<LeakDetector>,
     minter: Arc<PlaceholderMinter>,
@@ -54,7 +59,6 @@ struct Params {
 
 impl CodeBuilderTool {
     pub fn new(
-        llm: Arc<GuardedLlm>,
         sandbox_runner: Arc<dyn SandboxRunner>,
         leak_detector: Arc<LeakDetector>,
         secret_vault: Arc<SecretVault>,
@@ -63,7 +67,6 @@ impl CodeBuilderTool {
             secret_vault.master_key(),
         ));
         Self {
-            llm,
             sandbox_runner,
             leak_detector,
             minter,
@@ -84,6 +87,7 @@ impl CodeBuilderTool {
 
     async fn fetch_plan(
         &self,
+        llm: &dyn BilledChat,
         task: &str,
         caps: &CallerCaps,
     ) -> Result<EffectivePlan, CodeBuilderError> {
@@ -93,18 +97,28 @@ impl CodeBuilderTool {
             temperature: Some(0.0),
             tools: vec![],
         };
-        let first = self.llm.chat(&request).await?;
-        let parsed = match parse_plan(&first.content) {
+        // `BilledChat::chat` returns a sanitised String on error (the
+        // agent-side adapter has already scrubbed leaked secrets out of
+        // the provider message), so we surface it verbatim into
+        // `CodeBuilderError::LlmFailed`.
+        let first = llm
+            .chat(&request)
+            .await
+            .map_err(CodeBuilderError::LlmFailed)?;
+        let parsed = match parse_plan(&first.response.content) {
             Ok(p) => p,
             Err(_) => {
-                let retry_messages = build_retry_messages(messages, &first.content);
+                let retry_messages = build_retry_messages(messages, &first.response.content);
                 let retry_request = ChatRequest {
                     messages: retry_messages,
                     temperature: Some(0.0),
                     tools: vec![],
                 };
-                let second = self.llm.chat(&retry_request).await?;
-                parse_plan(&second.content)?
+                let second = llm
+                    .chat(&retry_request)
+                    .await
+                    .map_err(CodeBuilderError::LlmFailed)?;
+                parse_plan(&second.response.content)?
             }
         };
         project(parsed, caps, &self.hard_caps)
@@ -264,6 +278,17 @@ impl Tool for CodeBuilderTool {
             return Err(CodeBuilderError::Cancelled.into());
         }
 
+        // Planner must run against the surrounding actor's billed LLM
+        // handle so the call lands on the session's currently-selected
+        // model and bills against the running tool span. Fail closed
+        // when none is bound — there is no acceptable fallback that
+        // doesn't risk routing planning prompts to the wrong provider.
+        let billed_llm = ctx
+            .llm
+            .as_ref()
+            .ok_or(CodeBuilderError::LlmUnavailable)
+            .map_err(ToolError::from)?;
+
         let uv_path = self.resolve_uv().map_err(ToolError::from)?.to_path_buf();
 
         let plan_start = Instant::now();
@@ -271,7 +296,7 @@ impl Tool for CodeBuilderTool {
             _ = ctx.cancellation_token.cancelled() => {
                 return Err(CodeBuilderError::Cancelled.into());
             }
-            res = self.fetch_plan(&p.task, &caps) => res?,
+            res = self.fetch_plan(billed_llm.as_ref(), &p.task, &caps) => res?,
         };
         let planning_ms = plan_start.elapsed().as_millis() as u64;
 
@@ -730,15 +755,74 @@ mod tests {
     use super::*;
     use crate::test_support::FakeSandboxRunner;
     use aura_llm::test_support::StubLlm;
-    use aura_llm::{LlmResponse, TokenUsage};
-    use aura_model::User;
+    use aura_llm::{BilledChatResponse, LlmCompletion, LlmResponse, ModelInfo, TokenUsage};
+    use aura_model::{MicroUsd, User};
     use aura_sandbox::SandboxOutput;
     use aura_security::EncryptionKey;
     use aura_storage::test_support::MemorySecretStore;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
-    fn make_ctx(workspace_root: PathBuf) -> ToolContext {
+    /// Minimal `BilledChat` stub used by the CodeBuilder tests now
+    /// that the tool reads its LLM handle from `ToolContext.llm`
+    /// instead of capturing one at construction. Wraps a `StubLlm`
+    /// and surfaces its scripted responses as `BilledChatResponse`s
+    /// with zero cost — tests don't exercise the billing surface,
+    /// only that planning prompts reach the LLM and that retries
+    /// happen on parse failures.
+    struct StubBilledChat {
+        inner: Arc<StubLlm>,
+        info: ModelInfo,
+    }
+
+    impl StubBilledChat {
+        fn new(inner: Arc<StubLlm>) -> Self {
+            let info = inner.model_info().clone();
+            Self { inner, info }
+        }
+    }
+
+    #[async_trait]
+    impl BilledChat for StubBilledChat {
+        fn model_info(&self) -> &ModelInfo {
+            &self.info
+        }
+        async fn chat(
+            &self,
+            request: &ChatRequest,
+        ) -> std::result::Result<BilledChatResponse, String> {
+            self.inner
+                .chat(request)
+                .await
+                .map(|response| BilledChatResponse {
+                    response,
+                    cost_micros: MicroUsd::ZERO,
+                })
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    fn make_ctx_with_llm(workspace_root: PathBuf, stub: &Arc<StubLlm>) -> ToolContext {
+        ToolContext {
+            session_id: "test".into(),
+            user: User {
+                id: "u".into(),
+                name: None,
+                channel: aura_model::ChannelType::tui(),
+            },
+            timeout: Duration::from_secs(30),
+            cancellation_token: CancellationToken::new(),
+            workspace_paths: aura_workspace::WorkspacePaths::new(workspace_root.clone()),
+            workspace_root,
+            sandbox: None,
+            approval: None,
+            notifier: None,
+            events: aura_tools::noop_event_sink(),
+            llm: Some(Arc::new(StubBilledChat::new(Arc::clone(stub)))),
+        }
+    }
+
+    fn make_ctx_no_llm(workspace_root: PathBuf) -> ToolContext {
         ToolContext {
             session_id: "test".into(),
             user: User {
@@ -778,21 +862,17 @@ mod tests {
         }
     }
 
-    fn make_tool(stub: Arc<StubLlm>, runner: Arc<dyn SandboxRunner>) -> CodeBuilderTool {
-        let (tool, _vault) = make_tool_with_vault(stub, runner);
+    fn make_tool(runner: Arc<dyn SandboxRunner>) -> CodeBuilderTool {
+        let (tool, _vault) = make_tool_with_vault(runner);
         tool
     }
 
-    fn make_tool_with_vault(
-        stub: Arc<StubLlm>,
-        runner: Arc<dyn SandboxRunner>,
-    ) -> (CodeBuilderTool, Arc<SecretVault>) {
+    fn make_tool_with_vault(runner: Arc<dyn SandboxRunner>) -> (CodeBuilderTool, Arc<SecretVault>) {
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
         let store = Arc::new(MemorySecretStore::new());
         let vault = Arc::new(SecretVault::new(key, store));
         let detector = Arc::new(LeakDetector::with_default_rules());
-        let llm = GuardedLlm::passthrough(stub as Arc<dyn aura_llm::LlmCompletion>);
-        let tool = CodeBuilderTool::new(llm, runner, detector, Arc::clone(&vault));
+        let tool = CodeBuilderTool::new(runner, detector, Arc::clone(&vault));
         tool.uv_path
             .set(PathBuf::from("/usr/local/bin/uv"))
             .unwrap();
@@ -813,10 +893,10 @@ mod tests {
             timed_out: false,
         });
         let runner: Arc<dyn SandboxRunner> = fake.clone();
-        let tool = make_tool(stub, runner);
+        let tool = make_tool(runner);
 
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
 
         let out = tool.execute(json!({"task": "exit 5"}), &ctx).await.unwrap();
         match out {
@@ -848,10 +928,10 @@ mod tests {
             elapsed: Duration::from_millis(250),
             timed_out: false,
         });
-        let tool = make_tool(stub, fake as Arc<dyn SandboxRunner>);
+        let tool = make_tool(fake as Arc<dyn SandboxRunner>);
 
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
         let v = match tool.execute(json!({"task": "x"}), &ctx).await.unwrap() {
             ToolOutput::Json(v) => v,
             _ => panic!(),
@@ -875,10 +955,10 @@ mod tests {
             Duration::from_secs(30),
         ));
         let runner: Arc<dyn SandboxRunner> = fake;
-        let tool = make_tool(stub, runner);
+        let tool = make_tool(runner);
 
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
         let err = tool
             .execute(json!({"task": "loop forever"}), &ctx)
             .await
@@ -900,10 +980,10 @@ mod tests {
             timed_out: false,
         });
         let runner: Arc<dyn SandboxRunner> = fake.clone();
-        let tool = make_tool(stub, runner);
+        let tool = make_tool(runner);
 
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
         let _ = tool
             .execute(json!({"task": "print 42"}), &ctx)
             .await
@@ -918,6 +998,40 @@ mod tests {
         assert!(spec.args.iter().any(|a| a.starts_with("UV_CACHE_DIR=")));
     }
 
+    /// `ToolContext.llm = None` means no per-actor `BilledChatFactory`
+    /// was bound for this call. CodeBuilder must NOT silently fall
+    /// back to a process default — that would route planning prompts
+    /// to a model the surrounding session didn't authorise, bypassing
+    /// the per-session pin and its cost/credential profile. The tool
+    /// fails closed with `ToolError::Execution(... LlmUnavailable
+    /// ...)` and no sandbox spawn ever happens.
+    #[tokio::test]
+    async fn execute_without_ctx_llm_fails_closed() {
+        let fake = FakeSandboxRunner::new(empty_output());
+        let runner: Arc<dyn SandboxRunner> = fake.clone();
+        let tool = make_tool(runner);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = make_ctx_no_llm(tmp.path().to_path_buf());
+        let err = tool
+            .execute(json!({"task": "anything"}), &ctx)
+            .await
+            .expect_err("execute must fail when ctx.llm is unbound");
+        match err {
+            ToolError::Execution(msg) => {
+                assert!(
+                    msg.contains("requires a billed LLM handle"),
+                    "expected LlmUnavailable surface, got: {msg}"
+                );
+            }
+            other => panic!("expected ToolError::Execution, got {other:?}"),
+        }
+        assert!(
+            fake.captured().is_empty(),
+            "sandbox must not be invoked when planning LLM is unavailable"
+        );
+    }
+
     #[tokio::test]
     async fn cancellation_token_pre_llm_returns_immediately() {
         let stub = Arc::new(StubLlm::new());
@@ -925,10 +1039,10 @@ mod tests {
         // with "queue empty"; we want to assert it never gets there.
         let fake = FakeSandboxRunner::new(empty_output());
         let runner: Arc<dyn SandboxRunner> = fake;
-        let tool = make_tool(stub, runner);
+        let tool = make_tool(runner);
 
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
         ctx.cancellation_token.cancel();
 
         let err = tool.execute(json!({"task": "x"}), &ctx).await.unwrap_err();
@@ -942,10 +1056,10 @@ mod tests {
         stub.push_response(ok_response("still not json"));
         let fake = FakeSandboxRunner::new(empty_output());
         let runner: Arc<dyn SandboxRunner> = fake;
-        let tool = make_tool(stub, runner);
+        let tool = make_tool(runner);
 
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
         let err = tool.execute(json!({"task": "x"}), &ctx).await.unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
     }
@@ -955,10 +1069,10 @@ mod tests {
         let stub = Arc::new(StubLlm::new());
         let fake = FakeSandboxRunner::new(empty_output());
         let runner: Arc<dyn SandboxRunner> = fake;
-        let tool = make_tool(stub, runner);
+        let tool = make_tool(runner);
 
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
         let err = tool.execute(json!({"task": "  "}), &ctx).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidParams(_)));
     }
@@ -971,10 +1085,9 @@ mod tests {
         // network host + reason and concrete out-of-scratch write
         // paths. Returning empty here is what makes the executor's
         // pre-execute gate skip CodeBuilder.
-        let stub = Arc::new(StubLlm::new());
         let fake = FakeSandboxRunner::new(empty_output());
         let runner: Arc<dyn SandboxRunner> = fake;
-        let tool = make_tool(stub, runner);
+        let tool = make_tool(runner);
 
         assert!(
             tool.accessed_resources(&json!({"task": "compute things"}))
@@ -1003,10 +1116,10 @@ mod tests {
         ));
         let fake = FakeSandboxRunner::new(empty_output());
         let runner: Arc<dyn SandboxRunner> = fake;
-        let (tool, vault) = make_tool_with_vault(stub, runner);
+        let (tool, vault) = make_tool_with_vault(runner);
 
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
 
         let _ = tool
             .execute(
@@ -1042,10 +1155,10 @@ mod tests {
             timed_out: false,
         });
         let runner: Arc<dyn SandboxRunner> = fake;
-        let tool = make_tool(stub, runner);
+        let tool = make_tool(runner);
 
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
         let out = tool
             .execute(json!({"task": "print 1"}), &ctx)
             .await
@@ -1091,10 +1204,10 @@ mod tests {
             elapsed: Duration::from_millis(20),
             timed_out: false,
         });
-        let tool = make_tool(stub, fake as Arc<dyn SandboxRunner>);
+        let tool = make_tool(fake as Arc<dyn SandboxRunner>);
 
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
         let v = match tool.execute(json!({"task": "x"}), &ctx).await.unwrap() {
             ToolOutput::Json(v) => v,
             _ => panic!(),
@@ -1117,10 +1230,10 @@ mod tests {
             elapsed: Duration::from_millis(20),
             timed_out: false,
         });
-        let tool = make_tool(stub, fake as Arc<dyn SandboxRunner>);
+        let tool = make_tool(fake as Arc<dyn SandboxRunner>);
 
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
         let v = match tool.execute(json!({"task": "x"}), &ctx).await.unwrap() {
             ToolOutput::Json(v) => v,
             _ => panic!(),
@@ -1156,10 +1269,10 @@ mod tests {
             elapsed: Duration::from_millis(20),
             timed_out: false,
         });
-        let (tool, vault) = make_tool_with_vault(stub, fake as Arc<dyn SandboxRunner>);
+        let (tool, vault) = make_tool_with_vault(fake as Arc<dyn SandboxRunner>);
 
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
         let v = match tool.execute(json!({"task": "x"}), &ctx).await.unwrap() {
             ToolOutput::Json(v) => v,
             _ => panic!(),
@@ -1193,10 +1306,10 @@ mod tests {
         let fake = FakeSandboxRunner::with_error(aura_sandbox::SandboxError::Timeout(
             Duration::from_secs(30),
         ));
-        let tool = make_tool(stub, fake as Arc<dyn SandboxRunner>);
+        let tool = make_tool(fake as Arc<dyn SandboxRunner>);
 
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
         let _ = tool.execute(json!({"task": "x"}), &ctx).await.unwrap_err();
 
         let runs_root = tmp.path().join(aura_workspace::paths::CODE_BUILDER_SUBDIR);
@@ -1219,10 +1332,10 @@ mod tests {
             elapsed: Duration::from_millis(11),
             timed_out: false,
         });
-        let tool = make_tool(stub, fake as Arc<dyn SandboxRunner>);
+        let tool = make_tool(fake as Arc<dyn SandboxRunner>);
 
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
         let v = match tool
             .execute(json!({"task": "print 7"}), &ctx)
             .await
@@ -1307,7 +1420,11 @@ mod tests {
         (handle, captured, cache)
     }
 
-    fn make_ctx_with_handle(workspace_root: PathBuf, handle: ApprovalHandle) -> ToolContext {
+    fn make_ctx_with_handle(
+        workspace_root: PathBuf,
+        handle: ApprovalHandle,
+        stub: &Arc<StubLlm>,
+    ) -> ToolContext {
         ToolContext {
             session_id: "test".into(),
             user: User {
@@ -1323,7 +1440,7 @@ mod tests {
             approval: Some(handle),
             notifier: None,
             events: aura_tools::noop_event_sink(),
-            llm: None,
+            llm: Some(Arc::new(StubBilledChat::new(Arc::clone(stub)))),
         }
     }
 
@@ -1342,11 +1459,11 @@ mod tests {
             elapsed: Duration::from_millis(20),
             timed_out: false,
         });
-        let tool = make_tool(stub, fake as Arc<dyn SandboxRunner>);
+        let tool = make_tool(fake as Arc<dyn SandboxRunner>);
 
         let tmp = tempfile::tempdir().unwrap();
         let (handle, captured, _) = handle_with(ApprovalDecision::Deny);
-        let ctx = make_ctx_with_handle(tmp.path().to_path_buf(), handle);
+        let ctx = make_ctx_with_handle(tmp.path().to_path_buf(), handle, &stub);
         let _ = tool.execute(json!({"task": "x"}), &ctx).await.unwrap();
         assert!(
             captured.lock().is_empty(),
@@ -1367,11 +1484,11 @@ mod tests {
             elapsed: Duration::from_millis(20),
             timed_out: false,
         });
-        let tool = make_tool(stub, fake as Arc<dyn SandboxRunner>);
+        let tool = make_tool(fake as Arc<dyn SandboxRunner>);
 
         let tmp = tempfile::tempdir().unwrap();
         let (handle, captured, _) = handle_with(ApprovalDecision::Approve);
-        let ctx = make_ctx_with_handle(tmp.path().to_path_buf(), handle);
+        let ctx = make_ctx_with_handle(tmp.path().to_path_buf(), handle, &stub);
         let _ = tool
             .execute(
                 json!({"task": "fetch inventory", "allow_network": true}),
@@ -1406,11 +1523,11 @@ mod tests {
         ));
         let fake = FakeSandboxRunner::new(empty_output());
         let runner: Arc<dyn SandboxRunner> = fake.clone();
-        let tool = make_tool(stub, runner);
+        let tool = make_tool(runner);
 
         let tmp = tempfile::tempdir().unwrap();
         let (handle, _captured, _) = handle_with(ApprovalDecision::Deny);
-        let ctx = make_ctx_with_handle(tmp.path().to_path_buf(), handle);
+        let ctx = make_ctx_with_handle(tmp.path().to_path_buf(), handle, &stub);
         let err = tool
             .execute(json!({"task": "fetch", "allow_network": true}), &ctx)
             .await
@@ -1439,11 +1556,11 @@ mod tests {
             r#"{"code":"print(1)","network_required":true,"network_reason":"fetch","readable_paths":[],"estimated_runtime_seconds":1,"estimated_memory_mb":64,"rationale":"r"}"#,
         ));
         let fake = FakeSandboxRunner::new(empty_output());
-        let tool = make_tool(stub, fake as Arc<dyn SandboxRunner>);
+        let tool = make_tool(fake as Arc<dyn SandboxRunner>);
 
         let tmp = tempfile::tempdir().unwrap();
         let (handle, _captured, cache) = handle_with(ApprovalDecision::ApproveAlways);
-        let ctx = make_ctx_with_handle(tmp.path().to_path_buf(), handle);
+        let ctx = make_ctx_with_handle(tmp.path().to_path_buf(), handle, &stub);
         let _ = tool
             .execute(json!({"task": "fetch", "allow_network": true}), &ctx)
             .await
@@ -1471,7 +1588,7 @@ mod tests {
             r#"{"code":"print(1)","network_required":true,"network_reason":"fetch","readable_paths":[],"estimated_runtime_seconds":1,"estimated_memory_mb":64,"rationale":"r"}"#,
         ));
         let fake = FakeSandboxRunner::new(empty_output());
-        let tool = make_tool(stub, fake as Arc<dyn SandboxRunner>);
+        let tool = make_tool(fake as Arc<dyn SandboxRunner>);
 
         let tmp = tempfile::tempdir().unwrap();
         // Pre-populate the cache with `Http { host: "*" }`. This is
@@ -1485,7 +1602,7 @@ mod tests {
         // Deny-all gate; the test asserts it is *not* invoked.
         let (handle, captured, _cache) =
             handle_with_cache(ApprovalDecision::Deny, Arc::clone(&cache));
-        let ctx = make_ctx_with_handle(tmp.path().to_path_buf(), handle);
+        let ctx = make_ctx_with_handle(tmp.path().to_path_buf(), handle, &stub);
 
         let out = tool
             .execute(json!({"task": "fetch", "allow_network": true}), &ctx)
@@ -1512,11 +1629,11 @@ mod tests {
         ));
         let fake = FakeSandboxRunner::new(empty_output());
         let runner: Arc<dyn SandboxRunner> = fake.clone();
-        let tool = make_tool(stub, runner);
+        let tool = make_tool(runner);
 
         let tmp = tempfile::tempdir().unwrap();
         // make_ctx() leaves approval = None.
-        let ctx = make_ctx(tmp.path().to_path_buf());
+        let ctx = make_ctx_with_llm(tmp.path().to_path_buf(), &stub);
         let err = tool
             .execute(json!({"task": "fetch", "allow_network": true}), &ctx)
             .await
@@ -1894,11 +2011,11 @@ mod tests {
             r#"{"code":"print(1)","network_required":true,"network_reason":"reach api","readable_paths":[],"estimated_runtime_seconds":1,"estimated_memory_mb":64,"rationale":"r"}"#,
         ));
         let fake = FakeSandboxRunner::new(empty_output());
-        let (tool, vault) = make_tool_with_vault(stub, fake as Arc<dyn SandboxRunner>);
+        let (tool, vault) = make_tool_with_vault(fake as Arc<dyn SandboxRunner>);
 
         let tmp = tempfile::tempdir().unwrap();
         let (handle, captured, _) = handle_with(ApprovalDecision::Approve);
-        let ctx = make_ctx_with_handle(tmp.path().to_path_buf(), handle);
+        let ctx = make_ctx_with_handle(tmp.path().to_path_buf(), handle, &stub);
         let _ = tool
             .execute(
                 json!({
@@ -1955,11 +2072,11 @@ mod tests {
         let stub = Arc::new(StubLlm::new());
         stub.push_response(ok_response(&response_json));
         let fake = FakeSandboxRunner::new(empty_output());
-        let (tool, vault) = make_tool_with_vault(stub, fake as Arc<dyn SandboxRunner>);
+        let (tool, vault) = make_tool_with_vault(fake as Arc<dyn SandboxRunner>);
 
         let workspace = tempfile::tempdir().unwrap();
         let (handle, captured, _) = handle_with(ApprovalDecision::Approve);
-        let ctx = make_ctx_with_handle(workspace.path().to_path_buf(), handle);
+        let ctx = make_ctx_with_handle(workspace.path().to_path_buf(), handle, &stub);
         let _ = tool
             .execute(
                 json!({

@@ -167,6 +167,15 @@ pub struct ContextManager {
     /// Tail size for the truncate fallback and the pre-flight gate.
     pub(crate) keep_recent: usize,
     pub(crate) budget: TokenBudget,
+    /// Configured per-session cap (`agent.context.max_tokens` from
+    /// `aura.json`). The effective compression trigger uses
+    /// `min(configured_max_tokens, active_model.context_window)` —
+    /// [`Self::set_active_model_context_window`] clamps `budget` down
+    /// when the actor swaps to a smaller-context model so requests
+    /// don't grow past the live provider's limit between turns.
+    /// Stored independently of `budget.max_tokens` so a swap back to
+    /// a larger model can restore the original cap.
+    configured_max_tokens: usize,
     calibration: Arc<TokenCalibration>,
     pub(crate) skill_registry: Arc<SkillRegistry>,
     /// Owned conversation transcript — the sole source of truth.
@@ -234,11 +243,13 @@ pub struct ContextManagerConfig {
 
 impl ContextManager {
     pub fn from_config(config: ContextManagerConfig) -> Self {
+        let configured_max_tokens = config.budget.max_tokens();
         Self {
             tokenizer: config.tokenizer,
             workspace: config.workspace,
             keep_recent: config.keep_recent,
             budget: config.budget,
+            configured_max_tokens,
             calibration: config.calibration,
             skill_registry: config.skill_registry,
             messages: Vec::new(),
@@ -251,6 +262,18 @@ impl ContextManager {
             last_summary_anchor: None,
             last_synced_cursor: None,
         }
+    }
+
+    /// Clamp the compression trigger to the active model's context
+    /// window. Called by `AgentLoop` on construction and on every
+    /// [`AgentLoop::set_current_llm`] so a swap into a
+    /// smaller-context model triggers compression before the provider
+    /// rejects the request. A swap back into a larger model relaxes
+    /// the cap back up to (but not above) the configured
+    /// `agent.context.max_tokens`.
+    pub fn set_active_model_context_window(&mut self, window: usize) {
+        let effective = self.configured_max_tokens.min(window);
+        self.budget.set_max_tokens(effective);
     }
 
     /// Read-only access to the owned transcript.
@@ -1242,6 +1265,20 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
         })
+    }
+
+    #[test]
+    fn set_active_model_context_window_clamps_to_min() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        // Smaller model window → budget drops to model_window.
+        ctx.set_active_model_context_window(60_000);
+        assert_eq!(ctx.budget().max_tokens(), 60_000);
+        // Switching back to a larger model can't exceed configured cap.
+        ctx.set_active_model_context_window(500_000);
+        assert_eq!(ctx.budget().max_tokens(), 100_000);
+        // A swap into a smaller-still model re-clamps.
+        ctx.set_active_model_context_window(8_000);
+        assert_eq!(ctx.budget().max_tokens(), 8_000);
     }
 
     #[tokio::test]
