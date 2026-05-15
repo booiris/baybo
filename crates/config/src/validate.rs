@@ -8,7 +8,6 @@ use crate::cost::CostConfig;
 use crate::error::{ConfigError, ValidationError};
 use crate::gateway::GatewayConfig;
 use crate::llm::LlmEntry;
-use crate::session::SessionConfig;
 use crate::workspace::WorkspaceConfig;
 
 impl AuraConfig {
@@ -19,7 +18,6 @@ impl AuraConfig {
         let mut errors = Vec::new();
         validate_llm_entries(&self.llm, &mut errors);
         validate_agent(self, &mut errors);
-        validate_session(&self.session, &mut errors);
         validate_channels(&self.channels, &mut errors);
         validate_cost(&self.cost, &mut errors);
         validate_workspace(&self.workspace, &mut errors);
@@ -105,15 +103,6 @@ fn validate_agent(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
     if ctx.keep_recent == 0 {
         errors.push(ValidationError::new(
             "agent.context.keep_recent",
-            "must be >= 1",
-        ));
-    }
-}
-
-fn validate_session(session: &SessionConfig, errors: &mut Vec<ValidationError>) {
-    if session.timeout_minutes == 0 {
-        errors.push(ValidationError::new(
-            "session.timeout_minutes",
             "must be >= 1",
         ));
     }

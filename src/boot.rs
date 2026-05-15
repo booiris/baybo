@@ -12,8 +12,7 @@ use std::path::{Path, PathBuf};
 
 use aura_agent::policy::ExecutionPolicy;
 use aura_config::{
-    AgentConfig, AuraConfig, LlmEntry, RiskCheckConfig, SecurityConfig, SessionConfig,
-    WorkspaceConfig,
+    AgentConfig, AuraConfig, LlmEntry, RiskCheckConfig, SecurityConfig, WorkspaceConfig,
 };
 use aura_context::TokenBudget;
 use aura_llm::credentials::resolve_api_key;
@@ -229,10 +228,6 @@ pub fn to_token_budget(cfg: &aura_config::ContextConfig) -> TokenBudget {
     TokenBudget::new(cfg.max_tokens, cfg.compression_threshold)
 }
 
-pub fn to_session_timeout(cfg: &SessionConfig) -> chrono::Duration {
-    chrono::Duration::minutes(cfg.timeout_minutes as i64)
-}
-
 pub fn to_assessment_mode(cfg: RiskCheckConfig) -> AssessmentMode {
     match cfg {
         RiskCheckConfig::Off => AssessmentMode::Off,
@@ -252,7 +247,7 @@ pub fn build_leak_detector(cfg: &SecurityConfig) -> LeakDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_config::{AgentConfig, ContextConfig, SecurityConfig, SessionConfig, WorkspaceConfig};
+    use aura_config::{AgentConfig, ContextConfig, SecurityConfig, WorkspaceConfig};
 
     #[test]
     fn execution_policy_maps_max_iterations() {
@@ -262,15 +257,6 @@ mod tests {
         };
         let policy = to_execution_policy(&cfg);
         assert_eq!(policy.max_iterations, 42);
-    }
-
-    #[test]
-    fn session_timeout_converts_minutes_to_chrono() {
-        let cfg = SessionConfig {
-            timeout_minutes: 15,
-            ..SessionConfig::default()
-        };
-        assert_eq!(to_session_timeout(&cfg), chrono::Duration::minutes(15));
     }
 
     #[test]

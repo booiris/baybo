@@ -20,7 +20,6 @@ pub struct SessionManager {
     /// production wires the libsql backend; tests pass
     /// `aura_storage::test_support::MemorySessionSummaryStore`.
     summary_store: Arc<dyn SessionSummaryStore>,
-    session_timeout: Duration,
     /// Default soul version stamped on new sessions when the caller
     /// does not supply one. The agent layer overrides this via
     /// `create_session_with_options` once it loads the live config.
@@ -28,15 +27,10 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    pub fn new(
-        store: Arc<dyn SessionStore>,
-        summary_store: Arc<dyn SessionSummaryStore>,
-        session_timeout: Duration,
-    ) -> Self {
+    pub fn new(store: Arc<dyn SessionStore>, summary_store: Arc<dyn SessionSummaryStore>) -> Self {
         Self {
             store,
             summary_store,
-            session_timeout,
             default_soul_version: "soul-default".to_owned(),
         }
     }
@@ -157,6 +151,19 @@ impl SessionManager {
     /// parent permanently blocked.
     pub async fn clear_all_summary_in_flight(&self) -> Result<()> {
         self.summary_store.clear_all_in_flight().await.map_err(wrap)
+    }
+
+    /// Unconditionally clear the `in_flight` flag for one session.
+    /// Used by the actor idle reaper before sending `Shutdown`: the
+    /// maintenance child whose `actor_token` is a grandchild of the
+    /// reaped parent will cascade-cancel, so any pass it owned is
+    /// abandoned. Without this clear, the next hydration would see
+    /// the dangling mark and skip compression forever.
+    pub async fn clear_summary_in_flight(&self, session_id: &SessionId) -> Result<()> {
+        self.summary_store
+            .set_in_flight(session_id, false, None, Utc::now())
+            .await
+            .map_err(wrap)
     }
 
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
@@ -610,18 +617,19 @@ impl SessionManager {
         }
     }
 
-    /// Remove all sessions whose `last_active` is older than the configured timeout.
-    /// Returns the number of sessions removed.
-    pub async fn cleanup_expired(&self) -> Result<usize> {
-        let cutoff = Utc::now() - self.session_timeout;
-        let expired_ids = self.store.list_expired(cutoff).await.map_err(wrap)?;
-        let count = expired_ids.len();
-        let deletes = expired_ids.iter().map(|id| self.store.delete(id));
-        futures::future::try_join_all(deletes).await.map_err(wrap)?;
-        if count > 0 {
-            debug!(count, "cleaned up expired sessions");
-        }
-        Ok(count)
+    /// List candidate idle sessions: every "normal" session whose
+    /// `last_active` is older than the supplied threshold. Surfaces
+    /// session IDs the actor reaper should consider for eviction.
+    /// Hydration on the next user message restores the transcript from
+    /// store, so dropping the in-memory actor is lossless as long as
+    /// no turn is in flight (the invariant the caller is expected to
+    /// uphold).
+    ///
+    /// This method must **never** become a delete. Session conversations
+    /// are core user data; see CLAUDE.md ("Session data is core data").
+    pub async fn idle_sessions(&self, threshold: Duration) -> Result<Vec<SessionId>> {
+        let cutoff = Utc::now() - threshold;
+        self.store.list_expired(cutoff).await.map_err(wrap)
     }
 }
 
@@ -633,7 +641,7 @@ mod tests {
     use aura_storage::test_support::{MemorySessionStore, MemorySessionSummaryStore};
     use chrono::{Duration, Utc};
 
-    use super::{SessionError, SessionManager, SessionStore};
+    use super::{SessionError, SessionManager, SessionStore, SessionSummaryStore};
 
     fn test_user() -> User {
         User {
@@ -646,11 +654,7 @@ mod tests {
     #[tokio::test]
     async fn create_session_returns_valid_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::minutes(30),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -667,11 +671,7 @@ mod tests {
     #[tokio::test]
     async fn get_or_create_returns_existing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::minutes(30),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -689,11 +689,7 @@ mod tests {
     #[tokio::test]
     async fn get_or_create_creates_new_when_missing() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::minutes(30),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
 
         let id = SessionId::from("cli-abc");
         let session = mgr
@@ -709,11 +705,7 @@ mod tests {
     #[tokio::test]
     async fn touch_updates_last_active() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store.clone(),
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::minutes(30),
-        );
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionSummaryStore::new()));
 
         let mut session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -736,11 +728,7 @@ mod tests {
     #[tokio::test]
     async fn touch_nonexistent_returns_not_found() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::minutes(30),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
 
         let err = mgr
             .touch(&SessionId::from("nonexistent"))
@@ -750,37 +738,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_expired_removes_old_sessions() {
+    async fn idle_sessions_lists_without_deleting() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store.clone(),
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::seconds(1),
-        );
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionSummaryStore::new()));
 
-        let mut session = mgr
+        let mut idle = mgr
             .create_session(test_user(), ChannelType::tui())
             .await
             .unwrap();
-        // Back-date past the 1s timeout instead of sleeping.
-        session.last_active = Utc::now() - Duration::seconds(5);
-        store.save(&session).await.unwrap();
+        idle.last_active = Utc::now() - Duration::seconds(120);
+        store.save(&idle).await.unwrap();
 
-        let count = mgr.cleanup_expired().await.unwrap();
-        assert_eq!(count, 1);
+        let fresh = mgr
+            .create_session(test_user(), ChannelType::tui())
+            .await
+            .unwrap();
 
-        let count = mgr.cleanup_expired().await.unwrap();
-        assert_eq!(count, 0);
+        let idle_ids = mgr.idle_sessions(Duration::seconds(60)).await.unwrap();
+        assert_eq!(idle_ids, vec![idle.id.clone()]);
+
+        // List-only — neither session is deleted.
+        assert!(store.get(&idle.id).await.unwrap().is_some());
+        assert!(store.get(&fresh.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn clear_summary_in_flight_resets_single_session() {
+        let summary_store = Arc::new(MemorySessionSummaryStore::new());
+        let mgr = SessionManager::new(Arc::new(MemorySessionStore::new()), summary_store.clone());
+
+        let session_id = SessionId::from("clear-target");
+        let other = SessionId::from("clear-other");
+        mgr.mark_summary_in_flight(&session_id, "owner-1")
+            .await
+            .unwrap();
+        mgr.mark_summary_in_flight(&other, "owner-2").await.unwrap();
+
+        mgr.clear_summary_in_flight(&session_id).await.unwrap();
+
+        let row = summary_store.get(&session_id).await.unwrap().unwrap();
+        assert!(!row.in_flight);
+        let other_row = summary_store.get(&other).await.unwrap().unwrap();
+        assert!(other_row.in_flight, "other session's flag untouched");
     }
 
     #[tokio::test]
     async fn list_returns_all_sessions_newest_first() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store.clone(),
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::minutes(30),
-        );
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionSummaryStore::new()));
 
         let mut first = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -803,11 +808,7 @@ mod tests {
     #[tokio::test]
     async fn history_returns_messages_for_existing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::minutes(30),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -821,11 +822,7 @@ mod tests {
     #[tokio::test]
     async fn history_errors_for_missing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::minutes(30),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
 
         let err = mgr
             .history(&SessionId::from("nonexistent"))
@@ -837,11 +834,7 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_existing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::minutes(30),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -855,11 +848,7 @@ mod tests {
     #[tokio::test]
     async fn delete_errors_for_missing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::minutes(30),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
 
         let err = mgr
             .delete(&SessionId::from("nonexistent"))
@@ -877,11 +866,7 @@ mod tests {
         // in-memory only (router/supervisor drop the actor); history
         // stays put.
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store.clone(),
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::seconds(1),
-        );
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionSummaryStore::new()));
 
         let mut session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -913,11 +898,7 @@ mod tests {
         use aura_model::{ChatMessage, ContentBlock, Role};
 
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::minutes(30),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -973,11 +954,7 @@ mod tests {
     #[tokio::test]
     async fn load_active_messages_empty_for_session_without_turns() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::minutes(30),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -993,11 +970,7 @@ mod tests {
         use aura_model::{JobId, LineageKind, SystemReason};
 
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(
-            store,
-            Arc::new(MemorySessionSummaryStore::new()),
-            Duration::minutes(30),
-        );
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
 
         let parent = mgr
             .create_session(test_user(), ChannelType::tui())

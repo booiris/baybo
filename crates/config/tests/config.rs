@@ -150,14 +150,6 @@ fn max_iterations_bounds() {
 }
 
 #[test]
-fn session_timeout_must_be_positive() {
-    let mut c = AuraConfig::default();
-    c.session.timeout_minutes = 0;
-    let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "session.timeout_minutes"));
-}
-
-#[test]
 fn channel_buffer_bounds() {
     let mut c = AuraConfig::default();
     c.channels.message_buffer_size = 0;
@@ -320,12 +312,12 @@ fn aggregates_multiple_errors() {
     let mut c = config_with_default_entry();
     c.llm[0].provider = String::new();
     c.llm[0].model = String::new();
-    c.session.timeout_minutes = 0;
+    c.agent.max_iterations = 0;
     let errors = unwrap_validation(c.validate().unwrap_err());
     assert!(errors.len() >= 3);
     assert!(has_field(&errors, "llm[0].provider"));
     assert!(has_field(&errors, "llm[0].model"));
-    assert!(has_field(&errors, "session.timeout_minutes"));
+    assert!(has_field(&errors, "agent.max_iterations"));
 }
 
 #[test]

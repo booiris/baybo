@@ -22,6 +22,7 @@ aura-security = { workspace = true }
 aura-sandbox = { workspace = true }
 aura-storage = { workspace = true }
 aura-channels = { workspace = true }
+dashmap = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

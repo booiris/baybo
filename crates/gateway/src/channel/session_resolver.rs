@@ -145,11 +145,7 @@ mod tests {
         let summary_store = Arc::new(aura_storage::libsql::LibsqlSessionSummaryStore::new(
             pool.clone(),
         ));
-        let session_mgr = Arc::new(SessionManager::new(
-            session_store,
-            summary_store,
-            chrono::Duration::seconds(300),
-        ));
+        let session_mgr = Arc::new(SessionManager::new(session_store, summary_store));
         let channel_store = Arc::new(LibsqlChannelSessionStore::new(pool));
         ChannelSessionResolver::new(session_mgr, channel_store)
     }

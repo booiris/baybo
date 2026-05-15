@@ -451,7 +451,22 @@ impl Router {
             // is the only path that pins a non-default model.
             let response_tx = self.supervisor.response_tx().clone();
             let sender = (self.actor_spawner)(session, None, response_tx, &self.actor_parent_token);
-            self.supervisor.register(session_id.clone(), sender);
+            if let Err(rejected) = self
+                .supervisor
+                .register_if_absent(session_id.clone(), sender)
+            {
+                // Race: another writer registered an actor for this
+                // session_id between our earlier `route` miss and the
+                // `register_if_absent` here. Router's `select!` is
+                // serial so this should not trigger today; the branch
+                // exists so a future second writer (or a buggy retry
+                // loop) cannot leave a duplicate actor task running.
+                debug!(
+                    session_id = %session_id,
+                    "register raced with another writer; shutting down duplicate actor"
+                );
+                let _ = rejected.send(AgentMessage::Shutdown).await;
+            }
 
             // Retry routing now that the actor exists.
             let re_routed = self

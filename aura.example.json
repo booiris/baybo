@@ -7,10 +7,6 @@
       "keep_recent": 100
     }
   },
-  "session": {
-    "timeout_minutes": 30,
-    "cleanup_interval_minutes": 0
-  },
   "channels": {
     "cli": {
       "enabled": true

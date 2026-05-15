@@ -405,7 +405,6 @@ pub async fn build_managers(
     let session_manager = Arc::new(SessionManager::new(
         stores.session.clone(),
         stores.session_summary.clone(),
-        boot::to_session_timeout(&config.session),
     ));
 
     // Reap orphans from any maintenance sessions that were
@@ -721,6 +720,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
             graph.workspace.root.clone(),
         ));
         let system_spawn_tx = graph.system_spawn_tx.clone();
+        let supervisor_for_spawn = supervisor.clone();
         Arc::new(
             move |session: aura_model::Session,
                   initial_llm: Option<String>,
@@ -780,13 +780,16 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     trace_event_stream.clone(),
                 ));
 
-                let actor = AgentActor::new(
-                    session,
-                    agent_loop,
-                    response_tx,
-                    Arc::clone(&job_lifecycle),
-                    span_recorder,
-                    actor_token,
+                let actor = AgentActor::from_parts(
+                    aura_agent::state::DurableActorState::new(session),
+                    aura_agent::state::VolatileResources {
+                        agent_loop,
+                        response_tx,
+                        job_lifecycle: Arc::clone(&job_lifecycle),
+                        span_recorder,
+                        actor_token,
+                        supervisor: Some(supervisor_for_spawn.clone()),
+                    },
                 );
                 let (sender, mailbox) = mpsc::channel(buffer);
                 tokio::spawn(async move {
@@ -821,6 +824,17 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         .system_spawn_rx
         .take()
         .expect("wire_router called twice; system_spawn_rx already consumed");
+
+    // Idle actor reaper: shuts down registered actors whose sessions
+    // have been idle. Hydration on the next user message rebuilds the
+    // actor from the durable session row, so eviction is lossless for
+    // an actor with no in-flight turn. The session row itself is never
+    // deleted.
+    aura_agent::supervisor::spawn_idle_reaper(
+        supervisor.clone(),
+        Arc::clone(&graph.session_manager),
+        graph.actor_parent_token.clone(),
+    );
 
     let router = Router::from_config(aura_agent::router::RouterConfig {
         session_manager: Arc::clone(&graph.session_manager),

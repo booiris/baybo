@@ -202,7 +202,6 @@ async fn main() -> anyhow::Result<()> {
             .session(Arc::new(aura_agent::SessionManager::new(
                 stores.session.clone(),
                 stores.session_summary.clone(),
-                boot::to_session_timeout(&config.session),
             )))
             .job(Arc::new(aura_agent::JobLifecycle::new(stores.job.clone())))
             .trace(stores.trace.clone())

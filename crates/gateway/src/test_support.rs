@@ -66,7 +66,6 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     let session_manager = Arc::new(SessionManager::new(
         stores.session.clone(),
         stores.session_summary.clone(),
-        chrono::Duration::seconds(300),
     ));
     let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
 

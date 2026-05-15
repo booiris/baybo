@@ -21,7 +21,6 @@ pub mod error;
 pub mod gateway;
 pub mod llm;
 pub mod security;
-pub mod session;
 pub mod skills;
 pub mod tools;
 mod validate;
@@ -41,7 +40,6 @@ pub use crate::error::{ConfigError, Result, ValidationError};
 pub use crate::gateway::GatewayConfig;
 pub use crate::llm::{LlmEntry, LlmPricingOverride};
 pub use crate::security::SecurityConfig;
-pub use crate::session::SessionConfig;
 pub use crate::skills::{RiskCheckConfig, SkillsConfig};
 pub use crate::tools::TrustLevelConfig;
 pub use crate::workspace::WorkspaceConfig;
@@ -61,7 +59,6 @@ pub struct AuraConfig {
     #[serde(rename = "default-llm")]
     pub default_llm: String,
     pub agent: AgentConfig,
-    pub session: SessionConfig,
     pub channels: ChannelsConfig,
     pub security: SecurityConfig,
     pub skills: SkillsConfig,

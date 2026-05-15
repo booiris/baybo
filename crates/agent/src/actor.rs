@@ -1,15 +1,11 @@
-use std::sync::Arc;
-
 use aura_channels::{AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage};
 use aura_job::JobInput;
-use aura_model::{ContentBlock, Session, SystemTrigger};
+use aura_model::{ContentBlock, SystemTrigger};
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::agent_loop::AgentLoop;
-use crate::job::JobLifecycle;
-use crate::trace::SpanRecorder;
+use crate::state::{DurableActorState, VolatileResources};
+use crate::supervisor::ActorRegistryGuard;
 
 /// Messages that can be sent to an AgentActor.
 #[derive(Debug, Clone)]
@@ -55,72 +51,65 @@ fn is_compact_command(content: &[ContentBlock]) -> bool {
 }
 
 /// One actor per session. Receives messages sequentially through its mailbox.
+///
+/// State is split into two halves by lifetime class (see
+/// [`crate::state`]):
+/// - `durable` — must survive eviction; persisted via the session store.
+/// - `volatile` — rebuilt from `durable` + the runtime each time the
+///   actor is spawned.
 pub struct AgentActor {
-    session: Session,
-    agent_loop: AgentLoop,
-    response_tx: mpsc::Sender<AgentOutput>,
-    job_lifecycle: Arc<JobLifecycle>,
-    span_recorder: Arc<SpanRecorder>,
-    /// Lifetime token for this actor. Derived as a child of the
-    /// `parent_token` passed at construction. For top-level user/cron
-    /// sessions the parent is the process-wide actor parent token; for
-    /// maintenance children spawned via `SystemSpawnRequest` it is the
-    /// originating parent actor's `actor_token`, so parent shutdown
-    /// cascades automatically via the `tokio_util` token tree.
-    /// `Shutdown` on the mailbox additionally trips it locally for
-    /// cooperative shutdown of just this actor.
-    actor_token: CancellationToken,
+    durable: DurableActorState,
+    volatile: VolatileResources,
 }
 
 impl AgentActor {
-    /// Construct an actor around a pre-derived `actor_token`. The
-    /// caller (spawner factory / test harness) is responsible for
-    /// deriving the token from whatever cancel parent applies and
-    /// for plumbing the same token into the supplied `agent_loop`
-    /// via `AgentLoop::with_actor_token` so the maintenance trigger
-    /// gate can clone it into outgoing `SystemSpawnRequest`s.
-    pub fn new(
-        session: Session,
-        agent_loop: AgentLoop,
-        response_tx: mpsc::Sender<AgentOutput>,
-        job_lifecycle: Arc<JobLifecycle>,
-        span_recorder: Arc<SpanRecorder>,
-        actor_token: CancellationToken,
-    ) -> Self {
-        Self {
-            session,
-            agent_loop,
-            response_tx,
-            job_lifecycle,
-            span_recorder,
-            actor_token,
-        }
+    /// Construct an actor from its durable and volatile halves.
+    ///
+    /// Production wiring goes through [`crate::router::ActorSpawner`],
+    /// which builds the [`VolatileResources`] from the per-process
+    /// dependency graph and either creates a fresh [`DurableActorState`]
+    /// or hydrates one from the session store.
+    pub fn from_parts(durable: DurableActorState, volatile: VolatileResources) -> Self {
+        Self { durable, volatile }
     }
 
     /// Run the actor's message processing loop.
     pub async fn run(mut self, mut mailbox: mpsc::Receiver<AgentMessage>) {
-        info!(session_id = %self.session.id, "agent actor started");
+        let session_id = self.durable.session.id.clone();
+        info!(session_id = %session_id, "agent actor started");
+
+        // Self-deregistration on any exit path — Shutdown message,
+        // mailbox close, or panic. Without this guard the supervisor's
+        // `actors` map would keep the dead handle indefinitely.
+        let _registry_guard = self
+            .volatile
+            .supervisor
+            .take()
+            .map(|s| ActorRegistryGuard::new(s, session_id.clone()));
 
         // Cold-start hydration: pull any persisted transcript out of
         // the store before processing the first message. No-ops for
         // fresh sessions (cron fires, subagent spawns, brand-new
         // user sessions) and for test harnesses that don't wire a
         // store; failures log and fall through to an empty transcript.
-        self.agent_loop.restore_transcript_from_store().await;
+        self.volatile
+            .agent_loop
+            .restore_transcript_from_store()
+            .await;
 
         while let Some(msg) = mailbox.recv().await {
             match msg {
                 AgentMessage::UserInput(incoming) => {
                     if let Err(e) = self.handle_user_input(*incoming).await {
                         error!(
-                            session_id = %self.session.id,
+                            session_id = %session_id,
                             error = %e,
                             "failed to handle user input"
                         );
                     }
                 }
                 AgentMessage::CronTrigger { job_id, prompt } => {
-                    debug!(session_id = %self.session.id, job_id = %job_id, "received cron trigger");
+                    debug!(session_id = %session_id, job_id = %job_id, "received cron trigger");
                     let job_input = JobInput::Cron {
                         action_payload: serde_json::json!({
                             "cron_job_id": job_id,
@@ -132,7 +121,7 @@ impl AgentActor {
                         .await
                     {
                         error!(
-                            session_id = %self.session.id,
+                            session_id = %session_id,
                             job_id = %job_id,
                             error = %e,
                             "failed to handle cron trigger"
@@ -148,7 +137,7 @@ impl AgentActor {
                         .await
                     {
                         error!(
-                            session_id = %self.session.id,
+                            session_id = %session_id,
                             error = %e,
                             "failed to handle subagent spawn"
                         );
@@ -157,26 +146,26 @@ impl AgentActor {
                 AgentMessage::SystemTrigger(trigger) => {
                     if let Err(e) = self.handle_system_trigger(trigger).await {
                         error!(
-                            session_id = %self.session.id,
+                            session_id = %session_id,
                             error = %e,
                             "failed to handle system trigger"
                         );
                     }
                 }
                 AgentMessage::Shutdown => {
-                    debug!(session_id = %self.session.id, "actor shutting down");
+                    debug!(session_id = %session_id, "actor shutting down");
                     // Cancelling our `actor_token` cascades into every
                     // child we spawned — including maintenance actors,
                     // whose `actor_token` is a grandchild of ours via
                     // the `parent_actor_token` carried in their
                     // `SystemSpawnRequest`. No explicit Shutdown
                     // mailbox dispatch is required.
-                    self.actor_token.cancel();
+                    self.volatile.actor_token.cancel();
                     break;
                 }
             }
         }
-        info!(session_id = %self.session.id, "agent actor stopped");
+        info!(session_id = %session_id, "agent actor stopped");
     }
 
     /// Run the agent loop. Terminal-state notification is published by
@@ -194,16 +183,17 @@ impl AgentActor {
         parent_job_id: Option<aura_model::JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<OutgoingMessage> {
-        self.agent_loop
+        self.volatile
+            .agent_loop
             .run(
-                &mut self.session,
+                &mut self.durable.session,
                 job_input,
                 content,
-                &self.job_lifecycle,
-                &self.span_recorder,
+                &self.volatile.job_lifecycle,
+                &self.volatile.span_recorder,
                 parent_job_id,
                 delta_tx,
-                self.actor_token.child_token(),
+                self.volatile.actor_token.child_token(),
             )
             .await
     }
@@ -243,6 +233,7 @@ impl AgentActor {
         // Pass a clone of the response channel so the loop can stream
         // text deltas as `AgentOutput::Delta` while the final assembled
         // message still flows through the normal path.
+        let response_tx = self.volatile.response_tx.clone();
         let response = self
             .run_agent_loop(
                 JobInput::UserChat {
@@ -250,7 +241,7 @@ impl AgentActor {
                 },
                 content,
                 None,
-                Some(self.response_tx.clone()),
+                Some(response_tx),
             )
             .await?;
         self.send_response(AgentOutput::Message(response), "user")
@@ -263,19 +254,20 @@ impl AgentActor {
     /// rather than `Message`.
     async fn handle_compact(&mut self) -> anyhow::Result<()> {
         let text = self
+            .volatile
             .agent_loop
             .compact_now(
-                &mut self.session,
-                &self.job_lifecycle,
-                &self.span_recorder,
+                &mut self.durable.session,
+                &self.volatile.job_lifecycle,
+                &self.volatile.span_recorder,
                 None,
-                self.actor_token.child_token(),
+                self.volatile.actor_token.child_token(),
             )
             .await?;
         let notice = AgentOutput::Notice {
-            session_id: self.session.id.clone(),
-            user_id: self.session.user.id.clone(),
-            channel: self.session.channel.clone(),
+            session_id: self.durable.session.id.clone(),
+            user_id: self.durable.session.user.id.clone(),
+            channel: self.durable.session.channel.clone(),
             level: NoticeLevel::Info,
             text,
         };
@@ -293,6 +285,7 @@ impl AgentActor {
         parent_job_id: aura_model::JobId,
     ) -> anyhow::Result<()> {
         let content = incoming.message.content;
+        let response_tx = self.volatile.response_tx.clone();
         let response = self
             .run_agent_loop(
                 JobInput::Spawned {
@@ -300,7 +293,7 @@ impl AgentActor {
                 },
                 content,
                 Some(parent_job_id),
-                Some(self.response_tx.clone()),
+                Some(response_tx),
             )
             .await?;
         self.send_response(AgentOutput::Message(response), "subagent")
@@ -313,7 +306,7 @@ impl AgentActor {
     /// labelled-on-error log so the four call sites all funnel
     /// through the same warn format.
     async fn send_response(&self, output: AgentOutput, source: &str) {
-        if let Err(e) = self.response_tx.send(output).await {
+        if let Err(e) = self.volatile.response_tx.send(output).await {
             warn!(error = %e, source, "failed to send agent output to channel");
         }
     }
@@ -326,17 +319,18 @@ impl AgentActor {
         match trigger {
             SystemTrigger::BackgroundCompression(payload) => {
                 let outcome = self
+                    .volatile
                     .agent_loop
                     .run_background_compression(
-                        &mut self.session,
+                        &mut self.durable.session,
                         payload,
-                        &self.job_lifecycle,
-                        &self.span_recorder,
-                        self.actor_token.child_token(),
+                        &self.volatile.job_lifecycle,
+                        &self.volatile.span_recorder,
+                        self.volatile.actor_token.child_token(),
                     )
                     .await?;
                 debug!(
-                    session_id = %self.session.id,
+                    session_id = %self.durable.session.id,
                     cursor = outcome.cursor,
                     cost_micros = outcome.cost_micros,
                     "background summary: pass landed"
@@ -344,7 +338,7 @@ impl AgentActor {
             }
             other @ (SystemTrigger::HistoryReview | SystemTrigger::MemoryConsolidation) => {
                 warn!(
-                    session_id = %self.session.id,
+                    session_id = %self.durable.session.id,
                     reason = ?other.reason(),
                     "SystemTrigger variant not yet wired in actor; dropping trigger"
                 );

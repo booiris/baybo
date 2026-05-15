@@ -31,7 +31,7 @@ use aura_model::{
 };
 use aura_storage::Store;
 use aura_workspace::WorkspacePaths;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Utc;
 use tempfile::TempDir;
 
 fn user(id: &str) -> User {
@@ -74,11 +74,7 @@ async fn record_then_read_summary_metadata_via_session_manager() {
     let session = root_session("user-A");
     store.session.save(&session).await.unwrap();
 
-    let mgr = SessionManager::new(
-        store.session.clone(),
-        store.session_summary.clone(),
-        ChronoDuration::minutes(30),
-    );
+    let mgr = SessionManager::new(store.session.clone(), store.session_summary.clone());
 
     // Initially no metadata.
     let none = mgr.summary_metadata(&session.id).await.unwrap();
@@ -125,11 +121,7 @@ async fn maintenance_sessions_are_invisible_to_default_listings() {
     let parent = root_session("parent-1");
     store.session.save(&parent).await.unwrap();
 
-    let mgr = SessionManager::new(
-        store.session.clone(),
-        store.session_summary.clone(),
-        ChronoDuration::minutes(30),
-    );
+    let mgr = SessionManager::new(store.session.clone(), store.session_summary.clone());
 
     // Spawn one maintenance session for the parent.
     let maint = mgr
@@ -168,7 +160,6 @@ async fn orphan_reaper_cleans_db_and_fs() {
     let mgr = Arc::new(SessionManager::new(
         store.session.clone(),
         store.session_summary.clone(),
-        ChronoDuration::minutes(30),
     ));
 
     // Create a maintenance session — represents a pass that was
@@ -253,7 +244,6 @@ async fn orphan_reaper_preserves_completed_maintenance_sessions() {
     let mgr = Arc::new(SessionManager::new(
         store.session.clone(),
         store.session_summary.clone(),
-        ChronoDuration::minutes(30),
     ));
 
     // (a) A maintenance session whose pass *succeeded* — its job is
@@ -358,11 +348,7 @@ async fn parent_delete_cascades_summary_metadata() {
     let parent = root_session("parent-cascade");
     store.session.save(&parent).await.unwrap();
 
-    let mgr = SessionManager::new(
-        store.session.clone(),
-        store.session_summary.clone(),
-        ChronoDuration::minutes(30),
-    );
+    let mgr = SessionManager::new(store.session.clone(), store.session_summary.clone());
 
     mgr.record_summary_success(&parent.id, 1, 1, "m", "span", Utc::now())
         .await
@@ -426,11 +412,7 @@ async fn in_flight_marks_then_clears_on_recorded_pass() {
     let parent = root_session("parent-in-flight");
     store.session.save(&parent).await.unwrap();
 
-    let mgr = SessionManager::new(
-        store.session.clone(),
-        store.session_summary.clone(),
-        ChronoDuration::minutes(30),
-    );
+    let mgr = SessionManager::new(store.session.clone(), store.session_summary.clone());
 
     // Initially no metadata row at all.
     assert!(mgr.summary_metadata(&parent.id).await.unwrap().is_none());
@@ -481,11 +463,7 @@ async fn defensive_clear_does_not_clobber_newer_pass_mark() {
     let parent = root_session("parent-cas-race");
     store.session.save(&parent).await.unwrap();
 
-    let mgr = SessionManager::new(
-        store.session.clone(),
-        store.session_summary.clone(),
-        ChronoDuration::minutes(30),
-    );
+    let mgr = SessionManager::new(store.session.clone(), store.session_summary.clone());
 
     // Pass A marks itself in-flight, then lands a successful summary
     // (which clears flag + owner in one terminal UPSERT).
@@ -541,7 +519,6 @@ async fn orphan_reaper_clears_orphan_in_flight_without_maintenance_row() {
     let mgr = Arc::new(SessionManager::new(
         store.session.clone(),
         store.session_summary.clone(),
-        ChronoDuration::minutes(30),
     ));
 
     // Simulate the gap: gate persisted in_flight = 1, process crashed
@@ -589,7 +566,6 @@ async fn orphan_reaper_clears_in_flight_on_recovered_parent() {
     let mgr = Arc::new(SessionManager::new(
         store.session.clone(),
         store.session_summary.clone(),
-        ChronoDuration::minutes(30),
     ));
 
     // Simulate the crash mid-pass: maintenance row exists, parent's
@@ -626,11 +602,7 @@ async fn rapid_record_calls_accumulate_cost_and_pass_count() {
     let parent = root_session("rapid");
     store.session.save(&parent).await.unwrap();
 
-    let mgr = SessionManager::new(
-        store.session.clone(),
-        store.session_summary.clone(),
-        ChronoDuration::minutes(30),
-    );
+    let mgr = SessionManager::new(store.session.clone(), store.session_summary.clone());
 
     // 5 quick passes — same span_id pattern as production "many
     // refreshes per session" exercise.

@@ -349,7 +349,6 @@ impl AgentTestHarnessBuilder {
         let session_manager = Arc::new(aura_agent::SessionManager::new(
             session_store,
             summary_store,
-            chrono::Duration::minutes(30),
         ));
         let context_manager = ContextManager::from_config(ContextManagerConfig {
             tokenizer,
@@ -408,13 +407,16 @@ impl AgentTestHarnessBuilder {
         let (mailbox_tx, mailbox_rx) = mpsc::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
-        let actor = AgentActor::new(
-            session.clone(),
-            agent_loop,
-            output_tx,
-            job_lifecycle,
-            span_recorder,
-            actor_token,
+        let actor = AgentActor::from_parts(
+            aura_agent::state::DurableActorState::new(session.clone()),
+            aura_agent::state::VolatileResources {
+                agent_loop,
+                response_tx: output_tx,
+                job_lifecycle,
+                span_recorder,
+                actor_token,
+                supervisor: None,
+            },
         );
         let actor_handle = tokio::spawn(actor.run(mailbox_rx));
 

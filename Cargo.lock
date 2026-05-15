@@ -242,6 +242,7 @@ dependencies = [
  "aura-trace",
  "aura-workspace",
  "chrono",
+ "dashmap",
  "futures",
  "hex",
  "parking_lot",

@@ -18,6 +18,7 @@ pub mod service;
 pub mod session;
 pub mod session_log;
 pub mod soul;
+pub mod state;
 pub mod subagent;
 pub mod supervisor;
 pub mod tool_executor;

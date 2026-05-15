@@ -2,6 +2,15 @@
 
 **Aura** is an intelligent assistant framework built on large language models, supporting multi-channel access, tool invocation, skill extensions, with comprehensive context management, compression, and error recovery mechanisms.
 
+## Session data is core data — never delete
+
+Session rows and their conversation transcripts are **user-facing core data**. They must never be deleted by the runtime:
+
+- No `DELETE FROM sessions` in production paths. No "expire and drop" sweep. No "idle cleanup" that touches the row.
+- The `hidden` flag is the user-facing "remove from my list" affordance — the row, transcript, summary cursor, and channel binding stay live so the user can recover the conversation.
+- The actor reaper (`AgentSupervisor::reap_idle` / `spawn_idle_reaper`) is allowed to shut down the in-memory `AgentActor` for an idle session. The session row stays in the store; hydration on the next user message rebuilds the actor from durable state. The reaper must only operate on actors, never on rows.
+- Do not add a `cleanup_expired`-style API. If a future feature needs row-level retention (user-requested wipe, GDPR delete-on-request), gate it explicitly behind a user-triggered command, not a background sweeper.
+
 ## Build & Test
 
 ```bash
@@ -42,6 +51,8 @@ RUST_LOG=aura::agent=debug cargo run         # agent module only
 - Required dependencies belong in the constructor, NOT behind a `with_*` setter. If a struct ends up with many required fields, define a sibling `XxxConfig` struct with `pub` fields and a single `pub fn from_config(config: XxxConfig) -> Self` constructor — callers populate it via struct literal so every required field shows up at the call site by name. `with_*` is reserved for: (a) **genuine config knobs** with a real default that some callers rationally leave alone (`with_rate_limit`, `with_timeout`); (b) **incremental builders** that append to a collection (`with_tool`, `add_rule`); (c) **truly optional deps** where some real production paths legitimately leave them unset (not just tests).
 - Don't make a field `Option<T>` to accommodate tests. If every production caller passes `Some(...)` and the field is `Option` solely so a test fixture can skip wiring it, the field belongs as `T` (required). Tests that need a stripped-down loop should provide a real value or use a smaller dedicated fixture, not push `Option` onto the production type.
 - Prefer raw string literals (`r#"..."#`) for any multi-line text — LLM prompts, error messages, code templates, doc snippets — so embedded `"` and newlines stay literal. `\n`/`\"` escapes hurt readability and a stray `\\n` in an escape-heavy block becomes a silent prompt bug. For substitutions, lift the body into a `const` raw string and apply `String::replace("{{placeholder}}", value)` rather than building the whole text inside `format!(...)`.
+- **Locks**: always use `parking_lot::Mutex` / `parking_lot::RwLock`, never `std::sync::Mutex` / `RwLock`. `parking_lot` doesn't poison, so locking is infallible — no `.lock().unwrap()` or `.lock().expect("…poisoned")` (both of which violate the no-`.unwrap()/.expect()` rule above). `parking_lot` is already a workspace dep.
+- **Concurrent maps**: reach for `dashmap` when a shared map is hot enough that a single `parking_lot::Mutex<HashMap>` would actually contend — many concurrent readers/writers, sustained high rate, large entry count. For supervisor-style registries that see a handful of ops/sec on a few-thousand-entry map (µs critical sections), `Arc<parking_lot::Mutex<HashMap>>` is simpler and just as fast. Don't reach for DashMap reflexively just because the map is shared. When you do use DashMap, remember the iter-while-mutate footgun: an iterator holds shard locks, so any `insert`/`remove` against the same shard inside the loop deadlocks — snapshot keys/values to a `Vec` first if you need to mutate.
 
 ## Platform Support
 
