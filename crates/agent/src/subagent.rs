@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_channels::AgentOutput;
-use aura_job::JobStatusKind;
+use aura_job::{CancelReason, JobStatusKind};
 use aura_model::{ContentBlock, SessionId, SubagentExitStatus, SubagentResult};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -57,6 +57,17 @@ pub async fn await_subagent_terminal(
                 event = terminal_rx.recv() => {
                     match event {
                         Ok(ev) if ev.session_id == child_session_id => {
+                            if matches!(ev.kind, JobStatusKind::Completed) && captured.is_none() {
+                                // `JobLifecycle::complete` publishes the terminal
+                                // event inside `with_job` BEFORE
+                                // `handle_subagent_spawned` dispatches the final
+                                // `AgentOutput::Message`. Drain `output_rx` so the
+                                // queued message isn't lost when the terminal
+                                // event wins the select with `captured == None`.
+                                // The outer `tokio::time::timeout` still bounds
+                                // the wait.
+                                captured = drain_for_final_message(&mut output_rx).await;
+                            }
                             return terminal_event_to_status(ev.kind, captured.take());
                         }
                         Ok(_) => continue,
@@ -66,12 +77,14 @@ pub async fn await_subagent_terminal(
                                 skipped = n,
                                 "subagent waiter lagged on terminal-event bus, reconciling via store"
                             );
-                            if let Some(status) = check_child_terminal_via_store(
+                            if let Some(kind) = check_child_terminal_via_store(
                                 &job_lifecycle,
                                 &child_session_id,
-                                captured.take(),
                             ).await {
-                                return status;
+                                if matches!(kind, JobStatusKind::Completed) && captured.is_none() {
+                                    captured = drain_for_final_message(&mut output_rx).await;
+                                }
+                                return terminal_event_to_status(kind, captured.take());
                             }
                             continue;
                         }
@@ -101,6 +114,18 @@ pub async fn await_subagent_terminal(
             status,
         },
         Err(_elapsed) => {
+            // Mark any in-flight child jobs `Cancelled` BEFORE cancelling
+            // the actor token. `with_job`'s "cancel observed → skip
+            // fail()" branch assumes `JobLifecycle::cancel` has already
+            // flipped the row terminal; cancelling only the actor token
+            // would leave the child's job stuck `InProgress` with no
+            // terminal event or history.
+            cancel_in_flight_child_jobs(
+                &job_lifecycle,
+                &child_session_id,
+                CancelReason::SubagentTimeout,
+            )
+            .await;
             actor_token.cancel();
             SubagentResult {
                 child_session_id,
@@ -131,8 +156,7 @@ fn terminal_event_to_status(
 async fn check_child_terminal_via_store(
     job_lifecycle: &JobLifecycle,
     child_session_id: &SessionId,
-    captured: Option<Vec<ContentBlock>>,
-) -> Option<Result<Option<Vec<ContentBlock>>, SubagentExitStatus>> {
+) -> Option<JobStatusKind> {
     let jobs = match job_lifecycle.list_by_session(child_session_id, None).await {
         Ok(j) => j,
         Err(e) => {
@@ -144,24 +168,78 @@ async fn check_child_terminal_via_store(
             return None;
         }
     };
-    for j in jobs {
-        let kind = j.status.kind();
-        if matches!(
+    jobs.into_iter().map(|j| j.status.kind()).find(|kind| {
+        matches!(
             kind,
             JobStatusKind::Completed | JobStatusKind::Failed | JobStatusKind::Cancelled
-        ) {
-            return Some(terminal_event_to_status(kind, captured));
+        )
+    })
+}
+
+/// Drain `output_rx` until the child actor's final `AgentOutput::Message`
+/// arrives (or the channel closes). Other `AgentOutput` variants
+/// (`Delta`, `Notice`) are skipped — only `Message` carries the
+/// subagent's final content. Bounded by the caller's outer timeout.
+async fn drain_for_final_message(
+    output_rx: &mut mpsc::Receiver<AgentOutput>,
+) -> Option<Vec<ContentBlock>> {
+    while let Some(out) = output_rx.recv().await {
+        if let AgentOutput::Message(m) = out {
+            return Some(m.content);
         }
     }
     None
 }
 
+/// Cancel any non-terminal job on the child session through
+/// `JobLifecycle::cancel`. Used on the subagent timeout path so the
+/// child's `with_job` sees a real `Cancelled` row (and matching
+/// terminal event) instead of staying `InProgress` after the actor
+/// token is tripped. `lifecycle.cancel` is idempotent on terminal
+/// jobs, so a race where the job completes naturally just before this
+/// call is a no-op.
+async fn cancel_in_flight_child_jobs(
+    job_lifecycle: &JobLifecycle,
+    child_session_id: &SessionId,
+    reason: CancelReason,
+) {
+    let jobs = match job_lifecycle.list_by_session(child_session_id, None).await {
+        Ok(j) => j,
+        Err(e) => {
+            warn!(
+                session_id = %child_session_id,
+                error = %e,
+                "subagent timeout: failed to list child jobs to cancel"
+            );
+            return;
+        }
+    };
+    for j in jobs {
+        if j.is_terminal() {
+            continue;
+        }
+        if let Err(e) = job_lifecycle.cancel(&j.id, reason, vec![]).await {
+            warn!(
+                session_id = %child_session_id,
+                job_id = %j.id,
+                error = %e,
+                "subagent timeout: failed to cancel child job"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aura_channels::OutgoingMessage;
+    use aura_job::{JobInput, JobOutput, JobStatus};
+    use aura_model::{ChannelType, MessageMetadata, TriggerKind};
     use aura_storage::test_support::MemoryJobStore;
     use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
+
+    const CHILD_SESSION: &str = "child";
 
     struct Harness {
         job_lifecycle: Arc<JobLifecycle>,
@@ -202,7 +280,7 @@ mod tests {
             Waiter {
                 actor_token: self.actor_token.clone(),
                 handle: tokio::spawn(await_subagent_terminal(
-                    SessionId::from("child"),
+                    SessionId::from(CHILD_SESSION),
                     self.output_rx,
                     self.terminal_rx,
                     self.mailbox_tx,
@@ -210,19 +288,54 @@ mod tests {
                     timeout,
                     self.job_lifecycle,
                 )),
-                _output_tx: self.output_tx,
+                output_tx: self.output_tx,
                 _mailbox_rx: self._mailbox_rx,
             }
         }
     }
 
+    /// Create + start an in-progress `Spawned` job on the child session.
+    /// Mirrors what `with_job` does for a real subagent so tests can
+    /// drive `JobLifecycle::complete` / observe `JobLifecycle::cancel`
+    /// against a real row.
+    async fn start_in_progress_child_job(lc: &JobLifecycle) -> aura_model::JobId {
+        let job = lc
+            .start_job(
+                SessionId::from(CHILD_SESSION),
+                TriggerKind::User,
+                JobInput::Spawned {
+                    initial_prompt: vec![ContentBlock::Text("task".into())],
+                },
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lc.start(&job.id).await.unwrap();
+        job.id
+    }
+
+    fn outgoing(text: &str) -> AgentOutput {
+        AgentOutput::Message(OutgoingMessage {
+            session_id: SessionId::from(CHILD_SESSION),
+            user_id: String::new(),
+            channel: ChannelType::from("subagent"),
+            content: vec![ContentBlock::Text(text.into())],
+            reply_to: None,
+            metadata: MessageMetadata::default(),
+            ordinal: None,
+        })
+    }
+
     /// Spawned waiter plus the peer endpoints that must outlive it —
     /// dropping `output_tx` here would close `output_rx` mid-test and
-    /// surface `Failed` regardless of intent.
+    /// surface `Failed` regardless of intent. Tests that need the
+    /// `JobLifecycle` after spawn clone it from the `Harness` before
+    /// calling `spawn_waiter`.
     struct Waiter {
         actor_token: CancellationToken,
         handle: JoinHandle<SubagentResult>,
-        _output_tx: mpsc::Sender<AgentOutput>,
+        output_tx: mpsc::Sender<AgentOutput>,
         _mailbox_rx: mpsc::Receiver<AgentMessage>,
     }
 
@@ -258,5 +371,72 @@ mod tests {
         h.close_output();
         let result = h.spawn_waiter(Duration::from_secs(60)).finish().await;
         assert!(matches!(result.status, SubagentExitStatus::Failed(_)));
+    }
+
+    /// `JobLifecycle::complete` publishes the terminal event inside
+    /// `with_job` BEFORE `handle_subagent_spawned` dispatches the final
+    /// `AgentOutput::Message`. The waiter must keep draining `output_rx`
+    /// after observing `Completed` with `captured == None`, otherwise
+    /// the queued final Message is lost and the parent sees an empty
+    /// "subagent completed without producing a final message" answer.
+    #[tokio::test]
+    async fn completed_event_drains_late_final_message() {
+        let h = Harness::new();
+        let lc = Arc::clone(&h.job_lifecycle);
+        let job_id = start_in_progress_child_job(&lc).await;
+
+        let w = h.spawn_waiter(Duration::from_secs(5));
+
+        // Publish terminal Completed BEFORE the final Message lands on
+        // output_rx — the precise race the production path produces.
+        lc.complete(
+            &job_id,
+            JobOutput::Message {
+                content: vec![ContentBlock::Text("done".into())],
+            },
+        )
+        .await
+        .unwrap();
+        // Hand the runtime a tick so the waiter pulls the terminal
+        // event and enters drain_for_final_message before we send.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        w.output_tx.send(outgoing("hello")).await.unwrap();
+
+        let result = w.finish().await;
+        assert!(
+            matches!(result.status, SubagentExitStatus::Completed),
+            "expected Completed, got {:?}",
+            result.status
+        );
+        let content = result
+            .final_content
+            .expect("drain must surface the late final Message");
+        assert!(matches!(&content[..], [ContentBlock::Text(t)] if t == "hello"));
+    }
+
+    /// On timeout the waiter must flip any in-flight child job to
+    /// `Cancelled { SubagentTimeout }` BEFORE cancelling the actor
+    /// token. Cancelling the token alone takes `with_job` down the
+    /// "cancel observed → skip fail()" branch, which assumes
+    /// `JobLifecycle::cancel` already flipped the row — without the
+    /// explicit cancel the row stays `InProgress` forever with no
+    /// terminal event or transition history.
+    #[tokio::test]
+    async fn timeout_marks_child_job_cancelled_with_subagent_timeout_reason() {
+        let h = Harness::new();
+        let lc = Arc::clone(&h.job_lifecycle);
+        let job_id = start_in_progress_child_job(&lc).await;
+
+        let w = h.spawn_waiter(Duration::from_millis(10));
+        let result = w.finish().await;
+        assert!(matches!(result.status, SubagentExitStatus::Timeout));
+
+        let loaded = lc.get(&job_id).await.unwrap().expect("child job row");
+        match loaded.status {
+            JobStatus::Cancelled { reason, .. } => {
+                assert_eq!(reason, CancelReason::SubagentTimeout);
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
     }
 }
