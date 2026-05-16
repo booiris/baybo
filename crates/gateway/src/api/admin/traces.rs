@@ -17,7 +17,7 @@ use serde_json::json;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use aura_agent::{SessionSummaryFilter, SessionSummaryPage};
+use aura_query::{SessionSummaryFilter, SessionSummaryPage};
 
 use crate::api::dto::{ErrorBody, TraceSessionSummary, TracesListQuery, TracesListResponse};
 use crate::server::AdminState;

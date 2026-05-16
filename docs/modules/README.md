@@ -43,6 +43,7 @@ Bottom-up along the dependency graph:
 - **job** — Job types + store trait + state machine + lifecycle orchestrator: `Job`, `JobStatus`, `JobKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, `DriftRecord`, the `JobStore` trait, and the `JobLifecycle` persistence orchestrator (with `JobCancellationRegistry` and terminal-event bus). `Cancelled` and `Failed` are independent terminal states.
 - **memory** — Long-term, user-scoped memory: `MemoryStore` trait and `MemoryManager` business-logic facade (recall, dedup, importance, eviction). Domain types (`MemoryEntry`, `MemoryCategory`) live in `model`. Optional `EmbeddingModel` injection point.
 - **cost** — LLM-call spend tracking: `CostStore` trait + domain types (`CostRecord`, `CostSummary`, `TimeRange`) + `CostManager` (synchronous in-memory accumulator + async persist + `LlmCallGuard` bridge via `cost_call_guard`). Integer `MicroUsd` arithmetic — never floats.
+- **query** — Read-only analytics surface (`QueryApi`) over Session / Job / Step / Span / Cost. One `QueryError` collapses four upstream store error types; CLI and gateway admin handlers use it without re-deriving error shape.
 
 ### Infrastructure and Assembly Layer
 

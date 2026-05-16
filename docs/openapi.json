@@ -3372,7 +3372,7 @@
       },
       "TraceSessionSummary": {
         "type": "object",
-        "description": "One row of the trace browser list view. Mirrors\n[`aura_agent::SessionSummary`] for the wire.",
+        "description": "One row of the trace browser list view. Mirrors\n[`aura_query::SessionSummary`] for the wire.",
         "required": [
           "session_id",
           "created_at",

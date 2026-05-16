@@ -11,6 +11,7 @@ members = [
     "crates/job",
     "crates/memory",
     "crates/cost",
+    "crates/query",
     "crates/trace",
     "crates/security",
     "crates/sandbox",
@@ -48,6 +49,7 @@ aura-session = { path = "crates/session" }
 aura-job = { path = "crates/job" }
 aura-memory = { path = "crates/memory" }
 aura-cost = { path = "crates/cost" }
+aura-query = { path = "crates/query" }
 aura-trace = { path = "crates/trace" }
 aura-security = { path = "crates/security" }
 aura-sandbox = { path = "crates/sandbox" }

@@ -1,0 +1,29 @@
+[package]
+name = "aura-query"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+aura-cost = { workspace = true }
+aura-job = { workspace = true }
+aura-model = { workspace = true }
+aura-storage = { workspace = true }
+aura-trace = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+aura-cost = { workspace = true, features = ["test-support"] }
+aura-job = { workspace = true, features = ["test-support"] }
+aura-storage = { workspace = true, features = ["test-support"] }
+aura-trace = { workspace = true, features = ["test-support"] }
+parking_lot = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

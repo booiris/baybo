@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::{CronScheduler, QueryApi, SecurityGateway, SessionManager};
+use aura_agent::{CronScheduler, SecurityGateway, SessionManager};
+use aura_query::QueryApi;
 use aura_channels::ChannelRegistry;
 use aura_config::AuraConfig;
 use aura_job::JobLifecycle;

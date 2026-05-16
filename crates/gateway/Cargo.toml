@@ -38,6 +38,7 @@ aura-job = { workspace = true }
 aura-llm = { workspace = true }
 aura-memory = { workspace = true }
 aura-model = { workspace = true }
+aura-query = { workspace = true }
 aura-pairing = { workspace = true }
 aura-security = { workspace = true }
 aura-skills = { workspace = true }

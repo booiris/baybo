@@ -972,7 +972,7 @@ export interface components {
         };
         /**
          * @description One row of the trace browser list view. Mirrors
-         *     [`aura_agent::SessionSummary`] for the wire.
+         *     [`aura_query::SessionSummary`] for the wire.
          */
         TraceSessionSummary: {
             cache_creation_input_tokens: number;
