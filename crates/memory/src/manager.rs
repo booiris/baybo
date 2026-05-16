@@ -1,28 +1,16 @@
-use thiserror::Error;
 use tracing::{debug, warn};
 
 use aura_model::Session;
 use aura_model::{ContentBlock, MemoryCategory, MemoryEntry};
-use aura_storage::{MemoryStore, StorageError};
 
-#[derive(Debug, Error)]
-pub enum MemoryManagerError {
-    #[error("embedding error: {0}")]
-    Embedding(String),
-
-    #[error("memory entry {0} not found")]
-    NotFound(String),
-
-    #[error(transparent)]
-    Storage(#[from] StorageError),
-}
-
-pub type Result<T> = std::result::Result<T, MemoryManagerError>;
+use crate::MemoryError;
+use crate::Result;
+use crate::store::MemoryStore;
 
 /// A minimal embedding model trait for generating vector embeddings from text.
 #[async_trait::async_trait]
-pub(crate) trait EmbeddingModel: Send + Sync {
-    async fn embed(&self, text: &str) -> std::result::Result<Vec<f32>, MemoryManagerError>;
+pub trait EmbeddingModel: Send + Sync {
+    async fn embed(&self, text: &str) -> std::result::Result<Vec<f32>, MemoryError>;
 }
 
 const DEFAULT_RECALL_LIMIT: usize = 10;
@@ -175,7 +163,7 @@ impl MemoryManager {
 
     /// Look a memory entry up by its stable id, without a user scope.
     pub async fn get(&self, id: &str) -> Result<Option<MemoryEntry>> {
-        Ok(self.store.get_by_id(id).await?)
+        self.store.get_by_id(id).await
     }
 
     /// Delete a single memory entry by id. Returns `Ok(())` even if the entry
@@ -193,7 +181,7 @@ impl MemoryManager {
             .store
             .get_by_id(id)
             .await?
-            .ok_or_else(|| MemoryManagerError::NotFound(id.to_string()))?;
+            .ok_or_else(|| MemoryError::NotFound(id.to_string()))?;
         entry.importance = importance.clamp(0.0, 1.0);
         self.store.store(&entry).await?;
         Ok(entry)
@@ -361,6 +349,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::MemoryMemoryStore;
     use aura_model::BlobRef;
 
     #[test]
@@ -412,8 +401,9 @@ mod tests {
                 },
                 mime_type: "image/png".into(),
             },
+            ContentBlock::Text("world".to_string()),
         ];
-        assert_eq!(extract_text(&blocks), "hello");
+        assert_eq!(extract_text(&blocks), "hello world");
     }
 
     #[test]
@@ -425,87 +415,6 @@ mod tests {
         assert!((entry2.importance - 0.0).abs() < f32::EPSILON);
     }
 
-    use async_trait::async_trait;
-    use aura_storage::memory::MemoryStore;
-    use aura_storage::memory::Result as StoreResult;
-    use parking_lot::Mutex;
-
-    /// Minimal `MemoryStore` implementation used by the unit tests below.
-    struct InMemoryStore {
-        entries: Mutex<Vec<MemoryEntry>>,
-    }
-
-    impl InMemoryStore {
-        fn new() -> Self {
-            Self {
-                entries: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl MemoryStore for InMemoryStore {
-        async fn store(&self, entry: &MemoryEntry) -> StoreResult<()> {
-            let mut lock = self.entries.lock();
-            if let Some(slot) = lock.iter_mut().find(|e| e.id == entry.id) {
-                *slot = entry.clone();
-            } else {
-                lock.push(entry.clone());
-            }
-            Ok(())
-        }
-
-        async fn retrieve(&self, user_id: &str, key: &str) -> StoreResult<Option<MemoryEntry>> {
-            let lock = self.entries.lock();
-            Ok(lock
-                .iter()
-                .find(|e| e.user_id == user_id && e.id == key)
-                .cloned())
-        }
-
-        async fn search(
-            &self,
-            user_id: &str,
-            query: &str,
-            limit: usize,
-        ) -> StoreResult<Vec<MemoryEntry>> {
-            let needle = query.to_lowercase();
-            let lock = self.entries.lock();
-            let mut out: Vec<MemoryEntry> = lock
-                .iter()
-                .filter(|e| e.user_id == user_id && e.content.to_lowercase().contains(&needle))
-                .cloned()
-                .collect();
-            out.truncate(limit);
-            Ok(out)
-        }
-
-        async fn delete(&self, id: &str) -> StoreResult<()> {
-            let mut lock = self.entries.lock();
-            lock.retain(|e| e.id != id);
-            Ok(())
-        }
-
-        async fn list_by_user(&self, user_id: &str) -> StoreResult<Vec<MemoryEntry>> {
-            let lock = self.entries.lock();
-            Ok(lock
-                .iter()
-                .filter(|e| e.user_id == user_id)
-                .cloned()
-                .collect())
-        }
-
-        async fn list_all(&self) -> StoreResult<Vec<MemoryEntry>> {
-            let lock = self.entries.lock();
-            Ok(lock.clone())
-        }
-
-        async fn get_by_id(&self, id: &str) -> StoreResult<Option<MemoryEntry>> {
-            let lock = self.entries.lock();
-            Ok(lock.iter().find(|e| e.id == id).cloned())
-        }
-    }
-
     fn make_entry(user: &str, content: &str, session: Option<&str>) -> MemoryEntry {
         let mut e = MemoryEntry::new(user.into(), content.into(), MemoryCategory::KeyFact, 0.5);
         e.source_session_id = session.map(str::to_string);
@@ -514,7 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_returns_user_subset_when_scoped() {
-        let store = std::sync::Arc::new(InMemoryStore::new());
+        let store = std::sync::Arc::new(MemoryMemoryStore::new());
         let mgr = MemoryManager::without_embedder(store);
         mgr.store(make_entry("u1", "a", None)).await.unwrap();
         mgr.store(make_entry("u2", "b", None)).await.unwrap();
@@ -527,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_returns_every_entry_when_unscoped() {
-        let store = std::sync::Arc::new(InMemoryStore::new());
+        let store = std::sync::Arc::new(MemoryMemoryStore::new());
         let mgr = MemoryManager::without_embedder(store);
         mgr.store(make_entry("u1", "a", None)).await.unwrap();
         mgr.store(make_entry("u2", "b", None)).await.unwrap();
@@ -538,7 +447,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_global_matches_across_users() {
-        let store = std::sync::Arc::new(InMemoryStore::new());
+        let store = std::sync::Arc::new(MemoryMemoryStore::new());
         let mgr = MemoryManager::without_embedder(store);
         mgr.store(make_entry("u1", "Rust rocks", None))
             .await
@@ -556,7 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_importance_clamps_and_persists() {
-        let store = std::sync::Arc::new(InMemoryStore::new());
+        let store = std::sync::Arc::new(MemoryMemoryStore::new());
         let mgr = MemoryManager::without_embedder(store);
         let entry = make_entry("u1", "anchor", None);
         let id = entry.id.clone();
@@ -570,15 +479,15 @@ mod tests {
 
     #[tokio::test]
     async fn set_importance_errors_when_missing() {
-        let store = std::sync::Arc::new(InMemoryStore::new());
+        let store = std::sync::Arc::new(MemoryMemoryStore::new());
         let mgr = MemoryManager::without_embedder(store);
         let err = mgr.set_importance("nope", 0.5).await.unwrap_err();
-        assert!(matches!(err, MemoryManagerError::NotFound(_)));
+        assert!(matches!(err, MemoryError::NotFound(_)));
     }
 
     #[tokio::test]
     async fn delete_for_session_removes_only_matching_entries() {
-        let store = std::sync::Arc::new(InMemoryStore::new());
+        let store = std::sync::Arc::new(MemoryMemoryStore::new());
         let mgr = MemoryManager::without_embedder(store);
         mgr.store(make_entry("u1", "from s1", Some("s1")))
             .await

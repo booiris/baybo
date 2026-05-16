@@ -8,7 +8,7 @@ Core responsibilities:
 
 - **Message dispatch**: Actor model, one Actor per session for isolation
 - **Agent main loop**: LLM calls, tool/skill execution, reply generation
-- **Business logic managers**: `SessionManager` (in `aura-session`), `JobLifecycle` (in `aura-job`), `SpanRecorder` (in `aura-trace`), `MemoryManager`, `SecretVault`, `SecurityGateway` — most domain managers live in their respective domain crates now; `agent` assembles them. `SecurityGateway` stays here because it is a cross-cutting interception facade tied to the execution path
+- **Business logic managers**: `SessionManager` (in `aura-session`), `JobLifecycle` (in `aura-job`), `SpanRecorder` (in `aura-trace`), `MemoryManager` (in `aura-memory`), `SecretVault`, `SecurityGateway` — most domain managers live in their respective domain crates now; `agent` assembles them. `SecurityGateway` stays here because it is a cross-cutting interception facade tied to the execution path
 - **Long-running execution**: cron scheduling, background notifications
 - **Unified observability**: `SpanRecorder` (in `aura-trace`, Step / Span / SpanEvent) and `JobLifecycle` (in `aura-job`, Job state machine)
 - **Cost management**: `CostManager` records LLM-call cost and gates spend; `CostGuardError`, `CostMetrics`, `SpendingLimits` round out `agent::cost`
@@ -101,7 +101,8 @@ Before a message enters an actor, Router completes: session identification/creat
 | `llm` | `AgentLoop` initiates model calls |
 | `tools` | `ToolExecutor` executes tools |
 | `skills` | `AgentLoop` parses and executes skills |
-| `model` | Provides memory domain types (`MemoryEntry`, `MemoryCategory`) used by `agent::memory::MemoryManager`; session domain types (`Session`, `User`, `ChannelType`) used by `agent::session::SessionManager` |
+| `model` | Provides memory domain types (`MemoryEntry`, `MemoryCategory`) used by `aura-memory::MemoryManager`; session domain types (`Session`, `User`, `ChannelType`) used by `aura-session::SessionManager` |
+| `memory` | Owns `MemoryStore` trait and `MemoryManager` (recall, dedup, importance, eviction). Agent constructs one `MemoryManager` per process and shares it with `AgentLoop` |
 | `workspace` | Identity files for system prompt |
 | `cron` | Owns `CronJob`, `CronExecution`, and `CronScheduler`; agent re-exports `CronScheduler` / `CronTriggerEvent` for assembly-layer wiring |
 | `context` | Conversation window and compression |

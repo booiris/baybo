@@ -9,6 +9,7 @@ members = [
     "crates/context",
     "crates/session",
     "crates/job",
+    "crates/memory",
     "crates/trace",
     "crates/security",
     "crates/sandbox",
@@ -44,6 +45,7 @@ aura-workspace = { path = "crates/workspace", default-features = false }
 aura-context = { path = "crates/context" }
 aura-session = { path = "crates/session" }
 aura-job = { path = "crates/job" }
+aura-memory = { path = "crates/memory" }
 aura-trace = { path = "crates/trace" }
 aura-security = { path = "crates/security" }
 aura-sandbox = { path = "crates/sandbox" }
@@ -169,6 +171,7 @@ aura-tools = { workspace = true }
 aura-workspace = { workspace = true, features = ["io"] }
 aura-context = { workspace = true }
 aura-job = { workspace = true }
+aura-memory = { workspace = true }
 aura-trace = { workspace = true }
 aura-security = { workspace = true }
 aura-sandbox = { workspace = true }

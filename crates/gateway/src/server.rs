@@ -30,11 +30,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::{CronScheduler, MemoryManager, SessionManager, service::ShutdownSignal};
+use aura_agent::{CronScheduler, SessionManager, service::ShutdownSignal};
 use aura_channels::{ChannelRegistry, IncomingMessage};
-use aura_job::JobLifecycle;
 use aura_config::AuraConfig;
+use aura_job::JobLifecycle;
 use aura_llm::GuardedLlm;
+use aura_memory::MemoryManager;
 use aura_security::SecretVault;
 use aura_skills::SkillRegistry;
 use aura_storage::{ChannelBotStore, Store};

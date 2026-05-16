@@ -194,6 +194,7 @@ dependencies = [
  "aura-janitor",
  "aura-job",
  "aura-llm",
+ "aura-memory",
  "aura-model",
  "aura-sandbox",
  "aura-security",
@@ -231,6 +232,7 @@ dependencies = [
  "aura-cron",
  "aura-job",
  "aura-llm",
+ "aura-memory",
  "aura-model",
  "aura-sandbox",
  "aura-security",
@@ -292,6 +294,7 @@ dependencies = [
  "aura-gateway",
  "aura-job",
  "aura-llm",
+ "aura-memory",
  "aura-model",
  "aura-security",
  "aura-setup",
@@ -419,6 +422,7 @@ dependencies = [
  "aura-gateway",
  "aura-job",
  "aura-llm",
+ "aura-memory",
  "aura-model",
  "aura-pairing",
  "aura-security",
@@ -472,6 +476,7 @@ dependencies = [
  "aura-gateway",
  "aura-job",
  "aura-llm",
+ "aura-memory",
  "aura-model",
  "aura-security",
  "aura-setup",
@@ -548,6 +553,22 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "aura-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aura-model",
+ "chrono",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -713,6 +734,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aura-job",
+ "aura-memory",
  "aura-model",
  "aura-trace",
  "bytes",

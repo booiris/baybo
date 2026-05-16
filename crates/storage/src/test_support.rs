@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use async_trait::async_trait;
-use aura_model::{BlobRef, ChatMessage, JobId, MemoryEntry, Session, SessionId};
+use aura_model::{BlobRef, ChatMessage, JobId, Session, SessionId};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use parking_lot::Mutex;
@@ -20,7 +20,6 @@ use crate::blob::{
     BlobMeta, BlobReader, BlobStore, ByteStream, Result as BlobResult, SHA256_PREFIX,
 };
 use crate::cost::{CostRecord, CostResult, CostStore, CostSummary, TimeRange};
-use crate::memory::{MemoryStore, Result as MemoryStoreResult};
 use crate::secret::{Result as SecretResult, SecretStore};
 use crate::session::{Result as SessionStoreResult, SessionStore, StoredMessage};
 use crate::session_summary::{
@@ -177,86 +176,6 @@ impl CostStore for MemoryCostStore {
             summary.record_count += 1;
         }
         Ok(summary)
-    }
-}
-
-/// In-memory `MemoryStore` for tests. Keyed by `entry.id`. Search is a
-/// case-insensitive substring match against the entry's `content` —
-/// good enough for asserting "the entry I just stored shows up in
-/// search".
-#[derive(Debug, Default)]
-pub struct MemoryMemoryStore {
-    entries: Mutex<HashMap<String, MemoryEntry>>,
-}
-
-impl MemoryMemoryStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.lock().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-#[async_trait]
-impl MemoryStore for MemoryMemoryStore {
-    async fn store(&self, entry: &MemoryEntry) -> MemoryStoreResult<()> {
-        self.entries.lock().insert(entry.id.clone(), entry.clone());
-        Ok(())
-    }
-
-    async fn retrieve(&self, user_id: &str, key: &str) -> MemoryStoreResult<Option<MemoryEntry>> {
-        Ok(self
-            .entries
-            .lock()
-            .values()
-            .find(|e| e.user_id == user_id && e.id == key)
-            .cloned())
-    }
-
-    async fn search(
-        &self,
-        user_id: &str,
-        query: &str,
-        limit: usize,
-    ) -> MemoryStoreResult<Vec<MemoryEntry>> {
-        let q = query.to_ascii_lowercase();
-        Ok(self
-            .entries
-            .lock()
-            .values()
-            .filter(|e| e.user_id == user_id && e.content.to_ascii_lowercase().contains(&q))
-            .take(limit)
-            .cloned()
-            .collect())
-    }
-
-    async fn delete(&self, id: &str) -> MemoryStoreResult<()> {
-        self.entries.lock().remove(id);
-        Ok(())
-    }
-
-    async fn list_by_user(&self, user_id: &str) -> MemoryStoreResult<Vec<MemoryEntry>> {
-        Ok(self
-            .entries
-            .lock()
-            .values()
-            .filter(|e| e.user_id == user_id)
-            .cloned()
-            .collect())
-    }
-
-    async fn list_all(&self) -> MemoryStoreResult<Vec<MemoryEntry>> {
-        Ok(self.entries.lock().values().cloned().collect())
-    }
-
-    async fn get_by_id(&self, id: &str) -> MemoryStoreResult<Option<MemoryEntry>> {
-        Ok(self.entries.lock().get(id).cloned())
     }
 }
 
