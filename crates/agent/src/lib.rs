@@ -2,7 +2,6 @@ pub mod actor;
 pub mod agent_loop;
 pub mod billed_chat;
 pub mod compression;
-pub mod cost;
 pub mod error_recovery;
 pub mod llm_pool;
 pub mod query;
@@ -23,7 +22,6 @@ pub use aura_cron::{CronScheduler, CronTriggerEvent};
 pub use aura_security::SecretVault;
 pub use aura_session::SessionManager;
 pub use billed_chat::BilledChatFactory;
-pub use cost::{CostGuardError, CostManager, CostMetrics, SpendingLimits};
 pub use llm_pool::LlmClientPool;
 pub use query::{
     AnalyticsDayBucket, AnalyticsModelBucket, AnalyticsSummary, CostScope, JobDetail, JobFilter,

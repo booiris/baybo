@@ -12,7 +12,7 @@ use chrono::{Duration, Utc};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use aura_storage::TimeRange;
+use aura_cost::TimeRange;
 
 use crate::api::dto::{AnalyticsQuery, AnalyticsResponse, ErrorBody};
 use crate::server::AdminState;

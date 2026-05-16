@@ -4,9 +4,8 @@
 
 use std::sync::Arc;
 
-use aura_storage::SecretStore;
-
 use crate::crypto::{self, EncryptionKey};
+use crate::secret_store::SecretStore;
 use crate::secret_value::SecretValue;
 use crate::{Result, SecurityError};
 
@@ -82,7 +81,7 @@ impl SecretVault {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_storage::test_support::MemorySecretStore;
+    use crate::test_support::MemorySecretStore;
 
     fn make_vault() -> SecretVault {
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();

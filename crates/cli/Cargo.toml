@@ -20,6 +20,7 @@ aura-channels = { workspace = true }
 aura-config = { workspace = true }
 aura-gateway = { workspace = true }
 aura-cron = { workspace = true }
+aura-cost = { workspace = true }
 aura-job = { workspace = true }
 aura-memory = { workspace = true }
 aura-skills = { workspace = true }

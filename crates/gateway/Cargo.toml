@@ -33,6 +33,7 @@ aura-agent = { workspace = true }
 aura-channels = { workspace = true }
 aura-config = { workspace = true }
 aura-cron = { workspace = true }
+aura-cost = { workspace = true }
 aura-job = { workspace = true }
 aura-llm = { workspace = true }
 aura-memory = { workspace = true }

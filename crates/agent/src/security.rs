@@ -814,7 +814,7 @@ mod tests {
     use aura_model::ChannelType;
     use aura_security::EncryptionKey;
     use aura_security::leak_detector::{LeakAction, LeakDetectionRule};
-    use aura_storage::test_support::MemorySecretStore;
+    use aura_security::test_support::MemorySecretStore;
     use chrono::Utc;
     use regex::Regex;
     use tempfile::TempDir;

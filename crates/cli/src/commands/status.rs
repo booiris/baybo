@@ -1,6 +1,6 @@
 use aura_agent::CostScope;
 use aura_job::JobStatusKind;
-use aura_storage::TimeRange;
+use aura_cost::TimeRange;
 use chrono::{Duration, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};

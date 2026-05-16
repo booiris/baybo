@@ -22,7 +22,8 @@ use std::sync::Arc;
 
 use aura_job::{Job, JobError, JobKind, JobLifecycle, JobStatus, JobStatusKind};
 use aura_model::{JobId, Lineage, LineageKind, MicroUsd, Session, SessionId, StepId};
-use aura_storage::{CostError, CostStore, CostSummary, SessionStore, StorageError, TimeRange};
+use aura_cost::{CostError, CostStore, CostSummary, TimeRange};
+use aura_storage::{SessionStore, StorageError};
 use aura_trace::{Span, SpanEvent, Step, TraceError, TraceStore};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -887,7 +888,7 @@ mod tests {
     use aura_job::test_support::MemoryJobStore;
     use aura_model::{ChannelType, ContentBlock, TriggerKind, TriggerSource};
     use aura_storage::SessionStore;
-    use aura_storage::test_support::MemoryCostStore;
+    use aura_cost::test_support::MemoryCostStore;
     use aura_trace::test_support::MemoryTraceStore;
     use std::sync::Arc;
 

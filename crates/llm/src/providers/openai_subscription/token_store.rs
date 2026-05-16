@@ -44,7 +44,7 @@ impl VaultTokenStore {
 mod tests {
     use super::*;
     use aura_security::EncryptionKey;
-    use aura_storage::test_support::MemorySecretStore;
+    use aura_security::test_support::MemorySecretStore;
     use std::sync::Arc;
 
     fn make_store() -> VaultTokenStore {

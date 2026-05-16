@@ -13,11 +13,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::{
-    AgentLoop, CostManager, SecurityGateway, SpendingLimits,
+    AgentLoop, SecurityGateway,
     actor::{AgentActor, AgentMessage},
     soul::Soul,
     tool_executor::ToolExecutor,
 };
+use aura_cost::{CostManager, SpendingLimits, cost_call_guard};
 use aura_channels::{AgentOutput, IncomingMessage, Message};
 use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, budget::TokenBudget};
 use aura_job::JobLifecycle;
@@ -29,7 +30,8 @@ use aura_memory::test_support::MemoryMemoryStore;
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, Session, User};
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
-use aura_storage::test_support::{MemoryCostStore, MemorySecretStore};
+use aura_cost::test_support::MemoryCostStore;
+use aura_security::test_support::MemorySecretStore;
 use aura_trace::test_support::MemoryTraceStore;
 use aura_trace::{SpanRecorder, TraceEventStream, TraceStore};
 use aura_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
@@ -271,7 +273,7 @@ impl AgentTestHarnessBuilder {
         let secret_store = Arc::new(MemorySecretStore::new());
         let vault = Arc::new(SecretVault::new(
             master_key_for_tests(),
-            secret_store.clone() as Arc<dyn aura_storage::SecretStore>,
+            secret_store.clone() as Arc<dyn aura_security::SecretStore>,
         ));
         let spill_dir = std::env::temp_dir().join(format!(
             "aura-it-tool-spills-{}",
@@ -302,7 +304,7 @@ impl AgentTestHarnessBuilder {
         // Cost ledger. Default builder leaves pricing empty (cost_usd
         // resolves to 0) and limits as `None` (no budget gate). Tests
         // that exercise budgeting use `with_pricing` / `with_spending_limits`.
-        let cost_manager = aura_agent::CostManager::new(
+        let cost_manager = CostManager::new(
             share_cost_store(&cost_store),
             self.pricing,
             self.spending_limits,
@@ -371,7 +373,7 @@ impl AgentTestHarnessBuilder {
 
         let guarded_llm = aura_llm::GuardedLlm::new(
             stub_llm.clone() as Arc<dyn aura_llm::LlmCompletion>,
-            cost_manager.as_guard(),
+            cost_call_guard(&cost_manager),
         );
 
         // Single-entry pool keyed by the stub model's id; tests that
@@ -456,7 +458,7 @@ fn share_job_store(arc: &Arc<MemoryJobStore>) -> Arc<dyn aura_job::JobStore> {
     arc.clone()
 }
 
-fn share_cost_store(arc: &Arc<MemoryCostStore>) -> Arc<dyn aura_storage::CostStore> {
+fn share_cost_store(arc: &Arc<MemoryCostStore>) -> Arc<dyn aura_cost::CostStore> {
     arc.clone()
 }
 

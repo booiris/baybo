@@ -94,7 +94,7 @@ impl TuiHistoryStore {
 mod tests {
     use super::*;
     use aura_security::EncryptionKey;
-    use aura_storage::test_support::MemorySecretStore;
+    use aura_security::test_support::MemorySecretStore;
 
     fn build_store() -> TuiHistoryStore {
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())

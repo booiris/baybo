@@ -8,10 +8,10 @@ Core responsibilities:
 
 - **Message dispatch**: Actor model, one Actor per session for isolation
 - **Agent main loop**: LLM calls, tool/skill execution, reply generation
-- **Business logic managers**: `SessionManager` (in `aura-session`), `JobLifecycle` (in `aura-job`), `SpanRecorder` (in `aura-trace`), `MemoryManager` (in `aura-memory`), `SecretVault`, `SecurityGateway` — most domain managers live in their respective domain crates now; `agent` assembles them. `SecurityGateway` stays here because it is a cross-cutting interception facade tied to the execution path
+- **Business logic managers**: `SessionManager` (in `aura-session`), `JobLifecycle` (in `aura-job`), `SpanRecorder` (in `aura-trace`), `MemoryManager` (in `aura-memory`), `CostManager` (in `aura-cost`), `SecretVault` (in `aura-security`), `SecurityGateway` — all domain managers live in their respective domain crates now; `agent` assembles them. `SecurityGateway` stays here because it is a cross-cutting interception facade tied to the execution path
 - **Long-running execution**: cron scheduling, background notifications
 - **Unified observability**: `SpanRecorder` (in `aura-trace`, Step / Span / SpanEvent) and `JobLifecycle` (in `aura-job`, Job state machine)
-- **Cost management**: `CostManager` records LLM-call cost and gates spend; `CostGuardError`, `CostMetrics`, `SpendingLimits` round out `agent::cost`
+- **Cost management**: `CostManager` (in `aura-cost`) records LLM-call cost and gates spend; agent constructs it and threads it through the loop
 - **Runtime logic**: error recovery, timeout control
 
 It does not own low-level storage or backend implementation — it consumes Store traits from `aura-job` (for `JobStore`) and `aura-storage` (for the rest) through dependency injection. Domain types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`). Each manager defines its own error type for business-level failures (e.g. `MemoryManager` defines errors for embedding and dedup failures).

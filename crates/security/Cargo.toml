@@ -6,9 +6,12 @@ edition.workspace = true
 [lib]
 doctest = false
 
+[features]
+test-support = ["dep:parking_lot"]
+
 [dependencies]
 aura-model = { workspace = true }
-aura-storage = { workspace = true }
+parking_lot = { workspace = true, optional = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -26,7 +29,7 @@ hex = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-aura-storage = { workspace = true, features = ["test-support"] }
+aura-security = { path = ".", features = ["test-support"] }
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 chrono = { workspace = true }

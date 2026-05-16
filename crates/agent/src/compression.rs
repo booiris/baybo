@@ -41,8 +41,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::billed_chat::{BilledAttribution, chat_billed_core};
-use crate::cost::CostManager;
 use crate::security::SecurityGateway;
+use aura_cost::CostManager;
 
 /// Synthetic `model_id` recorded against `session_summaries.error_count`
 /// when the orphan reaper bumps a parent's failure count for a

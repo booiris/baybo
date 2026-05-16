@@ -50,7 +50,7 @@ pub(crate) async fn rescan_for_llm(
 mod tests {
     use super::*;
     use aura_security::EncryptionKey;
-    use aura_storage::test_support::MemorySecretStore;
+    use aura_security::test_support::MemorySecretStore;
 
     fn make_vault() -> Arc<SecretVault> {
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();

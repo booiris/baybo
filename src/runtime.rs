@@ -30,12 +30,12 @@ use aura_agent::soul::Soul;
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{
-    CostManager, CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager,
-    SpendingLimits,
+    CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager,
 };
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
 use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, Tokenizer};
+use aura_cost::{CostManager, SpendingLimits, cost_call_guard};
 use aura_job::JobLifecycle;
 use aura_llm::GuardedLlm;
 use aura_memory::MemoryManager;
@@ -337,7 +337,7 @@ pub async fn build_managers(
         let provider_registry = &provider_registry;
         let blob = stores.blob.clone();
         let vault = Arc::clone(&secret_vault);
-        let cost_guard = cost_manager.as_guard();
+        let cost_guard = cost_call_guard(&cost_manager);
         async move {
             let result = boot::build_llm_client_for_entry(
                 entry,

@@ -14,7 +14,7 @@ use aura_model::{ChannelType, ContentBlock, MessageMetadata, User};
 use aura_security::{
     EncryptionKey, LeakAction, LeakDetectionRule, LeakDetector, PlaceholderMinter, SecretVault,
 };
-use aura_storage::test_support::MemorySecretStore;
+use aura_security::test_support::MemorySecretStore;
 use chrono::Utc;
 use regex::Regex;
 use tracing::Level;
@@ -138,7 +138,7 @@ async fn s4_blocked_rule_returns_violation_and_redacts_message() {
     let key = EncryptionKey::new(b"aura-it-master-key-32-bytes!!!!!".to_vec()).unwrap();
     let vault = Arc::new(SecretVault::new(
         key,
-        store.clone() as Arc<dyn aura_storage::SecretStore>,
+        store.clone() as Arc<dyn aura_security::SecretStore>,
     ));
     let gw = SecurityGateway::new(Arc::new(detector), vault);
 
