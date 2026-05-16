@@ -1,21 +1,34 @@
-//! Job lifecycle types — see `docs/modules/job.md` for the design.
+//! Job lifecycle types and orchestration — see `docs/modules/job.md`
+//! for the design.
 //!
-//! This crate is types-only: no async, no storage. The persistence
-//! orchestrator (`JobLifecycle`) lives in `agent::job`.
+//! Domain types (`Job`, `JobStatus`, `JobKind`, `CancelReason`,
+//! `JobError`) and the `JobLifecycle` persistence orchestrator both
+//! live here; the orchestrator wraps a `JobStore` with the cancel
+//! state machine, terminal-event bus, and `JobId → CancellationToken`
+//! registry that the in-flight execution path subscribes to.
 
 mod cancel;
+mod cancellation_registry;
 mod drift;
 mod error;
 mod kind;
+mod lifecycle;
+mod store;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 use aura_model::{JobId, SessionId, SpanId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub use cancel::CancelReason;
+pub use cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
 pub use drift::DriftRecord;
 pub use error::JobError;
 pub use kind::{JobInput, JobKind, JobOutput};
+pub use lifecycle::{JobLifecycle, JobTerminalEvent};
+pub use store::JobStore;
 
 pub type Result<T> = std::result::Result<T, JobError>;
 

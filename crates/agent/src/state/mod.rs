@@ -33,8 +33,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::AgentLoop;
-use crate::job::JobLifecycle;
 use crate::supervisor::AgentSupervisor;
+use aura_job::JobLifecycle;
 use crate::trace::SpanRecorder;
 
 pub mod marker;

@@ -8,13 +8,13 @@ Core responsibilities:
 
 - **Message dispatch**: Actor model, one Actor per session for isolation
 - **Agent main loop**: LLM calls, tool/skill execution, reply generation
-- **Business logic managers**: `SessionManager`, `MemoryManager`, `SpanRecorder`, `JobLifecycle`, `SecretVault`, `SecurityGateway` — all domain managers live here
+- **Business logic managers**: `SessionManager` (in `aura-session`), `JobLifecycle` (in `aura-job`), `MemoryManager`, `SpanRecorder`, `SecretVault`, `SecurityGateway` — most domain managers live in their respective domain crates now; `agent` assembles them. `SecurityGateway` stays here because it is a cross-cutting interception facade tied to the execution path
 - **Long-running execution**: cron scheduling, background notifications
-- **Unified observability**: `SpanRecorder` (Step / Span / SpanEvent) and `JobLifecycle` (Job state machine)
+- **Unified observability**: `SpanRecorder` (Step / Span / SpanEvent) and `JobLifecycle` (Job state machine, in `aura-job`)
 - **Cost management**: `CostManager` records LLM-call cost and gates spend; `CostGuardError`, `CostMetrics`, `SpendingLimits` round out `agent::cost`
 - **Runtime logic**: error recovery, timeout control
 
-It does not own low-level storage or backend implementation — it consumes Store traits from `storage` through dependency injection. Domain types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`). Each manager defines its own error type for business-level failures (e.g. `MemoryManager` defines errors for embedding and dedup failures).
+It does not own low-level storage or backend implementation — it consumes Store traits from `aura-job` (for `JobStore`) and `aura-storage` (for the rest) through dependency injection. Domain types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`). Each manager defines its own error type for business-level failures (e.g. `MemoryManager` defines errors for embedding and dedup failures).
 
 ## Design Decisions
 
@@ -105,9 +105,9 @@ Before a message enters an actor, Router completes: session identification/creat
 | `workspace` | Identity files for system prompt |
 | `cron` | Owns `CronJob`, `CronExecution`, and `CronScheduler`; agent re-exports `CronScheduler` / `CronTriggerEvent` for assembly-layer wiring |
 | `context` | Conversation window and compression |
-| `job` | Provides domain types (`Job`, `JobStatus`, `JobKind`) used by `agent::job::JobLifecycle` |
+| `job` | Owns `Job`, `JobStatus`, `JobKind`, `JobStore` trait, and `JobLifecycle` (persistence orchestrator + cancellation registry + terminal-event bus). Agent constructs and shares one `JobLifecycle` across the loop, router, supervisor, and subagent wait routine |
 | `trace` | Provides domain types and tree/fork utilities used by `agent::trace::SpanRecorder` |
 | `session` | Provides `SessionManager` and its error type (domain types live in `aura-model`) |
 | `security` | Provides crypto primitives, `SecretVault`, `SecretValue`, `LeakDetector`, `PlaceholderMinter`, `InjectionDetector`; `agent::security::SecurityGateway` composes them |
 | `channels` | `Channel` handles + `ChannelRegistry`; Router owns the registry for dispatch by `ChannelType` |
-| `storage` | Provides all Store traits and libsql implementations; injected into managers |
+| `storage` | Provides remaining Store traits and the libsql implementations of all stores; `JobStore` trait moved to `aura-job` |

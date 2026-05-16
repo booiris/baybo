@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use async_trait::async_trait;
-use aura_job::{Job, JobStatusKind, JobTransition};
 use aura_model::{BlobRef, ChatMessage, JobId, MemoryEntry, Session, SessionId, SpanId, StepId};
 use aura_trace::{Span, SpanEvent, Step};
 use chrono::{DateTime, Utc};
@@ -22,7 +21,6 @@ use crate::blob::{
     BlobMeta, BlobReader, BlobStore, ByteStream, Result as BlobResult, SHA256_PREFIX,
 };
 use crate::cost::{CostRecord, CostResult, CostStore, CostSummary, TimeRange};
-use crate::job::{JobStore, Result as JobStoreResult};
 use crate::memory::{MemoryStore, Result as MemoryStoreResult};
 use crate::secret::{Result as SecretResult, SecretStore};
 use crate::session::{Result as SessionStoreResult, SessionStore, StoredMessage};
@@ -76,107 +74,6 @@ impl SecretStore for MemorySecretStore {
     async fn delete(&self, name: &str) -> SecretResult<()> {
         self.data.lock().remove(name);
         Ok(())
-    }
-}
-
-/// In-memory `JobStore` for tests. Keyed by `job.id`. `record_transition`
-/// appends to a per-job vector so the order of transitions is preserved.
-#[derive(Debug, Default)]
-pub struct MemoryJobStore {
-    jobs: Mutex<HashMap<JobId, Job>>,
-    transitions: Mutex<HashMap<JobId, Vec<JobTransition>>>,
-}
-
-impl MemoryJobStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn len(&self) -> usize {
-        self.jobs.lock().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-#[async_trait]
-impl JobStore for MemoryJobStore {
-    async fn create(&self, job: &Job) -> JobStoreResult<()> {
-        self.jobs.lock().insert(job.id, job.clone());
-        Ok(())
-    }
-
-    async fn get(&self, job_id: &JobId) -> JobStoreResult<Option<Job>> {
-        Ok(self.jobs.lock().get(job_id).cloned())
-    }
-
-    async fn save(&self, job: &Job) -> JobStoreResult<()> {
-        self.jobs.lock().insert(job.id, job.clone());
-        Ok(())
-    }
-
-    async fn list_by_session(&self, session_id: &SessionId) -> JobStoreResult<Vec<Job>> {
-        Ok(self
-            .jobs
-            .lock()
-            .values()
-            .filter(|j| &j.session_id == session_id)
-            .cloned()
-            .collect())
-    }
-
-    async fn list_by_status_kind(&self, kind: JobStatusKind) -> JobStoreResult<Vec<Job>> {
-        Ok(self
-            .jobs
-            .lock()
-            .values()
-            .filter(|j| j.status.kind() == kind)
-            .cloned()
-            .collect())
-    }
-
-    async fn list_recoverable(&self) -> JobStoreResult<Vec<Job>> {
-        Ok(self
-            .jobs
-            .lock()
-            .values()
-            .filter(|j| j.status.kind().needs_recovery())
-            .cloned()
-            .collect())
-    }
-
-    async fn list_children(&self, parent_job_id: &JobId) -> JobStoreResult<Vec<Job>> {
-        Ok(self
-            .jobs
-            .lock()
-            .values()
-            .filter(|j| j.parent_job_id.as_ref() == Some(parent_job_id))
-            .cloned()
-            .collect())
-    }
-
-    async fn list_all(&self) -> JobStoreResult<Vec<Job>> {
-        Ok(self.jobs.lock().values().cloned().collect())
-    }
-
-    async fn record_transition(&self, transition: &JobTransition) -> JobStoreResult<()> {
-        self.transitions
-            .lock()
-            .entry(transition.job_id)
-            .or_default()
-            .push(transition.clone());
-        Ok(())
-    }
-
-    async fn get_transitions(&self, job_id: &JobId) -> JobStoreResult<Vec<JobTransition>> {
-        Ok(self
-            .transitions
-            .lock()
-            .get(job_id)
-            .cloned()
-            .unwrap_or_default())
     }
 }
 

@@ -154,10 +154,10 @@ mod tests {
     #[test]
     fn volatile_resources_fields_are_marker_clean() {
         use crate::agent_loop::AgentLoop;
-        use crate::job::JobLifecycle;
         use crate::supervisor::AgentSupervisor;
         use crate::trace::SpanRecorder;
         use aura_channels::AgentOutput;
+        use aura_job::JobLifecycle;
 
         assert_volatile::<AgentLoop>();
         assert_volatile::<mpsc::Sender<AgentOutput>>();

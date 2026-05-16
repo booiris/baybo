@@ -13,21 +13,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::{
-    AgentLoop, CostManager, JobLifecycle, MemoryManager, SecurityGateway, SpanRecorder,
-    SpendingLimits,
+    AgentLoop, CostManager, MemoryManager, SecurityGateway, SpanRecorder, SpendingLimits,
     actor::{AgentActor, AgentMessage},
     soul::Soul,
     tool_executor::ToolExecutor,
 };
 use aura_channels::{AgentOutput, IncomingMessage, Message};
 use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, budget::TokenBudget};
+use aura_job::JobLifecycle;
+use aura_job::test_support::MemoryJobStore;
 use aura_llm::test_support::StubLlm;
 use aura_llm::{LlmCompletion, ModelPricing};
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, Session, User};
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
 use aura_storage::test_support::{
-    MemoryCostStore, MemoryJobStore, MemoryMemoryStore, MemorySecretStore, MemoryTraceStore,
+    MemoryCostStore, MemoryMemoryStore, MemorySecretStore, MemoryTraceStore,
 };
 use aura_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
 use chrono::Utc;
@@ -449,7 +450,7 @@ impl AgentTestHarnessBuilder {
 // manager-owned handle point at the same instance and post-run
 // assertions see real state.
 
-fn share_job_store(arc: &Arc<MemoryJobStore>) -> Arc<dyn aura_storage::JobStore> {
+fn share_job_store(arc: &Arc<MemoryJobStore>) -> Arc<dyn aura_job::JobStore> {
     arc.clone()
 }
 

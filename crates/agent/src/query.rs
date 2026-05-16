@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aura_job::{Job, JobError, JobKind, JobStatus, JobStatusKind};
+use aura_job::{Job, JobError, JobKind, JobLifecycle, JobStatus, JobStatusKind};
 use aura_model::{JobId, Lineage, LineageKind, MicroUsd, Session, SessionId, StepId};
 use aura_storage::{
     CostError, CostStore, CostSummary, SessionStore, StorageError, TimeRange, TraceStore,
@@ -29,8 +29,6 @@ use aura_trace::{Span, SpanEvent, Step, TraceError};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-use crate::job::JobLifecycle;
 
 #[derive(Debug, Error)]
 pub enum QueryError {
@@ -888,9 +886,10 @@ fn filter_matches(j: &Job, f: &JobFilter) -> bool {
 mod tests {
     use super::*;
     use aura_job::JobInput;
+    use aura_job::test_support::MemoryJobStore;
     use aura_model::{ChannelType, ContentBlock, TriggerKind, TriggerSource};
     use aura_storage::SessionStore;
-    use aura_storage::test_support::{MemoryCostStore, MemoryJobStore, MemoryTraceStore};
+    use aura_storage::test_support::{MemoryCostStore, MemoryTraceStore};
     use std::sync::Arc;
 
     fn user_input() -> JobInput {

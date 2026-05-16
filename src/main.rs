@@ -203,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
                 stores.session.clone(),
                 stores.session_summary.clone(),
             )))
-            .job(Arc::new(aura_agent::JobLifecycle::new(stores.job.clone())))
+            .job(Arc::new(aura_job::JobLifecycle::new(stores.job.clone())))
             .trace(stores.trace.clone())
             .cost_store(stores.cost.clone());
         let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(1);

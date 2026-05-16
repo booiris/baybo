@@ -5,7 +5,6 @@ pub mod channel_session;
 pub mod cost;
 pub mod cron;
 pub mod error;
-pub mod job;
 pub mod libsql;
 pub mod memory;
 pub mod retry;
@@ -25,8 +24,9 @@ pub use channel_session::ChannelSessionStore;
 pub use cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
 pub use cron::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
 pub use error::StorageError;
-pub use job::JobStore;
 pub use memory::MemoryStore;
+
+use aura_job::JobStore;
 pub use retry::retry_on_busy;
 pub use secret::SecretStore;
 pub use session::{SessionStore, StoredMessage};

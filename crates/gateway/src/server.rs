@@ -30,10 +30,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::{
-    CronScheduler, JobLifecycle, MemoryManager, SessionManager, service::ShutdownSignal,
-};
+use aura_agent::{CronScheduler, MemoryManager, SessionManager, service::ShutdownSignal};
 use aura_channels::{ChannelRegistry, IncomingMessage};
+use aura_job::JobLifecycle;
 use aura_config::AuraConfig;
 use aura_llm::GuardedLlm;
 use aura_security::SecretVault;
