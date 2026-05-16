@@ -22,10 +22,8 @@ use std::sync::Arc;
 
 use aura_job::{Job, JobError, JobKind, JobLifecycle, JobStatus, JobStatusKind};
 use aura_model::{JobId, Lineage, LineageKind, MicroUsd, Session, SessionId, StepId};
-use aura_storage::{
-    CostError, CostStore, CostSummary, SessionStore, StorageError, TimeRange, TraceStore,
-};
-use aura_trace::{Span, SpanEvent, Step, TraceError};
+use aura_storage::{CostError, CostStore, CostSummary, SessionStore, StorageError, TimeRange};
+use aura_trace::{Span, SpanEvent, Step, TraceError, TraceStore};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -889,7 +887,8 @@ mod tests {
     use aura_job::test_support::MemoryJobStore;
     use aura_model::{ChannelType, ContentBlock, TriggerKind, TriggerSource};
     use aura_storage::SessionStore;
-    use aura_storage::test_support::{MemoryCostStore, MemoryTraceStore};
+    use aura_storage::test_support::MemoryCostStore;
+    use aura_trace::test_support::MemoryTraceStore;
     use std::sync::Arc;
 
     fn user_input() -> JobInput {
@@ -1393,9 +1392,8 @@ mod tests {
     #[tokio::test]
     async fn replay_hydrates_persisted_inputs_across_compaction() {
         use aura_model::{ChatMessage, ContentBlock, Role, SpanId, StepId};
-        use aura_storage::TraceStore;
         use aura_trace::{
-            LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind,
+            LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind, TraceStore,
         };
 
         fn user_msg(text: &str) -> ChatMessage {

@@ -43,4 +43,5 @@ hex = { workspace = true }
 aura-job = { workspace = true, features = ["test-support"] }
 aura-llm = { workspace = true, features = ["test-support"] }
 aura-storage = { workspace = true, features = ["test-support"] }
+aura-trace = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

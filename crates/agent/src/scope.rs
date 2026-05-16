@@ -33,13 +33,11 @@ use std::future::Future;
 use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
 use aura_model::{JobId, ParallelGroup, SessionId, TriggerKind};
 use aura_trace::{
-    LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanHandle, SpanKind, StepHandle,
-    StepKind,
+    LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanHandle, SpanKind, SpanRecorder,
+    StepHandle, StepKind,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
-
-use crate::trace::SpanRecorder;
 
 /// Inputs needed to create a new `Job`. Bundled into a struct so
 /// [`with_job`] can own the full `start_job → start → body → complete/fail`

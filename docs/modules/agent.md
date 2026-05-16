@@ -8,9 +8,9 @@ Core responsibilities:
 
 - **Message dispatch**: Actor model, one Actor per session for isolation
 - **Agent main loop**: LLM calls, tool/skill execution, reply generation
-- **Business logic managers**: `SessionManager` (in `aura-session`), `JobLifecycle` (in `aura-job`), `MemoryManager`, `SpanRecorder`, `SecretVault`, `SecurityGateway` — most domain managers live in their respective domain crates now; `agent` assembles them. `SecurityGateway` stays here because it is a cross-cutting interception facade tied to the execution path
+- **Business logic managers**: `SessionManager` (in `aura-session`), `JobLifecycle` (in `aura-job`), `SpanRecorder` (in `aura-trace`), `MemoryManager`, `SecretVault`, `SecurityGateway` — most domain managers live in their respective domain crates now; `agent` assembles them. `SecurityGateway` stays here because it is a cross-cutting interception facade tied to the execution path
 - **Long-running execution**: cron scheduling, background notifications
-- **Unified observability**: `SpanRecorder` (Step / Span / SpanEvent) and `JobLifecycle` (Job state machine, in `aura-job`)
+- **Unified observability**: `SpanRecorder` (in `aura-trace`, Step / Span / SpanEvent) and `JobLifecycle` (in `aura-job`, Job state machine)
 - **Cost management**: `CostManager` records LLM-call cost and gates spend; `CostGuardError`, `CostMetrics`, `SpendingLimits` round out `agent::cost`
 - **Runtime logic**: error recovery, timeout control
 
@@ -106,7 +106,7 @@ Before a message enters an actor, Router completes: session identification/creat
 | `cron` | Owns `CronJob`, `CronExecution`, and `CronScheduler`; agent re-exports `CronScheduler` / `CronTriggerEvent` for assembly-layer wiring |
 | `context` | Conversation window and compression |
 | `job` | Owns `Job`, `JobStatus`, `JobKind`, `JobStore` trait, and `JobLifecycle` (persistence orchestrator + cancellation registry + terminal-event bus). Agent constructs and shares one `JobLifecycle` across the loop, router, supervisor, and subagent wait routine |
-| `trace` | Provides domain types and tree/fork utilities used by `agent::trace::SpanRecorder` |
+| `trace` | Owns `Step`, `Span`, `SpanEvent`, `TraceStore` trait, `SpanRecorder` (lifecycle facade), and `TraceEventStream` (broadcast bus). Agent constructs and shares one `SpanRecorder` per session |
 | `session` | Provides `SessionManager` and its error type (domain types live in `aura-model`) |
 | `security` | Provides crypto primitives, `SecretVault`, `SecretValue`, `LeakDetector`, `PlaceholderMinter`, `InjectionDetector`; `agent::security::SecurityGateway` composes them |
 | `channels` | `Channel` handles + `ChannelRegistry`; Router owns the registry for dispatch by `ChannelType` |

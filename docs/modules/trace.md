@@ -1,10 +1,10 @@
-# trace - Step / Span Domain Types and Recovery Utilities
+# trace - Step / Span Types, Store, and Lifecycle Recorder
 
 ## Overview
 
-The `trace` crate defines domain types for the four-tier observability model (`Step`, `StepKind`, `Span`, `SpanKind`, `SpanEvent`, `SpanEventKind`, `LlmToolCallRecord`, `ToolCallOrigin`) and provides the recovery scan utility for half-open spans.
+The `trace` crate is the complete home for the four-tier observability model: domain types (`Step`, `StepKind`, `Span`, `SpanKind`, `SpanEvent`, `SpanEventKind`, `LlmToolCallRecord`, `ToolCallOrigin`), the `TraceStore` trait, and the `SpanRecorder` lifecycle facade (with its `TraceEvent` / `TraceEventStream` broadcast bus).
 
-Business logic (`SpanRecorder` — span lifecycle management, persistence, and `TraceEvent` emission) lives in `agent::trace`. The `TraceStore` trait is defined in `storage::trace`.
+`aura-storage` provides the libsql implementation of `TraceStore`; the trait itself lives here so downstream callers and tests can depend on `aura-trace` alone for trace-recording work.
 
 Trace answers **"what exactly did this operation do"** by recording sanitized inputs, results, latency, and execution provenance. Its difference from `job` is: **Job manages state, Trace manages content.**
 
@@ -95,18 +95,18 @@ When listing jobs / steps / spans for a session whose `Lineage` is `UserFork { f
 
 ## Constraints
 
-- Types crate — no facade or persistence logic (those live in `agent::trace::SpanRecorder`)
-- Depends on `aura-job` (for `JobId`, `CancelReason`, `DriftRecord`) and `aura-model` (for `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.)
+- Depends on `aura-job` (for `JobId`, `CancelReason`, `DriftRecord`) and `aura-model` (for `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.). No dependency on `aura-storage`.
 - IDs use ULID newtypes (`StepId`, `SpanId`); `SpanEvent` uses a `(span_id, seq)` compound key
 - Storage uses columnar schema: `steps` / `spans` / `span_events` (one row per entity); the `Job > Step > Span` parent chain is encoded by foreign keys, not by embedded child lists
 - All deletes are hard `DELETE FROM` — no `deleted_at` tombstone column (see [storage.md](./storage.md#hard-delete))
-- `SpanRecorder` (in `agent::trace`) holds locks only for short critical sections, never across `await`
+- `SpanRecorder` holds locks only for short critical sections, never across `await`
+- `test_support::MemoryTraceStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `aura-trace = { workspace = true, features = ["test-support"] }`.
 
 ## Collaboration
 
 | Module    | Role                                                                                                                         |
 | --------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `job`     | Job manages state, Trace manages content; linked via `JobId`; `partial_artifacts: Vec<SpanId>` references trace spans         |
-| `agent`   | `agent::trace::SpanRecorder` owns span lifecycle + `TraceEvent` emission; `JobLifecycle` and `SpanRecorder` are sibling facades |
-| `storage` | Defines the `TraceStore` trait; provides the libsql implementation                                                              |
+| `agent`   | Constructs and shares one `SpanRecorder` per session; uses `JobLifecycle` and `SpanRecorder` together as sibling facades       |
+| `storage` | Provides the libsql implementation of `TraceStore`; the trait itself lives in this crate                                       |
 | `model`   | Provides `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, `PlaceholderId`, `ApprovalDecision`, `ResourceAccess`       |

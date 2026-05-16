@@ -12,7 +12,6 @@ pub mod secret;
 pub mod session;
 pub mod session_summary;
 pub mod skill_risk;
-pub mod trace;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -27,12 +26,12 @@ pub use error::StorageError;
 pub use memory::MemoryStore;
 
 use aura_job::JobStore;
+use aura_trace::TraceStore;
 pub use retry::retry_on_busy;
 pub use secret::SecretStore;
 pub use session::{SessionStore, StoredMessage};
 pub use session_summary::{SessionSummaryRow, SessionSummaryStore};
 pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
-pub use trace::TraceStore;
 
 /// Bundles all store implementations into a single container
 /// for dependency injection by the assembly layer.

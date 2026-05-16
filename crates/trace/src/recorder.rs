@@ -8,13 +8,14 @@
 use std::sync::Arc;
 
 use aura_model::{JobId, ParallelGroup, SessionId, SpanId, StepId};
-use aura_storage::TraceStore;
-use aura_trace::{
+use chrono::Utc;
+use tokio::sync::broadcast;
+
+use crate::store::TraceStore;
+use crate::{
     LifecycleOutcome, LifecycleState, Span, SpanEvent, SpanEventKind, SpanFinalize, SpanHandle,
     SpanKind, Step, StepHandle, StepKind, TraceError,
 };
-use chrono::Utc;
-use tokio::sync::broadcast;
 
 type Result<T> = std::result::Result<T, TraceError>;
 
@@ -337,7 +338,7 @@ fn finalize_span_kind(kind: &mut SpanKind, finalize: SpanFinalize, span_id: &Spa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_storage::test_support::MemoryTraceStore;
+    use crate::test_support::MemoryTraceStore;
 
     fn make_recorder() -> SpanRecorder {
         SpanRecorder::new(
@@ -350,11 +351,11 @@ mod tests {
 
     fn dummy_llm_kind() -> SpanKind {
         SpanKind::LlmCall {
-            begin: aura_trace::LlmCallBegin {
+            begin: crate::LlmCallBegin {
                 model_id: "claude".into(),
                 provider: "anthropic".into(),
                 provider_config_hash: "h".into(),
-                input_messages: aura_trace::LlmCallInputs::empty(),
+                input_messages: crate::LlmCallInputs::empty(),
                 temperature: None,
             },
             result: None,
@@ -362,7 +363,7 @@ mod tests {
     }
 
     fn llm_finalize(input_tokens: usize, output_tokens: usize) -> SpanFinalize {
-        SpanFinalize::LlmCall(aura_trace::LlmCallResult {
+        SpanFinalize::LlmCall(crate::LlmCallResult {
             output_content: "hi".into(),
             thinking: None,
             tool_calls: vec![],
@@ -478,7 +479,7 @@ mod tests {
             .end_span(
                 span,
                 job,
-                SpanFinalize::ToolCall(aura_trace::ToolCallResult {
+                SpanFinalize::ToolCall(crate::ToolCallResult {
                     output: serde_json::Value::Null,
                     success: false,
                 }),

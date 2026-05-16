@@ -35,7 +35,7 @@ use aura_context::{
 use aura_llm::{GuardedLlm, ModelInfo};
 use aura_model::{BackgroundCompressionPayload, JobId, SessionId};
 use aura_session::SessionManager;
-use aura_trace::{LifecycleOutcome, LlmCallBegin, LlmCallResult, StepKind};
+use aura_trace::{LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepKind};
 use aura_workspace::WorkspacePaths;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -43,7 +43,6 @@ use tracing::{debug, info, warn};
 use crate::billed_chat::{BilledAttribution, chat_billed_core};
 use crate::cost::CostManager;
 use crate::security::SecurityGateway;
-use crate::trace::SpanRecorder;
 
 /// Synthetic `model_id` recorded against `session_summaries.error_count`
 /// when the orphan reaper bumps a parent's failure count for a

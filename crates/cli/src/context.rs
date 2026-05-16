@@ -11,8 +11,9 @@ use aura_llm::GuardedLlm;
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
-use aura_storage::{ChannelBotStore, ChannelPairingStore, CostStore, TraceStore};
+use aura_storage::{ChannelBotStore, ChannelPairingStore, CostStore};
 use aura_tools::ToolRegistry;
+use aura_trace::TraceStore;
 use aura_workspace::WorkspaceManager;
 
 use crate::format::OutputFormat;
