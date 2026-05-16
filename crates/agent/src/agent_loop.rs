@@ -14,7 +14,7 @@ use crate::memory::MemoryManager;
 use aura_model::Session;
 use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillRegistry, SkillSummary};
 use aura_tools::{ToolOutput, ToolRegistry};
-use aura_trace::{LifecycleOutcome, LlmCallBegin, LlmCallResult, StepHandle, StepKind};
+use aura_trace::{LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind};
 use tracing::{debug, info, warn};
 
 use crate::compression::CompressionRunner;
@@ -26,7 +26,6 @@ use crate::session_log::{
 };
 use crate::soul::Soul;
 use crate::tool_executor::ToolExecutor;
-use crate::trace::SpanRecorder;
 use tokio_util::sync::CancellationToken;
 
 /// The maximum amount of text we'll hold in the streaming buffer waiting

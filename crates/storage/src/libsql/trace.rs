@@ -9,9 +9,8 @@
 use async_trait::async_trait;
 
 use super::LibsqlPool;
-use crate::trace::TraceStore;
 use aura_model::{JobId, SpanId, StepId};
-use aura_trace::{Span, SpanEvent, Step, TraceError};
+use aura_trace::{Span, SpanEvent, Step, TraceError, TraceStore};
 
 pub struct LibsqlTraceStore {
     pool: LibsqlPool,

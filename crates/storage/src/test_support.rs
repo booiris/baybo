@@ -9,8 +9,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use async_trait::async_trait;
-use aura_model::{BlobRef, ChatMessage, JobId, MemoryEntry, Session, SessionId, SpanId, StepId};
-use aura_trace::{Span, SpanEvent, Step};
+use aura_model::{BlobRef, ChatMessage, JobId, MemoryEntry, Session, SessionId};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use parking_lot::Mutex;
@@ -27,7 +26,6 @@ use crate::session::{Result as SessionStoreResult, SessionStore, StoredMessage};
 use crate::session_summary::{
     Result as SessionSummaryResult, SessionSummaryRow, SessionSummaryStore,
 };
-use crate::trace::{Result as TraceStoreResult, TraceStore};
 
 /// In-memory `SecretStore` for tests. Stores raw `(name, encrypted_value)`
 /// pairs in a `Mutex<HashMap>`. No encryption performed here — the bytes
@@ -179,92 +177,6 @@ impl CostStore for MemoryCostStore {
             summary.record_count += 1;
         }
         Ok(summary)
-    }
-}
-
-/// In-memory `TraceStore` for tests. Steps are keyed by `StepId`,
-/// spans by `SpanId`, span events by `(SpanId, seq)`.
-#[derive(Debug, Default)]
-pub struct MemoryTraceStore {
-    steps: Mutex<HashMap<StepId, Step>>,
-    spans: Mutex<HashMap<SpanId, Span>>,
-    span_events: Mutex<HashMap<SpanId, Vec<SpanEvent>>>,
-}
-
-impl MemoryTraceStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn len(&self) -> usize {
-        self.spans.lock().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-#[async_trait]
-impl TraceStore for MemoryTraceStore {
-    async fn save_step(&self, step: &Step) -> TraceStoreResult<()> {
-        self.steps.lock().insert(step.id, step.clone());
-        Ok(())
-    }
-
-    async fn load_step(&self, step_id: &StepId) -> TraceStoreResult<Option<Step>> {
-        Ok(self.steps.lock().get(step_id).cloned())
-    }
-
-    async fn list_steps_by_job(&self, job_id: &JobId) -> TraceStoreResult<Vec<Step>> {
-        let mut out: Vec<Step> = self
-            .steps
-            .lock()
-            .values()
-            .filter(|s| &s.job_id == job_id)
-            .cloned()
-            .collect();
-        out.sort_by_key(|s| s.started_at);
-        Ok(out)
-    }
-
-    async fn save_span(&self, span: &Span) -> TraceStoreResult<()> {
-        self.spans.lock().insert(span.id, span.clone());
-        Ok(())
-    }
-
-    async fn load_span(&self, span_id: &SpanId) -> TraceStoreResult<Option<Span>> {
-        Ok(self.spans.lock().get(span_id).cloned())
-    }
-
-    async fn list_spans_by_step(&self, step_id: &StepId) -> TraceStoreResult<Vec<Span>> {
-        let mut out: Vec<Span> = self
-            .spans
-            .lock()
-            .values()
-            .filter(|s| &s.step_id == step_id)
-            .cloned()
-            .collect();
-        out.sort_by_key(|s| s.started_at);
-        Ok(out)
-    }
-
-    async fn append_span_event(&self, event: &SpanEvent) -> TraceStoreResult<()> {
-        self.span_events
-            .lock()
-            .entry(event.span_id)
-            .or_default()
-            .push(event.clone());
-        Ok(())
-    }
-
-    async fn list_span_events(&self, span_id: &SpanId) -> TraceStoreResult<Vec<SpanEvent>> {
-        Ok(self
-            .span_events
-            .lock()
-            .get(span_id)
-            .cloned()
-            .unwrap_or_default())
     }
 }
 

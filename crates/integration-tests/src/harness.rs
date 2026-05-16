@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::{
-    AgentLoop, CostManager, MemoryManager, SecurityGateway, SpanRecorder, SpendingLimits,
+    AgentLoop, CostManager, MemoryManager, SecurityGateway, SpendingLimits,
     actor::{AgentActor, AgentMessage},
     soul::Soul,
     tool_executor::ToolExecutor,
@@ -27,9 +27,9 @@ use aura_llm::{LlmCompletion, ModelPricing};
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, Session, User};
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
-use aura_storage::test_support::{
-    MemoryCostStore, MemoryMemoryStore, MemorySecretStore, MemoryTraceStore,
-};
+use aura_storage::test_support::{MemoryCostStore, MemoryMemoryStore, MemorySecretStore};
+use aura_trace::test_support::MemoryTraceStore;
+use aura_trace::{SpanRecorder, TraceEventStream, TraceStore};
 use aura_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
 use chrono::Utc;
 use tokio::sync::mpsc;
@@ -290,11 +290,11 @@ impl AgentTestHarnessBuilder {
         // upfront keeps both sides explicit about which stream they
         // share (forgetting this is the silent under-billing bug
         // SpanRecorder::new now refuses to compile around).
-        let trace_event_stream = aura_agent::TraceEventStream::new();
+        let trace_event_stream = TraceEventStream::new();
         let span_recorder = Arc::new(SpanRecorder::new(
             session.id.clone(),
             session.user.id.clone(),
-            trace_store.clone() as Arc<dyn aura_storage::TraceStore>,
+            trace_store.clone() as Arc<dyn TraceStore>,
             trace_event_stream.clone(),
         ));
         // Cost ledger. Default builder leaves pricing empty (cost_usd

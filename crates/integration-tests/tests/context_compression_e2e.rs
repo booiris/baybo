@@ -25,8 +25,7 @@ use aura_context::budget::TokenBudget;
 use aura_integration_tests::AgentTestHarness;
 use aura_llm::{LlmResponse, ModelPricing, StreamEvent, TokenUsage};
 use aura_model::MicroUsd;
-use aura_storage::TraceStore;
-use aura_trace::{SpanKind, StepKind};
+use aura_trace::{SpanKind, StepKind, TraceStore};
 
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 

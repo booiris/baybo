@@ -5,9 +5,8 @@
 
 use async_trait::async_trait;
 use aura_model::{JobId, SpanId, StepId};
-use aura_trace::{Span, SpanEvent, Step, TraceError};
 
-pub type Result<T> = std::result::Result<T, TraceError>;
+use crate::{Result, Span, SpanEvent, Step};
 
 /// Reads / writes the columnar main tables (`steps`, `spans`,
 /// `span_events`).

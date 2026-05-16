@@ -18,7 +18,6 @@ pub mod state;
 pub mod subagent;
 pub mod supervisor;
 pub mod tool_executor;
-pub mod trace;
 
 pub use agent_loop::AgentLoop;
 pub use aura_cron::{CronScheduler, CronTriggerEvent};
@@ -42,4 +41,3 @@ pub use session_log::{
 };
 pub use supervisor::AgentSupervisor;
 pub use tool_executor::ToolExecutor;
-pub use trace::{SpanRecorder, TraceEvent, TraceEventStream};

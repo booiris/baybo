@@ -13,8 +13,8 @@ use aura_tools::{
     ToolRegistry, approval::preview_params,
 };
 use aura_trace::{
-    LifecycleOutcome, SpanEventKind, SpanFinalize, SpanKind, StepHandle, ToolCallBegin,
-    ToolCallOrigin, ToolCallResult, ToolEventPayload,
+    LifecycleOutcome, SpanEventKind, SpanFinalize, SpanKind, SpanRecorder, StepHandle,
+    ToolCallBegin, ToolCallOrigin, ToolCallResult, ToolEventPayload,
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -23,7 +23,6 @@ use uuid::Uuid;
 
 use crate::sandbox::SandboxAdapter;
 use crate::security::SecurityGateway;
-use crate::trace::SpanRecorder;
 
 /// Preview length used when rendering parameters inside an approval prompt.
 const APPROVAL_PARAMS_PREVIEW_LEN: usize = 512;
