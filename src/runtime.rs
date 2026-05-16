@@ -676,7 +676,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         .unwrap_or_else(|_| Soul::custom("You are Aura, an intelligent assistant.".to_string()));
     let system_prompt = soul.raw_template().to_string();
 
-    let policy = boot::to_execution_policy(&graph.config.agent);
+    let max_iterations = graph.config.agent.max_iterations;
     let token_budget = boot::to_token_budget(&graph.config.agent.context);
     let keep_recent = graph.config.agent.context.keep_recent;
 
@@ -715,7 +715,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let tokenizer = Arc::clone(&tokenizer);
         let trace_event_stream = trace_event_stream.clone();
         let token_budget = token_budget.clone();
-        let policy = policy.clone();
         let system_prompt = system_prompt.clone();
         let cost_manager = Arc::clone(&cost_manager);
         let token_calibration = Arc::clone(&token_calibration);
@@ -760,7 +759,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         sessions: Arc::clone(&sessions),
                     }),
                     memory_manager: Arc::clone(&memory_manager),
-                    policy: policy.clone(),
+                    max_iterations,
                     soul: Soul::custom(system_prompt.clone()),
                     security_gateway: Arc::clone(&security_gateway),
                     cost_manager: Arc::clone(&cost_manager),

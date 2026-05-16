@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::{
-    AgentLoop, CostManager, ExecutionPolicy, JobLifecycle, MemoryManager, SecurityGateway,
-    SpanRecorder, SpendingLimits,
+    AgentLoop, CostManager, JobLifecycle, MemoryManager, SecurityGateway, SpanRecorder,
+    SpendingLimits,
     actor::{AgentActor, AgentMessage},
     soul::Soul,
     tool_executor::ToolExecutor,
@@ -156,7 +156,7 @@ impl AgentTestHarness {
 /// the standard `LeakDetector::with_default_rules()` security stack
 /// pointed at an in-memory `SecretStore`, an empty `ToolRegistry` and
 /// `SkillRegistry`, the soul `"You are Aura, a test assistant."`, and
-/// `ExecutionPolicy::default()`. Mailbox capacity defaults to 32.
+/// `max_iterations = 20`. Mailbox capacity defaults to 32.
 pub struct AgentTestHarnessBuilder {
     session: Option<Session>,
     soul_prompt: Option<String>,
@@ -393,7 +393,7 @@ impl AgentTestHarnessBuilder {
             tool_executor: tool_executor.clone(),
             context_manager,
             memory_manager,
-            policy: ExecutionPolicy::default(),
+            max_iterations: 20,
             soul,
             security_gateway: gateway.clone(),
             cost_manager: Arc::clone(&cost_manager),

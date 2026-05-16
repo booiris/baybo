@@ -20,7 +20,6 @@ use tracing::{debug, info, warn};
 use crate::compression::CompressionRunner;
 use crate::error_recovery::ErrorHandler;
 use crate::job::{JobLifecycle, JobSpec};
-use crate::policy::ExecutionPolicy;
 use crate::security::SecurityGateway;
 use crate::session_log::{
     LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
@@ -178,7 +177,7 @@ pub struct AgentLoop {
     tool_executor: Arc<ToolExecutor>,
     context_manager: ContextManager,
     memory_manager: Arc<MemoryManager>,
-    policy: ExecutionPolicy,
+    max_iterations: usize,
     soul: Soul,
     security_gateway: Arc<SecurityGateway>,
     error_handler: ErrorHandler,
@@ -237,7 +236,7 @@ pub struct AgentLoopConfig {
     pub tool_executor: Arc<ToolExecutor>,
     pub context_manager: ContextManager,
     pub memory_manager: Arc<MemoryManager>,
-    pub policy: ExecutionPolicy,
+    pub max_iterations: usize,
     pub soul: Soul,
     pub security_gateway: Arc<SecurityGateway>,
     /// Cost gate + ledger.
@@ -269,7 +268,7 @@ impl AgentLoop {
             tool_executor,
             context_manager,
             memory_manager,
-            policy,
+            max_iterations,
             soul,
             security_gateway,
             cost_manager,
@@ -295,7 +294,7 @@ impl AgentLoop {
             tool_executor,
             context_manager,
             memory_manager,
-            policy,
+            max_iterations,
             soul,
             security_gateway,
             error_handler: ErrorHandler::default(),
@@ -549,8 +548,8 @@ impl AgentLoop {
                 warn!(job_id = %job_id, iterations, "cancel observed at iteration boundary; aborting loop");
                 return Err(anyhow::anyhow!("agent loop cancelled"));
             }
-            if iterations >= self.policy.max_iterations {
-                warn!(max = self.policy.max_iterations, "max iterations reached");
+            if iterations >= self.max_iterations {
+                warn!(max = self.max_iterations, "max iterations reached");
                 break;
             }
             iterations += 1;

@@ -8,7 +8,6 @@ pub mod error_recovery;
 pub mod job;
 pub mod llm_pool;
 pub mod memory;
-pub mod policy;
 pub mod query;
 pub mod router;
 pub mod sandbox;
@@ -26,13 +25,13 @@ pub mod trace;
 pub use agent_loop::AgentLoop;
 pub use aura_cron::{CronScheduler, CronTriggerEvent};
 pub use aura_security::SecretVault;
+pub use aura_session::SessionManager;
 pub use billed_chat::BilledChatFactory;
 pub use cancel::{JobCancellationGuard, JobCancellationRegistry};
 pub use cost::{CostGuardError, CostManager, CostMetrics, SpendingLimits};
 pub use job::JobLifecycle;
 pub use llm_pool::LlmClientPool;
 pub use memory::MemoryManager;
-pub use policy::ExecutionPolicy;
 pub use query::{
     AnalyticsDayBucket, AnalyticsModelBucket, AnalyticsSummary, CostScope, JobDetail, JobFilter,
     JobSummary, LineageNode, QueryApi, QueryError, ReplayJob, ReplayStep, ReplayedConversation,
@@ -41,7 +40,6 @@ pub use query::{
 pub use router::{ActorSpawner, Router};
 pub use security::{LeakRuleSummary, SecretVaultSummary, SecurityAuditReport, SecurityGateway};
 pub use service::{ShutdownSignal, TaskTracker};
-pub use aura_session::SessionManager;
 pub use session_log::{
     LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
     SessionMessageRecord,

@@ -10,10 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aura_agent::policy::ExecutionPolicy;
-use aura_config::{
-    AgentConfig, AuraConfig, LlmEntry, RiskCheckConfig, SecurityConfig, WorkspaceConfig,
-};
+use aura_config::{AuraConfig, LlmEntry, RiskCheckConfig, SecurityConfig, WorkspaceConfig};
 use aura_context::TokenBudget;
 use aura_llm::credentials::resolve_api_key;
 use aura_llm::{GuardedLlm, LlmCallGuard, LlmProviderConfig, LlmProviderRegistry};
@@ -210,12 +207,6 @@ pub fn load_encryption_key(cfg: &SecurityConfig) -> anyhow::Result<EncryptionKey
 // Pure mappings (no I/O, no Arc, no allocation beyond the returned value)
 // ---------------------------------------------------------------------------
 
-pub fn to_execution_policy(cfg: &AgentConfig) -> ExecutionPolicy {
-    ExecutionPolicy {
-        max_iterations: cfg.max_iterations,
-    }
-}
-
 /// Path to the libsql database file, derived from the project root
 /// (`workspace.path`). Storage always lives at `<root>/state/storage.db`;
 /// the workspace root is itself the aura data directory (defaults to
@@ -247,17 +238,7 @@ pub fn build_leak_detector(cfg: &SecurityConfig) -> LeakDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_config::{AgentConfig, ContextConfig, SecurityConfig, WorkspaceConfig};
-
-    #[test]
-    fn execution_policy_maps_max_iterations() {
-        let cfg = AgentConfig {
-            max_iterations: 42,
-            ..AgentConfig::default()
-        };
-        let policy = to_execution_policy(&cfg);
-        assert_eq!(policy.max_iterations, 42);
-    }
+    use aura_config::{ContextConfig, SecurityConfig, WorkspaceConfig};
 
     #[test]
     fn token_budget_carries_max() {
