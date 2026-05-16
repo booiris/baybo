@@ -3,7 +3,7 @@
 //!
 //! Defaults to the last 30 UTC days when no range is supplied. Caller
 //! supplies `since` / `until` for any other window. Results are
-//! computed via [`aura_agent::QueryApi::compute_analytics`], which
+//! computed via [`aura_query::QueryApi::compute_analytics`], which
 //! single-passes `cost_records` plus a session list.
 
 use axum::Json;

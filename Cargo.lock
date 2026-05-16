@@ -299,6 +299,7 @@ dependencies = [
  "aura-llm",
  "aura-memory",
  "aura-model",
+ "aura-query",
  "aura-security",
  "aura-setup",
  "aura-skills",
@@ -446,6 +447,7 @@ dependencies = [
  "aura-memory",
  "aura-model",
  "aura-pairing",
+ "aura-query",
  "aura-security",
  "aura-skills",
  "aura-storage",
@@ -616,6 +618,25 @@ dependencies = [
  "aura-storage",
  "chrono",
  "rand 0.10.1",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "aura-query"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aura-cost",
+ "aura-job",
+ "aura-model",
+ "aura-storage",
+ "aura-trace",
+ "chrono",
+ "parking_lot",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

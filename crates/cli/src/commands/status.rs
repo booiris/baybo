@@ -1,4 +1,4 @@
-use aura_agent::CostScope;
+use aura_query::CostScope;
 use aura_job::JobStatusKind;
 use aura_cost::TimeRange;
 use chrono::{Duration, Utc};

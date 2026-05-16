@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use aura_agent::QueryApi;
+use aura_query::QueryApi;
 use aura_model::SessionId;
 use aura_storage::StoredMessage;
 use serde_json::{Value, json};

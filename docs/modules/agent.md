@@ -108,6 +108,7 @@ Before a message enters an actor, Router completes: session identification/creat
 | `context` | Conversation window and compression |
 | `job` | Owns `Job`, `JobStatus`, `JobKind`, `JobStore` trait, and `JobLifecycle` (persistence orchestrator + cancellation registry + terminal-event bus). Agent constructs and shares one `JobLifecycle` across the loop, router, supervisor, and subagent wait routine |
 | `trace` | Owns `Step`, `Span`, `SpanEvent`, `TraceStore` trait, `SpanRecorder` (lifecycle facade), and `TraceEventStream` (broadcast bus). Agent constructs and shares one `SpanRecorder` per session |
+| `query` | Owns `QueryApi` — the read-only analytics facade over session/job/trace/cost. Agent does not consume `QueryApi` directly; gateway and CLI do |
 | `session` | Provides `SessionManager` and its error type (domain types live in `aura-model`) |
 | `security` | Provides crypto primitives, `SecretVault`, `SecretValue`, `LeakDetector`, `PlaceholderMinter`, `InjectionDetector`; `agent::security::SecurityGateway` composes them |
 | `channels` | `Channel` handles + `ChannelRegistry`; Router owns the registry for dispatch by `ChannelType` |

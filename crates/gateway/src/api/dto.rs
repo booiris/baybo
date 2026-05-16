@@ -861,7 +861,7 @@ pub struct TracesListQuery {
 }
 
 /// One row of the trace browser list view. Mirrors
-/// [`aura_agent::SessionSummary`] for the wire.
+/// [`aura_query::SessionSummary`] for the wire.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TraceSessionSummary {
     pub session_id: String,
@@ -880,8 +880,8 @@ pub struct TraceSessionSummary {
     pub cache_creation_input_tokens: usize,
 }
 
-impl From<aura_agent::SessionSummary> for TraceSessionSummary {
-    fn from(v: aura_agent::SessionSummary) -> Self {
+impl From<aura_query::SessionSummary> for TraceSessionSummary {
+    fn from(v: aura_query::SessionSummary) -> Self {
         Self {
             session_id: v.session_id.to_string(),
             created_at: v.created_at,
@@ -936,8 +936,8 @@ pub struct AnalyticsDayBucket {
     pub sessions_created: usize,
 }
 
-impl From<aura_agent::AnalyticsDayBucket> for AnalyticsDayBucket {
-    fn from(v: aura_agent::AnalyticsDayBucket) -> Self {
+impl From<aura_query::AnalyticsDayBucket> for AnalyticsDayBucket {
+    fn from(v: aura_query::AnalyticsDayBucket) -> Self {
         Self {
             date: v.date,
             input_tokens: v.input_tokens,
@@ -964,8 +964,8 @@ pub struct AnalyticsModelBucket {
     pub call_count: usize,
 }
 
-impl From<aura_agent::AnalyticsModelBucket> for AnalyticsModelBucket {
-    fn from(v: aura_agent::AnalyticsModelBucket) -> Self {
+impl From<aura_query::AnalyticsModelBucket> for AnalyticsModelBucket {
+    fn from(v: aura_query::AnalyticsModelBucket) -> Self {
         Self {
             model: v.model,
             input_tokens: v.input_tokens,
