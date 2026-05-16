@@ -48,16 +48,14 @@ impl Router {
             self.spawn_oneshot_actor(maint, None, response_tx, &parent_actor_token);
 
         if let Err(e) = mailbox
-            .send(AgentMessage::SystemTrigger(
-                aura_model::SystemTrigger::BackgroundCompression(payload),
-            ))
+            .send(AgentMessage::BackgroundCompression(payload))
             .await
         {
             warn!(
                 parent_session_id = %parent_session_id,
                 maint_session_id = %maint_session_id,
                 error = %e,
-                "failed to deliver SystemTrigger to maintenance actor mailbox"
+                "failed to deliver BackgroundCompression to maintenance actor mailbox"
             );
         }
         Ok(())

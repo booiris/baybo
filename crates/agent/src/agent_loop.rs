@@ -1515,7 +1515,7 @@ impl AgentLoop {
             session_id: session.id.clone(),
             session_trigger_kind: session.trigger.kind(),
             input: aura_job::JobInput::System {
-                trigger: aura_model::SystemTrigger::BackgroundCompression(payload.clone()),
+                payload: payload.clone(),
             },
             effective_soul_version: session.bound_soul_version.clone(),
             parent_job_id: session.lineage.as_ref().map(|l| l.parent_job_id),

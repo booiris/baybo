@@ -33,7 +33,11 @@ async fn build_router_with_seeded_jobs(sessions: &[(&str, TriggerKind, usize)]) 
                     action_payload: serde_json::json!({}),
                 },
                 TriggerKind::System => JobInput::System {
-                    trigger: aura_model::SystemTrigger::HistoryReview,
+                    payload: aura_model::BackgroundCompressionPayload {
+                        parent_session_id: SessionId::from(*sid),
+                        up_to_ordinal: 0,
+                        in_flight_owner: "test".into(),
+                    },
                 },
                 TriggerKind::Spawned => JobInput::Spawned {
                     initial_prompt: vec![ContentBlock::Text("task".into())],

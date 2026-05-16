@@ -1,6 +1,6 @@
 use aura_channels::{AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage};
 use aura_job::JobInput;
-use aura_model::{ContentBlock, SystemTrigger};
+use aura_model::{BackgroundCompressionPayload, ContentBlock};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -27,11 +27,8 @@ pub enum AgentMessage {
     },
     /// A maintenance task has been spawned on this actor's session.
     /// Bypasses the normal chat-turn cycle (`agent_loop.run`) and
-    /// dispatches to a dedicated handler based on the carried
-    /// [`SystemTrigger`] variant. Currently the only wired variant is
-    /// `SystemTrigger::BackgroundCompression`; other variants log a
-    /// warning and drop until they get implementations.
-    SystemTrigger(SystemTrigger),
+    /// dispatches the carried payload to a dedicated handler.
+    BackgroundCompression(BackgroundCompressionPayload),
     /// Gracefully shut down this actor.
     Shutdown,
 }
@@ -143,12 +140,12 @@ impl AgentActor {
                         );
                     }
                 }
-                AgentMessage::SystemTrigger(trigger) => {
-                    if let Err(e) = self.handle_system_trigger(trigger).await {
+                AgentMessage::BackgroundCompression(payload) => {
+                    if let Err(e) = self.handle_background_compression(payload).await {
                         error!(
                             session_id = %session_id,
                             error = %e,
-                            "failed to handle system trigger"
+                            "failed to handle background compression"
                         );
                     }
                 }
@@ -311,39 +308,29 @@ impl AgentActor {
         }
     }
 
-    /// Dispatch a `SystemTrigger` to its variant-specific handler.
-    /// Currently only `SystemTrigger::BackgroundCompression` is wired
-    /// through to `agent_loop.run_background_compression`; the other
-    /// variants are ignored with a warning until they're implemented.
-    async fn handle_system_trigger(&mut self, trigger: SystemTrigger) -> anyhow::Result<()> {
-        match trigger {
-            SystemTrigger::BackgroundCompression(payload) => {
-                let outcome = self
-                    .volatile
-                    .agent_loop
-                    .run_background_compression(
-                        &mut self.durable.session,
-                        payload,
-                        &self.volatile.job_lifecycle,
-                        &self.volatile.span_recorder,
-                        self.volatile.actor_token.child_token(),
-                    )
-                    .await?;
-                debug!(
-                    session_id = %self.durable.session.id,
-                    cursor = outcome.cursor,
-                    cost_micros = outcome.cost_micros,
-                    "background summary: pass landed"
-                );
-            }
-            other @ (SystemTrigger::HistoryReview | SystemTrigger::MemoryConsolidation) => {
-                warn!(
-                    session_id = %self.durable.session.id,
-                    reason = ?other.reason(),
-                    "SystemTrigger variant not yet wired in actor; dropping trigger"
-                );
-            }
-        }
+    /// Run a background compression pass on this actor's session via
+    /// `agent_loop.run_background_compression`.
+    async fn handle_background_compression(
+        &mut self,
+        payload: BackgroundCompressionPayload,
+    ) -> anyhow::Result<()> {
+        let outcome = self
+            .volatile
+            .agent_loop
+            .run_background_compression(
+                &mut self.durable.session,
+                payload,
+                &self.volatile.job_lifecycle,
+                &self.volatile.span_recorder,
+                self.volatile.actor_token.child_token(),
+            )
+            .await?;
+        debug!(
+            session_id = %self.durable.session.id,
+            cursor = outcome.cursor,
+            cost_micros = outcome.cost_micros,
+            "background summary: pass landed"
+        );
         Ok(())
     }
 }

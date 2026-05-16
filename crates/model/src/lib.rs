@@ -19,7 +19,7 @@ pub use pricing::LlmPricingOverride;
 pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{
     BackgroundCompressionPayload, ChannelType, Lineage, LineageKind, Session, SessionState,
-    SystemReason, SystemTrigger, TriggerKind, TriggerSource, User,
+    SystemReason, TriggerKind, TriggerSource, User,
 };
 pub use spawn_protocol::{
     MAX_SUBAGENT_TIMEOUT_SECS, SPAWN_SUBAGENT_TOOL_NAME, SUBAGENT_CHANNEL_TAG, SubagentExitStatus,

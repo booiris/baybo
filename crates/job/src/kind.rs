@@ -10,7 +10,7 @@
 //! | `System`        | `JobKind::System`           |
 //! | (any)           | `JobKind::Spawned` is also valid in any session — spawned jobs inherit their parent context regardless of root trigger |
 
-use aura_model::{ContentBlock, SystemTrigger, TriggerKind};
+use aura_model::{BackgroundCompressionPayload, ContentBlock, TriggerKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -54,11 +54,11 @@ pub enum JobInput {
     Cron {
         action_payload: Value,
     },
-    /// A maintenance task — see [`SystemTrigger`] for the variants.
-    /// The trigger carries its payload directly; no opaque
-    /// `serde_json::Value` blob.
+    /// A maintenance task. Currently the only wired system task is
+    /// background compression; if another shape lands later, this
+    /// variant's payload becomes an enum.
     System {
-        trigger: SystemTrigger,
+        payload: BackgroundCompressionPayload,
     },
     Spawned {
         initial_prompt: Vec<ContentBlock>,
@@ -121,7 +121,11 @@ mod tests {
         assert_eq!(i.kind(), JobKind::Cron);
 
         let i = JobInput::System {
-            trigger: SystemTrigger::HistoryReview,
+            payload: BackgroundCompressionPayload {
+                parent_session_id: aura_model::SessionId::from("sess-1"),
+                up_to_ordinal: 0,
+                in_flight_owner: "owner".into(),
+            },
         };
         assert_eq!(i.kind(), JobKind::System);
 
@@ -134,7 +138,11 @@ mod tests {
     #[test]
     fn input_round_trips_through_serde() {
         let i = JobInput::System {
-            trigger: SystemTrigger::MemoryConsolidation,
+            payload: BackgroundCompressionPayload {
+                parent_session_id: aura_model::SessionId::from("sess-1"),
+                up_to_ordinal: 0,
+                in_flight_owner: "owner".into(),
+            },
         };
         let s = serde_json::to_string(&i).unwrap();
         let back: JobInput = serde_json::from_str(&s).unwrap();

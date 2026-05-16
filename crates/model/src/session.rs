@@ -130,15 +130,9 @@ pub enum TriggerKind {
 /// work back to itself. Never use the open-ended `Other` antipattern.
 ///
 /// Acts as the discriminator-only label persisted on `Session.trigger`.
-/// The matching payload-bearing event delivered to the maintenance
-/// actor is [`SystemTrigger`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SystemReason {
-    /// `aura review` or equivalent retrospective pass over a prior session.
-    HistoryReview,
-    /// Background memory consolidation / summarization task.
-    MemoryConsolidation,
     /// Async per-session background summary — a `BackgroundCompressionRunner` actor
     /// reads its parent's transcript, generates an updated summary, and
     /// writes `<workspace>/state/sessions/<parent_id>/summary.md` plus
@@ -147,10 +141,10 @@ pub enum SystemReason {
     BackgroundCompression,
 }
 
-/// Payload carried by a `SystemTrigger::BackgroundCompression`. Built
-/// by the parent's agent loop at trigger time and forwarded through
-/// `JobInput::System` and `AgentMessage::SystemTrigger` to the
-/// maintenance actor's `BackgroundCompressionRunner`.
+/// Payload carried by a background compression trigger. Built by the
+/// parent's agent loop at trigger time and forwarded through
+/// `JobInput::System` and the maintenance actor's mailbox to the
+/// `BackgroundCompressionRunner`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundCompressionPayload {
     pub parent_session_id: SessionId,
@@ -164,31 +158,6 @@ pub struct BackgroundCompressionPayload {
     /// finishing after Pass B remarked the parent cannot wipe Pass
     /// B's mark. Generated once per pass at the gate (UUID v4).
     pub in_flight_owner: String,
-}
-
-/// Strongly-typed system maintenance trigger. Replaces the previous
-/// `(reason: SystemReason, payload: serde_json::Value)` pair carried
-/// in `JobInput::System` and `AgentMessage::SystemTrigger`. Unit
-/// variants exist for reasons whose runners aren't yet wired
-/// (`HistoryReview`, `MemoryConsolidation`); they keep the discriminator
-/// space symmetric with [`SystemReason`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
-pub enum SystemTrigger {
-    HistoryReview,
-    MemoryConsolidation,
-    BackgroundCompression(BackgroundCompressionPayload),
-}
-
-impl SystemTrigger {
-    /// Discriminator label, matching the `Session.trigger` reason field.
-    pub fn reason(&self) -> SystemReason {
-        match self {
-            SystemTrigger::HistoryReview => SystemReason::HistoryReview,
-            SystemTrigger::MemoryConsolidation => SystemReason::MemoryConsolidation,
-            SystemTrigger::BackgroundCompression(_) => SystemReason::BackgroundCompression,
-        }
-    }
 }
 
 /// Direct parent relationship for sessions spawned from another session.
@@ -359,7 +328,7 @@ mod tests {
     #[test]
     fn trigger_source_system_round_trip() {
         let t = TriggerSource::System {
-            reason: SystemReason::HistoryReview,
+            reason: SystemReason::BackgroundCompression,
         };
         let s = serde_json::to_string(&t).unwrap();
         let back: TriggerSource = serde_json::from_str(&s).unwrap();
@@ -440,28 +409,14 @@ mod tests {
     }
 
     #[test]
-    fn system_trigger_unit_variants_round_trip() {
-        for t in [
-            SystemTrigger::HistoryReview,
-            SystemTrigger::MemoryConsolidation,
-        ] {
-            let s = serde_json::to_string(&t).unwrap();
-            let back: SystemTrigger = serde_json::from_str(&s).unwrap();
-            assert_eq!(back, t);
-            assert_eq!(back.reason(), t.reason());
-        }
-    }
-
-    #[test]
-    fn system_trigger_background_compression_round_trip() {
-        let t = SystemTrigger::BackgroundCompression(BackgroundCompressionPayload {
+    fn background_compression_payload_round_trip() {
+        let p = BackgroundCompressionPayload {
             parent_session_id: SessionId::from("user-1"),
             up_to_ordinal: 42,
             in_flight_owner: "owner-token".into(),
-        });
-        let s = serde_json::to_string(&t).unwrap();
-        let back: SystemTrigger = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, t);
-        assert_eq!(back.reason(), SystemReason::BackgroundCompression);
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: BackgroundCompressionPayload = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, p);
     }
 }
