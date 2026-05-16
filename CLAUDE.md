@@ -24,6 +24,8 @@ pnpm --filter @aura/channel-sdk test                            # SDK unit + e2e
 scripts/check-ts-bindings.sh                                    # ts-rs regen CI gate
 ```
 
+**Zero warnings means zero — including test files.** `--tests` is part of the clippy invocation above on purpose. Don't dismiss a warning as "pre-existing" or "only in a test"; if `cargo clippy` lights it up, fix it as part of the change.
+
 Test layout, `test-support` feature gating, and the shared fixture inventory are in [`docs/testing.md`](docs/testing.md). Read it before adding tests that cross crate boundaries.
 
 Verbose / scoped logging:
