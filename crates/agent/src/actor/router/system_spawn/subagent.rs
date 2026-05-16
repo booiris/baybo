@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::AgentMessage;
-use crate::router::Router;
-use crate::subagent::await_subagent_terminal;
+use crate::actor::router::Router;
+use crate::actor::subagent::await_subagent_terminal;
 
 /// `output_tx` buffer for a subagent's actor. Intentionally smaller than
 /// the operator-configured channel size for top-level actors — a child

@@ -17,15 +17,15 @@ use aura_tools::{ToolOutput, ToolRegistry};
 use aura_trace::{LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind};
 use tracing::{debug, info, warn};
 
-use crate::compression::CompressionRunner;
-use crate::error_recovery::ErrorHandler;
-use crate::scope::JobSpec;
+use crate::runtime::compression::CompressionRunner;
+use crate::runtime::error_recovery::ErrorHandler;
+use crate::runtime::scope::JobSpec;
 use crate::security::SecurityGateway;
-use crate::session_log::{
+use crate::runtime::session_log::{
     LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
 };
-use crate::soul::Soul;
-use crate::tool_executor::ToolExecutor;
+use crate::runtime::soul::Soul;
+use crate::runtime::tool_executor::ToolExecutor;
 use tokio_util::sync::CancellationToken;
 
 /// The maximum amount of text we'll hold in the streaming buffer waiting
@@ -167,10 +167,10 @@ enum IterationOutcome {
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
 pub struct AgentLoop {
     llm_client: Arc<GuardedLlm>,
-    /// Plumbed into [`crate::tool_executor::ToolExecutor::execute`] so
+    /// Plumbed into [`crate::runtime::tool_executor::ToolExecutor::execute`] so
     /// in-tool LLM calls bill against the same model the surrounding
     /// actor is using.
-    billed_chat_factory: Arc<crate::billed_chat::BilledChatFactory>,
+    billed_chat_factory: Arc<crate::runtime::billed_chat::BilledChatFactory>,
     tool_registry: Arc<ToolRegistry>,
     skill_registry: Arc<SkillRegistry>,
     tool_executor: Arc<ToolExecutor>,
@@ -225,7 +225,7 @@ pub struct AgentLoopConfig {
     /// The active client is resolved from this pool at construction
     /// (using `initial_llm`) and on every subsequent
     /// [`AgentLoop::set_current_llm`].
-    pub llm_pool: Arc<crate::llm_pool::LlmClientPool>,
+    pub llm_pool: Arc<crate::runtime::llm_pool::LlmClientPool>,
     /// Initial pick for the active LLM. `None` ⇒ pool default.
     /// Typically sourced from `Session.state.last_llm` for cold-start
     /// hydration; can be overridden by the spawner for fresh actors.
@@ -278,7 +278,7 @@ impl AgentLoop {
             sessions,
         } = config;
         let (llm_client, _effective_name) = llm_pool.resolve(initial_llm.as_deref());
-        let billed_chat_factory = crate::billed_chat::BilledChatFactory::new(
+        let billed_chat_factory = crate::runtime::billed_chat::BilledChatFactory::new(
             llm_client.clone(),
             cost_manager.clone(),
             Arc::clone(&security_gateway),
@@ -351,7 +351,7 @@ impl AgentLoop {
             effective_soul_version: session.bound_soul_version.clone(),
             parent_job_id,
         };
-        crate::scope::with_job(
+        crate::runtime::scope::with_job(
             job_lifecycle,
             cancel_token.clone(),
             spec,
@@ -473,7 +473,7 @@ impl AgentLoop {
             let notifier_clone = notifier.clone();
             let factory_clone = Arc::clone(&self.billed_chat_factory);
 
-            let result_text = crate::scope::with_step(
+            let result_text = crate::runtime::scope::with_step(
                 span_recorder.as_ref(),
                 job_id,
                 StepKind::LlmIteration,
@@ -571,7 +571,7 @@ impl AgentLoop {
                 None
             };
 
-            let outcome = crate::scope::with_step(
+            let outcome = crate::runtime::scope::with_step(
                 span_recorder.as_ref(),
                 job_id,
                 StepKind::LlmIteration,
@@ -634,7 +634,7 @@ impl AgentLoop {
     }
 
     /// One iteration of the agentic loop, scoped to a single
-    /// `LlmIteration` step (opened by [`crate::scope::with_step`] in
+    /// `LlmIteration` step (opened by [`crate::runtime::scope::with_step`] in
     /// the caller). Calls the LLM, executes any non-subagent tool
     /// calls, appends their results to context. `spawn_subagent` calls
     /// are deferred — returned in [`IterationOutcome::Continue`] so
@@ -946,7 +946,7 @@ impl AgentLoop {
 
         let input_messages = self.context_manager.build_call_input_marker().await;
 
-        crate::scope::with_llm_span(
+        crate::runtime::scope::with_llm_span(
             span_recorder.as_ref(),
             step,
             step.job_id,
@@ -1364,7 +1364,7 @@ impl AgentLoop {
             parent_job_id,
         };
 
-        crate::scope::with_job(
+        crate::runtime::scope::with_job(
             job_lifecycle,
             cancel_token.clone(),
             spec,
@@ -1521,11 +1521,11 @@ impl AgentLoop {
         };
 
         let result =
-            crate::scope::with_job(job_lifecycle, cancel_token.clone(), spec, move |job_id| {
+            crate::runtime::scope::with_job(job_lifecycle, cancel_token.clone(), spec, move |job_id| {
                 let payload = payload.clone();
                 let cancel_token = cancel_token.clone();
                 async move {
-                    let refresher = crate::compression::BackgroundCompressionRunner {
+                    let refresher = crate::runtime::compression::BackgroundCompressionRunner {
                         llm_client,
                         security_gateway,
                         cost_manager,

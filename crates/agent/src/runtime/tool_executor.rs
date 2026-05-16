@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::sandbox::SandboxAdapter;
+use crate::runtime::sandbox::SandboxAdapter;
 use crate::security::SecurityGateway;
 
 /// Preview length used when rendering parameters inside an approval prompt.
@@ -307,7 +307,7 @@ impl ToolExecutor {
         cancel_token: CancellationToken,
         notifier: Option<Arc<dyn aura_tools::SessionNotifier>>,
         // `None` ⇒ tool's `ctx.llm` is unset (argv-mode / older tests).
-        billed_chat_factory: Option<&Arc<crate::billed_chat::BilledChatFactory>>,
+        billed_chat_factory: Option<&Arc<crate::runtime::billed_chat::BilledChatFactory>>,
     ) -> anyhow::Result<ToolOutput> {
         debug!(tool = tool_name, "executing tool");
 
@@ -325,7 +325,7 @@ impl ToolExecutor {
         // Open the tool span up front so denials and approval failures
         // still appear in the trace tree. The handle carries the
         // begin-time kind, so close-time only supplies the result.
-        crate::scope::with_span(
+        crate::runtime::scope::with_span(
             recorder.as_ref(),
             step,
             job_id,

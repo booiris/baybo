@@ -3,7 +3,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;
-use crate::router::Router;
+use crate::actor::router::Router;
 
 impl Router {
     pub(super) async fn handle_background_compression_spawn(

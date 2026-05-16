@@ -14,7 +14,37 @@ Core responsibilities:
 - **Cost management**: `CostManager` (in `aura-cost`) records LLM-call cost and gates spend; agent constructs it and threads it through the loop
 - **Runtime logic**: error recovery, timeout control
 
-It does not own low-level storage or backend implementation — it consumes Store traits from `aura-job` (for `JobStore`) and `aura-storage` (for the rest) through dependency injection. Domain types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`). Each manager defines its own error type for business-level failures (e.g. `MemoryManager` defines errors for embedding and dedup failures).
+It does not own low-level storage or backend implementation — it consumes Store traits from `aura-job` (for `JobStore`), `aura-trace` (for `TraceStore`), `aura-memory` (for `MemoryStore`), `aura-cost` (for `CostStore`), `aura-security` (for `SecretStore`), and `aura-storage` (for the rest) through dependency injection. Domain types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`). Each manager defines its own error type for business-level failures (e.g. `MemoryManager` defines errors for embedding and dedup failures).
+
+## Source Layout
+
+`src/` is split along two axes — per-turn execution and per-session actor orchestration — plus the cross-cutting policy / process-level infrastructure that lives outside either bucket:
+
+```
+agent/src/
+├── lib.rs
+├── security.rs               # SecurityGateway (cross-cutting interception facade)
+├── service.rs                # ShutdownSignal, TaskTracker (process-level)
+├── runtime/                  # per-turn execution core
+│   ├── agent_loop.rs         # AgentLoop, AgentLoopConfig
+│   ├── tool_executor.rs      # ToolExecutor + approval gate wiring
+│   ├── compression.rs        # inline + background compression wiring
+│   ├── soul.rs               # system-prompt + identity assembly
+│   ├── session_log.rs        # JSONL session-message logger
+│   ├── billed_chat.rs        # cost-aware LLM call wrapper
+│   ├── error_recovery.rs     # retry / degrade policy
+│   ├── sandbox.rs            # SandboxAdapter glue for tool exec
+│   ├── scope.rs              # with_job / with_step / with_span guards
+│   └── llm_pool.rs           # per-provider LlmClient pool
+└── actor/                    # per-session actor + orchestration
+    ├── mod.rs                # AgentActor + AgentMessage
+    ├── supervisor.rs         # AgentSupervisor + idle reaper
+    ├── subagent.rs           # subagent wait routine
+    ├── router/               # ingress dispatch (cron / user / output / system_spawn)
+    └── state/                # DurableActorState + VolatileResources
+```
+
+For backwards compatibility, `lib.rs` re-exports the submodules at the crate root (`aura_agent::agent_loop`, `aura_agent::supervisor`, etc.), so consumers don't see the directory split unless they want to.
 
 ## Design Decisions
 

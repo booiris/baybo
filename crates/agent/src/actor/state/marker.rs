@@ -79,11 +79,11 @@ impl<T: Volatile> Volatile for Option<T> {}
 // point: if you can't justify why losing the value is harmless when
 // the actor dies, it doesn't belong in the volatile half.
 
-impl sealed::Sealed for crate::agent_loop::AgentLoop {}
-impl Volatile for crate::agent_loop::AgentLoop {}
+impl sealed::Sealed for crate::runtime::agent_loop::AgentLoop {}
+impl Volatile for crate::runtime::agent_loop::AgentLoop {}
 
-impl sealed::Sealed for crate::supervisor::AgentSupervisor {}
-impl Volatile for crate::supervisor::AgentSupervisor {}
+impl sealed::Sealed for crate::actor::supervisor::AgentSupervisor {}
+impl Volatile for crate::actor::supervisor::AgentSupervisor {}
 
 // === Derived<T>: values rebuilt from the durable layer ===
 
@@ -153,8 +153,8 @@ mod tests {
     /// from the marker module docs.
     #[test]
     fn volatile_resources_fields_are_marker_clean() {
-        use crate::agent_loop::AgentLoop;
-        use crate::supervisor::AgentSupervisor;
+        use crate::runtime::agent_loop::AgentLoop;
+        use crate::actor::supervisor::AgentSupervisor;
         use aura_channels::AgentOutput;
         use aura_job::JobLifecycle;
         use aura_trace::SpanRecorder;

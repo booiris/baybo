@@ -1,20 +1,38 @@
+//! `aura-agent` is the assembly layer for the Aura execution engine.
+//! The agent's two halves are organised into sibling subdirectories:
+//!
+//! - [`runtime`] holds per-turn execution (agent loop, tool executor,
+//!   compression wiring, billed-chat helper, soul/system-prompt
+//!   builder, session log, sandbox + scope guards, LLM client pool).
+//! - [`actor`] holds the per-session actor (mailbox, supervisor, the
+//!   message router, subagent wait routine, and `DurableActorState`).
+//!
+//! `security` and `service` stay at the top level: `SecurityGateway`
+//! is the cross-cutting interception facade threaded through both
+//! halves, and `service` is process-level shutdown / task-tracker
+//! infrastructure that doesn't belong to either half.
+
 pub mod actor;
-pub mod agent_loop;
-pub mod billed_chat;
-pub mod compression;
-pub mod error_recovery;
-pub mod llm_pool;
-pub mod router;
-pub mod sandbox;
-mod scope;
+pub mod runtime;
 pub mod security;
 pub mod service;
-pub mod session_log;
-pub mod soul;
-pub mod state;
-pub mod subagent;
-pub mod supervisor;
-pub mod tool_executor;
+
+// Stable external paths — consumers import `aura_agent::agent_loop::*`,
+// `aura_agent::supervisor::*`, etc. The submodules live under `runtime`
+// and `actor` after the PR6 reorg; these re-exports keep the wire shape.
+pub use actor::router;
+pub use actor::state;
+pub use actor::subagent;
+pub use actor::supervisor;
+pub use runtime::agent_loop;
+pub use runtime::billed_chat;
+pub use runtime::compression;
+pub use runtime::error_recovery;
+pub use runtime::llm_pool;
+pub use runtime::sandbox;
+pub use runtime::session_log;
+pub use runtime::soul;
+pub use runtime::tool_executor;
 
 pub use agent_loop::AgentLoop;
 pub use aura_cron::{CronScheduler, CronTriggerEvent};

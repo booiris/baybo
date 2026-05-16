@@ -1,11 +1,21 @@
+//! Actor model + supervision: one `AgentActor` per session, supervised
+//! by [`AgentSupervisor`](crate::actor::supervisor::AgentSupervisor),
+//! routed to by [`Router`](crate::actor::router::Router), and
+//! checkpointed via [`DurableActorState`](crate::actor::state::DurableActorState).
+
+pub mod router;
+pub mod state;
+pub mod subagent;
+pub mod supervisor;
+
 use aura_channels::{AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage};
 use aura_job::JobInput;
 use aura_model::{BackgroundCompressionPayload, ContentBlock};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::state::{DurableActorState, VolatileResources};
-use crate::supervisor::ActorRegistryGuard;
+use crate::actor::state::{DurableActorState, VolatileResources};
+use crate::actor::supervisor::ActorRegistryGuard;
 
 /// Messages that can be sent to an AgentActor.
 #[derive(Debug, Clone)]
@@ -50,7 +60,7 @@ fn is_compact_command(content: &[ContentBlock]) -> bool {
 /// One actor per session. Receives messages sequentially through its mailbox.
 ///
 /// State is split into two halves by lifetime class (see
-/// [`crate::state`]):
+/// [`crate::actor::state`]):
 /// - `durable` — must survive eviction; persisted via the session store.
 /// - `volatile` — rebuilt from `durable` + the runtime each time the
 ///   actor is spawned.
@@ -62,7 +72,7 @@ pub struct AgentActor {
 impl AgentActor {
     /// Construct an actor from its durable and volatile halves.
     ///
-    /// Production wiring goes through [`crate::router::ActorSpawner`],
+    /// Production wiring goes through [`crate::actor::router::ActorSpawner`],
     /// which builds the [`VolatileResources`] from the per-process
     /// dependency graph and either creates a fresh [`DurableActorState`]
     /// or hydrates one from the session store.

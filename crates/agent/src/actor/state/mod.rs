@@ -18,7 +18,7 @@
 //!   transcript copy and `ContextManager` caches), and the supervisor
 //!   handle the actor uses to self-deregister on shutdown.  None of it
 //!   is persisted; it is rebuilt from the durable layer + the runtime
-//!   [`crate::router::ActorSpawner`] on every fresh actor.
+//!   [`crate::actor::router::ActorSpawner`] on every fresh actor.
 //!
 //! The sealed [`marker::Volatile`] trait enforces the boundary: adding
 //! a new field to [`VolatileResources`] forces a compile-time decision
@@ -32,8 +32,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent_loop::AgentLoop;
-use crate::supervisor::AgentSupervisor;
+use crate::runtime::agent_loop::AgentLoop;
+use crate::actor::supervisor::AgentSupervisor;
 use aura_job::JobLifecycle;
 use aura_trace::SpanRecorder;
 
@@ -73,7 +73,7 @@ impl DurableActorState {
 /// — owns the context manager, billed-chat factory, and other state
 /// rebuildable from [`DurableActorState`] + the session store).
 ///
-/// Mark-checked by [`crate::state::marker`]: every field type must
+/// Mark-checked by [`crate::actor::state::marker`]: every field type must
 /// implement the sealed `Volatile` trait, so adding a value type (e.g.
 /// a `String` counter) here fails to compile and forces the author
 /// into [`DurableActorState`] instead.
@@ -89,7 +89,7 @@ pub struct VolatileResources {
     /// originating parent actor's `actor_token`, so parent shutdown
     /// cascades automatically via the `tokio_util` token tree.
     pub actor_token: CancellationToken,
-    /// Supervisor handle used by [`crate::supervisor::ActorRegistryGuard`]
+    /// Supervisor handle used by [`crate::actor::supervisor::ActorRegistryGuard`]
     /// in [`crate::actor::AgentActor::run`] to self-deregister when the
     /// task exits. `None` for one-shot actors that are not tracked by
     /// the supervisor (cron fires, maintenance spawns, tests).

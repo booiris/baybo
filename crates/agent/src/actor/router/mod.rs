@@ -32,7 +32,7 @@ use tracing::{error, info};
 
 use crate::actor::AgentMessage;
 use crate::security::SecurityGateway;
-use crate::supervisor::AgentSupervisor;
+use crate::actor::supervisor::AgentSupervisor;
 use aura_cost::CostManager;
 use aura_job::JobLifecycle;
 use aura_session::SessionManager;

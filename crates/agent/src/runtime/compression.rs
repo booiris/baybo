@@ -22,7 +22,7 @@
 //!
 //! The `SystemSpawnRequest` channel contract that ferries
 //! background-compression triggers from the parent's gate to the
-//! router lives in [`crate::router`] — it's the router's surface, not
+//! router lives in [`crate::actor::router`] — it's the router's surface, not
 //! a compression concern.
 //!
 //! See `docs/background-compression.md`.
@@ -40,7 +40,7 @@ use aura_workspace::WorkspacePaths;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::billed_chat::{BilledAttribution, chat_billed_core};
+use crate::runtime::billed_chat::{BilledAttribution, chat_billed_core};
 use crate::security::SecurityGateway;
 use aura_cost::CostManager;
 
@@ -112,13 +112,13 @@ impl CompressionRunner {
         };
 
         let recorder_inner = Arc::clone(&recorder);
-        crate::scope::with_step(
+        crate::runtime::scope::with_step(
             recorder.as_ref(),
             job_id,
             StepKind::Compression,
             cancel_ctx,
             |step| async move {
-                let result = crate::scope::with_llm_span(
+                let result = crate::runtime::scope::with_llm_span(
                     recorder_inner.as_ref(),
                     &step,
                     job_id,
