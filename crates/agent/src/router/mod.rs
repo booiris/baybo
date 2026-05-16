@@ -32,9 +32,9 @@ use tracing::{error, info};
 
 use crate::actor::AgentMessage;
 use crate::cost::CostManager;
-use crate::job::JobLifecycle;
 use crate::security::SecurityGateway;
 use crate::supervisor::AgentSupervisor;
+use aura_job::JobLifecycle;
 use aura_session::SessionManager;
 
 /// Per-user sliding-window rate limiter.

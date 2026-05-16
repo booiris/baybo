@@ -4,14 +4,13 @@
 use std::sync::Arc;
 
 #[cfg(test)]
-use aura_job::JobStatus;
-use aura_job::{CancelReason, Job, JobError, JobInput, JobStatusKind, JobTransition};
+use crate::JobStatus;
+use crate::cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
+use crate::store::JobStore;
+use crate::{CancelReason, Job, JobError, JobInput, JobStatusKind, JobTransition};
 use aura_model::{JobId, SessionId, SpanId, TriggerKind};
-use aura_storage::JobStore;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-
-use crate::cancel::{JobCancellationGuard, JobCancellationRegistry};
 
 type Result<T> = std::result::Result<T, JobError>;
 
@@ -40,20 +39,6 @@ pub struct JobTerminalEvent {
     pub kind: JobStatusKind,
 }
 
-/// Inputs needed to create a new `Job`. Bundled into a struct so
-/// `crate::scope::with_job` can own the full
-/// `start_job → start → body → complete/fail` lifecycle without
-/// ballooning its parameter list — production callers must go through
-/// `with_job`, not `JobLifecycle::start_job` directly, so the cancel
-/// state machine can't be skipped.
-pub(crate) struct JobSpec {
-    pub session_id: SessionId,
-    pub session_trigger_kind: TriggerKind,
-    pub input: JobInput,
-    pub effective_soul_version: String,
-    pub parent_job_id: Option<JobId>,
-}
-
 /// Owns the job state machine + persistence orchestration. Pure
 /// passthrough to `Job`'s internal transition validation —
 /// `JobLifecycle` itself contains no state machine logic.
@@ -61,7 +46,7 @@ pub struct JobLifecycle {
     store: Arc<dyn JobStore>,
     /// Process-wide registry of `JobId → CancellationToken` for
     /// in-flight jobs. `cancel()` trips the matching token (if any)
-    /// in addition to flipping the DB row. See `agent::cancel`.
+    /// in addition to flipping the DB row.
     cancellation: Arc<JobCancellationRegistry>,
     /// Fire-and-forget bus for terminal transitions. The subagent
     /// runtime subscribes to this so the parent unblocks on the
@@ -115,7 +100,7 @@ impl JobLifecycle {
     /// passing through silently as before).
     ///
     /// **Production code does not call this directly** — it goes
-    /// through [`crate::scope::with_job`] (which builds a [`JobSpec`]
+    /// through `agent::scope::with_job` (which builds a `JobSpec`
     /// and owns the full create→start→run→complete chain) so the
     /// cancel state machine can't be skipped. The method is left
     /// `pub` only for tests in this crate (and downstream test
@@ -147,7 +132,7 @@ impl JobLifecycle {
     }
 
     /// Move `InProgress → Completed` with a final output.
-    pub async fn complete(&self, job_id: &JobId, output: aura_job::JobOutput) -> Result<()> {
+    pub async fn complete(&self, job_id: &JobId, output: crate::JobOutput) -> Result<()> {
         let (job, transition) = self.apply(job_id, |j| j.complete(output)).await?;
         self.persist_and_publish(job, transition).await
     }
@@ -286,8 +271,8 @@ impl JobLifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::MemoryJobStore;
     use aura_model::ContentBlock;
-    use aura_storage::test_support::MemoryJobStore;
 
     fn user_chat_input() -> JobInput {
         JobInput::UserChat {
@@ -295,8 +280,8 @@ mod tests {
         }
     }
 
-    fn dummy_output() -> aura_job::JobOutput {
-        aura_job::JobOutput::Message {
+    fn dummy_output() -> crate::JobOutput {
+        crate::JobOutput::Message {
             content: vec![ContentBlock::Text("ok".into())],
         }
     }

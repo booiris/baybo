@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 
 use super::LibsqlPool;
-use crate::job::JobStore;
-use aura_job::{Job, JobError, JobStatusKind, JobTransition};
+use aura_job::{Job, JobError, JobStatusKind, JobStore, JobTransition};
 use aura_model::{JobId, SessionId};
 
 pub struct LibsqlJobStore {

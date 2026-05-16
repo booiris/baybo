@@ -15,7 +15,7 @@ pub async fn handle(ctx: &CommandContext, cmd: JobCmd) -> Result<CommandOutput> 
     }
 }
 
-fn jobs(ctx: &CommandContext) -> Result<&aura_agent::JobLifecycle> {
+fn jobs(ctx: &CommandContext) -> Result<&aura_job::JobLifecycle> {
     ctx.job
         .as_deref()
         .ok_or_else(|| CliError::Manager("job manager is not available in this invocation".into()))

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use aura_channels::{AgentOutput, COMPACT_COMMAND, OutgoingMessage};
 use aura_context::ContextManager;
-use aura_job::{JobInput, JobOutput};
+use aura_job::{JobInput, JobLifecycle, JobOutput};
 use aura_llm::{
     ChatRequest, GuardedLlm, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
 };
@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::compression::CompressionRunner;
 use crate::error_recovery::ErrorHandler;
-use crate::job::{JobLifecycle, JobSpec};
+use crate::scope::JobSpec;
 use crate::security::SecurityGateway;
 use crate::session_log::{
     LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
@@ -1511,7 +1511,7 @@ impl AgentLoop {
         let maintenance_session_id = session.id.clone();
         let recorder = span_recorder.clone();
 
-        let spec = crate::job::JobSpec {
+        let spec = JobSpec {
             session_id: session.id.clone(),
             session_trigger_kind: session.trigger.kind(),
             input: aura_job::JobInput::System {

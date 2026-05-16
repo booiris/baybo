@@ -9,14 +9,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_channels::AgentOutput;
-use aura_job::{CancelReason, JobStatusKind};
+use aura_job::{CancelReason, JobLifecycle, JobStatusKind, JobTerminalEvent};
 use aura_model::{ContentBlock, SessionId, SubagentExitStatus, SubagentResult};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::actor::AgentMessage;
-use crate::job::{JobLifecycle, JobTerminalEvent};
 
 /// Wait for a freshly-spawned subagent to terminate. The caller (router)
 /// owns the synchronous prelude (build child session, spawn actor, send
@@ -235,7 +234,7 @@ mod tests {
     use aura_channels::OutgoingMessage;
     use aura_job::{JobInput, JobOutput, JobStatus};
     use aura_model::{ChannelType, MessageMetadata, TriggerKind};
-    use aura_storage::test_support::MemoryJobStore;
+    use aura_job::test_support::MemoryJobStore;
     use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
 

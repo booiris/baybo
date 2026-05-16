@@ -30,8 +30,8 @@
 
 use std::future::Future;
 
-use aura_job::{CancelReason, JobOutput};
-use aura_model::{JobId, ParallelGroup};
+use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
+use aura_model::{JobId, ParallelGroup, SessionId, TriggerKind};
 use aura_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanHandle, SpanKind, StepHandle,
     StepKind,
@@ -39,8 +39,20 @@ use aura_trace::{
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::job::{JobLifecycle, JobSpec};
 use crate::trace::SpanRecorder;
+
+/// Inputs needed to create a new `Job`. Bundled into a struct so
+/// [`with_job`] can own the full `start_job → start → body → complete/fail`
+/// lifecycle without ballooning its parameter list — production callers
+/// must go through [`with_job`], not `JobLifecycle::start_job` directly,
+/// so the cancel state machine can't be skipped.
+pub(crate) struct JobSpec {
+    pub session_id: SessionId,
+    pub session_trigger_kind: TriggerKind,
+    pub input: JobInput,
+    pub effective_soul_version: String,
+    pub parent_job_id: Option<JobId>,
+}
 
 /// Optional cancel context. When the body returns `Err` and the token
 /// is tripped, the resource closes as `Cancelled { reason }` rather

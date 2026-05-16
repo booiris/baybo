@@ -1,11 +1,9 @@
 pub mod actor;
 pub mod agent_loop;
 pub mod billed_chat;
-pub mod cancel;
 pub mod compression;
 pub mod cost;
 pub mod error_recovery;
-pub mod job;
 pub mod llm_pool;
 pub mod memory;
 pub mod query;
@@ -27,9 +25,7 @@ pub use aura_cron::{CronScheduler, CronTriggerEvent};
 pub use aura_security::SecretVault;
 pub use aura_session::SessionManager;
 pub use billed_chat::BilledChatFactory;
-pub use cancel::{JobCancellationGuard, JobCancellationRegistry};
 pub use cost::{CostGuardError, CostManager, CostMetrics, SpendingLimits};
-pub use job::JobLifecycle;
 pub use llm_pool::LlmClientPool;
 pub use memory::MemoryManager;
 pub use query::{

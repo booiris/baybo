@@ -1,9 +1,7 @@
 use async_trait::async_trait;
 
-use aura_job::{Job, JobError, JobStatusKind, JobTransition};
+use crate::{Job, JobStatusKind, JobTransition, Result};
 use aura_model::{JobId, SessionId};
-
-pub type Result<T> = std::result::Result<T, JobError>;
 
 /// Persistence layer for jobs and their transitions.
 ///

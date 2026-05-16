@@ -1,10 +1,10 @@
-# job - Job Types and State Machine
+# job - Job Types, Store, and State Machine
 
 ## Overview
 
-The `job` crate defines domain types for job lifecycle management (`Job`, `JobStatus`, `JobKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`) and the `JobError` error type. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself.
+The `job` crate is the complete home for the Job concept: domain types (`Job`, `JobStatus`, `JobKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, `JobError`), the `JobStore` trait, and the `JobLifecycle` persistence orchestrator. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself; `JobLifecycle` wraps `JobStore` with the cancel state machine, terminal-event bus, and `JobId → CancellationToken` registry the in-flight execution path subscribes to.
 
-Business logic (`JobLifecycle` — persistence orchestration) lives in `agent::job`. The `JobStore` trait is defined in `storage::job`.
+`aura-storage` provides the libsql implementation of `JobStore`; the trait itself lives here so downstream callers and tests can depend on `aura-job` alone for job-management work.
 
 Job answers **"what step is this operation at"**, not "what exactly did it do." Detailed input/output is recorded by `trace`. Each job carries its own `final_result` for the final contractual value, but progress messages emitted mid-job live in the trace tree — `Job.emitted_span_ids` is an index, not a copy. Spans completed before a cancel are tracked separately on `JobStatus::Cancelled { reason, partial_artifacts }`, not as a top-level `Job` field.
 
@@ -67,7 +67,10 @@ This keeps the state machine invariants co-located with the type and makes them 
 
 ### JobLifecycle is a thin persistence orchestrator
 
-`JobLifecycle` in `agent::job` does only: load from store → call `job.transition()` → `store.save()` + `store.record_transition()`. No state machine logic in the orchestrator.
+`JobLifecycle` does only: load from store → call `job.transition()` → `store.save()` + `store.record_transition()`. No state machine logic in the orchestrator. It additionally owns:
+
+- A `tokio::sync::broadcast` bus that publishes a `JobTerminalEvent` (id, session, parent, terminal kind) on every `Completed | Failed | Cancelled` transition. Subscribers (subagent runtime, admin UI) wait on this without polling the store. Lagging subscribers must reconcile via `list_by_session` — a dropped event is not re-published.
+- A `JobCancellationRegistry` mapping `JobId → CancellationToken` for in-flight jobs. `JobLifecycle::cancel` trips the registered token *before* flipping the row, so the running execution observes the cancel before terminal-state observers do. `register_running` returns a RAII `JobCancellationGuard` that unregisters on drop, so an early `?` from the agent loop can't leak entries.
 
 ### Restart recovery
 
@@ -96,21 +99,21 @@ The job state machine itself is trigger-agnostic, but the actor that drives it f
 | Key fields     | `status`, timestamps, hierarchy, `final_result`      | `step_id`, `span_id`, kind-specific input/output/provenance |
 | Sensitive data | Sanitized JSON only                                  | Sanitized payloads/summaries only                           |
 
-`JobLifecycle` and `SpanRecorder` (in `agent`) are separate facades and do not share a transaction; cross-table consistency is reconciled by the recovery scan (per-table transactions, eventually consistent).
+`JobLifecycle` lives in this crate; `SpanRecorder` (still in `agent`, pending its own extraction to `aura-trace`) is its peer facade. They do not share a transaction; cross-table consistency is reconciled by the recovery scan (per-table transactions, eventually consistent).
 
 ## Constraints
 
-- Pure types crate — no storage interfaces, no async
 - `input` / `final_result` / `JobStatus::Cancelled.partial_artifacts` store sanitized JSON / span-id lists only — sensitive values must already be placeholders
 - `save()` and `record_transition()` should run in the same transaction (enforced by `JobLifecycle`)
 - `session.trigger.kind() == job.kind()` invariant is enforced at `JobLifecycle::start_job` (returns `JobError::KindMismatch` on violation); `Job::new` is the type-safe constructor and trusts the caller to have matched kinds upstream
-- Does not depend on `trace`, `llm`, `tools`, or `agent`
+- Does not depend on `trace`, `llm`, `tools`, or `agent`. Depends only on `aura-model` for IDs.
+- `test_support::MemoryJobStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `aura-job = { workspace = true, features = ["test-support"] }`.
 
 ## Collaboration
 
 | Module    | Role                                                                                                      |
 | --------- | --------------------------------------------------------------------------------------------------------- |
-| `agent`   | `agent::job::JobLifecycle` owns persistence and the lifecycle state machine                               |
+| `agent`   | Consumes `JobLifecycle` to drive jobs through the agent loop; supplies the cancellation tokens that `register_running` tracks |
 | `trace`   | Provides `SpanId`; `JobStatus::Cancelled.partial_artifacts` references trace spans; recovery coordinates with the trace scan    |
-| `storage` | Defines `JobStore` trait using job types; provides libsql implementation                                   |
+| `storage` | Provides the libsql implementation of `JobStore`; the trait itself lives in this crate                     |
 | `session` | `Session.trigger.kind() == Job.kind()` invariant; `Lineage` consumes `parent_job_id`                       |
