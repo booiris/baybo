@@ -34,7 +34,7 @@ use crate::actor::AgentMessage;
 use crate::cost::CostManager;
 use crate::job::JobLifecycle;
 use crate::security::SecurityGateway;
-use crate::session::SessionManager;
+use aura_session::SessionManager;
 use crate::supervisor::AgentSupervisor;
 
 /// Per-user sliding-window rate limiter.

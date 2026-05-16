@@ -15,7 +15,6 @@ pub mod sandbox;
 mod scope;
 pub mod security;
 pub mod service;
-pub mod session;
 pub mod session_log;
 pub mod soul;
 pub mod state;
@@ -42,7 +41,7 @@ pub use query::{
 pub use router::{ActorSpawner, Router};
 pub use security::{LeakRuleSummary, SecretVaultSummary, SecurityAuditReport, SecurityGateway};
 pub use service::{ShutdownSignal, TaskTracker};
-pub use session::SessionManager;
+pub use aura_session::SessionManager;
 pub use session_log::{
     LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
     SessionMessageRecord,

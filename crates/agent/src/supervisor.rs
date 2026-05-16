@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::actor::AgentMessage;
-use crate::session::SessionManager;
+use aura_session::SessionManager;
 
 /// Handle to communicate with a running AgentActor.
 pub struct ActorHandle {
