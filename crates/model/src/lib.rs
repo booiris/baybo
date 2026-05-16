@@ -24,5 +24,4 @@ pub use session::{
 pub use spawn_protocol::{
     MAX_SUBAGENT_TIMEOUT_SECS, SPAWN_SUBAGENT_TOOL_NAME, SUBAGENT_CHANNEL_TAG, SubagentExitStatus,
     SubagentParentContext, SubagentResult, SubagentSpawnRequest, SystemSpawnRequest,
-    parse_spawn_request,
 };

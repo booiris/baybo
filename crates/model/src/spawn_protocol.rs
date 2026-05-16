@@ -29,8 +29,6 @@ pub const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";
 /// sidecars filter subagent traffic.
 pub const SUBAGENT_CHANNEL_TAG: &str = "subagent";
 
-const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 600;
-
 /// Hard upper bound on a single `spawn_subagent` wait, in seconds.
 /// Shared with the `spawn_subagent` tool's `Tool::max_timeout` so the
 /// router's waiter cannot outlive the executor's wall-clock cap.
@@ -175,91 +173,18 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
         .join("\n")
 }
 
-/// Raw JSON shape the LLM emits as `spawn_subagent`'s arguments.
-/// `timeout_secs` defaults to [`DEFAULT_SUBAGENT_TIMEOUT_SECS`] and is
-/// clamped to `[1, MAX_SUBAGENT_TIMEOUT_SECS]` in [`parse_spawn_request`].
-#[derive(Debug, Clone, Deserialize)]
-struct SpawnParams {
-    task_description: String,
-    #[serde(default)]
-    must_include_context: Vec<String>,
-    #[serde(default)]
-    timeout_secs: Option<u64>,
-    #[serde(default)]
-    llm: Option<String>,
-}
-
-pub fn parse_spawn_request(value: &serde_json::Value) -> Result<SubagentSpawnRequest, String> {
-    let p: SpawnParams = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-    let secs = p
-        .timeout_secs
-        .unwrap_or(DEFAULT_SUBAGENT_TIMEOUT_SECS)
-        .clamp(1, MAX_SUBAGENT_TIMEOUT_SECS);
-    Ok(SubagentSpawnRequest {
-        task_description: p.task_description,
-        must_include_context: p.must_include_context,
-        timeout: Duration::from_secs(secs),
-        llm: p.llm,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn parse_spawn_request_minimal() {
-        let v = json!({"task_description": "do the thing"});
-        let req = parse_spawn_request(&v).unwrap();
-        assert_eq!(req.task_description, "do the thing");
-        assert_eq!(req.must_include_context.len(), 0);
-        assert_eq!(req.timeout, Duration::from_secs(600));
-        assert!(req.llm.is_none());
-    }
-
-    #[test]
-    fn parse_spawn_request_full() {
-        let v = json!({
-            "task_description": "investigate",
-            "must_include_context": ["span:abc", "user wanted X"],
-            "timeout_secs": 30,
-            "llm": "fast",
-        });
-        let req = parse_spawn_request(&v).unwrap();
-        assert_eq!(req.task_description, "investigate");
-        assert_eq!(req.must_include_context.len(), 2);
-        assert_eq!(req.timeout, Duration::from_secs(30));
-        assert_eq!(req.llm.as_deref(), Some("fast"));
-    }
-
-    #[test]
-    fn parse_spawn_request_rejects_missing_task() {
-        let v = json!({"timeout_secs": 60});
-        assert!(parse_spawn_request(&v).is_err());
-    }
-
-    #[test]
-    fn timeout_clamped_to_at_least_1s() {
-        let v = json!({"task_description": "x", "timeout_secs": 0});
-        let req = parse_spawn_request(&v).unwrap();
-        assert_eq!(req.timeout, Duration::from_secs(1));
-    }
-
-    #[test]
-    fn timeout_clamped_to_outer_cap() {
-        let v = json!({
-            "task_description": "x",
-            "timeout_secs": MAX_SUBAGENT_TIMEOUT_SECS + 1
-        });
-        let req = parse_spawn_request(&v).unwrap();
-        assert_eq!(req.timeout, Duration::from_secs(MAX_SUBAGENT_TIMEOUT_SECS));
-    }
 
     #[test]
     fn initial_prompt_without_context_is_task_only() {
-        let v = json!({"task_description": "just the task"});
-        let req = parse_spawn_request(&v).unwrap();
+        let req = SubagentSpawnRequest {
+            task_description: "just the task".to_string(),
+            must_include_context: vec![],
+            timeout: Duration::from_secs(60),
+            llm: None,
+        };
         assert_eq!(req.initial_prompt(), "just the task");
     }
 
