@@ -54,7 +54,7 @@ async fn connect_register(
         token: String::new(),
         channel_type,
     };
-    ws.send(WsMessage::Binary(wire::encode(&frame)?.into()))
+    ws.send(WsMessage::Binary(wire::encode(&frame)?))
         .await?;
 
     // Drain RegisterAck.
@@ -118,7 +118,7 @@ async fn send_frame(
     ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
     frame: Frame,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    ws.send(WsMessage::Binary(wire::encode(&frame)?.into()))
+    ws.send(WsMessage::Binary(wire::encode(&frame)?))
         .await?;
     Ok(())
 }
