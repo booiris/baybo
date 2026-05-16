@@ -22,23 +22,25 @@ use crate::job::{JobLifecycle, JobTerminalEvent};
 /// owns the synchronous prelude (build child session, spawn actor, send
 /// initial message); this routine then watches output_rx for the final
 /// message + terminal_rx for the job's terminal event, with a store
-/// fallback on broadcast lag. On timeout the child token is tripped so
-/// the child's descendants cascade-cancel.
+/// fallback on broadcast lag.
+///
+/// `actor_token` must be the child actor's own
+/// `VolatileResources::actor_token` — we cancel it on timeout, and a
+/// sibling token here would leak the child's in-flight work.
 pub async fn await_subagent_terminal(
     child_session_id: SessionId,
     mut output_rx: mpsc::Receiver<AgentOutput>,
     mut terminal_rx: broadcast::Receiver<JobTerminalEvent>,
     mailbox: mpsc::Sender<AgentMessage>,
-    parent_token: CancellationToken,
+    actor_token: CancellationToken,
     timeout: Duration,
     job_lifecycle: Arc<JobLifecycle>,
 ) -> SubagentResult {
-    let child_token = parent_token.child_token();
     let mut captured: Option<Vec<ContentBlock>> = None;
     let wait_result = tokio::time::timeout(timeout, async {
         loop {
             tokio::select! {
-                _ = child_token.cancelled() => {
+                _ = actor_token.cancelled() => {
                     return Err(SubagentExitStatus::Cancelled);
                 }
                 msg = output_rx.recv() => {
@@ -99,7 +101,7 @@ pub async fn await_subagent_terminal(
             status,
         },
         Err(_elapsed) => {
-            child_token.cancel();
+            actor_token.cancel();
             SubagentResult {
                 child_session_id,
                 final_content: None,
@@ -152,4 +154,109 @@ async fn check_child_terminal_via_store(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aura_storage::test_support::MemoryJobStore;
+    use tokio::sync::mpsc;
+    use tokio::task::JoinHandle;
+
+    struct Harness {
+        job_lifecycle: Arc<JobLifecycle>,
+        terminal_rx: tokio::sync::broadcast::Receiver<JobTerminalEvent>,
+        output_tx: mpsc::Sender<AgentOutput>,
+        output_rx: mpsc::Receiver<AgentOutput>,
+        mailbox_tx: mpsc::Sender<AgentMessage>,
+        _mailbox_rx: mpsc::Receiver<AgentMessage>,
+        actor_token: CancellationToken,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let job_lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
+            let terminal_rx = job_lifecycle.subscribe_terminal_events();
+            let (output_tx, output_rx) = mpsc::channel(1);
+            let (mailbox_tx, _mailbox_rx) = mpsc::channel(1);
+            Self {
+                job_lifecycle,
+                terminal_rx,
+                output_tx,
+                output_rx,
+                mailbox_tx,
+                _mailbox_rx,
+                actor_token: CancellationToken::new(),
+            }
+        }
+
+        /// Drop the only sender so the waiter's `output_rx.recv()`
+        /// resolves to `None` — mimics a child actor that exited
+        /// before emitting a final Message.
+        fn close_output(&mut self) {
+            let (closed, _drop_rx) = mpsc::channel(1);
+            self.output_tx = closed;
+        }
+
+        fn spawn_waiter(self, timeout: Duration) -> Waiter {
+            Waiter {
+                actor_token: self.actor_token.clone(),
+                handle: tokio::spawn(await_subagent_terminal(
+                    SessionId::from("child"),
+                    self.output_rx,
+                    self.terminal_rx,
+                    self.mailbox_tx,
+                    self.actor_token,
+                    timeout,
+                    self.job_lifecycle,
+                )),
+                _output_tx: self.output_tx,
+                _mailbox_rx: self._mailbox_rx,
+            }
+        }
+    }
+
+    /// Spawned waiter plus the peer endpoints that must outlive it —
+    /// dropping `output_tx` here would close `output_rx` mid-test and
+    /// surface `Failed` regardless of intent.
+    struct Waiter {
+        actor_token: CancellationToken,
+        handle: JoinHandle<SubagentResult>,
+        _output_tx: mpsc::Sender<AgentOutput>,
+        _mailbox_rx: mpsc::Receiver<AgentMessage>,
+    }
+
+    impl Waiter {
+        async fn finish(self) -> SubagentResult {
+            self.handle.await.unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_cancels_passed_in_actor_token() {
+        let w = Harness::new().spawn_waiter(Duration::from_millis(10));
+        let actor_token = w.actor_token.clone();
+        let result = w.finish().await;
+        assert!(matches!(result.status, SubagentExitStatus::Timeout));
+        assert!(
+            actor_token.is_cancelled(),
+            "actor_token must cancel so the child's in-flight work tears down"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_cancel_surfaces_as_cancelled() {
+        let w = Harness::new().spawn_waiter(Duration::from_secs(60));
+        w.actor_token.cancel();
+        let result = w.finish().await;
+        assert!(matches!(result.status, SubagentExitStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn output_channel_close_surfaces_as_failed() {
+        let mut h = Harness::new();
+        h.close_output();
+        let result = h.spawn_waiter(Duration::from_secs(60)).finish().await;
+        assert!(matches!(result.status, SubagentExitStatus::Failed(_)));
+    }
 }

@@ -730,13 +730,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
             move |session: aura_model::Session,
                   initial_llm: Option<String>,
                   response_tx: mpsc::Sender<AgentOutput>,
-                  parent_token: &CancellationToken| {
-                // Derive the actor's lifetime token here, threaded
-                // into both the loop (so its summary trigger gate can
-                // clone it into outgoing SystemSpawnRequests) and the
-                // actor itself.
-                let actor_token = parent_token.child_token();
-
+                  actor_token: CancellationToken| {
                 // LLM pinning is exclusively a subagent-spawn affair —
                 // user-channel actors always run on `default-llm`.
                 // `initial_llm` is `Some` only when the router's

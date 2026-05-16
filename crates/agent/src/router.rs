@@ -70,28 +70,17 @@ impl RateLimiter {
     }
 }
 
-/// A callback that creates and spawns a new AgentActor for a given session.
-///
-/// Returns the mailbox sender for communicating with the spawned actor.
-/// The closure captures all dependencies needed to construct an actor
-/// (AgentLoop, ToolExecutor, JobLifecycle, SpanRecorder, etc.).
-///
-/// `parent_token` is the cancellation parent the child actor's
-/// `actor_token` is derived from. Tripping the parent cascades cancel
-/// down through every job / tool / nested subagent the child runs. For
-/// top-level user / cron sessions the router passes a process-wide
-/// token bridged to `ShutdownSignal`. For maintenance spawns the
-/// originating parent actor's `actor_token` is passed (carried in the
-/// `SystemSpawnRequest`), so cancelling the parent cascades into its
-/// maintenance children automatically. For subagent dispatch the
-/// parent's per-job cancel token is passed instead, so admin
-/// `cancel_job(parent)` trips the entire descendant subtree.
+/// Builds and spawns an [`AgentActor`] for `session`, returning its
+/// mailbox. `actor_token` is installed as the actor's
+/// `VolatileResources::actor_token` — callers that need to cancel
+/// the spawned actor (e.g. the subagent waiter on timeout) must
+/// keep their own clone before calling.
 pub type ActorSpawner = Box<
     dyn Fn(
             Session,
             /* initial_llm */ Option<String>,
             mpsc::Sender<AgentOutput>,
-            &CancellationToken,
+            /* actor_token */ CancellationToken,
         ) -> mpsc::Sender<AgentMessage>
         + Send
         + Sync,
@@ -228,6 +217,20 @@ impl Router {
         self.supervisor.shutdown_all().await;
     }
 
+    /// Derive a child cancellation token, hand a clone to the
+    /// spawner, return both.
+    fn spawn_actor(
+        &self,
+        session: Session,
+        initial_llm: Option<String>,
+        response_tx: mpsc::Sender<AgentOutput>,
+        parent_token: &CancellationToken,
+    ) -> (mpsc::Sender<AgentMessage>, CancellationToken) {
+        let actor_token = parent_token.child_token();
+        let mailbox = (self.actor_spawner)(session, initial_llm, response_tx, actor_token.clone());
+        (mailbox, actor_token)
+    }
+
     /// Materialise a [`SystemSpawnRequest`] into a maintenance session
     /// + actor + dispatched mailbox message.
     ///
@@ -324,7 +327,8 @@ impl Router {
         // on their own transcripts. If that changes, plumb the
         // parent's effective LLM through `SystemSpawnRequest`.
         let response_tx = self.supervisor.response_tx().clone();
-        let mailbox = (self.actor_spawner)(maint, None, response_tx, &parent_actor_token);
+        let (mailbox, _actor_token) =
+            self.spawn_actor(maint, None, response_tx, &parent_actor_token);
 
         if let Err(e) = mailbox
             .send(AgentMessage::SystemTrigger(
@@ -414,7 +418,8 @@ impl Router {
         let llm = request.llm.clone();
 
         let (output_tx, output_rx) = mpsc::channel::<AgentOutput>(SUBAGENT_OUTPUT_BUFFER);
-        let mailbox = (self.actor_spawner)(child_session, llm, output_tx, &parent_actor_token);
+        let (mailbox, actor_token) =
+            self.spawn_actor(child_session, llm, output_tx, &parent_actor_token);
 
         if let Err(e) = mailbox
             .send(AgentMessage::SubagentSpawned {
@@ -434,7 +439,7 @@ impl Router {
                 output_rx,
                 terminal_rx,
                 mailbox,
-                parent_actor_token,
+                actor_token,
                 timeout,
                 job_lifecycle,
             )
@@ -486,7 +491,8 @@ impl Router {
         );
 
         let response_tx = self.supervisor.response_tx().clone();
-        let sender = (self.actor_spawner)(session, None, response_tx, &self.actor_parent_token);
+        let (sender, _actor_token) =
+            self.spawn_actor(session, None, response_tx, &self.actor_parent_token);
 
         let trigger_msg = AgentMessage::CronTrigger {
             job_id: event.job_id.clone(),
@@ -587,7 +593,8 @@ impl Router {
             // not exposed to user-channel callers — `SubagentSpawnRequest`
             // is the only path that pins a non-default model.
             let response_tx = self.supervisor.response_tx().clone();
-            let sender = (self.actor_spawner)(session, None, response_tx, &self.actor_parent_token);
+            let (sender, _actor_token) =
+                self.spawn_actor(session, None, response_tx, &self.actor_parent_token);
             if let Err(rejected) = self
                 .supervisor
                 .register_if_absent(session_id.clone(), sender)

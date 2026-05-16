@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_model::{
-    SPAWN_SUBAGENT_TOOL_NAME, SubagentParentContext, SubagentResult, SystemSpawnRequest,
-    parse_spawn_request,
+    MAX_SUBAGENT_TIMEOUT_SECS, SPAWN_SUBAGENT_TOOL_NAME, SubagentParentContext, SubagentResult,
+    SystemSpawnRequest, parse_spawn_request,
 };
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -25,10 +25,8 @@ The subagent runs as an independent session with its own transcript and tool bud
 This call blocks until the subagent returns its final message (or hits its declared timeout).
 Use sparingly — each spawn incurs a fresh LLM cost stream."#;
 
-/// Tool-executor wall-clock cap; the real per-spawn bound is
-/// `request.timeout_secs` and is enforced by the router's
-/// `await_subagent_terminal`.
-const MAX_OUTER_TIMEOUT: Duration = Duration::from_secs(3600);
+/// Mirrors [`aura_model::MAX_SUBAGENT_TIMEOUT_SECS`] (single source of truth).
+const MAX_OUTER_TIMEOUT: Duration = Duration::from_secs(MAX_SUBAGENT_TIMEOUT_SECS);
 
 pub struct SpawnSubagentTool {
     system_spawn_tx: mpsc::Sender<SystemSpawnRequest>,

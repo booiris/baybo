@@ -31,16 +31,22 @@ pub const SUBAGENT_CHANNEL_TAG: &str = "subagent";
 
 const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 600;
 
+/// Hard upper bound on a single `spawn_subagent` wait, in seconds.
+/// Shared with the `spawn_subagent` tool's `Tool::max_timeout` so the
+/// router's waiter cannot outlive the executor's wall-clock cap.
+pub const MAX_SUBAGENT_TIMEOUT_SECS: u64 = 3600;
+
 /// Request emitted by `AgentLoop`'s parent-side trigger gate and by
 /// the `spawn_subagent` tool, consumed by `Router`'s `system_trigger_rx`
 /// arm. Senders push onto an `mpsc::Sender<SystemSpawnRequest>`; the
 /// router does the session-create + actor-spawn + mailbox-dispatch.
 ///
-/// `parent_actor_token` is the parent actor's lifetime token. The
-/// router uses it as the new spawned actor's `parent_token`, so the
-/// child's `actor_token` derives as a grandchild — cancelling the
-/// parent automatically cascades into the child via the `tokio_util`
-/// token tree, with no explicit `Shutdown` mailbox dance.
+/// `parent_actor_token` is the lifetime token of whatever component
+/// owns this spawn (parent actor for background-compression, parent
+/// per-job token for subagent dispatch). The router derives the
+/// spawned actor's `actor_token` as a child of it, so cancelling the
+/// parent cascades into the child via the `tokio_util` token tree
+/// — no explicit `Shutdown` mailbox dance required.
 #[derive(Debug)]
 pub enum SystemSpawnRequest {
     BackgroundCompression {
@@ -170,8 +176,8 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
 }
 
 /// Raw JSON shape the LLM emits as `spawn_subagent`'s arguments.
-/// `timeout_secs` defaults to [`DEFAULT_SUBAGENT_TIMEOUT_SECS`] and
-/// gets clamped to `>=1` in [`parse_spawn_request`].
+/// `timeout_secs` defaults to [`DEFAULT_SUBAGENT_TIMEOUT_SECS`] and is
+/// clamped to `[1, MAX_SUBAGENT_TIMEOUT_SECS]` in [`parse_spawn_request`].
 #[derive(Debug, Clone, Deserialize)]
 struct SpawnParams {
     task_description: String,
@@ -188,7 +194,7 @@ pub fn parse_spawn_request(value: &serde_json::Value) -> Result<SubagentSpawnReq
     let secs = p
         .timeout_secs
         .unwrap_or(DEFAULT_SUBAGENT_TIMEOUT_SECS)
-        .max(1);
+        .clamp(1, MAX_SUBAGENT_TIMEOUT_SECS);
     Ok(SubagentSpawnRequest {
         task_description: p.task_description,
         must_include_context: p.must_include_context,
@@ -238,6 +244,16 @@ mod tests {
         let v = json!({"task_description": "x", "timeout_secs": 0});
         let req = parse_spawn_request(&v).unwrap();
         assert_eq!(req.timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn timeout_clamped_to_outer_cap() {
+        let v = json!({
+            "task_description": "x",
+            "timeout_secs": MAX_SUBAGENT_TIMEOUT_SECS + 1
+        });
+        let req = parse_spawn_request(&v).unwrap();
+        assert_eq!(req.timeout, Duration::from_secs(MAX_SUBAGENT_TIMEOUT_SECS));
     }
 
     #[test]

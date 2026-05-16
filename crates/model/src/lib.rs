@@ -22,6 +22,7 @@ pub use session::{
     SystemReason, SystemTrigger, TriggerKind, TriggerSource, User,
 };
 pub use spawn_protocol::{
-    SPAWN_SUBAGENT_TOOL_NAME, SUBAGENT_CHANNEL_TAG, SubagentExitStatus, SubagentParentContext,
-    SubagentResult, SubagentSpawnRequest, SystemSpawnRequest, parse_spawn_request,
+    MAX_SUBAGENT_TIMEOUT_SECS, SPAWN_SUBAGENT_TOOL_NAME, SUBAGENT_CHANNEL_TAG, SubagentExitStatus,
+    SubagentParentContext, SubagentResult, SubagentSpawnRequest, SystemSpawnRequest,
+    parse_spawn_request,
 };
