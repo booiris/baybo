@@ -18,6 +18,7 @@ aura-context = { workspace = true }
 aura-session = { workspace = true }
 aura-trace = { workspace = true }
 aura-job = { workspace = true }
+aura-memory = { workspace = true }
 aura-security = { workspace = true }
 aura-sandbox = { workspace = true }
 aura-storage = { workspace = true }
@@ -42,6 +43,7 @@ hex = { workspace = true }
 [dev-dependencies]
 aura-job = { workspace = true, features = ["test-support"] }
 aura-llm = { workspace = true, features = ["test-support"] }
+aura-memory = { workspace = true, features = ["test-support"] }
 aura-storage = { workspace = true, features = ["test-support"] }
 aura-trace = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

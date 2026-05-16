@@ -29,6 +29,7 @@ aura-channels = { workspace = true }
 aura-context = { workspace = true }
 aura-job = { workspace = true, features = ["test-support"] }
 aura-llm = { workspace = true, features = ["test-support"] }
+aura-memory = { workspace = true, features = ["test-support"] }
 aura-model = { workspace = true }
 aura-security = { workspace = true }
 aura-skills = { workspace = true }

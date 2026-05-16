@@ -21,6 +21,7 @@ aura-config = { workspace = true }
 aura-gateway = { workspace = true }
 aura-cron = { workspace = true }
 aura-job = { workspace = true }
+aura-memory = { workspace = true }
 aura-skills = { workspace = true }
 aura-skills-assessor = { workspace = true }
 aura-storage = { workspace = true }

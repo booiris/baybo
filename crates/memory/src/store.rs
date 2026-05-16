@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use aura_model::MemoryEntry;
 
-use crate::error::StorageError;
+use crate::Result;
 
-pub type Result<T> = std::result::Result<T, StorageError>;
-
-/// Abstract interface for memory persistence.
+/// Persistence interface for memory entries. Implemented by
+/// `aura_storage::libsql::LibsqlMemoryStore` (production) and by
+/// `aura_memory::test_support::MemoryMemoryStore` (tests).
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
     async fn store(&self, entry: &MemoryEntry) -> Result<()>;

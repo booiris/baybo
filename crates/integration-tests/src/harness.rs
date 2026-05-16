@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::{
-    AgentLoop, CostManager, MemoryManager, SecurityGateway, SpendingLimits,
+    AgentLoop, CostManager, SecurityGateway, SpendingLimits,
     actor::{AgentActor, AgentMessage},
     soul::Soul,
     tool_executor::ToolExecutor,
@@ -24,10 +24,12 @@ use aura_job::JobLifecycle;
 use aura_job::test_support::MemoryJobStore;
 use aura_llm::test_support::StubLlm;
 use aura_llm::{LlmCompletion, ModelPricing};
+use aura_memory::MemoryManager;
+use aura_memory::test_support::MemoryMemoryStore;
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, Session, User};
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
-use aura_storage::test_support::{MemoryCostStore, MemoryMemoryStore, MemorySecretStore};
+use aura_storage::test_support::{MemoryCostStore, MemorySecretStore};
 use aura_trace::test_support::MemoryTraceStore;
 use aura_trace::{SpanRecorder, TraceEventStream, TraceStore};
 use aura_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
@@ -458,7 +460,7 @@ fn share_cost_store(arc: &Arc<MemoryCostStore>) -> Arc<dyn aura_storage::CostSto
     arc.clone()
 }
 
-fn share_memory_store(arc: &Arc<MemoryMemoryStore>) -> Arc<dyn aura_storage::MemoryStore> {
+fn share_memory_store(arc: &Arc<MemoryMemoryStore>) -> Arc<dyn aura_memory::MemoryStore> {
     arc.clone()
 }
 

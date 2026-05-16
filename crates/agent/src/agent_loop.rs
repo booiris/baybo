@@ -10,7 +10,7 @@ use aura_model::{ChatMessage, ContentBlock, JobId, Role, SystemSpawnRequest};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::memory::MemoryManager;
+use aura_memory::MemoryManager;
 use aura_model::Session;
 use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillRegistry, SkillSummary};
 use aura_tools::{ToolOutput, ToolRegistry};

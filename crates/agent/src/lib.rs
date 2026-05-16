@@ -5,7 +5,6 @@ pub mod compression;
 pub mod cost;
 pub mod error_recovery;
 pub mod llm_pool;
-pub mod memory;
 pub mod query;
 pub mod router;
 pub mod sandbox;
@@ -26,7 +25,6 @@ pub use aura_session::SessionManager;
 pub use billed_chat::BilledChatFactory;
 pub use cost::{CostGuardError, CostManager, CostMetrics, SpendingLimits};
 pub use llm_pool::LlmClientPool;
-pub use memory::MemoryManager;
 pub use query::{
     AnalyticsDayBucket, AnalyticsModelBucket, AnalyticsSummary, CostScope, JobDetail, JobFilter,
     JobSummary, LineageNode, QueryApi, QueryError, ReplayJob, ReplayStep, ReplayedConversation,

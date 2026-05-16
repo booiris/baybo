@@ -1,13 +1,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::{
-    CronScheduler, MemoryManager, QueryApi, SecurityGateway, SessionManager,
-};
+use aura_agent::{CronScheduler, QueryApi, SecurityGateway, SessionManager};
 use aura_channels::ChannelRegistry;
 use aura_config::AuraConfig;
 use aura_job::JobLifecycle;
 use aura_llm::GuardedLlm;
+use aura_memory::MemoryManager;
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;

@@ -30,14 +30,15 @@ use aura_agent::soul::Soul;
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{
-    CostManager, CronScheduler, CronTriggerEvent, MemoryManager, SecretVault, SecurityGateway,
-    SessionManager, SpendingLimits,
+    CostManager, CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager,
+    SpendingLimits,
 };
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
 use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, Tokenizer};
 use aura_job::JobLifecycle;
 use aura_llm::GuardedLlm;
+use aura_memory::MemoryManager;
 use aura_trace::{SpanRecorder, TraceEventStream};
 use aura_model::SystemSpawnRequest;
 use aura_security::{EncryptionKey, LeakDetectionRule, LeakDetector};

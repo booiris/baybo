@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use crate::auth::ChannelTokenTable;
 use aura_agent::service::ShutdownSignal;
-use aura_agent::{CronScheduler, MemoryManager, SessionManager};
+use aura_agent::{CronScheduler, SessionManager};
 use aura_job::JobLifecycle;
+use aura_memory::MemoryManager;
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
 use aura_llm::{LlmProviderConfig, LlmProviderRegistry};
