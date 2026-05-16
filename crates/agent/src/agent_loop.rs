@@ -182,7 +182,7 @@ pub struct AgentLoop {
     error_handler: ErrorHandler,
     /// Cost gate + ledger; `record_call` feeds spend back so the
     /// `GuardedLlm` wrapper's gate sees it before the next dispatch.
-    cost_manager: Arc<crate::cost::CostManager>,
+    cost_manager: Arc<aura_cost::CostManager>,
     /// Lifetime token for the surrounding `AgentActor`. The spawner
     /// factory derives the token once and threads it into both this
     /// loop and the actor. The summary-refresh trigger gate clones it
@@ -239,7 +239,7 @@ pub struct AgentLoopConfig {
     pub soul: Soul,
     pub security_gateway: Arc<SecurityGateway>,
     /// Cost gate + ledger.
-    pub cost_manager: Arc<crate::cost::CostManager>,
+    pub cost_manager: Arc<aura_cost::CostManager>,
     /// Lifetime token for the surrounding `AgentActor`. The spawner
     /// factory derives the actor token once and threads the same
     /// handle into both this loop and the actor.

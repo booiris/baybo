@@ -5,7 +5,7 @@ use std::sync::Arc;
 use aura_agent::SecurityGateway;
 use aura_model::{ChannelType, Session, SessionId, SessionState, TriggerSource, User};
 use aura_security::{EncryptionKey, LeakDetector, SecretVault};
-use aura_storage::test_support::MemorySecretStore;
+use aura_security::test_support::MemorySecretStore;
 use chrono::Utc;
 
 /// Stable 32-byte key used by every fixture so placeholder hex values
@@ -27,7 +27,7 @@ pub fn gateway_with_memory_vault() -> (
     let store = Arc::new(MemorySecretStore::new());
     let vault = Arc::new(SecretVault::new(
         master_key_for_tests(),
-        store.clone() as Arc<dyn aura_storage::SecretStore>,
+        store.clone() as Arc<dyn aura_security::SecretStore>,
     ));
     let spill_dir = std::env::temp_dir().join(format!(
         "aura-it-tool-spills-{}",

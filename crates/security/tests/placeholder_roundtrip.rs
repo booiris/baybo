@@ -11,14 +11,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use aura_security::{EncryptionKey, LeakAction, LeakDetector, PlaceholderMinter, SecretVault};
-use aura_storage::test_support::MemorySecretStore;
+use aura_security::test_support::MemorySecretStore;
 
 fn make_vault() -> (Arc<SecretVault>, Arc<MemorySecretStore>) {
     let store = Arc::new(MemorySecretStore::new());
     let key = EncryptionKey::new(b"aura-it-master-key-32-bytes!!!!!".to_vec()).unwrap();
     let vault = Arc::new(SecretVault::new(
         key,
-        store.clone() as Arc<dyn aura_storage::SecretStore>,
+        store.clone() as Arc<dyn aura_security::SecretStore>,
     ));
     (vault, store)
 }

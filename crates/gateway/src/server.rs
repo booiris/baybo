@@ -135,7 +135,7 @@ pub struct AdminState {
     pub cron_scheduler: Arc<CronScheduler>,
     pub memory_manager: Arc<MemoryManager>,
     pub trace_store: Arc<dyn TraceStore>,
-    pub cost_store: Arc<dyn aura_storage::CostStore>,
+    pub cost_store: Arc<dyn aura_cost::CostStore>,
     /// Pre-built `QueryApi` so `/v1/traces/{id}` and any future
     /// query-shaped endpoint don't allocate one per request.
     pub query_api: Arc<aura_agent::QueryApi>,

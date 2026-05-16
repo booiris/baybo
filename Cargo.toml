@@ -10,6 +10,7 @@ members = [
     "crates/session",
     "crates/job",
     "crates/memory",
+    "crates/cost",
     "crates/trace",
     "crates/security",
     "crates/sandbox",
@@ -46,6 +47,7 @@ aura-context = { path = "crates/context" }
 aura-session = { path = "crates/session" }
 aura-job = { path = "crates/job" }
 aura-memory = { path = "crates/memory" }
+aura-cost = { path = "crates/cost" }
 aura-trace = { path = "crates/trace" }
 aura-security = { path = "crates/security" }
 aura-sandbox = { path = "crates/sandbox" }
@@ -172,6 +174,7 @@ aura-workspace = { workspace = true, features = ["io"] }
 aura-context = { workspace = true }
 aura-job = { workspace = true }
 aura-memory = { workspace = true }
+aura-cost = { workspace = true }
 aura-trace = { workspace = true }
 aura-security = { workspace = true }
 aura-sandbox = { workspace = true }

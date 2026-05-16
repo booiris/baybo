@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use aura_llm::{LlmCallGuard, LlmError, ModelPricing};
+use aura_llm::ModelPricing;
 use aura_model::{JobId, MicroUsd, SessionId, SpanId};
-use aura_storage::{CostRecord, CostStore, TimeRange};
 use chrono::{Datelike, NaiveDate, Utc};
 use parking_lot::RwLock;
 use thiserror::Error;
 use tracing::warn;
+
+use crate::store::{CostRecord, CostStore, TimeRange};
 
 #[derive(Debug, Error)]
 pub enum CostGuardError {
@@ -415,18 +416,20 @@ impl CostManager {
         Ok(())
     }
 
-    /// Project this `CostManager` into a bare [`LlmCallGuard`] closure
-    /// — the closure form `LlmProviderRegistry::create_client` and
-    /// other low-level construction sites take. Mapping
-    /// `CostGuardError` → `LlmError::GuardRejected` happens here so
-    /// downstream consumers see the standard `LlmError` shape.
-    pub fn as_guard(self: &Arc<Self>) -> LlmCallGuard {
-        let cm = Arc::clone(self);
-        Arc::new(move || {
-            cm.check()
-                .map_err(|e| LlmError::GuardRejected(e.to_string()))
-        })
-    }
+}
+
+/// Bridge `CostManager` to the `LlmCallGuard` closure shape that
+/// `LlmProviderRegistry::create_client` (and other low-level
+/// construction sites) take. Lives outside the manager so this crate
+/// doesn't need to know about `LlmError` — callers in the agent layer
+/// can compose `CostManager::check` with `LlmError::GuardRejected`
+/// using [`cost_call_guard`].
+pub fn cost_call_guard(manager: &Arc<CostManager>) -> aura_llm::LlmCallGuard {
+    let cm = Arc::clone(manager);
+    Arc::new(move || {
+        cm.check()
+            .map_err(|e| aura_llm::LlmError::GuardRejected(e.to_string()))
+    })
 }
 
 fn utc_day_start(now: chrono::DateTime<Utc>) -> Option<chrono::DateTime<Utc>> {
@@ -445,7 +448,7 @@ fn utc_month_start(now: chrono::DateTime<Utc>) -> Option<chrono::DateTime<Utc>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_storage::test_support::MemoryCostStore;
+    use crate::test_support::MemoryCostStore;
 
     fn pricing(model: &str, input: f64, output: f64) -> HashMap<String, ModelPricing> {
         let mut h = HashMap::new();

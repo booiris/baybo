@@ -23,8 +23,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_agent::SpendingLimits;
 use aura_channels::AgentOutput;
+use aura_cost::SpendingLimits;
 use aura_integration_tests::{AgentTestHarness, capture_tracing};
 use aura_llm::test_support::StubLlm;
 use aura_llm::{LlmError, LlmResponse, ModelPricing, StreamEvent, TokenUsage, ToolCallInfo};

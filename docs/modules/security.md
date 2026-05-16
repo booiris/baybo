@@ -4,7 +4,7 @@
 
 The `security` crate provides low-level security primitives: cryptographic operations (`EncryptionKey`, `encrypt`/`decrypt`), encrypted secret storage (`SecretVault`, `SecretValue`), leak detection (`LeakDetector`, `LeakDetectionRule`, `LeakMatch`, `LeakScanResult`), deterministic placeholder minting (`PlaceholderMinter`), prompt-injection detection (`InjectionDetector`, `InjectionWarning`, `InjectionSeverity`), filesystem path sensitivity checks (`is_sensitive_path`), and the `SecurityError` error type.
 
-The gateway (`SecurityGateway`) lives in `agent::security` — it holds session-scoped state and orchestrates scanning, minting, and reveal across the agent loop. The `SecretStore` trait is defined in `storage::secret` and consumed here via `aura_storage::SecretStore`; `SecretVault` maps `StorageError` to `SecurityError::Storage` at that boundary.
+The gateway (`SecurityGateway`) lives in `agent::security` — it holds session-scoped state and orchestrates scanning, minting, and reveal across the agent loop. The `SecretStore` trait lives in this crate alongside `SecretVault`; `aura-storage` provides the libsql implementation. `MemorySecretStore` for downstream tests is exposed via the `test-support` feature gate.
 
 Core responsibilities of the primitives in this crate:
 

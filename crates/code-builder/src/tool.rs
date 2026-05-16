@@ -759,7 +759,7 @@ mod tests {
     use aura_model::{MicroUsd, User};
     use aura_sandbox::SandboxOutput;
     use aura_security::EncryptionKey;
-    use aura_storage::test_support::MemorySecretStore;
+    use aura_security::test_support::MemorySecretStore;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 

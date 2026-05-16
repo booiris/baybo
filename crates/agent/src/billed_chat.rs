@@ -21,8 +21,8 @@ use aura_llm::{BilledChat, BilledChatResponse, ChatRequest, GuardedLlm, ModelInf
 use aura_model::{JobId, MicroUsd, SessionId, SpanId};
 use tracing::warn;
 
-use crate::cost::CostManager;
 use crate::security::SecurityGateway;
+use aura_cost::CostManager;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BilledAttribution {
@@ -158,11 +158,12 @@ mod tests {
     use aura_model::{ChatMessage, ContentBlock, JobId, Role, SessionId, SpanId};
     use aura_security::leak_detector::{LeakAction, LeakDetectionRule, LeakDetector};
     use aura_security::{EncryptionKey, SecretVault};
-    use aura_storage::test_support::{MemoryCostStore, MemorySecretStore};
+    use aura_cost::test_support::MemoryCostStore;
+    use aura_security::test_support::MemorySecretStore;
     use regex::Regex;
 
     use super::*;
-    use crate::cost::{CostManager, SpendingLimits};
+    use aura_cost::{CostManager, SpendingLimits};
     use crate::security::SecurityGateway;
 
     fn fixture(stub: Arc<StubLlm>) -> (Arc<dyn BilledChat>, Arc<SecurityGateway>) {

@@ -134,7 +134,7 @@ mod tests {
     use super::*;
     use aura_model::MicroUsd;
     use aura_security::{EncryptionKey, SecretVault};
-    use aura_storage::test_support::MemorySecretStore;
+    use aura_security::test_support::MemorySecretStore;
     use std::sync::Arc;
 
     fn vault() -> Arc<SecretVault> {

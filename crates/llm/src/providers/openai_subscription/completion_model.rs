@@ -1607,23 +1607,23 @@ mod tests {
     /// SecretStore adapter that fails the first N stores, then succeeds.
     /// Drives the "vault is broken right now" branch of the durable-save path.
     struct FailingStoreNTimes {
-        inner: aura_storage::test_support::MemorySecretStore,
+        inner: aura_security::test_support::MemorySecretStore,
         fails_remaining: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
-    impl aura_storage::SecretStore for FailingStoreNTimes {
+    impl aura_security::SecretStore for FailingStoreNTimes {
         async fn store(
             &self,
             name: &str,
             encrypted_value: &[u8],
-        ) -> std::result::Result<(), aura_storage::StorageError> {
+        ) -> std::result::Result<(), aura_security::SecurityError> {
             if self
                 .fails_remaining
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
                 > 0
             {
-                return Err(aura_storage::StorageError::Storage(
+                return Err(aura_security::SecurityError::Storage(
                     "simulated vault failure".into(),
                 ));
             }
@@ -1632,13 +1632,13 @@ mod tests {
         async fn retrieve(
             &self,
             name: &str,
-        ) -> std::result::Result<Option<Vec<u8>>, aura_storage::StorageError> {
+        ) -> std::result::Result<Option<Vec<u8>>, aura_security::SecurityError> {
             self.inner.retrieve(name).await
         }
-        async fn delete(&self, name: &str) -> std::result::Result<(), aura_storage::StorageError> {
+        async fn delete(&self, name: &str) -> std::result::Result<(), aura_security::SecurityError> {
             self.inner.delete(name).await
         }
-        async fn list(&self) -> std::result::Result<Vec<String>, aura_storage::StorageError> {
+        async fn list(&self) -> std::result::Result<Vec<String>, aura_security::SecurityError> {
             self.inner.list().await
         }
     }
@@ -1649,7 +1649,7 @@ mod tests {
         use aura_security::{EncryptionKey, SecretVault};
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
         let store = std::sync::Arc::new(FailingStoreNTimes {
-            inner: aura_storage::test_support::MemorySecretStore::new(),
+            inner: aura_security::test_support::MemorySecretStore::new(),
             fails_remaining: std::sync::atomic::AtomicUsize::new(initial_fails),
         });
         let vault = std::sync::Arc::new(SecretVault::new(key, store.clone()));
@@ -1719,7 +1719,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_fresh_bundle_invalidates_cache_when_vault_is_emptied() {
         use aura_security::{EncryptionKey, SecretVault};
-        use aura_storage::test_support::MemorySecretStore;
+        use aura_security::test_support::MemorySecretStore;
 
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
         let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));
@@ -1766,7 +1766,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_fresh_bundle_skips_vault_within_revalidate_interval() {
         use aura_security::{EncryptionKey, SecretVault};
-        use aura_storage::test_support::MemorySecretStore;
+        use aura_security::test_support::MemorySecretStore;
 
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
         let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));
@@ -1833,7 +1833,7 @@ mod tests {
     #[tokio::test]
     async fn single_flight_refresh_dedups_after_concurrent_rotation() {
         use aura_security::{EncryptionKey, SecretVault};
-        use aura_storage::test_support::MemorySecretStore;
+        use aura_security::test_support::MemorySecretStore;
 
         let now = chrono::Utc::now().timestamp();
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();

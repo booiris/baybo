@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use super::LibsqlPool;
-use crate::StorageError;
-use crate::secret::SecretStore;
+
+use aura_security::SecretStore;
 
 pub struct LibsqlSecretStore {
     pool: LibsqlPool,
@@ -16,18 +16,18 @@ impl LibsqlSecretStore {
 
 #[async_trait]
 impl SecretStore for LibsqlSecretStore {
-    async fn store(&self, name: &str, encrypted_value: &[u8]) -> crate::secret::Result<()> {
+    async fn store(&self, name: &str, encrypted_value: &[u8]) -> aura_security::secret_store::Result<()> {
         let conn = self.pool.conn();
         conn.execute(
             "INSERT OR REPLACE INTO secrets (name, encrypted_value) VALUES (?1, ?2)",
             libsql::params![name.to_string(), encrypted_value.to_vec()],
         )
         .await
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql insert error: {e}")))?;
+        .map_err(|e| aura_security::SecurityError::Internal(anyhow::anyhow!("libsql insert error: {e}")))?;
         Ok(())
     }
 
-    async fn retrieve(&self, name: &str) -> crate::secret::Result<Option<Vec<u8>>> {
+    async fn retrieve(&self, name: &str) -> aura_security::secret_store::Result<Option<Vec<u8>>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
@@ -35,53 +35,53 @@ impl SecretStore for LibsqlSecretStore {
                 libsql::params![name.to_string()],
             )
             .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
+            .map_err(|e| aura_security::SecurityError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
 
         let row = rows
             .next()
             .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row error: {e}")))?;
+            .map_err(|e| aura_security::SecurityError::Internal(anyhow::anyhow!("libsql row error: {e}")))?;
 
         match row {
             Some(row) => {
                 let value: Vec<u8> = row
                     .get(0)
-                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                    .map_err(|e| aura_security::SecurityError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
                 Ok(Some(value))
             }
             None => Ok(None),
         }
     }
 
-    async fn list(&self) -> crate::secret::Result<Vec<String>> {
+    async fn list(&self) -> aura_security::secret_store::Result<Vec<String>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query("SELECT name FROM secrets", ())
             .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
+            .map_err(|e| aura_security::SecurityError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
 
         let mut names = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
+            .map_err(|e| aura_security::SecurityError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
         {
             let name: String = row
                 .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                .map_err(|e| aura_security::SecurityError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             names.push(name);
         }
         Ok(names)
     }
 
-    async fn delete(&self, name: &str) -> crate::secret::Result<()> {
+    async fn delete(&self, name: &str) -> aura_security::secret_store::Result<()> {
         let conn = self.pool.conn();
         conn.execute(
             "DELETE FROM secrets WHERE name = ?1",
             libsql::params![name.to_string()],
         )
         .await
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete error: {e}")))?;
+        .map_err(|e| aura_security::SecurityError::Internal(anyhow::anyhow!("libsql delete error: {e}")))?;
         Ok(())
     }
 }

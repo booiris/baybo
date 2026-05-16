@@ -189,6 +189,7 @@ dependencies = [
  "aura-code-builder",
  "aura-config",
  "aura-context",
+ "aura-cost",
  "aura-cron",
  "aura-gateway",
  "aura-janitor",
@@ -229,6 +230,7 @@ dependencies = [
  "async-trait",
  "aura-channels",
  "aura-context",
+ "aura-cost",
  "aura-cron",
  "aura-job",
  "aura-llm",
@@ -290,6 +292,7 @@ dependencies = [
  "aura-agent",
  "aura-channels",
  "aura-config",
+ "aura-cost",
  "aura-cron",
  "aura-gateway",
  "aura-job",
@@ -388,6 +391,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "aura-cost"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aura-llm",
+ "aura-model",
+ "chrono",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aura-cron"
 version = "0.1.0"
 dependencies = [
@@ -418,6 +438,7 @@ dependencies = [
  "aura-agent",
  "aura-channels",
  "aura-config",
+ "aura-cost",
  "aura-cron",
  "aura-gateway",
  "aura-job",
@@ -473,6 +494,7 @@ dependencies = [
  "aura-channels",
  "aura-cli",
  "aura-context",
+ "aura-cost",
  "aura-gateway",
  "aura-job",
  "aura-llm",
@@ -622,7 +644,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aura-model",
- "aura-storage",
+ "aura-security",
  "chrono",
  "hex",
  "hkdf",
@@ -733,9 +755,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aura-cost",
  "aura-job",
  "aura-memory",
  "aura-model",
+ "aura-security",
  "aura-trace",
  "bytes",
  "chrono",

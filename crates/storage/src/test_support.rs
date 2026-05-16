@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use async_trait::async_trait;
-use aura_model::{BlobRef, ChatMessage, JobId, Session, SessionId};
+use aura_model::{BlobRef, ChatMessage, Session, SessionId};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use parking_lot::Mutex;
@@ -19,165 +19,10 @@ use crate::StorageError;
 use crate::blob::{
     BlobMeta, BlobReader, BlobStore, ByteStream, Result as BlobResult, SHA256_PREFIX,
 };
-use crate::cost::{CostRecord, CostResult, CostStore, CostSummary, TimeRange};
-use crate::secret::{Result as SecretResult, SecretStore};
 use crate::session::{Result as SessionStoreResult, SessionStore, StoredMessage};
 use crate::session_summary::{
     Result as SessionSummaryResult, SessionSummaryRow, SessionSummaryStore,
 };
-
-/// In-memory `SecretStore` for tests. Stores raw `(name, encrypted_value)`
-/// pairs in a `Mutex<HashMap>`. No encryption performed here — the bytes
-/// are whatever the caller hands in (typically already AES-GCM ciphertext
-/// from `SecretVault`).
-#[derive(Debug, Default)]
-pub struct MemorySecretStore {
-    data: Mutex<HashMap<String, Vec<u8>>>,
-}
-
-impl MemorySecretStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Number of live entries. Useful for asserting deterministic-mint
-    /// invariants ("same secret minted twice → vault holds one entry").
-    pub fn len(&self) -> usize {
-        self.data.lock().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-#[async_trait]
-impl SecretStore for MemorySecretStore {
-    async fn store(&self, name: &str, encrypted_value: &[u8]) -> SecretResult<()> {
-        self.data
-            .lock()
-            .insert(name.to_owned(), encrypted_value.to_vec());
-        Ok(())
-    }
-
-    async fn retrieve(&self, name: &str) -> SecretResult<Option<Vec<u8>>> {
-        Ok(self.data.lock().get(name).cloned())
-    }
-
-    async fn list(&self) -> SecretResult<Vec<String>> {
-        Ok(self.data.lock().keys().cloned().collect())
-    }
-
-    async fn delete(&self, name: &str) -> SecretResult<()> {
-        self.data.lock().remove(name);
-        Ok(())
-    }
-}
-
-/// In-memory `CostStore` for tests. Records are appended in arrival
-/// order; queries scan linearly. Plenty fast for tests.
-#[derive(Debug, Default)]
-pub struct MemoryCostStore {
-    records: Mutex<Vec<CostRecord>>,
-}
-
-impl MemoryCostStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn len(&self) -> usize {
-        self.records.lock().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Snapshot every persisted `CostRecord` in arrival order. Cloned
-    /// on read so callers can iterate without holding the mutex.
-    pub fn records(&self) -> Vec<CostRecord> {
-        self.records.lock().clone()
-    }
-}
-
-fn in_range(record: &CostRecord, range: &TimeRange) -> bool {
-    record.timestamp >= range.from && record.timestamp < range.to
-}
-
-#[async_trait]
-impl CostStore for MemoryCostStore {
-    async fn record(&self, record: &CostRecord) -> CostResult<()> {
-        self.records.lock().push(record.clone());
-        Ok(())
-    }
-
-    async fn query_user(&self, user_id: &str, range: TimeRange) -> CostResult<Vec<CostRecord>> {
-        Ok(self
-            .records
-            .lock()
-            .iter()
-            .filter(|r| r.user_id == user_id && in_range(r, &range))
-            .cloned()
-            .collect())
-    }
-
-    async fn query_global(&self, range: TimeRange) -> CostResult<CostSummary> {
-        let mut summary = CostSummary::default();
-        for r in self.records.lock().iter().filter(|r| in_range(r, &range)) {
-            summary.total_cost_usd += r.cost_usd;
-            summary.total_input_tokens += r.input_tokens;
-            summary.total_output_tokens += r.output_tokens;
-            summary.total_cached_input_tokens += r.cached_input_tokens;
-            summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
-            summary.record_count += 1;
-        }
-        Ok(summary)
-    }
-
-    async fn query_records_in_range(&self, range: TimeRange) -> CostResult<Vec<CostRecord>> {
-        let mut out: Vec<CostRecord> = self
-            .records
-            .lock()
-            .iter()
-            .filter(|r| in_range(r, &range))
-            .cloned()
-            .collect();
-        out.sort_by_key(|r| r.timestamp);
-        Ok(out)
-    }
-
-    async fn query_session(&self, session_id: &SessionId) -> CostResult<CostSummary> {
-        let mut summary = CostSummary::default();
-        for r in self
-            .records
-            .lock()
-            .iter()
-            .filter(|r| &r.session_id == session_id)
-        {
-            summary.total_cost_usd += r.cost_usd;
-            summary.total_input_tokens += r.input_tokens;
-            summary.total_output_tokens += r.output_tokens;
-            summary.total_cached_input_tokens += r.cached_input_tokens;
-            summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
-            summary.record_count += 1;
-        }
-        Ok(summary)
-    }
-
-    async fn query_job(&self, job_id: &JobId) -> CostResult<CostSummary> {
-        let mut summary = CostSummary::default();
-        for r in self.records.lock().iter().filter(|r| &r.job_id == job_id) {
-            summary.total_cost_usd += r.cost_usd;
-            summary.total_input_tokens += r.input_tokens;
-            summary.total_output_tokens += r.output_tokens;
-            summary.total_cached_input_tokens += r.cached_input_tokens;
-            summary.total_cache_creation_input_tokens += r.cache_creation_input_tokens;
-            summary.record_count += 1;
-        }
-        Ok(summary)
-    }
-}
 
 /// In-memory `BlobStore` for tests. Bytes live in a `Mutex<HashMap>`,
 /// keyed by the same `sha256:<hex>` blob id the libsql backend uses, so

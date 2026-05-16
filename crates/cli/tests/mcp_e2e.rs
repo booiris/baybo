@@ -11,7 +11,7 @@ use aura_cli::cli::{Commands, McpCmd, McpTransportArg, TrustLevelArg};
 use aura_cli::{ContextBuilder, Invocation, OutputFormat, dispatch};
 use aura_config::AuraConfig;
 use aura_security::{EncryptionKey, SecretVault};
-use aura_storage::test_support::MemorySecretStore;
+use aura_security::test_support::MemorySecretStore;
 use aura_tools::mcp::{McpFile, McpTransportConfig, vault_keys};
 
 fn make_ctx(tmpdir: &tempfile::TempDir) -> aura_cli::CommandContext {

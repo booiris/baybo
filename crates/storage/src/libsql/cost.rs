@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use super::LibsqlPool;
 use super::time;
-use crate::cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
+use aura_cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
 use aura_model::{JobId, MicroUsd, SessionId, SpanId};
 
 pub struct LibsqlCostStore {
