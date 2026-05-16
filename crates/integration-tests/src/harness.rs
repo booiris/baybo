@@ -398,7 +398,6 @@ impl AgentTestHarnessBuilder {
             security_gateway: gateway.clone(),
             cost_manager: Arc::clone(&cost_manager),
             actor_token: actor_token.clone(),
-            subagent_runtime: None,
             session_log: None,
             system_spawn_tx: None,
             workspace_paths: None,

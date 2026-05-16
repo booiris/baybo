@@ -89,4 +89,4 @@ All libsql-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tomb
 | `model` / `trace` / `security` / `job`   | Provide domain types consumed by Store traits                                             |
 | `context`                                | Owns `ContextManager`; pure in-memory                                                     |
 | `session`                                | Owns `SessionManager`; depends on `storage` to consume `SessionStore`                     |
-| `agent`                                  | Injects stores into managers (MemoryManager, JobManager, etc.); re-exports SessionManager |
+| `agent`                                  | Injects stores into managers (MemoryManager, JobLifecycle, etc.); re-exports SessionManager |

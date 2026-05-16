@@ -386,6 +386,7 @@ async fn lineage_kind_round_trips_for_system_maintenance() {
         lineage: Some(Lineage {
             parent_session_id: parent.id.clone(),
             parent_job_id: JobId::new(),
+            parent_span_id: None,
             kind: LineageKind::SystemMaintenance,
         }),
         bound_soul_version: "soul".into(),

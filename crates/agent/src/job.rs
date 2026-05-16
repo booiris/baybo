@@ -1,6 +1,5 @@
 //! `JobLifecycle` — thin orchestration layer over `JobStore` for the
-//! Job state machine. Replaces the legacy `JobManager` /
-//! `ObservabilityRecorder`. See `docs/modules/job.md` for the design.
+//! Job state machine. See `docs/modules/job.md` for the design.
 
 use std::sync::Arc;
 

@@ -2,42 +2,34 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage, OutgoingMessage};
-use aura_model::{BackgroundCompressionPayload, JobId, Session, SessionId, TriggerSource, User};
+use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage, Message, OutgoingMessage};
+use aura_model::{
+    BackgroundCompressionPayload, ChannelType, ContentBlock, JobId, Lineage, LineageKind,
+    MessageMetadata, SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentResult,
+    SubagentSpawnRequest, SystemSpawnRequest, TriggerSource, User,
+};
 
 use aura_cron::CronTriggerEvent;
 
 use crate::cost::CostManager;
+use crate::job::JobLifecycle;
 use crate::security::SecurityGateway;
 use crate::session::SessionManager;
-use tokio::sync::mpsc;
+use crate::subagent::await_subagent_terminal;
+use chrono::Utc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::actor::AgentMessage;
 use crate::supervisor::AgentSupervisor;
 
-/// Request emitted by `AgentLoop`'s parent-side trigger gate and
-/// consumed by `Router`'s `system_trigger_rx` arm. Replaces the old
-/// `MaintenanceSpawner` trait: the gate just sends a value on an
-/// `mpsc::Sender<SystemSpawnRequest>`; the router does the
-/// session-create + actor-spawn + mailbox-dispatch.
-///
-/// `parent_actor_token` is the parent actor's lifetime token. The
-/// router uses it as the new maintenance actor's `parent_token`, so
-/// the maintenance child's `actor_token` derives as a grandchild —
-/// cancelling the parent automatically cascades into the child via
-/// the `tokio_util` token tree, with no explicit `Shutdown` mailbox
-/// dance.
-#[derive(Debug)]
-pub enum SystemSpawnRequest {
-    BackgroundCompression {
-        parent_session_id: SessionId,
-        parent_job_id: JobId,
-        parent_actor_token: CancellationToken,
-        payload: BackgroundCompressionPayload,
-    },
-}
+/// `output_tx` buffer for a subagent's actor. Intentionally smaller than
+/// the operator-configured channel size for top-level actors — a child
+/// session only emits its final `AgentOutput::Message` (deltas are not
+/// forwarded back through this channel), so 64 is overkill but matches
+/// the wait routine's earlier sizing.
+const SUBAGENT_OUTPUT_BUFFER: usize = 64;
 
 /// Per-user sliding-window rate limiter.
 ///
@@ -114,6 +106,10 @@ pub struct Router {
     cost_manager: Arc<CostManager>,
     rate_limiter: RateLimiter,
     actor_spawner: ActorSpawner,
+    /// Job lifecycle handle. Needed to subscribe to terminal-event
+    /// broadcasts when waiting on a subagent child to terminate, and
+    /// to reconcile via the store on broadcast lag.
+    job_lifecycle: Arc<JobLifecycle>,
     /// Stored as `Option<Receiver>` so `run()` can `take()` them out of
     /// `self` to drive in `select!` arms; populated unconditionally
     /// from `RouterConfig` at construction.
@@ -136,6 +132,7 @@ pub struct RouterConfig {
     pub security_gateway: Arc<SecurityGateway>,
     pub cost_manager: Arc<CostManager>,
     pub actor_spawner: ActorSpawner,
+    pub job_lifecycle: Arc<JobLifecycle>,
     pub cron_trigger_rx: mpsc::Receiver<CronTriggerEvent>,
     pub system_trigger_rx: mpsc::Receiver<SystemSpawnRequest>,
     /// Cancellation parent passed to every top-level actor the router
@@ -157,6 +154,7 @@ impl Router {
             security_gateway,
             cost_manager,
             actor_spawner,
+            job_lifecycle,
             cron_trigger_rx,
             system_trigger_rx,
             actor_parent_token,
@@ -171,6 +169,7 @@ impl Router {
             cost_manager,
             rate_limiter: RateLimiter::new(rate_limit_max_requests, rate_limit_window),
             actor_spawner,
+            job_lifecycle,
             cron_trigger_rx: Some(cron_trigger_rx),
             system_trigger_rx: Some(system_trigger_rx),
             actor_parent_token,
@@ -251,13 +250,49 @@ impl Router {
     /// supervisor — maintenance is one-shot and registering would just
     /// accumulate dangling handles.
     async fn handle_system_spawn(&mut self, request: SystemSpawnRequest) -> anyhow::Result<()> {
-        let SystemSpawnRequest::BackgroundCompression {
-            parent_session_id,
-            parent_job_id,
-            parent_actor_token,
-            payload,
-        } = request;
+        match request {
+            SystemSpawnRequest::BackgroundCompression {
+                parent_session_id,
+                parent_job_id,
+                parent_actor_token,
+                payload,
+            } => {
+                self.handle_background_compression_spawn(
+                    parent_session_id,
+                    parent_job_id,
+                    parent_actor_token,
+                    payload,
+                )
+                .await
+            }
+            SystemSpawnRequest::Subagent {
+                parent_session_id,
+                parent_job_id,
+                parent_span_id,
+                parent_actor_token,
+                request,
+                result_tx,
+            } => {
+                self.handle_subagent_spawn(
+                    parent_session_id,
+                    parent_job_id,
+                    parent_span_id,
+                    parent_actor_token,
+                    request,
+                    result_tx,
+                )
+                .await
+            }
+        }
+    }
 
+    async fn handle_background_compression_spawn(
+        &mut self,
+        parent_session_id: SessionId,
+        parent_job_id: JobId,
+        parent_actor_token: CancellationToken,
+        payload: BackgroundCompressionPayload,
+    ) -> anyhow::Result<()> {
         let parent = self
             .session_manager
             .get(&parent_session_id)
@@ -304,6 +339,108 @@ impl Router {
                 "failed to deliver SystemTrigger to maintenance actor mailbox"
             );
         }
+        Ok(())
+    }
+
+    async fn handle_subagent_spawn(
+        &mut self,
+        parent_session_id: SessionId,
+        parent_job_id: JobId,
+        parent_span_id: SpanId,
+        parent_actor_token: CancellationToken,
+        request: SubagentSpawnRequest,
+        result_tx: oneshot::Sender<SubagentResult>,
+    ) -> anyhow::Result<()> {
+        let parent = match self.session_manager.get(&parent_session_id).await {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                let _ = result_tx.send(SubagentResult::failed(format!(
+                    "parent session {parent_session_id} not found"
+                )));
+                return Ok(());
+            }
+            Err(e) => {
+                let _ = result_tx.send(SubagentResult::failed(format!("load parent session: {e}")));
+                return Ok(());
+            }
+        };
+
+        let child_channel = ChannelType::from(SUBAGENT_CHANNEL_TAG);
+        let child_user = User {
+            id: parent.user.id.clone(),
+            name: parent.user.name.clone(),
+            channel: child_channel.clone(),
+        };
+        let lineage = Lineage {
+            parent_session_id,
+            parent_job_id,
+            parent_span_id: Some(parent_span_id),
+            kind: LineageKind::Subagent,
+        };
+        let child_session = match self
+            .session_manager
+            .create_spawned_session(child_user, child_channel, &parent, lineage)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let _ =
+                    result_tx.send(SubagentResult::failed(format!("create child session: {e}")));
+                return Ok(());
+            }
+        };
+
+        // Subscribe to terminal events BEFORE dispatch so a child whose
+        // actor exits synchronously cannot terminate between
+        // dispatch and the receiver being open.
+        let terminal_rx = self.job_lifecycle.subscribe_terminal_events();
+
+        let now = Utc::now();
+        let incoming = IncomingMessage {
+            message: Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: child_session.id.clone(),
+                channel: child_session.channel.clone(),
+                sender: child_session.user.clone(),
+                content: vec![ContentBlock::Text(request.initial_prompt())],
+                timestamp: now,
+                reply_to: None,
+                metadata: MessageMetadata::default(),
+            },
+            platform_msg_id: String::new(),
+        };
+        let child_session_id = child_session.id.clone();
+        let timeout = request.timeout;
+        let llm = request.llm.clone();
+
+        let (output_tx, output_rx) = mpsc::channel::<AgentOutput>(SUBAGENT_OUTPUT_BUFFER);
+        let mailbox = (self.actor_spawner)(child_session, llm, output_tx, &parent_actor_token);
+
+        if let Err(e) = mailbox
+            .send(AgentMessage::SubagentSpawned {
+                initial_message: Box::new(incoming),
+                parent_job_id,
+            })
+            .await
+        {
+            let _ = result_tx.send(SubagentResult::failed(format!("dispatch child input: {e}")));
+            return Ok(());
+        }
+
+        let job_lifecycle = Arc::clone(&self.job_lifecycle);
+        tokio::spawn(async move {
+            let result = await_subagent_terminal(
+                child_session_id,
+                output_rx,
+                terminal_rx,
+                mailbox,
+                parent_actor_token,
+                timeout,
+                job_lifecycle,
+            )
+            .await;
+            let _ = result_tx.send(result);
+        });
         Ok(())
     }
 

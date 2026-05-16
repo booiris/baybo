@@ -302,6 +302,8 @@ mod tests {
     fn ctx() -> ToolContext {
         ToolContext {
             session_id: "t".into(),
+            job_id: aura_model::JobId::default(),
+            span_id: aura_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -322,6 +324,8 @@ mod tests {
     fn ctx_with_paths(paths: WorkspacePaths) -> ToolContext {
         ToolContext {
             session_id: "sess-test".into(),
+            job_id: aura_model::JobId::default(),
+            span_id: aura_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,

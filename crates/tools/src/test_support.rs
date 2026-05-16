@@ -256,6 +256,8 @@ mod tests {
     fn ctx() -> ToolContext {
         ToolContext {
             session_id: "s1".into(),
+            job_id: aura_model::JobId::default(),
+            span_id: aura_model::SpanId::default(),
             user: User {
                 id: "u1".into(),
                 name: Some("tester".into()),

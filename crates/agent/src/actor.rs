@@ -15,8 +15,8 @@ pub enum AgentMessage {
     /// A cron job fired.
     CronTrigger { job_id: String, prompt: String },
     /// A subagent was spawned. Carries the initial prompt assembled by
-    /// `LocalSubagentRuntime` and the parent's `JobId` for lineage.
-    /// The child actor runs `agent_loop.run` with `JobInput::Spawned`,
+    /// `Router::handle_subagent_spawn` and the parent's `JobId` for
+    /// lineage. The child actor runs `agent_loop.run` with `JobInput::Spawned`,
     /// which `JobKind::Spawned.allowed_for(*) == true` lets through
     /// regardless of the child session's root trigger — which it must,
     /// because subagents inherit the parent's trigger (cron / system)

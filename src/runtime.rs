@@ -23,11 +23,10 @@ use std::sync::Arc;
 
 use aura_agent::actor::AgentActor;
 use aura_agent::agent_loop::{AgentLoop, AgentLoopConfig};
-use aura_agent::router::{Router, SystemSpawnRequest};
+use aura_agent::router::Router;
 use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_agent::session_log::SessionLlmLogger;
 use aura_agent::soul::Soul;
-use aura_agent::subagent::{LocalSubagentRuntime, SubagentRuntime};
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{
@@ -38,6 +37,7 @@ use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
 use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, Tokenizer};
 use aura_llm::GuardedLlm;
+use aura_model::SystemSpawnRequest;
 use aura_security::{EncryptionKey, LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
@@ -444,6 +444,16 @@ pub async fn build_managers(
         tool_registry.register(tool, manifest);
     }
 
+    // `spawn_subagent` is just another tool from the LLM's perspective.
+    // It ferries the spawn request to the router via the same
+    // system-spawn channel that background-compression uses; the router
+    // does the session-create + actor-spawn + wait, and ships the
+    // final `SubagentResult` back through a oneshot the tool blocks on.
+    {
+        let (tool, manifest) = aura_tools::builtin::spawn_subagent::make(system_spawn_tx.clone());
+        tool_registry.register(tool, manifest);
+    }
+
     // --- Skill tool — registered with the risk assessor as the
     // gate. Lives in aura-skills (parallel to aura-cron::tools)
     // because it needs the registry + assessor; both are constructed
@@ -689,14 +699,10 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let cost_manager = Arc::clone(&graph.cost_manager);
     let llm_pool = Arc::clone(&graph.llm_pool);
 
-    // Spawner-vs-runtime build cycle: closure captures the slot and is
-    // built first, then `LocalSubagentRuntime` patches itself in.
-    let subagent_runtime_slot: Arc<std::sync::OnceLock<Arc<dyn SubagentRuntime>>> =
-        Arc::new(std::sync::OnceLock::new());
-
-    // Single Arc-shared factory: router's `ActorSpawner` and
-    // `LocalSubagentRuntime` both spawn the same fully-wired actor.
-    let spawn_actor_for: aura_agent::subagent::SubagentActorSpawner = {
+    // Single boxed factory owned by the router: used for top-level
+    // user/cron actors, background-compression maintenance spawns,
+    // AND `SystemSpawnRequest::Subagent` child materialisation.
+    let spawn_actor_for: aura_agent::router::ActorSpawner = {
         let llm_pool = Arc::clone(&llm_pool);
         let tool_registry = Arc::clone(&graph.tool_registry);
         let skill_registry = Arc::clone(&graph.skill_registry);
@@ -708,7 +714,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let session_logger = Arc::clone(&session_logger);
         let tokenizer = Arc::clone(&tokenizer);
         let trace_event_stream = trace_event_stream.clone();
-        let subagent_runtime_slot = Arc::clone(&subagent_runtime_slot);
         let token_budget = token_budget.clone();
         let policy = policy.clone();
         let system_prompt = system_prompt.clone();
@@ -721,7 +726,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         ));
         let system_spawn_tx = graph.system_spawn_tx.clone();
         let supervisor_for_spawn = supervisor.clone();
-        Arc::new(
+        Box::new(
             move |session: aura_model::Session,
                   initial_llm: Option<String>,
                   response_tx: mpsc::Sender<AgentOutput>,
@@ -734,8 +739,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
                 // LLM pinning is exclusively a subagent-spawn affair —
                 // user-channel actors always run on `default-llm`.
-                // `initial_llm` is `Some` only when
-                // `LocalSubagentRuntime::run` forwards a
+                // `initial_llm` is `Some` only when the router's
+                // `handle_subagent_spawn` forwards a
                 // `SubagentSpawnRequest.llm`.
                 let effective_initial = initial_llm;
 
@@ -766,7 +771,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     security_gateway: Arc::clone(&security_gateway),
                     cost_manager: Arc::clone(&cost_manager),
                     actor_token: actor_token.clone(),
-                    subagent_runtime: subagent_runtime_slot.get().map(Arc::clone),
                     session_log: Some(Arc::clone(&session_logger)),
                     system_spawn_tx: Some(system_spawn_tx.clone()),
                     workspace_paths: Some(Arc::clone(&workspace_paths_arc)),
@@ -800,16 +804,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         )
     };
 
-    let local_subagent_runtime: Arc<dyn SubagentRuntime> = Arc::new(LocalSubagentRuntime::new(
-        Arc::clone(&graph.session_manager),
-        Arc::clone(&spawn_actor_for),
-        Arc::clone(&graph.job_lifecycle),
-    ));
-    // Sole `set` site in the process — `is_err()` is unreachable barring
-    // a programming error in this file.
-    let set_ok = subagent_runtime_slot.set(local_subagent_runtime).is_ok();
-    debug_assert!(set_ok);
-
     let rate_limit_cfg = &graph.config.cost.rate_limit;
 
     // `take` cron + system rxs eagerly — a caller who forgot to plumb
@@ -842,9 +836,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         channels: Arc::clone(&graph.channels_registry),
         security_gateway: Arc::clone(&graph.security_gateway),
         cost_manager: Arc::clone(&cost_manager),
-        actor_spawner: Box::new(move |session, initial_llm, response_tx, parent_token| {
-            spawn_actor_for(session, initial_llm, response_tx, parent_token)
-        }),
+        actor_spawner: spawn_actor_for,
+        job_lifecycle: Arc::clone(&graph.job_lifecycle),
         cron_trigger_rx,
         system_trigger_rx,
         actor_parent_token: graph.actor_parent_token.clone(),

@@ -1,7 +1,7 @@
 //! `Step` — one iteration of the agent loop, or one logical
 //! work-unit (compression / memory / skill-selection / subagent).
 
-use aura_model::{JobId, SessionId, StepId};
+use aura_model::{JobId, StepId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -57,16 +57,6 @@ pub enum StepKind {
     MemoryRecall,
     MemoryWrite,
     SkillSelection,
-    /// Special: the actual work runs in `child_session_id`. The step's
-    /// inner span is a `SpanKind::SubagentStub` that records the parent's
-    /// wait window only — no tool calls, no LLM calls live here.
-    ///
-    /// The child's root `JobId` is not stored here — given
-    /// `child_session_id`, callers can recover the lineage by querying
-    /// `Job` rows where `parent_job_id` matches the parent step's job.
-    Subagent {
-        child_session_id: SessionId,
-    },
 }
 
 impl StepKind {
@@ -77,7 +67,6 @@ impl StepKind {
             StepKind::MemoryRecall => "memory_recall",
             StepKind::MemoryWrite => "memory_write",
             StepKind::SkillSelection => "skill_selection",
-            StepKind::Subagent { .. } => "subagent",
         }
     }
 }
@@ -131,16 +120,6 @@ mod tests {
     #[test]
     fn compression_round_trips() {
         let s = fresh_step(StepKind::Compression);
-        let json = serde_json::to_string(&s).unwrap();
-        let back: Step = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, s);
-    }
-
-    #[test]
-    fn subagent_round_trips_with_child_refs() {
-        let s = fresh_step(StepKind::Subagent {
-            child_session_id: SessionId::from("cli-child"),
-        });
         let json = serde_json::to_string(&s).unwrap();
         let back: Step = serde_json::from_str(&json).unwrap();
         assert_eq!(back, s);

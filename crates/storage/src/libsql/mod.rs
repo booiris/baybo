@@ -126,6 +126,15 @@ impl LibsqlPool {
                     trigger_kind          TEXT NOT NULL,
                     parent_session_id     TEXT,
                     parent_job_id         TEXT,
+                    -- `ToolCall(spawn_subagent)` span on the parent
+                    -- that birthed this session, recorded so trace
+                    -- viewers can hop from the parent's span to the
+                    -- child's session and so sibling subagents from
+                    -- one parent job stay distinguishable. NULL for
+                    -- non-subagent lineage (maintenance / fork) and
+                    -- for sessions migrated from before this column
+                    -- existed.
+                    parent_span_id        TEXT,
                     lineage_kind          TEXT,
                     bound_soul_version    TEXT NOT NULL,
                     created_at            INTEGER NOT NULL,
@@ -150,6 +159,9 @@ impl LibsqlPool {
                 CREATE INDEX IF NOT EXISTS idx_sessions_parent
                     ON sessions(parent_session_id, lineage_kind)
                     WHERE lineage_kind IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_sessions_parent_span
+                    ON sessions(parent_span_id)
+                    WHERE parent_span_id IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_sessions_last_active
                     ON sessions(last_active DESC);
                 -- Partial index over normal sessions only — most listings hit
@@ -436,6 +448,23 @@ impl LibsqlPool {
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;
+
+        // Migrations for DBs created before a column was added. libsql
+        // / SQLite has no `ADD COLUMN IF NOT EXISTS`, so we attempt the
+        // ALTER and swallow the "duplicate column" error. Add new
+        // migrations to this list rather than mutating the CREATE
+        // TABLE — fresh DBs pick the column up from CREATE, existing
+        // DBs from the ALTER.
+        let migrations: &[&str] = &["ALTER TABLE sessions ADD COLUMN parent_span_id TEXT"];
+        for stmt in migrations {
+            if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(anyhow::anyhow!("migration `{stmt}` failed: {msg}"));
+                }
+            }
+        }
+
         Ok(())
     }
 }

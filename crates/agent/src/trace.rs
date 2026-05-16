@@ -3,8 +3,7 @@
 //! `tokio::sync::broadcast` bus that downstream observers (cost
 //! subscriber, TUI / Web UI) subscribe to.
 //!
-//! Replaces the legacy `TraceCollector` + `ObservabilityRecorder`
-//! split. See `docs/modules/trace.md` for the design.
+//! See `docs/modules/trace.md` for the design.
 
 use std::sync::Arc;
 

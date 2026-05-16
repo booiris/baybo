@@ -205,6 +205,8 @@ mod tests {
     async fn stub_returns_not_implemented() {
         let ctx = ToolContext {
             session_id: "t".into(),
+            job_id: aura_model::JobId::default(),
+            span_id: aura_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
