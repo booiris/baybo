@@ -60,24 +60,60 @@ impl AgentSupervisor {
         true
     }
 
+    /// Route `message` to the actor for `session_id`, spawning one via
+    /// `spawn` if no actor is registered yet. The spawn + insert step is
+    /// atomic against the actor map's shard lock, so two concurrent
+    /// callers cannot both observe a vacancy and each spawn an actor.
+    ///
+    /// `spawn` must return a freshly built mailbox sender (typically
+    /// produced by an [`crate::router::ActorSpawner`]); the supervisor
+    /// inserts it into the registry, then sends `message`. `spawn` runs
+    /// only when the entry is vacant, so callers must build the session /
+    /// derive the cancellation token before invoking — there's no
+    /// "lazy" mode that skips the work when an actor already exists.
+    ///
+    /// Returns `false` if the eventual `send().await` fails (mailbox
+    /// closed); otherwise `true`.
+    pub async fn route_or_spawn<F>(
+        &self,
+        session_id: &SessionId,
+        message: AgentMessage,
+        spawn: F,
+    ) -> bool
+    where
+        F: FnOnce() -> mpsc::Sender<AgentMessage>,
+    {
+        use dashmap::Entry;
+        let sender = match self.actors.entry(session_id.clone()) {
+            Entry::Occupied(slot) => slot.get().sender.clone(),
+            Entry::Vacant(slot) => {
+                debug!(%session_id, "registering actor");
+                let sender = spawn();
+                slot.insert(ActorHandle {
+                    sender: sender.clone(),
+                });
+                sender
+            }
+        };
+        if let Err(e) = sender.send(message).await {
+            tracing::warn!(
+                %session_id,
+                error = %e,
+                "failed to send message to actor"
+            );
+            return false;
+        }
+        true
+    }
+
     /// Atomically insert a new actor handle if no entry exists for
     /// `session_id`. Returns `Ok(())` on insert, or `Err(rejected)`
-    /// with the sender the caller tried to register — the caller is
-    /// expected to dispatch `Shutdown` on it so the orphaned actor
-    /// task exits.
+    /// with the sender the caller tried to register.
     ///
-    /// Today [`crate::router::Router`] is the sole writer, processing
-    /// incoming messages serially through its `select!`, so the
-    /// `Err` arm never trips in practice. The atomic check keeps the
-    /// invariant ("at most one handle per session_id") explicit so
-    /// any future second writer can't silently overwrite an entry.
-    ///
-    /// Caveat: [`ActorRegistryGuard`] currently removes the entry for
-    /// its `session_id` unconditionally on drop. While Router is the
-    /// sole writer that's fine; if another writer is added, the guard
-    /// must learn to compare its actor's identity against the live
-    /// entry before removing, or a race-losing duplicate could clobber
-    /// the winner on its way out.
+    /// Production code should reach for [`Self::route_or_spawn`] which
+    /// folds the build-and-register step into one atomic check; this
+    /// raw API is kept for tests and any future caller that genuinely
+    /// owns a pre-built mailbox.
     pub fn register_if_absent(
         &self,
         session_id: SessionId,
@@ -362,6 +398,84 @@ mod tests {
         // The rejected sender is returned to the caller intact —
         // still usable for dispatching `Shutdown` to its actor.
         assert_eq!(rejected.capacity(), 8);
+        assert_eq!(supervisor.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn route_or_spawn_invokes_spawn_when_absent() {
+        let supervisor = make_supervisor();
+        let session_id = SessionId::from("s-spawn");
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let spawn_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawn_calls_for_closure = Arc::clone(&spawn_calls);
+
+        let routed = supervisor
+            .route_or_spawn(&session_id, AgentMessage::Shutdown, move || {
+                spawn_calls_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tx
+            })
+            .await;
+
+        assert!(routed);
+        assert_eq!(spawn_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(supervisor.len(), 1, "spawned actor must be registered");
+        assert!(matches!(rx.try_recv(), Ok(AgentMessage::Shutdown)));
+    }
+
+    #[tokio::test]
+    async fn route_or_spawn_reuses_existing_actor() {
+        let supervisor = make_supervisor();
+        let session_id = SessionId::from("s-reuse");
+
+        let (first, mut first_rx) = mpsc::channel(8);
+        supervisor
+            .register_if_absent(session_id.clone(), first)
+            .expect("seed an existing actor");
+
+        let spawn_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawn_calls_for_closure = Arc::clone(&spawn_calls);
+
+        let routed = supervisor
+            .route_or_spawn(&session_id, AgentMessage::Shutdown, move || {
+                spawn_calls_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (rogue, _) = mpsc::channel(1);
+                rogue
+            })
+            .await;
+
+        assert!(routed);
+        assert_eq!(
+            spawn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "spawn closure must not run when an actor is already registered"
+        );
+        assert_eq!(supervisor.len(), 1);
+        // Message reaches the *pre-registered* mailbox, not a freshly
+        // built one.
+        assert!(matches!(first_rx.try_recv(), Ok(AgentMessage::Shutdown)));
+    }
+
+    #[tokio::test]
+    async fn route_or_spawn_returns_false_when_send_fails() {
+        let supervisor = make_supervisor();
+        let session_id = SessionId::from("s-closed");
+
+        let routed = supervisor
+            .route_or_spawn(&session_id, AgentMessage::Shutdown, || {
+                // Drop the receiver immediately so the freshly built
+                // sender is closed before route_or_spawn sends on it.
+                let (tx, rx) = mpsc::channel(1);
+                drop(rx);
+                tx
+            })
+            .await;
+
+        assert!(!routed, "closed mailbox must surface as routed=false");
+        // The actor handle is still inserted — the registry guard will
+        // clear it when the (hypothetical) actor task notices its
+        // mailbox closed; the supervisor itself does not roll back on
+        // send failure.
         assert_eq!(supervisor.len(), 1);
     }
 
