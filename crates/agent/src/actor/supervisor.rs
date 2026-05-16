@@ -66,7 +66,7 @@ impl AgentSupervisor {
     /// callers cannot both observe a vacancy and each spawn an actor.
     ///
     /// `spawn` must return a freshly built mailbox sender (typically
-    /// produced by an [`crate::router::ActorSpawner`]); the supervisor
+    /// produced by an [`crate::actor::router::ActorSpawner`]); the supervisor
     /// inserts it into the registry, then sends `message`. `spawn` runs
     /// only when the entry is vacant, so callers must build the session /
     /// derive the cancellation token before invoking — there's no
