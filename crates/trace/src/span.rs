@@ -78,12 +78,6 @@ pub enum SpanKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<ToolCallResult>,
     },
-    /// Inside a `StepKind::Subagent`. Carries no real execution state
-    /// — bounds the parent's wait window. The actual work runs in
-    /// `child_session_id`'s own trace tree.
-    SubagentStub {
-        child_session_id: aura_model::SessionId,
-    },
 }
 
 impl SpanKind {
@@ -91,7 +85,6 @@ impl SpanKind {
         match self {
             SpanKind::LlmCall { .. } => "llm_call",
             SpanKind::ToolCall { .. } => "tool_call",
-            SpanKind::SubagentStub { .. } => "subagent_stub",
         }
     }
 }
@@ -370,25 +363,6 @@ mod tests {
         let back: Span = serde_json::from_str(&s).unwrap();
         assert_eq!(back.parallel_group, Some(pg));
         assert_eq!(back.kind, kind);
-    }
-
-    #[test]
-    fn subagent_stub_round_trips() {
-        let span = Span {
-            id: SpanId::new(),
-            step_id: StepId::new(),
-            kind: SpanKind::SubagentStub {
-                child_session_id: aura_model::SessionId::from("cli-child"),
-            },
-            parallel_group: None,
-            started_at: Utc::now(),
-            ended_at: None,
-            outcome: LifecycleState::Pending,
-            events: vec![],
-        };
-        let s = serde_json::to_string(&span).unwrap();
-        let back: Span = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, span);
     }
 
     #[test]

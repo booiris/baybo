@@ -200,6 +200,13 @@ impl SystemTrigger {
 pub struct Lineage {
     pub parent_session_id: SessionId,
     pub parent_job_id: JobId,
+    /// The parent's `SpanId` that birthed this session. For
+    /// `Subagent`, this is the parent's `ToolCall(spawn_subagent)`
+    /// span — disambiguates sibling subagents from the same job. For
+    /// `SystemMaintenance` and `UserFork` it is `None` because those
+    /// don't originate inside a span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<crate::ids::SpanId>,
     pub kind: LineageKind,
 }
 
@@ -365,6 +372,7 @@ mod tests {
         let l = Lineage {
             parent_session_id: SessionId::from("cli-parent"),
             parent_job_id: JobId::new(),
+            parent_span_id: Some(crate::ids::SpanId::new()),
             kind: LineageKind::Subagent,
         };
         let s = serde_json::to_string(&l).unwrap();
@@ -377,6 +385,7 @@ mod tests {
         let l = Lineage {
             parent_session_id: SessionId::from("cli-source"),
             parent_job_id: JobId::new(),
+            parent_span_id: None,
             kind: LineageKind::UserFork {
                 fork_at_job_id: JobId::new(),
                 prefix_state_hash: "deadbeef".into(),
@@ -392,11 +401,31 @@ mod tests {
         let l = Lineage {
             parent_session_id: SessionId::from("user-parent"),
             parent_job_id: JobId::new(),
+            parent_span_id: None,
             kind: LineageKind::SystemMaintenance,
         };
         let s = serde_json::to_string(&l).unwrap();
         let back: Lineage = serde_json::from_str(&s).unwrap();
         assert_eq!(back, l);
+    }
+
+    #[test]
+    fn lineage_legacy_without_parent_span_id_deserialises_as_none() {
+        // Round-trip a Lineage with `parent_span_id: None` (the
+        // serialised form skips the field entirely thanks to
+        // `skip_serializing_if`), then deserialise back. Equivalent
+        // shape to any pre-`parent_span_id` row.
+        let l = Lineage {
+            parent_session_id: SessionId::from("p"),
+            parent_job_id: JobId::new(),
+            parent_span_id: None,
+            kind: LineageKind::Subagent,
+        };
+        let s = serde_json::to_string(&l).unwrap();
+        assert!(!s.contains("parent_span_id"));
+        let back: Lineage = serde_json::from_str(&s).unwrap();
+        assert!(back.parent_span_id.is_none());
+        assert_eq!(back.kind, LineageKind::Subagent);
     }
 
     #[test]

@@ -50,7 +50,7 @@ Splitting the gateway isolates blast radius: a leaked admin bearer
 token cannot read chat content or message sessions, and a sidecar
 channel plugin running as a child of the gateway has no admin surface
 to hit even if compromised. Both listeners share the same manager
-graph (`SessionManager`, `JobManager`, …); the channel listener hosts
+graph (`SessionManager`, `JobLifecycle`, …); the channel listener hosts
 the `GET /v1/channel-ws` upgrade path and nothing else, so the router
 sees a single `IncomingMessage` stream regardless of whether a given
 frame came from the built-in TUI or an out-of-process sidecar. Each
@@ -211,7 +211,7 @@ back to the registry-wide fail-closed `AutoDenyGate` for that
 ### Gateway owns its own DTOs — utoipa stays in the gateway
 
 Route handlers call the manager `pub async fn` methods directly
-(`SessionManager`, `JobManager`, `CronScheduler`, `MemoryManager`,
+(`SessionManager`, `JobLifecycle`, `CronScheduler`, `MemoryManager`,
 `TraceStore`, `SkillRegistry`, `ToolRegistry`) and serialise into DTOs
 defined in `crates/gateway/src/api/dto.rs`. CLI handler output is not
 reused — those are built around `CommandContext` + `OutputFormat` and
@@ -605,7 +605,7 @@ subcommands use it for the same reason.
   is honoured. Request spans carry a `listener` field (`admin` /
   `channel`) so the origin of each request is obvious in logs.
 - **Every mutation goes through a manager.** Route handlers call
-  `SessionManager`, `JobManager`, `CronScheduler`, `MemoryManager` and
+  `SessionManager`, `JobLifecycle`, `CronScheduler`, `MemoryManager` and
   friends directly; there are no side-channel writes that bypass
   Trace/Job observability.
 - **Singleton lock applies only to the gateway.** `start` acquires
@@ -674,7 +674,7 @@ at runtime and stored in the per-workspace vault.
 
 ## Collaboration
 
-- **agent** — provides `SessionManager`, `JobManager`, `CronScheduler`,
+- **agent** — provides `SessionManager`, `JobLifecycle`, `CronScheduler`,
   `MemoryManager`, `SecurityGateway`, `service::{ShutdownSignal,
   TaskTracker}` used by the server's graceful shutdown path.
 - **channels** — the `Channel` handle, `IncomingMessage`,

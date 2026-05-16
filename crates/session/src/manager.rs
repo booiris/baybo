@@ -235,6 +235,7 @@ impl SessionManager {
             lineage: Some(aura_model::Lineage {
                 parent_session_id: parent.id.clone(),
                 parent_job_id,
+                parent_span_id: None,
                 kind: aura_model::LineageKind::SystemMaintenance,
             }),
             bound_soul_version: parent.bound_soul_version.clone(),

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use aura_model::{SessionId, User};
+use aura_model::{JobId, SessionId, SpanId, User};
 use aura_trace::ToolEventPayload;
 use aura_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,16 @@ pub trait Tool: Send + Sync {
 /// Context injected into tool execution by the agent layer.
 pub struct ToolContext {
     pub session_id: SessionId,
+    /// Job this tool call belongs to. Tools that emit downstream work
+    /// (e.g. spawn a subagent) carry it so the spawned work can be
+    /// lineaged back to the originating job. Production wiring sources
+    /// it from the per-job context the executor opens around each tool
+    /// call.
+    pub job_id: JobId,
+    /// This tool's own `ToolCall` span id. Tools that emit downstream
+    /// work record it as `parent_span_id` so the resulting lineage
+    /// pins back to the exact span that spawned them.
+    pub span_id: SpanId,
     pub user: User,
     pub timeout: Duration,
     pub cancellation_token: tokio_util::sync::CancellationToken,

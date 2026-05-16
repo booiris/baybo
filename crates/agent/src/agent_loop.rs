@@ -6,7 +6,7 @@ use aura_job::{JobInput, JobOutput};
 use aura_llm::{
     ChatRequest, GuardedLlm, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
 };
-use aura_model::{ChatMessage, ContentBlock, JobId, Role};
+use aura_model::{ChatMessage, ContentBlock, JobId, Role, SystemSpawnRequest};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -14,9 +14,7 @@ use crate::memory::MemoryManager;
 use aura_model::Session;
 use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillRegistry, SkillSummary};
 use aura_tools::{ToolOutput, ToolRegistry};
-use aura_trace::{
-    LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanKind, StepHandle, StepKind,
-};
+use aura_trace::{LifecycleOutcome, LlmCallBegin, LlmCallResult, StepHandle, StepKind};
 use tracing::{debug, info, warn};
 
 use crate::compression::CompressionRunner;
@@ -28,10 +26,6 @@ use crate::session_log::{
     LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
 };
 use crate::soul::Soul;
-use crate::subagent::{
-    SPAWN_SUBAGENT_TOOL_NAME, SubagentExitStatus, SubagentResult, SubagentRuntime,
-    parse_spawn_request,
-};
 use crate::tool_executor::ToolExecutor;
 use crate::trace::SpanRecorder;
 use tokio_util::sync::CancellationToken;
@@ -168,13 +162,8 @@ impl aura_tools::SessionNotifier for DeltaTxNotifier {
 enum IterationOutcome {
     /// Final assistant response — caller returns this from `run_inner`.
     Final(OutgoingMessage),
-    /// LLM emitted tool calls; loop continues. `deferred_subagents`
-    /// must be dispatched as **peer** steps (each its own
-    /// `StepKind::Subagent`) after the iteration step closes — per
-    /// `trace.md`, steps cannot nest.
-    Continue {
-        deferred_subagents: Vec<(String, serde_json::Value)>,
-    },
+    /// LLM emitted tool calls; loop continues.
+    Continue,
 }
 
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
@@ -203,13 +192,6 @@ pub struct AgentLoop {
     /// from the parent actor into its maintenance children
     /// automatically.
     actor_token: CancellationToken,
-    /// Optional subagent runtime. When set, LLM `tool_use` calls
-    /// targeting `spawn_subagent` short-circuit the regular
-    /// tool_executor path and route through here. Unset →
-    /// `spawn_subagent` calls return a synthetic
-    /// `SubagentExitStatus::Failed("no subagent runtime registered")`
-    /// tool result.
-    subagent_runtime: Option<Arc<dyn SubagentRuntime>>,
     /// Optional per-session JSONL logger for LLM calls. When set, every
     /// `call_llm` invocation appends a record (request, response or
     /// error, latency, model metadata) to
@@ -221,7 +203,7 @@ pub struct AgentLoop {
     /// memory consolidation, ...) will share the same channel via
     /// other `SystemSpawnRequest` variants. `None` disables every
     /// system-trigger gate that gates on it.
-    system_spawn_tx: Option<mpsc::Sender<crate::router::SystemSpawnRequest>>,
+    system_spawn_tx: Option<mpsc::Sender<SystemSpawnRequest>>,
     /// Resolved workspace paths. Today only the summary-refresh
     /// maintenance handler reads it (to write `summary.md`); other
     /// future system handlers may want it too. `None` in tests that
@@ -264,15 +246,11 @@ pub struct AgentLoopConfig {
     /// factory derives the actor token once and threads the same
     /// handle into both this loop and the actor.
     pub actor_token: CancellationToken,
-    /// Optional subagent runtime. When set, LLM `tool_use` calls
-    /// targeting `spawn_subagent` short-circuit the regular
-    /// tool_executor path and route through here.
-    pub subagent_runtime: Option<Arc<dyn SubagentRuntime>>,
     /// Optional per-session JSONL logger for LLM calls.
     pub session_log: Option<Arc<SessionLlmLogger>>,
     /// Generic system-spawn channel sender (any
     /// `SystemSpawnRequest` variant — today background summary).
-    pub system_spawn_tx: Option<mpsc::Sender<crate::router::SystemSpawnRequest>>,
+    pub system_spawn_tx: Option<mpsc::Sender<SystemSpawnRequest>>,
     /// Workspace paths. Used by system handlers that touch on-disk
     /// state.
     pub workspace_paths: Option<Arc<aura_workspace::WorkspacePaths>>,
@@ -296,7 +274,6 @@ impl AgentLoop {
             security_gateway,
             cost_manager,
             actor_token,
-            subagent_runtime,
             session_log,
             system_spawn_tx,
             workspace_paths,
@@ -324,7 +301,6 @@ impl AgentLoop {
             error_handler: ErrorHandler::default(),
             cost_manager,
             actor_token,
-            subagent_runtime,
             session_log,
             system_spawn_tx,
             workspace_paths,
@@ -629,39 +605,10 @@ impl AgentLoop {
                         .await;
                     return Ok(msg);
                 }
-                IterationOutcome::Continue { deferred_subagents } => {
-                    // Now that the iteration step is closed, dispatch
-                    // any deferred subagent calls as peer steps. Each
-                    // invocation appends a tool_result message into
-                    // context so the next iteration's LLM call sees the
-                    // outcome.
-                    for (tool_use_id, arguments) in deferred_subagents {
-                        let raw = match self
-                            .dispatch_subagent(
-                                session,
-                                job_id,
-                                span_recorder,
-                                arguments,
-                                cancel_token.clone(),
-                            )
-                            .await
-                        {
-                            Ok(text) => text,
-                            Err(e) => format!("[spawn_subagent error: {e}]"),
-                        };
-                        let wrapped = self
-                            .security_gateway
-                            .wrap_tool_output_for_llm(SPAWN_SUBAGENT_TOOL_NAME, &raw);
-                        let tool_msg = ChatMessage {
-                            role: Role::Tool,
-                            content: vec![ContentBlock::ToolResult {
-                                tool_use_id,
-                                content: wrapped,
-                            }],
-                            from_user: false,
-                        };
-                        self.append_context_message(session, &tool_msg).await?;
-                    }
+                IterationOutcome::Continue => {
+                    // Continue to the next LLM iteration; `run_iteration`
+                    // has already appended each tool's result to the
+                    // context.
                 }
             }
         }
@@ -812,25 +759,11 @@ impl AgentLoop {
             session.state.approved_resources.clone(),
         ));
 
-        // `spawn_subagent` requests are deferred until *after* the
-        // enclosing LlmIteration step closes. Per `trace.md`, steps
-        // cannot nest — the subagent's own `StepKind::Subagent` step
-        // must run as a peer of this iteration's, not inside it. The
-        // deferred dispatch order matches the LLM's tool_use order, so
-        // the next iteration sees results in the same sequence the
-        // model produced.
-        let mut deferred_subagents: Vec<(String, serde_json::Value)> = Vec::new();
-
         for tool_call in &response.tool_calls {
             debug!(
                 tool = %tool_call.name,
                 "executing tool call"
             );
-
-            if tool_call.name == SPAWN_SUBAGENT_TOOL_NAME {
-                deferred_subagents.push((tool_call.id.clone(), tool_call.arguments.clone()));
-                continue;
-            }
 
             let tool_result = self
                 .tool_executor
@@ -936,7 +869,7 @@ impl AgentLoop {
         // Flush accumulated approvals back into session state.
         session.state.approved_resources = approved.lock().clone();
 
-        Ok(IterationOutcome::Continue { deferred_subagents })
+        Ok(IterationOutcome::Continue)
     }
 
     /// Call the LLM with retry on transient errors using `ErrorHandler`.
@@ -1346,212 +1279,6 @@ impl AgentLoop {
         }
     }
 
-    /// Dispatch one `spawn_subagent` tool_use through the subagent
-    /// runtime. Opens a dedicated `StepKind::Subagent` step + a
-    /// single `SubagentStub` span that bounds the parent's wait
-    /// window. Returns the rendered tool_result text the parent's
-    /// next LLM iteration will see.
-    async fn dispatch_subagent(
-        &self,
-        session: &Session,
-        job_id: JobId,
-        span_recorder: &Arc<SpanRecorder>,
-        arguments: serde_json::Value,
-        parent_cancel: CancellationToken,
-    ) -> anyhow::Result<String> {
-        let runtime = match self.subagent_runtime.as_ref() {
-            Some(rt) => Arc::clone(rt),
-            None => {
-                return Ok(SubagentResult {
-                    child_session_id: aura_model::SessionId::from(""),
-                    final_content: None,
-                    status: SubagentExitStatus::Failed("no subagent runtime registered".into()),
-                }
-                .to_tool_result_text());
-            }
-        };
-        let mut request = parse_spawn_request(&arguments).map_err(|e| anyhow::anyhow!(e))?;
-
-        // Q10 A3: prepend a parent-conversation summary so the child
-        // has provenance without inheriting the full transcript.
-        // Failures degrade silently.
-        match self
-            .summarize_for_subagent(session, span_recorder, job_id)
-            .await
-        {
-            Ok(Some(summary)) => {
-                request
-                    .must_include_context
-                    .insert(0, format!("Parent conversation summary:\n{summary}"));
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(error = %e, "subagent context summarization failed; spawning without it")
-            }
-        }
-
-        // Prepare the child synchronously *before* opening the
-        // Subagent step so the step kind carries the real
-        // child_session_id instead of an empty placeholder.
-        let prepared = match runtime.prepare(session, job_id, &request).await {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(SubagentResult {
-                    child_session_id: aura_model::SessionId::from(""),
-                    final_content: None,
-                    status: SubagentExitStatus::Failed(e),
-                }
-                .to_tool_result_text());
-            }
-        };
-        let child_session_id = prepared.child_session.id.clone();
-
-        // Real parent token from the agent loop's cancel tree, not a
-        // throwaway. The runtime derives a child_token() from this for
-        // its own bookkeeping; tripping our parent (via JobLifecycle::cancel)
-        // cascades into every nested subagent.
-        let result_text = crate::scope::with_step(
-            span_recorder.as_ref(),
-            job_id,
-            StepKind::Subagent {
-                child_session_id: child_session_id.clone(),
-            },
-            None,
-            |step| async move {
-                crate::scope::with_span(
-                    span_recorder.as_ref(),
-                    &step,
-                    job_id,
-                    SpanKind::SubagentStub {
-                        child_session_id: child_session_id.clone(),
-                    },
-                    None,
-                    None,
-                    |_span| async move {
-                        let result = runtime.run(prepared, request, parent_cancel).await;
-                        let outcome = match &result.status {
-                            SubagentExitStatus::Completed => LifecycleOutcome::Ok,
-                            SubagentExitStatus::Cancelled => LifecycleOutcome::Cancelled {
-                                reason: aura_job::CancelReason::ParentCancelled,
-                            },
-                            SubagentExitStatus::Failed(reason) => LifecycleOutcome::Failed {
-                                reason: reason.clone(),
-                            },
-                            SubagentExitStatus::Timeout => LifecycleOutcome::Cancelled {
-                                reason: aura_job::CancelReason::SubagentTimeout,
-                            },
-                        };
-                        Ok((SpanFinalize::Empty, outcome.clone(), (outcome, result)))
-                    },
-                )
-                .await
-                .map(|(outcome, result)| (outcome, result.to_tool_result_text()))
-            },
-        )
-        .await?;
-
-        Ok(result_text)
-    }
-
-    /// Condense the parent's recent non-system messages into a summary
-    /// for a child subagent, wrapped in a Compression step / LlmCall
-    /// span. Returns `Ok(None)` for brand-new sessions or empty LLM
-    /// output — the subagent still launches.
-    async fn summarize_for_subagent(
-        &self,
-        _session: &Session,
-        span_recorder: &Arc<SpanRecorder>,
-        job_id: JobId,
-    ) -> anyhow::Result<Option<String>> {
-        let transcript = self.context_manager.messages();
-        let has_real_history = transcript
-            .iter()
-            .any(|m| matches!(m.role, Role::Assistant | Role::Tool));
-        if !has_real_history {
-            return Ok(None);
-        }
-
-        let model_info = self.llm_client.model_info();
-        let summarize_prompt = ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text(
-                "Summarize the prior conversation into a concise briefing for a subagent. \
-                 Focus on the user's current goal, decisions already made, \
-                 outstanding questions, and constraints. Output plain prose, \
-                 no preamble."
-                    .to_string(),
-            )],
-            from_user: false,
-        };
-        let mut messages: Vec<ChatMessage> = transcript
-            .iter()
-            .filter(|m| !matches!(m.role, Role::System))
-            .cloned()
-            .collect();
-        messages.push(summarize_prompt);
-
-        let llm_call_kind = SpanKind::LlmCall {
-            begin: LlmCallBegin {
-                model_id: model_info.id.clone(),
-                provider: model_info.provider.clone(),
-                provider_config_hash: String::new(),
-                // Subagent briefing payload is built ad hoc from
-                // parent context — not part of the child's persisted
-                // transcript — so embed inline.
-                input_messages: aura_trace::LlmCallInputs::Inline(messages.clone()),
-                temperature: None,
-            },
-            result: None,
-        };
-
-        let rec = span_recorder.as_ref();
-        let llm = &self.llm_client;
-        let content = crate::scope::with_step(
-            rec,
-            job_id,
-            StepKind::Compression,
-            None,
-            |step| async move {
-                let v = crate::scope::with_span(
-                    rec,
-                    &step,
-                    job_id,
-                    llm_call_kind,
-                    None,
-                    None,
-                    |_span| async move {
-                        let request = ChatRequest {
-                            messages,
-                            temperature: None,
-                            tools: Vec::new(),
-                        };
-                        let response = llm.chat(&request).await?;
-                        let finalize = SpanFinalize::LlmCall(LlmCallResult {
-                            output_content: response.content.clone(),
-                            thinking: response.thinking.clone(),
-                            tool_calls: vec![],
-                            input_tokens: response.usage.input_tokens,
-                            output_tokens: response.usage.output_tokens,
-                            cached_input_tokens: response.usage.cached_input_tokens,
-                            cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
-                        });
-                        Ok((finalize, LifecycleOutcome::Ok, response.content))
-                    },
-                )
-                .await?;
-                Ok((LifecycleOutcome::Ok, v))
-            },
-        )
-        .await?;
-
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(trimmed.to_string()))
-        }
-    }
-
     /// Compress if the budget calls for it. The `chat` closure is
     /// invoked only when the strategy returns `NeedsLlmCall`; pure
     /// strategies (Truncate, Summarize fallback) skip it entirely. The
@@ -1719,7 +1446,7 @@ impl AgentLoop {
 
         self.context_manager
             .maybe_request_background_summary(job_done, move |payload| {
-                let request = crate::router::SystemSpawnRequest::BackgroundCompression {
+                let request = SystemSpawnRequest::BackgroundCompression {
                     parent_session_id: payload.parent_session_id.clone(),
                     parent_job_id: current_job_id,
                     parent_actor_token: actor_token,

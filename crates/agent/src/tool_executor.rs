@@ -483,6 +483,8 @@ impl ToolExecutor {
                 });
                 let ctx = ToolContext {
                     session_id: session_id.clone(),
+                    job_id,
+                    span_id: span_handle.span_id,
                     user: user.clone(),
                     timeout: effective_timeout,
                     cancellation_token: cancel_token,

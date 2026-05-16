@@ -37,6 +37,7 @@ pub mod now;
 pub(crate) mod paths;
 pub mod read;
 pub mod send_local_file;
+pub mod spawn_subagent;
 pub mod todo;
 pub mod web_fetch;
 pub mod write;
@@ -95,7 +96,7 @@ pub fn default_tools(
     tools
 }
 
-fn trusted<T: Tool + 'static>(
+pub(crate) fn trusted<T: Tool + 'static>(
     tool: T,
     capabilities: Vec<ToolCapability>,
 ) -> (Arc<dyn Tool>, ToolManifest) {

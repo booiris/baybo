@@ -805,6 +805,8 @@ mod tests {
     fn make_ctx_with_llm(workspace_root: PathBuf, stub: &Arc<StubLlm>) -> ToolContext {
         ToolContext {
             session_id: "test".into(),
+            job_id: aura_model::JobId::default(),
+            span_id: aura_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -825,6 +827,8 @@ mod tests {
     fn make_ctx_no_llm(workspace_root: PathBuf) -> ToolContext {
         ToolContext {
             session_id: "test".into(),
+            job_id: aura_model::JobId::default(),
+            span_id: aura_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -1427,6 +1431,8 @@ mod tests {
     ) -> ToolContext {
         ToolContext {
             session_id: "test".into(),
+            job_id: aura_model::JobId::default(),
+            span_id: aura_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,

@@ -98,21 +98,26 @@ impl SessionStore for LibsqlSessionStore {
             .lineage
             .as_ref()
             .map(|l| l.parent_job_id.to_string());
+        let parent_span = session
+            .lineage
+            .as_ref()
+            .and_then(|l| l.parent_span_id.as_ref().map(|s| s.to_string()));
         let lineage_kind = lineage_kind_str(session).map(|s| s.to_string());
         let is_normal = is_normal_session_flag(session);
         let hidden_flag: i64 = if session.hidden { 1 } else { 0 };
         conn.execute(
             "INSERT OR REPLACE INTO sessions \
              (id, root_session_id, trigger_kind, parent_session_id, parent_job_id, \
-              lineage_kind, bound_soul_version, created_at, last_active, \
+              parent_span_id, lineage_kind, bound_soul_version, created_at, last_active, \
               is_normal_session, hidden, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             libsql::params![
                 session.id.as_str().to_string(),
                 session.root_session_id.as_str().to_string(),
                 trigger_kind.to_string(),
                 parent_session,
                 parent_job,
+                parent_span,
                 lineage_kind,
                 session.bound_soul_version.clone(),
                 super::time::to_us(session.created_at),
@@ -1061,6 +1066,7 @@ mod tests {
             lineage: Some(Lineage {
                 parent_session_id: parent.clone(),
                 parent_job_id: fork_at,
+                parent_span_id: None,
                 kind: LineageKind::UserFork {
                     fork_at_job_id: fork_at,
                     prefix_state_hash: "hash-1".into(),

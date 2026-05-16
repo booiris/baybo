@@ -6,7 +6,8 @@
 //! completion before noticing. The registry maps `JobId →
 //! CancellationToken` for currently-executing jobs; tripping the token
 //! propagates through `AgentLoop::run`'s child tokens into
-//! `tool_executor::execute` and `LocalSubagentRuntime::spawn`.
+//! `tool_executor::execute` and the subagent dispatch path
+//! (`SubagentDispatchSink::dispatch` → `Router::handle_subagent_spawn`).
 //!
 //! The actor runs jobs serially through its mailbox, but the registry
 //! is process-wide because external callers (`/v1/jobs/{id}/cancel`,
