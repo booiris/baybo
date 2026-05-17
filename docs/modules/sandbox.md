@@ -315,24 +315,44 @@ the state directory, which is almost certainly not what the operator
 wants — that case will be addressed by the deferred `[sandbox]` config
 section.
 
-### Tempdir routing (writes outside the workspace)
+### Tempdir routing
 
-`SandboxSpec.workspace_root` is the only host path the child may write
-to (plus the bwrap tmpfs `/tmp` on Linux). To keep callers that respect
-`$TMPDIR` / `$TMP` / `$TEMP` from blowing up, the runner sets those
-variables explicitly:
+`$TMPDIR` / `$TMP` / `$TEMP` are always set to the in-sandbox `/tmp`,
+but what `/tmp` actually points at depends on the filesystem policy:
 
-- **Linux**: `TMPDIR=/tmp`, `TMP=/tmp`, `TEMP=/tmp`. The bwrap-mounted
-  tmpfs at `/tmp` is fresh per invocation and disposed when bwrap
-  exits.
-- **macOS**: the runner creates a `.aura-sandbox-XXXXXX` directory
-  under `workspace_root` for each call and points the temp env vars at
-  it. The SBPL profile allows writes only inside the workspace, so
-  even programs that ignore `$TMPDIR` and hard-code `/tmp` or
-  `/private/var/folders` will get `(deny)` from the kernel. The
-  scratch directory is removed when the call returns (best-effort —
-  `kill -9` of the gateway leaves the directory behind, recognizable
-  by the `.aura-sandbox-` prefix).
+- **`Workspace`** (used by CodeBuilder): `/tmp` is a fresh per-call
+  scratch — `--tmpfs /tmp` on bwrap, `tempdir_in(workspace_root)` on
+  macOS with `TMPDIR` pointed at it. The macOS scratch dir is removed
+  when the call returns (best-effort — `kill -9` of the gateway
+  leaves it behind, recognizable by the `.aura-sandbox-` prefix). The
+  SBPL profile still denies writes to host `/tmp` / `/private/tmp`,
+  so a CodeBuilder script that ignores `$TMPDIR` and hardcodes `/tmp`
+  gets `EPERM` from the kernel on macOS; on Linux it writes into the
+  per-call tmpfs which is disposed on exit. Either way, nothing leaks
+  out of the call.
+
+- **`Permissive`** (used by `BashTool`): `/tmp` is the host's real
+  `/tmp` — bwrap binds it with `--bind /tmp /tmp`; sandbox-exec adds
+  `/private/tmp` to the SBPL file-write\* allow block and points
+  `TMPDIR=/tmp` directly. Files written under `/tmp` persist across
+  Bash calls because the host directory itself is the persistence
+  mechanism — usually a kernel tmpfs cleared on reboot. There is **no
+  per-session isolation**: every Bash call across every session sees
+  the same `/tmp` as the host user and any other host process.
+  Credential-vault denylist entries (`~/.ssh`, `~/.aws`, …) still
+  mask in their original locations; `/tmp` is not on that list.
+
+This is a deliberate trade-off — session-scoped persistence with
+per-call namespacing was rejected because the bookkeeping (mkdir,
+chmod, sanitization, cleanup policy that aligns with "session data is
+core data") outweighed the isolation gain. Bash is already a shared,
+shell-level escape hatch; treating its `/tmp` as host-shared matches
+how a developer using `/tmp` from their own terminal already expects
+it to behave.
+
+Docker is unaffected: the Docker runner does not bind host `/tmp`
+into the container — the image's default `/tmp` layer applies and is
+disposed when the `--rm` container exits.
 
 ### DNS resolution under `--share-net`
 

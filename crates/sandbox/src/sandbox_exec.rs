@@ -12,7 +12,7 @@ use crate::SandboxRunner;
 use crate::args::{effective_pwd, render_sbpl_profile};
 use crate::bootstrap::{SandboxAvailability, locate_binary, parse_version};
 use crate::error::SandboxError;
-use crate::spec::{Backend, EnvPolicy, SandboxOutput, SandboxSpec, StdinSource};
+use crate::spec::{Backend, EnvPolicy, FilesystemPolicy, SandboxOutput, SandboxSpec, StdinSource};
 
 pub struct SandboxExecRunner {
     binary: PathBuf,
@@ -65,15 +65,28 @@ impl SandboxRunner for SandboxExecRunner {
             .as_deref()
             .and_then(|cwd| crate::workspace_symlink_mount_for(cwd, &spec.workspace_root));
         let profile = render_sbpl_profile(&spec, workspace_symlink_mount.as_ref());
-        // SBPL allows writes only inside the workspace. Carve out a
-        // per-invocation scratch dir under the workspace and route
-        // `$TMPDIR` / `$TMP` / `$TEMP` there so callers respecting those
-        // env vars stay inside the bind. The TempDir handle is held
-        // until `run()` returns; Drop removes the directory.
-        let scratch = tempfile::Builder::new()
-            .prefix(".aura-sandbox-")
-            .tempdir_in(&spec.workspace_root)?;
-        let scratch_path = scratch.path().to_path_buf();
+        // Workspace policy: SBPL allows writes only inside the
+        // workspace. Carve out a per-invocation scratch dir under
+        // the workspace and route `$TMPDIR` / `$TMP` / `$TEMP` there
+        // so callers respecting those env vars stay inside the bind.
+        // The TempDir handle is held until `run()` returns; Drop
+        // removes the directory.
+        //
+        // Permissive policy (Bash): the SBPL profile already grants
+        // RW on `/private/tmp`, matching the bwrap `--bind /tmp /tmp`
+        // shape on Linux. Skip the scratch dir and point `$TMPDIR`
+        // straight at host `/tmp` so files persist across calls and
+        // hardcoded `/tmp` writers work.
+        let (scratch_handle, tmpdir) = match &spec.filesystem_policy {
+            FilesystemPolicy::Workspace => {
+                let scratch = tempfile::Builder::new()
+                    .prefix(".aura-sandbox-")
+                    .tempdir_in(&spec.workspace_root)?;
+                let path = scratch.path().to_path_buf();
+                (Some(scratch), path)
+            }
+            FilesystemPolicy::Permissive { .. } => (None, PathBuf::from("/tmp")),
+        };
 
         let mut cmd = Command::new(&self.binary);
         cmd.arg("-p").arg(&profile);
@@ -81,9 +94,9 @@ impl SandboxRunner for SandboxExecRunner {
         cmd.arg("PATH=/usr/bin:/bin:/usr/sbin:/sbin");
         cmd.arg(format!("HOME={}", spec.workspace_root.display()));
         cmd.arg(format!("PWD={}", effective_pwd(&spec)));
-        cmd.arg(format!("TMPDIR={}", scratch_path.display()));
-        cmd.arg(format!("TMP={}", scratch_path.display()));
-        cmd.arg(format!("TEMP={}", scratch_path.display()));
+        cmd.arg(format!("TMPDIR={}", tmpdir.display()));
+        cmd.arg(format!("TMP={}", tmpdir.display()));
+        cmd.arg(format!("TEMP={}", tmpdir.display()));
         for opt in ["LANG", "LC_ALL", "TZ"] {
             if let Ok(v) = std::env::var(opt) {
                 cmd.arg(format!("{opt}={v}"));
@@ -130,8 +143,11 @@ impl SandboxRunner for SandboxExecRunner {
         let result = tokio::time::timeout(spec.timeout, wait).await;
         let elapsed = started.elapsed();
 
-        // Hold `scratch` until after the child has been awaited so the
-        // tempdir lives for the full lifetime of the sandboxed call.
+        // Hold `scratch_handle` (when present) until after the child
+        // has been awaited so the per-call tempdir lives for the full
+        // lifetime of the sandboxed call. Permissive mode has no
+        // handle (`/tmp` is the host directory; lifetime is the
+        // host's problem).
         let outcome = match result {
             Ok(Ok(out)) => Ok(SandboxOutput {
                 exit_code: out.status.code().unwrap_or(-1),
@@ -143,7 +159,7 @@ impl SandboxRunner for SandboxExecRunner {
             Ok(Err(e)) => Err(SandboxError::Io(e)),
             Err(_) => Err(SandboxError::Timeout(spec.timeout)),
         };
-        drop(scratch);
+        drop(scratch_handle);
         outcome
     }
 

@@ -84,7 +84,16 @@ pub fn build_bwrap_argv(
             push(&mut argv, "/proc");
             push(&mut argv, "--dev");
             push(&mut argv, "/dev");
-            push(&mut argv, "--tmpfs");
+            // Bind the host `/tmp` RW so files written through `$TMPDIR`
+            // survive across calls (the host directory itself is the
+            // persistence mechanism — usually a kernel tmpfs that
+            // clears on reboot). Permissive mode is the Bash tool's
+            // policy; CodeBuilder uses `Workspace` and keeps its
+            // per-call tmpfs above. There is no per-session isolation:
+            // every sandboxed Bash call sees the same `/tmp` as the
+            // host user and any other agent session.
+            push(&mut argv, "--bind");
+            push(&mut argv, "/tmp");
             push(&mut argv, "/tmp");
 
             // FHS roots stay RO so installed binaries and resolver
@@ -149,9 +158,12 @@ pub(crate) fn resolve_env(spec: &SandboxSpec) -> Vec<(String, String)> {
     let workspace = spec.workspace_root.display().to_string();
     out.push(("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()));
     out.push(("HOME".into(), workspace));
-    // Point temp env vars at the bwrap-mounted tmpfs `/tmp` so callers
-    // that respect $TMPDIR write into the disposable per-sandbox tmpfs
-    // instead of polluting the workspace bind.
+    // Point temp env vars at the in-sandbox `/tmp` so callers that
+    // respect $TMPDIR land on whatever the bwrap filesystem policy
+    // mapped there: a fresh per-call tmpfs (`Workspace`, used by
+    // CodeBuilder) or the host's `/tmp` bind (`Permissive`, used by
+    // Bash). The two policies have different persistence and isolation
+    // properties; see the bwrap branch above and `docs/modules/sandbox.md`.
     out.push(("TMPDIR".into(), "/tmp".into()));
     out.push(("TMP".into(), "/tmp".into()));
     out.push(("TEMP".into(), "/tmp".into()));
@@ -384,11 +396,17 @@ pub fn render_sbpl_profile(
             extra_root,
             denied_paths,
         } => {
-            // Allow read on the FHS-mac equivalent + workspace +
-            // extra_root; allow write on workspace + extra_root only.
-            // Then deny read+write on each sensitive subpath via
-            // last-match-wins so credential vaults stay opaque even
-            // though they sit under `extra_root`.
+            // Allow read on the FHS-mac equivalent + host /tmp +
+            // workspace + extra_root; allow write on host /tmp +
+            // workspace + extra_root. Then deny read+write on each
+            // sensitive subpath via last-match-wins so credential
+            // vaults stay opaque even though they sit under
+            // `extra_root`. Host `/tmp` (canonical `/private/tmp`) is
+            // intentionally opened so $TMPDIR-respecting callers and
+            // hardcoded `/tmp` writers both work — this matches the
+            // bwrap `--bind /tmp /tmp` policy on Linux. No per-session
+            // isolation: all sessions and other host processes see
+            // the same `/tmp`.
             s.push_str("(allow file-read*\n");
             for p in [
                 "/usr",
@@ -396,6 +414,7 @@ pub fn render_sbpl_profile(
                 "/Library",
                 "/private/var/db/dyld",
                 "/private/etc",
+                "/private/tmp",
                 "/bin",
                 "/sbin",
             ] {
@@ -415,6 +434,7 @@ pub fn render_sbpl_profile(
             s.push_str(")\n\n");
 
             s.push_str("(allow file-write*\n");
+            s.push_str("  (subpath \"/private/tmp\")\n");
             s.push_str(&format!(
                 "  (subpath \"{}\")\n",
                 sbpl_quote(&spec.workspace_root)
@@ -700,6 +720,79 @@ mod tests {
 
         // --share-net still respected via NetworkPolicy.
         assert!(strs.contains(&"--share-net".to_string()));
+    }
+
+    #[test]
+    fn bwrap_argv_permissive_binds_host_tmp_at_tmp_not_tmpfs() {
+        // Permissive mode (Bash) exposes the host's `/tmp` so files
+        // written to `/tmp` survive across Bash calls. The companion
+        // Workspace mode keeps `--tmpfs /tmp` (asserted below).
+        let mut spec = spec_for(NetworkPolicy::None, "/data/proj");
+        spec.filesystem_policy = FilesystemPolicy::Permissive {
+            extra_root: PathBuf::from("/home/agent"),
+            denied_paths: vec![],
+        };
+        let argv = build_bwrap_argv(&spec, None);
+        let strs = argv_strs(&argv);
+        assert!(
+            strs.windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/tmp" && w[2] == "/tmp"),
+            "permissive mode must bind host /tmp at /tmp: {strs:?}",
+        );
+        assert!(
+            !strs.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == "/tmp"),
+            "permissive mode must NOT --tmpfs /tmp: {strs:?}",
+        );
+    }
+
+    #[test]
+    fn bwrap_argv_workspace_keeps_tmpfs_at_tmp() {
+        // Workspace mode (CodeBuilder) stays on per-call tmpfs. The
+        // Bash-only `Permissive` swap above must not bleed into the
+        // CodeBuilder policy.
+        let argv = build_bwrap_argv(&spec_for(NetworkPolicy::None, "/tmp/ws"), None);
+        let strs = argv_strs(&argv);
+        assert!(
+            strs.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == "/tmp"),
+            "workspace mode must keep --tmpfs /tmp: {strs:?}",
+        );
+        assert!(
+            !strs.windows(3).any(|w| w[0] == "--bind" && w[2] == "/tmp"),
+            "workspace mode must NOT bind anything at /tmp: {strs:?}",
+        );
+    }
+
+    #[test]
+    fn sbpl_profile_permissive_grants_rw_on_host_tmp() {
+        // macOS counterpart of the bwrap `--bind /tmp /tmp` above.
+        // Permissive mode (Bash) must open `/private/tmp` for both
+        // read and write so `$TMPDIR=/tmp` writes succeed and
+        // hardcoded `/tmp` writers work. Workspace mode is unchanged
+        // and is covered by `sbpl_profile_writes_only_to_workspace`.
+        let mut spec = spec_for(NetworkPolicy::None, "/data/proj");
+        spec.filesystem_policy = FilesystemPolicy::Permissive {
+            extra_root: PathBuf::from("/home/agent"),
+            denied_paths: vec![],
+        };
+        let s = render_sbpl_profile(&spec, None);
+
+        let read_start = s
+            .find("(allow file-read*")
+            .expect("file-read* block must exist");
+        let read_block = &s[read_start..read_start + s[read_start..].find(")\n\n").unwrap()];
+        assert!(
+            read_block.contains("(subpath \"/private/tmp\")"),
+            "permissive read must grant /private/tmp: {read_block}",
+        );
+
+        let write_start = s
+            .find("(allow file-write*")
+            .expect("file-write* block must exist");
+        let write_block = &s[write_start..write_start + s[write_start..].find(")\n\n").unwrap()];
+        assert!(
+            write_block.contains("(subpath \"/private/tmp\")"),
+            "permissive write must grant /private/tmp: {write_block}",
+        );
     }
 
     #[test]
