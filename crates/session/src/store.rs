@@ -238,8 +238,9 @@ pub trait SessionStore: Send + Sync {
     /// `limit` rows whose `ordinal` is strictly below `before_ordinal`
     /// (or the tail of the transcript when `before_ordinal` is `None`),
     /// returned in **ascending** ordinal order. Each row is paired with
-    /// its absolute ordinal so the caller can request the next-older
-    /// page without a second lookup.
+    /// its absolute ordinal and persisted `created_at` so the caller
+    /// can both request the next-older page and render a per-message
+    /// timestamp without a second lookup.
     ///
     /// Used by the chat REST surface so a long-running session doesn't
     /// pay an O(transcript-length) round-trip on every initial load;
@@ -249,7 +250,7 @@ pub trait SessionStore: Send + Sync {
         session_id: &SessionId,
         before_ordinal: Option<i64>,
         limit: usize,
-    ) -> Result<Vec<(i64, ChatMessage)>>;
+    ) -> Result<Vec<(i64, DateTime<Utc>, ChatMessage)>>;
 
     /// Forward catch-up slice: the next at most `limit` active rows
     /// whose `ordinal` is strictly **greater than** `after_ordinal`,

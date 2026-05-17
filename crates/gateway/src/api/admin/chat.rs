@@ -72,6 +72,18 @@ pub const DEFAULT_HISTORY_LIMIT: usize = 50;
 /// whole transcript by passing `limit=999999`.
 pub const MAX_HISTORY_LIMIT: usize = 200;
 
+/// How far back to scan when fetching each session's sidebar preview.
+/// A typical conversation alternates user / assistant, so the most-
+/// recent user row is usually within the last couple of messages — but
+/// trailing assistant tool-only turns can push it further. Ten rows
+/// covers realistic shapes without paying a deep walk on long sessions.
+const PREVIEW_SCAN_DEPTH: usize = 10;
+
+/// Maximum length of the truncated preview the sidebar shows for each
+/// session. Sized to fit a 260px-wide sidebar row at the web client's
+/// font without wrapping; the client may truncate further with CSS.
+const PREVIEW_MAX_CHARS: usize = 120;
+
 /// Query string for `GET /v1/chat/sessions/{session_id}`. Reverse-
 /// paginates the active transcript: the response carries the
 /// most-recent slice, and the client walks backward by setting
@@ -131,6 +143,14 @@ pub struct ChatTranscriptItem {
     /// `true` when this row had non-text content (image / audio /
     /// file). The web client currently shows a placeholder.
     pub has_attachments: bool,
+    /// Wall-clock time the row was persisted, sourced from
+    /// `session_messages.created_at`. Lets the client render a
+    /// per-message timestamp without a second lookup. Live WS frames
+    /// don't carry this — the web client falls back to the receive
+    /// time for those, which is close enough for live emissions and
+    /// drifts only on catch-up replays (where the row is also
+    /// reachable via the REST history surface with the real value).
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -161,6 +181,14 @@ pub struct ChatSessionSummary {
     /// `include_hidden=true` was requested.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden: bool,
+    /// Preview text drawn from the session's most-recent user-authored
+    /// message, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar
+    /// renders this as the row label so users can scan past
+    /// conversations by what they last asked. `None` for sessions
+    /// without a user turn yet (a freshly-created row, or one whose
+    /// transcript holds only system/tool rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_user_text: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -256,14 +284,34 @@ async fn list_sessions(
         .list_by_channel(&ChannelType::http())
         .await
         .map_err(|e| GatewayError::Internal(format!("list sessions: {e}")))?;
-    let items: Vec<ChatSessionSummary> = scoped
+    let visible: Vec<Session> = scoped
         .into_iter()
         .filter(|s| query.include_hidden || !s.hidden)
-        .map(|s| ChatSessionSummary {
+        .collect();
+    // Fan out the per-session preview fetch — each row needs its own
+    // reverse-tail walk against `session_messages`, which is cheap
+    // individually (back-of-the-index walk capped at
+    // `PREVIEW_SCAN_DEPTH` rows) but adds up serially when a tab has
+    // dozens of conversations open. `join_all` runs the libsql queries
+    // concurrently against the shared connection pool. A preview that
+    // fails to load is dropped to `None` rather than failing the whole
+    // list — the sidebar still renders the row, just without a
+    // preview, and the next list refresh will retry.
+    let previews = futures::future::join_all(visible.iter().map(|s| {
+        let manager = state.session_manager.clone();
+        let sid = s.id.clone();
+        async move { last_user_preview(&manager, &sid).await }
+    }))
+    .await;
+    let items: Vec<ChatSessionSummary> = visible
+        .into_iter()
+        .zip(previews)
+        .map(|(s, last_user_text)| ChatSessionSummary {
             session_id: s.id.to_string(),
             created_at: s.created_at,
             last_active: s.last_active,
             hidden: s.hidden,
+            last_user_text,
         })
         .collect();
     Ok(Json(ChatSessionsList { items }))
@@ -325,7 +373,9 @@ async fn get_session(
     // WS-replayed one agree on what's a user-visible bubble.
     let transcript = tail
         .into_iter()
-        .filter_map(|(ordinal, msg)| chat_to_transcript_item(ordinal, msg))
+        .filter_map(|(ordinal, created_at, msg)| {
+            chat_to_transcript_item(ordinal, created_at, msg)
+        })
         .collect();
     Ok(Json(ChatSessionDetail {
         session_id,
@@ -551,7 +601,61 @@ pub(crate) fn broadcast_session_patch(
     }
 }
 
-fn chat_to_transcript_item(ordinal: i64, msg: ChatMessage) -> Option<ChatTranscriptItem> {
+/// Fetch the most-recent user-authored text for `session_id` and shape
+/// it into the sidebar preview the list endpoint serves. Returns
+/// `None` when the session has no user turn yet, when the user turn's
+/// content is media-only, or when the underlying tail query fails —
+/// the sidebar treats all three as "no preview" rather than surfacing
+/// an error, so a single bad row never breaks the whole list. Walks
+/// at most [`PREVIEW_SCAN_DEPTH`] rows back; deeper user turns
+/// (e.g. a session whose recent activity is purely tool churn) fall
+/// off the window and are accepted as missing rather than chased.
+async fn last_user_preview(
+    manager: &aura_session::SessionManager,
+    session_id: &SessionId,
+) -> Option<String> {
+    let tail = manager
+        .history_tail(session_id, None, PREVIEW_SCAN_DEPTH)
+        .await
+        .ok()?;
+    // `history_tail` returns ascending; iterate in reverse so we hit
+    // the freshest user row first and stop scanning the moment we
+    // find it.
+    for (_ord, created_at, msg) in tail.into_iter().rev() {
+        if !matches!(msg.role, Role::User) || !msg.from_user {
+            continue;
+        }
+        let item = chat_to_transcript_item(0, created_at, msg)?;
+        if item.text.is_empty() {
+            return None;
+        }
+        return Some(truncate_preview(&item.text));
+    }
+    None
+}
+
+/// Collapse whitespace and clip to [`PREVIEW_MAX_CHARS`] for the
+/// sidebar preview. Newlines and runs of spaces would render as a
+/// single line in the sidebar's truncating row anyway, so we collapse
+/// them here rather than ship the raw multi-line text just to have
+/// the client throw the structure away.
+fn truncate_preview(text: &str) -> String {
+    let collapsed: String = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.chars().count() <= PREVIEW_MAX_CHARS {
+        return collapsed;
+    }
+    let cut: String = collapsed.chars().take(PREVIEW_MAX_CHARS).collect();
+    format!("{cut}…")
+}
+
+fn chat_to_transcript_item(
+    ordinal: i64,
+    created_at: DateTime<Utc>,
+    msg: ChatMessage,
+) -> Option<ChatTranscriptItem> {
     // Same gate as `channel::route::chat_to_visible_wire_message` —
     // see that fn for why each excluded variant doesn't belong on the
     // chat surface.
@@ -589,5 +693,6 @@ fn chat_to_transcript_item(ordinal: i64, msg: ChatMessage) -> Option<ChatTranscr
         role: role.to_owned(),
         text,
         has_attachments,
+        created_at,
     })
 }

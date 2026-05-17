@@ -50,6 +50,14 @@ interface TranscriptRow {
    *  echo matches against. Unset on rows that didn't originate from
    *  this tab's composer. */
   clientMsgId?: string;
+  /** ISO timestamp the bubble renders next to the message. For
+   *  REST-loaded history rows this is the persisted
+   *  `session_messages.created_at`; for live WS frames (the wire
+   *  shape doesn't carry it) it's the receive time, which is close
+   *  enough for genuine live emissions and drifts only on catch-up
+   *  replays — those rows are also reachable via the REST history
+   *  surface with the real value once the page refetches. */
+  createdAt?: string;
 }
 
 interface PendingApproval {
@@ -81,6 +89,13 @@ interface SessionSummary {
    *  currently viewing because activity for foreground sessions
    *  doesn't bump. */
   unread: number;
+  /** Preview text the sidebar row renders — the session's most-recent
+   *  user-authored message, truncated server-side. `undefined` for
+   *  brand-new sessions with no user turn yet, and for sessions whose
+   *  preview fetch failed on the list call. Updated locally on send
+   *  and on inbound `Frame::UserEcho` so the row reflects the latest
+   *  prompt without a list refetch. */
+  last_user_text?: string;
 }
 
 /**
@@ -260,6 +275,7 @@ export function ChatPage() {
         created_at: s.created_at,
         last_active: s.last_active,
         unread: 0,
+        last_user_text: s.last_user_text ?? undefined,
       }));
       setSessions(existing);
       setSlashCommands(manifest?.items ?? []);
@@ -433,7 +449,7 @@ export function ChatPage() {
           default:
             break;
         }
-        routeInboundFrame(frame, setViews, lastConnectedAtRef.current);
+        routeInboundFrame(frame, setViews, setSessions, lastConnectedAtRef.current);
       },
       onTokenRejected: (reason) => onTokenRejectedRef.current?.(reason),
       onReset: (reason) => {
@@ -564,11 +580,20 @@ export function ChatPage() {
   // parked at the bottom. Otherwise raise the "new messages" pill so
   // they can opt back in. useLayoutEffect runs before paint so we read
   // fresh scrollHeight.
+  //
+  // `instant` (the default behavior) not `smooth` — when first landing
+  // on a session, the history fetch resolves and React commits the
+  // populated transcript, and we want the first paint to already be at
+  // the bottom rather than scrolling past every message on the way
+  // down. Same for streaming deltas: each delta would otherwise queue
+  // another smooth animation, which compounds into visible jitter as
+  // the bubble grows. The user-initiated `jumpToLatest` (below) keeps
+  // smooth — that one IS a discrete "take me there" gesture.
   useLayoutEffect(() => {
     const scroller = transcriptScrollRef.current;
     if (!scroller) return;
     if (pinnedToBottomRef.current) {
-      transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      scroller.scrollTop = scroller.scrollHeight;
       setHasNewBelow(false);
     } else {
       setHasNewBelow(true);
@@ -745,11 +770,18 @@ export function ChatPage() {
                 text: trimmed,
                 pending: true,
                 clientMsgId,
+                createdAt: new Date().toISOString(),
               },
             ],
           },
         };
       });
+      // Update the sidebar row's preview optimistically — the server
+      // will repeat the truth in the UserEcho frame (which also flows
+      // into setSessions via applySessionUserText), but reflecting it
+      // here keeps the sidebar in lockstep with the bubble the user
+      // just dropped.
+      setSessions((prev) => applySessionUserText(prev, sessionId, trimmed));
       wsRef.current.sendMessage({
         sessionId,
         userId: 'web-operator',
@@ -926,24 +958,28 @@ export function ChatPage() {
       {/* Main column */}
       <main className="flex-1 flex flex-col overflow-hidden relative">
         <header className="h-12 px-4 border-b-2 border-black flex items-center justify-between gap-3 bg-white">
-          <div className="flex items-baseline gap-2 min-w-0">
-            <span className="font-bold text-sm truncate" title={sessionId ?? undefined}>
-              {sessionTitle(currentView.transcript)}
-            </span>
+          <div className="flex items-baseline gap-2 min-w-0 flex-1">
             {sessionId ? (
-              <span className="font-mono text-[0.7rem] text-ink-soft shrink-0">
-                {shortId(sessionId)}
+              <span
+                className="font-mono text-xs text-ink select-all break-all"
+                title={sessionId}
+              >
+                <span className="text-ink-soft select-none mr-1">session id:</span>
+                {sessionId}
               </span>
-            ) : null}
+            ) : (
+              <span className="font-bold text-sm text-ink-soft">No session</span>
+            )}
           </div>
           <ConnectionBadge status={status} />
         </header>
 
         <div className="flex-1 flex flex-col overflow-hidden relative xl:pr-[260px]">
+        <div className="flex-1 flex justify-center min-h-0 relative">
         <div
           ref={transcriptScrollRef}
           onScroll={handleTranscriptScroll}
-          className="relative flex-1 overflow-auto px-6 py-4"
+          className="relative w-full max-w-6xl overflow-auto px-6 py-4"
         >
           {currentView.historyLoading ? (
             <div className="flex justify-center py-12 text-ink-soft">
@@ -952,7 +988,7 @@ export function ChatPage() {
           ) : currentView.transcript.length === 0 && !currentView.pendingApproval ? (
             <WelcomeEmpty slashCommands={slashCommands} onPick={handleComposerChange} />
           ) : (
-            <div className="max-w-5xl mx-auto flex flex-col gap-3">
+            <div className="flex flex-col gap-3">
               {currentView.olderLoading ? (
                 <div className="flex justify-center py-2 text-ink-soft">
                   <RiLoader4Line className="text-xl animate-spin" />
@@ -976,6 +1012,7 @@ export function ChatPage() {
             </div>
           )}
         </div>
+        </div>
 
         {hasNewBelow ? (
           <button
@@ -989,9 +1026,10 @@ export function ChatPage() {
           </button>
         ) : null}
 
+        <div className="bg-canvas border-t-2 border-black max-w-6xl mx-auto w-full">
         <form
           onSubmit={handleSend}
-          className="border-t-2 border-black bg-canvas px-4 pt-3 pb-6 mb-[calc(14vh-131px)] max-w-3xl mx-auto w-full"
+          className="bg-canvas px-4 pt-3 pb-6 mb-[calc(14vh-131px)] max-w-3xl mx-auto w-full"
         >
           <div className="relative border-2 border-black rounded-md bg-white shadow-brutal-sm focus-within:shadow-brutal transition-shadow">
             {filteredSlash.length > 0 ? (
@@ -1057,6 +1095,7 @@ export function ChatPage() {
           </div>
         </form>
         </div>
+        </div>
       </main>
     </div>
   );
@@ -1073,6 +1112,7 @@ export function ChatPage() {
 function routeInboundFrame(
   frame: Frame,
   setViews: React.Dispatch<React.SetStateAction<Record<string, SessionView>>>,
+  setSessions: React.Dispatch<React.SetStateAction<SessionSummary[]>>,
   lastConnectedAt: number,
 ): void {
   switch (frame.kind) {
@@ -1113,6 +1153,18 @@ function routeInboundFrame(
       //   would sit alongside the replay forever.
       if (frame.ordinal !== undefined) {
         const replayKey = `hist-${sid}-${frame.ordinal}`;
+        // Replays arrive ascending so iteratively overwriting the
+        // sidebar preview converges on the freshest user turn — the
+        // disconnect window may have hidden a sibling-tab send that
+        // the bootstrap snapshot also missed.
+        if (role === 'user') {
+          const preview = frame.content.trim().length > 0
+            ? frame.content
+            : ((frame.attachments?.length ?? 0) > 0 ? '[attachment]' : '');
+          if (preview) {
+            setSessions((prev) => applySessionUserText(prev, sid, preview));
+          }
+        }
         setViews((prev) => {
           const view = prev[sid] ?? EMPTY_VIEW;
           if (view.transcript.some((r) => r.key === replayKey)) return prev;
@@ -1121,7 +1173,16 @@ function routeInboundFrame(
             const last = view.transcript[lastIdx];
             if (last?.streaming && last.role === 'assistant') {
               const next = view.transcript.slice();
-              next[lastIdx] = { key: replayKey, role: 'assistant', text: frame.content };
+              // Preserve the streaming row's `createdAt` (stamped at
+              // first Delta) — the persisted Message replay is the
+              // same logical bubble, the user just saw it earlier.
+              next[lastIdx] = {
+                ...last,
+                key: replayKey,
+                role: 'assistant',
+                text: frame.content,
+                streaming: false,
+              };
               return { ...prev, [sid]: { ...view, transcript: next } };
             }
           }
@@ -1131,7 +1192,13 @@ function routeInboundFrame(
             );
             if (matchIdx >= 0) {
               const next = view.transcript.slice();
-              next[matchIdx] = { key: replayKey, role: 'user', text: frame.content };
+              next[matchIdx] = {
+                ...view.transcript[matchIdx],
+                key: replayKey,
+                role: 'user',
+                text: frame.content,
+                pending: false,
+              };
               return { ...prev, [sid]: { ...view, transcript: next } };
             }
           }
@@ -1176,7 +1243,12 @@ function routeInboundFrame(
               ...view,
               transcript: [
                 ...view.transcript,
-                { key: replayKey, role, text: frame.content },
+                {
+                  key: replayKey,
+                  role,
+                  text: frame.content,
+                  createdAt: new Date().toISOString(),
+                },
               ],
             },
           };
@@ -1193,6 +1265,19 @@ function routeInboundFrame(
       // updater because state setters are batched — checking outside
       // can't observe whether the updater found a match.
       const hasAttachments = (frame.attachments?.length ?? 0) > 0;
+      // Sidebar preview tracks the freshest user-authored text, so
+      // every live user echo (whether this tab sent it or a sibling
+      // did) feeds the sidebar — including the attachment-only case,
+      // where the placeholder string mirrors the bubble's "[attachment]"
+      // fallback so the row doesn't go blank on a media-only send.
+      if (role === 'user') {
+        const preview = frame.content.trim().length > 0
+          ? frame.content
+          : (hasAttachments ? '[attachment]' : '');
+        if (preview) {
+          setSessions((prev) => applySessionUserText(prev, sid, preview));
+        }
+      }
       if (role === 'user' && frame.platform_msg_id) {
         const clientMsgId = frame.platform_msg_id;
         setViews((prev) => {
@@ -1340,6 +1425,11 @@ function appendStreamingDelta(prev: TranscriptRow[], text: string): TranscriptRo
   if (last?.streaming && last.role === 'assistant') {
     return [...prev.slice(0, -1), { ...last, text: last.text + text }];
   }
+  // Stamp `createdAt` at the moment the assistant starts streaming —
+  // not when the final Message lands — so the timestamp the user sees
+  // matches when the bubble actually appeared in their view rather
+  // than the persistence-time clock skew of "Message arrives a few
+  // hundred ms after the last delta".
   return [
     ...prev,
     {
@@ -1347,6 +1437,7 @@ function appendStreamingDelta(prev: TranscriptRow[], text: string): TranscriptRo
       role: 'assistant',
       text,
       streaming: true,
+      createdAt: new Date().toISOString(),
     },
   ];
 }
@@ -1379,6 +1470,7 @@ function finalizeMessage(
       role,
       text: content,
       hasAttachments: hasAttachments || undefined,
+      createdAt: new Date().toISOString(),
     },
   ];
 }
@@ -1395,11 +1487,8 @@ function roleFromString(role: string): 'user' | 'assistant' | 'system' {
   return 'assistant';
 }
 
-function shortId(id: string): string {
-  return id.length > 16 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
-}
-
 interface HistoryRowDto {
+  created_at: string;
   ordinal: number;
   role: string;
   text: string;
@@ -1416,6 +1505,7 @@ function historyRowToTranscript(sessionId: string, row: HistoryRowDto): Transcri
     role: roleFromString(row.role),
     text: row.text,
     hasAttachments: row.has_attachments,
+    createdAt: row.created_at,
   };
 }
 
@@ -1476,6 +1566,7 @@ function applySessionPatch(
     created_at: patch.created_at ?? current.created_at,
     last_active: patch.last_active ?? current.last_active,
     unread: current.unread,
+    last_user_text: current.last_user_text,
   };
   if (
     merged.created_at === current.created_at &&
@@ -1522,13 +1613,66 @@ function sortByLastActiveDesc(list: SessionSummary[]): SessionSummary[] {
     .sort((a, b) => Date.parse(b.last_active) - Date.parse(a.last_active));
 }
 
-/** First user message, truncated, as the conversation's display title.
- *  Falls back to a placeholder when the session is still empty. */
-function sessionTitle(transcript: TranscriptRow[]): string {
-  const firstUser = transcript.find((r) => r.role === 'user' && r.text);
-  if (!firstUser) return 'New conversation';
-  const oneLine = firstUser.text.replace(/\s+/g, ' ').trim();
-  return oneLine.length > 80 ? `${oneLine.slice(0, 80)}…` : oneLine;
+/** Soft cap on the sidebar preview length. Mirrors `PREVIEW_MAX_CHARS`
+ *  on the gateway side — server-supplied previews already arrive
+ *  pre-truncated, but local updates (this tab's send, sibling tab's
+ *  UserEcho) go through this so the row stays at the same width
+ *  regardless of which path filled it. */
+const PREVIEW_MAX_CHARS = 120;
+
+/** Replace `session_id`'s preview text with the freshest user turn.
+ *  Collapses whitespace + truncates to mirror the server's
+ *  `truncate_preview`. Returns `prev` unchanged when the target row
+ *  isn't in the list (sidebar dropped it via hide, or the activity
+ *  raced ahead of Created) — Created arrives separately and seeds the
+ *  row, and the next list refresh will reseed the preview. */
+function applySessionUserText(
+  prev: SessionSummary[],
+  sessionId: string,
+  text: string,
+): SessionSummary[] {
+  const idx = prev.findIndex((s) => s.session_id === sessionId);
+  if (idx === -1) return prev;
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  if (!collapsed) return prev;
+  const truncated =
+    collapsed.length > PREVIEW_MAX_CHARS
+      ? `${collapsed.slice(0, PREVIEW_MAX_CHARS)}…`
+      : collapsed;
+  if (prev[idx].last_user_text === truncated) return prev;
+  const next = prev.slice();
+  next[idx] = { ...prev[idx], last_user_text: truncated };
+  return next;
+}
+
+/** `HH:MM` for messages from today, `MM-DD HH:MM` for older rows.
+ *  Keeps each bubble's timestamp short enough to sit next to a
+ *  280px-wide bubble without wrapping, while still disambiguating
+ *  long sessions that span multiple days. */
+function formatTimestampShort(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  const now = new Date();
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  if (sameDay) return hm;
+  return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${hm}`;
+}
+
+/** Full date + time for the bubble's hover tooltip — locale-formatted
+ *  so users in different time zones see something they recognize
+ *  rather than the wire ISO. */
+function formatTimestampTooltip(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString();
+}
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : `${n}`;
 }
 
 /** Compact human-readable age. Same shape the logs page uses, kept
@@ -1576,9 +1720,12 @@ function SessionRow({
     >
       <div className="flex items-center gap-2">
         <span
-          className={`text-sm font-bold flex-1 truncate ${active ? 'text-white' : 'text-ink'}`}
+          className={`text-sm font-bold flex-1 truncate ${
+            active ? 'text-white' : 'text-ink'
+          } ${session.last_user_text ? '' : 'italic opacity-70'}`}
+          title={session.last_user_text ?? undefined}
         >
-          {relativeAge(session.last_active)}
+          {session.last_user_text ?? 'New conversation'}
         </span>
         {showUnread ? (
           <span
@@ -1611,11 +1758,11 @@ function SessionRow({
         </button>
       </div>
       <div
-        className={`mt-0.5 font-mono text-[0.7rem] truncate ${
+        className={`mt-0.5 font-mono text-[0.65rem] ${
           active ? 'text-white/70' : 'text-ink-soft'
         }`}
       >
-        {shortId(session.session_id)}
+        {relativeAge(session.last_active)}
       </div>
     </Link>
   );
@@ -1640,7 +1787,7 @@ function MessageBubble({ row }: { row: TranscriptRow }) {
   const isUser = row.role === 'user';
   const body = row.text || (row.hasAttachments ? '[attachment]' : '');
   return (
-    <div className={`group flex ${isUser ? 'justify-end' : 'justify-start'}`}>
+    <div className={`group flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
       <div className="relative max-w-2xl">
         <div
           className={`border-2 border-black rounded-md px-3 py-2 font-mono text-sm whitespace-pre-wrap transition-opacity ${
@@ -1660,6 +1807,14 @@ function MessageBubble({ row }: { row: TranscriptRow }) {
         ) : null}
         {!isUser && !row.streaming && body ? <CopyButton text={body} /> : null}
       </div>
+      {row.createdAt ? (
+        <span
+          className="mt-1 px-1 font-mono text-[0.65rem] text-ink-soft tabular-nums"
+          title={formatTimestampTooltip(row.createdAt)}
+        >
+          {formatTimestampShort(row.createdAt)}
+        </span>
+      ) : null}
     </div>
   );
 }
