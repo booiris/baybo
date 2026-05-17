@@ -18,23 +18,21 @@ use aura_agent::{
     soul::Soul,
     tool_executor::ToolExecutor,
 };
-use aura_cost::{CostManager, SpendingLimits, cost_call_guard};
 use aura_channels::{AgentOutput, IncomingMessage, Message};
 use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, budget::TokenBudget};
+use aura_cost::test_support::MemoryCostStore;
+use aura_cost::{CostManager, SpendingLimits, cost_call_guard};
 use aura_job::JobLifecycle;
 use aura_job::test_support::MemoryJobStore;
 use aura_llm::test_support::StubLlm;
 use aura_llm::{LlmCompletion, ModelPricing};
-use aura_memory::MemoryManager;
-use aura_memory::test_support::MemoryMemoryStore;
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, Session, User};
+use aura_security::test_support::MemorySecretStore;
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
-use aura_cost::test_support::MemoryCostStore;
-use aura_security::test_support::MemorySecretStore;
+use aura_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
 use aura_trace::test_support::MemoryTraceStore;
 use aura_trace::{SpanRecorder, TraceEventStream, TraceStore};
-use aura_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
 use chrono::Utc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -61,7 +59,6 @@ pub struct AgentTestHarness {
     pub job_store: Arc<MemoryJobStore>,
     pub cost_store: Arc<MemoryCostStore>,
     pub trace_store: Arc<MemoryTraceStore>,
-    pub memory_store: Arc<MemoryMemoryStore>,
     pub tool_registry: Arc<ToolRegistry>,
     pub skill_registry: Arc<SkillRegistry>,
     pub cost_manager: Arc<CostManager>,
@@ -286,7 +283,6 @@ impl AgentTestHarnessBuilder {
         let job_store = Arc::new(MemoryJobStore::new());
         let cost_store = Arc::new(MemoryCostStore::new());
         let trace_store = Arc::new(MemoryTraceStore::new());
-        let memory_store = Arc::new(MemoryMemoryStore::new());
 
         let job_lifecycle = Arc::new(JobLifecycle::new(share_job_store(&job_store)));
         // One shared bus per harness — the recorder publishes into it
@@ -318,9 +314,6 @@ impl AgentTestHarnessBuilder {
         }
         let tool_registry = Arc::new(tool_registry);
         let skill_registry = Arc::new(SkillRegistry::new());
-        let memory_manager = Arc::new(MemoryManager::without_embedder(share_memory_store(
-            &memory_store,
-        )));
         let approval_gates = Arc::new(ApprovalGateMap::new());
         let tool_executor = Arc::new(ToolExecutor::new(
             tool_registry.clone(),
@@ -397,7 +390,6 @@ impl AgentTestHarnessBuilder {
             skill_registry: skill_registry.clone(),
             tool_executor: tool_executor.clone(),
             context_manager,
-            memory_manager,
             max_iterations: 20,
             soul,
             security_gateway: gateway.clone(),
@@ -433,7 +425,6 @@ impl AgentTestHarnessBuilder {
             job_store,
             cost_store,
             trace_store,
-            memory_store,
             tool_registry,
             skill_registry,
             cost_manager,
@@ -449,20 +440,15 @@ impl AgentTestHarnessBuilder {
 // --- Helpers to obtain `Box<dyn Trait>` handles from `Arc<Concrete>` ---
 //
 // Each in-memory store is constructed once as an `Arc` and shared
-// directly with the managers — `JobLifecycle`, `CostManager`, and
-// `MemoryManager` all accept `Arc<dyn Trait>`, so the test handle and the
-// manager-owned handle point at the same instance and post-run
-// assertions see real state.
+// directly with the managers — `JobLifecycle` and `CostManager` accept
+// `Arc<dyn Trait>`, so the test handle and the manager-owned handle
+// point at the same instance and post-run assertions see real state.
 
 fn share_job_store(arc: &Arc<MemoryJobStore>) -> Arc<dyn aura_job::JobStore> {
     arc.clone()
 }
 
 fn share_cost_store(arc: &Arc<MemoryCostStore>) -> Arc<dyn aura_cost::CostStore> {
-    arc.clone()
-}
-
-fn share_memory_store(arc: &Arc<MemoryMemoryStore>) -> Arc<dyn aura_memory::MemoryStore> {
     arc.clone()
 }
 

@@ -1,7 +1,9 @@
 //! Long-term memory subsystem — domain types live in `aura-model`
 //! (`MemoryEntry`, `MemoryCategory`). This crate owns the
 //! `MemoryStore` trait and the `MemoryManager` business-logic facade
-//! (recall, store, dedup, importance, embedding hook).
+//! (list/search/store/delete/importance) used by the admin REST surface.
+//! There is currently no automatic recall or auto-store path; the agent
+//! loop does not consult this subsystem.
 //!
 //! `aura-storage` provides the libsql implementation of `MemoryStore`;
 //! the trait itself lives here so downstream callers and tests can
@@ -15,7 +17,7 @@ mod store;
 pub mod test_support;
 
 pub use error::MemoryError;
-pub use manager::{EmbeddingModel, MemoryManager};
+pub use manager::MemoryManager;
 pub use store::MemoryStore;
 
 pub type Result<T> = std::result::Result<T, MemoryError>;

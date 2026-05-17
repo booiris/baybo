@@ -10,22 +10,23 @@ use aura_model::{ChatMessage, ContentBlock, JobId, Role, SystemSpawnRequest};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use aura_memory::MemoryManager;
 use aura_model::Session;
 use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillRegistry, SkillSummary};
 use aura_tools::{ToolOutput, ToolRegistry};
-use aura_trace::{LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind};
+use aura_trace::{
+    LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
+};
 use tracing::{debug, info, warn};
 
 use crate::runtime::compression::CompressionRunner;
 use crate::runtime::error_recovery::ErrorHandler;
 use crate::runtime::scope::JobSpec;
-use crate::security::SecurityGateway;
 use crate::runtime::session_log::{
     LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
 };
 use crate::runtime::soul::Soul;
 use crate::runtime::tool_executor::ToolExecutor;
+use crate::security::SecurityGateway;
 use tokio_util::sync::CancellationToken;
 
 /// The maximum amount of text we'll hold in the streaming buffer waiting
@@ -175,7 +176,6 @@ pub struct AgentLoop {
     skill_registry: Arc<SkillRegistry>,
     tool_executor: Arc<ToolExecutor>,
     context_manager: ContextManager,
-    memory_manager: Arc<MemoryManager>,
     max_iterations: usize,
     soul: Soul,
     security_gateway: Arc<SecurityGateway>,
@@ -234,7 +234,6 @@ pub struct AgentLoopConfig {
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
     pub context_manager: ContextManager,
-    pub memory_manager: Arc<MemoryManager>,
     pub max_iterations: usize,
     pub soul: Soul,
     pub security_gateway: Arc<SecurityGateway>,
@@ -266,7 +265,6 @@ impl AgentLoop {
             skill_registry,
             tool_executor,
             context_manager,
-            memory_manager,
             max_iterations,
             soul,
             security_gateway,
@@ -292,7 +290,6 @@ impl AgentLoop {
             skill_registry,
             tool_executor,
             context_manager,
-            memory_manager,
             max_iterations,
             soul,
             security_gateway,
@@ -401,28 +398,6 @@ impl AgentLoop {
                 channel: session.channel.clone(),
             }) as Arc<dyn aura_tools::SessionNotifier>
         });
-
-        // Recall relevant memories
-        let memories = self
-            .memory_manager
-            .recall(&session.user.id, &user_content)
-            .await?;
-        if !memories.is_empty() {
-            debug!(count = memories.len(), "recalled memories");
-            let memory_text: String = memories
-                .iter()
-                .map(|m| m.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let memory_msg = ChatMessage {
-                role: Role::System,
-                content: vec![ContentBlock::Text(format!(
-                    "[Memory Context]\n{memory_text}"
-                ))],
-                from_user: false,
-            };
-            self.append_context_message(session, &memory_msg).await?;
-        }
 
         let user_text = aura_llm::multimodal::extract_text(&user_content);
         let skills_for_turn = if self.skill_registry.is_empty() {
@@ -700,11 +675,6 @@ impl AgentLoop {
                 from_user: false,
             };
             let ordinal = self.append_context_message(session, &assistant_msg).await?;
-
-            // Maybe store memory.
-            if let Err(e) = self.memory_manager.maybe_store(session, &final_text).await {
-                warn!(error = %e, "failed to auto-store memory");
-            }
 
             return Ok(IterationOutcome::Final(OutgoingMessage {
                 session_id: session.id.clone(),
@@ -1519,8 +1489,11 @@ impl AgentLoop {
             parent_job_id: session.lineage.as_ref().map(|l| l.parent_job_id),
         };
 
-        let result =
-            crate::runtime::scope::with_job(job_lifecycle, cancel_token.clone(), spec, move |job_id| {
+        let result = crate::runtime::scope::with_job(
+            job_lifecycle,
+            cancel_token.clone(),
+            spec,
+            move |job_id| {
                 let payload = payload.clone();
                 let cancel_token = cancel_token.clone();
                 async move {
@@ -1543,8 +1516,9 @@ impl AgentLoop {
                     let output = aura_job::JobOutput::Structured { value };
                     Ok((output, outcome))
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
         // Defense in depth: CAS-clear `in_flight` after the runner
         // returns. Successful and failed passes already clear the

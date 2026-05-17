@@ -15,11 +15,11 @@ use std::time::Duration;
 use crate::auth::ChannelTokenTable;
 use aura_agent::service::ShutdownSignal;
 use aura_agent::{CronScheduler, SessionManager};
-use aura_job::JobLifecycle;
-use aura_memory::MemoryManager;
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
+use aura_job::JobLifecycle;
 use aura_llm::{LlmProviderConfig, LlmProviderRegistry};
+use aura_memory::MemoryManager;
 use aura_security::{EncryptionKey, SecretVault};
 use aura_skills::SkillRegistry;
 use aura_storage::Store;
@@ -85,7 +85,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         Arc::new(shutdown.clone()) as Arc<dyn aura_cron::Shutdown>,
     ));
 
-    let memory_manager = Arc::new(MemoryManager::without_embedder(stores.memory.clone()));
+    let memory_manager = Arc::new(MemoryManager::new(stores.memory.clone()));
     let skill_registry = Arc::new(SkillRegistry::new());
     let tool_registry = Arc::new(ToolRegistry::new());
     let channel_registry = Arc::new(ChannelRegistry::new());

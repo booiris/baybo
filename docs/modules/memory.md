@@ -1,39 +1,36 @@
-# memory - Long-term User Memory
+# memory - User-scoped Memory Store
 
 ## Overview
 
-The `memory` crate is the complete home for long-term, user-scoped memory: the `MemoryStore` trait and the `MemoryManager` business-logic facade that wraps it. Domain types (`MemoryEntry`, `MemoryCategory`) live in `aura-model` so the wire shape is reusable from non-storage call sites.
+The `memory` crate owns the `MemoryStore` trait and a thin `MemoryManager` business-logic facade (list / search / store / delete / importance, with per-user eviction). Domain types (`MemoryEntry`, `MemoryCategory`) live in `aura-model` so the wire shape is reusable from non-storage call sites.
 
 `aura-storage` provides the libsql implementation of `MemoryStore`; the trait itself lives here so downstream callers and tests can depend on `aura-memory` alone for memory work.
 
-## Design Decisions
+There is currently **no automatic recall path and no auto-store path**. The agent loop does not consult the memory subsystem on incoming user content, and it does not write the assistant's response back to memory. The previous heuristic-based `recall` + `maybe_store` pipeline was removed because it pulled in arbitrary substrings, treated entire assistant outputs (including embedded code or document content) as memorable, and re-injected those snapshots as `Role::System` messages in subsequent turns. Any future memory mechanism must be driven by an explicit signal (a tool call, an operator action), not by substring matching against free-form text.
 
-### MemoryManager owns recall, dedup, importance, and eviction
+## Surface
 
-`MemoryManager` is the sole entry point for production code. It composes the raw `MemoryStore` with three pieces of business logic:
+`MemoryManager` exposes only operator-facing operations:
 
-1. **Recall** — when the agent loop has the user's incoming `ContentBlock`s, `recall()` extracts text, runs an embedding-aware similarity scan (or a plain substring scan when no embedder is configured), and returns the top-`DEFAULT_RECALL_LIMIT` matches sorted by combined similarity + importance.
-2. **Dedup at write time** — `maybe_store()` watches the user's response for preference / fact indicators (`"i prefer"`, `"my project"`, …) and calls `store_with_dedup()` so two near-identical entries aren't both kept. The dedup threshold (`DEDUP_SIMILARITY_THRESHOLD = 0.85` cosine when an embedder is wired up; exact-string match otherwise) is deliberately tighter than the recall threshold.
-3. **Per-user eviction** — `enforce_user_limit()` runs after every store, scoring entries by (`importance`, `last_accessed`) ascending and dropping the lowest-ranked ones once `max_entries_per_user` is exceeded.
+- `store(entry)` — persist a single `MemoryEntry`; runs per-user eviction afterwards.
+- `list(user_id?)` — list entries, optionally scoped to one user.
+- `search(user_id?, query, limit)` — substring search, scoped or global.
+- `get(id)` / `delete(id)` — point lookup / point delete.
+- `set_importance(id, importance)` — clamp `[0,1]` and persist.
+- `delete_for_session(session_id)` — bulk delete entries tagged with `source_session_id`.
 
-### Embedding model is optional
-
-`EmbeddingModel` is a trait (`async fn embed(text) -> Vec<f32>`) injected at construction. When `None`, recall falls back to the store's substring search and dedup falls back to exact-string match. Production deployments wire an embedding provider in via the LLM client pool; tests use `without_embedder()` so they don't need a model fixture.
-
-### `MemoryError` mirrors `JobError`
-
-`MemoryError` carries `Embedding(String)`, `NotFound(String)`, `Storage(String)`, and `Internal(anyhow::Error)`. The `Storage` variant is a stringified `aura_storage::StorageError` produced at the libsql impl boundary — this keeps `aura-memory` free of any `aura-storage` dependency.
+These power the gateway admin REST endpoints (`/v1/memory`) and any future operator-facing CLI surface. Nothing in the agent loop calls them.
 
 ## Constraints
 
-- No dependency on `aura-storage` — the libsql impl converts its own errors at the trait boundary
-- `test_support::MemoryMemoryStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `aura-memory = { workspace = true, features = ["test-support"] }`
-- Per-user limit eviction runs after every successful write; `recall` does not trigger eviction
+- No dependency on `aura-storage` — the libsql impl converts its own errors at the trait boundary.
+- `test_support::MemoryMemoryStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `aura-memory = { workspace = true, features = ["test-support"] }`.
+- Per-user limit eviction (`enforce_user_limit`, default 1000 entries) runs after every successful write, scoring entries by `(importance, last_accessed)` ascending and dropping the lowest-ranked ones.
 
 ## Collaboration
 
-| Module    | Role                                                                                                                |
-| --------- | ------------------------------------------------------------------------------------------------------------------- |
-| `model`   | Provides `MemoryEntry`, `MemoryCategory`, `ContentBlock`, `Session` (used by `maybe_store` for the user-id scope)    |
-| `agent`   | Constructs one `MemoryManager` and shares it with `AgentLoop`; calls `recall`/`maybe_store` around each turn         |
-| `storage` | Provides the libsql implementation of `MemoryStore`; the trait itself lives in this crate                            |
+| Module    | Role                                                                                                  |
+| --------- | ----------------------------------------------------------------------------------------------------- |
+| `model`   | Provides `MemoryEntry`, `MemoryCategory`                                                              |
+| `gateway` | Wires `MemoryManager` into the admin REST surface (`/v1/memory` list / store / delete)                 |
+| `storage` | Provides the libsql implementation of `MemoryStore`; the trait itself lives in this crate              |

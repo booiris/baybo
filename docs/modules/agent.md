@@ -55,11 +55,10 @@ One Actor per session: natural serialization within a session (no context races)
 ### Main execution path (AgentLoop)
 
 1. Build system prompt, Soul, identity injection from `workspace` — `Soul` reads the three identity files (`profile/{SOUL,USER,IDENTITY}.md`) once here and bakes them into a single `system_prompt` `String`. Mid-session writes (e.g. via `Edit` against a path under `profile/`) are **not** picked up by this session; see [`docs/todo/profile-hot-reload.md`](../todo/profile-hot-reload.md).
-2. Recall long-term memory
-3. Append current user message to Context
-4. Skill selection (`AgentLoop::invocable_skills`): `SkillRegistry::all_summaries_sorted()` filtered by `agent_invocable && trust_level != Untrusted`. Risk assessment fires later, inside `SkillTool` at invocation time (see `crates/skills/src/tools.rs`), not during selection. Selected skill names are recorded on `session.state.active_skills`; when the set has changed since last turn the full list is rebroadcast as a `Role::User` skill reminder before the user message.
-5. Loop: `maybe_compress()` → build `ChatRequest` → call `LlmClient` → parse response → dispatch tool execution
-6. Emit `OutgoingMessage` and persist Job, Trace, and Cost state
+2. Append current user message to Context
+3. Skill selection (`AgentLoop::invocable_skills`): `SkillRegistry::all_summaries_sorted()` filtered by `agent_invocable && trust_level != Untrusted`. Risk assessment fires later, inside `SkillTool` at invocation time (see `crates/skills/src/tools.rs`), not during selection. Selected skill names are recorded on `session.state.active_skills`; when the set has changed since last turn the full list is rebroadcast as a `Role::User` skill reminder before the user message.
+4. Loop: `maybe_compress()` → build `ChatRequest` → call `LlmClient` → parse response → dispatch tool execution
+5. Emit `OutgoingMessage` and persist Job, Trace, and Cost state
 
 ### SpanRecorder lock strategy
 
@@ -73,7 +72,7 @@ ToolExecutor: lookup tool → validate trust/capability → consult approval gat
 
 ### LLM-response defensive scrubbing
 
-`AgentLoop` holds an `Arc<SecurityGateway>`. In `call_llm`, every `LlmResponse` — including `content`, `content_blocks` text, `thinking`, and `tool_calls[*].arguments` — is run through `SecurityGateway::sanitize_llm_response` *before* the response is recorded to the trace, appended to `session.messages`, or passed to the memory manager. This prevents LLM-fabricated secret-shaped strings from leaking into any downstream sink.
+`AgentLoop` holds an `Arc<SecurityGateway>`. In `call_llm`, every `LlmResponse` — including `content`, `content_blocks` text, `thinking`, and `tool_calls[*].arguments` — is run through `SecurityGateway::sanitize_llm_response` *before* the response is recorded to the trace or appended to `session.messages`. This prevents LLM-fabricated secret-shaped strings from leaking into any downstream sink.
 
 ### Tool-result formatting into LLM context
 
@@ -132,7 +131,7 @@ Before a message enters an actor, Router completes: session identification/creat
 | `tools` | `ToolExecutor` executes tools |
 | `skills` | `AgentLoop` parses and executes skills |
 | `model` | Provides memory domain types (`MemoryEntry`, `MemoryCategory`) used by `aura-memory::MemoryManager`; session domain types (`Session`, `User`, `ChannelType`) used by `aura-session::SessionManager` |
-| `memory` | Owns `MemoryStore` trait and `MemoryManager` (recall, dedup, importance, eviction). Agent constructs one `MemoryManager` per process and shares it with `AgentLoop` |
+| `memory` | Owns `MemoryStore` trait and `MemoryManager` (list/search/store/delete/importance, per-user eviction). The agent loop does **not** consult `MemoryManager`; it is exposed only through the gateway admin REST surface |
 | `workspace` | Identity files for system prompt |
 | `cron` | Owns `CronJob`, `CronExecution`, and `CronScheduler`; agent re-exports `CronScheduler` / `CronTriggerEvent` for assembly-layer wiring |
 | `context` | Conversation window and compression |

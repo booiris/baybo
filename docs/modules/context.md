@@ -98,16 +98,15 @@ Every `Replaced` return triggers `ContextManager` to insert the skill trailer ri
 The context sent to the LLM is organized in descending priority:
 
 1. **System Prompt / Soul** — fixed, never compressed
-2. **Memory Context** — fixed, injected by `agent`
-3. **Compressed Summary** — elastic, grows as compression happens
-4. **Recent Messages** — elastic, main recent history
-5. **Current User Message** — fixed, always preserved
+2. **Compressed Summary** — elastic, grows as compression happens
+3. **Recent Messages** — elastic, main recent history
+4. **Current User Message** — fixed, always preserved
 
 ### Dependency boundaries
 
 - Depends on `aura-llm` for the `ChatRequest` / `LlmResponse` shape used in the `ChatCallback` signature. The compressor does not construct an LLM client itself; the callback is supplied by the caller. Tokenization stays algorithm-only: `TiktokenTokenizer` depends on `tiktoken-rs` (pure BPE), not on any provider SDK.
 - Depends on `aura-workspace` for `WorkspacePaths` so per-session paths (`summary.md`, JSONL transcript) resolve through the same source of truth the rest of the runtime uses.
-- Does **not** depend on `memory` (memory context injected by `agent`).
+- Does **not** depend on `memory` (the agent loop has no automatic memory injection; the `memory` crate only powers the admin REST surface).
 - Does **not** depend on `trace` or `storage` directly — the chat callback is what opens the trace span and records cost; `context` only sees its `Result<LlmResponse, ContextError>`. Persistence of the transcript is brokered through the `Arc<SessionManager>` (from `aura-session`) supplied at construction.
 
 ## Constraints
@@ -148,7 +147,6 @@ Wiring contract:
 | -------- | -------------------------------------------------------------------------------------- |
 | `agent`   | `AgentLoop` owns a `ContextManager` instance and calls `append` / `maybe_compress`     |
 | `session` | Required `Arc<SessionManager>` supplied to `ContextManager::new`; mirrors transcript mutations to `session_messages` |
-| `memory`  | Memory context is injected into the context window by `agent`, not by `context` itself |
 
 ## See also
 

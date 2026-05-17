@@ -27,22 +27,7 @@ All `model` types are `Send + Sync + Serialize + Deserialize + Clone`.
 
 ### Memory types
 
-`model` also houses the long-term memory domain types (`MemoryEntry`, `MemoryCategory`). These are pure data definitions consumed by `storage` (for `MemoryStore`) and `agent` (for `MemoryManager`). No memory-specific error type lives here — storage failures surface through `StorageError`, and business-level memory errors (embedding, dedup) are defined in `agent::memory`. Business logic (recall, store, dedup, eviction) lives in `agent::memory`.
-
-#### Recall strategy
-
-- **With embedder**: extract text → generate query vector → cosine similarity against stored embeddings → blend with importance → return top-N
-- **Without embedder**: extract keywords → keyword search → sort by importance
-
-Common post-processing: limit count to avoid context overflow, prioritize important memories, update `last_accessed` for recalled items.
-
-#### Automatic memory storage
-
-`maybe_store()` runs after the final response and decides whether the turn should become memory. Triggers: preference expressions, important facts, interaction length crossing summary threshold, heuristic rules. Memory itself does **not** call LLMs — rule-based defaults are used for importance scoring, upper layers may adjust before calling `store()`.
-
-#### Deduplication
-
-Check for semantically similar existing memories before inserting. Update the existing entry if similarity is high enough. Use vector similarity with embedder, text matching without.
+`model` houses the memory domain types (`MemoryEntry`, `MemoryCategory`). These are pure data definitions consumed by `storage` (for `MemoryStore`) and `aura-memory` (for `MemoryManager`). Storage failures surface through `StorageError`; `MemoryManager` only exposes operator-facing CRUD (list / search / store / delete / importance) and per-user eviction — there is no automatic recall or auto-store path.
 
 #### Eviction
 
@@ -50,11 +35,7 @@ Check for semantically similar existing memories before inserting. Update the ex
 
 #### Memory categories
 
-`UserPreference`, `KeyFact` — providing semantic categorization for retrieval and management.
-
-#### Vector embeddings
-
-The `EmbeddingModel` trait is `pub(crate)` inside `aura-agent::memory` and not exported by `model`. `MemoryManager` holds an optional `Box<dyn EmbeddingModel>` injected by the assembly layer. Embeddings stored as `Vec<f32>` in `MemoryEntry.embedding`.
+`UserPreference`, `KeyFact` — left in place as categorisation hints for operator-stored entries.
 
 ## Constraints
 
@@ -62,13 +43,11 @@ The `EmbeddingModel` trait is `pub(crate)` inside `aura-agent::memory` and not e
 - `model` does not define business interfaces or error types
 - All upper layers use `model` only as a data exchange layer
 - Any field that may enter logs, Trace, or Job should be sanitizable and serializable by default
-- Memory context is positioned after System Prompt/Soul and before Compressed Summary in the context window
 
 ## Collaboration
 
 | Module | Role |
 |--------|------|
-| `agent` | `agent::memory::MemoryManager` owns recall/store/dedup/eviction logic; `AgentLoop` calls it; `EmbeddingModel` trait is `pub(crate)` inside `agent::memory` |
-| `storage` | Defines `MemoryStore` trait using memory types; provides libsql implementation |
+| `memory` | Owns the `MemoryStore` trait and `MemoryManager` facade (list/search/store/delete/importance, per-user eviction); consumed by the admin REST surface |
+| `storage` | Provides the libsql implementation of `MemoryStore` |
 | `workspace` | Complements with identity/strategy files (no overlap) |
-| `context` | Memory context is injected into the context window by `agent` |

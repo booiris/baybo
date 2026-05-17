@@ -29,9 +29,7 @@ use aura_agent::session_log::SessionLlmLogger;
 use aura_agent::soul::Soul;
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
-use aura_agent::{
-    CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager,
-};
+use aura_agent::{CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager};
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
 use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, Tokenizer};
@@ -39,7 +37,6 @@ use aura_cost::{CostManager, SpendingLimits, cost_call_guard};
 use aura_job::JobLifecycle;
 use aura_llm::GuardedLlm;
 use aura_memory::MemoryManager;
-use aura_trace::{SpanRecorder, TraceEventStream};
 use aura_model::SystemSpawnRequest;
 use aura_security::{LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
@@ -47,6 +44,7 @@ use aura_skills_assessor::SkillAssessor;
 use aura_storage::Store;
 use aura_tools::ToolRegistry;
 use aura_tools::mcp::{EmbeddedMcpServer, McpReconciler};
+use aura_trace::{SpanRecorder, TraceEventStream};
 use aura_workspace::WorkspaceManager;
 use regex::Regex;
 use tokio::sync::mpsc;
@@ -541,7 +539,7 @@ pub async fn build_managers(
         sandbox_runner,
     ));
 
-    let memory_manager = Arc::new(MemoryManager::without_embedder(stores.memory.clone()));
+    let memory_manager = Arc::new(MemoryManager::new(stores.memory.clone()));
 
     // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and
     // dynamically registers/unregisters MCP-discovered tools. Bridge the
@@ -679,7 +677,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let tool_registry = Arc::clone(&graph.tool_registry);
         let skill_registry = Arc::clone(&graph.skill_registry);
         let tool_executor = Arc::clone(&graph.tool_executor);
-        let memory_manager = Arc::clone(&graph.memory_manager);
         let trace_store = graph.stores.trace.clone();
         let job_lifecycle = Arc::clone(&graph.job_lifecycle);
         let security_gateway = Arc::clone(&graph.security_gateway);
@@ -730,7 +727,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         session_id: session.id.clone(),
                         sessions: Arc::clone(&sessions),
                     }),
-                    memory_manager: Arc::clone(&memory_manager),
                     max_iterations,
                     soul: Soul::custom(system_prompt.clone()),
                     security_gateway: Arc::clone(&security_gateway),
