@@ -405,16 +405,17 @@ impl SessionManager {
     /// most-recent `limit` rows whose `ordinal` is strictly below
     /// `before_ordinal` (or the tail when `before_ordinal` is `None`),
     /// returned in ascending ordinal order paired with each row's
-    /// absolute ordinal. Errors with `SessionError::NotFound` when
-    /// the session itself does not exist. Used by the chat REST
-    /// surface to avoid round-tripping a long-running session's full
-    /// transcript on every initial load.
+    /// absolute ordinal and persisted `created_at`. Errors with
+    /// `SessionError::NotFound` when the session itself does not
+    /// exist. Used by the chat REST surface to avoid round-tripping
+    /// a long-running session's full transcript on every initial load
+    /// while still letting the client render per-message timestamps.
     pub async fn history_tail(
         &self,
         session_id: &SessionId,
         before_ordinal: Option<i64>,
         limit: usize,
-    ) -> Result<Vec<(i64, ChatMessage)>> {
+    ) -> Result<Vec<(i64, DateTime<Utc>, ChatMessage)>> {
         if self.store.get(session_id).await?.is_none() {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }

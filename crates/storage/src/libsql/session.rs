@@ -828,7 +828,7 @@ impl SessionStore for LibsqlSessionStore {
         session_id: &SessionId,
         before_ordinal: Option<i64>,
         limit: usize,
-    ) -> Result<Vec<(i64, aura_model::ChatMessage)>> {
+    ) -> Result<Vec<(i64, DateTime<Utc>, aura_model::ChatMessage)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -843,7 +843,7 @@ impl SessionStore for LibsqlSessionStore {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut rows = conn
             .query(
-                "SELECT ordinal, role, content, from_user FROM session_messages \
+                "SELECT ordinal, role, content, from_user, created_at FROM session_messages \
                  WHERE session_id = ?1 AND superseded_by IS NULL \
                    AND (?2 IS NULL OR ordinal < ?2) \
                  ORDER BY ordinal DESC \
@@ -855,7 +855,7 @@ impl SessionStore for LibsqlSessionStore {
                 StorageError::Internal(anyhow::anyhow!("libsql query active tail: {e}"))
             })?;
 
-        let mut out: Vec<(i64, aura_model::ChatMessage)> = Vec::new();
+        let mut out: Vec<(i64, DateTime<Utc>, aura_model::ChatMessage)> = Vec::new();
         while let Some(row) = rows
             .next()
             .await
@@ -873,10 +873,19 @@ impl SessionStore for LibsqlSessionStore {
             let from_user_flag: i64 = row.get(3).map_err(|e| {
                 StorageError::Internal(anyhow::anyhow!("libsql get from_user: {e}"))
             })?;
+            let created_us: i64 = row.get(4).map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql get created_at: {e}"))
+            })?;
+            let created_at = super::time::from_us(created_us).ok_or_else(|| {
+                StorageError::Storage(format!(
+                    "session_messages.created_at out of range: {created_us}"
+                ))
+            })?;
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
             out.push((
                 ordinal,
+                created_at,
                 aura_model::ChatMessage {
                     role: role
                         .parse::<aura_model::Role>()
@@ -1233,7 +1242,7 @@ mod tests {
             .load_active_session_messages_tail(&session.id, None, 3)
             .await
             .unwrap();
-        let ordinals: Vec<i64> = tail.iter().map(|(o, _)| *o).collect();
+        let ordinals: Vec<i64> = tail.iter().map(|(o, _, _)| *o).collect();
         assert_eq!(ordinals, vec![4, 5, 6]);
 
         // Scroll-up page: the 3 messages strictly before ordinal 4,
@@ -1242,7 +1251,7 @@ mod tests {
             .load_active_session_messages_tail(&session.id, Some(4), 3)
             .await
             .unwrap();
-        let older_ords: Vec<i64> = older.iter().map(|(o, _)| *o).collect();
+        let older_ords: Vec<i64> = older.iter().map(|(o, _, _)| *o).collect();
         assert_eq!(older_ords, vec![1, 2, 3]);
 
         // Final page: only ordinal 0 is older than 1, so a `limit=3`
@@ -1251,7 +1260,7 @@ mod tests {
             .load_active_session_messages_tail(&session.id, Some(1), 3)
             .await
             .unwrap();
-        let head_ords: Vec<i64> = head.iter().map(|(o, _)| *o).collect();
+        let head_ords: Vec<i64> = head.iter().map(|(o, _, _)| *o).collect();
         assert_eq!(head_ords, vec![0]);
 
         // Beyond the start: empty result, no error.

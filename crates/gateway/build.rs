@@ -445,7 +445,16 @@ fn list_dir_entries(dir: &Path) -> Vec<PathBuf> {
 /// output is cached for unchanged sidecar inputs and the binary ships
 /// to every user, paying the build-time cost is the right tradeoff.
 const ZSTD_LEVEL: i32 = 19;
-const SIDECAR_CACHE_SCHEMA_VERSION: &str = "5";
+const SIDECAR_CACHE_SCHEMA_VERSION: &str = "6";
+
+/// The pnpm package that channel sidecars import (`@aura/channel-sdk`).
+/// Sidecar `bundle` scripts shell out to `bun build`, which resolves
+/// this dependency through the workspace symlink — but bun honors the
+/// SDK's `exports` map, which points exclusively at `./dist/*.js`. So
+/// the SDK must be compiled before any sidecar can be bundled. The
+/// gateway build script runs `pnpm --filter` against this name in the
+/// cache-miss path to guarantee `dist/` exists.
+const CHANNEL_SDK_PKG: &str = "@aura/channel-sdk";
 
 /// Each sidecar self-declares its **domain** — the business surface
 /// it belongs to (`channel` for Telegram/WeChat/TUI, `browser` for
@@ -546,6 +555,20 @@ fn embed_sidecars(ws_root: &Path) {
             "create sidecar cache dir {} failed: {e}",
             cache_dir.display()
         );
+        sidecar_failure(strict, &msg);
+        write_empty_sidecar_assets(&generated);
+        return;
+    }
+
+    // Compile `@aura/channel-sdk` before bundling. Channel sidecars
+    // import it, and `bun build` resolves the import through the
+    // SDK's `exports` map → `./dist/*.js`; without `dist/` every
+    // sidecar bundle fails with "Could not resolve". This runs only
+    // on the cache-miss path (the fingerprint above already covers
+    // the SDK's `src/` and config), and `tsc` is incremental, so
+    // the cost is paid once per SDK change.
+    if let Err(e) = build_channel_sdk(ws_root) {
+        let msg = format!("building {CHANNEL_SDK_PKG} failed: {e}");
         sidecar_failure(strict, &msg);
         write_empty_sidecar_assets(&generated);
         return;
@@ -794,7 +817,12 @@ fn sidecar_input_roots(ws_root: &Path, sidecar_dirs: &[PathBuf]) -> Vec<PathBuf>
     let mut paths = vec![
         ws_root.join("pnpm-lock.yaml"),
         ws_root.join("pnpm-workspace.yaml"),
-        ws_root.join("sdks/channel-ts/dist"),
+        // Fingerprint the SDK *source*, not the compiled `dist/`. The
+        // build script compiles `dist/` on the cache-miss path, so
+        // including `dist/` here would mean the fingerprint changes
+        // every time we (re)build the SDK, and the cache could never
+        // be reused on the next cargo invocation.
+        ws_root.join("sdks/channel-ts/src"),
         ws_root.join("sdks/channel-ts/package.json"),
         ws_root.join("sdks/channel-ts/tsconfig.json"),
     ];
@@ -907,6 +935,29 @@ fn read_package_meta(package_json: &Path) -> Result<(String, String), String> {
         ));
     }
     Ok((name, domain))
+}
+
+/// Compile `@aura/channel-sdk` (`pnpm --filter <pkg> build`) so its
+/// `dist/` exists before sidecar bundlers try to resolve it. `tsc` is
+/// incremental — on a no-op the cost is negligible — so it's safe to
+/// run this unconditionally on the cache-miss path.
+fn build_channel_sdk(ws_root: &Path) -> Result<(), String> {
+    let output = Command::new("pnpm")
+        .arg("--filter")
+        .arg(CHANNEL_SDK_PKG)
+        .arg("build")
+        .current_dir(ws_root)
+        .output()
+        .map_err(|e| format!("spawn pnpm: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "pnpm build exited {}: stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    Ok(())
 }
 
 /// Run `pnpm --filter <pkg> bundle` inside the workspace. The script

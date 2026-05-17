@@ -2405,6 +2405,13 @@
             "type": "string",
             "format": "date-time"
           },
+          "last_user_text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Preview text drawn from the session's most-recent user-authored\nmessage, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar\nrenders this as the row label so users can scan past\nconversations by what they last asked. `None` for sessions\nwithout a user turn yet (a freshly-created row, or one whose\ntranscript holds only system/tool rows)."
+          },
           "session_id": {
             "type": "string"
           }
@@ -2431,9 +2438,15 @@
           "ordinal",
           "role",
           "text",
-          "has_attachments"
+          "has_attachments",
+          "created_at"
         ],
         "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Wall-clock time the row was persisted, sourced from\n`session_messages.created_at`. Lets the client render a\nper-message timestamp without a second lookup. Live WS frames\ndon't carry this — the web client falls back to the receive\ntime for those, which is close enough for live emissions and\ndrifts only on catch-up replays (where the row is also\nreachable via the REST history surface with the real value)."
+          },
           "has_attachments": {
             "type": "boolean",
             "description": "`true` when this row had non-text content (image / audio /\nfile). The web client currently shows a placeholder."

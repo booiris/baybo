@@ -286,10 +286,10 @@ function SpanRow({
             </span>
           )}
         </div>
-        <div className="flex items-center gap-3 text-[0.75rem] text-ink-soft font-mono mt-0.5">
-          <span>{visual.label}</span>
-          <span>•</span>
-          <span>{subtitle}</span>
+        <div className="flex items-center gap-3 text-[0.75rem] text-ink-soft font-mono mt-0.5 min-w-0">
+          <span className="shrink-0">{visual.label}</span>
+          <span className="shrink-0">•</span>
+          <span className="truncate">{subtitle}</span>
         </div>
       </div>
       <div className="shrink-0 text-right">
@@ -390,7 +390,7 @@ function LlmCallDetail({ span }: { span: Span }) {
           <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-err pb-1 text-err">
             Failure reason
           </h4>
-          <div className="font-mono text-[0.85rem] bg-err/5 border-2 border-err rounded-md p-3 whitespace-pre-wrap break-words text-err">
+          <div className="font-mono text-[0.85rem] bg-err/5 border-2 border-err rounded-md p-3 whitespace-pre-wrap break-all text-err">
             {failureReason}
           </div>
         </section>
@@ -409,7 +409,7 @@ function LlmCallDetail({ span }: { span: Span }) {
             Output
           </h4>
           {result.output_content && (
-            <pre className="whitespace-pre-wrap break-words font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3">
+            <pre className="whitespace-pre-wrap break-all font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3">
               {renderWithSanitizeChips(result.output_content, hint)}
             </pre>
           )}
@@ -418,7 +418,7 @@ function LlmCallDetail({ span }: { span: Span }) {
               <summary className="cursor-pointer text-[0.75rem] uppercase font-bold tracking-wider text-ink-soft">
                 Thinking ({result.thinking.length.toLocaleString()} chars)
               </summary>
-              <pre className="mt-1 whitespace-pre-wrap break-words font-mono text-[0.8rem] italic bg-gray-50 border-2 border-black rounded-md p-3">
+              <pre className="mt-1 whitespace-pre-wrap break-all font-mono text-[0.8rem] italic bg-gray-50 border-2 border-black rounded-md p-3">
                 {result.thinking}
               </pre>
             </details>
@@ -486,7 +486,7 @@ function ToolCallDetail({
           <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-err pb-1 text-err">
             Failure reason
           </h4>
-          <div className="font-mono text-[0.85rem] bg-err/5 border-2 border-err rounded-md p-3 whitespace-pre-wrap break-words text-err">
+          <div className="font-mono text-[0.85rem] bg-err/5 border-2 border-err rounded-md p-3 whitespace-pre-wrap break-all text-err">
             {failureReason}
           </div>
         </section>
@@ -506,7 +506,7 @@ function ToolCallDetail({
           <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
             Output {result.success ? '(success)' : '(failed)'}
           </h4>
-          <pre className="whitespace-pre-wrap break-words font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3">
+          <pre className="whitespace-pre-wrap break-all font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3">
             {renderWithSanitizeChips(
               typeof result.output === 'string'
                 ? result.output
@@ -645,7 +645,7 @@ function ToolEventRow({
             <summary className="cursor-pointer text-[0.75rem] uppercase font-bold tracking-wider text-ink-soft">
               Body preview ({payload.body_preview.length} chars)
             </summary>
-            <pre className="mt-1 whitespace-pre-wrap break-words text-[0.75rem] text-ink-soft">
+            <pre className="mt-1 whitespace-pre-wrap break-all text-[0.75rem] text-ink-soft">
               {payload.body_preview}
             </pre>
           </details>
@@ -663,7 +663,7 @@ function ToolEventRow({
         <summary className="cursor-pointer text-[0.75rem] uppercase font-bold tracking-wider text-ink-soft">
           Input ({payload.input.length} chars)
         </summary>
-        <pre className="mt-1 whitespace-pre-wrap break-words text-[0.75rem] text-ink-soft">
+        <pre className="mt-1 whitespace-pre-wrap break-all text-[0.75rem] text-ink-soft">
           {payload.input}
         </pre>
       </details>
@@ -671,7 +671,7 @@ function ToolEventRow({
         <summary className="cursor-pointer text-[0.75rem] uppercase font-bold tracking-wider text-ink-soft">
           Output ({payload.output.length} chars)
         </summary>
-        <pre className="mt-1 whitespace-pre-wrap break-words text-[0.75rem] text-ink-soft">
+        <pre className="mt-1 whitespace-pre-wrap break-all text-[0.75rem] text-ink-soft">
           {payload.output}
         </pre>
       </details>
@@ -1019,7 +1019,7 @@ function JobSummaryPanel({
             Input
           </h4>
           {inputText ? (
-            <pre className="whitespace-pre-wrap break-words font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3 max-h-72 overflow-y-auto">
+            <pre className="whitespace-pre-wrap break-all font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3 max-h-72 overflow-y-auto">
               {inputText}
             </pre>
           ) : (
@@ -1032,7 +1032,7 @@ function JobSummaryPanel({
             Output
           </h4>
           {outputText ? (
-            <pre className="whitespace-pre-wrap break-words font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3 max-h-72 overflow-y-auto">
+            <pre className="whitespace-pre-wrap break-all font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3 max-h-72 overflow-y-auto">
               {outputText}
             </pre>
           ) : (

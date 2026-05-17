@@ -1098,7 +1098,10 @@ mod tests {
             id: &SessionId,
             before_ordinal: Option<i64>,
             limit: usize,
-        ) -> std::result::Result<Vec<(i64, aura_model::ChatMessage)>, SessionError> {
+        ) -> std::result::Result<
+            Vec<(i64, chrono::DateTime<chrono::Utc>, aura_model::ChatMessage)>,
+            SessionError,
+        > {
             if limit == 0 {
                 return Ok(Vec::new());
             }
@@ -1118,7 +1121,7 @@ mod tests {
                     active
                         .into_iter()
                         .skip(skip)
-                        .map(|m| (m.ordinal, m.message.clone()))
+                        .map(|m| (m.ordinal, m.created_at, m.message.clone()))
                         .collect()
                 })
                 .unwrap_or_default())

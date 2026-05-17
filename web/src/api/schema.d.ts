@@ -580,6 +580,15 @@ export interface components {
             hidden?: boolean;
             /** Format: date-time */
             last_active: string;
+            /**
+             * @description Preview text drawn from the session's most-recent user-authored
+             *     message, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar
+             *     renders this as the row label so users can scan past
+             *     conversations by what they last asked. `None` for sessions
+             *     without a user turn yet (a freshly-created row, or one whose
+             *     transcript holds only system/tool rows).
+             */
+            last_user_text?: string | null;
             session_id: string;
         };
         ChatSessionsList: {
@@ -591,6 +600,17 @@ export interface components {
          *     matcher.
          */
         ChatTranscriptItem: {
+            /**
+             * Format: date-time
+             * @description Wall-clock time the row was persisted, sourced from
+             *     `session_messages.created_at`. Lets the client render a
+             *     per-message timestamp without a second lookup. Live WS frames
+             *     don't carry this — the web client falls back to the receive
+             *     time for those, which is close enough for live emissions and
+             *     drifts only on catch-up replays (where the row is also
+             *     reachable via the REST history surface with the real value).
+             */
+            created_at: string;
             /**
              * @description `true` when this row had non-text content (image / audio /
              *     file). The web client currently shows a placeholder.

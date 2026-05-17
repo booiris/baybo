@@ -9,6 +9,8 @@ import {
   type KeyboardEvent,
 } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
+import ReactMarkdown, { type Components } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
   RiAddLine,
   RiArrowDownLine,
@@ -50,6 +52,14 @@ interface TranscriptRow {
    *  echo matches against. Unset on rows that didn't originate from
    *  this tab's composer. */
   clientMsgId?: string;
+  /** ISO timestamp the bubble renders next to the message. For
+   *  REST-loaded history rows this is the persisted
+   *  `session_messages.created_at`; for live WS frames (the wire
+   *  shape doesn't carry it) it's the receive time, which is close
+   *  enough for genuine live emissions and drifts only on catch-up
+   *  replays — those rows are also reachable via the REST history
+   *  surface with the real value once the page refetches. */
+  createdAt?: string;
 }
 
 interface PendingApproval {
@@ -81,6 +91,13 @@ interface SessionSummary {
    *  currently viewing because activity for foreground sessions
    *  doesn't bump. */
   unread: number;
+  /** Preview text the sidebar row renders — the session's most-recent
+   *  user-authored message, truncated server-side. `undefined` for
+   *  brand-new sessions with no user turn yet, and for sessions whose
+   *  preview fetch failed on the list call. Updated locally on send
+   *  and on inbound `Frame::UserEcho` so the row reflects the latest
+   *  prompt without a list refetch. */
+  last_user_text?: string;
 }
 
 /**
@@ -108,6 +125,14 @@ interface SessionView {
    *  the session's first message and there's nothing left to page
    *  back to. */
   hasMore: boolean;
+  /** True between `handleSend` and the assistant's first response
+   *  (delta or message). Drives the left-aligned typing indicator
+   *  bubble so the user gets immediate visual feedback that the agent
+   *  is working, instead of staring at a frozen transcript. Cleared
+   *  on first `Frame::Delta` (the streaming bubble itself takes over
+   *  as the activity signal) or on a non-streaming assistant
+   *  `Frame::Message`, and on Reset / session switch. */
+  awaitingReply: boolean;
 }
 
 const EMPTY_VIEW: SessionView = {
@@ -118,6 +143,7 @@ const EMPTY_VIEW: SessionView = {
   olderLoading: false,
   oldestOrdinal: null,
   hasMore: false,
+  awaitingReply: false,
 };
 
 /** Soft cap on `views` map size. Past this, the oldest non-active
@@ -191,6 +217,19 @@ export function ChatPage() {
   const pinnedToBottomRef = useRef(true);
   const [hasNewBelow, setHasNewBelow] = useState(false);
   const wsRef = useRef<ChatWs | null>(null);
+  // react-router v7's `useNavigate` (non-data routes) returns a fresh
+  // function whenever the location pathname changes — its useCallback
+  // depends on `locationPathname`. Capturing `navigate` directly in any
+  // effect's dep array would re-run that effect on every URL change,
+  // which for the WS effect means tearing down the live socket on every
+  // session switch (the server revokes the channel-token on close, so
+  // the next reconnect hits a dead-token 401 → reconnect loop). The ref
+  // gives long-lived closures a stable handle to "whatever navigate is
+  // right now".
+  const navigateRef = useRef(navigate);
+  useEffect(() => {
+    navigateRef.current = navigate;
+  });
   // Holds the latest token-rejected handler so the ChatWs callback
   // (captured at construction) always calls the current closure.
   const onTokenRejectedRef = useRef<((reason: string) => void) | null>(null);
@@ -203,12 +242,81 @@ export function ChatPage() {
   // without forcing the effect that constructs the WS to re-run.
   const recencyRef = useRef<Map<string, number>>(new Map());
 
+  // Streaming pacer: decouples the visual reveal cadence from the wire
+  // cadence. Servers tend to flush Delta frames in uneven bursts (a few
+  // chars at a time during steady-state, then a 200-char chunk after a
+  // network hiccup); writing each burst straight into the bubble looks
+  // jittery. The pacer instead accumulates incoming text into a per-
+  // session `target` and a rAF loop catches `rendered` up at a smooth,
+  // adaptive rate — slow when the backlog is small (keeps a typewriter
+  // feel), fast when the backlog grows (so we never visibly lag far
+  // behind the server). State lives in a ref because the rAF callback
+  // reads/writes between commits and we don't want to thrash React.
+  const streamPacersRef = useRef<
+    Record<string, { target: string; rendered: number; rafId: number | null }>
+  >({});
+
+  const cancelPacer = useCallback((sid: string) => {
+    const pacer = streamPacersRef.current[sid];
+    if (!pacer) return;
+    if (pacer.rafId !== null) cancelAnimationFrame(pacer.rafId);
+    delete streamPacersRef.current[sid];
+  }, []);
+
+  const pacerTick = useCallback((sid: string) => {
+    const pacer = streamPacersRef.current[sid];
+    if (!pacer) return;
+    const backlog = pacer.target.length - pacer.rendered;
+    if (backlog <= 0) {
+      pacer.rafId = null;
+      return;
+    }
+    // Adaptive reveal: a small backlog reveals slowly so the eye reads
+    // a steady typewriter trickle; a big backlog (after a burst) is
+    // drained proportionally so we close the gap within a handful of
+    // frames instead of running visibly behind the server for seconds.
+    const step =
+      backlog > 400 ? Math.ceil(backlog / 6)
+      : backlog > 120 ? 8
+      : backlog > 40 ? 4
+      : 2;
+    pacer.rendered = Math.min(pacer.target.length, pacer.rendered + step);
+    const visible = pacer.target.slice(0, pacer.rendered);
+    setViews((prev) => {
+      const view = prev[sid] ?? EMPTY_VIEW;
+      const nextTranscript = setStreamingText(view.transcript, visible);
+      if (nextTranscript === view.transcript && !view.awaitingReply) return prev;
+      return {
+        ...prev,
+        [sid]: { ...view, transcript: nextTranscript, awaitingReply: false },
+      };
+    });
+    pacer.rafId = requestAnimationFrame(() => pacerTick(sid));
+  }, []);
+
+  const enqueueDelta = useCallback(
+    (sid: string, text: string) => {
+      if (!text) return;
+      let pacer = streamPacersRef.current[sid];
+      if (!pacer) {
+        pacer = { target: '', rendered: 0, rafId: null };
+        streamPacersRef.current[sid] = pacer;
+      }
+      pacer.target += text;
+      if (pacer.rafId === null) {
+        pacer.rafId = requestAnimationFrame(() => pacerTick(sid));
+      }
+    },
+    [pacerTick],
+  );
+
   // Tear down everything we hold for a single session: WS subscription,
   // view bucket, recency entry. Used by local hide, cross-tab hide, and
   // LRU eviction. Stable identity via useCallback([]) so the WS effect's
   // dep array stays clean.
   const releaseSessionView = useCallback((sid: string) => {
     wsRef.current?.unsubscribe(sid);
+    cancelPacer(sid);
     setViews((prev) => {
       if (!(sid in prev)) return prev;
       const next = { ...prev };
@@ -216,7 +324,7 @@ export function ChatPage() {
       return next;
     });
     recencyRef.current.delete(sid);
-  }, []);
+  }, [cancelPacer]);
 
   // ── Bootstrap: load session list + slash manifest, mint a token ─────
   // Runs once on mount. Anchor selection priority:
@@ -247,6 +355,7 @@ export function ChatPage() {
         created_at: s.created_at,
         last_active: s.last_active,
         unread: 0,
+        last_user_text: s.last_user_text ?? undefined,
       }));
       setSessions(existing);
       setSlashCommands(manifest?.items ?? []);
@@ -297,7 +406,7 @@ export function ChatPage() {
       // Land on a session: if the URL has none, redirect to the
       // anchor; if it points at an unknown id, also redirect.
       if (!sessionId || sessionId !== anchorId) {
-        navigate(`/chat/${anchorId}`, { replace: true });
+        navigateRef.current(`/chat/${anchorId}`, { replace: true });
       }
 
       async function createAnchorSession(): Promise<{ sessionId: string; token: string } | null> {
@@ -383,7 +492,7 @@ export function ChatPage() {
             // handleHideSession cleanup.
             releaseSessionView(frame.session_id);
             if (currentSessionIdRef.current === frame.session_id) {
-              navigate('/chat', { replace: true });
+              navigateRef.current('/chat', { replace: true });
             }
           }
           return;
@@ -420,7 +529,21 @@ export function ChatPage() {
           default:
             break;
         }
-        routeInboundFrame(frame, setViews, lastConnectedAtRef.current);
+        // Route delta frames through the pacer instead of straight to
+        // setViews — the pacer's rAF loop owns the bubble's text while
+        // streaming is in flight. routeInboundFrame's delta case stays
+        // as a defensive fallback but should not fire from this path.
+        if (frame.kind === 'delta') {
+          enqueueDelta(frame.session_id, frame.text);
+          return;
+        }
+        // An assistant message frame is the authoritative final text
+        // for the stream — drop any pacer state so its in-flight rAF
+        // doesn't overwrite the finalized bubble a tick later.
+        if (frame.kind === 'message' && frame.role !== 'user') {
+          cancelPacer(frame.session_id);
+        }
+        routeInboundFrame(frame, setViews, setSessions, lastConnectedAtRef.current);
       },
       onTokenRejected: (reason) => onTokenRejectedRef.current?.(reason),
       onReset: (reason) => {
@@ -436,6 +559,12 @@ export function ChatPage() {
         // the server's ApprovalResolved fan-out will clear when /
         // if the call resolves.
         console.warn('chat WS reset; refetching history via REST', reason);
+        // The REST refill will rebuild the streaming bubble's final
+        // text — any pacer state we hold is stale relative to that
+        // and must not flush after the wipe.
+        for (const sid of Object.keys(streamPacersRef.current)) {
+          cancelPacer(sid);
+        }
         setViews((prev) => {
           const next: Record<string, SessionView> = {};
           for (const [sid, view] of Object.entries(prev)) {
@@ -453,7 +582,7 @@ export function ChatPage() {
       ws.close();
       wsRef.current = null;
     };
-  }, [baseUrl, channelToken, navigate, releaseSessionView]);
+  }, [baseUrl, channelToken, releaseSessionView, enqueueDelta, cancelPacer]);
 
   // ── Active session: subscribe + lazy-load history ───────────────────
   // Subscribe stays sticky once added: when the user switches away,
@@ -551,16 +680,25 @@ export function ChatPage() {
   // parked at the bottom. Otherwise raise the "new messages" pill so
   // they can opt back in. useLayoutEffect runs before paint so we read
   // fresh scrollHeight.
+  //
+  // `instant` (the default behavior) not `smooth` — when first landing
+  // on a session, the history fetch resolves and React commits the
+  // populated transcript, and we want the first paint to already be at
+  // the bottom rather than scrolling past every message on the way
+  // down. Same for streaming deltas: each delta would otherwise queue
+  // another smooth animation, which compounds into visible jitter as
+  // the bubble grows. The user-initiated `jumpToLatest` (below) keeps
+  // smooth — that one IS a discrete "take me there" gesture.
   useLayoutEffect(() => {
     const scroller = transcriptScrollRef.current;
     if (!scroller) return;
     if (pinnedToBottomRef.current) {
-      transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      scroller.scrollTop = scroller.scrollHeight;
       setHasNewBelow(false);
     } else {
       setHasNewBelow(true);
     }
-  }, [currentView.transcript, currentView.pendingApproval]);
+  }, [currentView.transcript, currentView.pendingApproval, currentView.awaitingReply]);
 
   // Reset pin state when switching sessions — a fresh view should jump
   // to its tail, not inherit the previous view's scroll posture. Also
@@ -732,11 +870,25 @@ export function ChatPage() {
                 text: trimmed,
                 pending: true,
                 clientMsgId,
+                createdAt: new Date().toISOString(),
               },
             ],
+            awaitingReply: true,
           },
         };
       });
+      // Update the sidebar row's preview optimistically — the server
+      // will repeat the truth in the UserEcho frame (which also flows
+      // into setSessions via applySessionUserText), but reflecting it
+      // here keeps the sidebar in lockstep with the bubble the user
+      // just dropped.
+      setSessions((prev) => applySessionUserText(prev, sessionId, trimmed));
+      // The user just hit send — anchor them to the tail regardless of
+      // where they had scrolled to, so the optimistic row + incoming
+      // reply land in view. The transcript-change effect above reads
+      // this ref and jumps to scrollHeight on the next layout pass.
+      pinnedToBottomRef.current = true;
+      setHasNewBelow(false);
       wsRef.current.sendMessage({
         sessionId,
         userId: 'web-operator',
@@ -812,13 +964,13 @@ export function ChatPage() {
             ? anchorSessionIdRef.current
             : null);
         if (fallback) {
-          navigate(`/chat/${fallback}`, { replace: true });
+          navigateRef.current(`/chat/${fallback}`, { replace: true });
         } else {
-          navigate('/chat', { replace: true });
+          navigateRef.current('/chat', { replace: true });
         }
       }
     },
-    [client, navigate, releaseSessionView, sessionId, sessions],
+    [client, releaseSessionView, sessionId, sessions],
   );
 
   const handleNewChat = useCallback(async () => {
@@ -845,12 +997,12 @@ export function ChatPage() {
                 ...prev,
               ],
         );
-        navigate(`/chat/${data.session_id}`);
+        navigateRef.current(`/chat/${data.session_id}`);
       }
     } finally {
       setCreating(false);
     }
-  }, [client, navigate]);
+  }, [client]);
 
   const filteredSlash = useMemo(() => {
     if (!showSlashHints) return [];
@@ -913,23 +1065,28 @@ export function ChatPage() {
       {/* Main column */}
       <main className="flex-1 flex flex-col overflow-hidden relative">
         <header className="h-12 px-4 border-b-2 border-black flex items-center justify-between gap-3 bg-white">
-          <div className="flex items-baseline gap-2 min-w-0">
-            <span className="font-bold text-sm truncate" title={sessionId ?? undefined}>
-              {sessionTitle(currentView.transcript)}
-            </span>
+          <div className="flex items-baseline gap-2 min-w-0 flex-1">
             {sessionId ? (
-              <span className="font-mono text-[0.7rem] text-ink-soft shrink-0">
-                {shortId(sessionId)}
+              <span
+                className="font-mono text-xs text-ink select-all break-all"
+                title={sessionId}
+              >
+                <span className="text-ink-soft select-none mr-1">session id:</span>
+                {sessionId}
               </span>
-            ) : null}
+            ) : (
+              <span className="font-bold text-sm text-ink-soft">No session</span>
+            )}
           </div>
           <ConnectionBadge status={status} />
         </header>
 
+        <div className="flex-1 flex flex-col overflow-hidden relative xl:pr-[260px]">
+        <div className="flex-1 flex justify-center min-h-0 relative">
         <div
           ref={transcriptScrollRef}
           onScroll={handleTranscriptScroll}
-          className="relative flex-1 overflow-auto px-6 py-4"
+          className="relative w-full max-w-6xl overflow-auto px-6 py-4"
         >
           {currentView.historyLoading ? (
             <div className="flex justify-center py-12 text-ink-soft">
@@ -938,7 +1095,7 @@ export function ChatPage() {
           ) : currentView.transcript.length === 0 && !currentView.pendingApproval ? (
             <WelcomeEmpty slashCommands={slashCommands} onPick={handleComposerChange} />
           ) : (
-            <div className="max-w-3xl mx-auto flex flex-col gap-3">
+            <div className="flex flex-col gap-3">
               {currentView.olderLoading ? (
                 <div className="flex justify-center py-2 text-ink-soft">
                   <RiLoader4Line className="text-xl animate-spin" />
@@ -951,6 +1108,7 @@ export function ChatPage() {
               {currentView.transcript.map((row) => (
                 <MessageBubble key={row.key} row={row} />
               ))}
+              {currentView.awaitingReply ? <TypingIndicator /> : null}
               {currentView.pendingApproval ? (
                 <ApprovalCard
                   approval={currentView.pendingApproval}
@@ -962,12 +1120,13 @@ export function ChatPage() {
             </div>
           )}
         </div>
+        </div>
 
         {hasNewBelow ? (
           <button
             type="button"
             onClick={jumpToLatest}
-            className="absolute bottom-[96px] left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-3 py-1.5 bg-white border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:bg-gray-100 cursor-pointer"
+            className="absolute bottom-[calc(18vh+12px)] left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-3 py-1.5 bg-white border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:bg-gray-100 cursor-pointer"
             title="Jump to latest"
           >
             <RiArrowDownLine className="text-base" />
@@ -975,28 +1134,33 @@ export function ChatPage() {
           </button>
         ) : null}
 
+        <div className="bg-canvas border-t-2 border-black max-w-6xl mx-auto w-full">
         <form
           onSubmit={handleSend}
-          className="border-t-2 border-black bg-white px-4 py-3 flex flex-col gap-2 max-w-3xl mx-auto w-full"
+          className="bg-canvas px-4 pt-3 pb-6 mb-[calc(14vh-131px)] max-w-3xl mx-auto w-full"
         >
-          {filteredSlash.length > 0 ? (
-            <div className="border-2 border-black bg-canvas rounded-md p-2 flex flex-col gap-1">
-              {filteredSlash.map((s) => (
-                <button
-                  key={s.command}
-                  type="button"
-                  onClick={() => {
-                    handleComposerChange(`/${s.command} `);
-                  }}
-                  className="text-left px-2 py-1 hover:bg-gray-100 rounded font-mono text-sm flex items-center gap-2 cursor-pointer"
-                >
-                  <span className="font-bold">/{s.command}</span>
-                  <span className="text-ink-soft">{s.description}</span>
-                </button>
-              ))}
-            </div>
-          ) : null}
-          <div className="flex gap-2 items-end">
+          <div className="relative border-2 border-black rounded-md bg-white shadow-brutal-sm focus-within:shadow-brutal transition-shadow">
+            {filteredSlash.length > 0 ? (
+              <div className="border-b-2 border-black bg-canvas px-2 py-2 flex flex-col gap-0.5 rounded-t-[4px]">
+                <div className="px-2 pb-1 text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
+                  Slash commands
+                </div>
+                {filteredSlash.map((s) => (
+                  <button
+                    key={s.command}
+                    type="button"
+                    onClick={() => {
+                      handleComposerChange(`/${s.command} `);
+                    }}
+                    className="text-left px-2 py-1.5 border-2 border-transparent hover:border-black hover:bg-white rounded font-mono text-sm flex items-center gap-2 cursor-pointer"
+                  >
+                    <span className="font-bold shrink-0">/{s.command}</span>
+                    <span className="text-ink-soft truncate">{s.description}</span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+
             <textarea
               ref={composerRef}
               value={composer}
@@ -1004,23 +1168,42 @@ export function ChatPage() {
               onKeyDown={handleComposerKey}
               placeholder={
                 status.state === 'connected'
-                  ? 'Type a message. / for commands, Shift+Enter for newline.'
-                  : 'Type a message — will send once the connection is ready.'
+                  ? 'Message Aura…'
+                  : 'Waiting for connection…'
               }
               rows={1}
-              className="flex-1 border-2 border-black rounded-md px-3 py-2 font-mono text-sm resize-none focus:outline-none focus:ring-0 leading-relaxed"
+              className="w-full px-3.5 py-3 font-mono text-sm bg-transparent resize-none focus:outline-none leading-relaxed placeholder:text-ink-soft/70"
             />
-            <button
-              type="submit"
-              disabled={!sessionId || composer.trim().length === 0 || status.state !== 'connected'}
-              className="px-4 py-2 bg-brand text-white border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-sm hover:bg-brand-hover active:translate-x-[2px] active:translate-y-[2px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer flex items-center gap-1.5"
-              title="Send (Enter)"
-            >
-              <RiSendPlane2Line className="text-base" />
-              Send
-            </button>
+
+            <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 border-t-2 border-black bg-canvas rounded-b-[4px]">
+              <span className="hidden md:flex items-center gap-1 text-[0.6rem] font-mono text-ink-soft/80 min-w-0 flex-1">
+                <kbd className="px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
+                  Enter
+                </kbd>
+                send
+                <kbd className="ml-1 px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
+                  ⇧Enter
+                </kbd>
+                newline
+                <kbd className="ml-1 px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
+                  /
+                </kbd>
+                commands
+              </span>
+              <button
+                type="submit"
+                disabled={!sessionId || composer.trim().length === 0 || status.state !== 'connected'}
+                className="shrink-0 px-3 py-1.5 bg-brand text-white border-2 border-black rounded-md shadow-brutal-xs font-bold uppercase tracking-wider text-[0.7rem] hover:bg-brand-hover active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer flex items-center gap-1.5"
+                title="Send (Enter)"
+              >
+                <RiSendPlane2Line className="text-sm" />
+                Send
+              </button>
+            </div>
           </div>
         </form>
+        </div>
+        </div>
       </main>
     </div>
   );
@@ -1037,6 +1220,7 @@ export function ChatPage() {
 function routeInboundFrame(
   frame: Frame,
   setViews: React.Dispatch<React.SetStateAction<Record<string, SessionView>>>,
+  setSessions: React.Dispatch<React.SetStateAction<SessionSummary[]>>,
   lastConnectedAt: number,
 ): void {
   switch (frame.kind) {
@@ -1046,7 +1230,11 @@ function routeInboundFrame(
         const view = prev[sid] ?? EMPTY_VIEW;
         return {
           ...prev,
-          [sid]: { ...view, transcript: appendStreamingDelta(view.transcript, frame.text) },
+          [sid]: {
+            ...view,
+            transcript: appendStreamingDelta(view.transcript, frame.text),
+            awaitingReply: false,
+          },
         };
       });
       return;
@@ -1054,6 +1242,19 @@ function routeInboundFrame(
     case 'message': {
       const sid = frame.session_id;
       const role: 'user' | 'assistant' = frame.role === 'user' ? 'user' : 'assistant';
+      // Any assistant message — replay or live, with or without prior
+      // streaming deltas — ends the "awaiting reply" window. React
+      // batches this with the transcript update below, so it's a single
+      // commit. Done as its own setViews rather than threading the flag
+      // through every replay-merge branch so the various return paths
+      // below don't all have to remember to carry it.
+      if (role === 'assistant') {
+        setViews((prev) => {
+          const view = prev[sid];
+          if (!view || !view.awaitingReply) return prev;
+          return { ...prev, [sid]: { ...view, awaitingReply: false } };
+        });
+      }
       // Catch-up replay (ordinal set): key by ordinal so React
       // reconciles against rows the REST history fetch already laid
       // down with the same shape, and a duplicate replay is a no-op.
@@ -1077,6 +1278,18 @@ function routeInboundFrame(
       //   would sit alongside the replay forever.
       if (frame.ordinal !== undefined) {
         const replayKey = `hist-${sid}-${frame.ordinal}`;
+        // Replays arrive ascending so iteratively overwriting the
+        // sidebar preview converges on the freshest user turn — the
+        // disconnect window may have hidden a sibling-tab send that
+        // the bootstrap snapshot also missed.
+        if (role === 'user') {
+          const preview = frame.content.trim().length > 0
+            ? frame.content
+            : ((frame.attachments?.length ?? 0) > 0 ? '[attachment]' : '');
+          if (preview) {
+            setSessions((prev) => applySessionUserText(prev, sid, preview));
+          }
+        }
         setViews((prev) => {
           const view = prev[sid] ?? EMPTY_VIEW;
           if (view.transcript.some((r) => r.key === replayKey)) return prev;
@@ -1085,7 +1298,16 @@ function routeInboundFrame(
             const last = view.transcript[lastIdx];
             if (last?.streaming && last.role === 'assistant') {
               const next = view.transcript.slice();
-              next[lastIdx] = { key: replayKey, role: 'assistant', text: frame.content };
+              // Preserve the streaming row's `createdAt` (stamped at
+              // first Delta) — the persisted Message replay is the
+              // same logical bubble, the user just saw it earlier.
+              next[lastIdx] = {
+                ...last,
+                key: replayKey,
+                role: 'assistant',
+                text: frame.content,
+                streaming: false,
+              };
               return { ...prev, [sid]: { ...view, transcript: next } };
             }
           }
@@ -1095,7 +1317,13 @@ function routeInboundFrame(
             );
             if (matchIdx >= 0) {
               const next = view.transcript.slice();
-              next[matchIdx] = { key: replayKey, role: 'user', text: frame.content };
+              next[matchIdx] = {
+                ...view.transcript[matchIdx],
+                key: replayKey,
+                role: 'user',
+                text: frame.content,
+                pending: false,
+              };
               return { ...prev, [sid]: { ...view, transcript: next } };
             }
           }
@@ -1140,7 +1368,12 @@ function routeInboundFrame(
               ...view,
               transcript: [
                 ...view.transcript,
-                { key: replayKey, role, text: frame.content },
+                {
+                  key: replayKey,
+                  role,
+                  text: frame.content,
+                  createdAt: new Date().toISOString(),
+                },
               ],
             },
           };
@@ -1157,6 +1390,19 @@ function routeInboundFrame(
       // updater because state setters are batched — checking outside
       // can't observe whether the updater found a match.
       const hasAttachments = (frame.attachments?.length ?? 0) > 0;
+      // Sidebar preview tracks the freshest user-authored text, so
+      // every live user echo (whether this tab sent it or a sibling
+      // did) feeds the sidebar — including the attachment-only case,
+      // where the placeholder string mirrors the bubble's "[attachment]"
+      // fallback so the row doesn't go blank on a media-only send.
+      if (role === 'user') {
+        const preview = frame.content.trim().length > 0
+          ? frame.content
+          : (hasAttachments ? '[attachment]' : '');
+        if (preview) {
+          setSessions((prev) => applySessionUserText(prev, sid, preview));
+        }
+      }
       if (role === 'user' && frame.platform_msg_id) {
         const clientMsgId = frame.platform_msg_id;
         setViews((prev) => {
@@ -1213,6 +1459,12 @@ function routeInboundFrame(
                 notice: { level: noticeLevel(frame.level), text: frame.text },
               },
             ],
+            // Some turns reply with `AgentOutput::Notice` and never
+            // emit a Delta/Message — slash commands like `/compact`,
+            // refusal / error paths, etc. Without this, the typing
+            // dots would hang forever for those sends. The notice
+            // itself is now the reply, so awaitingReply ends here.
+            awaitingReply: false,
           },
         };
       });
@@ -1236,6 +1488,11 @@ function routeInboundFrame(
               accesses: frame.accesses,
               receivedAt,
             },
+            // Agent has stopped to ask the user something — it's no
+            // longer composing. The approval card is the activity
+            // signal now; suppress the typing dots so the two don't
+            // stack and contradict each other.
+            awaitingReply: false,
           },
         };
       });
@@ -1299,10 +1556,14 @@ function mergeView(
   return { ...prev, [sessionId]: { ...view, ...patch } };
 }
 
-function appendStreamingDelta(prev: TranscriptRow[], text: string): TranscriptRow[] {
+// Like `appendStreamingDelta` but the second arg is the *full* visible
+// text, not an increment. Used by the rAF pacer to write the smoothed
+// reveal output where each tick already knows the cumulative slice.
+function setStreamingText(prev: TranscriptRow[], text: string): TranscriptRow[] {
   const last = prev[prev.length - 1];
   if (last?.streaming && last.role === 'assistant') {
-    return [...prev.slice(0, -1), { ...last, text: last.text + text }];
+    if (last.text === text) return prev;
+    return [...prev.slice(0, -1), { ...last, text }];
   }
   return [
     ...prev,
@@ -1311,6 +1572,29 @@ function appendStreamingDelta(prev: TranscriptRow[], text: string): TranscriptRo
       role: 'assistant',
       text,
       streaming: true,
+      createdAt: new Date().toISOString(),
+    },
+  ];
+}
+
+function appendStreamingDelta(prev: TranscriptRow[], text: string): TranscriptRow[] {
+  const last = prev[prev.length - 1];
+  if (last?.streaming && last.role === 'assistant') {
+    return [...prev.slice(0, -1), { ...last, text: last.text + text }];
+  }
+  // Stamp `createdAt` at the moment the assistant starts streaming —
+  // not when the final Message lands — so the timestamp the user sees
+  // matches when the bubble actually appeared in their view rather
+  // than the persistence-time clock skew of "Message arrives a few
+  // hundred ms after the last delta".
+  return [
+    ...prev,
+    {
+      key: `stream-${prev.length}-${Date.now()}`,
+      role: 'assistant',
+      text,
+      streaming: true,
+      createdAt: new Date().toISOString(),
     },
   ];
 }
@@ -1343,6 +1627,7 @@ function finalizeMessage(
       role,
       text: content,
       hasAttachments: hasAttachments || undefined,
+      createdAt: new Date().toISOString(),
     },
   ];
 }
@@ -1359,11 +1644,8 @@ function roleFromString(role: string): 'user' | 'assistant' | 'system' {
   return 'assistant';
 }
 
-function shortId(id: string): string {
-  return id.length > 16 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
-}
-
 interface HistoryRowDto {
+  created_at: string;
   ordinal: number;
   role: string;
   text: string;
@@ -1380,6 +1662,7 @@ function historyRowToTranscript(sessionId: string, row: HistoryRowDto): Transcri
     role: roleFromString(row.role),
     text: row.text,
     hasAttachments: row.has_attachments,
+    createdAt: row.created_at,
   };
 }
 
@@ -1440,6 +1723,7 @@ function applySessionPatch(
     created_at: patch.created_at ?? current.created_at,
     last_active: patch.last_active ?? current.last_active,
     unread: current.unread,
+    last_user_text: current.last_user_text,
   };
   if (
     merged.created_at === current.created_at &&
@@ -1486,13 +1770,66 @@ function sortByLastActiveDesc(list: SessionSummary[]): SessionSummary[] {
     .sort((a, b) => Date.parse(b.last_active) - Date.parse(a.last_active));
 }
 
-/** First user message, truncated, as the conversation's display title.
- *  Falls back to a placeholder when the session is still empty. */
-function sessionTitle(transcript: TranscriptRow[]): string {
-  const firstUser = transcript.find((r) => r.role === 'user' && r.text);
-  if (!firstUser) return 'New conversation';
-  const oneLine = firstUser.text.replace(/\s+/g, ' ').trim();
-  return oneLine.length > 80 ? `${oneLine.slice(0, 80)}…` : oneLine;
+/** Soft cap on the sidebar preview length. Mirrors `PREVIEW_MAX_CHARS`
+ *  on the gateway side — server-supplied previews already arrive
+ *  pre-truncated, but local updates (this tab's send, sibling tab's
+ *  UserEcho) go through this so the row stays at the same width
+ *  regardless of which path filled it. */
+const PREVIEW_MAX_CHARS = 120;
+
+/** Replace `session_id`'s preview text with the freshest user turn.
+ *  Collapses whitespace + truncates to mirror the server's
+ *  `truncate_preview`. Returns `prev` unchanged when the target row
+ *  isn't in the list (sidebar dropped it via hide, or the activity
+ *  raced ahead of Created) — Created arrives separately and seeds the
+ *  row, and the next list refresh will reseed the preview. */
+function applySessionUserText(
+  prev: SessionSummary[],
+  sessionId: string,
+  text: string,
+): SessionSummary[] {
+  const idx = prev.findIndex((s) => s.session_id === sessionId);
+  if (idx === -1) return prev;
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  if (!collapsed) return prev;
+  const truncated =
+    collapsed.length > PREVIEW_MAX_CHARS
+      ? `${collapsed.slice(0, PREVIEW_MAX_CHARS)}…`
+      : collapsed;
+  if (prev[idx].last_user_text === truncated) return prev;
+  const next = prev.slice();
+  next[idx] = { ...prev[idx], last_user_text: truncated };
+  return next;
+}
+
+/** `HH:MM` for messages from today, `MM-DD HH:MM` for older rows.
+ *  Keeps each bubble's timestamp short enough to sit next to a
+ *  280px-wide bubble without wrapping, while still disambiguating
+ *  long sessions that span multiple days. */
+function formatTimestampShort(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  const now = new Date();
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  if (sameDay) return hm;
+  return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${hm}`;
+}
+
+/** Full date + time for the bubble's hover tooltip — locale-formatted
+ *  so users in different time zones see something they recognize
+ *  rather than the wire ISO. */
+function formatTimestampTooltip(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString();
+}
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : `${n}`;
 }
 
 /** Compact human-readable age. Same shape the logs page uses, kept
@@ -1540,9 +1877,12 @@ function SessionRow({
     >
       <div className="flex items-center gap-2">
         <span
-          className={`text-sm font-bold flex-1 truncate ${active ? 'text-white' : 'text-ink'}`}
+          className={`text-sm font-bold flex-1 truncate ${
+            active ? 'text-white' : 'text-ink'
+          } ${session.last_user_text ? '' : 'italic opacity-70'}`}
+          title={session.last_user_text ?? undefined}
         >
-          {relativeAge(session.last_active)}
+          {session.last_user_text ?? 'New conversation'}
         </span>
         {showUnread ? (
           <span
@@ -1575,13 +1915,118 @@ function SessionRow({
         </button>
       </div>
       <div
-        className={`mt-0.5 font-mono text-[0.7rem] truncate ${
+        className={`mt-0.5 font-mono text-[0.65rem] ${
           active ? 'text-white/70' : 'text-ink-soft'
         }`}
       >
-        {shortId(session.session_id)}
+        {relativeAge(session.last_active)}
       </div>
     </Link>
+  );
+}
+
+// Brutalist override map for ReactMarkdown. Keeps the bubble feeling
+// like a chat bubble (tight spacing, no doc-style top margins) while
+// still giving lists / code / quotes / tables a recognizable shape.
+// `first:mt-0 last:mb-0` on the block elements keeps the bubble's top
+// and bottom edges from gaining extra padding from leading/trailing
+// markdown blocks.
+const MARKDOWN_COMPONENTS: Components = {
+  p: ({ children }) => (
+    <p className="my-2 first:mt-0 last:mb-0 leading-relaxed">{children}</p>
+  ),
+  h1: ({ children }) => (
+    <h1 className="my-2 first:mt-0 last:mb-0 text-base font-bold uppercase tracking-wider">
+      {children}
+    </h1>
+  ),
+  h2: ({ children }) => (
+    <h2 className="my-2 first:mt-0 last:mb-0 text-base font-bold">{children}</h2>
+  ),
+  h3: ({ children }) => (
+    <h3 className="my-2 first:mt-0 last:mb-0 text-sm font-bold">{children}</h3>
+  ),
+  h4: ({ children }) => (
+    <h4 className="my-2 first:mt-0 last:mb-0 text-sm font-bold">{children}</h4>
+  ),
+  h5: ({ children }) => (
+    <h5 className="my-2 first:mt-0 last:mb-0 text-sm font-bold">{children}</h5>
+  ),
+  h6: ({ children }) => (
+    <h6 className="my-2 first:mt-0 last:mb-0 text-sm font-bold">{children}</h6>
+  ),
+  ul: ({ children }) => (
+    <ul className="my-2 first:mt-0 last:mb-0 list-disc pl-5 space-y-1">{children}</ul>
+  ),
+  ol: ({ children }) => (
+    <ol className="my-2 first:mt-0 last:mb-0 list-decimal pl-5 space-y-1">{children}</ol>
+  ),
+  li: ({ children }) => <li className="leading-snug">{children}</li>,
+  a: ({ href, children }) => (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="text-brand underline underline-offset-2 hover:text-brand-hover break-words"
+    >
+      {children}
+    </a>
+  ),
+  strong: ({ children }) => <strong className="font-bold">{children}</strong>,
+  em: ({ children }) => <em className="italic">{children}</em>,
+  blockquote: ({ children }) => (
+    <blockquote className="my-2 first:mt-0 last:mb-0 border-l-4 border-black pl-3 italic text-ink-soft">
+      {children}
+    </blockquote>
+  ),
+  hr: () => <hr className="my-3 border-t-2 border-black" />,
+  // `inline` is false for fenced code blocks; ReactMarkdown wraps those
+  // in `<pre><code>…</code></pre>`, so the inline branch handles the
+  // `\`foo\`` case and the block branch is rendered via `pre`.
+  code: ({ className, children, ...rest }) => {
+    const isInline = !/^language-/.test(className ?? '');
+    if (isInline) {
+      return (
+        <code
+          className="bg-canvas border border-black/30 rounded px-1 py-[1px] text-[0.85em]"
+          {...rest}
+        >
+          {children}
+        </code>
+      );
+    }
+    return (
+      <code className={`${className ?? ''} block`} {...rest}>
+        {children}
+      </code>
+    );
+  },
+  pre: ({ children }) => (
+    <pre className="my-2 first:mt-0 last:mb-0 bg-canvas border-2 border-black rounded-md p-2 overflow-x-auto text-xs leading-snug">
+      {children}
+    </pre>
+  ),
+  table: ({ children }) => (
+    <div className="my-2 first:mt-0 last:mb-0 overflow-x-auto">
+      <table className="border-2 border-black border-collapse text-xs">{children}</table>
+    </div>
+  ),
+  thead: ({ children }) => <thead className="bg-canvas">{children}</thead>,
+  th: ({ children }) => (
+    <th className="border border-black px-2 py-1 font-bold uppercase tracking-wider text-[0.65rem] text-left">
+      {children}
+    </th>
+  ),
+  td: ({ children }) => <td className="border border-black px-2 py-1">{children}</td>,
+};
+
+const REMARK_PLUGINS = [remarkGfm];
+
+function MarkdownBody({ text }: { text: string }) {
+  return (
+    <ReactMarkdown components={MARKDOWN_COMPONENTS} remarkPlugins={REMARK_PLUGINS}>
+      {text}
+    </ReactMarkdown>
   );
 }
 
@@ -1603,18 +2048,35 @@ function MessageBubble({ row }: { row: TranscriptRow }) {
   }
   const isUser = row.role === 'user';
   const body = row.text || (row.hasAttachments ? '[attachment]' : '');
+  // Markdown rendering is reserved for assistant output — user input
+  // is left as plain pre-wrap so markdown-looking syntax (e.g. paths
+  // with underscores, leading hashes in shell logs, raw HTML tags)
+  // shows up verbatim instead of being silently reinterpreted. The
+  // streaming caret is also dropped on the markdown side: the pacer's
+  // character-by-character reveal already conveys "in progress", and
+  // a caret pinned to the bubble's tail would land below a block
+  // element when the last token is a code fence or list, looking off.
+  const showMarkdown = !isUser && !row.notice && body.length > 0;
   return (
-    <div className={`group flex ${isUser ? 'justify-end' : 'justify-start'}`}>
-      <div className="relative max-w-[80%]">
+    <div className={`group flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
+      <div className="relative max-w-2xl">
         <div
-          className={`border-2 border-black rounded-md px-3 py-2 font-mono text-sm whitespace-pre-wrap transition-opacity ${
-            isUser ? 'bg-brand text-white' : 'bg-white text-ink'
-          } ${row.pending ? 'opacity-60' : ''}`}
+          className={`border-2 border-black rounded-md px-3 py-2 text-sm transition-opacity ${
+            showMarkdown ? 'font-mono' : 'font-mono whitespace-pre-wrap'
+          } ${isUser ? 'bg-brand text-white' : 'bg-white text-ink'} ${
+            row.pending ? 'opacity-60' : ''
+          }`}
         >
-          {body}
-          {row.streaming ? (
-            <span className="inline-block w-1.5 h-3 ml-0.5 align-baseline bg-current animate-pulse" />
-          ) : null}
+          {showMarkdown ? (
+            <MarkdownBody text={body} />
+          ) : (
+            <>
+              {body}
+              {row.streaming ? (
+                <span className="inline-block w-1.5 h-3 ml-0.5 align-baseline bg-current animate-pulse" />
+              ) : null}
+            </>
+          )}
         </div>
         {row.pending ? (
           <RiLoader4Line
@@ -1623,6 +2085,46 @@ function MessageBubble({ row }: { row: TranscriptRow }) {
           />
         ) : null}
         {!isUser && !row.streaming && body ? <CopyButton text={body} /> : null}
+      </div>
+      {row.createdAt ? (
+        <span
+          className="mt-1 px-1 font-mono text-[0.65rem] text-ink-soft tabular-nums"
+          title={formatTimestampTooltip(row.createdAt)}
+        >
+          {formatTimestampShort(row.createdAt)}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+// Three brand-colored dots inside an assistant-style bubble, bouncing
+// in sequence. Rendered while `SessionView.awaitingReply` is true —
+// i.e. the user has sent a turn and the agent's first delta hasn't
+// arrived yet. The bubble is intentionally left-aligned and shaped
+// like a real assistant message so the eye reads it as "the assistant
+// is composing here". Staggered `animationDelay` produces the
+// canonical typing-dot cascade.
+function TypingIndicator() {
+  return (
+    <div className="group flex flex-col items-start">
+      <div
+        className="border-2 border-black rounded-md bg-white px-3 py-2.5 shadow-brutal-sm flex items-end gap-1"
+        aria-label="Assistant is composing a reply"
+        role="status"
+      >
+        <span
+          className="block w-1.5 h-1.5 rounded-full bg-brand animate-bounce"
+          style={{ animationDelay: '0ms' }}
+        />
+        <span
+          className="block w-1.5 h-1.5 rounded-full bg-brand animate-bounce"
+          style={{ animationDelay: '150ms' }}
+        />
+        <span
+          className="block w-1.5 h-1.5 rounded-full bg-brand animate-bounce"
+          style={{ animationDelay: '300ms' }}
+        />
       </div>
     </div>
   );
@@ -1657,7 +2159,7 @@ function WelcomeEmpty({
   onPick: (value: string) => void;
 }) {
   return (
-    <div className="max-w-2xl mx-auto pt-12 pb-6 flex flex-col gap-4">
+    <div className="max-w-3xl mx-auto pt-12 pb-6 flex flex-col gap-4">
       <div className="border-2 border-black bg-white rounded-md shadow-brutal-sm p-4 flex flex-col gap-2">
         <span className="text-2xl font-bold uppercase -tracking-[0.04em]">Start chatting</span>
         <p className="text-sm font-mono text-ink-soft">
