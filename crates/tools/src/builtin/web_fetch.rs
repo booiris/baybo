@@ -20,16 +20,17 @@
 //! returns the extracted (or summarised) text.
 //!
 //! HTML bodies are run through `dom_smoothie` — a Rust port of
-//! Mozilla's Readability.js. It evaluates each candidate subtree by
-//! text density and class/id signals, picks the article body, and
-//! drops navigation chrome, sidebars, comments, scripts, and styles
-//! in one pass. We ask for `TextMode::Formatted` so block boundaries
-//! survive as newlines without injecting markdown syntax (the user
-//! asked for plain text, not markdown). When the heuristic can't
-//! identify an article (list pages, very short bodies, malformed
-//! markup), the raw page text is returned as a fallback so the agent
-//! still sees *something* — script tags are inert in plain text
-//! output, so the security floor we lose is essentially nil.
+//! Mozilla's Readability.js — to pick the article body and drop
+//! navigation chrome, sidebars, comments, scripts, and styles. The
+//! cleaned article HTML is then converted to Markdown via `htmd`
+//! (a turndown.js-style HTML→MD converter), which keeps headings,
+//! lists, links, code blocks and tables in a form the agent can
+//! read structurally. `script` / `style` survivors are stripped
+//! explicitly so any leftover inline JS or CSS can't leak into the
+//! Markdown output. When the readability heuristic can't identify
+//! an article (list pages, very short bodies, malformed markup) or
+//! the MD conversion fails, the raw page bytes are returned verbatim
+//! as a fallback so the agent still sees *something*.
 //!
 //! SSRF guard runs at two layers:
 //!  1. URL parse: `validate_url_with` rejects non-http(s) schemes, literal-IP
@@ -54,7 +55,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use aura_llm::{BilledChat, ChatRequest};
 use aura_model::{ChatMessage, ContentBlock, Role};
-use dom_smoothie::{Config, Readability, TextMode};
+use dom_smoothie::Readability;
+use htmd::HtmlToMarkdown;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect;
 use serde::Deserialize;
@@ -240,16 +242,18 @@ impl Tool for WebFetchTool {
 
     fn description(&self) -> &str {
         r#"
-- Fetches content from a specified URL
-- Takes a URL and an optional prompt as input
-- Fetches the URL content, extracts the article body as plain text (navigation, sidebars, scripts, and styles are removed)
-- When a prompt is supplied the extracted text is run through a side LLM that produces a focused answer; otherwise the text is returned verbatim
+- Fetches content from a specified URL and processes it using an AI model
+- Takes a URL and a prompt as input
+- Fetches the URL content, converts HTML to markdown
+- Returns the model's response about the content
 - Use this tool when you need to retrieve and analyze web content
+
 Usage notes:
   - The URL must be a fully-formed valid URL
   - HTTP URLs will be automatically upgraded to HTTPS
+  - The prompt should describe what information you want to extract from the page
   - This tool is read-only and does not modify any files
-  - If no LLM is configured the prompt is ignored and the extracted text is returned
+  - Results may be summarized if the content is very large
 "#
     }
 
@@ -562,41 +566,47 @@ async fn read_body(
     Ok(buf)
 }
 
-/// Run dom_smoothie's Readability over the HTML body and return the
-/// article text. Title (when non-empty) is prefixed on its own line so
-/// the agent has it without re-parsing. `TextMode::Formatted` keeps
-/// block boundaries as newlines without injecting markdown markers.
+/// Run dom_smoothie's Readability over the HTML body to pick the
+/// article subtree, then convert that cleaned HTML to Markdown via
+/// `htmd`. The title (when non-empty) is prefixed as an H1 so the
+/// agent has it without re-parsing.
 ///
 /// On failure (list pages, very short bodies, malformed markup that
-/// makes the readability heuristic give up), the raw page bytes are
-/// returned verbatim — a noisy text dump still beats an empty
-/// `ToolOutput::Text`, and scripts in plain text are inert.
+/// makes the readability heuristic give up, or htmd choking on the
+/// cleaned HTML), the raw page bytes are returned verbatim — a noisy
+/// dump still beats an empty `ToolOutput::Text`.
 fn extract_article(raw_html: &str, host: &str) -> String {
-    let cfg = Config {
-        text_mode: TextMode::Formatted,
-        ..Config::default()
-    };
-    let mut readability = match Readability::new(raw_html, None, Some(cfg)) {
+    let mut readability = match Readability::new(raw_html, None, None) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(host = %host, error = %e, "WebFetch readability init failed; returning raw");
             return raw_html.to_string();
         }
     };
-    match readability.parse() {
-        Ok(article) => {
-            let title = article.title.trim();
-            let body = article.text_content.trim();
-            if title.is_empty() {
-                body.to_string()
-            } else {
-                format!("{title}\n\n{body}")
-            }
-        }
+    let article = match readability.parse() {
+        Ok(a) => a,
         Err(e) => {
             tracing::warn!(host = %host, error = %e, "WebFetch readability parse failed; returning raw");
-            raw_html.to_string()
+            return raw_html.to_string();
         }
+    };
+
+    let converter = HtmlToMarkdown::builder()
+        .skip_tags(vec!["script", "style", "noscript"])
+        .build();
+    let body_md = match converter.convert(&article.content) {
+        Ok(md) => md.trim().to_string(),
+        Err(e) => {
+            tracing::warn!(host = %host, error = %e, "WebFetch html→md conversion failed; returning raw");
+            return raw_html.to_string();
+        }
+    };
+
+    let title = article.title.trim();
+    if title.is_empty() {
+        body_md
+    } else {
+        format!("# {title}\n\n{body_md}")
     }
 }
 
@@ -921,7 +931,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn html_body_is_extracted_as_plain_text() {
+    async fn html_body_is_extracted_as_markdown() {
         let body = article_html("Real Title", "Hello body world");
         let server = spawn(Router::new().route(
             "/",
@@ -938,8 +948,9 @@ mod tests {
         let ToolOutput::Text(s) = out else { panic!() };
         assert!(s.contains("Real Title"), "title missing: {s:?}");
         assert!(s.contains("Hello body world"), "body missing: {s:?}");
-        // dom_smoothie returns plain text — no markdown markers.
-        assert!(!s.contains("# Real Title"), "unexpected md heading: {s:?}");
+        // htmd renders headings as ATX markdown — the title prefix is
+        // emitted as `# ...` and the in-body <h1> as another `# ...`.
+        assert!(s.contains("# Real Title"), "expected md heading: {s:?}");
         assert!(!s.contains("<h1"), "raw html leaked: {s:?}");
     }
 

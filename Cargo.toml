@@ -118,6 +118,7 @@ tower = { version = "0.5", features = ["util"] }
 url = "2"
 reqwest = { version = "0.13", features = ["json"] }
 dom_smoothie = "0.17"
+htmd = "0.5"
 bytes = "1"
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 cron = "0.15"

@@ -47,6 +47,7 @@ shell-words = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 dom_smoothie = { workspace = true }
+htmd = { workspace = true }
 # MCP client + OAuth: rmcp owns the protocol/transport surface, oauth2
 # powers the authorization-code+PKCE flow inside `aura mcp add`, `open`
 # launches the user's browser at authorization time, base64 encodes the
