@@ -9,6 +9,8 @@ import {
   type KeyboardEvent,
 } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
+import ReactMarkdown, { type Components } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
   RiAddLine,
   RiArrowDownLine,
@@ -1917,6 +1919,111 @@ function SessionRow({
   );
 }
 
+// Brutalist override map for ReactMarkdown. Keeps the bubble feeling
+// like a chat bubble (tight spacing, no doc-style top margins) while
+// still giving lists / code / quotes / tables a recognizable shape.
+// `first:mt-0 last:mb-0` on the block elements keeps the bubble's top
+// and bottom edges from gaining extra padding from leading/trailing
+// markdown blocks.
+const MARKDOWN_COMPONENTS: Components = {
+  p: ({ children }) => (
+    <p className="my-2 first:mt-0 last:mb-0 leading-relaxed">{children}</p>
+  ),
+  h1: ({ children }) => (
+    <h1 className="my-2 first:mt-0 last:mb-0 text-base font-bold uppercase tracking-wider">
+      {children}
+    </h1>
+  ),
+  h2: ({ children }) => (
+    <h2 className="my-2 first:mt-0 last:mb-0 text-base font-bold">{children}</h2>
+  ),
+  h3: ({ children }) => (
+    <h3 className="my-2 first:mt-0 last:mb-0 text-sm font-bold">{children}</h3>
+  ),
+  h4: ({ children }) => (
+    <h4 className="my-2 first:mt-0 last:mb-0 text-sm font-bold">{children}</h4>
+  ),
+  h5: ({ children }) => (
+    <h5 className="my-2 first:mt-0 last:mb-0 text-sm font-bold">{children}</h5>
+  ),
+  h6: ({ children }) => (
+    <h6 className="my-2 first:mt-0 last:mb-0 text-sm font-bold">{children}</h6>
+  ),
+  ul: ({ children }) => (
+    <ul className="my-2 first:mt-0 last:mb-0 list-disc pl-5 space-y-1">{children}</ul>
+  ),
+  ol: ({ children }) => (
+    <ol className="my-2 first:mt-0 last:mb-0 list-decimal pl-5 space-y-1">{children}</ol>
+  ),
+  li: ({ children }) => <li className="leading-snug">{children}</li>,
+  a: ({ href, children }) => (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="text-brand underline underline-offset-2 hover:text-brand-hover break-words"
+    >
+      {children}
+    </a>
+  ),
+  strong: ({ children }) => <strong className="font-bold">{children}</strong>,
+  em: ({ children }) => <em className="italic">{children}</em>,
+  blockquote: ({ children }) => (
+    <blockquote className="my-2 first:mt-0 last:mb-0 border-l-4 border-black pl-3 italic text-ink-soft">
+      {children}
+    </blockquote>
+  ),
+  hr: () => <hr className="my-3 border-t-2 border-black" />,
+  // `inline` is false for fenced code blocks; ReactMarkdown wraps those
+  // in `<pre><code>…</code></pre>`, so the inline branch handles the
+  // `\`foo\`` case and the block branch is rendered via `pre`.
+  code: ({ className, children, ...rest }) => {
+    const isInline = !/^language-/.test(className ?? '');
+    if (isInline) {
+      return (
+        <code
+          className="bg-canvas border border-black/30 rounded px-1 py-[1px] text-[0.85em]"
+          {...rest}
+        >
+          {children}
+        </code>
+      );
+    }
+    return (
+      <code className={`${className ?? ''} block`} {...rest}>
+        {children}
+      </code>
+    );
+  },
+  pre: ({ children }) => (
+    <pre className="my-2 first:mt-0 last:mb-0 bg-canvas border-2 border-black rounded-md p-2 overflow-x-auto text-xs leading-snug">
+      {children}
+    </pre>
+  ),
+  table: ({ children }) => (
+    <div className="my-2 first:mt-0 last:mb-0 overflow-x-auto">
+      <table className="border-2 border-black border-collapse text-xs">{children}</table>
+    </div>
+  ),
+  thead: ({ children }) => <thead className="bg-canvas">{children}</thead>,
+  th: ({ children }) => (
+    <th className="border border-black px-2 py-1 font-bold uppercase tracking-wider text-[0.65rem] text-left">
+      {children}
+    </th>
+  ),
+  td: ({ children }) => <td className="border border-black px-2 py-1">{children}</td>,
+};
+
+const REMARK_PLUGINS = [remarkGfm];
+
+function MarkdownBody({ text }: { text: string }) {
+  return (
+    <ReactMarkdown components={MARKDOWN_COMPONENTS} remarkPlugins={REMARK_PLUGINS}>
+      {text}
+    </ReactMarkdown>
+  );
+}
+
 function MessageBubble({ row }: { row: TranscriptRow }) {
   if (row.notice) {
     const palette =
@@ -1935,18 +2042,35 @@ function MessageBubble({ row }: { row: TranscriptRow }) {
   }
   const isUser = row.role === 'user';
   const body = row.text || (row.hasAttachments ? '[attachment]' : '');
+  // Markdown rendering is reserved for assistant output — user input
+  // is left as plain pre-wrap so markdown-looking syntax (e.g. paths
+  // with underscores, leading hashes in shell logs, raw HTML tags)
+  // shows up verbatim instead of being silently reinterpreted. The
+  // streaming caret is also dropped on the markdown side: the pacer's
+  // character-by-character reveal already conveys "in progress", and
+  // a caret pinned to the bubble's tail would land below a block
+  // element when the last token is a code fence or list, looking off.
+  const showMarkdown = !isUser && !row.notice && body.length > 0;
   return (
     <div className={`group flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
       <div className="relative max-w-2xl">
         <div
-          className={`border-2 border-black rounded-md px-3 py-2 font-mono text-sm whitespace-pre-wrap transition-opacity ${
-            isUser ? 'bg-brand text-white' : 'bg-white text-ink'
-          } ${row.pending ? 'opacity-60' : ''}`}
+          className={`border-2 border-black rounded-md px-3 py-2 text-sm transition-opacity ${
+            showMarkdown ? 'font-mono' : 'font-mono whitespace-pre-wrap'
+          } ${isUser ? 'bg-brand text-white' : 'bg-white text-ink'} ${
+            row.pending ? 'opacity-60' : ''
+          }`}
         >
-          {body}
-          {row.streaming ? (
-            <span className="inline-block w-1.5 h-3 ml-0.5 align-baseline bg-current animate-pulse" />
-          ) : null}
+          {showMarkdown ? (
+            <MarkdownBody text={body} />
+          ) : (
+            <>
+              {body}
+              {row.streaming ? (
+                <span className="inline-block w-1.5 h-3 ml-0.5 align-baseline bg-current animate-pulse" />
+              ) : null}
+            </>
+          )}
         </div>
         {row.pending ? (
           <RiLoader4Line
