@@ -104,12 +104,24 @@ async fn chat_api_round_trip() {
         "new token must be live after refresh",
     );
 
-    // ── 5. Slash manifest is non-empty ──────────────────────────────
+    // ── 5. Slash manifest exposes /compact but hides /new ───────────
     let manifest = get(&router, "/v1/chat/slash-manifest", StatusCode::OK).await;
     let manifest_items = manifest["items"].as_array().expect("items");
     assert!(
         !manifest_items.is_empty(),
         "/v1/chat/slash-manifest exposes the gateway's slash commands",
+    );
+    let commands: Vec<&str> = manifest_items
+        .iter()
+        .map(|c| c["command"].as_str().expect("command"))
+        .collect();
+    assert!(
+        commands.contains(&"compact"),
+        "manifest must advertise /compact, got {commands:?}",
+    );
+    assert!(
+        !commands.contains(&"new"),
+        "web composer should not see /new — it has a 'New chat' button instead, got {commands:?}",
     );
 
     // ── 6. DELETE hides — row + token both stay live ────────────────

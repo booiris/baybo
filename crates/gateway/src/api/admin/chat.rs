@@ -451,10 +451,18 @@ async fn slash_manifest(
 ) -> Result<Json<ListResponse<SlashCommandEntry>>> {
     let items = crate::channel::slash::manifest()
         .into_iter()
+        .filter(|c| !WEB_HIDDEN_SLASH_COMMANDS.contains(&c.command.as_str()))
         .map(SlashCommandEntry::from)
         .collect();
     Ok(Json(ListResponse::new(items)))
 }
+
+/// Slash commands the gateway dispatcher owns for sidecars but the web
+/// composer should NOT advertise. `/new` is a sidecar affordance for
+/// resetting a session over a chat surface that has no UI — the web
+/// already exposes a "New chat" button, so listing it in the slash
+/// palette is just clutter.
+const WEB_HIDDEN_SLASH_COMMANDS: &[&str] = &["new"];
 
 // ── helpers ──────────────────────────────────────────────────────────
 
