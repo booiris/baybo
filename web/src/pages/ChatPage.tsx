@@ -967,7 +967,7 @@ export function ChatPage() {
           <button
             type="button"
             onClick={jumpToLatest}
-            className="absolute bottom-[calc(20vh+12px)] left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-3 py-1.5 bg-white border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:bg-gray-100 cursor-pointer"
+            className="absolute bottom-[calc(18vh+12px)] left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-3 py-1.5 bg-white border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:bg-gray-100 cursor-pointer"
             title="Jump to latest"
           >
             <RiArrowDownLine className="text-base" />
