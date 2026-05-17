@@ -81,10 +81,13 @@ pub fn default_tools(
             vec![ToolCapability::ReadFile, ToolCapability::WriteFile],
         ),
         trusted(
-            EditTool::new(workspace_paths),
+            EditTool::new(workspace_paths.clone()),
             vec![ToolCapability::ReadFile, ToolCapability::WriteFile],
         ),
-        trusted(BashTool, vec![ToolCapability::ExecCommand]),
+        trusted(
+            BashTool::new(workspace_paths),
+            vec![ToolCapability::ExecCommand],
+        ),
         trusted(GlobTool, vec![ToolCapability::ReadFile]),
         trusted(GrepTool, vec![ToolCapability::ReadFile]),
         trusted(WebFetchTool::default(), vec![ToolCapability::Http]),

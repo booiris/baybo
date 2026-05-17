@@ -646,7 +646,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let soul = Soul::from_workspace(&graph.workspace)
         .await
         .unwrap_or_else(|_| Soul::custom("You are Aura, an intelligent assistant.".to_string()));
-    let system_prompt = soul.raw_template().to_string();
+    let system_prompt = soul.system_prompt().to_string();
 
     let max_iterations = graph.config.agent.max_iterations;
     let token_budget = boot::to_token_budget(&graph.config.agent.context);

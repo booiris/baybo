@@ -173,7 +173,7 @@ impl Tool for SkillTool {
         }
 
         let mut out = match p.file_path.as_deref() {
-            None => render_main(&skill, p.args.as_deref())?,
+            None => render_main(&skill, p.args.as_deref(), ctx.session_id.as_ref())?,
             Some(rel) => render_subfile(&skill, rel).await?,
         };
         if let Some(warn) = warning.as_deref() {
@@ -259,15 +259,29 @@ async fn check_env_or_prompt(
     }
 }
 
-fn render_main(skill: &SkillDefinition, args: Option<&str>) -> aura_tools::Result<ToolOutput> {
+/// Token in a built-in SKILL.md body that gets substituted with the
+/// running session's id at render time. Only the aura-cli skill uses
+/// it today; the substitution is a no-op for skill bodies that don't
+/// contain the token, so every skill goes through the same path.
+const SESSION_ID_TOKEN: &str = "{{session_id}}";
+
+fn render_main(
+    skill: &SkillDefinition,
+    args: Option<&str>,
+    session_id: &str,
+) -> aura_tools::Result<ToolOutput> {
     let dir = skill.source_path.as_deref();
     let path = dir.map(|d| d.join("SKILL.md"));
+
+    let content = skill
+        .prompt_template
+        .replace(SESSION_ID_TOKEN, session_id);
 
     let mut out = json!({
         "name": skill.name,
         "version": skill.version,
         "description": skill.description,
-        "content": skill.prompt_template,
+        "content": content,
         "skill_dir": dir.map(path_to_string),
         "path": path.as_deref().map(path_to_string),
         "linked_files": skill.linked_files.to_json(),
@@ -815,6 +829,45 @@ mod tests {
         assert_eq!(lf["templates"], json!(["templates/cfg.yaml"]));
         assert_eq!(lf["scripts"], json!(["scripts/s.sh"]));
         assert_eq!(lf["other"], json!(["misc.txt"]));
+    }
+
+    #[tokio::test]
+    async fn session_id_token_is_substituted_in_rendered_content() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("SKILL.md"),
+            "current session is {{session_id}}\n",
+        )
+        .unwrap();
+
+        let registry = Arc::new(SkillRegistry::new());
+        let mut skill = mk_skill(root, "session-aware");
+        skill.prompt_template = "current session is {{session_id}}\n".into();
+        registry.register(skill);
+        let tool = SkillTool {
+            registry,
+            risk_check: Arc::new(AlwaysPass),
+        };
+
+        let ctx = mk_ctx();
+        let out = tool
+            .execute(json!({"skill": "session-aware"}), &ctx)
+            .await
+            .unwrap();
+        let v = match out {
+            ToolOutput::Json(v) => v,
+            other => panic!("expected json, got {other:?}"),
+        };
+        assert_eq!(v["content"], format!("current session is {}\n", "s"));
+        assert!(
+            !v["content"]
+                .as_str()
+                .unwrap()
+                .contains(SESSION_ID_TOKEN),
+            "raw placeholder must not survive substitution: {}",
+            v["content"]
+        );
     }
 
     #[tokio::test]

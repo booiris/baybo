@@ -40,6 +40,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use aura_workspace::{WorkspacePaths, absolutise};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -49,60 +50,62 @@ use crate::{ApprovalDecision, ResourceAccess, Tool, ToolContext, ToolError, Tool
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_KIB: usize = MAX_OUTPUT_BYTES / 1024;
 
-static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "Execute a shell command in a fresh `sh -c` process. Environment \
-         changes and `cd` do not persist across invocations. Each of \
-         stdout and stderr is truncated at {MAX_OUTPUT_KIB} KiB.\n\n\
-         IMPORTANT: Do NOT use Bash for tasks that have a dedicated tool:\n\
-         - File-content viewers (`cat`, `head`, `tail`, `less`, `more`, \
-         `tac`) and file-driven text processors (`sed`, `awk`) are \
-         REJECTED at this layer when invoked as the leading command — \
-         use `Read` for content (`offset`/`limit` cover head/tail), \
-         `Edit` for in-place changes (safer than `sed -i`). \
-         Stream-mode `sed`/`awk` AFTER a pipe is fine (e.g. \
-         `git log | sed 's/.../.../'`) — only `sed <file>` / `awk <file>` \
-         is blocked.\n\
-         - To write files use `Write` (not echo/cat with redirection)\n\
-         - To search file names use `Glob` (not find/ls)\n\
-         - To search file contents use `Grep` (not grep/rg)\n\n\
-         SANDBOX: The shell runs with read+write access to the project \
-         workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … \
-         stay readable; nothing outside that union is visible — no \
-         full host-root bind). Credential vaults inside `$HOME` \
-         (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, \
-         `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Aura \
-         state dir under `~/.aura`/`$AURA_HOME`) are masked with empty \
-         tmpfs and look empty inside the sandbox. Host raw devices \
-         stay unreachable (`/dev` is a minimal devtmpfs). Network is \
-         enabled.\n\n\
-         APPROVAL: sandboxed commands run without prompting by default. \
-         The pre-execution approval gate only fires when the command \
-         tokens contain a file-delete (`rm`, `rmdir`, `unlink`, `shred`, \
-         `srm`, `wipe`, or `find … -delete`) or a destructive `git` \
-         operation (`clean -f`, `reset --hard`, `branch -d`/`-D`/\
-         `--delete`, `tag -d`, `push -f`/`--force`/`--force-with-lease`/\
-         `--delete`/`-d`, `stash drop`/`clear`, `worktree remove`, \
-         `update-ref -d`, `filter-branch`, `filter-repo`); a separate \
-         prompt also fires if the sandbox refuses the command and an \
-         unsandboxed retry is available.\n\
-         Reserve Bash for system commands, git operations, build/test, \
-         and terminal tasks that require shell execution.\n\n\
-         DEFAULT CWD: If `cwd` is omitted, Aura runs the command from the \
-         workspace work directory and exports `PWD` with the same value.\n\n\
-         PATHS: Any directory or file argument inside the command (cd, ls, \
-         mkdir, rm, mv, cp, find, …) MUST be an absolute path. The optional \
-         `cwd` parameter MUST also be absolute when provided — relative \
-         values are rejected. Always quote file paths that contain spaces \
-         with double quotes (e.g. `cd \"/path with spaces/file.txt\"`).\n\n\
-         BEFORE BROAD SCANS: Do not run `find`, `du`, recursive `ls`, or \
-         similar walks against unknown directories without first checking \
-         their size with a bounded probe (e.g. `ls -1 <dir> | wc -l`, or a \
-         shallow `find -maxdepth 2`). Large trees can hang the process."
-    )
-});
+/// Description template. `{{max_output_kib}}`, `{{work_dir}}`, and
+/// `{{platform}}` are filled in by [`BashTool::new`]; the work-dir and
+/// platform live here (not in the agent's system prompt) so they're
+/// adjacent to the tool that actually consumes them — the agent reads
+/// the description right before composing a Bash call.
+const DESCRIPTION_TEMPLATE: &str = r#"Execute a shell command in a fresh `sh -c` process. Environment changes and `cd` do not persist across invocations. Each of stdout and stderr is truncated at {{max_output_kib}} KiB.
 
-pub struct BashTool;
+IMPORTANT: Do NOT use Bash for tasks that have a dedicated tool:
+- File-content viewers (`cat`, `head`, `tail`, `less`, `more`, `tac`) and file-driven text processors (`sed`, `awk`) are REJECTED at this layer when invoked as the leading command — use `Read` for content (`offset`/`limit` cover head/tail), `Edit` for in-place changes (safer than `sed -i`). Stream-mode `sed`/`awk` AFTER a pipe is fine (e.g. `git log | sed 's/.../.../'`) — only `sed <file>` / `awk <file>` is blocked.
+- To write files use `Write` (not echo/cat with redirection)
+- To search file names use `Glob` (not find/ls)
+- To search file contents use `Grep` (not grep/rg)
+
+SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Aura state dir under `~/.aura`/`$AURA_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled.
+
+APPROVAL: sandboxed commands run without prompting by default. The pre-execution approval gate only fires when the command tokens contain a file-delete (`rm`, `rmdir`, `unlink`, `shred`, `srm`, `wipe`, or `find … -delete`) or a destructive `git` operation (`clean -f`, `reset --hard`, `branch -d`/`-D`/`--delete`, `tag -d`, `push -f`/`--force`/`--force-with-lease`/`--delete`/`-d`, `stash drop`/`clear`, `worktree remove`, `update-ref -d`, `filter-branch`, `filter-repo`); a separate prompt also fires if the sandbox refuses the command and an unsandboxed retry is available.
+Reserve Bash for system commands, git operations, build/test, and terminal tasks that require shell execution.
+
+DEFAULT CWD: If `cwd` is omitted, Aura runs the command from the workspace work directory and exports `PWD` with the same value.
+
+PATHS: Any directory or file argument inside the command (cd, ls, mkdir, rm, mv, cp, find, …) MUST be an absolute path. The optional `cwd` parameter MUST also be absolute when provided — relative values are rejected. Always quote file paths that contain spaces with double quotes (e.g. `cd "/path with spaces/file.txt"`).
+
+BEFORE BROAD SCANS: Do not run `find`, `du`, recursive `ls`, or similar walks against unknown directories without first checking their size with a bounded probe (e.g. `ls -1 <dir> | wc -l`, or a shallow `find -maxdepth 2`). Large trees can hang the process.
+
+ENVIRONMENT:
+- Working directory: {{work_dir}}
+- Platform: {{platform}}"#;
+
+pub struct BashTool {
+    description: String,
+}
+
+impl BashTool {
+    pub fn new(workspace_paths: WorkspacePaths) -> Self {
+        let work_dir = absolutise(&workspace_paths.work_dir());
+        Self {
+            description: build_description(&work_dir, std::env::consts::OS),
+        }
+    }
+}
+
+fn build_description(work_dir: &Path, platform: &str) -> String {
+    DESCRIPTION_TEMPLATE
+        .replace("{{max_output_kib}}", &MAX_OUTPUT_KIB.to_string())
+        .replace("{{work_dir}}", &work_dir.display().to_string())
+        .replace("{{platform}}", platform)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl BashTool {
+    /// Test-only constructor anchored at `/tmp` — production paths go
+    /// through [`Self::new`] with the real workspace.
+    pub fn for_test() -> Self {
+        Self::new(WorkspacePaths::new("/tmp"))
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct Params {
@@ -120,7 +123,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        &DESCRIPTION
+        &self.description
     }
 
     fn parameters_schema(&self) -> Value {
@@ -1399,7 +1402,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_when_sandbox_missing() {
-        let err = BashTool
+        let err = BashTool::for_test()
             .execute(json!({ "command": "echo hi" }), &ctx_with(None))
             .await
             .unwrap_err();
@@ -1417,7 +1420,7 @@ mod tests {
             stderr: Vec::new(),
             timed_out: false,
         });
-        let out = BashTool
+        let out = BashTool::for_test()
             .execute(json!({ "command": "echo hello" }), &ctx_with(Some(sandbox)))
             .await
             .unwrap();
@@ -1450,7 +1453,7 @@ mod tests {
             .to_string();
         let exe_canon = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
 
-        let err = BashTool
+        let err = BashTool::for_test()
             .execute(
                 json!({ "command": format!("{exe_name} --probe") }),
                 &ctx_with(None),
@@ -1492,7 +1495,7 @@ mod tests {
             timed_out: false,
         });
         let cmd = format!("{exe_path} --aura-bypass-probe-nonexistent-arg");
-        let out = BashTool
+        let out = BashTool::for_test()
             .execute(
                 json!({ "command": cmd, "timeout_ms": 5000 }),
                 &ctx_with(Some(sandbox)),
@@ -1508,7 +1511,7 @@ mod tests {
 
         // And the bypass works even when no sandbox is installed.
         let cmd = format!("{exe_path} --aura-bypass-probe-nonexistent-arg");
-        BashTool
+        BashTool::for_test()
             .execute(
                 json!({ "command": cmd, "timeout_ms": 5000 }),
                 &ctx_with(None),
@@ -1531,7 +1534,7 @@ mod tests {
             stderr: Vec::new(),
             timed_out: false,
         });
-        BashTool
+        BashTool::for_test()
             .execute(json!({ "command": "pwd" }), &ctx_with(Some(sandbox)))
             .await
             .expect("pwd must run");
@@ -1548,7 +1551,7 @@ mod tests {
             stderr: Vec::new(),
             timed_out: false,
         });
-        let out = BashTool
+        let out = BashTool::for_test()
             .execute(json!({ "command": "exit 7" }), &ctx_with(Some(sandbox)))
             .await
             .unwrap();
@@ -1564,7 +1567,7 @@ mod tests {
             stderr: Vec::new(),
             timed_out: true,
         });
-        let err = BashTool
+        let err = BashTool::for_test()
             .execute(
                 json!({ "command": "sleep 5", "timeout_ms": 50 }),
                 &ctx_with(Some(sandbox)),
@@ -1576,7 +1579,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_relative_cwd_before_sandbox_dispatch() {
-        let err = BashTool
+        let err = BashTool::for_test()
             .execute(
                 json!({ "command": "echo hi", "cwd": "relative/path" }),
                 &ctx_with(None),
@@ -1597,7 +1600,7 @@ mod tests {
             stderr: Vec::new(),
             timed_out: false,
         });
-        let out = BashTool
+        let out = BashTool::for_test()
             .execute(
                 json!({ "command": "grep foo bar.txt" }),
                 &ctx_with(Some(sandbox)),
@@ -1616,7 +1619,7 @@ mod tests {
             stderr: b"grep: bar.txt: No such file\n".to_vec(),
             timed_out: false,
         });
-        let out = BashTool
+        let out = BashTool::for_test()
             .execute(
                 json!({ "command": "grep foo bar.txt" }),
                 &ctx_with(Some(sandbox)),
@@ -1635,7 +1638,7 @@ mod tests {
             stderr: Vec::new(),
             timed_out: false,
         });
-        let out = BashTool
+        let out = BashTool::for_test()
             .execute(json!({ "command": "false" }), &ctx_with(Some(sandbox)))
             .await
             .unwrap();
@@ -1651,7 +1654,7 @@ mod tests {
             stderr: Vec::new(),
             timed_out: false,
         });
-        let out = BashTool
+        let out = BashTool::for_test()
             .execute(
                 json!({ "command": "diff a.txt b.txt" }),
                 &ctx_with(Some(sandbox)),
@@ -1670,7 +1673,7 @@ mod tests {
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
         let ctx = ctx_with_approval(Some(sandbox), gate.clone());
 
-        let out = BashTool
+        let out = BashTool::for_test()
             .execute(json!({ "command": "echo hi" }), &ctx)
             .await
             .expect("approved unsandboxed retry must succeed");
@@ -1701,7 +1704,7 @@ mod tests {
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
         let ctx = ctx_with_approval(Some(sandbox), gate.clone());
 
-        let err = BashTool
+        let err = BashTool::for_test()
             .execute(json!({ "command": "echo hi" }), &ctx)
             .await
             .unwrap_err();
@@ -1722,7 +1725,7 @@ mod tests {
         });
         let ctx = ctx_with(Some(sandbox));
 
-        let err = BashTool
+        let err = BashTool::for_test()
             .execute(json!({ "command": "echo hi" }), &ctx)
             .await
             .unwrap_err();
@@ -1749,7 +1752,7 @@ mod tests {
         // Non-zero exit is the command's own failure, not a sandbox
         // infrastructure failure. We must NOT auto-prompt for an
         // unsandboxed retry — that would be noise on every failed test.
-        let out = BashTool
+        let out = BashTool::for_test()
             .execute(json!({ "command": "false" }), &ctx)
             .await
             .expect("non-zero exit returns Ok");
@@ -1779,7 +1782,7 @@ mod tests {
         let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
         let ctx = ctx_with_approval(Some(sandbox), gate.clone());
 
-        let out = BashTool
+        let out = BashTool::for_test()
             .execute(json!({ "command": "curl https://example.com" }), &ctx)
             .await
             .expect("network failure surfaces as ordinary non-zero exit");
@@ -1809,7 +1812,7 @@ mod tests {
             stderr: Vec::new(),
             timed_out: false,
         });
-        let out = BashTool
+        let out = BashTool::for_test()
             .execute(json!({ "command": "yes" }), &ctx_with(Some(sandbox)))
             .await
             .unwrap();
@@ -1879,7 +1882,7 @@ mod tests {
     fn accessed_resources_only_prompts_for_delete_tokens() {
         // FileToolRedirect rejection bypasses approval — the sandbox
         // never gets reached.
-        let resources = BashTool.accessed_resources(&json!({ "command": "cat foo" }));
+        let resources = BashTool::for_test().accessed_resources(&json!({ "command": "cat foo" }));
         assert!(
             resources.is_empty(),
             "content-read is rejected before sandbox; no approval needed"
@@ -1897,7 +1900,7 @@ mod tests {
             "pwd",
             "stat /tmp/x",
         ] {
-            let resources = BashTool.accessed_resources(&json!({ "command": cmd }));
+            let resources = BashTool::for_test().accessed_resources(&json!({ "command": cmd }));
             assert!(
                 resources.is_empty(),
                 "{cmd:?} must skip pre-execution approval, got {resources:?}"
@@ -1926,7 +1929,7 @@ mod tests {
             "git stash drop",
             "git worktree remove /tmp/wt",
         ] {
-            let resources = BashTool.accessed_resources(&json!({ "command": cmd }));
+            let resources = BashTool::for_test().accessed_resources(&json!({ "command": cmd }));
             assert_eq!(
                 resources.len(),
                 1,
@@ -1948,7 +1951,7 @@ mod tests {
             "git reset --hard origin/main",
             "xargs rm",
         ] {
-            let label = BashTool.call_label(&json!({ "command": cmd }));
+            let label = BashTool::for_test().call_label(&json!({ "command": cmd }));
             let label = label.unwrap_or_else(|| panic!("expected warning label for {cmd:?}"));
             assert!(
                 label.contains("Destructive") && label.contains("irreversible"),
@@ -1961,7 +1964,7 @@ mod tests {
         // label only appears as part of the overall warning UX).
         for cmd in ["echo hi", "git status", "cargo build", "ls /tmp"] {
             assert_eq!(
-                BashTool.call_label(&json!({ "command": cmd })),
+                BashTool::for_test().call_label(&json!({ "command": cmd })),
                 None,
                 "benign command {cmd:?} must not surface a warning label"
             );
@@ -1980,7 +1983,7 @@ mod tests {
             "sed -i 's/a/b/' f",
             "awk '{print}' f",
         ] {
-            let err = BashTool
+            let err = BashTool::for_test()
                 .execute(json!({ "command": cmd }), &ctx_with(None))
                 .await
                 .unwrap_err();
@@ -2290,10 +2293,10 @@ mod tests {
         // BashTool::execute itself, so no prompt fires here regardless.
         // What this test pins is the *resource declaration*: empty for
         // benign commands so the registry has nothing to gate.
-        let resources = BashTool.accessed_resources(&json!({ "command": "git status" }));
+        let resources = BashTool::for_test().accessed_resources(&json!({ "command": "git status" }));
         assert!(resources.is_empty());
 
-        let out = BashTool
+        let out = BashTool::for_test()
             .execute(json!({ "command": "git status" }), &ctx)
             .await
             .expect("benign command must run");

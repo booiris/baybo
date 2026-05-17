@@ -22,6 +22,16 @@ commands you compose:
 
 You never need to pass `--config` yourself.
 
+## Current session
+
+The conversation you are answering inside right now is
+**session `{{session_id}}`**. Use this id whenever a subcommand
+takes `<id>` and the user is asking about "this session" / "the
+current chat" / "now" — e.g. `{{AURA_BIN}} session show {{session_id}}`,
+`{{AURA_BIN}} session history {{session_id}}`,
+`{{AURA_BIN}} cost show --session {{session_id}}`. Only swap in a
+different id if the user names one explicitly.
+
 ## Decision tree
 
 Pick the family that matches the question. `{{AURA_BIN}}` is the

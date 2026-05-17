@@ -1299,8 +1299,7 @@ impl AgentLoop {
             })
             .await?;
         if matches!(outcome, aura_context::CompressionOutcome::Compressed) {
-            self.reload_soul_after_compaction(session.id.as_ref())
-                .await?;
+            self.reload_soul_after_compaction().await?;
         }
         Ok(())
     }
@@ -1379,7 +1378,7 @@ impl AgentLoop {
                     })
                     .await?;
                 if matches!(outcome, aura_context::CompressionOutcome::Compressed) {
-                    self.reload_soul_after_compaction(session.id.as_ref()).await?;
+                    self.reload_soul_after_compaction().await?;
                 }
                 let text = match outcome {
                     aura_context::CompressionOutcome::Compressed => {
@@ -1603,10 +1602,10 @@ impl AgentLoop {
         } else {
             self.invocable_skills()
         };
-        let soul_prompt = self.soul.system_prompt(session.id.as_ref());
+        let soul_prompt = self.soul.system_prompt();
         let to_seed = initial_seed_messages(
             self.context_manager.messages().first(),
-            &soul_prompt,
+            soul_prompt,
             &skills,
         );
         for msg in &to_seed {
@@ -1630,7 +1629,7 @@ impl AgentLoop {
     /// forward forever. New sessions don't need this path because
     /// `ensure_system_prompt` already seeds them from a fresh
     /// [`Soul::from_workspace`] read.
-    async fn reload_soul_after_compaction(&mut self, session_id: &str) -> anyhow::Result<()> {
+    async fn reload_soul_after_compaction(&mut self) -> anyhow::Result<()> {
         let Some(paths) = self.workspace_paths.as_ref() else {
             return Ok(());
         };
@@ -1651,7 +1650,7 @@ impl AgentLoop {
         if first_is_system_text {
             self.context_manager.replace_first_message(ChatMessage {
                 role: Role::System,
-                content: vec![ContentBlock::Text(new_soul.system_prompt(session_id))],
+                content: vec![ContentBlock::Text(new_soul.system_prompt().to_string())],
                 from_user: false,
             });
         }
