@@ -991,7 +991,7 @@ export function ChatPage() {
 
         <form
           onSubmit={handleSend}
-          className="border-t-2 border-black bg-canvas px-4 pt-3 pb-6 mb-[calc(18vh-131px)] max-w-3xl mx-auto w-full"
+          className="border-t-2 border-black bg-canvas px-4 pt-3 pb-6 mb-[calc(14vh-131px)] max-w-3xl mx-auto w-full"
         >
           <div className="relative border-2 border-black rounded-md bg-white shadow-brutal-sm focus-within:shadow-brutal transition-shadow">
             {filteredSlash.length > 0 ? (
