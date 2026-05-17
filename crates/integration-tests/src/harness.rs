@@ -347,10 +347,10 @@ impl AgentTestHarnessBuilder {
             .token_budget
             .unwrap_or_else(|| TokenBudget::new(100_000, 0.95));
         let token_calibration = Arc::new(aura_context::TokenCalibration::new());
-        let session_store = Arc::new(aura_storage::test_support::MemorySessionStore::new())
-            as Arc<dyn aura_storage::SessionStore>;
-        let summary_store = Arc::new(aura_storage::test_support::MemorySessionSummaryStore::new())
-            as Arc<dyn aura_storage::SessionSummaryStore>;
+        let session_store = Arc::new(aura_session::test_support::MemorySessionStore::new())
+            as Arc<dyn aura_session::SessionStore>;
+        let summary_store = Arc::new(aura_session::test_support::MemorySessionSummaryStore::new())
+            as Arc<dyn aura_session::SessionSummaryStore>;
         let session_manager = Arc::new(aura_agent::SessionManager::new(
             session_store,
             summary_store,

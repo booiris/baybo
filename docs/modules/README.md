@@ -34,8 +34,8 @@ Bottom-up along the dependency graph:
 - **[skills-assessor](skills-assessor.md)** — LLM-backed risk classifier for skills. Hashes the skill directory, caches verdicts (`Safe`/`Suspicious`/`Dangerous`) in `SkillRiskStore`, tiers large skills (primary-scope synchronous + full-scope background worker with restart-safe job recovery), and gates skill injection in `AgentLoop` so only `Dangerous` blocks. Kept separate from `skills` so selection stays deterministic and offline-capable.
 - **workspace** — Identity files and long-running configuration.
 - **cron** — Cron job domain types (`CronJob`, `CronExecution`, `CronStatus`, `CronRunMode`, `CronError`). Standard cron syntax.
-- **context** — Per-actor token budget + compression strategy + transcript ownership (`ContextManager`). Pure in-memory; persistence is the agent loop's job, brokered through `SessionStore` from `storage`.
-- **session** — `SessionManager` and `SessionError`: process-level lifecycle wrapper over `aura_storage::SessionStore` (CRUD, timeout cleanup, fork-delete refusal, transcript / system-prompt persistence helpers). Session domain types (`User`, `ChannelType`, `Session`, `SessionState`, `TriggerSource`, `SystemReason`, `Lineage`) live in `model`; the `SessionStore` trait lives in `storage`. A `Session` is the top of one trace tree (1 trace = 1 session); fork and subagent spawn create new sessions linked through `Lineage`.
+- **context** — Per-actor token budget + compression strategy + transcript ownership (`ContextManager`). Pure in-memory; persistence is the agent loop's job, brokered through `SessionStore` from `session`.
+- **session** — Owns the session persistence vertical: `SessionStore` / `SessionSummaryStore` traits, `StoredMessage` / `SessionSummaryRow` value types, `SessionError`, and the `SessionManager` business-logic facade (CRUD, timeout cleanup, fork-delete refusal, transcript / summary persistence helpers). Session domain types (`User`, `ChannelType`, `Session`, `SessionState`, `TriggerSource`, `SystemReason`, `Lineage`) live in `model`; `aura-storage` provides the libsql implementations of both store traits. A `Session` is the top of one trace tree (1 trace = 1 session); fork and subagent spawn create new sessions linked through `Lineage`.
 
 ### Runtime and Observability Layer
 
@@ -47,7 +47,7 @@ Bottom-up along the dependency graph:
 
 ### Infrastructure and Assembly Layer
 
-- **storage** — Defines the remaining Store traits (`SessionStore`, `CronStore`, `SkillRiskStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`, `SessionSummaryStore`, `BlobStore`) and implements every store (including `JobStore` / `TraceStore` / `MemoryStore` / `CostStore` / `SecretStore` from their respective domain crates) via libsql (single backend). `CronStore` uses opaque row types (`CronJobRow`, `CronExecutionRow`) — no dependency on `cron` domain crate. `SkillRiskStore` defines its own `RiskVerdict` / `RiskLevel` types so `aura-skills` can stay LLM-free. `ChannelPairingStore` defines `ChannelPairingRow` / `PairingStatus` so `aura-pairing` can stay a business-logic crate.
+- **storage** — Defines the remaining Store traits (`CronStore`, `SkillRiskStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`, `BlobStore`) and implements every store (including `SessionStore` / `SessionSummaryStore` / `JobStore` / `TraceStore` / `MemoryStore` / `CostStore` / `SecretStore` from their respective domain crates) via libsql (single backend). `CronStore` uses opaque row types (`CronJobRow`, `CronExecutionRow`) — no dependency on `cron` domain crate. `SkillRiskStore` defines its own `RiskVerdict` / `RiskLevel` types so `aura-skills` can stay LLM-free. `ChannelPairingStore` defines `ChannelPairingRow` / `PairingStatus` so `aura-pairing` can stay a business-logic crate.
 - **code-builder** — `aura-code-builder`. LLM-driven Python script execution: builds a workspace-bound `SandboxSpec` (`FilesystemPolicy::Workspace`), runs scripts under per-call `<work>/.code-builder/<uuid>/` scratch dirs, and routes through the sandbox runner.
 - **janitor** — `aura-janitor`. Background maintenance tasks (storage compaction, log rotation, scratch-dir cleanup) that run on a cadence outside the agent loop.
 - **[pairing](pairing.md)** — Per-user pairing gate for sidecar-routed inbound messages. `PairingService` checks the `(channel_type, bot_id, user_id)` triple, mints 6-char codes for unknown senders, and refuses with a `Frame::Notice` until `aura pair approve <code>` flips the row to `approved`. Store trait + row lives in `storage`; `aura-pairing` is the service + code generator.
@@ -80,9 +80,9 @@ model (owns Session/User/ChannelType/SessionState + memory/message types; no int
   └── workspace (no internal deps)
   └── config (no internal deps; external only)
 
-storage   ──► model, trace, security, job (defines all Store traits; sole backend: libsql; CronStore uses opaque row types)
-context   ──► model, llm, skills (owns ContextManager; pure in-memory)
-session   ──► model, storage (owns SessionManager; consumes SessionStore from storage)
+storage   ──► model, session, trace, security, job, memory, cost (implements traits owned by each domain crate; sole backend: libsql)
+context   ──► model, llm, skills, session (owns ContextManager; pure in-memory; persistence routed via SessionStore)
+session   ──► model (owns SessionStore + SessionSummaryStore traits + SessionManager; storage depends on session)
 pairing   ──► model, storage (owns PairingService + code generator; consumes ChannelPairingStore from storage)
 sandbox   ──► (no internal deps; OS sandbox runner consumed by agent)
 agent     ──► model, llm, tools, workspace, context, session, trace, job, cron, security, sandbox, storage, channels, config

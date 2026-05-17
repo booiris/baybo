@@ -47,6 +47,7 @@ aura-job = { workspace = true, features = ["test-support"] }
 aura-llm = { workspace = true, features = ["test-support"] }
 aura-memory = { workspace = true, features = ["test-support"] }
 aura-security = { workspace = true, features = ["test-support"] }
+aura-session = { workspace = true, features = ["test-support"] }
 aura-storage = { workspace = true, features = ["test-support"] }
 aura-trace = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

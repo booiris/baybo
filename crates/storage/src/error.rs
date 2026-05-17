@@ -1,4 +1,5 @@
 use aura_model::SessionId;
+use aura_session::SessionError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -26,4 +27,22 @@ pub enum StorageError {
     /// driver failures that don't map cleanly onto a richer variant).
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
+}
+
+/// Bridge libsql-backed session/summary store errors to the public
+/// `SessionError` returned by the trait. Stringifies generic libsql
+/// failures into `SessionError::Storage`; preserves `HasLiveForks`
+/// structurally so the CLI delete path can render the fork ids back.
+impl From<StorageError> for SessionError {
+    fn from(e: StorageError) -> Self {
+        match e {
+            StorageError::HasLiveForks { fork_session_ids } => {
+                SessionError::HasLiveForks { fork_session_ids }
+            }
+            StorageError::NotFound(s) => SessionError::NotFound(s),
+            StorageError::Storage(s) => SessionError::Storage(s),
+            other @ StorageError::TooLarge { .. } => SessionError::Storage(other.to_string()),
+            StorageError::Internal(e) => SessionError::Internal(e),
+        }
+    }
 }

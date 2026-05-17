@@ -20,6 +20,7 @@ aura-job = { workspace = true }
 aura-memory = { workspace = true }
 aura-cost = { workspace = true }
 aura-security = { workspace = true }
+aura-session = { workspace = true }
 
 async-trait = { workspace = true }
 bytes = { workspace = true }

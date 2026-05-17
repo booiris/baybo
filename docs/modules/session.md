@@ -2,13 +2,13 @@
 
 ## Overview
 
-The `session` crate owns `SessionError` and the `SessionManager` that implements session lifecycle logic. Domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `SystemReason`, `Lineage`, `LineageKind`) live in `aura-model`; the `SessionStore` persistence trait lives in `aura-storage`. `aura-session` depends on both and wraps the store behind the manager API.
+The `session` crate owns the full vertical for session persistence and lifecycle: `SessionError`, the `SessionStore` / `SessionSummaryStore` traits, the per-row `StoredMessage` / `SessionSummaryRow` value types, and the `SessionManager` business-logic facade. Domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `SystemReason`, `Lineage`, `LineageKind`) live in `aura-model`; the libsql implementations of both store traits live in `aura-storage`, which depends on `aura-session` for the contract.
 
 A `Session` is the top of one trace tree. There is exactly one trace per session — fork and subagent spawn create new sessions with `Lineage` pointers, never new trees rooted in the same session.
 
 The conversation transcript itself is **not** carried on `Session`. It lives in `aura_context::ContextManager` while the actor is alive; the agent loop persists each appended message and each `/compact` apply through `SessionManager::append_session_message` / `apply_session_compaction`, and the router seeds it from `load_active_session_messages` on cold start.
 
-**Design principle**: types and store interface are pushed down into lower crates (`aura-model`, `aura-storage`) so this crate can consume the store without creating a dependency cycle. `SessionManager` itself is the only business-logic resident. Concrete storage implementations live in `storage`; higher-level orchestration (Router, Actor) lives in `agent`, which re-exports `SessionManager` for convenience.
+**Design principle**: each domain crate owns its full persistence vertical (trait + manager + test-support fake) so downstream callers depend on the domain crate alone for session work. `aura-storage` keeps only the libsql implementations and exposes a `Store` bundle for assembly-layer wiring. Higher-level orchestration (Router, Actor) lives in `agent`, which re-exports `SessionManager` for convenience.
 
 ## Manager surface
 
@@ -79,7 +79,7 @@ When a session with an in-flight subagent is deleted, the subagent's cancellatio
 | Module    | Role                                                                                                |
 | --------- | --------------------------------------------------------------------------------------------------- |
 | `model`   | Defines `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`               |
-| `storage` | Defines `SessionStore` trait + libsql impl; defines `StoredMessage` for transcript replay          |
+| `storage` | Implements `SessionStore` / `SessionSummaryStore` against libsql; pulls the traits from `aura-session` |
 | `context` | Owns the in-memory transcript via `ContextManager`; agent loop brokers persistence via this crate  |
 | `agent`   | Re-exports `SessionManager`; Router calls it; `AgentActor` holds the `Session` instance            |
 | `cli` / `gateway` | Operator-facing surfaces consume `aura_agent::SessionManager`                              |

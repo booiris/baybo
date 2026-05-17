@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
 use crate::error::StorageError;
-use crate::session_summary::{Result, SessionSummaryRow, SessionSummaryStore};
+use aura_session::{Result, SessionSummaryRow, SessionSummaryStore};
 
 pub struct LibsqlSessionSummaryStore {
     pool: LibsqlPool,
@@ -301,7 +301,7 @@ impl SessionSummaryStore for LibsqlSessionSummaryStore {
 mod tests {
     use super::*;
     use crate::libsql::session::LibsqlSessionStore;
-    use crate::session::SessionStore;
+    use aura_session::SessionStore;
     use aura_model::{ChannelType, Session, SessionState, TriggerSource, User};
 
     fn make_session(id: &str) -> Session {

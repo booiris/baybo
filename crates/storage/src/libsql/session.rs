@@ -3,8 +3,8 @@ use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
 use crate::error::StorageError;
-use crate::session::{Result, SessionStore};
 use aura_model::{ChatMessage, Lineage, LineageKind, Session, SessionId};
+use aura_session::{Result, SessionError, SessionStore, StoredMessage};
 
 pub struct LibsqlSessionStore {
     pool: LibsqlPool,
@@ -184,7 +184,7 @@ impl SessionStore for LibsqlSessionStore {
         drop(rows);
         if !live_forks.is_empty() {
             let _ = tx.rollback().await;
-            return Err(StorageError::HasLiveForks {
+            return Err(SessionError::HasLiveForks {
                 fork_session_ids: live_forks,
             });
         }
@@ -704,9 +704,9 @@ impl SessionStore for LibsqlSessionStore {
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
         {
-            Some(row) => row
+            Some(row) => Ok(row
                 .get::<Option<i64>>(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}"))),
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?),
             None => Ok(None),
         }
     }
@@ -960,7 +960,7 @@ impl SessionStore for LibsqlSessionStore {
     async fn load_session_messages_with_supersede(
         &self,
         session_id: &SessionId,
-    ) -> Result<Vec<crate::session::StoredMessage>> {
+    ) -> Result<Vec<StoredMessage>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
@@ -1005,7 +1005,7 @@ impl SessionStore for LibsqlSessionStore {
             })?;
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
-            out.push(crate::session::StoredMessage {
+            out.push(StoredMessage {
                 ordinal,
                 superseded_by,
                 created_at,
@@ -1106,7 +1106,7 @@ mod tests {
 
         let err = store.delete(&parent.id).await.unwrap_err();
         match err {
-            StorageError::HasLiveForks { fork_session_ids } => {
+            SessionError::HasLiveForks { fork_session_ids } => {
                 assert_eq!(fork_session_ids, vec![fork.id.clone()]);
             }
             other => panic!("expected HasLiveForks, got {other:?}"),
