@@ -62,6 +62,7 @@ IMPORTANT: Do NOT use Bash for tasks that have a dedicated tool:
 - To write files use `Write` (not echo/cat with redirection)
 - To search file names use `Glob` (not find/ls)
 - To search file contents use `Grep` (not grep/rg)
+- To download a file to disk (`.txt`, `.json`, `.csv`, archives, binaries, scripts, …) use Bash with `curl`/`wget` — WebFetch only returns rendered text into the conversation and never writes to disk.
 
 SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Aura state dir under `~/.aura`/`$AURA_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled.
 
