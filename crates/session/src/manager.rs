@@ -84,7 +84,6 @@ impl SessionManager {
                 updated_at,
             )
             .await
-
     }
 
     /// Record a failed summary attempt: bumps `error_count`. Inserts
@@ -101,7 +100,6 @@ impl SessionManager {
         self.summary_store
             .bump_error_count(session_id, model_id, span_id, updated_at)
             .await
-
     }
 
     /// Mark `session_id` as having an in-flight `BackgroundCompressionRunner`
@@ -120,7 +118,6 @@ impl SessionManager {
         self.summary_store
             .set_in_flight(session_id, true, Some(owner), Utc::now())
             .await
-
     }
 
     /// Compare-and-clear the `in_flight` flag: only clears when the
@@ -137,7 +134,6 @@ impl SessionManager {
         self.summary_store
             .clear_in_flight_if_owned(session_id, owner, Utc::now())
             .await
-
     }
 
     /// Reset `in_flight = 0` on every `session_summaries` row. Called
@@ -160,7 +156,6 @@ impl SessionManager {
         self.summary_store
             .set_in_flight(session_id, false, None, Utc::now())
             .await
-
     }
 
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
@@ -260,17 +255,13 @@ impl SessionManager {
         self.store
             .list_active_maintenance_for_parent(parent_session_id)
             .await
-
     }
 
     /// Enumerate every maintenance session id (`is_normal_session
     /// = 0`). Used by the startup orphan reaper to delete sessions
     /// whose actor isn't running after a process bounce.
     pub async fn all_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
-        self.store
-            .list_all_maintenance_sessions()
-            .await
-
+        self.store.list_all_maintenance_sessions().await
     }
 
     /// Maintenance sessions whose associated job is **not** in a
@@ -279,10 +270,7 @@ impl SessionManager {
     /// Sessions whose pass landed cleanly are kept as audit history
     /// (cost-records join lookups depend on them).
     pub async fn unfinished_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
-        self.store
-            .list_unfinished_maintenance_sessions()
-            .await
-
+        self.store.list_unfinished_maintenance_sessions().await
     }
 
     /// Create a session that descends from `parent` via the given
@@ -410,10 +398,7 @@ impl SessionManager {
         if self.store.get(session_id).await?.is_none() {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
-        self.store
-            .load_active_session_messages(session_id)
-            .await
-
+        self.store.load_active_session_messages(session_id).await
     }
 
     /// Reverse-paginated slice of the active transcript: the
@@ -436,7 +421,6 @@ impl SessionManager {
         self.store
             .load_active_session_messages_tail(session_id, before_ordinal, limit)
             .await
-
     }
 
     /// Forward catch-up slice: at most `limit` active rows with
@@ -458,7 +442,6 @@ impl SessionManager {
         self.store
             .load_active_session_messages_since(session_id, after_ordinal, limit)
             .await
-
     }
 
     /// Append a single message to the session's transcript log.
@@ -473,10 +456,7 @@ impl SessionManager {
         session_id: &SessionId,
         message: &ChatMessage,
     ) -> Result<i64> {
-        self.store
-            .append_session_message(session_id, message)
-            .await
-
+        self.store.append_session_message(session_id, message).await
     }
 
     /// Mark the currently-active rows for `session_id` as superseded
@@ -491,7 +471,6 @@ impl SessionManager {
         self.store
             .apply_session_compaction(session_id, new_active)
             .await
-
     }
 
     /// Load the active transcript for `session_id` — used by the
@@ -501,20 +480,14 @@ impl SessionManager {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<ChatMessage>> {
-        self.store
-            .load_active_session_messages(session_id)
-            .await
-
+        self.store.load_active_session_messages(session_id).await
     }
 
     /// Highest `session_messages.ordinal` ever assigned for the
     /// session, regardless of supersede status. Used by the trace
     /// span builder to anchor `LlmCallInputs::Persisted`.
     pub async fn latest_session_ordinal(&self, session_id: &SessionId) -> Result<Option<i64>> {
-        self.store
-            .latest_session_ordinal(session_id)
-            .await
-
+        self.store.latest_session_ordinal(session_id).await
     }
 
     /// Full message log including superseded rows, paired with each
@@ -528,7 +501,6 @@ impl SessionManager {
         self.store
             .load_session_messages_with_supersede(session_id)
             .await
-
     }
 
     /// 0-indexed position of `ordinal` within the active message
@@ -542,15 +514,11 @@ impl SessionManager {
         self.store
             .active_index_of_ordinal(session_id, ordinal)
             .await
-
     }
 
     /// Count of active rows for the session. Index-only.
     pub async fn count_active_messages(&self, session_id: &SessionId) -> Result<usize> {
-        self.store
-            .count_active_messages(session_id)
-            .await
-
+        self.store.count_active_messages(session_id).await
     }
 
     /// Active transcript clipped to `ordinal <= up_to_ordinal`. Used
@@ -565,7 +533,6 @@ impl SessionManager {
         self.store
             .load_active_session_messages_up_to(session_id, up_to_ordinal)
             .await
-
     }
 
     /// Hard-delete a session by id. Errors with `SessionError::NotFound`
@@ -587,11 +554,7 @@ impl SessionManager {
     /// running actor stay live. Returns `Err(NotFound)` when the
     /// session id is unknown.
     pub async fn set_hidden(&self, session_id: &SessionId, hidden: bool) -> Result<()> {
-        let updated = self
-            .store
-            .set_hidden(session_id, hidden)
-            .await
-            ?;
+        let updated = self.store.set_hidden(session_id, hidden).await?;
         if !updated {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }

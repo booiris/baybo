@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use aura_agent::SecurityGateway;
 use aura_model::{ChannelType, Session, SessionId, SessionState, TriggerSource, User};
-use aura_security::{EncryptionKey, LeakDetector, SecretVault};
 use aura_security::test_support::MemorySecretStore;
+use aura_security::{EncryptionKey, LeakDetector, SecretVault};
 use chrono::Utc;
 
 /// Stable 32-byte key used by every fixture so placeholder hex values

@@ -11,10 +11,10 @@ use aura_agent::SecurityGateway;
 use aura_channels::{Message, OutgoingMessage};
 use aura_integration_tests::{SessionBuilder, capture_tracing, gateway_with_memory_vault};
 use aura_model::{ChannelType, ContentBlock, MessageMetadata, User};
+use aura_security::test_support::MemorySecretStore;
 use aura_security::{
     EncryptionKey, LeakAction, LeakDetectionRule, LeakDetector, PlaceholderMinter, SecretVault,
 };
-use aura_security::test_support::MemorySecretStore;
 use chrono::Utc;
 use regex::Regex;
 use tracing::Level;

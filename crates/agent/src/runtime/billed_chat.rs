@@ -152,19 +152,19 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use aura_cost::test_support::MemoryCostStore;
     use aura_llm::LlmCompletion;
     use aura_llm::test_support::StubLlm;
     use aura_llm::{GuardedLlm, LlmResponse, TokenUsage};
     use aura_model::{ChatMessage, ContentBlock, JobId, Role, SessionId, SpanId};
     use aura_security::leak_detector::{LeakAction, LeakDetectionRule, LeakDetector};
-    use aura_security::{EncryptionKey, SecretVault};
-    use aura_cost::test_support::MemoryCostStore;
     use aura_security::test_support::MemorySecretStore;
+    use aura_security::{EncryptionKey, SecretVault};
     use regex::Regex;
 
     use super::*;
-    use aura_cost::{CostManager, SpendingLimits};
     use crate::security::SecurityGateway;
+    use aura_cost::{CostManager, SpendingLimits};
 
     fn fixture(stub: Arc<StubLlm>) -> (Arc<dyn BilledChat>, Arc<SecurityGateway>) {
         let mut detector = LeakDetector::new();

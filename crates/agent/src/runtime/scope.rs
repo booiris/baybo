@@ -33,8 +33,8 @@ use std::future::Future;
 use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
 use aura_model::{JobId, ParallelGroup, SessionId, TriggerKind};
 use aura_trace::{
-    LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanHandle, SpanKind, SpanRecorder,
-    StepHandle, StepKind,
+    LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanHandle, SpanKind,
+    SpanRecorder, StepHandle, StepKind,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::warn;

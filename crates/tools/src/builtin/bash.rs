@@ -2293,7 +2293,8 @@ mod tests {
         // BashTool::execute itself, so no prompt fires here regardless.
         // What this test pins is the *resource declaration*: empty for
         // benign commands so the registry has nothing to gate.
-        let resources = BashTool::for_test().accessed_resources(&json!({ "command": "git status" }));
+        let resources =
+            BashTool::for_test().accessed_resources(&json!({ "command": "git status" }));
         assert!(resources.is_empty());
 
         let out = BashTool::for_test()

@@ -413,7 +413,6 @@ impl CostManager {
         }
         Ok(())
     }
-
 }
 
 /// Bridge `CostManager` to the `LlmCallGuard` closure shape that

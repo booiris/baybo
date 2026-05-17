@@ -441,8 +441,7 @@ mod tests {
         // UNIQUE(job_id, scheduled_fire_time) constraint isn't tripped
         // by repeat fixture rows.
         let salt: i64 = id.chars().map(|c| c as i64).sum();
-        let scheduled =
-            future_dt() + chrono::Duration::microseconds(salt);
+        let scheduled = future_dt() + chrono::Duration::microseconds(salt);
         CronExecution {
             id: id.to_string(),
             job_id: job_id.to_string(),

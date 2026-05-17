@@ -1635,7 +1635,10 @@ mod tests {
         ) -> std::result::Result<Option<Vec<u8>>, aura_security::SecurityError> {
             self.inner.retrieve(name).await
         }
-        async fn delete(&self, name: &str) -> std::result::Result<(), aura_security::SecurityError> {
+        async fn delete(
+            &self,
+            name: &str,
+        ) -> std::result::Result<(), aura_security::SecurityError> {
             self.inner.delete(name).await
         }
         async fn list(&self) -> std::result::Result<Vec<String>, aura_security::SecurityError> {
@@ -1718,8 +1721,8 @@ mod tests {
     /// so a cross-process `aura llm remove` (which clears the vault entry) is honoured.
     #[tokio::test]
     async fn ensure_fresh_bundle_invalidates_cache_when_vault_is_emptied() {
-        use aura_security::{EncryptionKey, SecretVault};
         use aura_security::test_support::MemorySecretStore;
+        use aura_security::{EncryptionKey, SecretVault};
 
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
         let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));
@@ -1765,8 +1768,8 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_fresh_bundle_skips_vault_within_revalidate_interval() {
-        use aura_security::{EncryptionKey, SecretVault};
         use aura_security::test_support::MemorySecretStore;
+        use aura_security::{EncryptionKey, SecretVault};
 
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
         let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));
@@ -1832,8 +1835,8 @@ mod tests {
     /// — the re-check fires before any network call.
     #[tokio::test]
     async fn single_flight_refresh_dedups_after_concurrent_rotation() {
-        use aura_security::{EncryptionKey, SecretVault};
         use aura_security::test_support::MemorySecretStore;
+        use aura_security::{EncryptionKey, SecretVault};
 
         let now = chrono::Utc::now().timestamp();
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();

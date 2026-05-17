@@ -118,4 +118,3 @@ impl CostStore for MemoryCostStore {
         Ok(summary)
     }
 }
-

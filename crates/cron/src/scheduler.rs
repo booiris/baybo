@@ -603,7 +603,8 @@ mod tests {
                 .iter()
                 .filter(|j| {
                     j.status == CronStatus::Enabled
-                        && j.next_trigger_at.is_some_and(|t| t.timestamp_micros() <= now_us)
+                        && j.next_trigger_at
+                            .is_some_and(|t| t.timestamp_micros() <= now_us)
                 })
                 .cloned()
                 .collect())
@@ -640,7 +641,8 @@ mod tests {
             scheduled_fire_time_us: i64,
         ) -> Result<bool> {
             Ok(self.executions.lock().iter().any(|e| {
-                e.job_id == job_id && e.scheduled_fire_time.timestamp_micros() == scheduled_fire_time_us
+                e.job_id == job_id
+                    && e.scheduled_fire_time.timestamp_micros() == scheduled_fire_time_us
             }))
         }
 

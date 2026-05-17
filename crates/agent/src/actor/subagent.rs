@@ -232,9 +232,9 @@ async fn cancel_in_flight_child_jobs(
 mod tests {
     use super::*;
     use aura_channels::OutgoingMessage;
+    use aura_job::test_support::MemoryJobStore;
     use aura_job::{JobInput, JobOutput, JobStatus};
     use aura_model::{ChannelType, MessageMetadata, TriggerKind};
-    use aura_job::test_support::MemoryJobStore;
     use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
 

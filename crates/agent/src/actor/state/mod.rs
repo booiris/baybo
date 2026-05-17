@@ -32,8 +32,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::runtime::agent_loop::AgentLoop;
 use crate::actor::supervisor::AgentSupervisor;
+use crate::runtime::agent_loop::AgentLoop;
 use aura_job::JobLifecycle;
 use aura_trace::SpanRecorder;
 

@@ -10,8 +10,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use aura_security::{EncryptionKey, LeakAction, LeakDetector, PlaceholderMinter, SecretVault};
 use aura_security::test_support::MemorySecretStore;
+use aura_security::{EncryptionKey, LeakAction, LeakDetector, PlaceholderMinter, SecretVault};
 
 fn make_vault() -> (Arc<SecretVault>, Arc<MemorySecretStore>) {
     let store = Arc::new(MemorySecretStore::new());

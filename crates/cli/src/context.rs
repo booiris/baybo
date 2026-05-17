@@ -2,16 +2,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aura_agent::{CronScheduler, SecurityGateway, SessionManager};
-use aura_query::QueryApi;
 use aura_channels::ChannelRegistry;
 use aura_config::AuraConfig;
+use aura_cost::CostStore;
 use aura_job::JobLifecycle;
 use aura_llm::GuardedLlm;
 use aura_memory::MemoryManager;
+use aura_query::QueryApi;
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
-use aura_cost::CostStore;
 use aura_storage::{ChannelBotStore, ChannelPairingStore};
 use aura_tools::ToolRegistry;
 use aura_trace::TraceStore;

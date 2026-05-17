@@ -31,8 +31,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::actor::AgentMessage;
-use crate::security::SecurityGateway;
 use crate::actor::supervisor::AgentSupervisor;
+use crate::security::SecurityGateway;
 use aura_cost::CostManager;
 use aura_job::JobLifecycle;
 use aura_session::SessionManager;

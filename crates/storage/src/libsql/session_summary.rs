@@ -301,8 +301,8 @@ impl SessionSummaryStore for LibsqlSessionSummaryStore {
 mod tests {
     use super::*;
     use crate::libsql::session::LibsqlSessionStore;
-    use aura_session::SessionStore;
     use aura_model::{ChannelType, Session, SessionState, TriggerSource, User};
+    use aura_session::SessionStore;
 
     fn make_session(id: &str) -> Session {
         let user = User {

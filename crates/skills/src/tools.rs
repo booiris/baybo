@@ -273,9 +273,7 @@ fn render_main(
     let dir = skill.source_path.as_deref();
     let path = dir.map(|d| d.join("SKILL.md"));
 
-    let content = skill
-        .prompt_template
-        .replace(SESSION_ID_TOKEN, session_id);
+    let content = skill.prompt_template.replace(SESSION_ID_TOKEN, session_id);
 
     let mut out = json!({
         "name": skill.name,
@@ -835,11 +833,7 @@ mod tests {
     async fn session_id_token_is_substituted_in_rendered_content() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        fs::write(
-            root.join("SKILL.md"),
-            "current session is {{session_id}}\n",
-        )
-        .unwrap();
+        fs::write(root.join("SKILL.md"), "current session is {{session_id}}\n").unwrap();
 
         let registry = Arc::new(SkillRegistry::new());
         let mut skill = mk_skill(root, "session-aware");
@@ -861,10 +855,7 @@ mod tests {
         };
         assert_eq!(v["content"], format!("current session is {}\n", "s"));
         assert!(
-            !v["content"]
-                .as_str()
-                .unwrap()
-                .contains(SESSION_ID_TOKEN),
+            !v["content"].as_str().unwrap().contains(SESSION_ID_TOKEN),
             "raw placeholder must not survive substitution: {}",
             v["content"]
         );

@@ -16,9 +16,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use aura_config::{AuraConfig, LlmEntry};
+use aura_cost::CostRecord;
 use aura_gateway::test_support::{TEST_ADMIN_TOKEN, build_test_deps};
 use aura_model::{JobId, MicroUsd, SessionId, SpanId};
-use aura_cost::CostRecord;
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode, header};
 use chrono::Utc;

@@ -153,8 +153,8 @@ mod tests {
     /// from the marker module docs.
     #[test]
     fn volatile_resources_fields_are_marker_clean() {
-        use crate::runtime::agent_loop::AgentLoop;
         use crate::actor::supervisor::AgentSupervisor;
+        use crate::runtime::agent_loop::AgentLoop;
         use aura_channels::AgentOutput;
         use aura_job::JobLifecycle;
         use aura_trace::SpanRecorder;
