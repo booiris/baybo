@@ -77,7 +77,7 @@ pub fn default_tools(
     let mut tools: Vec<(Arc<dyn Tool>, ToolManifest)> = vec![
         trusted(ReadTool, vec![ToolCapability::ReadFile]),
         trusted(
-            WriteTool,
+            WriteTool::new(workspace_paths.clone()),
             vec![ToolCapability::ReadFile, ToolCapability::WriteFile],
         ),
         trusted(

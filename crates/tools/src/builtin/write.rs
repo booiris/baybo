@@ -1,15 +1,30 @@
 //! `Write` — create or overwrite a file with the given contents.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use aura_workspace::{WorkspacePaths, absolutise};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::paths::require_absolute;
 use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
-pub struct WriteTool;
+pub struct WriteTool {
+    work_dir: PathBuf,
+}
+
+impl WriteTool {
+    pub fn new(workspace_paths: WorkspacePaths) -> Self {
+        Self {
+            work_dir: absolutise(&workspace_paths.work_dir()),
+        }
+    }
+
+    fn is_inside_work_dir(&self, file_path: &Path) -> bool {
+        file_path.is_absolute() && file_path.starts_with(&self.work_dir)
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct Params {
@@ -45,15 +60,18 @@ impl Tool for WriteTool {
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
-        params
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .map(|s| {
-                vec![ResourceAccess::WriteFile {
-                    path: PathBuf::from(s),
-                }]
-            })
-            .unwrap_or_default()
+        let Some(s) = params.get("file_path").and_then(|v| v.as_str()) else {
+            return Vec::new();
+        };
+        let path = PathBuf::from(s);
+        // Writes targeting `<workspace>/work` skip the approval gate to
+        // match Bash's bypass for non-destructive ops inside `work/`.
+        // Everything else (profile/, config/, $HOME, /tmp, …) keeps
+        // the prompt as a backstop.
+        if self.is_inside_work_dir(&path) {
+            return Vec::new();
+        }
+        vec![ResourceAccess::WriteFile { path }]
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
@@ -103,11 +121,15 @@ mod tests {
         }
     }
 
+    fn tool() -> WriteTool {
+        WriteTool::new(aura_workspace::WorkspacePaths::new("/tmp"))
+    }
+
     #[tokio::test]
     async fn creates_file() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("new.txt");
-        WriteTool
+        tool()
             .execute(json!({ "file_path": p, "content": "hi" }), &ctx())
             .await
             .unwrap();
@@ -116,13 +138,50 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_relative_path() {
-        let err = WriteTool
+        let err = tool()
             .execute(json!({ "file_path": "rel.txt", "content": "x" }), &ctx())
             .await
             .unwrap_err();
         assert!(
             matches!(err, ToolError::InvalidParams(ref m) if m.contains("absolute")),
             "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn accessed_resources_skips_writefile_inside_work_dir() {
+        let paths = aura_workspace::WorkspacePaths::new("/var/aura");
+        let write = WriteTool::new(paths.clone());
+        let in_work = paths.work_dir().join("scratch.txt");
+        assert!(
+            write
+                .accessed_resources(&json!({ "file_path": in_work.to_string_lossy() }))
+                .is_empty(),
+            "writes inside <workspace>/work must skip approval",
+        );
+    }
+
+    #[test]
+    fn accessed_resources_keeps_writefile_outside_work_dir() {
+        let paths = aura_workspace::WorkspacePaths::new("/var/aura");
+        let write = WriteTool::new(paths.clone());
+
+        let in_profile = paths.profile_dir().join("SOUL.md");
+        let resources =
+            write.accessed_resources(&json!({ "file_path": in_profile.to_string_lossy() }));
+        assert!(
+            resources
+                .iter()
+                .any(|r| matches!(r, ResourceAccess::WriteFile { .. })),
+            "writes into other workspace subtrees must still declare WriteFile",
+        );
+
+        let outside = write.accessed_resources(&json!({ "file_path": "/tmp/random.txt" }));
+        assert!(
+            outside
+                .iter()
+                .any(|r| matches!(r, ResourceAccess::WriteFile { .. })),
+            "writes outside the workspace must still declare WriteFile",
         );
     }
 }
