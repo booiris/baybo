@@ -147,7 +147,7 @@ fn get(ctx: &CommandContext, path: &str) -> Result<CommandOutput> {
 
 /// Parse `raw` as JSON; on failure, treat it as a bare string literal. This
 /// keeps `aura config set llm.model gpt-5` ergonomic while still supporting
-/// `aura config set agent.max_tokens 4096` and `aura config set cost.enabled true`.
+/// `aura config set agent.max_iterations 100` and `aura config set cost.enabled true`.
 fn parse_value(raw: &str) -> serde_json::Value {
     match serde_json::from_str::<serde_json::Value>(raw) {
         Ok(v) => v,

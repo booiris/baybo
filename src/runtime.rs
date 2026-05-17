@@ -647,7 +647,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let system_prompt = soul.system_prompt().to_string();
 
     let max_iterations = graph.config.agent.max_iterations;
-    let token_budget = boot::to_token_budget(&graph.config.agent.context);
+    let compression_threshold = graph.config.agent.context.compression_threshold;
     let keep_recent = graph.config.agent.context.keep_recent;
 
     let (incoming_tx, incoming_rx) = mpsc::channel(buffer);
@@ -683,7 +683,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let session_logger = Arc::clone(&session_logger);
         let tokenizer = Arc::clone(&tokenizer);
         let trace_event_stream = trace_event_stream.clone();
-        let token_budget = token_budget.clone();
         let system_prompt = system_prompt.clone();
         let cost_manager = Arc::clone(&cost_manager);
         let token_calibration = Arc::clone(&token_calibration);
@@ -721,7 +720,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         tokenizer: Arc::clone(&tokenizer),
                         workspace: Arc::clone(&workspace_paths_arc),
                         keep_recent,
-                        budget: token_budget.clone(),
+                        compression_threshold,
                         calibration: Arc::clone(&token_calibration),
                         skill_registry: Arc::clone(&skill_registry),
                         session_id: session.id.clone(),

@@ -19,7 +19,7 @@ use aura_agent::{
     tool_executor::ToolExecutor,
 };
 use aura_channels::{AgentOutput, IncomingMessage, Message};
-use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, budget::TokenBudget};
+use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer};
 use aura_cost::test_support::MemoryCostStore;
 use aura_cost::{CostManager, SpendingLimits, cost_call_guard};
 use aura_job::JobLifecycle;
@@ -169,7 +169,15 @@ pub struct AgentTestHarnessBuilder {
     pricing: HashMap<String, ModelPricing>,
     workspace: Option<Arc<aura_workspace::WorkspacePaths>>,
     keep_recent: Option<usize>,
-    token_budget: Option<TokenBudget>,
+    /// Override for the stub LLM's `context_window`, which becomes the
+    /// `ContextManager`'s budget cap after `AgentLoop::from_config`
+    /// installs it. Defaults to the stub's built-in 8_192.
+    model_context_window: Option<usize>,
+    /// Compression threshold applied to the `ContextManager` budget.
+    /// Defaults to `0.95` — loose enough that tests not exercising
+    /// compression stay under it with the stub's default 8_192-token
+    /// window.
+    compression_threshold: Option<f64>,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -184,7 +192,8 @@ impl Default for AgentTestHarnessBuilder {
             pricing: HashMap::new(),
             workspace: None,
             keep_recent: None,
-            token_budget: None,
+            model_context_window: None,
+            compression_threshold: None,
         }
     }
 }
@@ -248,11 +257,20 @@ impl AgentTestHarnessBuilder {
         self
     }
 
-    /// Override the token budget handed to `ContextManager` (default:
-    /// `100_000` tokens, threshold `0.95`). Use a tight budget to
-    /// force compression with small canned messages.
-    pub fn with_token_budget(mut self, budget: TokenBudget) -> Self {
-        self.token_budget = Some(budget);
+    /// Override the stub LLM's `context_window`. The
+    /// `ContextManager` budget cap is sourced from this value because
+    /// `AgentLoop::from_config` installs it via
+    /// `ContextManager::set_active_model_context_window`. Use a small
+    /// value to force compression with short canned messages.
+    pub fn with_model_context_window(mut self, window: usize) -> Self {
+        self.model_context_window = Some(window);
+        self
+    }
+
+    /// Override the compression threshold applied to the
+    /// `ContextManager` budget. Defaults to `0.95`.
+    pub fn with_compression_threshold(mut self, threshold: f64) -> Self {
+        self.compression_threshold = Some(threshold);
         self
     }
 
@@ -307,7 +325,15 @@ impl AgentTestHarnessBuilder {
         );
 
         // Agent loop dependencies.
-        let stub_llm = Arc::new(StubLlm::new());
+        let stub_llm = {
+            let mut stub = StubLlm::new();
+            if let Some(window) = self.model_context_window {
+                let mut info = stub.model_info().clone();
+                info.context_window = window;
+                stub = stub.with_model_info(info);
+            }
+            Arc::new(stub)
+        };
         let mut tool_registry = ToolRegistry::new();
         for (tool, manifest) in self.tools {
             tool_registry.register(tool, manifest);
@@ -336,9 +362,7 @@ impl AgentTestHarnessBuilder {
             )))
         });
         let keep_recent = self.keep_recent.unwrap_or(50);
-        let token_budget = self
-            .token_budget
-            .unwrap_or_else(|| TokenBudget::new(100_000, 0.95));
+        let compression_threshold = self.compression_threshold.unwrap_or(0.95);
         let token_calibration = Arc::new(aura_context::TokenCalibration::new());
         let session_store = Arc::new(aura_session::test_support::MemorySessionStore::new())
             as Arc<dyn aura_session::SessionStore>;
@@ -352,7 +376,7 @@ impl AgentTestHarnessBuilder {
             tokenizer,
             workspace,
             keep_recent,
-            budget: token_budget,
+            compression_threshold,
             calibration: Arc::clone(&token_calibration),
             skill_registry: Arc::clone(&skill_registry),
             session_id: session.id.clone(),

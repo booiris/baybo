@@ -40,12 +40,11 @@ impl TokenBudget {
         self.current = token_count;
     }
 
-    /// Replace the maximum token cap. Used when the actor switches to
-    /// a model with a different context window — the configured budget
-    /// from `aura.json` is the upper bound, but if the active model's
-    /// window is smaller we clamp down so compression triggers before
-    /// the provider rejects the request. `current` is unchanged so the
-    /// next `needs_compression()` check sees the new cap immediately.
+    /// Install the active model's context window as the cap. Called
+    /// when an actor swaps LLMs so compression triggers before the
+    /// new provider rejects an oversized request. `current` is
+    /// unchanged so the next `needs_compression()` check sees the
+    /// new cap immediately.
     pub fn set_max_tokens(&mut self, max_tokens: usize) {
         self.max_tokens = max_tokens;
     }

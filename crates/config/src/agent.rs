@@ -13,7 +13,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 20,
+            max_iterations: 300,
             context: ContextConfig::default(),
         }
     }
@@ -23,9 +23,8 @@ impl Default for AgentConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ContextConfig {
-    /// Maximum tokens allowed in the context window.
-    pub max_tokens: usize,
-    /// Fraction of `max_tokens` at which compression triggers. Must be in `(0.0, 1.0]`.
+    /// Fraction of the active model's context window at which
+    /// compression triggers. Must be in `(0.0, 1.0]`.
     pub compression_threshold: f64,
     /// Number of most recent messages to retain when truncating.
     pub keep_recent: usize,
@@ -34,9 +33,8 @@ pub struct ContextConfig {
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
-            max_tokens: 120_000,
-            compression_threshold: 0.75,
-            keep_recent: 100,
+            compression_threshold: 0.65,
+            keep_recent: 10,
         }
     }
 }

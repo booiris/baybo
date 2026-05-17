@@ -21,7 +21,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_context::budget::TokenBudget;
 use aura_integration_tests::AgentTestHarness;
 use aura_llm::{LlmResponse, ModelPricing, StreamEvent, TokenUsage};
 use aura_model::MicroUsd;
@@ -52,7 +51,8 @@ async fn compression_call_records_cost_with_matching_span_id() {
     // gate from short-circuiting on the small canned transcript.
     let mut harness = AgentTestHarness::builder()
         .with_pricing(pricing)
-        .with_token_budget(TokenBudget::new(200, 0.1))
+        .with_model_context_window(200)
+        .with_compression_threshold(0.1)
         .with_keep_recent(1)
         .build();
 

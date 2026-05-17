@@ -111,7 +111,7 @@ The context sent to the LLM is organized in descending priority:
 
 ## Constraints
 
-- Keep `max_tokens` slightly below the real model limit to reserve output space
+- `TokenBudget::max_tokens` is sourced from the active LLM client's `ModelInfo::context_window` — installed by `AgentLoop::from_config` via `ContextManager::set_active_model_context_window`. There is no separate configured cap; resize the model's `context_window` if you need headroom for output tokens.
 - Compression threshold around 0.7–0.85 is usually reasonable
 - Tool-heavy conversations often need a larger `keep_recent`
 

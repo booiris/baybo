@@ -167,15 +167,6 @@ pub struct ContextManager {
     /// Tail size for the truncate fallback and the pre-flight gate.
     pub(crate) keep_recent: usize,
     pub(crate) budget: TokenBudget,
-    /// Configured per-session cap (`agent.context.max_tokens` from
-    /// `aura.json`). The effective compression trigger uses
-    /// `min(configured_max_tokens, active_model.context_window)` —
-    /// [`Self::set_active_model_context_window`] clamps `budget` down
-    /// when the actor swaps to a smaller-context model so requests
-    /// don't grow past the live provider's limit between turns.
-    /// Stored independently of `budget.max_tokens` so a swap back to
-    /// a larger model can restore the original cap.
-    configured_max_tokens: usize,
     calibration: Arc<TokenCalibration>,
     pub(crate) skill_registry: Arc<SkillRegistry>,
     /// Owned conversation transcript — the sole source of truth.
@@ -234,7 +225,13 @@ pub struct ContextManagerConfig {
     /// the continuation-summary message.
     pub workspace: Arc<aura_workspace::WorkspacePaths>,
     pub keep_recent: usize,
-    pub budget: TokenBudget,
+    /// Fraction of the active model's context window at which the
+    /// compression gate trips. Sourced from
+    /// `agent.context.compression_threshold` in `aura.json`. The
+    /// budget's `max_tokens` is installed later via
+    /// [`ContextManager::set_active_model_context_window`] once the
+    /// owning `AgentLoop` resolves its LLM client.
+    pub compression_threshold: f64,
     pub calibration: Arc<TokenCalibration>,
     pub skill_registry: Arc<SkillRegistry>,
     pub session_id: SessionId,
@@ -243,13 +240,15 @@ pub struct ContextManagerConfig {
 
 impl ContextManager {
     pub fn from_config(config: ContextManagerConfig) -> Self {
-        let configured_max_tokens = config.budget.max_tokens();
         Self {
             tokenizer: config.tokenizer,
             workspace: config.workspace,
             keep_recent: config.keep_recent,
-            budget: config.budget,
-            configured_max_tokens,
+            // `max_tokens` is a placeholder; `AgentLoop::from_config`
+            // installs the active model's `context_window` via
+            // `set_active_model_context_window` before any compression
+            // check runs.
+            budget: TokenBudget::new(0, config.compression_threshold),
             calibration: config.calibration,
             skill_registry: config.skill_registry,
             messages: Vec::new(),
@@ -264,16 +263,11 @@ impl ContextManager {
         }
     }
 
-    /// Clamp the compression trigger to the active model's context
-    /// window. Called by `AgentLoop` on construction and on every
-    /// [`AgentLoop::set_current_llm`] so a swap into a
-    /// smaller-context model triggers compression before the provider
-    /// rejects the request. A swap back into a larger model relaxes
-    /// the cap back up to (but not above) the configured
-    /// `agent.context.max_tokens`.
+    /// Install the active model's context window as the compression
+    /// budget cap. Called by `AgentLoop` on construction so the
+    /// budget reflects the provider's hard limit.
     pub fn set_active_model_context_window(&mut self, window: usize) {
-        let effective = self.configured_max_tokens.min(window);
-        self.budget.set_max_tokens(effective);
+        self.budget.set_max_tokens(window);
     }
 
     /// Read-only access to the owned transcript.
@@ -1251,30 +1245,30 @@ mod tests {
     }
 
     fn make_ctx(keep_recent: usize, max_tokens: usize, threshold: f64) -> ContextManager {
-        ContextManager::from_config(ContextManagerConfig {
+        let mut ctx = ContextManager::from_config(ContextManagerConfig {
             tokenizer: Arc::new(SimpleTokenizer),
             workspace: test_workspace(),
             keep_recent,
-            budget: TokenBudget::new(max_tokens, threshold),
+            compression_threshold: threshold,
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: Arc::new(SkillRegistry::new()),
             session_id: test_session_id(),
             sessions: test_sessions(),
-        })
+        });
+        ctx.set_active_model_context_window(max_tokens);
+        ctx
     }
 
     #[test]
-    fn set_active_model_context_window_clamps_to_min() {
+    fn set_active_model_context_window_installs_budget_cap() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
-        // Smaller model window → budget drops to model_window.
-        ctx.set_active_model_context_window(60_000);
-        assert_eq!(ctx.budget().max_tokens(), 60_000);
-        // Switching back to a larger model can't exceed configured cap.
-        ctx.set_active_model_context_window(500_000);
         assert_eq!(ctx.budget().max_tokens(), 100_000);
-        // A swap into a smaller-still model re-clamps.
+        // Swap to a smaller-context model: budget drops.
         ctx.set_active_model_context_window(8_000);
         assert_eq!(ctx.budget().max_tokens(), 8_000);
+        // Swap to a larger one: budget grows to the new model's window.
+        ctx.set_active_model_context_window(500_000);
+        assert_eq!(ctx.budget().max_tokens(), 500_000);
     }
 
     #[tokio::test]
@@ -1631,16 +1625,18 @@ mod tests {
         max_tokens: usize,
         threshold: f64,
     ) -> ContextManager {
-        ContextManager::from_config(ContextManagerConfig {
+        let mut ctx = ContextManager::from_config(ContextManagerConfig {
             tokenizer: Arc::new(SimpleTokenizer),
             workspace: test_workspace(),
             keep_recent,
-            budget: TokenBudget::new(max_tokens, threshold),
+            compression_threshold: threshold,
             calibration: Arc::new(TokenCalibration::new()),
             skill_registry: registry,
             session_id: test_session_id(),
             sessions: test_sessions(),
-        })
+        });
+        ctx.set_active_model_context_window(max_tokens);
+        ctx
     }
 
     /// Chat closure returning a well-formed `<summary>S</summary>` so the

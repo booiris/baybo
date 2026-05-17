@@ -129,7 +129,6 @@ When hot reload is implemented, the following contract must be in place **before
 | `llm[i].api_key_env`                  | if set, valid env-var identifier                     |
 | `default-llm`                         | when `llm` is non-empty, must name an existing entry |
 | `agent.max_iterations`                | in `1..=1000`                                        |
-| `agent.context.max_tokens`            | ≥ 1                                                  |
 | `agent.context.compression_threshold` | in `(0.0, 1.0]`, finite                              |
 | `agent.context.keep_recent`           | ≥ 1                                                  |
 | `workspace.path`                      | non-empty                                            |

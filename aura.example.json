@@ -1,10 +1,9 @@
 {
   "agent": {
-    "max_iterations": 20,
+    "max_iterations": 300,
     "context": {
-      "max_tokens": 120000,
-      "compression_threshold": 0.75,
-      "keep_recent": 100
+      "compression_threshold": 0.65,
+      "keep_recent": 10
     }
   },
   "channels": {

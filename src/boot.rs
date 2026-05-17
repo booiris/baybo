@@ -11,7 +11,6 @@
 use std::path::{Path, PathBuf};
 
 use aura_config::{AuraConfig, LlmEntry, RiskCheckConfig, SecurityConfig, WorkspaceConfig};
-use aura_context::TokenBudget;
 use aura_llm::credentials::resolve_api_key;
 use aura_llm::{GuardedLlm, LlmCallGuard, LlmProviderConfig, LlmProviderRegistry};
 use aura_security::{EncryptionKey, LeakDetector};
@@ -207,10 +206,6 @@ pub fn storage_db_path(cfg: &WorkspaceConfig) -> PathBuf {
     WorkspacePaths::new(PathBuf::from(&cfg.path)).storage_db()
 }
 
-pub fn to_token_budget(cfg: &aura_config::ContextConfig) -> TokenBudget {
-    TokenBudget::new(cfg.max_tokens, cfg.compression_threshold)
-}
-
 pub fn to_assessment_mode(cfg: RiskCheckConfig) -> AssessmentMode {
     match cfg {
         RiskCheckConfig::Off => AssessmentMode::Off,
@@ -230,17 +225,7 @@ pub fn build_leak_detector(cfg: &SecurityConfig) -> LeakDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_config::{ContextConfig, SecurityConfig, WorkspaceConfig};
-
-    #[test]
-    fn token_budget_carries_max() {
-        let cfg = ContextConfig {
-            max_tokens: 50_000,
-            compression_threshold: 0.5,
-            keep_recent: 10,
-        };
-        assert_eq!(to_token_budget(&cfg).max_tokens(), 50_000);
-    }
+    use aura_config::{SecurityConfig, WorkspaceConfig};
 
     #[test]
     fn storage_db_path_is_under_workspace_state_dir() {

@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_context::{SUMMARIZE_INSTRUCTION, budget::TokenBudget};
+use aura_context::SUMMARIZE_INSTRUCTION;
 use aura_integration_tests::AgentTestHarness;
 use aura_llm::{StreamEvent, TokenUsage};
 use aura_model::ContentBlock;
@@ -56,10 +56,9 @@ async fn fast_path_skips_chat_callback_when_summary_md_present() {
     // Tight budget so the second turn definitely trips the
     // compression gate inside `compress_if_needed`. With max=400 and
     // threshold=0.05 (= 20 tokens), even a short reply pushes us over.
-    let budget = TokenBudget::new(400, 0.05);
-
     let mut harness = AgentTestHarness::builder()
-        .with_token_budget(budget)
+        .with_model_context_window(400)
+        .with_compression_threshold(0.05)
         .with_workspace(Arc::clone(&workspace))
         .with_keep_recent(2)
         .build();

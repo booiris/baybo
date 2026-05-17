@@ -88,12 +88,6 @@ fn validate_agent(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
         ));
     }
     let ctx = &agent.context;
-    if ctx.max_tokens == 0 {
-        errors.push(ValidationError::new(
-            "agent.context.max_tokens",
-            "must be >= 1",
-        ));
-    }
     if !ctx.compression_threshold.is_finite()
         || ctx.compression_threshold <= 0.0
         || ctx.compression_threshold > 1.0
