@@ -17,6 +17,12 @@
 //!   where pre-commit hooks would be authored. A commit failure
 //!   (detached HEAD, missing git, etc.) leaves the file write in place
 //!   and surfaces a warning in the tool output.
+//!
+//! Edits under `<workspace>/work/` and `<workspace>/skills/` also skip
+//! the approval gate (matching the `Write` tool's `work/` bypass), but
+//! without the identity-file allowlist, size cap, or audit commit —
+//! those roots are agent scratch / managed skill content, not the
+//! three-slot identity store.
 
 use std::path::{Path, PathBuf};
 
@@ -35,17 +41,22 @@ const MAX_PROFILE_BYTES: u64 = 1 << 20;
 
 pub struct EditTool {
     profile_dir: PathBuf,
+    work_dir: PathBuf,
+    skills_dir: PathBuf,
 }
 
 impl EditTool {
     pub fn new(workspace_paths: WorkspacePaths) -> Self {
-        // Bake an absolutised profile dir so `starts_with` comparisons
-        // work even when the workspace root is relative — the
-        // debug-build default is `./.aura`, and a relative prefix
-        // never matches an absolute file path the LLM passes from the
-        // system prompt's `<soul path="...">` wrapper.
-        let profile_dir = absolutise(&workspace_paths.profile_dir());
-        Self { profile_dir }
+        // Bake absolutised dirs so `starts_with` comparisons work even
+        // when the workspace root is relative — the debug-build default
+        // is `./.aura`, and a relative prefix never matches an absolute
+        // file path the LLM passes from the system prompt's
+        // `<soul path="...">` wrapper.
+        Self {
+            profile_dir: absolutise(&workspace_paths.profile_dir()),
+            work_dir: absolutise(&workspace_paths.work_dir()),
+            skills_dir: absolutise(&workspace_paths.skills_dir()),
+        }
     }
 
     /// True when the requested edit targets one of the three identity
@@ -60,6 +71,14 @@ impl EditTool {
             return false;
         };
         IdentityKind::all().iter().any(|k| k.file_name() == name)
+    }
+
+    fn is_inside_work_dir(&self, file_path: &Path) -> bool {
+        file_path.is_absolute() && file_path.starts_with(&self.work_dir)
+    }
+
+    fn is_inside_skills_dir(&self, file_path: &Path) -> bool {
+        file_path.is_absolute() && file_path.starts_with(&self.skills_dir)
     }
 }
 
@@ -107,11 +126,15 @@ impl Tool for EditTool {
             return Vec::new();
         };
         let path = PathBuf::from(s);
-        // Edits to identity files under the workspace `profile/` dir
-        // bypass the approval gate (audit trail is the per-edit git
-        // commit, not a user prompt). Any other write still goes
-        // through the gate.
-        if self.is_profile_target(&path) {
+        // Bypass the approval gate for edits inside the workspace's
+        // managed roots: identity files under `profile/` (audit trail
+        // is the per-edit git commit, not a user prompt), and any path
+        // under `work/` or `skills/` (agent scratch / managed skill
+        // content). Anything else still goes through the gate.
+        if self.is_profile_target(&path)
+            || self.is_inside_work_dir(&path)
+            || self.is_inside_skills_dir(&path)
+        {
             return vec![ResourceAccess::ReadFile { path }];
         }
         vec![
@@ -652,6 +675,30 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, ResourceAccess::WriteFile { .. }))
         );
+    }
+
+    #[test]
+    fn accessed_resources_drops_writefile_for_work_targets() {
+        let paths = WorkspacePaths::new("/var/aura");
+        let edit = EditTool::new(paths.clone());
+
+        let in_work = paths.work_dir().join("scratch/notes.txt");
+        let resources =
+            edit.accessed_resources(&json!({ "file_path": in_work.to_string_lossy() }));
+        assert_eq!(resources.len(), 1, "{resources:?}");
+        assert!(matches!(resources[0], ResourceAccess::ReadFile { .. }));
+    }
+
+    #[test]
+    fn accessed_resources_drops_writefile_for_skills_targets() {
+        let paths = WorkspacePaths::new("/var/aura");
+        let edit = EditTool::new(paths.clone());
+
+        let in_skills = paths.skills_dir().join("my-skill/SKILL.md");
+        let resources =
+            edit.accessed_resources(&json!({ "file_path": in_skills.to_string_lossy() }));
+        assert_eq!(resources.len(), 1, "{resources:?}");
+        assert!(matches!(resources[0], ResourceAccess::ReadFile { .. }));
     }
 
     #[test]
