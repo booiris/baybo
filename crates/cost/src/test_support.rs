@@ -11,8 +11,8 @@ use parking_lot::Mutex;
 
 use crate::store::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
 
-#[allow(dead_code)]
-fn assert_send<T: Send>() {}
+const fn assert_send<T: Send>() {}
+const _: () = assert_send::<CostError>();
 
 /// In-memory `CostStore` for tests. Records are appended in arrival
 /// order; queries scan linearly. Plenty fast for tests.
@@ -119,7 +119,3 @@ impl CostStore for MemoryCostStore {
     }
 }
 
-#[allow(dead_code)]
-fn ensure_error_is_sendable() {
-    assert_send::<CostError>();
-}

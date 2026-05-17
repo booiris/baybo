@@ -36,4 +36,5 @@ async-stream = { workspace = true }
 bytes = { workspace = true }
 
 [dev-dependencies]
+aura-security = { workspace = true, features = ["test-support"] }
 aura-storage = { workspace = true, features = ["test-support"] }

@@ -43,12 +43,10 @@ pub struct SpendingLimits {
 ///    Persist failures log a warning and tick
 ///    `metrics.persist_failures`; they never fail the call.
 ///
-/// [`Router`] also calls `check` at message ingress so an over-cap
-/// user never even gets an actor spun up. [`Self::hydrate`] runs at
-/// boot to rebuild today's / this month's totals from disk so a
+/// `Router` (in `aura-agent`) also calls `check` at message ingress so
+/// an over-cap user never even gets an actor spun up. [`Self::hydrate`]
+/// runs at boot to rebuild today's / this month's totals from disk so a
 /// restart doesn't silently widen the budget.
-///
-/// [`Router`]: crate::router::Router
 pub struct CostManager {
     store: Arc<dyn CostStore>,
     /// `RwLock` so the boot-time refresh can overlay rates without
