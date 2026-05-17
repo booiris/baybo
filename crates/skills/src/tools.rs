@@ -454,12 +454,6 @@ impl Tool for SkillInstallTool {
         Duration::from_secs(120)
     }
 
-    fn accessed_resources(&self, _params: &Value) -> Vec<ToolResourceAccess> {
-        vec![ToolResourceAccess::WriteFile {
-            path: self.workspace_skills_dir.clone(),
-        }]
-    }
-
     async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
         let p: InstallParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
@@ -618,12 +612,6 @@ impl Tool for SkillUninstallTool {
             },
             "required": ["name"]
         })
-    }
-
-    fn accessed_resources(&self, _params: &Value) -> Vec<ToolResourceAccess> {
-        vec![ToolResourceAccess::WriteFile {
-            path: self.workspace_skills_dir.clone(),
-        }]
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
