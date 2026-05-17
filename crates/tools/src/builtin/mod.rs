@@ -90,7 +90,10 @@ pub fn default_tools(
         ),
         trusted(GlobTool, vec![ToolCapability::ReadFile]),
         trusted(GrepTool, vec![ToolCapability::ReadFile]),
-        trusted(WebFetchTool::default(), vec![ToolCapability::Http]),
+        trusted(
+            WebFetchTool::new(blob_store.clone()),
+            vec![ToolCapability::Http],
+        ),
         send_local_file::tool(blob_store.clone()),
         trusted(NowTool, vec![]),
     ];

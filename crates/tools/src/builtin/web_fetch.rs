@@ -47,14 +47,27 @@
 //! `ToolOutput::Error` so the LLM has to re-issue WebFetch on the new
 //! URL — it makes the host change visible in the call trace instead of
 //! letting it happen silently inside reqwest.
+//!
+//! Raw-content archival: every successful fetch stores the rendered
+//! page (markdown for HTML, raw text for plain bodies) into the shared
+//! `BlobStore` BEFORE the side LLM (if any) is asked to summarise.
+//! The on-disk path lands at `<workspace>/state/blobs/<hex[..2]>/<hex>.<ext>`
+//! and is included in the response header (`raw_content_file=...`) so
+//! the agent can `Read` the untruncated/unsummarised version when the
+//! shortened reply loses a detail it now needs. The response is also
+//! prefixed with a `summarized=<bool>` flag so the agent knows whether
+//! the body it just received was rewritten by the side LLM or returned
+//! verbatim.
 
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_llm::{BilledChat, ChatRequest};
 use aura_model::{ChatMessage, ContentBlock, Role};
+use aura_storage::BlobStore;
 use dom_smoothie::Readability;
 use htmd::HtmlToMarkdown;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -98,6 +111,15 @@ extracted from the page (chrome and scripts already stripped). Respond with a co
 or summary that directly answers the prompt. Quote short fragments verbatim when accuracy \
 matters; do not invent details. If the page does not contain the requested information, say so \
 explicitly.";
+
+/// MIME used when archiving HTML pages — the body is already converted to
+/// markdown by [`extract_article`] before the put, so `.md` is the right
+/// extension for the on-disk file.
+const RAW_BLOB_MIME_MARKDOWN: &str = "text/markdown";
+/// MIME used when archiving non-HTML text bodies (`text/plain`,
+/// `application/json`, …). The bytes are stored verbatim under a `.txt`
+/// extension so a human poking around `state/blobs/` can preview them.
+const RAW_BLOB_MIME_PLAIN: &str = "text/plain";
 
 fn host_to_literal_ip(host: &str) -> Option<IpAddr> {
     if let Ok(addr) = host.parse::<IpAddr>() {
@@ -167,11 +189,20 @@ impl Resolve for SafeResolver {
 
 pub struct WebFetchTool {
     client: reqwest::Client,
+    blob_store: Arc<dyn BlobStore>,
     validator_allow_loopback: bool,
 }
 
 impl WebFetchTool {
-    fn build(validator_allow_loopback: bool, resolver_allow_loopback: bool) -> Self {
+    pub fn new(blob_store: Arc<dyn BlobStore>) -> Self {
+        Self::build(blob_store, false, false)
+    }
+
+    fn build(
+        blob_store: Arc<dyn BlobStore>,
+        validator_allow_loopback: bool,
+        resolver_allow_loopback: bool,
+    ) -> Self {
         let validator_lax = validator_allow_loopback;
         let client = reqwest::Client::builder()
             .user_agent(concat!("aura-webfetch/", env!("CARGO_PKG_VERSION")))
@@ -206,24 +237,35 @@ impl WebFetchTool {
             .expect("reqwest::Client builder accepts only static config");
         Self {
             client,
+            blob_store,
             validator_allow_loopback,
         }
     }
 
     #[cfg(test)]
     fn for_testing() -> Self {
-        Self::build(true, true)
+        let blob_store: Arc<dyn BlobStore> =
+            Arc::new(aura_storage::test_support::MemoryBlobStore::new());
+        Self::build(blob_store, true, true)
     }
 
     #[cfg(test)]
     fn for_testing_strict_resolver() -> Self {
-        Self::build(true, false)
+        let blob_store: Arc<dyn BlobStore> =
+            Arc::new(aura_storage::test_support::MemoryBlobStore::new());
+        Self::build(blob_store, true, false)
     }
-}
 
-impl Default for WebFetchTool {
-    fn default() -> Self {
-        Self::build(false, false)
+    /// Strict validator + strict resolver — mirrors the production
+    /// posture of [`WebFetchTool::new`] but with an in-memory blob
+    /// store. Used by tests that assert blocked URLs / hostnames are
+    /// rejected (where the lax `for_testing` variant would let them
+    /// through).
+    #[cfg(test)]
+    fn for_testing_default() -> Self {
+        let blob_store: Arc<dyn BlobStore> =
+            Arc::new(aura_storage::test_support::MemoryBlobStore::new());
+        Self::build(blob_store, false, false)
     }
 }
 
@@ -254,7 +296,9 @@ Usage notes:
   - The prompt should describe what information you want to extract from the page
   - This tool is read-only and does not modify any files
   - Results may be summarized if the content is very large
-  - Returns the rendered text into the conversation only — it does NOT save anything to disk. If you need the file on disk (download a `.txt`/`.json`/`.csv`/archive/binary, save a script, etc.), use Bash with `curl` or `wget` instead.
+  - The reply is prefixed with a metadata header line: `[WebFetch] summarized=<bool> raw_content_file=<absolute path>`. `summarized=true` means a side LLM rewrote the body to answer your `prompt`; `summarized=false` means the body is the verbatim rendered page (possibly truncated). The full pre-summary rendered page is always archived to `raw_content_file` — use the `Read` tool on that path when you need the untruncated/unsummarised content.
+  - The archived file lives under `<workspace>/state/blobs/` and is GC'd by the janitor's LRU sweep, so treat the path as ephemeral within a session.
+  - Binary/non-text content types are still refused; for downloading `.zip`/images/archives use Bash with `curl` or `wget` instead.
   - For GitHub URLs, prefer using the gh CLI via Bash instead (e.g., gh pr view, gh issue view, gh api).
 "#
     }
@@ -422,6 +466,37 @@ Usage notes:
             },
         );
 
+        // Archive the rendered page (pre-summary) into the shared blob
+        // store so the agent can `Read` the untruncated/unsummarised
+        // version later via `raw_content_file`. HTML is stored as
+        // markdown (extract_article already converted it); other text
+        // bodies are stored verbatim. Failures here must not break the
+        // fetch — log and continue with no `raw_content_file` in the
+        // header.
+        let raw_mime = if is_html {
+            RAW_BLOB_MIME_MARKDOWN
+        } else {
+            RAW_BLOB_MIME_PLAIN
+        };
+        let raw_content_path = {
+            let _t = start_timer(&ctx.events, "archive_raw_blob");
+            match self
+                .blob_store
+                .put(rendered.as_bytes(), raw_mime, None)
+                .await
+            {
+                Ok(blob_ref) => blob_local_path(
+                    &ctx.workspace_paths.state_dir(),
+                    &blob_ref.blob_id,
+                    raw_mime,
+                ),
+                Err(e) => {
+                    tracing::warn!(host = %host, error = %e, "WebFetch raw-blob archive failed");
+                    None
+                }
+            }
+        };
+
         // Side-channel summary path: only when the caller asked for one
         // (`prompt` is non-empty), the agent layer bound a billed LLM
         // into `ctx.llm`, AND the rendered content is large enough to
@@ -445,15 +520,16 @@ Usage notes:
             };
             return match summary {
                 Ok(text) => {
-                    let output = truncate_utf8(text.as_bytes(), MAX_OUTPUT_BYTES);
+                    let body = truncate_utf8(text.as_bytes(), MAX_OUTPUT_BYTES);
                     ctx.events.emit(
                         "llm_summary",
                         ToolEventPayload::LlmCall {
                             model: llm.model_info().id.clone(),
                             input: summary_user_text.clone(),
-                            output: output.clone(),
+                            output: body.clone(),
                         },
                     );
+                    let output = format_output(true, raw_content_path.as_deref(), &body);
                     tracing::info!(
                         host = %host,
                         status = status.as_u16(),
@@ -473,7 +549,8 @@ Usage notes:
             };
         }
 
-        let output = truncate_utf8(rendered.as_bytes(), MAX_OUTPUT_BYTES);
+        let body = truncate_utf8(rendered.as_bytes(), MAX_OUTPUT_BYTES);
+        let output = format_output(false, raw_content_path.as_deref(), &body);
         tracing::info!(
             host = %host,
             status = status.as_u16(),
@@ -612,6 +689,48 @@ fn extract_article(raw_html: &str, host: &str) -> String {
     }
 }
 
+/// Mirror of `LibsqlBlobStore::blob_path` + its private `mime_extension`
+/// table for the two MIME types this tool uses. The libsql backend
+/// stores `text/markdown` as `<hex>.md` and `text/plain` as `<hex>.txt`
+/// under `<root>/<hex[..2]>/`; if that mapping ever changes upstream
+/// this helper must move with it. In-memory test backends keep no files
+/// on disk — the path is still computed (so the response header has a
+/// stable shape) but the file won't exist.
+fn blob_local_path(state_dir: &Path, blob_id: &str, mime: &str) -> Option<PathBuf> {
+    let hex_all = blob_id.strip_prefix("sha256:")?;
+    let hex = hex_all.split('.').next()?;
+    if hex.len() < 2 {
+        return None;
+    }
+    let ext = match mime {
+        RAW_BLOB_MIME_MARKDOWN => ".md",
+        RAW_BLOB_MIME_PLAIN => ".txt",
+        _ => "",
+    };
+    Some(
+        state_dir
+            .join("blobs")
+            .join(&hex[..2])
+            .join(format!("{hex}{ext}")),
+    )
+}
+
+/// Prefix the agent-visible reply with a one-line metadata header
+/// followed by a blank line, then the body. The header carries
+/// `summarized=<bool>` always; `raw_content_file=<path>` is included
+/// when the blob archive succeeded so the agent can `Read` the
+/// untruncated/unsummarised version.
+fn format_output(summarized: bool, raw_content_file: Option<&Path>, body: &str) -> String {
+    let header = match raw_content_file {
+        Some(p) => format!(
+            "[WebFetch] summarized={summarized} raw_content_file={}",
+            p.display()
+        ),
+        None => format!("[WebFetch] summarized={summarized}"),
+    };
+    format!("{header}\n\n{body}")
+}
+
 fn reqwest_error_chain(e: &reqwest::Error) -> String {
     let mut s = e.to_string();
     let mut cursor: Option<&dyn std::error::Error> = std::error::Error::source(e);
@@ -734,6 +853,21 @@ mod tests {
         format!("http://{}{path}", server.addr)
     }
 
+    /// Split the `Text` output into `(header_line, body)`. The metadata
+    /// header is mandatory after every successful fetch — a missing
+    /// header is a regression, so this panics rather than returning
+    /// `None`.
+    fn split_output(s: &str) -> (&str, &str) {
+        let (header, body) = s
+            .split_once("\n\n")
+            .unwrap_or_else(|| panic!("output missing metadata header: {s:?}"));
+        assert!(
+            header.starts_with("[WebFetch] "),
+            "unexpected header shape: {header:?}"
+        );
+        (header, body)
+    }
+
     #[test]
     fn validate_url_rejects_blocked_targets() {
         for bad in [
@@ -782,7 +916,7 @@ mod tests {
 
     #[test]
     fn schema_describes_url_param() {
-        let schema = WebFetchTool::default().parameters_schema();
+        let schema = WebFetchTool::for_testing_default().parameters_schema();
         assert_eq!(schema["required"], json!(["url"]));
         assert_eq!(schema["properties"]["url"]["type"], "string");
     }
@@ -792,14 +926,14 @@ mod tests {
         // Hostname URLs declare no access so the executor's approval
         // gate has nothing to prompt on — the SSRF resolver is the
         // sole guard at runtime.
-        let tool = WebFetchTool::default();
+        let tool = WebFetchTool::for_testing_default();
         let acc = tool.accessed_resources(&json!({ "url": "https://Example.COM/path" }));
         assert!(acc.is_empty(), "got: {acc:?}");
     }
 
     #[test]
     fn accessed_resources_declares_http_for_literal_ipv4() {
-        let tool = WebFetchTool::default();
+        let tool = WebFetchTool::for_testing_default();
         let acc = tool.accessed_resources(&json!({ "url": "https://1.2.3.4/path" }));
         assert!(matches!(
             acc.first(),
@@ -809,7 +943,7 @@ mod tests {
 
     #[test]
     fn accessed_resources_declares_http_for_literal_ipv6() {
-        let tool = WebFetchTool::default();
+        let tool = WebFetchTool::for_testing_default();
         let acc = tool.accessed_resources(&json!({ "url": "https://[2001:db8::1]/" }));
         assert!(
             matches!(acc.first(), Some(ResourceAccess::Http { .. })),
@@ -829,12 +963,12 @@ mod tests {
     /// IPs the SSRF floor would reject must NOT trigger approval —
     /// the tool fails at `validate_url_with` before any request goes
     /// out, so prompting is pure noise. Covers literal RFC1918,
-    /// loopback (default `WebFetchTool::default()` runs strict), and
+    /// loopback (default `WebFetchTool::for_testing_default()` runs strict), and
     /// the unusual encodings that `url::Url` canonicalizes into
     /// reserved ranges (`http://2130706433/` → `127.0.0.1` etc.).
     #[test]
     fn accessed_resources_skips_blocked_literal_ips() {
-        let tool = WebFetchTool::default();
+        let tool = WebFetchTool::for_testing_default();
         for url in [
             "http://10.0.0.1/",
             "http://192.168.1.1/",
@@ -859,7 +993,7 @@ mod tests {
 
     #[test]
     fn call_label_returns_url_truncated() {
-        let tool = WebFetchTool::default();
+        let tool = WebFetchTool::for_testing_default();
         assert_eq!(
             tool.call_label(&json!({ "url": "https://example.com/" })),
             Some("https://example.com/".into())
@@ -872,7 +1006,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_url_is_invalid_params() {
-        let err = WebFetchTool::default()
+        let err = WebFetchTool::for_testing_default()
             .execute(json!({}), &ctx())
             .await
             .unwrap_err();
@@ -881,7 +1015,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocked_url_is_invalid_params() {
-        let err = WebFetchTool::default()
+        let err = WebFetchTool::for_testing_default()
             .execute(json!({ "url": "http://127.0.0.1/" }), &ctx())
             .await
             .unwrap_err();
@@ -903,7 +1037,11 @@ mod tests {
             .await
             .unwrap();
         let ToolOutput::Text(s) = out else { panic!() };
-        assert_eq!(s.trim(), "ok");
+        let (header, body) = split_output(&s);
+        // Short content + no LLM wired -> summary path skipped, body
+        // returned verbatim and `summarized=false`.
+        assert!(header.contains("summarized=false"), "header: {header:?}");
+        assert_eq!(body, "ok");
     }
 
     /// Build an HTML body that comfortably exceeds dom_smoothie's
@@ -1051,6 +1189,100 @@ mod tests {
         }
     }
 
+    /// The rendered page is archived to the blob store BEFORE any
+    /// summarisation step, so the agent can `Read` the full unsummarised
+    /// markdown via the `raw_content_file` path even when the side LLM
+    /// rewrote the body. Asserts: (a) exactly one blob landed, (b) its
+    /// bytes match the extracted markdown (not the LLM reply), (c) the
+    /// path in the response header points at the expected
+    /// `<state>/blobs/<hex[..2]>/<hex>.md` layout.
+    #[tokio::test]
+    async fn raw_content_is_archived_before_summarisation() {
+        use aura_llm::test_support::StubLlm;
+        use aura_llm::{LlmResponse, TokenUsage};
+        use aura_storage::test_support::MemoryBlobStore;
+
+        let stub = Arc::new(StubLlm::new());
+        stub.push_response(LlmResponse {
+            content: "summary reply".into(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: TokenUsage::default(),
+            thinking: None,
+        });
+
+        let body = format!(
+            "<h1>Archive Me</h1><p>{}</p>",
+            "lorem ipsum ".repeat(SUMMARY_MIN_CHARS / 6),
+        );
+        let server = spawn(Router::new().route(
+            "/",
+            get(move || {
+                let body = body.clone();
+                async move { ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body) }
+            }),
+        ))
+        .await;
+
+        let blob_store = Arc::new(MemoryBlobStore::new());
+        let tool = WebFetchTool::build(blob_store.clone() as Arc<dyn BlobStore>, true, true);
+
+        let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
+        let mut tctx = ctx();
+        tctx.llm = Some(llm);
+        let out = tool
+            .execute(
+                json!({ "url": url_to(&server, "/"), "prompt": "summarise" }),
+                &tctx,
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else {
+            panic!("expected Text, got: {out:?}")
+        };
+        let (header, body) = split_output(&s);
+        assert!(header.contains("summarized=true"), "header: {header:?}");
+        assert_eq!(body, "summary reply");
+
+        // Exactly one blob — the rendered markdown, not the summary.
+        assert_eq!(blob_store.len(), 1, "expected one archived blob");
+
+        // The path in the header carries the hex shard layout and the
+        // `.md` extension (HTML body archived as markdown).
+        let path_kv = header
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("raw_content_file="))
+            .expect("raw_content_file= missing from header");
+        let path = std::path::Path::new(path_kv);
+        let expected_prefix = tctx.workspace_paths.state_dir().join("blobs");
+        assert!(
+            path.starts_with(&expected_prefix),
+            "{path:?} not under {expected_prefix:?}"
+        );
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("md"),
+            "expected .md extension, got {path:?}"
+        );
+
+        // The captured LLM call saw the extracted markdown — and the
+        // archived blob is that same markdown (the `Archive Me` title
+        // survives extract_article + htmd).
+        let captured = stub.captured_requests();
+        assert_eq!(captured.len(), 1);
+        let aura_model::ContentBlock::Text(llm_input) = captured[0]
+            .messages
+            .last()
+            .expect("user msg")
+            .content
+            .first()
+            .expect("text block")
+        else {
+            panic!("expected text block")
+        };
+        assert!(llm_input.contains("Archive Me"));
+    }
+
     #[tokio::test]
     async fn timer_metrics_record_llm_summary_when_prompt_set() {
         use aura_llm::test_support::StubLlm;
@@ -1177,7 +1409,14 @@ mod tests {
             .await
             .unwrap();
         let ToolOutput::Text(s) = out else { panic!() };
-        assert_eq!(s, "raw <b>text</b>");
+        let (header, body) = split_output(&s);
+        assert!(header.contains("summarized=false"), "header: {header:?}");
+        // Plain text bodies archive under `.txt`.
+        assert!(
+            header.contains("raw_content_file=") && header.contains(".txt"),
+            "header missing raw_content_file path: {header:?}"
+        );
+        assert_eq!(body, "raw <b>text</b>");
     }
 
     #[tokio::test]
@@ -1343,7 +1582,8 @@ mod tests {
             .await
             .unwrap();
         let ToolOutput::Text(s) = out else { panic!() };
-        assert_eq!(s, "final");
+        let (_, body) = split_output(&s);
+        assert_eq!(body, "final");
         assert_eq!(state.counter.load(Ordering::SeqCst), 1);
     }
 
@@ -1463,7 +1703,14 @@ mod tests {
         let ToolOutput::Text(s) = out else {
             panic!("expected Text, got: {out:?}")
         };
-        assert_eq!(s, "Title is `Hello`.");
+        let (header, body) = split_output(&s);
+        assert!(header.contains("summarized=true"), "header: {header:?}");
+        // HTML pages archive under `.md` (extract_article emits markdown).
+        assert!(
+            header.contains("raw_content_file=") && header.contains(".md"),
+            "header missing markdown raw_content_file: {header:?}"
+        );
+        assert_eq!(body, "Title is `Hello`.");
 
         let captured = stub.captured_requests();
         assert_eq!(captured.len(), 1, "exactly one chat call");
@@ -1552,7 +1799,9 @@ mod tests {
         let ToolOutput::Text(s) = out else {
             panic!("expected Text, got: {out:?}")
         };
-        assert_eq!(s.trim(), "ok");
+        let (header, body) = split_output(&s);
+        assert!(header.contains("summarized=false"), "header: {header:?}");
+        assert_eq!(body, "ok");
         assert!(stub.captured_requests().is_empty());
     }
 

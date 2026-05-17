@@ -683,8 +683,7 @@ mod tests {
         let edit = EditTool::new(paths.clone());
 
         let in_work = paths.work_dir().join("scratch/notes.txt");
-        let resources =
-            edit.accessed_resources(&json!({ "file_path": in_work.to_string_lossy() }));
+        let resources = edit.accessed_resources(&json!({ "file_path": in_work.to_string_lossy() }));
         assert_eq!(resources.len(), 1, "{resources:?}");
         assert!(matches!(resources[0], ResourceAccess::ReadFile { .. }));
     }
