@@ -73,6 +73,8 @@ DEFAULT CWD: If `cwd` is omitted, Aura runs the command from the workspace work 
 
 PATHS: Any directory or file argument inside the command (cd, ls, mkdir, rm, mv, cp, find, …) MUST be an absolute path. The optional `cwd` parameter MUST also be absolute when provided — relative values are rejected. Always quote file paths that contain spaces with double quotes (e.g. `cd "/path with spaces/file.txt"`).
 
+WORK-DIR SCOPE: Bash may only touch files inside the workspace work directory ({{work_dir}}). Any absolute path argument that falls under the workspace root but outside `work/` (the sibling subtrees `profile/`, `config/`, `state/`, `logs/`, `skills/`, `.key/`) is rejected up front, and `cwd` is held to the same rule. Use the dedicated tools (Read, Edit, Write, …) when you genuinely need to read or modify those subtrees; everything else stays under {{work_dir}}.
+
 BEFORE BROAD SCANS: Do not run `find`, `du`, recursive `ls`, or similar walks against unknown directories without first checking their size with a bounded probe (e.g. `ls -1 <dir> | wc -l`, or a shallow `find -maxdepth 2`). Large trees can hang the process.
 
 ENVIRONMENT:
@@ -81,13 +83,23 @@ ENVIRONMENT:
 
 pub struct BashTool {
     description: String,
+    /// Absolute workspace root (`<workspace>`). Used together with
+    /// [`Self::work_dir`] to reject path arguments that would touch
+    /// non-`work/` subtrees (`profile/`, `config/`, `state/`, …).
+    workspace_root: PathBuf,
+    /// Absolute work directory (`<workspace>/work`). Sole writable area
+    /// for Bash invocations.
+    work_dir: PathBuf,
 }
 
 impl BashTool {
     pub fn new(workspace_paths: WorkspacePaths) -> Self {
+        let workspace_root = absolutise(workspace_paths.root());
         let work_dir = absolutise(&workspace_paths.work_dir());
         Self {
             description: build_description(&work_dir, std::env::consts::OS),
+            workspace_root,
+            work_dir,
         }
     }
 }
@@ -192,6 +204,7 @@ impl Tool for BashTool {
 
         if let Some(dir) = &p.cwd {
             require_absolute(dir, "Bash", "cwd")?;
+            require_within_work_dir(dir, &self.workspace_root, &self.work_dir, "cwd")?;
         }
 
         let timeout = p
@@ -200,6 +213,7 @@ impl Tool for BashTool {
             .unwrap_or(ctx.timeout);
 
         let command = p.command;
+        require_command_paths_within_work_dir(&command, &self.workspace_root, &self.work_dir)?;
         let cwd_ref: Option<&Path> = Some(p.cwd.as_deref().unwrap_or(ctx.workspace_root.as_path()));
 
         if is_file_tool_redirect(&command) {
@@ -300,6 +314,64 @@ impl Tool for BashTool {
 
         Ok(ToolOutput::Json(result))
     }
+}
+
+/// Reject an absolute path that lives inside the workspace root but
+/// outside the work directory. Bash invocations are scoped to the
+/// `work/` subtree so the agent can't accidentally clobber the
+/// gateway's own `config/`, `state/`, `profile/`, `logs/`, `skills/`,
+/// or `.key/` subdirectories from a shell call. Paths that are not
+/// absolute, or that fall entirely outside the workspace root (FHS
+/// roots, `$HOME`, `/tmp`, …) are left to the OS sandbox.
+fn require_within_work_dir(
+    path: &Path,
+    workspace_root: &Path,
+    work_dir: &Path,
+    label: &str,
+) -> crate::Result<()> {
+    if !path.is_absolute() {
+        return Ok(());
+    }
+    if path.starts_with(workspace_root) && !path.starts_with(work_dir) {
+        return Err(ToolError::InvalidParams(format!(
+            "Bash {label} `{}` is inside the workspace but outside the work \
+             directory. Only `{}` is writable for shell operations — move the \
+             action under `{}/` or use Read/Edit/Write for the read-only \
+             workspace subtrees (profile/, config/, state/, logs/, skills/, \
+             .key/).",
+            path.display(),
+            work_dir.display(),
+            work_dir.display(),
+        )));
+    }
+    Ok(())
+}
+
+/// Walk every token of every sub-command and reject the first one
+/// that resolves to an absolute path inside the workspace but outside
+/// `work/`. The token loop reuses [`split_into_subcommands`] +
+/// `shell_words::split` so quoted forms (`"<workspace>/profile"`,
+/// `'<workspace>/state'`) are checked against their unquoted body.
+/// Tokens that fail to unquote cleanly are skipped — they'd also slip
+/// past the rest of the heuristic stack and the goal here is to catch
+/// the obvious cases, not to be a full shell parser.
+fn require_command_paths_within_work_dir(
+    command: &str,
+    workspace_root: &Path,
+    work_dir: &Path,
+) -> crate::Result<()> {
+    for sub in split_into_subcommands(command) {
+        for tok in sub {
+            let Ok(words) = shell_words::split(tok) else {
+                continue;
+            };
+            for word in words {
+                let p = Path::new(&word);
+                require_within_work_dir(p, workspace_root, work_dir, "command argument")?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Map common diagnostic-tool exit codes to a human-readable hint so
@@ -1591,6 +1663,114 @@ mod tests {
             matches!(err, ToolError::InvalidParams(ref m) if m.contains("absolute")),
             "got: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_cwd_inside_workspace_but_outside_work_dir() {
+        // Test workspace anchors at `/tmp` (so work dir = `/tmp/work`).
+        // A cwd pointing at `/tmp/profile` is inside the workspace but
+        // outside `work/` — must be rejected before any sandbox dispatch
+        // with an error that names both the offending path and the
+        // mandatory work dir.
+        let err = BashTool::for_test()
+            .execute(
+                json!({ "command": "echo hi", "cwd": "/tmp/profile" }),
+                &ctx_with(None),
+            )
+            .await
+            .unwrap_err();
+        let ToolError::InvalidParams(msg) = err else {
+            panic!("expected InvalidParams, got {err:?}");
+        };
+        assert!(
+            msg.contains("/tmp/profile") && msg.contains("/tmp/work"),
+            "error must name the offending path and the work dir: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_command_argument_inside_workspace_but_outside_work_dir() {
+        // A path token buried in the command body (`ls /tmp/state/db`)
+        // is just as out-of-scope as a `cwd` outside `work/`. The
+        // validator must walk every sub-command token and refuse the
+        // first hit before the sandbox runs.
+        let err = BashTool::for_test()
+            .execute(json!({ "command": "ls /tmp/state/db" }), &ctx_with(None))
+            .await
+            .unwrap_err();
+        let ToolError::InvalidParams(msg) = err else {
+            panic!("expected InvalidParams, got {err:?}");
+        };
+        assert!(
+            msg.contains("/tmp/state/db"),
+            "error must name the offending command argument: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_paths_under_work_dir_and_outside_workspace() {
+        // `/tmp/work/foo` (inside work) and `/etc/hosts` (outside the
+        // workspace entirely — FHS roots are the sandbox's problem,
+        // not the work-dir guard's) must both pass through to the
+        // sandbox without an `InvalidParams` rejection.
+        let (_fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        BashTool::for_test()
+            .execute(
+                json!({ "command": "ls /tmp/work/foo /etc/hosts", "cwd": "/tmp/work" }),
+                &ctx_with(Some(sandbox)),
+            )
+            .await
+            .expect("paths under work_dir and outside workspace must be accepted");
+    }
+
+    #[test]
+    fn require_within_work_dir_only_flags_workspace_non_work() {
+        let ws = Path::new("/tmp");
+        let work = Path::new("/tmp/work");
+
+        // Inside workspace, outside work — reject.
+        assert!(require_within_work_dir(Path::new("/tmp/profile"), ws, work, "cwd").is_err());
+        assert!(require_within_work_dir(Path::new("/tmp/state/x"), ws, work, "cwd").is_err());
+        assert!(require_within_work_dir(Path::new("/tmp/config"), ws, work, "cwd").is_err());
+
+        // Inside work — accept.
+        assert!(require_within_work_dir(Path::new("/tmp/work"), ws, work, "cwd").is_ok());
+        assert!(require_within_work_dir(Path::new("/tmp/work/a/b"), ws, work, "cwd").is_ok());
+
+        // Outside workspace entirely — accept (sandbox's domain, not ours).
+        assert!(require_within_work_dir(Path::new("/etc/hosts"), ws, work, "cwd").is_ok());
+        assert!(require_within_work_dir(Path::new("/usr/bin/ls"), ws, work, "cwd").is_ok());
+
+        // Relative paths — skip; absolute is required separately.
+        assert!(require_within_work_dir(Path::new("relative/x"), ws, work, "cwd").is_ok());
+    }
+
+    #[test]
+    fn require_command_paths_within_work_dir_walks_subcommands() {
+        let ws = Path::new("/tmp");
+        let work = Path::new("/tmp/work");
+
+        // Clean command — no offending paths.
+        assert!(
+            require_command_paths_within_work_dir("ls /tmp/work && cat /etc/hosts", ws, work)
+                .is_ok()
+        );
+
+        // Quoted path inside the workspace but outside work — caught
+        // after `shell_words::split` unquotes the token.
+        let err = require_command_paths_within_work_dir(r#"ls "/tmp/profile/foo""#, ws, work)
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParams(ref m) if m.contains("/tmp/profile/foo")));
+
+        // Path hidden behind a pipeline still gets walked.
+        let err = require_command_paths_within_work_dir("git status | tee /tmp/logs/out", ws, work)
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidParams(ref m) if m.contains("/tmp/logs/out")));
     }
 
     #[tokio::test]
