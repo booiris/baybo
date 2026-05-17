@@ -73,7 +73,11 @@ pub type OnExit = Arc<dyn Fn() + Send + Sync>;
 
 /// Ratatui-based terminal channel adapter.
 pub struct TuiAdapter {
-    session_id: SessionId,
+    /// Initial session this TUI starts on. After [`start`] the live
+    /// session id lives in the transport's pin (so `/new` can swap it
+    /// from the event loop without coordinating with the adapter);
+    /// this field is read once during boot to seed the banner.
+    initial_session_id: SessionId,
     user: User,
     shutdown: Arc<Notify>,
     slash_handler: Option<Arc<dyn SlashHandler>>,
@@ -102,8 +106,9 @@ impl TuiAdapter {
             .unwrap_or_else(|_| "tui-user".to_string());
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(256);
         let approval_queue = transport.approval_queue();
+        let initial_session_id = transport.current_session_id();
         Self {
-            session_id: SessionId::from(format!("tui-{}", Uuid::new_v4())),
+            initial_session_id,
             user: User {
                 id: user_id,
                 name: None,
@@ -118,14 +123,6 @@ impl TuiAdapter {
             approval_queue,
             transport,
         }
-    }
-
-    /// Pin the session id. Callers resolve a session by
-    /// creating/resuming it on the gateway and hand the id here so SSE
-    /// subscriptions and message POSTs target the right resource.
-    pub fn with_session_id(mut self, id: SessionId) -> Self {
-        self.session_id = id;
-        self
     }
 
     /// Attach an exit callback. Invoked exactly once when the event loop
@@ -149,10 +146,6 @@ impl TuiAdapter {
         self
     }
 
-    pub fn session_id(&self) -> &SessionId {
-        &self.session_id
-    }
-
     /// Hand out a non-blocking sink for forwarding warn/error tracing events
     /// into the scrollback. Callers typically wire this into a
     /// `tracing_subscriber::Layer` that calls `emit` from `on_event`.
@@ -169,15 +162,10 @@ impl TuiAdapter {
             .take()
             .ok_or_else(|| ChannelError::Send("TuiAdapter::start called twice".into()))?;
 
-        spawn_transport_pump(
-            Arc::clone(&self.transport),
-            self.session_id.clone(),
-            self.event_tx.clone(),
-        )
-        .await;
+        spawn_transport_pump(Arc::clone(&self.transport), self.event_tx.clone()).await;
 
         let ctx = LoopCtx {
-            session_id: self.session_id.clone(),
+            initial_session_id: self.initial_session_id.clone(),
             user: self.user.clone(),
             shutdown: Arc::clone(&self.shutdown),
             input: Arc::clone(&self.transport),
@@ -202,7 +190,11 @@ impl TuiAdapter {
 }
 
 struct LoopCtx {
-    session_id: SessionId,
+    /// Session id captured at boot — used once to render the initial
+    /// banner. The *live* session id (which can change at runtime via
+    /// `/new`) lives in the transport's pin and is read on demand
+    /// through [`WsTransport::current_session_id`].
+    initial_session_id: SessionId,
     user: User,
     shutdown: Arc<Notify>,
     input: Arc<WsTransport>,
@@ -217,14 +209,13 @@ struct LoopCtx {
 /// Spawn a background task that pumps transport events into the TUI's
 /// AppEvent channel. Translates `TransportEvent` to the adapter's
 /// internal variants so the run loop can keep consuming the same
-/// `AppEvent` enum as before.
-async fn spawn_transport_pump(
-    transport: Arc<WsTransport>,
-    session_id: SessionId,
-    event_tx: mpsc::Sender<AppEvent>,
-) {
+/// `AppEvent` enum as before. The transport's own pin tracks which
+/// session the pump is forwarding for — the pump filters against
+/// whatever id [`WsTransport::switch_session`] last wrote, so `/new`
+/// re-routes inbound frames without restarting this task.
+async fn spawn_transport_pump(transport: Arc<WsTransport>, event_tx: mpsc::Sender<AppEvent>) {
     tokio::spawn(async move {
-        let mut stream = match transport.subscribe(&session_id).await {
+        let mut stream = match transport.subscribe().await {
             Ok(s) => s,
             Err(e) => {
                 let _ = event_tx
@@ -359,10 +350,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     // Initial greet so the user sees something before their first message.
     // Pinned as a persistent top banner so it remains visible after the
     // scrollback fills up; toggling mouse wheel updates it in place.
-    state.set_banner(format!(
-        "Session {} — type / to see commands, /quit or Ctrl-D twice to leave. Alt-M toggles mouse wheel (off enables text selection).",
-        ctx.session_id
-    ));
+    state.set_banner(session_banner(&ctx.initial_session_id));
     terminal.draw(|f| render(f, &mut state))?;
 
     loop {
@@ -653,6 +641,19 @@ async fn handle_slash(state: &mut AppState, ctx: &LoopCtx, text: String) {
             // Ask the loop to stop.
             let _ = ctx.event_tx.try_send(AppEvent::Shutdown);
         }
+        SlashOutcome::NewSession => {
+            let new_id = mint_new_session_id();
+            match ctx.input.switch_session(new_id.clone()).await {
+                Ok(()) => {
+                    state.clear_scrollback();
+                    state.set_banner(session_banner(&new_id));
+                    state.push_system(format!("Started a fresh session: {new_id}"));
+                }
+                Err(e) => {
+                    state.push_system(format!("/new failed: {e}"));
+                }
+            }
+        }
     }
 }
 
@@ -660,7 +661,7 @@ async fn dispatch_user_message(ctx: &LoopCtx, text: String) {
     let msg = IncomingMessage {
         message: Message {
             id: Uuid::new_v4().to_string(),
-            session_id: ctx.session_id.clone(),
+            session_id: ctx.input.current_session_id(),
             channel: ChannelType::tui(),
             sender: ctx.user.clone(),
             content: vec![ContentBlock::Text(text)],
@@ -673,6 +674,21 @@ async fn dispatch_user_message(ctx: &LoopCtx, text: String) {
     if let Err(e) = ctx.input.submit(msg).await {
         warn!("failed to forward TUI input: {e}");
     }
+}
+
+fn session_banner(session_id: &SessionId) -> String {
+    format!(
+        "Session {session_id} — type / to see commands, /quit or Ctrl-D twice to leave. Alt-M toggles mouse wheel (off enables text selection).",
+    )
+}
+
+/// Mint a fresh session id for `/new`. Matches the prefix
+/// `SessionManager::create_session_with_trigger` uses for
+/// `TriggerSource::User` (no prefix, bare UUID) so the lazily-
+/// created row on the agent side stays bucketed with other
+/// user-triggered sessions in logs and admin listings.
+fn mint_new_session_id() -> SessionId {
+    SessionId::from(Uuid::new_v4().to_string())
 }
 
 /// Ship the just-submitted `entry` to the gateway's `TuiHistoryStore`

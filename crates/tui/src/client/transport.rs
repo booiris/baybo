@@ -16,6 +16,7 @@ use aura_channels::wire::{Frame, Message as WireMessage};
 use aura_channels::{ChannelError, IncomingMessage, MessageRole, NoticeLevel, Result};
 use aura_model::{ChannelType, ContentBlock, SessionId};
 use aura_tools::{ApprovalQueue, ApprovalRequest};
+use parking_lot::RwLock;
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
@@ -36,10 +37,14 @@ pub struct WsTransport {
     // Hold subscribe()'s pump handles so a second subscribe on a new
     // session doesn't race the previous one on the shared source.
     subscribe_lock: Arc<Mutex<()>>,
-    /// Pinned session this TUI registered against. Used as the frame
-    /// `session_id` on [`WsTransport::append_history`] so the gateway
-    /// can attribute writes and enforce per-session auth invariants.
-    session_id: SessionId,
+    /// Pinned session this connection is currently bound to. Shared
+    /// with the subscribe pump (which reads it on every inbound frame
+    /// to drop messages that target the old session after a `/new`
+    /// switch) and rewritten by [`WsTransport::switch_session`]. Held
+    /// behind a `parking_lot::RwLock` because rewrites are rare (only
+    /// on `/new`) and reads are tiny / hot — uncontended `read()` is
+    /// a load+CAS.
+    session_pin: Arc<RwLock<SessionId>>,
     /// One-shot history ring the gateway pushed right after
     /// `RegisterAck`. The TUI consumes it once during bootstrap — see
     /// [`WsTransport::take_history_snapshot`].
@@ -97,7 +102,7 @@ impl WsTransport {
             client,
             approval_queue,
             subscribe_lock: Arc::new(Mutex::new(())),
-            session_id,
+            session_pin: Arc::new(RwLock::new(session_id)),
             initial_history: Mutex::new(Some(initial_history)),
         })
     }
@@ -143,13 +148,16 @@ impl WsTransport {
             .map_err(|e| ChannelError::Send(format!("tui ws send: {e}")))
     }
 
-    /// Open a long-lived subscription to gateway events for
-    /// `session_id`. The returned stream ends when the peer closes.
-    pub async fn subscribe(&self, session_id: &SessionId) -> Result<TransportEventStream> {
+    /// Open a long-lived subscription to gateway events for the
+    /// session this transport is currently pinned to. The returned
+    /// stream ends when the peer closes. The pump re-reads the pin on
+    /// every inbound frame so a [`WsTransport::switch_session`] call
+    /// immediately rolls over to the new id without a stream restart.
+    pub async fn subscribe(&self) -> Result<TransportEventStream> {
         let (tx, rx) = mpsc::channel::<Result<TransportEvent>>(EVENT_CHAN_CAPACITY);
         let client: Arc<WsClient> = Arc::clone(&self.client);
         let queue = self.approval_queue.clone();
-        let target = session_id.clone();
+        let target = Arc::clone(&self.session_pin);
         let subscribe_lock = Arc::clone(&self.subscribe_lock);
 
         tokio::spawn(async move {
@@ -171,7 +179,8 @@ impl WsTransport {
                         return;
                     }
                 };
-                if let Some(event) = map_frame(frame, &target, &queue)
+                let target_snapshot = target.read().clone();
+                if let Some(event) = map_frame(frame, &target_snapshot, &queue)
                     && tx.send(Ok(event)).await.is_err()
                 {
                     return;
@@ -180,6 +189,45 @@ impl WsTransport {
         });
 
         Ok(Box::pin(ReceiverStream::new(rx)) as TransportEventStream)
+    }
+
+    /// Current session id this transport is pinned to. Cloned out of
+    /// the shared pin; callers needing to compare or render the id
+    /// should call this once per use rather than caching, so a
+    /// [`Self::switch_session`] elsewhere stays visible.
+    pub fn current_session_id(&self) -> SessionId {
+        self.session_pin.read().clone()
+    }
+
+    /// Abandon the current session and start a fresh one. Sends an
+    /// `Unsubscribe` for the old id and a `Subscribe` for `new_id` on
+    /// the existing WS, then rewrites the shared pin so the subscribe
+    /// pump and `append_history` immediately target the new session.
+    /// No new gateway round-trip is needed beyond the two control
+    /// frames: the session row itself is created lazily on the agent
+    /// side when the first user message lands (see
+    /// `SessionManager::get_or_create`), so a `/new` that ends without
+    /// a message leaves no trace in the session store.
+    pub async fn switch_session(&self, new_id: SessionId) -> Result<()> {
+        let old_id = self.session_pin.read().clone();
+        if old_id == new_id {
+            return Ok(());
+        }
+        self.client
+            .send_raw(&Frame::Unsubscribe {
+                session_id: old_id.clone(),
+            })
+            .await
+            .map_err(|e| ChannelError::Send(format!("tui ws unsubscribe: {e}")))?;
+        self.client
+            .send_raw(&Frame::Subscribe {
+                session_id: new_id.clone(),
+                since_ordinal: None,
+            })
+            .await
+            .map_err(|e| ChannelError::Send(format!("tui ws subscribe: {e}")))?;
+        *self.session_pin.write() = new_id;
+        Ok(())
     }
 
     /// Shared approval queue. The TUI renders pending entries from it
@@ -202,7 +250,7 @@ impl WsTransport {
     /// can decide whether to log or retry.
     pub async fn append_history(&self, entry: &str) -> Result<()> {
         let frame = Frame::HistoryAppend {
-            session_id: self.session_id.clone(),
+            session_id: self.current_session_id(),
             entry: entry.to_owned(),
         };
         self.client
@@ -315,6 +363,16 @@ fn map_frame(
             // doesn't have to negotiate per-client.
             None
         }
+        Frame::HistorySnapshot { .. } => {
+            // First HistorySnapshot is drained by `connect_tui`; the
+            // gateway also resends one on every `Subscribe` (including
+            // the `/new`-driven re-subscribe), so a stray one
+            // post-handshake is expected, not a violation. Input
+            // history is conceptually global to the TUI process, not
+            // per-session, so the resends carry no useful new state
+            // and are silently dropped.
+            None
+        }
         Frame::Register { .. }
         | Frame::RegisterAck { .. }
         | Frame::Subscribe { .. }
@@ -322,19 +380,92 @@ fn map_frame(
         | Frame::Reset { .. }
         | Frame::ResolveApproval { .. }
         | Frame::HistoryAppend { .. }
-        | Frame::HistorySnapshot { .. }
         | Frame::StartBot { .. }
         | Frame::StopBot { .. }
         | Frame::BotStatus { .. }
         | Frame::SlashManifest { .. } => {
-            // HistorySnapshot is drained during `connect_tui`; any
-            // stray instance post-handshake is a protocol violation.
-            // StartBot / StopBot / BotStatus are sidecar
-            // control-plane frames — the TUI never participates in
-            // that flow. SlashManifest is also sidecar-only: the TUI
-            // owns its slash commands client-side via TuiSlashHandler.
+            // StartBot / StopBot / BotStatus are sidecar control-plane
+            // frames — the TUI never participates in that flow.
+            // SlashManifest is also sidecar-only: the TUI owns its
+            // slash commands client-side via TuiSlashHandler.
             warn!("unexpected frame from gateway; dropping");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sid(s: &str) -> SessionId {
+        SessionId::from(s)
+    }
+
+    #[test]
+    fn map_frame_forwards_delta_for_pinned_session() {
+        let queue = ApprovalQueue::new();
+        let target = sid("alpha");
+        let frame = Frame::Delta {
+            session_id: target.clone(),
+            user_id: String::new(),
+            text: "tick".into(),
+        };
+        match map_frame(frame, &target, &queue) {
+            Some(TransportEvent::StreamDelta(text)) => assert_eq!(text, "tick"),
+            other => panic!("expected StreamDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_frame_drops_delta_for_other_session() {
+        // Models the in-flight tail after `/new`: gateway emits a few
+        // more Deltas for the old session id before our Unsubscribe
+        // reaches it; the pump's filter must drop them rather than
+        // leak old-session output into the new transcript.
+        let queue = ApprovalQueue::new();
+        let target = sid("beta");
+        let frame = Frame::Delta {
+            session_id: sid("alpha"),
+            user_id: String::new(),
+            text: "stale".into(),
+        };
+        assert!(map_frame(frame, &target, &queue).is_none());
+    }
+
+    #[test]
+    fn map_frame_drops_history_snapshot_silently() {
+        // Subscribe always triggers a HistorySnapshot from the gateway
+        // (including the `/new`-driven re-subscribe). Input history is
+        // global to the TUI process, so the resend carries nothing the
+        // pump cares about — it must be dropped, not warned about.
+        let queue = ApprovalQueue::new();
+        let target = sid("alpha");
+        let frame = Frame::HistorySnapshot {
+            session_id: target.clone(),
+            entries: vec!["echo".into()],
+        };
+        assert!(map_frame(frame, &target, &queue).is_none());
+    }
+
+    #[test]
+    fn map_frame_drops_user_echo_for_pinned_session() {
+        // Subscribed-kind channels echo inbound to every subscriber —
+        // including the sender. The TUI already rendered its own
+        // prompt locally, so the echo must not duplicate the row.
+        let queue = ApprovalQueue::new();
+        let target = sid("alpha");
+        let echo = Frame::Message(WireMessage {
+            content: "hi".into(),
+            session_id: target.clone(),
+            user_id: "u".into(),
+            channel_type: ChannelType::tui(),
+            bot_id: String::new(),
+            attachments: Vec::new(),
+            platform_msg_id: String::new(),
+            role: MessageRole::User,
+            ordinal: None,
+        });
+        assert!(map_frame(echo, &target, &queue).is_none());
     }
 }

@@ -116,7 +116,6 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     let shutdown = ShutdownSignal::new();
     let tui_shutdown = shutdown.clone();
     let tui = TuiAdapter::new(transport)
-        .with_session_id(session_id.clone())
         .with_slash_handler(slash_handler)
         .with_dashboard_provider(dashboard_provider)
         .with_on_exit(Arc::new(move || tui_shutdown.trigger()));

@@ -39,6 +39,7 @@ impl SlashHandler for TuiSlashHandler {
     fn commands(&self) -> Vec<SlashCommand> {
         let mut out = vec![
             SlashCommand::new("/clear", "Clear the chat scrollback."),
+            SlashCommand::new("/new", "Abandon this session and start a fresh one."),
             SlashCommand::new("/quit", "Exit the chat session."),
             SlashCommand::new("/exit", "Exit the chat session."),
         ];
@@ -59,6 +60,7 @@ impl SlashHandler for TuiSlashHandler {
 
         match name.as_str() {
             "clear" => SlashOutcome::Handled(Vec::new()),
+            "new" => SlashOutcome::NewSession,
             "quit" | "exit" => SlashOutcome::Exit,
             "help" => SlashOutcome::Handled(vec![ContentBlock::Text(help_text())]),
             _ => SlashOutcome::PassThrough,
@@ -90,6 +92,7 @@ fn help_text() -> String {
     String::from(
         "Slash commands:\n\
          /clear           clear chat scrollback\n\
+         /new             abandon this session and start a fresh one\n\
          /quit, /exit     close the session\n\
          \n\
          Tool approvals are resolved from the modal (a / A / d).\n\
@@ -135,5 +138,36 @@ mod tests {
         // `memory` retired with the CLI `aura memory` family.
         assert_eq!(dashboard_shortcut("memory"), None);
         assert_eq!(dashboard_shortcut("status"), None);
+    }
+
+    #[tokio::test]
+    async fn new_returns_new_session_outcome() {
+        let handler = TuiSlashHandler::new();
+        // Bare /new — adapter is expected to mint a fresh session id
+        // and switch the connection's subscription.
+        assert!(matches!(
+            handler.handle("/new").await,
+            SlashOutcome::NewSession
+        ));
+        // Trailing whitespace and trailing junk both still trip the
+        // slash recognizer; arguments are ignored.
+        assert!(matches!(
+            handler.handle("  /new   ").await,
+            SlashOutcome::NewSession
+        ));
+        assert!(matches!(
+            handler.handle("/new extra junk").await,
+            SlashOutcome::NewSession
+        ));
+    }
+
+    #[test]
+    fn new_is_in_commands_manifest() {
+        let names: Vec<String> = TuiSlashHandler::new()
+            .commands()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "/new"));
     }
 }

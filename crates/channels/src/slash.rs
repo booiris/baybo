@@ -28,12 +28,18 @@ pub const COMPACT_COMMAND: &str = "/compact";
 /// - [`SlashOutcome::PassThrough`] — the input was not a recognised command;
 ///   the adapter should treat it as an ordinary user message.
 /// - [`SlashOutcome::Exit`] — the handler requests that the adapter stop.
+/// - [`SlashOutcome::NewSession`] — the handler asks the adapter to abandon
+///   the current session (`/new`). Subscribed-kind adapters (TUI, web chat)
+///   honour this by minting a fresh session id and switching their
+///   subscription; adapters that have no session-switch concept should
+///   treat it as `Handled(empty)`.
 #[derive(Debug)]
 pub enum SlashOutcome {
     Handled(Vec<ContentBlock>),
     OpenView(ViewKind),
     PassThrough,
     Exit,
+    NewSession,
 }
 
 /// Built-in dashboard views that a channel adapter may render.
