@@ -632,7 +632,10 @@ impl QueryApi {
                 cost_usd: MicroUsd::ZERO,
                 sessions_created: 0,
             });
-            cursor = cursor.succ_opt().unwrap_or(cursor);
+            cursor = match cursor.succ_opt() {
+                Some(d) => d,
+                None => break,
+            };
         }
 
         let mut total_input = 0usize;

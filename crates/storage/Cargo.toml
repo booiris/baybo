@@ -7,8 +7,8 @@ edition.workspace = true
 doctest = false
 
 [features]
-# Exposes in-memory `SecretStore` (and future `SessionStore`, etc.) fakes
-# to downstream crates' tests. Pull in via:
+# Exposes in-memory fakes (`MemoryBlobStore`, `MemorySessionStore`,
+# `MemorySessionSummaryStore`) to downstream crates' tests. Pull in via:
 #   aura-storage = { workspace = true, features = ["test-support"] }
 # inside the consumer's `[dev-dependencies]`.
 test-support = []
