@@ -1459,6 +1459,12 @@ function routeInboundFrame(
                 notice: { level: noticeLevel(frame.level), text: frame.text },
               },
             ],
+            // Some turns reply with `AgentOutput::Notice` and never
+            // emit a Delta/Message — slash commands like `/compact`,
+            // refusal / error paths, etc. Without this, the typing
+            // dots would hang forever for those sends. The notice
+            // itself is now the reply, so awaitingReply ends here.
+            awaitingReply: false,
           },
         };
       });
