@@ -926,6 +926,7 @@ export function ChatPage() {
           <ConnectionBadge status={status} />
         </header>
 
+        <div className="flex-1 flex flex-col overflow-hidden relative xl:pr-[260px]">
         <div
           ref={transcriptScrollRef}
           onScroll={handleTranscriptScroll}
@@ -1042,6 +1043,7 @@ export function ChatPage() {
             </div>
           </div>
         </form>
+        </div>
       </main>
     </div>
   );
@@ -1626,7 +1628,7 @@ function MessageBubble({ row }: { row: TranscriptRow }) {
   const body = row.text || (row.hasAttachments ? '[attachment]' : '');
   return (
     <div className={`group flex ${isUser ? 'justify-end' : 'justify-start'}`}>
-      <div className="relative max-w-[80%]">
+      <div className="relative max-w-2xl">
         <div
           className={`border-2 border-black rounded-md px-3 py-2 font-mono text-sm whitespace-pre-wrap transition-opacity ${
             isUser ? 'bg-brand text-white' : 'bg-white text-ink'
