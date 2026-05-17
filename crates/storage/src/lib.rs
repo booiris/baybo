@@ -6,8 +6,6 @@ pub mod cron;
 pub mod error;
 pub mod libsql;
 pub mod retry;
-pub mod session;
-pub mod session_summary;
 pub mod skill_risk;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -24,10 +22,9 @@ use aura_cost::CostStore;
 use aura_job::JobStore;
 use aura_memory::MemoryStore;
 use aura_security::SecretStore;
+use aura_session::{SessionStore, SessionSummaryStore};
 use aura_trace::TraceStore;
 pub use retry::retry_on_busy;
-pub use session::{SessionStore, StoredMessage};
-pub use session_summary::{SessionSummaryRow, SessionSummaryStore};
 pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 
 /// Bundles all store implementations into a single container

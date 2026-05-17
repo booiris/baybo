@@ -18,8 +18,8 @@ use std::sync::Arc;
 use aura_agent::state::DurableActorState;
 use aura_model::{ChannelType, SessionId, User};
 use aura_session::SessionManager;
-use aura_storage::SessionStore;
-use aura_storage::test_support::{MemorySessionStore, MemorySessionSummaryStore};
+use aura_session::SessionStore;
+use aura_session::test_support::{MemorySessionStore, MemorySessionSummaryStore};
 
 fn test_user() -> User {
     User {
@@ -131,7 +131,7 @@ async fn rehydrate_after_idle_eviction_preserves_session_state() {
 /// exercises the same clear path in isolation.
 #[tokio::test]
 async fn clearing_in_flight_unblocks_post_reap_compression() {
-    use aura_storage::SessionSummaryStore;
+    use aura_session::SessionSummaryStore;
 
     let session_store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
     let summary_store: Arc<dyn SessionSummaryStore> = Arc::new(MemorySessionSummaryStore::new());

@@ -1234,10 +1234,10 @@ mod tests {
     }
 
     fn test_sessions() -> Arc<aura_session::SessionManager> {
-        let store = Arc::new(aura_storage::test_support::MemorySessionStore::new())
-            as Arc<dyn aura_storage::SessionStore>;
-        let summary_store = Arc::new(aura_storage::test_support::MemorySessionSummaryStore::new())
-            as Arc<dyn aura_storage::SessionSummaryStore>;
+        let store = Arc::new(aura_session::test_support::MemorySessionStore::new())
+            as Arc<dyn aura_session::SessionStore>;
+        let summary_store = Arc::new(aura_session::test_support::MemorySessionSummaryStore::new())
+            as Arc<dyn aura_session::SessionSummaryStore>;
         Arc::new(aura_session::SessionManager::new(store, summary_store))
     }
 

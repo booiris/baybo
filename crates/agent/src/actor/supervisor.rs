@@ -339,8 +339,8 @@ impl Drop for ActorRegistryGuard {
 mod tests {
     use super::*;
     use aura_model::{ChannelType, SessionId, User};
-    use aura_storage::test_support::{MemorySessionStore, MemorySessionSummaryStore};
-    use aura_storage::{SessionStore, SessionSummaryStore};
+    use aura_session::test_support::{MemorySessionStore, MemorySessionSummaryStore};
+    use aura_session::{SessionStore, SessionSummaryStore};
 
     fn make_supervisor() -> AgentSupervisor {
         let (tx, _rx) = mpsc::channel(8);

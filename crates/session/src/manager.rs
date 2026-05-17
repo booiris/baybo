@@ -1,24 +1,21 @@
 use std::sync::Arc;
 
 use aura_model::{ChannelType, ChatMessage, Session, SessionId, SessionState, TriggerSource, User};
-use aura_storage::{SessionStore, SessionSummaryRow, SessionSummaryStore, StorageError};
 use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, warn};
 
 use crate::SessionError;
+use crate::store::{SessionStore, StoredMessage};
+use crate::summary_store::{SessionSummaryRow, SessionSummaryStore};
 
 type Result<T> = std::result::Result<T, SessionError>;
-
-fn wrap(e: StorageError) -> SessionError {
-    SessionError::Storage(e.to_string())
-}
 
 /// Higher-level session management logic wrapping a `SessionStore`.
 pub struct SessionManager {
     store: Arc<dyn SessionStore>,
     /// Per-session summary-metadata store. Required at construction —
     /// production wires the libsql backend; tests pass
-    /// `aura_storage::test_support::MemorySessionSummaryStore`.
+    /// `crate::test_support::MemorySessionSummaryStore`.
     summary_store: Arc<dyn SessionSummaryStore>,
     /// Default soul version stamped on new sessions when the caller
     /// does not supply one. The agent layer overrides this via
@@ -63,7 +60,7 @@ impl SessionManager {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<SessionSummaryRow>> {
-        self.summary_store.get(session_id).await.map_err(wrap)
+        self.summary_store.get(session_id).await
     }
 
     /// Record a successful summary pass: bumps `pass_count`, advances
@@ -87,7 +84,7 @@ impl SessionManager {
                 updated_at,
             )
             .await
-            .map_err(wrap)
+
     }
 
     /// Record a failed summary attempt: bumps `error_count`. Inserts
@@ -104,7 +101,7 @@ impl SessionManager {
         self.summary_store
             .bump_error_count(session_id, model_id, span_id, updated_at)
             .await
-            .map_err(wrap)
+
     }
 
     /// Mark `session_id` as having an in-flight `BackgroundCompressionRunner`
@@ -123,7 +120,7 @@ impl SessionManager {
         self.summary_store
             .set_in_flight(session_id, true, Some(owner), Utc::now())
             .await
-            .map_err(wrap)
+
     }
 
     /// Compare-and-clear the `in_flight` flag: only clears when the
@@ -140,7 +137,7 @@ impl SessionManager {
         self.summary_store
             .clear_in_flight_if_owned(session_id, owner, Utc::now())
             .await
-            .map_err(wrap)
+
     }
 
     /// Reset `in_flight = 0` on every `session_summaries` row. Called
@@ -150,7 +147,7 @@ impl SessionManager {
     /// (or even before the `try_send` returned) doesn't leave the
     /// parent permanently blocked.
     pub async fn clear_all_summary_in_flight(&self) -> Result<()> {
-        self.summary_store.clear_all_in_flight().await.map_err(wrap)
+        self.summary_store.clear_all_in_flight().await
     }
 
     /// Unconditionally clear the `in_flight` flag for one session.
@@ -163,7 +160,7 @@ impl SessionManager {
         self.summary_store
             .set_in_flight(session_id, false, None, Utc::now())
             .await
-            .map_err(wrap)
+
     }
 
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
@@ -241,7 +238,7 @@ impl SessionManager {
             bound_soul_version: parent.bound_soul_version.clone(),
             hidden: false,
         };
-        self.store.save(&session).await.map_err(wrap)?;
+        self.store.save(&session).await?;
         debug!(
             session_id = %session.id,
             parent_session_id = %parent.id,
@@ -263,7 +260,7 @@ impl SessionManager {
         self.store
             .list_active_maintenance_for_parent(parent_session_id)
             .await
-            .map_err(wrap)
+
     }
 
     /// Enumerate every maintenance session id (`is_normal_session
@@ -273,7 +270,7 @@ impl SessionManager {
         self.store
             .list_all_maintenance_sessions()
             .await
-            .map_err(wrap)
+
     }
 
     /// Maintenance sessions whose associated job is **not** in a
@@ -285,7 +282,7 @@ impl SessionManager {
         self.store
             .list_unfinished_maintenance_sessions()
             .await
-            .map_err(wrap)
+
     }
 
     /// Create a session that descends from `parent` via the given
@@ -322,7 +319,7 @@ impl SessionManager {
             bound_soul_version: self.default_soul_version.clone(),
             hidden: false,
         };
-        self.store.save(&session).await.map_err(wrap)?;
+        self.store.save(&session).await?;
         debug!(
             session_id = %session.id,
             parent_session_id = %parent.id,
@@ -352,7 +349,7 @@ impl SessionManager {
             bound_soul_version: self.default_soul_version.clone(),
             hidden: false,
         };
-        self.store.save(&session).await.map_err(wrap)?;
+        self.store.save(&session).await?;
         debug!(session_id = %session.id, "created new session");
         Ok(session)
     }
@@ -363,7 +360,7 @@ impl SessionManager {
         user: User,
         channel: ChannelType,
     ) -> Result<Session> {
-        if let Some(session) = self.store.get(session_id).await.map_err(wrap)? {
+        if let Some(session) = self.store.get(session_id).await? {
             // Idle sessions are NOT deleted on access. Deleting the
             // session row would cascade to `session_messages` and
             // strand the still-existing `jobs` / `steps` / `spans`
@@ -382,12 +379,12 @@ impl SessionManager {
     }
 
     pub async fn get(&self, session_id: &SessionId) -> Result<Option<Session>> {
-        self.store.get(session_id).await.map_err(wrap)
+        self.store.get(session_id).await
     }
 
     /// Return every session known to the underlying store, newest-active first.
     pub async fn list(&self) -> Result<Vec<Session>> {
-        let mut sessions = self.store.list_all().await.map_err(wrap)?;
+        let mut sessions = self.store.list_all().await?;
         sessions.sort_by(|a, b| b.last_active.cmp(&a.last_active));
         Ok(sessions)
     }
@@ -399,7 +396,7 @@ impl SessionManager {
     /// pay an O(all) round-trip when the caller only wants the
     /// http channel.
     pub async fn list_by_channel(&self, channel: &aura_model::ChannelType) -> Result<Vec<Session>> {
-        let mut sessions = self.store.list_by_channel(channel).await.map_err(wrap)?;
+        let mut sessions = self.store.list_by_channel(channel).await?;
         sessions.sort_by(|a, b| b.last_active.cmp(&a.last_active));
         Ok(sessions)
     }
@@ -410,13 +407,13 @@ impl SessionManager {
     /// does not exist; an existing session with no turns yet returns
     /// an empty vector.
     pub async fn history(&self, session_id: &SessionId) -> Result<Vec<ChatMessage>> {
-        if self.store.get(session_id).await.map_err(wrap)?.is_none() {
+        if self.store.get(session_id).await?.is_none() {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
         self.store
             .load_active_session_messages(session_id)
             .await
-            .map_err(wrap)
+
     }
 
     /// Reverse-paginated slice of the active transcript: the
@@ -433,13 +430,13 @@ impl SessionManager {
         before_ordinal: Option<i64>,
         limit: usize,
     ) -> Result<Vec<(i64, ChatMessage)>> {
-        if self.store.get(session_id).await.map_err(wrap)?.is_none() {
+        if self.store.get(session_id).await?.is_none() {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
         self.store
             .load_active_session_messages_tail(session_id, before_ordinal, limit)
             .await
-            .map_err(wrap)
+
     }
 
     /// Forward catch-up slice: at most `limit` active rows with
@@ -455,13 +452,13 @@ impl SessionManager {
         after_ordinal: i64,
         limit: usize,
     ) -> Result<Vec<(i64, ChatMessage)>> {
-        if self.store.get(session_id).await.map_err(wrap)?.is_none() {
+        if self.store.get(session_id).await?.is_none() {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
         self.store
             .load_active_session_messages_since(session_id, after_ordinal, limit)
             .await
-            .map_err(wrap)
+
     }
 
     /// Append a single message to the session's transcript log.
@@ -479,7 +476,7 @@ impl SessionManager {
         self.store
             .append_session_message(session_id, message)
             .await
-            .map_err(wrap)
+
     }
 
     /// Mark the currently-active rows for `session_id` as superseded
@@ -494,7 +491,7 @@ impl SessionManager {
         self.store
             .apply_session_compaction(session_id, new_active)
             .await
-            .map_err(wrap)
+
     }
 
     /// Load the active transcript for `session_id` — used by the
@@ -507,7 +504,7 @@ impl SessionManager {
         self.store
             .load_active_session_messages(session_id)
             .await
-            .map_err(wrap)
+
     }
 
     /// Highest `session_messages.ordinal` ever assigned for the
@@ -517,7 +514,7 @@ impl SessionManager {
         self.store
             .latest_session_ordinal(session_id)
             .await
-            .map_err(wrap)
+
     }
 
     /// Full message log including superseded rows, paired with each
@@ -527,11 +524,11 @@ impl SessionManager {
     pub async fn load_session_messages_with_supersede(
         &self,
         session_id: &SessionId,
-    ) -> Result<Vec<aura_storage::StoredMessage>> {
+    ) -> Result<Vec<StoredMessage>> {
         self.store
             .load_session_messages_with_supersede(session_id)
             .await
-            .map_err(wrap)
+
     }
 
     /// 0-indexed position of `ordinal` within the active message
@@ -545,7 +542,7 @@ impl SessionManager {
         self.store
             .active_index_of_ordinal(session_id, ordinal)
             .await
-            .map_err(wrap)
+
     }
 
     /// Count of active rows for the session. Index-only.
@@ -553,7 +550,7 @@ impl SessionManager {
         self.store
             .count_active_messages(session_id)
             .await
-            .map_err(wrap)
+
     }
 
     /// Active transcript clipped to `ordinal <= up_to_ordinal`. Used
@@ -568,7 +565,7 @@ impl SessionManager {
         self.store
             .load_active_session_messages_up_to(session_id, up_to_ordinal)
             .await
-            .map_err(wrap)
+
     }
 
     /// Hard-delete a session by id. Errors with `SessionError::NotFound`
@@ -576,7 +573,7 @@ impl SessionManager {
     /// `StorageError::HasLiveForks` (wrapped) when the session has live
     /// forks pointing at it.
     pub async fn delete(&self, session_id: &SessionId) -> Result<()> {
-        let deleted = self.store.delete(session_id).await.map_err(wrap)?;
+        let deleted = self.store.delete(session_id).await?;
         if !deleted {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
@@ -594,7 +591,7 @@ impl SessionManager {
             .store
             .set_hidden(session_id, hidden)
             .await
-            .map_err(wrap)?;
+            ?;
         if !updated {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
@@ -603,11 +600,11 @@ impl SessionManager {
     }
 
     pub async fn touch(&self, session_id: &SessionId) -> Result<()> {
-        let session = self.store.get(session_id).await.map_err(wrap)?;
+        let session = self.store.get(session_id).await?;
         match session {
             Some(mut session) => {
                 session.last_active = Utc::now();
-                self.store.save(&session).await.map_err(wrap)?;
+                self.store.save(&session).await?;
                 debug!(session_id = %session_id, "touched session");
                 Ok(())
             }
@@ -630,7 +627,7 @@ impl SessionManager {
     /// are core user data; see CLAUDE.md ("Session data is core data").
     pub async fn idle_sessions(&self, threshold: Duration) -> Result<Vec<SessionId>> {
         let cutoff = Utc::now() - threshold;
-        self.store.list_expired(cutoff).await.map_err(wrap)
+        self.store.list_expired(cutoff).await
     }
 }
 
@@ -639,10 +636,10 @@ mod tests {
     use std::sync::Arc;
 
     use aura_model::{ChannelType, SessionId, User};
-    use aura_storage::test_support::{MemorySessionStore, MemorySessionSummaryStore};
     use chrono::{Duration, Utc};
 
     use super::{SessionError, SessionManager, SessionStore, SessionSummaryStore};
+    use crate::test_support::{MemorySessionStore, MemorySessionSummaryStore};
 
     fn test_user() -> User {
         User {

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use aura_query::QueryApi;
 use aura_model::SessionId;
-use aura_storage::StoredMessage;
+use aura_session::StoredMessage;
 use serde_json::{Value, json};
 use tokio::fs;
 

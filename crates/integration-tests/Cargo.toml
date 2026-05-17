@@ -33,6 +33,7 @@ aura-llm = { workspace = true, features = ["test-support"] }
 aura-memory = { workspace = true, features = ["test-support"] }
 aura-model = { workspace = true }
 aura-security = { workspace = true, features = ["test-support"] }
+aura-session = { workspace = true, features = ["test-support"] }
 aura-skills = { workspace = true }
 aura-storage = { workspace = true, features = ["test-support"] }
 aura-tools = { workspace = true, features = ["test-support"] }
