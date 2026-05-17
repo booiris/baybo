@@ -240,12 +240,81 @@ export function ChatPage() {
   // without forcing the effect that constructs the WS to re-run.
   const recencyRef = useRef<Map<string, number>>(new Map());
 
+  // Streaming pacer: decouples the visual reveal cadence from the wire
+  // cadence. Servers tend to flush Delta frames in uneven bursts (a few
+  // chars at a time during steady-state, then a 200-char chunk after a
+  // network hiccup); writing each burst straight into the bubble looks
+  // jittery. The pacer instead accumulates incoming text into a per-
+  // session `target` and a rAF loop catches `rendered` up at a smooth,
+  // adaptive rate — slow when the backlog is small (keeps a typewriter
+  // feel), fast when the backlog grows (so we never visibly lag far
+  // behind the server). State lives in a ref because the rAF callback
+  // reads/writes between commits and we don't want to thrash React.
+  const streamPacersRef = useRef<
+    Record<string, { target: string; rendered: number; rafId: number | null }>
+  >({});
+
+  const cancelPacer = useCallback((sid: string) => {
+    const pacer = streamPacersRef.current[sid];
+    if (!pacer) return;
+    if (pacer.rafId !== null) cancelAnimationFrame(pacer.rafId);
+    delete streamPacersRef.current[sid];
+  }, []);
+
+  const pacerTick = useCallback((sid: string) => {
+    const pacer = streamPacersRef.current[sid];
+    if (!pacer) return;
+    const backlog = pacer.target.length - pacer.rendered;
+    if (backlog <= 0) {
+      pacer.rafId = null;
+      return;
+    }
+    // Adaptive reveal: a small backlog reveals slowly so the eye reads
+    // a steady typewriter trickle; a big backlog (after a burst) is
+    // drained proportionally so we close the gap within a handful of
+    // frames instead of running visibly behind the server for seconds.
+    const step =
+      backlog > 400 ? Math.ceil(backlog / 6)
+      : backlog > 120 ? 8
+      : backlog > 40 ? 4
+      : 2;
+    pacer.rendered = Math.min(pacer.target.length, pacer.rendered + step);
+    const visible = pacer.target.slice(0, pacer.rendered);
+    setViews((prev) => {
+      const view = prev[sid] ?? EMPTY_VIEW;
+      const nextTranscript = setStreamingText(view.transcript, visible);
+      if (nextTranscript === view.transcript && !view.awaitingReply) return prev;
+      return {
+        ...prev,
+        [sid]: { ...view, transcript: nextTranscript, awaitingReply: false },
+      };
+    });
+    pacer.rafId = requestAnimationFrame(() => pacerTick(sid));
+  }, []);
+
+  const enqueueDelta = useCallback(
+    (sid: string, text: string) => {
+      if (!text) return;
+      let pacer = streamPacersRef.current[sid];
+      if (!pacer) {
+        pacer = { target: '', rendered: 0, rafId: null };
+        streamPacersRef.current[sid] = pacer;
+      }
+      pacer.target += text;
+      if (pacer.rafId === null) {
+        pacer.rafId = requestAnimationFrame(() => pacerTick(sid));
+      }
+    },
+    [pacerTick],
+  );
+
   // Tear down everything we hold for a single session: WS subscription,
   // view bucket, recency entry. Used by local hide, cross-tab hide, and
   // LRU eviction. Stable identity via useCallback([]) so the WS effect's
   // dep array stays clean.
   const releaseSessionView = useCallback((sid: string) => {
     wsRef.current?.unsubscribe(sid);
+    cancelPacer(sid);
     setViews((prev) => {
       if (!(sid in prev)) return prev;
       const next = { ...prev };
@@ -253,7 +322,7 @@ export function ChatPage() {
       return next;
     });
     recencyRef.current.delete(sid);
-  }, []);
+  }, [cancelPacer]);
 
   // ── Bootstrap: load session list + slash manifest, mint a token ─────
   // Runs once on mount. Anchor selection priority:
@@ -458,6 +527,20 @@ export function ChatPage() {
           default:
             break;
         }
+        // Route delta frames through the pacer instead of straight to
+        // setViews — the pacer's rAF loop owns the bubble's text while
+        // streaming is in flight. routeInboundFrame's delta case stays
+        // as a defensive fallback but should not fire from this path.
+        if (frame.kind === 'delta') {
+          enqueueDelta(frame.session_id, frame.text);
+          return;
+        }
+        // An assistant message frame is the authoritative final text
+        // for the stream — drop any pacer state so its in-flight rAF
+        // doesn't overwrite the finalized bubble a tick later.
+        if (frame.kind === 'message' && frame.role !== 'user') {
+          cancelPacer(frame.session_id);
+        }
         routeInboundFrame(frame, setViews, setSessions, lastConnectedAtRef.current);
       },
       onTokenRejected: (reason) => onTokenRejectedRef.current?.(reason),
@@ -474,6 +557,12 @@ export function ChatPage() {
         // the server's ApprovalResolved fan-out will clear when /
         // if the call resolves.
         console.warn('chat WS reset; refetching history via REST', reason);
+        // The REST refill will rebuild the streaming bubble's final
+        // text — any pacer state we hold is stale relative to that
+        // and must not flush after the wipe.
+        for (const sid of Object.keys(streamPacersRef.current)) {
+          cancelPacer(sid);
+        }
         setViews((prev) => {
           const next: Record<string, SessionView> = {};
           for (const [sid, view] of Object.entries(prev)) {
@@ -491,7 +580,7 @@ export function ChatPage() {
       ws.close();
       wsRef.current = null;
     };
-  }, [baseUrl, channelToken, releaseSessionView]);
+  }, [baseUrl, channelToken, releaseSessionView, enqueueDelta, cancelPacer]);
 
   // ── Active session: subscribe + lazy-load history ───────────────────
   // Subscribe stays sticky once added: when the user switches away,
@@ -1457,6 +1546,27 @@ function mergeView(
 ): Record<string, SessionView> {
   const view = prev[sessionId] ?? EMPTY_VIEW;
   return { ...prev, [sessionId]: { ...view, ...patch } };
+}
+
+// Like `appendStreamingDelta` but the second arg is the *full* visible
+// text, not an increment. Used by the rAF pacer to write the smoothed
+// reveal output where each tick already knows the cumulative slice.
+function setStreamingText(prev: TranscriptRow[], text: string): TranscriptRow[] {
+  const last = prev[prev.length - 1];
+  if (last?.streaming && last.role === 'assistant') {
+    if (last.text === text) return prev;
+    return [...prev.slice(0, -1), { ...last, text }];
+  }
+  return [
+    ...prev,
+    {
+      key: `stream-${prev.length}-${Date.now()}`,
+      role: 'assistant',
+      text,
+      streaming: true,
+      createdAt: new Date().toISOString(),
+    },
+  ];
 }
 
 function appendStreamingDelta(prev: TranscriptRow[], text: string): TranscriptRow[] {
