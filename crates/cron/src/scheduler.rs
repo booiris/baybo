@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_model::{ChannelType, SessionId};
-use aura_storage::{CronExecutionRow, CronJobRow, CronStore, CronStoreError};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use tokio::sync::mpsc;
@@ -12,69 +11,9 @@ use tracing::{debug, error, info};
 use crate::error::CronError;
 use crate::job::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
 use crate::shutdown::Shutdown;
-
-// ── Error bridging ────────────────────────────────────────────────────
-
-fn store_err(e: CronStoreError) -> CronError {
-    match e {
-        CronStoreError::NotFound(id) => CronError::NotFound(id),
-        CronStoreError::AlreadyExists(key) => CronError::AlreadyDispatched(key),
-        CronStoreError::Internal(msg) => CronError::Storage(msg),
-    }
-}
+use crate::store::CronStore;
 
 type Result<T> = std::result::Result<T, CronError>;
-
-// ── Row ↔ Domain conversion ───────────────────────────────────────────
-
-fn job_to_row(job: &CronJob) -> Result<CronJobRow> {
-    let data = serde_json::to_string(job)
-        .map_err(|e| CronError::Storage(format!("failed to serialize cron job: {e}")))?;
-    Ok(CronJobRow {
-        id: job.id.clone(),
-        user_id: job.user_id.clone(),
-        status: job.status.as_str().to_string(),
-        next_trigger_at: job
-            .next_trigger_at
-            .map(|t| t.timestamp_micros())
-            .unwrap_or(0),
-        data,
-    })
-}
-
-fn row_to_job(row: CronJobRow) -> Result<CronJob> {
-    serde_json::from_str(&row.data)
-        .map_err(|e| CronError::Storage(format!("failed to deserialize cron job: {e}")))
-}
-
-fn execution_to_row(exec: &CronExecution) -> Result<CronExecutionRow> {
-    let data = serde_json::to_string(exec)
-        .map_err(|e| CronError::Storage(format!("failed to serialize execution: {e}")))?;
-    let status_str = match exec.status {
-        ExecutionStatus::Pending => "pending",
-        ExecutionStatus::Dispatched => "dispatched",
-    };
-    Ok(CronExecutionRow {
-        id: exec.id.clone(),
-        job_id: exec.job_id.clone(),
-        user_id: exec.user_id.clone(),
-        scheduled_fire_time: exec.scheduled_fire_time.timestamp_micros(),
-        triggered_at: exec.triggered_at.timestamp_micros(),
-        status: status_str.to_string(),
-        data,
-    })
-}
-
-fn row_to_execution(row: CronExecutionRow) -> Result<CronExecution> {
-    let mut exec: CronExecution = serde_json::from_str(&row.data)
-        .map_err(|e| CronError::Storage(format!("failed to deserialize execution: {e}")))?;
-    // The row-level `status` column is the source of truth (updated independently of `data`).
-    exec.status = match row.status.as_str() {
-        "dispatched" => ExecutionStatus::Dispatched,
-        _ => ExecutionStatus::Pending,
-    };
-    Ok(exec)
-}
 
 // ── Scheduler ──────────────────────────────────────────────────────────
 
@@ -169,15 +108,13 @@ impl CronScheduler {
             origin_session_id,
         };
 
-        let row = job_to_row(&job)?;
-        self.store.create(&row).await.map_err(store_err)?;
+        self.store.create(&job).await?;
         Ok(job)
     }
 
     /// Delete a cron job by ID.
     pub async fn delete_job(&self, job_id: &str) -> Result<()> {
-        self.store.delete(job_id).await.map_err(store_err)?;
-        Ok(())
+        self.store.delete(job_id).await
     }
 
     /// Advance a recurring job to its next fire slot and persist. Used
@@ -191,15 +128,8 @@ impl CronScheduler {
         job.last_triggered_at = Some(now);
         job.next_trigger_at = compute_next_trigger(&job.schedule, tz, now);
         job.updated_at = now;
-        match job_to_row(job) {
-            Ok(row) => {
-                if let Err(e) = self.store.save(&row).await {
-                    error!(job_id = %job.id, error = %e, "failed to advance cron job after trigger");
-                }
-            }
-            Err(e) => {
-                error!(job_id = %job.id, error = %e, "failed to serialize cron job after trigger");
-            }
+        if let Err(e) = self.store.save(job).await {
+            error!(job_id = %job.id, error = %e, "failed to advance cron job after trigger");
         }
     }
 
@@ -213,14 +143,7 @@ impl CronScheduler {
         job.next_trigger_at = None;
         job.last_triggered_at = Some(now);
         job.updated_at = now;
-        let row = match job_to_row(job) {
-            Ok(r) => r,
-            Err(e) => {
-                error!(job_id = %job.id, error = %e, "failed to serialize one-shot cron job after fire");
-                return;
-            }
-        };
-        if let Err(e) = self.store.save(&row).await {
+        if let Err(e) = self.store.save(job).await {
             error!(job_id = %job.id, error = %e, "failed to mark one-shot cron job as executed");
         }
     }
@@ -229,13 +152,11 @@ impl CronScheduler {
     /// if the job is an `At` schedule whose time has already passed — there
     /// is no future fire time to enable.
     pub async fn enable_job(&self, job_id: &str) -> Result<()> {
-        let row = self
+        let mut job = self
             .store
             .get(job_id)
-            .await
-            .map_err(store_err)?
+            .await?
             .ok_or_else(|| CronError::NotFound(job_id.to_string()))?;
-        let mut job = row_to_job(row)?;
         let tz = parse_timezone(&job.timezone)?;
 
         let now = Utc::now();
@@ -254,65 +175,40 @@ impl CronScheduler {
         job.next_trigger_at = next;
         job.updated_at = now;
 
-        self.store
-            .save(&job_to_row(&job)?)
-            .await
-            .map_err(store_err)?;
-        Ok(())
+        self.store.save(&job).await
     }
 
     /// Disable a cron job, clearing its next trigger time.
     pub async fn disable_job(&self, job_id: &str) -> Result<()> {
-        let row = self
+        let mut job = self
             .store
             .get(job_id)
-            .await
-            .map_err(store_err)?
+            .await?
             .ok_or_else(|| CronError::NotFound(job_id.to_string()))?;
-        let mut job = row_to_job(row)?;
 
         let now = Utc::now();
         job.status = CronStatus::Disabled;
         job.next_trigger_at = None;
         job.updated_at = now;
 
-        self.store
-            .save(&job_to_row(&job)?)
-            .await
-            .map_err(store_err)?;
-        Ok(())
+        self.store.save(&job).await
     }
 
     /// List all cron jobs for a user.
     pub async fn list_jobs(&self, user_id: &str) -> Result<Vec<CronJob>> {
-        self.store
-            .list_by_user(user_id)
-            .await
-            .map_err(store_err)?
-            .into_iter()
-            .map(row_to_job)
-            .collect()
+        self.store.list_by_user(user_id).await
     }
 
     /// List every cron job regardless of user. Used by operator CLI surfaces
     /// where the invoking identity is a CLI session rather than a per-user
     /// identity.
     pub async fn list_all_jobs(&self) -> Result<Vec<CronJob>> {
-        self.store
-            .list_all()
-            .await
-            .map_err(store_err)?
-            .into_iter()
-            .map(row_to_job)
-            .collect()
+        self.store.list_all().await
     }
 
     /// Fetch a cron job by id, or `None` if it does not exist.
     pub async fn get_job(&self, job_id: &str) -> Result<Option<CronJob>> {
-        match self.store.get(job_id).await.map_err(store_err)? {
-            Some(row) => Ok(Some(row_to_job(row)?)),
-            None => Ok(None),
-        }
+        self.store.get(job_id).await
     }
 
     /// Manually fire a cron job now, outside the regular schedule.
@@ -325,13 +221,11 @@ impl CronScheduler {
     /// in `list_due` keeps it from re-firing), matching the tick path so
     /// manual vs scheduled firing have identical lifecycle effects.
     pub async fn trigger_now(&self, job_id: &str) -> Result<CronExecution> {
-        let row = self
+        let mut job = self
             .store
             .get(job_id)
-            .await
-            .map_err(store_err)?
+            .await?
             .ok_or_else(|| CronError::NotFound(job_id.to_string()))?;
-        let mut job = row_to_job(row)?;
 
         let now = Utc::now();
         let execution = CronExecution {
@@ -347,11 +241,7 @@ impl CronScheduler {
             origin_session_id: job.origin_session_id.clone(),
         };
 
-        let exec_row = execution_to_row(&execution)?;
-        self.store
-            .record_execution(&exec_row)
-            .await
-            .map_err(store_err)?;
+        self.store.record_execution(&execution).await?;
 
         let event = CronTriggerEvent {
             job_id: execution.job_id.clone(),
@@ -367,9 +257,8 @@ impl CronScheduler {
             .map_err(|e| CronError::Storage(format!("failed to dispatch trigger: {e}")))?;
 
         self.store
-            .update_execution_status(&execution.id, "dispatched")
-            .await
-            .map_err(store_err)?;
+            .update_execution_status(&execution.id, ExecutionStatus::Dispatched)
+            .await?;
 
         if job.is_one_shot() {
             info!(job_id = %job.id, "marking one-shot cron job as executed after manual trigger");
@@ -383,13 +272,7 @@ impl CronScheduler {
 
     /// List execution records for a job.
     pub async fn list_executions(&self, job_id: &str) -> Result<Vec<CronExecution>> {
-        self.store
-            .list_executions_by_job(job_id)
-            .await
-            .map_err(store_err)?
-            .into_iter()
-            .map(row_to_execution)
-            .collect()
+        self.store.list_executions_by_job(job_id).await
     }
 
     /// Run the background tick loop. Checks for due jobs at every tick and
@@ -419,7 +302,11 @@ impl CronScheduler {
     /// Re-dispatch executions that were recorded as `Pending` but never
     /// reached `Dispatched` (crash between record and send).
     async fn recover_pending(&self) {
-        let pending_rows = match self.store.list_executions_by_status("pending").await {
+        let pending = match self
+            .store
+            .list_executions_by_status(ExecutionStatus::Pending)
+            .await
+        {
             Ok(rows) => rows,
             Err(e) => {
                 error!(error = %e, "failed to query pending executions for recovery");
@@ -427,15 +314,7 @@ impl CronScheduler {
             }
         };
 
-        for row in pending_rows {
-            let exec = match row_to_execution(row) {
-                Ok(e) => e,
-                Err(e) => {
-                    error!(error = %e, "failed to deserialize pending execution");
-                    continue;
-                }
-            };
-
+        for exec in pending {
             info!(
                 execution_id = %exec.id,
                 job_id = %exec.job_id,
@@ -445,7 +324,7 @@ impl CronScheduler {
             let event = CronTriggerEvent {
                 job_id: exec.job_id.clone(),
                 user_id: exec.user_id.clone(),
-                channel: exec.channel,
+                channel: exec.channel.clone(),
                 prompt: exec.prompt.clone(),
                 origin_session_id: exec.origin_session_id.clone(),
             };
@@ -457,7 +336,7 @@ impl CronScheduler {
 
             if let Err(e) = self
                 .store
-                .update_execution_status(&exec.id, "dispatched")
+                .update_execution_status(&exec.id, ExecutionStatus::Dispatched)
                 .await
             {
                 error!(execution_id = %exec.id, error = %e, "failed to mark recovered execution as dispatched");
@@ -467,23 +346,15 @@ impl CronScheduler {
 
     async fn tick(&self) {
         let now = Utc::now();
-        let due_rows = match self.store.list_due(now.timestamp_micros()).await {
-            Ok(rows) => rows,
+        let due = match self.store.list_due(now.timestamp_micros()).await {
+            Ok(jobs) => jobs,
             Err(e) => {
                 error!(error = %e, "failed to query due cron jobs");
                 return;
             }
         };
 
-        for row in due_rows {
-            let mut job = match row_to_job(row) {
-                Ok(j) => j,
-                Err(e) => {
-                    error!(error = %e, "failed to deserialize due cron job");
-                    continue;
-                }
-            };
-
+        for mut job in due {
             // The scheduled_fire_time is the next_trigger_at that was due.
             let scheduled_fire_time = match job.next_trigger_at {
                 Some(t) => t,
@@ -521,16 +392,9 @@ impl CronScheduler {
                 origin_session_id: job.origin_session_id.clone(),
                 status: ExecutionStatus::Pending,
             };
-            let exec_row = match execution_to_row(&execution) {
-                Ok(r) => r,
-                Err(e) => {
-                    error!(job_id = %job.id, error = %e, "failed to serialize cron execution");
-                    continue;
-                }
-            };
-            match self.store.record_execution(&exec_row).await {
+            match self.store.record_execution(&execution).await {
                 Ok(()) => {}
-                Err(CronStoreError::AlreadyExists(key)) => {
+                Err(CronError::AlreadyDispatched(key)) => {
                     debug!(job_id = %job.id, slot = %key, "skipping duplicate cron execution slot");
                     continue;
                 }
@@ -566,7 +430,7 @@ impl CronScheduler {
             // Phase 4: Mark as Dispatched
             if let Err(e) = self
                 .store
-                .update_execution_status(&execution.id, "dispatched")
+                .update_execution_status(&execution.id, ExecutionStatus::Dispatched)
                 .await
             {
                 error!(execution_id = %execution.id, error = %e, "failed to mark execution as dispatched");
@@ -663,8 +527,8 @@ mod tests {
 
     /// In-memory CronStore for testing.
     struct InMemoryCronStore {
-        jobs: Mutex<Vec<CronJobRow>>,
-        executions: Mutex<Vec<CronExecutionRow>>,
+        jobs: Mutex<Vec<CronJob>>,
+        executions: Mutex<Vec<CronExecution>>,
     }
 
     impl InMemoryCronStore {
@@ -678,99 +542,94 @@ mod tests {
 
     #[async_trait]
     impl CronStore for InMemoryCronStore {
-        async fn create(&self, row: &CronJobRow) -> aura_storage::cron::Result<()> {
-            self.jobs.lock().push(row.clone());
+        async fn create(&self, job: &CronJob) -> Result<()> {
+            self.jobs.lock().push(job.clone());
             Ok(())
         }
 
-        async fn get(&self, job_id: &str) -> aura_storage::cron::Result<Option<CronJobRow>> {
-            Ok(self.jobs.lock().iter().find(|r| r.id == job_id).cloned())
+        async fn get(&self, job_id: &str) -> Result<Option<CronJob>> {
+            Ok(self.jobs.lock().iter().find(|j| j.id == job_id).cloned())
         }
 
-        async fn save(&self, row: &CronJobRow) -> aura_storage::cron::Result<()> {
+        async fn save(&self, job: &CronJob) -> Result<()> {
             let mut jobs = self.jobs.lock();
-            if let Some(existing) = jobs.iter_mut().find(|r| r.id == row.id) {
-                *existing = row.clone();
+            if let Some(existing) = jobs.iter_mut().find(|j| j.id == job.id) {
+                *existing = job.clone();
                 Ok(())
             } else {
-                Err(CronStoreError::NotFound(row.id.clone()))
+                Err(CronError::NotFound(job.id.clone()))
             }
         }
 
-        async fn delete(&self, job_id: &str) -> aura_storage::cron::Result<()> {
+        async fn delete(&self, job_id: &str) -> Result<()> {
             let mut jobs = self.jobs.lock();
             let len_before = jobs.len();
-            jobs.retain(|r| r.id != job_id);
+            jobs.retain(|j| j.id != job_id);
             if jobs.len() == len_before {
-                Err(CronStoreError::NotFound(job_id.to_string()))
+                Err(CronError::NotFound(job_id.to_string()))
             } else {
                 Ok(())
             }
         }
 
-        async fn list_by_user(&self, user_id: &str) -> aura_storage::cron::Result<Vec<CronJobRow>> {
+        async fn list_by_user(&self, user_id: &str) -> Result<Vec<CronJob>> {
             Ok(self
                 .jobs
                 .lock()
                 .iter()
-                .filter(|r| r.user_id == user_id)
+                .filter(|j| j.user_id == user_id)
                 .cloned()
                 .collect())
         }
 
-        async fn list_all(&self) -> aura_storage::cron::Result<Vec<CronJobRow>> {
-            Ok(self.jobs.lock().to_vec())
+        async fn list_all(&self) -> Result<Vec<CronJob>> {
+            Ok(self.jobs.lock().clone())
         }
 
-        async fn list_enabled(&self) -> aura_storage::cron::Result<Vec<CronJobRow>> {
+        async fn list_enabled(&self) -> Result<Vec<CronJob>> {
             Ok(self
                 .jobs
                 .lock()
                 .iter()
-                .filter(|r| r.status == "enabled")
+                .filter(|j| j.status == CronStatus::Enabled)
                 .cloned()
                 .collect())
         }
 
-        async fn list_due(&self, now_us: i64) -> aura_storage::cron::Result<Vec<CronJobRow>> {
+        async fn list_due(&self, now_us: i64) -> Result<Vec<CronJob>> {
             Ok(self
                 .jobs
                 .lock()
                 .iter()
-                .filter(|r| {
-                    r.status == "enabled" && r.next_trigger_at != 0 && r.next_trigger_at <= now_us
+                .filter(|j| {
+                    j.status == CronStatus::Enabled
+                        && j.next_trigger_at.is_some_and(|t| t.timestamp_micros() <= now_us)
                 })
                 .cloned()
                 .collect())
         }
 
-        async fn record_execution(&self, row: &CronExecutionRow) -> aura_storage::cron::Result<()> {
-            self.executions.lock().push(row.clone());
+        async fn record_execution(&self, exec: &CronExecution) -> Result<()> {
+            self.executions.lock().push(exec.clone());
             Ok(())
         }
 
-        async fn list_executions_by_job(
-            &self,
-            job_id: &str,
-        ) -> aura_storage::cron::Result<Vec<CronExecutionRow>> {
+        async fn list_executions_by_job(&self, job_id: &str) -> Result<Vec<CronExecution>> {
             Ok(self
                 .executions
                 .lock()
                 .iter()
-                .filter(|r| r.job_id == job_id)
+                .filter(|e| e.job_id == job_id)
                 .cloned()
                 .collect())
         }
 
-        async fn list_executions_by_user(
-            &self,
-            user_id: &str,
-        ) -> aura_storage::cron::Result<Vec<CronExecutionRow>> {
+        async fn list_executions_by_user(&self, user_id: &str) -> Result<Vec<CronExecution>> {
             Ok(self
                 .executions
                 .lock()
                 .iter()
-                .filter(|r| r.user_id == user_id)
+                .filter(|e| e.user_id == user_id)
                 .cloned()
                 .collect())
         }
@@ -779,37 +638,35 @@ mod tests {
             &self,
             job_id: &str,
             scheduled_fire_time_us: i64,
-        ) -> aura_storage::cron::Result<bool> {
-            Ok(self
-                .executions
-                .lock()
-                .iter()
-                .any(|r| r.job_id == job_id && r.scheduled_fire_time == scheduled_fire_time_us))
+        ) -> Result<bool> {
+            Ok(self.executions.lock().iter().any(|e| {
+                e.job_id == job_id && e.scheduled_fire_time.timestamp_micros() == scheduled_fire_time_us
+            }))
         }
 
         async fn update_execution_status(
             &self,
             execution_id: &str,
-            status: &str,
-        ) -> aura_storage::cron::Result<()> {
+            status: ExecutionStatus,
+        ) -> Result<()> {
             let mut execs = self.executions.lock();
-            if let Some(exec) = execs.iter_mut().find(|r| r.id == execution_id) {
-                exec.status = status.to_string();
+            if let Some(exec) = execs.iter_mut().find(|e| e.id == execution_id) {
+                exec.status = status;
                 Ok(())
             } else {
-                Err(CronStoreError::NotFound(execution_id.to_string()))
+                Err(CronError::NotFound(execution_id.to_string()))
             }
         }
 
         async fn list_executions_by_status(
             &self,
-            status: &str,
-        ) -> aura_storage::cron::Result<Vec<CronExecutionRow>> {
+            status: ExecutionStatus,
+        ) -> Result<Vec<CronExecution>> {
             Ok(self
                 .executions
                 .lock()
                 .iter()
-                .filter(|r| r.status == status)
+                .filter(|e| e.status == status)
                 .cloned()
                 .collect())
         }
@@ -841,6 +698,14 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// Helper: rewrite a job's `next_trigger_at` to a past instant so the
+    /// next `tick()` treats it as due.
+    async fn backdate_next_trigger(scheduler: &CronScheduler, job_id: &str) {
+        let mut job = scheduler.store.get(job_id).await.unwrap().unwrap();
+        job.next_trigger_at = Some(Utc::now() - chrono::Duration::seconds(10));
+        scheduler.store.save(&job).await.unwrap();
     }
 
     #[tokio::test]
@@ -989,15 +854,11 @@ mod tests {
             .unwrap();
         scheduler.disable_job(&job.id).await.unwrap();
 
-        // Simulate passage of time past the fire point by rewriting the row.
-        let mut row = scheduler.store.get(&job.id).await.unwrap().unwrap();
-        let stored: CronJob = serde_json::from_str(&row.data).unwrap();
-        let expired = CronJob {
-            schedule: CronSchedule::at(Utc::now() - chrono::Duration::seconds(10)),
-            ..stored
-        };
-        row.data = serde_json::to_string(&expired).unwrap();
-        scheduler.store.save(&row).await.unwrap();
+        // Simulate passage of time past the fire point by rewriting the
+        // job's schedule to an `At` in the past.
+        let mut stored = scheduler.store.get(&job.id).await.unwrap().unwrap();
+        stored.schedule = CronSchedule::at(Utc::now() - chrono::Duration::seconds(10));
+        scheduler.store.save(&stored).await.unwrap();
 
         let err = scheduler.enable_job(&job.id).await.unwrap_err();
         assert!(matches!(err, CronError::InvalidSchedule(_)));
@@ -1009,14 +870,7 @@ mod tests {
         let (scheduler, mut rx) = make_scheduler(store);
 
         let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "every minute").await;
-
-        // Manually set next_trigger_at to the past so tick() considers it due.
-        {
-            let past = (Utc::now() - chrono::Duration::seconds(10)).timestamp_micros();
-            let mut row = scheduler.store.get(&job.id).await.unwrap().unwrap();
-            row.next_trigger_at = past;
-            scheduler.store.save(&row).await.unwrap();
-        }
+        backdate_next_trigger(&scheduler, &job.id).await;
 
         scheduler.tick().await;
 
@@ -1025,8 +879,7 @@ mod tests {
         assert_eq!(event.prompt, "every minute");
 
         // Verify next_trigger_at was advanced
-        let updated_row = scheduler.store.get(&job.id).await.unwrap().unwrap();
-        let updated = row_to_job(updated_row).unwrap();
+        let updated = scheduler.store.get(&job.id).await.unwrap().unwrap();
         assert!(updated.last_triggered_at.is_some());
         assert!(updated.next_trigger_at.unwrap() > Utc::now());
 
@@ -1043,14 +896,8 @@ mod tests {
         let (scheduler, mut rx) = make_scheduler(store);
 
         let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "test").await;
-
         scheduler.disable_job(&job.id).await.unwrap();
-        {
-            let past = (Utc::now() - chrono::Duration::seconds(10)).timestamp_micros();
-            let mut row = scheduler.store.get(&job.id).await.unwrap().unwrap();
-            row.next_trigger_at = past;
-            scheduler.store.save(&row).await.unwrap();
-        }
+        backdate_next_trigger(&scheduler, &job.id).await;
 
         scheduler.tick().await;
         assert!(rx.try_recv().is_err());
@@ -1084,14 +931,7 @@ mod tests {
             .unwrap();
         let job_id = job.id.clone();
 
-        // Set past due
-        {
-            let past = (Utc::now() - chrono::Duration::seconds(10)).timestamp_micros();
-            let mut row = scheduler.store.get(&job_id).await.unwrap().unwrap();
-            row.next_trigger_at = past;
-            scheduler.store.save(&row).await.unwrap();
-        }
-
+        backdate_next_trigger(&scheduler, &job_id).await;
         scheduler.tick().await;
 
         // Trigger was sent
@@ -1111,58 +951,24 @@ mod tests {
         assert!(execs[0].schedule.is_one_shot());
     }
 
-    #[test]
-    fn row_conversion_round_trip() {
-        let job = CronJob {
-            id: "cj-rt".to_string(),
-            user_id: "u1".to_string(),
-            channel: ChannelType::tui(),
-            schedule: CronSchedule::cron("0 9 * * *"),
-            prompt: "test".to_string(),
-            timezone: "UTC".to_string(),
-            status: CronStatus::Enabled,
-            last_triggered_at: None,
-            next_trigger_at: Some(Utc::now()),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            origin_session_id: None,
-        };
-        let row = job_to_row(&job).unwrap();
-        assert_eq!(row.status, "enabled");
-        assert_ne!(row.next_trigger_at, 0);
-
-        let restored = row_to_job(row).unwrap();
-        assert_eq!(restored.id, "cj-rt");
-        assert!(!restored.is_one_shot());
-    }
-
     #[tokio::test]
     async fn tick_idempotent_does_not_double_fire() {
         let store = InMemoryCronStore::new();
         let (scheduler, mut rx) = make_scheduler(store);
 
         let job = create_prompt_cron(&scheduler, "u1", "* * * * *", "dedup test").await;
-
-        let past = (Utc::now() - chrono::Duration::seconds(10)).timestamp_micros();
-        {
-            let mut row = scheduler.store.get(&job.id).await.unwrap().unwrap();
-            row.next_trigger_at = past;
-            scheduler.store.save(&row).await.unwrap();
-        }
+        backdate_next_trigger(&scheduler, &job.id).await;
 
         // First tick fires
         scheduler.tick().await;
         assert!(rx.try_recv().is_ok());
 
-        // Set next_trigger_at back to the same past value to simulate a
-        // re-trigger attempt for the same schedule slot.
+        // Rewind `next_trigger_at` to the same slot as the recorded execution
+        // to simulate a re-trigger attempt for an already-recorded slot.
         let execs = scheduler.list_executions(&job.id).await.unwrap();
-        let sft = execs[0].scheduled_fire_time.timestamp_micros();
-        {
-            let mut row = scheduler.store.get(&job.id).await.unwrap().unwrap();
-            row.next_trigger_at = sft;
-            scheduler.store.save(&row).await.unwrap();
-        }
+        let mut job = scheduler.store.get(&job.id).await.unwrap().unwrap();
+        job.next_trigger_at = Some(execs[0].scheduled_fire_time);
+        scheduler.store.save(&job).await.unwrap();
 
         // Second tick for the same slot is a no-op (dedup)
         scheduler.tick().await;
@@ -1190,8 +996,7 @@ mod tests {
             status: ExecutionStatus::Pending,
             origin_session_id: None,
         };
-        let exec_row = execution_to_row(&exec).unwrap();
-        store.record_execution(&exec_row).await.unwrap();
+        store.record_execution(&exec).await.unwrap();
 
         let (scheduler, mut rx) = make_scheduler(store);
         scheduler.recover_pending().await;
@@ -1204,7 +1009,7 @@ mod tests {
         // Status updated to dispatched
         let execs = scheduler
             .store
-            .list_executions_by_status("dispatched")
+            .list_executions_by_status(ExecutionStatus::Dispatched)
             .await
             .unwrap();
         assert_eq!(execs.len(), 1);
@@ -1213,7 +1018,7 @@ mod tests {
         // No pending left
         let pending = scheduler
             .store
-            .list_executions_by_status("pending")
+            .list_executions_by_status(ExecutionStatus::Pending)
             .await
             .unwrap();
         assert!(pending.is_empty());
@@ -1327,28 +1132,5 @@ mod tests {
             event.origin_session_id.as_ref().map(|s| s.as_str()),
             Some("sess-creator"),
         );
-    }
-
-    #[tokio::test]
-    async fn execution_row_conversion_round_trip() {
-        let exec = CronExecution {
-            id: "ce-rt".to_string(),
-            job_id: "cj-1".to_string(),
-            user_id: "u1".to_string(),
-            channel: ChannelType::tui(),
-            schedule: CronSchedule::cron("0 9 * * *"),
-            prompt: "test".to_string(),
-            scheduled_fire_time: Utc::now(),
-            triggered_at: Utc::now(),
-            status: ExecutionStatus::Pending,
-            origin_session_id: None,
-        };
-        let row = execution_to_row(&exec).unwrap();
-        assert_eq!(row.status, "pending");
-        assert_ne!(row.scheduled_fire_time, 0);
-
-        let restored = row_to_execution(row).unwrap();
-        assert_eq!(restored.id, "ce-rt");
-        assert_eq!(restored.status, ExecutionStatus::Pending);
     }
 }

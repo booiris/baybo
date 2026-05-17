@@ -37,6 +37,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tokio-util = { workspace = true }
 regex = { workspace = true }
+chrono-tz = { workspace = true }
 futures = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

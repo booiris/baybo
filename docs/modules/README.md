@@ -47,7 +47,7 @@ Bottom-up along the dependency graph:
 
 ### Infrastructure and Assembly Layer
 
-- **storage** — Defines the remaining Store traits (`CronStore`, `SkillRiskStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`, `BlobStore`) and implements every store (including `SessionStore` / `SessionSummaryStore` / `JobStore` / `TraceStore` / `MemoryStore` / `CostStore` / `SecretStore` from their respective domain crates) via libsql (single backend). `CronStore` uses opaque row types (`CronJobRow`, `CronExecutionRow`) — no dependency on `cron` domain crate. `SkillRiskStore` defines its own `RiskVerdict` / `RiskLevel` types so `aura-skills` can stay LLM-free. `ChannelPairingStore` defines `ChannelPairingRow` / `PairingStatus` so `aura-pairing` can stay a business-logic crate.
+- **storage** — Defines the remaining Store traits (`SkillRiskStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`, `BlobStore`) and implements every store (including `SessionStore` / `SessionSummaryStore` / `JobStore` / `TraceStore` / `MemoryStore` / `CostStore` / `SecretStore` / `CronStore` from their respective domain crates) via libsql (single backend). `SkillRiskStore` defines its own `RiskVerdict` / `RiskLevel` types so `aura-skills` can stay LLM-free. `ChannelPairingStore` defines `ChannelPairingRow` / `PairingStatus` so `aura-pairing` can stay a business-logic crate.
 - **code-builder** — `aura-code-builder`. LLM-driven Python script execution: builds a workspace-bound `SandboxSpec` (`FilesystemPolicy::Workspace`), runs scripts under per-call `<work>/.code-builder/<uuid>/` scratch dirs, and routes through the sandbox runner.
 - **janitor** — `aura-janitor`. Background maintenance tasks (storage compaction, log rotation, scratch-dir cleanup) that run on a cadence outside the agent loop.
 - **[pairing](pairing.md)** — Per-user pairing gate for sidecar-routed inbound messages. `PairingService` checks the `(channel_type, bot_id, user_id)` triple, mints 6-char codes for unknown senders, and refuses with a `Frame::Notice` until `aura pair approve <code>` flips the row to `approved`. Store trait + row lives in `storage`; `aura-pairing` is the service + code generator.
@@ -80,7 +80,7 @@ model (owns Session/User/ChannelType/SessionState + memory/message types; no int
   └── workspace (no internal deps)
   └── config (no internal deps; external only)
 
-storage   ──► model, session, trace, security, job, memory, cost (implements traits owned by each domain crate; sole backend: libsql)
+storage   ──► model, session, trace, security, job, memory, cost, cron (implements traits owned by each domain crate; sole backend: libsql)
 context   ──► model, llm, skills, session (owns ContextManager; pure in-memory; persistence routed via SessionStore)
 session   ──► model (owns SessionStore + SessionSummaryStore traits + SessionManager; storage depends on session)
 pairing   ──► model, storage (owns PairingService + code generator; consumes ChannelPairingStore from storage)

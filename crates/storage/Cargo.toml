@@ -19,6 +19,7 @@ aura-trace = { workspace = true }
 aura-job = { workspace = true }
 aura-memory = { workspace = true }
 aura-cost = { workspace = true }
+aura-cron = { workspace = true }
 aura-security = { workspace = true }
 aura-session = { workspace = true }
 

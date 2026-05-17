@@ -13,6 +13,7 @@
 //! infrastructure that doesn't belong to either half.
 
 pub mod actor;
+pub mod cron_tools;
 pub mod runtime;
 pub mod security;
 pub mod service;
