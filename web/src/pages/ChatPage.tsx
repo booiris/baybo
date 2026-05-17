@@ -123,6 +123,14 @@ interface SessionView {
    *  the session's first message and there's nothing left to page
    *  back to. */
   hasMore: boolean;
+  /** True between `handleSend` and the assistant's first response
+   *  (delta or message). Drives the left-aligned typing indicator
+   *  bubble so the user gets immediate visual feedback that the agent
+   *  is working, instead of staring at a frozen transcript. Cleared
+   *  on first `Frame::Delta` (the streaming bubble itself takes over
+   *  as the activity signal) or on a non-streaming assistant
+   *  `Frame::Message`, and on Reset / session switch. */
+  awaitingReply: boolean;
 }
 
 const EMPTY_VIEW: SessionView = {
@@ -133,6 +141,7 @@ const EMPTY_VIEW: SessionView = {
   olderLoading: false,
   oldestOrdinal: null,
   hasMore: false,
+  awaitingReply: false,
 };
 
 /** Soft cap on `views` map size. Past this, the oldest non-active
@@ -598,7 +607,7 @@ export function ChatPage() {
     } else {
       setHasNewBelow(true);
     }
-  }, [currentView.transcript, currentView.pendingApproval]);
+  }, [currentView.transcript, currentView.pendingApproval, currentView.awaitingReply]);
 
   // Reset pin state when switching sessions — a fresh view should jump
   // to its tail, not inherit the previous view's scroll posture. Also
@@ -773,6 +782,7 @@ export function ChatPage() {
                 createdAt: new Date().toISOString(),
               },
             ],
+            awaitingReply: true,
           },
         };
       });
@@ -782,6 +792,12 @@ export function ChatPage() {
       // here keeps the sidebar in lockstep with the bubble the user
       // just dropped.
       setSessions((prev) => applySessionUserText(prev, sessionId, trimmed));
+      // The user just hit send — anchor them to the tail regardless of
+      // where they had scrolled to, so the optimistic row + incoming
+      // reply land in view. The transcript-change effect above reads
+      // this ref and jumps to scrollHeight on the next layout pass.
+      pinnedToBottomRef.current = true;
+      setHasNewBelow(false);
       wsRef.current.sendMessage({
         sessionId,
         userId: 'web-operator',
@@ -1001,6 +1017,7 @@ export function ChatPage() {
               {currentView.transcript.map((row) => (
                 <MessageBubble key={row.key} row={row} />
               ))}
+              {currentView.awaitingReply ? <TypingIndicator /> : null}
               {currentView.pendingApproval ? (
                 <ApprovalCard
                   approval={currentView.pendingApproval}
@@ -1122,7 +1139,11 @@ function routeInboundFrame(
         const view = prev[sid] ?? EMPTY_VIEW;
         return {
           ...prev,
-          [sid]: { ...view, transcript: appendStreamingDelta(view.transcript, frame.text) },
+          [sid]: {
+            ...view,
+            transcript: appendStreamingDelta(view.transcript, frame.text),
+            awaitingReply: false,
+          },
         };
       });
       return;
@@ -1130,6 +1151,19 @@ function routeInboundFrame(
     case 'message': {
       const sid = frame.session_id;
       const role: 'user' | 'assistant' = frame.role === 'user' ? 'user' : 'assistant';
+      // Any assistant message — replay or live, with or without prior
+      // streaming deltas — ends the "awaiting reply" window. React
+      // batches this with the transcript update below, so it's a single
+      // commit. Done as its own setViews rather than threading the flag
+      // through every replay-merge branch so the various return paths
+      // below don't all have to remember to carry it.
+      if (role === 'assistant') {
+        setViews((prev) => {
+          const view = prev[sid];
+          if (!view || !view.awaitingReply) return prev;
+          return { ...prev, [sid]: { ...view, awaitingReply: false } };
+        });
+      }
       // Catch-up replay (ordinal set): key by ordinal so React
       // reconciles against rows the REST history fetch already laid
       // down with the same shape, and a duplicate replay is a no-op.
@@ -1357,6 +1391,11 @@ function routeInboundFrame(
               accesses: frame.accesses,
               receivedAt,
             },
+            // Agent has stopped to ask the user something — it's no
+            // longer composing. The approval card is the activity
+            // signal now; suppress the typing dots so the two don't
+            // stack and contradict each other.
+            awaitingReply: false,
           },
         };
       });
@@ -1815,6 +1854,38 @@ function MessageBubble({ row }: { row: TranscriptRow }) {
           {formatTimestampShort(row.createdAt)}
         </span>
       ) : null}
+    </div>
+  );
+}
+
+// Three brand-colored dots inside an assistant-style bubble, bouncing
+// in sequence. Rendered while `SessionView.awaitingReply` is true —
+// i.e. the user has sent a turn and the agent's first delta hasn't
+// arrived yet. The bubble is intentionally left-aligned and shaped
+// like a real assistant message so the eye reads it as "the assistant
+// is composing here". Staggered `animationDelay` produces the
+// canonical typing-dot cascade.
+function TypingIndicator() {
+  return (
+    <div className="group flex flex-col items-start">
+      <div
+        className="border-2 border-black rounded-md bg-white px-3 py-2.5 shadow-brutal-sm flex items-end gap-1"
+        aria-label="Assistant is composing a reply"
+        role="status"
+      >
+        <span
+          className="block w-1.5 h-1.5 rounded-full bg-brand animate-bounce"
+          style={{ animationDelay: '0ms' }}
+        />
+        <span
+          className="block w-1.5 h-1.5 rounded-full bg-brand animate-bounce"
+          style={{ animationDelay: '150ms' }}
+        />
+        <span
+          className="block w-1.5 h-1.5 rounded-full bg-brand animate-bounce"
+          style={{ animationDelay: '300ms' }}
+        />
+      </div>
     </div>
   );
 }
