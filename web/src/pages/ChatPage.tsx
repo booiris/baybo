@@ -938,7 +938,7 @@ export function ChatPage() {
           ) : currentView.transcript.length === 0 && !currentView.pendingApproval ? (
             <WelcomeEmpty slashCommands={slashCommands} onPick={handleComposerChange} />
           ) : (
-            <div className="max-w-3xl mx-auto flex flex-col gap-3">
+            <div className="max-w-5xl mx-auto flex flex-col gap-3">
               {currentView.olderLoading ? (
                 <div className="flex justify-center py-2 text-ink-soft">
                   <RiLoader4Line className="text-xl animate-spin" />
@@ -967,7 +967,7 @@ export function ChatPage() {
           <button
             type="button"
             onClick={jumpToLatest}
-            className="absolute bottom-[96px] left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-3 py-1.5 bg-white border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:bg-gray-100 cursor-pointer"
+            className="absolute bottom-[calc(20vh+12px)] left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-3 py-1.5 bg-white border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:bg-gray-100 cursor-pointer"
             title="Jump to latest"
           >
             <RiArrowDownLine className="text-base" />
@@ -977,26 +977,30 @@ export function ChatPage() {
 
         <form
           onSubmit={handleSend}
-          className="border-t-2 border-black bg-white px-4 py-3 flex flex-col gap-2 max-w-3xl mx-auto w-full"
+          className="border-t-2 border-black bg-canvas px-4 pt-3 pb-6 mb-[calc(18vh-131px)] max-w-3xl mx-auto w-full"
         >
-          {filteredSlash.length > 0 ? (
-            <div className="border-2 border-black bg-canvas rounded-md p-2 flex flex-col gap-1">
-              {filteredSlash.map((s) => (
-                <button
-                  key={s.command}
-                  type="button"
-                  onClick={() => {
-                    handleComposerChange(`/${s.command} `);
-                  }}
-                  className="text-left px-2 py-1 hover:bg-gray-100 rounded font-mono text-sm flex items-center gap-2 cursor-pointer"
-                >
-                  <span className="font-bold">/{s.command}</span>
-                  <span className="text-ink-soft">{s.description}</span>
-                </button>
-              ))}
-            </div>
-          ) : null}
-          <div className="flex gap-2 items-end">
+          <div className="relative border-2 border-black rounded-md bg-white shadow-brutal-sm focus-within:shadow-brutal transition-shadow">
+            {filteredSlash.length > 0 ? (
+              <div className="border-b-2 border-black bg-canvas px-2 py-2 flex flex-col gap-0.5 rounded-t-[4px]">
+                <div className="px-2 pb-1 text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
+                  Slash commands
+                </div>
+                {filteredSlash.map((s) => (
+                  <button
+                    key={s.command}
+                    type="button"
+                    onClick={() => {
+                      handleComposerChange(`/${s.command} `);
+                    }}
+                    className="text-left px-2 py-1.5 border-2 border-transparent hover:border-black hover:bg-white rounded font-mono text-sm flex items-center gap-2 cursor-pointer"
+                  >
+                    <span className="font-bold shrink-0">/{s.command}</span>
+                    <span className="text-ink-soft truncate">{s.description}</span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+
             <textarea
               ref={composerRef}
               value={composer}
@@ -1004,21 +1008,38 @@ export function ChatPage() {
               onKeyDown={handleComposerKey}
               placeholder={
                 status.state === 'connected'
-                  ? 'Type a message. / for commands, Shift+Enter for newline.'
-                  : 'Type a message — will send once the connection is ready.'
+                  ? 'Message Aura…'
+                  : 'Waiting for connection…'
               }
               rows={1}
-              className="flex-1 border-2 border-black rounded-md px-3 py-2 font-mono text-sm resize-none focus:outline-none focus:ring-0 leading-relaxed"
+              className="w-full px-3.5 py-3 font-mono text-sm bg-transparent resize-none focus:outline-none leading-relaxed placeholder:text-ink-soft/70"
             />
-            <button
-              type="submit"
-              disabled={!sessionId || composer.trim().length === 0 || status.state !== 'connected'}
-              className="px-4 py-2 bg-brand text-white border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-sm hover:bg-brand-hover active:translate-x-[2px] active:translate-y-[2px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer flex items-center gap-1.5"
-              title="Send (Enter)"
-            >
-              <RiSendPlane2Line className="text-base" />
-              Send
-            </button>
+
+            <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 border-t-2 border-black bg-canvas rounded-b-[4px]">
+              <span className="hidden md:flex items-center gap-1 text-[0.6rem] font-mono text-ink-soft/80 min-w-0 flex-1">
+                <kbd className="px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
+                  Enter
+                </kbd>
+                send
+                <kbd className="ml-1 px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
+                  ⇧Enter
+                </kbd>
+                newline
+                <kbd className="ml-1 px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
+                  /
+                </kbd>
+                commands
+              </span>
+              <button
+                type="submit"
+                disabled={!sessionId || composer.trim().length === 0 || status.state !== 'connected'}
+                className="shrink-0 px-3 py-1.5 bg-brand text-white border-2 border-black rounded-md shadow-brutal-xs font-bold uppercase tracking-wider text-[0.7rem] hover:bg-brand-hover active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer flex items-center gap-1.5"
+                title="Send (Enter)"
+              >
+                <RiSendPlane2Line className="text-sm" />
+                Send
+              </button>
+            </div>
           </div>
         </form>
       </main>
@@ -1657,7 +1678,7 @@ function WelcomeEmpty({
   onPick: (value: string) => void;
 }) {
   return (
-    <div className="max-w-2xl mx-auto pt-12 pb-6 flex flex-col gap-4">
+    <div className="max-w-3xl mx-auto pt-12 pb-6 flex flex-col gap-4">
       <div className="border-2 border-black bg-white rounded-md shadow-brutal-sm p-4 flex flex-col gap-2">
         <span className="text-2xl font-bold uppercase -tracking-[0.04em]">Start chatting</span>
         <p className="text-sm font-mono text-ink-soft">
