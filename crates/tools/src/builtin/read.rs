@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use super::paths::require_absolute;
 use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
-const DEFAULT_LIMIT: usize = 200;
+const DEFAULT_LIMIT: usize = 800;
 const MAX_LIMIT: usize = 50_00;
 const MAX_LINE_BYTES: usize = 2000;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
