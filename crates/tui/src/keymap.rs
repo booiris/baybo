@@ -22,8 +22,8 @@ pub(crate) enum Action {
     Submit,
     HistoryPrev,
     HistoryNext,
-    ScrollPageUp,
-    ScrollPageDown,
+    /// Wipe the visible terminal screen + scrollback and re-print the banner.
+    /// Bound to Ctrl-L.
     ClearScrollback,
     /// Clear input if non-empty; otherwise request shutdown.
     Cancel,
@@ -43,9 +43,6 @@ pub(crate) enum Action {
     CompletionPrev,
     /// Accept the highlighted slash-completion candidate.
     CompletionAccept,
-    /// Toggle terminal mouse capture on/off. Turning it off restores
-    /// native drag-to-select across all terminals.
-    ToggleMouseCapture,
     /// Approve the head pending approval for this call only.
     ApprovalApprove,
     /// Approve the head pending approval and remember the resource for
@@ -94,12 +91,7 @@ pub(crate) fn translate(mode: &ViewMode, key: KeyEvent, ctx: KeyContext) -> Acti
     }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Global bindings first.
-    if alt && matches!(key.code, KeyCode::Char('m')) {
-        return Action::ToggleMouseCapture;
-    }
     match (key.code, ctrl) {
         (KeyCode::Char('c'), true) => {
             return if input_empty {
@@ -161,8 +153,6 @@ fn translate_chat(key: KeyEvent, completion_open: bool) -> Action {
         KeyCode::End => Action::MoveEnd,
         KeyCode::Up => Action::HistoryPrev,
         KeyCode::Down => Action::HistoryNext,
-        KeyCode::PageUp => Action::ScrollPageUp,
-        KeyCode::PageDown => Action::ScrollPageDown,
         KeyCode::Char(c)
             if !key
                 .modifiers
