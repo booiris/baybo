@@ -121,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cmd = cli.command.expect("non-command branches handled above");
 
-    let skill_registry = {
+    let skill_registry = if needs_skills(&cmd) {
         let reg = Arc::new(aura_skills::SkillRegistry::new());
         let builtins = reg.register_builtins();
         if builtins > 0 {
@@ -137,6 +137,8 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         reg
+    } else {
+        Arc::new(aura_skills::SkillRegistry::new())
     };
     let stores = aura_storage::Store::open(boot::storage_db_path(&config.workspace)).await?;
     // Argv-mode commands (`llm probe`, `doctor`, `status`, `channel add`,
@@ -252,6 +254,14 @@ async fn main() -> anyhow::Result<()> {
 /// passes `None` for the vault.
 fn needs_llm(cmd: &Commands) -> bool {
     matches!(cmd, Commands::Doctor | Commands::Status { .. })
+}
+
+/// Subcommands that read `ctx.skills`. Anything else gets an empty
+/// `SkillRegistry`, skipping the per-invocation built-in registration
+/// and on-disk SKILL.md scan that would otherwise fire for every
+/// `aura config get`, `aura cost show`, etc.
+fn needs_skills(cmd: &Commands) -> bool {
+    matches!(cmd, Commands::Skills { .. } | Commands::Status { .. })
 }
 
 /// Subcommands that read `ctx.session` / `ctx.job` / `ctx.trace` /

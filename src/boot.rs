@@ -176,25 +176,17 @@ impl aura_llm::BlobFetcher for BlobStoreFetcher {
     }
 }
 
-/// Load the 32-byte encryption key from file (hex-encoded) or env var (hex-encoded).
-/// `validate()` guarantees at least one source is configured.
+/// Load the 32-byte encryption key from `security.encryption_key_file`
+/// (hex-encoded). `validate()` guarantees the field is set and absolute;
+/// a missing or malformed file is a hard error — there is no dev-key
+/// fallback. `aura setup` mints the file on first run.
 pub fn load_encryption_key(cfg: &SecurityConfig) -> anyhow::Result<EncryptionKey> {
-    let hex = if let Some(path) = &cfg.encryption_key_file {
-        std::fs::read_to_string(Path::new(path))
-            .map_err(|e| anyhow::anyhow!("failed to read encryption_key_file {path}: {e}"))?
-            .trim()
-            .to_string()
-    } else if !cfg.encryption_key_env.is_empty() {
-        std::env::var(&cfg.encryption_key_env).map_err(|_| {
-            anyhow::anyhow!(
-                "encryption key env var '{}' not set",
-                cfg.encryption_key_env
-            )
-        })?
-    } else {
-        anyhow::bail!("no encryption key source configured");
-    };
-
+    let path = cfg
+        .encryption_key_file
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("security.encryption_key_file is not set"))?;
+    let hex = std::fs::read_to_string(Path::new(path))
+        .map_err(|e| anyhow::anyhow!("failed to read encryption_key_file {path}: {e}"))?;
     let bytes = hex::decode(hex.trim())
         .map_err(|e| anyhow::anyhow!("encryption key is not valid hex: {e}"))?;
     if bytes.len() != 32 {

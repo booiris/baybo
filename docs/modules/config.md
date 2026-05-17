@@ -62,7 +62,7 @@ Sections that must not accept typos (security-sensitive or governance-sensitive 
 Config does **not** store live secret values; it stores references:
 
 - `LlmEntry::api_key_env` is a reference to an env-var name (e.g., `"OPENAI_API_KEY"`), not raw key material. `llm.md` §Constraints prohibits inline keys. When absent, `aura_llm::credentials::resolve_api_key` falls back to the per-entry vault key (`llm.entry.<name>.api_key`) and then to provider-specific defaults (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `MINIMAX_API_KEY`).
-- `SecurityConfig::encryption_key_file` and `encryption_key_env` are filesystem and environment indirections; the key bytes are loaded at startup by `agent::security`.
+- `SecurityConfig::encryption_key_file` is the only encryption-key source: an absolute path to a hex-encoded 32-byte file (mode 0600). `aura setup` mints one at `<workspace>/.key/encryption.key`. A missing or unreadable file is a hard error at startup — there is no env-var alternative and no dev-key fallback.
 
 ### Section boundaries
 
@@ -151,7 +151,8 @@ Field-level checks catch syntax errors; cross-section checks catch policy incons
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
 | `default-llm` (when `llm` is non-empty) must reference an existing `llm[i].name`                                                                                                 | `llm`              |
 | Each `channels.*` with `enabled: false` is rejected (enablement-model self-consistency)                                                                                          | `channels`         |
-| `security.encryption_key_file` and `encryption_key_env` cannot both be unset                                                                                                     | `security`         |
+| `security.encryption_key_file` must be set and absolute (string path to a hex-encoded 32-byte file)                                                                              | `security`         |
+| `workspace.path`, `security.encryption_key_file`, `browser.chrome_path`, and `browser.profile_dir` must be absolute paths (no `./`, no `~`)                                      | `workspace` / `security` / `browser` |
 
 The MCP-specific trust/capability rules (stdio requires `trusted`, `installed`/`untrusted` may not declare `WriteFile`/`ExecCommand`) live with the MCP file in `aura-tools::mcp::config` since `.mcp.json` is owned there.
 

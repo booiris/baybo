@@ -1,8 +1,10 @@
 use std::collections::HashSet;
+use std::path::Path;
 
 use aura_model::MicroUsd;
 
 use crate::AuraConfig;
+use crate::browser::BrowserConfig;
 use crate::channels::ChannelsConfig;
 use crate::cost::CostConfig;
 use crate::error::{ConfigError, ValidationError};
@@ -21,6 +23,7 @@ impl AuraConfig {
         validate_channels(&self.channels, &mut errors);
         validate_cost(&self.cost, &mut errors);
         validate_workspace(&self.workspace, &mut errors);
+        validate_browser(&self.browser, &mut errors);
         validate_gateway(&self.gateway, &mut errors);
         validate_cross_section(self, &mut errors);
         if errors.is_empty() {
@@ -184,6 +187,21 @@ fn validate_cost(cost: &CostConfig, errors: &mut Vec<ValidationError>) {
 fn validate_workspace(workspace: &WorkspaceConfig, errors: &mut Vec<ValidationError>) {
     if workspace.path.trim().is_empty() {
         errors.push(ValidationError::new("workspace.path", "must be non-empty"));
+    } else {
+        require_absolute(&workspace.path, "workspace.path", errors);
+    }
+}
+
+fn validate_browser(browser: &BrowserConfig, errors: &mut Vec<ValidationError>) {
+    if let Some(p) = &browser.chrome_path
+        && let Some(s) = p.to_str()
+    {
+        require_absolute(s, "browser.chrome_path", errors);
+    }
+    if let Some(p) = &browser.profile_dir
+        && let Some(s) = p.to_str()
+    {
+        require_absolute(s, "browser.profile_dir", errors);
     }
 }
 
@@ -264,12 +282,28 @@ fn validate_encryption_key_source(
     security: &crate::security::SecurityConfig,
     errors: &mut Vec<ValidationError>,
 ) {
-    let file_set = security.encryption_key_file.is_some();
-    let env_set = !security.encryption_key_env.trim().is_empty();
-    if !file_set && !env_set {
+    match &security.encryption_key_file {
+        Some(file) => require_absolute(file, "security.encryption_key_file", errors),
+        None => errors.push(ValidationError::new(
+            "security.encryption_key_file",
+            "must be set (run `aura setup` to mint a key under <workspace>/.key/encryption.key)",
+        )),
+    }
+}
+
+/// Reject relative paths so the value resolves identically regardless
+/// of which cwd a subprocess inherits. Empty/whitespace-only is left
+/// for the per-field non-empty check (it would otherwise produce two
+/// confusing errors for the same field).
+fn require_absolute(value: &str, field: &str, errors: &mut Vec<ValidationError>) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !Path::new(trimmed).is_absolute() {
         errors.push(ValidationError::new(
-            "security.encryption_key",
-            "either encryption_key_file or encryption_key_env must be set",
+            field,
+            format!("must be an absolute path (got {trimmed:?})"),
         ));
     }
 }

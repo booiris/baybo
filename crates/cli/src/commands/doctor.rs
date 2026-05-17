@@ -31,23 +31,31 @@ pub async fn handle(ctx: &CommandContext) -> Result<CommandOutput> {
         }
     }
 
-    // 2. Dev encryption key fallback.
-    let allow_dev = std::env::var("AURA_ALLOW_DEV_ENCRYPTION_KEY")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    if allow_dev {
-        rows.push(row(
-            "security.encryption_key",
-            CheckStatus::Warn,
-            "AURA_ALLOW_DEV_ENCRYPTION_KEY=1 — secrets use a publicly-known dev key".into(),
-        ));
-        worst = worst.worse(CheckStatus::Warn);
-    } else {
-        rows.push(row(
-            "security.encryption_key",
-            CheckStatus::Ok,
-            "production encryption key in use".into(),
-        ));
+    // 2. Encryption key file is readable.
+    match &ctx.config.security.encryption_key_file {
+        Some(path) => match std::fs::metadata(path) {
+            Ok(_) => rows.push(row(
+                "security.encryption_key_file",
+                CheckStatus::Ok,
+                format!("readable at {path}"),
+            )),
+            Err(e) => {
+                rows.push(row(
+                    "security.encryption_key_file",
+                    CheckStatus::Error,
+                    format!("{path}: {e}"),
+                ));
+                worst = worst.worse(CheckStatus::Error);
+            }
+        },
+        None => {
+            rows.push(row(
+                "security.encryption_key_file",
+                CheckStatus::Error,
+                "not set in aura.json — run `aura setup` to mint a key".into(),
+            ));
+            worst = worst.worse(CheckStatus::Error);
+        }
     }
 
     // 3. LLM client wired up.

@@ -221,7 +221,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 - `cargo test -p aura-cli` — 14 parser tests + 11 dispatch smoke tests pass.
 - `aura --help` / `aura <family> --help` render; slash `/config file`, `/skills list`, `/channel list` return the same payloads as their argv twins.
 - `aura completion zsh > /tmp/_aura && zsh -c 'source /tmp/_aura'` loads without error.
-- `aura doctor` reports a warning when `AURA_ALLOW_DEV_ENCRYPTION_KEY=1` and an error when no LLM client is configured.
+- `aura doctor` reports an error when `security.encryption_key_file` is missing or unreadable, and when no LLM client is configured.
 
 **Phase 2b — write-mutating commands** — complete. Tracked in `docs/todo/archives/cli-write-commands.md` (archived; one subsystem-level follow-up — `cli-agent-send-argv.md` — carries the remaining deferred work). Each shipped family landed with the following:
 

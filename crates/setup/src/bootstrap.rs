@@ -51,11 +51,9 @@ pub async fn bootstrap_workspace_if_needed(workspace_root: PathBuf) -> Result<Se
         cfg
     };
 
-    // Existing config without an explicit key source: pin to ours so the
+    // Existing config without an explicit key file: pin to ours so the
     // gateway picks it up. Never overwrite an explicit operator choice.
-    if config.security.encryption_key_file.is_none()
-        && std::env::var(&config.security.encryption_key_env).is_err()
-    {
+    if config.security.encryption_key_file.is_none() {
         config.security.encryption_key_file = Some(key_file.display().to_string());
     }
 

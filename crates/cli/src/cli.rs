@@ -42,10 +42,6 @@ pub struct GlobalArgs {
     /// Disable ANSI color in human output.
     #[arg(long, global = true)]
     pub no_color: bool,
-
-    /// Increase log verbosity. Repeat for trace-level logs.
-    #[arg(short, long, global = true, action = clap::ArgAction::Count, hide = true)]
-    pub verbose: u8,
 }
 
 /// Environment variable that, when set to any non-empty value, makes
@@ -847,14 +843,6 @@ mod tests {
                 );
             }
         }
-        let verbose = cmd
-            .get_arguments()
-            .find(|a| a.get_id().as_str() == "verbose")
-            .expect("--verbose arg present at top level");
-        assert!(
-            !verbose.is_hide_set(),
-            "--verbose should be unhidden after recursive flip"
-        );
     }
 
     /// Regression guard for the dev-only `--dev-auto-gateway` flag.

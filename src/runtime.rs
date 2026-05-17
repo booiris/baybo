@@ -41,7 +41,7 @@ use aura_llm::GuardedLlm;
 use aura_memory::MemoryManager;
 use aura_trace::{SpanRecorder, TraceEventStream};
 use aura_model::SystemSpawnRequest;
-use aura_security::{EncryptionKey, LeakDetectionRule, LeakDetector};
+use aura_security::{LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
 use aura_storage::Store;
@@ -92,37 +92,6 @@ pub fn build_leak_detector(
     Arc::new(detector)
 }
 
-/// Load the master encryption key, falling back to a well-known dev
-/// key when `AURA_ALLOW_DEV_ENCRYPTION_KEY=1`. The full manager graph
-/// and the gateway's vault-only subcommands (`enable`, `token show`,
-/// `token rotate`) both need this exact policy — keeping the dev-key
-/// gate in one place prevents them from drifting.
-pub fn load_master_key(security: &aura_config::SecurityConfig) -> anyhow::Result<EncryptionKey> {
-    match boot::load_encryption_key(security) {
-        Ok(k) => Ok(k),
-        Err(e) => {
-            let allow_dev = std::env::var("AURA_ALLOW_DEV_ENCRYPTION_KEY")
-                .ok()
-                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-            if !allow_dev {
-                return Err(anyhow::anyhow!(
-                    "failed to load encryption key: {e}. To run with an insecure dev-only key, \
-                     set AURA_ALLOW_DEV_ENCRYPTION_KEY=1 (NOT for production — secrets would be \
-                     encrypted with a publicly-known key)"
-                ));
-            }
-            error!(
-                error = %e,
-                "AURA_ALLOW_DEV_ENCRYPTION_KEY=1 — running with dev-only encryption key; \
-                 secrets are NOT confidential, DO NOT use in production"
-            );
-            Ok(EncryptionKey::new(
-                b"aura-dev-master-key-32-bytes-ok!".to_vec(),
-            )?)
-        }
-    }
-}
-
 /// Open the project's libsql store just far enough to build a
 /// [`SecretVault`]. Used by the gateway's vault-only subcommands so
 /// they don't have to pay the cost of a full [`build_managers`] call
@@ -130,7 +99,7 @@ pub fn load_master_key(security: &aura_config::SecurityConfig) -> anyhow::Result
 /// rotate a token.
 pub async fn build_secret_vault(config: &AuraConfig) -> anyhow::Result<Arc<SecretVault>> {
     let storage = Store::open(boot::storage_db_path(&config.workspace)).await?;
-    let master_key = load_master_key(&config.security)?;
+    let master_key = boot::load_encryption_key(&config.security)?;
     Ok(Arc::new(SecretVault::new(master_key, storage.secret)))
 }
 
@@ -144,7 +113,7 @@ pub async fn build_bot_registry_deps(
     config: &AuraConfig,
 ) -> anyhow::Result<(Arc<SecretVault>, Store)> {
     let storage = Store::open(boot::storage_db_path(&config.workspace)).await?;
-    let master_key = load_master_key(&config.security)?;
+    let master_key = boot::load_encryption_key(&config.security)?;
     let vault = Arc::new(SecretVault::new(master_key, storage.secret.clone()));
     Ok((vault, storage))
 }
@@ -279,10 +248,10 @@ pub async fn build_managers(
     // type system, not by an `Arc::get_mut().expect()` runtime check.
     // Vault is constructed up here (before `build_llm_client`) so the
     // openai-subscription provider can read its OAuth bundle straight away.
-    // Other providers ignore the vault. Comment from the original site:
-    // can't route through `build_secret_vault` (it would re-open libsql);
-    // share the master-key policy via `load_master_key`.
-    let master_key = load_master_key(&config.security)?;
+    // Other providers ignore the vault. Can't route through
+    // `build_secret_vault` here — it would re-open libsql; load the key
+    // directly and share `stores.secret` across both call sites.
+    let master_key = boot::load_encryption_key(&config.security)?;
     let secret_vault = Arc::new(SecretVault::new(master_key, stores.secret.clone()));
 
     // CostManager built before the LLM client so its gate closure is

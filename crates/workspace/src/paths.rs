@@ -226,16 +226,27 @@ pub fn absolutise(p: &Path) -> PathBuf {
     cleaned
 }
 
-/// Default workspace root: `~/.aura` in release, `./.aura` in debug. The
-/// debug default keeps `cargo run` self-contained inside the project
-/// checkout rather than polluting the real user home.
+/// Default workspace root: `~/.aura` in release, `<cwd>/.aura` in
+/// debug. The debug default keeps `cargo run` self-contained inside
+/// the project checkout rather than polluting the real user home;
+/// resolving against `current_dir` at call time keeps the result
+/// absolute so the path stays valid no matter which cwd a later
+/// subprocess inherits (see also [`AuraConfig::validate`], which
+/// rejects relative `workspace.path`).
+///
+/// Falls back to `/.aura` in the (unreachable in practice) case
+/// where neither `current_dir()` nor `home_dir()` resolves — an
+/// absolute literal is still better than a relative one that
+/// validation would refuse.
 pub fn default_workspace_root() -> PathBuf {
-    if cfg!(debug_assertions) {
-        return PathBuf::from("./.aura");
+    if cfg!(debug_assertions)
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        return cwd.join(".aura");
     }
     match std::env::home_dir() {
         Some(home) => home.join(".aura"),
-        None => PathBuf::from("./.aura"),
+        None => PathBuf::from("/.aura"),
     }
 }
 

@@ -12,7 +12,7 @@ It is **not** a reusable library. Alternative entry points (e.g. integration tes
 |------|------|
 | `src/main.rs` | Argv-mode dispatch. Parses the CLI, promotes `--config` into `AURA_CONFIG_PATH`, then either short-circuits to a subcommand entry (`gateway_cmd::run`, `setup_cmd::run`, `tui_cmd::run`) or builds a lightweight `CommandContext` and runs `aura_cli::dispatch::run`. |
 | `src/boot.rs` | Config → domain translation layer. Pure mappings and small loaders, unit-tested. No `Arc`, no channels, no actor spawning. |
-| `src/runtime.rs` | Shared chat-loop assembly: `build_managers`, `wire_router`, `install_signal_handler`, `build_secret_vault`, `load_master_key` (with the `AURA_ALLOW_DEV_ENCRYPTION_KEY` fallback), `force_exit_watchdog`. Used by both the gateway boot path and the TUI's auto-spawn helper. |
+| `src/runtime.rs` | Shared chat-loop assembly: `build_managers`, `wire_router`, `install_signal_handler`, `build_secret_vault`, `force_exit_watchdog`. Used by both the gateway boot path and the TUI's auto-spawn helper. Vault construction goes through `boot::load_encryption_key` directly. |
 | `src/gateway_cmd.rs` | Long-running entry point for `aura gateway start` and the supporting installer / token / status subcommands. |
 | `src/setup_cmd.rs` | First-run wizard (`aura setup`). |
 | `src/tui_cmd.rs` | Interactive `aura tui` entry point: connects to a running gateway over the channel WS. |
@@ -40,11 +40,11 @@ Each has a unit test in `boot::tests` that pins the mapping. These act as drift 
 
 | Function | Source | Notes |
 |----------|--------|-------|
-| `load_config` | `AURA_CONFIG_PATH` → `<default_workspace_root>/config/aura.json` → `Default` | Explicit path that doesn't exist is a hard error; implicit fallback is silent. `default_workspace_root()` is `~/.aura` in release / `./.aura` in debug. |
+| `load_config` | `AURA_CONFIG_PATH` → `<default_workspace_root>/config/aura.json` → `Default` | Explicit path that doesn't exist is a hard error; implicit fallback is silent. `default_workspace_root()` is `~/.aura` in release / `<cwd>/.aura` in debug — always absolute, since `AuraConfig::validate` rejects relative `workspace.path`. |
 | `resolve_config_path` | Same precedence as `load_config`, returning the path that was used (or `None` for a pure-default boot). | Used by mutation endpoints that need to write `aura.json` back. |
 | `build_llm_client` | `default-llm` entry of `AuraConfig`, plus `LlmProviderRegistry`, optional `BlobStore`, optional `SecretVault`, and an `LlmCallGuard` | Delegates credential resolution to `aura_llm::credentials::resolve_api_key`. Returns an `Arc<GuardedLlm>` so every consumer shares the same budget gate. |
 | `build_llm_client_for_entry` | Same wiring pinned to a specific non-default `LlmEntry`. | Used by `aura llm probe` / live-model listing. |
-| `load_encryption_key` | `security.encryption_key_file` (hex) or `security.encryption_key_env` (hex) | Rejects non-hex input and any length ≠ 32 bytes. The dev fallback (`AURA_ALLOW_DEV_ENCRYPTION_KEY=1`) is **not** in `boot` — it lives in `runtime::load_master_key`, which wraps `boot::load_encryption_key`. |
+| `load_encryption_key` | `security.encryption_key_file` (hex, required) | Rejects non-hex input and any length ≠ 32 bytes. No dev-key fallback — a missing or unreadable file aborts startup rather than silently encrypting secrets with a publicly-known constant. |
 
 Loaders return `anyhow::Result` because they surface I/O and format errors that `ConfigError` deliberately does not model.
 
@@ -100,11 +100,11 @@ The actor-spawner closure passed to `Router::with_actor_spawner` captures clones
 | `AURA_CONFIG_PATH` set but file missing | `bail!` — startup aborts. |
 | `<default_workspace_root>/config/aura.json` missing with no env | `info!` + `AuraConfig::default()`. |
 | `load_from_file` parse/validate error | `bail!` with full `ConfigError::Validation` list. |
-| `runtime::load_master_key` failure | `bail!` unless `AURA_ALLOW_DEV_ENCRYPTION_KEY=1` is set. With the flag, `error!` + dev-only `b"aura-dev-master-key-32-bytes-ok!"` fallback. Must not ship to production. |
+| `boot::load_encryption_key` failure | `bail!` — a missing, unreadable, or malformed `security.encryption_key_file` aborts startup. No fallback: silently encrypting secrets with a constant would be worse than a clear error. |
 | `build_llm_client` failure on a chat-loop boot path | `bail!` — unrecoverable, there's no sensible default. Argv-mode commands that don't need the LLM (`channel add`, `config get`, …) downgrade the failure to a `warn!`. |
 | Any other `?` at boot | Propagates up, process exits non-zero. |
 
-The dev fallback for the encryption key is intentional but explicit: a fresh checkout runs with `AURA_ALLOW_DEV_ENCRYPTION_KEY=1 cargo run`. Without the flag, a missing or mistyped key source aborts startup rather than silently encrypting secrets with a publicly-known key. When the flag is honoured, an `error!` line fires on every boot so it cannot be mistaken for a working setup. The gate lives on `runtime::load_master_key` so every chat-loop boot path (gateway start, gateway vault-only subcommands, the TUI's auto-spawn helper) hits the same policy.
+Fresh checkouts get a usable key from `aura setup`, which mints `<workspace>/.key/encryption.key` (mode 0600) and writes the absolute path into `aura.json`. There is no env-var key, no dev-key fallback, and no other source — exactly one place for the bytes, exactly one place pointed at by the config.
 
 ## What boot does NOT do
 

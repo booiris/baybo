@@ -87,8 +87,24 @@ impl TracingGuards {
 /// `eprintln!` (they don't panic). All entrypoints in this binary are
 /// mutually exclusive, so the single-init invariant holds in practice.
 pub fn init_tracing(mode: TracingMode<'_>) -> TracingGuards {
+    // `aura-tools`'s BashTool exports `AURA_HELP_AGENT=1` around every
+    // CLI invocation, which is how we can tell the binary is being
+    // driven by the agent loop rather than a human at a TTY. In that
+    // case Stdout-mode tracing has to keep two promises: (a) stay
+    // quiet so routine boot events ("registered built-in skills")
+    // don't end up in the command's stdout buffer ahead of the actual
+    // payload, and (b) emit no ANSI escapes — BashTool captures
+    // stdout as JSON, and ESC bytes would become literal `[..]`
+    // text and break downstream parsers. `RUST_LOG` always wins if
+    // explicitly set.
+    let agent_mode = std::env::var_os(aura_cli::cli::ENV_HELP_AGENT).is_some_and(|v| !v.is_empty());
+    let default_filter = if agent_mode && matches!(mode, TracingMode::Stdout) {
+        "aura=warn"
+    } else {
+        "aura=info"
+    };
     let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("aura=info"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
     let json = std::env::var("AURA_LOG_FORMAT").unwrap_or_default() == "json";
     let log_buffer = LogBuffer::new(LOG_BUFFER_CAPACITY);
     let buffer_layer = LogBufferLayer::new(Arc::clone(&log_buffer));
@@ -96,6 +112,7 @@ pub fn init_tracing(mode: TracingMode<'_>) -> TracingGuards {
     match mode {
         TracingMode::Stdout => {
             let fmt_layer = fmt::layer()
+                .with_ansi(!agent_mode)
                 .with_timer(SecondPrecisionTimer)
                 .with_target(true)
                 .with_file(true)

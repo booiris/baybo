@@ -258,24 +258,40 @@ fn discord_channel_disabled_flag_is_rejected() {
 }
 
 #[test]
-fn encryption_key_requires_a_source() {
+fn encryption_key_file_is_required() {
     let mut c = AuraConfig::default();
     c.security.encryption_key_file = None;
-    c.security.encryption_key_env = String::new();
     let errors = unwrap_validation(c.validate().unwrap_err());
-    assert!(has_field(&errors, "security.encryption_key"));
+    assert!(has_field(&errors, "security.encryption_key_file"));
 
-    // a file path alone is sufficient
-    let mut c = AuraConfig::default();
     c.security.encryption_key_file = Some("/tmp/key".into());
-    c.security.encryption_key_env = String::new();
     assert!(c.validate().is_ok());
+}
 
-    // env var name alone is sufficient (this is also the default)
+#[test]
+fn workspace_path_rejects_relative_value() {
     let mut c = AuraConfig::default();
-    c.security.encryption_key_file = None;
-    c.security.encryption_key_env = "AURA_KEY".into();
-    assert!(c.validate().is_ok());
+    c.workspace.path = "./.aura".into();
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "workspace.path"));
+}
+
+#[test]
+fn encryption_key_file_rejects_relative_value() {
+    let mut c = AuraConfig::default();
+    c.security.encryption_key_file = Some("relative/key".into());
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "security.encryption_key_file"));
+}
+
+#[test]
+fn browser_paths_reject_relative_values() {
+    let mut c = AuraConfig::default();
+    c.browser.chrome_path = Some("relative/chrome".into());
+    c.browser.profile_dir = Some("relative/profile".into());
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "browser.chrome_path"));
+    assert!(has_field(&errors, "browser.profile_dir"));
 }
 
 #[test]

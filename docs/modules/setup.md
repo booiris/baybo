@@ -74,9 +74,8 @@ Before showing any picker, `bootstrap_workspace_if_needed`:
    `<root>/config/aura.json`). Missing → write
    `AuraConfig::default()` with `security.encryption_key_file`
    pointing at the freshly-minted key. Existing → load and reuse;
-   only patch in the key file pointer if the existing config
-   neither set `encryption_key_file` nor a usable
-   `encryption_key_env`.
+   patch in the key file pointer only if the existing config
+   left `encryption_key_file` unset.
 4. Validates the in-memory config.
 5. Opens libsql at `<root>/state/storage.db` and builds the
    `SecretVault`.
