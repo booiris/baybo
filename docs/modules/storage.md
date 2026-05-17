@@ -17,7 +17,7 @@ Domain crates own their full persistence vertical (trait + manager + test-suppor
 
 ### Trait location follows domain ownership
 
-Each domain crate (`session`, `job`, `trace`, `memory`, `cost`, `security`) owns its own trait. `aura-storage` implements them. The remaining trait definitions — `CronStore`, `SkillRiskStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`, `BlobStore` — live in `aura-storage` because their consumer crates either don't exist (`channel_*`, `blob`) or deliberately keep persistence out of their dependency graph (`cron` / `skills-assessor` consume opaque row types).
+Each domain crate (`session`, `job`, `trace`, `memory`, `cost`, `security`, `cron`) owns its own trait. `aura-storage` implements them. The remaining trait definitions — `SkillRiskStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`, `BlobStore` — live in `aura-storage` because their consumer crates either don't exist (`channel_*`, `blob`) or deliberately keep persistence out of their dependency graph (`skills-assessor` consumes opaque row types).
 
 ```
 libsql/session.rs         → impl SessionStore + SessionSummaryStore   (traits from aura-session)
@@ -26,7 +26,7 @@ libsql/trace.rs           → impl TraceStore                           (trait f
 libsql/secret.rs          → impl SecretStore                          (trait from aura-security)
 libsql/job.rs             → impl JobStore                             (trait from aura-job)
 libsql/cost.rs            → impl CostStore                            (trait from aura-cost)
-libsql/cron.rs            → impl CronStore                            (trait + opaque row types here)
+libsql/cron.rs            → impl CronStore                            (trait from aura-cron; libsql adapter handles JSON serialization)
 libsql/skill_risk.rs      → impl SkillRiskStore                       (trait + RiskVerdict / RiskLevel here)
 libsql/channel_session.rs → impl ChannelSessionStore                  (trait here)
 libsql/channel_bot.rs     → impl ChannelBotStore                      (trait here)
