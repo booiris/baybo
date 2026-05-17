@@ -191,6 +191,19 @@ export function ChatPage() {
   const pinnedToBottomRef = useRef(true);
   const [hasNewBelow, setHasNewBelow] = useState(false);
   const wsRef = useRef<ChatWs | null>(null);
+  // react-router v7's `useNavigate` (non-data routes) returns a fresh
+  // function whenever the location pathname changes — its useCallback
+  // depends on `locationPathname`. Capturing `navigate` directly in any
+  // effect's dep array would re-run that effect on every URL change,
+  // which for the WS effect means tearing down the live socket on every
+  // session switch (the server revokes the channel-token on close, so
+  // the next reconnect hits a dead-token 401 → reconnect loop). The ref
+  // gives long-lived closures a stable handle to "whatever navigate is
+  // right now".
+  const navigateRef = useRef(navigate);
+  useEffect(() => {
+    navigateRef.current = navigate;
+  });
   // Holds the latest token-rejected handler so the ChatWs callback
   // (captured at construction) always calls the current closure.
   const onTokenRejectedRef = useRef<((reason: string) => void) | null>(null);
@@ -297,7 +310,7 @@ export function ChatPage() {
       // Land on a session: if the URL has none, redirect to the
       // anchor; if it points at an unknown id, also redirect.
       if (!sessionId || sessionId !== anchorId) {
-        navigate(`/chat/${anchorId}`, { replace: true });
+        navigateRef.current(`/chat/${anchorId}`, { replace: true });
       }
 
       async function createAnchorSession(): Promise<{ sessionId: string; token: string } | null> {
@@ -383,7 +396,7 @@ export function ChatPage() {
             // handleHideSession cleanup.
             releaseSessionView(frame.session_id);
             if (currentSessionIdRef.current === frame.session_id) {
-              navigate('/chat', { replace: true });
+              navigateRef.current('/chat', { replace: true });
             }
           }
           return;
@@ -453,7 +466,7 @@ export function ChatPage() {
       ws.close();
       wsRef.current = null;
     };
-  }, [baseUrl, channelToken, navigate, releaseSessionView]);
+  }, [baseUrl, channelToken, releaseSessionView]);
 
   // ── Active session: subscribe + lazy-load history ───────────────────
   // Subscribe stays sticky once added: when the user switches away,
@@ -812,13 +825,13 @@ export function ChatPage() {
             ? anchorSessionIdRef.current
             : null);
         if (fallback) {
-          navigate(`/chat/${fallback}`, { replace: true });
+          navigateRef.current(`/chat/${fallback}`, { replace: true });
         } else {
-          navigate('/chat', { replace: true });
+          navigateRef.current('/chat', { replace: true });
         }
       }
     },
-    [client, navigate, releaseSessionView, sessionId, sessions],
+    [client, releaseSessionView, sessionId, sessions],
   );
 
   const handleNewChat = useCallback(async () => {
@@ -845,12 +858,12 @@ export function ChatPage() {
                 ...prev,
               ],
         );
-        navigate(`/chat/${data.session_id}`);
+        navigateRef.current(`/chat/${data.session_id}`);
       }
     } finally {
       setCreating(false);
     }
-  }, [client, navigate]);
+  }, [client]);
 
   const filteredSlash = useMemo(() => {
     if (!showSlashHints) return [];
