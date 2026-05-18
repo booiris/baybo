@@ -114,8 +114,15 @@ impl Tool for SkillTool {
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
-        let p: SkillParams =
+        let mut p: SkillParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
+
+        // Strict-JSON-schema LLMs sometimes emit `""` instead of omitting
+        // the key. Without this filter, `file_path: ""` would reach
+        // `resolve_subpath` and hard-error, trapping the model in a retry
+        // loop instead of falling back to the main SKILL.md body.
+        p.file_path = p.file_path.filter(|s| !s.trim().is_empty());
+        p.args = p.args.filter(|s| !s.trim().is_empty());
 
         if let Some(args) = &p.args
             && args.len() > MAX_ARGS_BYTES
@@ -893,12 +900,50 @@ mod tests {
             risk_check: Arc::new(AlwaysPass),
         };
 
-        for bad in ["../etc/passwd", "/etc/passwd", "a/../../b", ""] {
+        for bad in ["../etc/passwd", "/etc/passwd", "a/../../b"] {
             let err = tool
                 .execute(json!({"skill": "demo", "file_path": bad}), &mk_ctx())
                 .await
                 .unwrap_err();
             assert!(matches!(err, ToolError::InvalidParams(_)), "{bad}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn blank_optional_fields_are_treated_as_unset() {
+        // Strict-JSON-schema LLMs (e.g. gpt-5.5) sometimes emit every
+        // property they have seen, including `"file_path": ""` and
+        // `"args": ""` instead of omitting the keys. Both must transparently
+        // fall back to "not provided" — otherwise file_path reaches
+        // resolve_subpath and traps the model in a retry loop.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("SKILL.md"), "# Body\n").unwrap();
+
+        let registry = Arc::new(SkillRegistry::new());
+        registry.register(mk_skill(root, "demo"));
+        let tool = SkillTool {
+            registry,
+            risk_check: Arc::new(AlwaysPass),
+        };
+
+        for blank in ["", "   ", "\t"] {
+            let out = tool
+                .execute(
+                    json!({"skill": "demo", "file_path": blank, "args": blank}),
+                    &mk_ctx(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("blank optionals {blank:?} should succeed: {e:?}"));
+            let v = match out {
+                ToolOutput::Json(v) => v,
+                other => panic!("expected json, got {other:?}"),
+            };
+            assert_eq!(v["content"], "# Body\n", "blank file_path {blank:?}");
+            assert!(
+                v.get("args").is_none(),
+                "blank args {blank:?} must not surface in output: {v}"
+            );
         }
     }
 
