@@ -172,6 +172,46 @@ pub struct ReplayedConversation {
     pub jobs: Vec<ReplayJob>,
 }
 
+/// Coarse "what started this session" label derived from
+/// `session.trigger` and `session.lineage` for the trace browser. Pure
+/// presentation — never persisted, never round-tripped.
+///
+/// Variants are exhaustive over the (trigger, lineage) combinations we
+/// surface today. Subagent overrides trigger because a subagent of a
+/// cron job is still conceptually "a subagent" for browsing purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    /// Root user-triggered session (chat or fork — both are
+    /// human-initiated).
+    User,
+    /// Root cron-triggered session.
+    Cron,
+    /// Background maintenance (currently only background-compression).
+    /// These are `is_normal_session = 0` rows; the listing reaches them
+    /// via `list_all_maintenance_sessions` and is opt-in via the kind
+    /// filter.
+    Compression,
+    /// Subagent spawned by another session — its trigger is inherited
+    /// from the root, but `lineage.kind == Subagent` wins for display.
+    Subagent,
+}
+
+fn derive_session_kind(session: &Session) -> SessionKind {
+    if let Some(Lineage {
+        kind: LineageKind::Subagent,
+        ..
+    }) = session.lineage.as_ref()
+    {
+        return SessionKind::Subagent;
+    }
+    match session.trigger {
+        aura_model::TriggerSource::Cron { .. } => SessionKind::Cron,
+        aura_model::TriggerSource::System { .. } => SessionKind::Compression,
+        aura_model::TriggerSource::User => SessionKind::User,
+    }
+}
+
 /// Filter for [`QueryApi::list_session_summaries`]. All fields are
 /// AND-combined; `None` means no constraint. `status_kind` matches
 /// against the *latest* job's `JobStatusKind` (not any historical job).
@@ -181,6 +221,11 @@ pub struct SessionSummaryFilter {
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
     pub session_id_prefix: Option<String>,
+    /// Coarse trigger/lineage label. `Compression` is opt-in: when set,
+    /// the listing pulls maintenance sessions (`is_normal_session = 0`)
+    /// that the default `list_all` excludes; otherwise maintenance rows
+    /// never appear.
+    pub kind: Option<SessionKind>,
 }
 
 /// Offset/limit pagination for [`QueryApi::list_session_summaries`].
@@ -202,6 +247,7 @@ pub struct SessionSummary {
     pub last_active: DateTime<Utc>,
     /// `None` when the session has no jobs (filtered out by default).
     pub latest_job_status: Option<JobStatus>,
+    pub kind: SessionKind,
     pub job_count: usize,
     pub span_count: usize,
     pub input_tokens: usize,
@@ -518,7 +564,23 @@ impl QueryApi {
         filter: SessionSummaryFilter,
         page: SessionSummaryPage,
     ) -> Result<SessionSummaryListing> {
-        let mut sessions = self.sessions.list_all().await?;
+        // Pull the candidate pool. `Compression` opts into maintenance
+        // sessions (`is_normal_session = 0`), which the default
+        // `list_all` deliberately excludes; every other kind reads
+        // user-facing rows only.
+        let mut sessions = if matches!(filter.kind, Some(SessionKind::Compression)) {
+            let ids = self.sessions.list_all_maintenance_sessions().await?;
+            let mut out = Vec::with_capacity(ids.len());
+            for id in &ids {
+                if let Some(session) = self.sessions.get(id).await? {
+                    out.push(session);
+                }
+            }
+            out.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+            out
+        } else {
+            self.sessions.list_all().await?
+        };
 
         // Cheap filters first so we don't pay per-session aggregate
         // costs for rows about to be dropped.
@@ -531,6 +593,9 @@ impl QueryApi {
         }
         if let Some(until) = filter.until {
             sessions.retain(|s| s.last_active < until);
+        }
+        if let Some(want_kind) = filter.kind {
+            sessions.retain(|s| derive_session_kind(s) == want_kind);
         }
 
         // Now compute aggregates + apply latest-status filter +
@@ -579,6 +644,7 @@ impl QueryApi {
                 created_at: session.created_at,
                 last_active: session.last_active,
                 latest_job_status: latest.map(|j| j.status.clone()),
+                kind: derive_session_kind(session),
                 job_count: jobs.len(),
                 span_count,
                 input_tokens,

@@ -2074,6 +2074,15 @@
             }
           },
           {
+            "name": "kind",
+            "in": "query",
+            "description": "Filter on coarse trigger/lineage label. `compression` opts into\nbackground-maintenance sessions that the default list hides.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SessionKind"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
             "required": false,
@@ -3287,6 +3296,16 @@
           }
         }
       },
+      "SessionKind": {
+        "type": "string",
+        "description": "Wire mirror of [`aura_query::SessionKind`]. Coarse trigger/lineage\nlabel for the trace browser list view.",
+        "enum": [
+          "user",
+          "cron",
+          "compression",
+          "subagent"
+        ]
+      },
       "SetConfigRequest": {
         "type": "object",
         "description": "`PUT /v1/config` body.",
@@ -3390,6 +3409,7 @@
           "session_id",
           "created_at",
           "last_active",
+          "kind",
           "job_count",
           "span_count",
           "input_tokens",
@@ -3417,6 +3437,9 @@
           "job_count": {
             "type": "integer",
             "minimum": 0
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SessionKind"
           },
           "last_active": {
             "type": "string",

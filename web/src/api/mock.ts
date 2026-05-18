@@ -87,18 +87,33 @@ function generateMockSummaries(count: number): TraceSessionSummary[] {
     'cancelled',
     'completed',
   ];
+  // Weighted to reflect typical traffic: user chats dominate, subagent
+  // spawns + cron are common, compression is a thin background tail.
+  const kinds: components['schemas']['SessionKind'][] = [
+    'user',
+    'user',
+    'user',
+    'user',
+    'cron',
+    'cron',
+    'subagent',
+    'subagent',
+    'compression',
+  ];
 
   for (let i = 0; i < count; i++) {
     const lastActive = new Date(now - i * 1000 * 60 * 15 - Math.random() * 10_000_000);
     const created = new Date(lastActive.getTime() - Math.random() * 1000 * 60 * 60);
-    const kind = statuses[Math.floor(Math.random() * statuses.length)];
+    const status = statuses[Math.floor(Math.random() * statuses.length)];
+    const kind = kinds[Math.floor(Math.random() * kinds.length)];
     out.push({
       session_id: `sess-${Math.random().toString(36).substring(2, 12)}-${Math.random()
         .toString(36)
         .substring(2, 8)}`,
       created_at: created.toISOString(),
       last_active: lastActive.toISOString(),
-      latest_job_status: makeJobStatus(kind),
+      latest_job_status: makeJobStatus(status),
+      kind,
       job_count: Math.floor(Math.random() * 4) + 1,
       span_count: Math.floor(Math.random() * 60) + 1,
       input_tokens: Math.floor(Math.random() * 80_000),

@@ -51,6 +51,7 @@ async fn list_traces(
         since: q.since,
         until: q.until,
         session_id_prefix: q.q.clone(),
+        kind: q.kind.map(Into::into),
     };
     let page = SessionSummaryPage {
         offset: q.offset.unwrap_or(0),
