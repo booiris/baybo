@@ -170,6 +170,33 @@ impl JobLifecycle {
         self.persist_and_publish(job, transition).await
     }
 
+    /// Boot-time recovery cancel. Same state-machine semantics as
+    /// [`Self::cancel`], but `ended_at` is set to the supplied `at`
+    /// (typically `max(child_step.ended_at)`) instead of `Utc::now()` —
+    /// the process may have crashed long before the next start, so using
+    /// the wall-clock at recovery time would distort duration metrics.
+    ///
+    /// No registered token to trip (the job is by definition no longer
+    /// running), so this skips the `cancellation.cancel` call.
+    pub async fn cancel_at(
+        &self,
+        job_id: &JobId,
+        reason: CancelReason,
+        partial_artifacts: Vec<SpanId>,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let job = self.load_job(job_id).await?;
+        if job.is_terminal() {
+            return Ok(());
+        }
+        let (job, transition) = self
+            .apply(job_id, |j| {
+                j.cancel_at(reason, partial_artifacts.clone(), at)
+            })
+            .await?;
+        self.persist_and_publish(job, transition).await
+    }
+
     /// Move to `Stuck { reason }` from `InProgress`.
     pub async fn stuck(&self, job_id: &JobId, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();

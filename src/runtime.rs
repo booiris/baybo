@@ -386,6 +386,18 @@ pub async fn build_managers(
         .await;
 
     let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
+
+    // Crash recovery: roll forward orphan trace rows (steps/spans left
+    // `Pending` because their `with_step` future was dropped before
+    // close) and the surrounding non-terminal jobs. `ended_at` is
+    // backfilled from observed activity, not boot wall-clock.
+    // Best-effort — errors warn but never block boot.
+    aura_agent::recovery::recover_orphaned_traces_and_jobs(
+        stores.trace.clone(),
+        Arc::clone(&job_lifecycle),
+    )
+    .await;
+
     // CostTracker has been retired in favour of a process-wide
     // --- cron scheduler (built before ToolExecutor so its tools register
     // while `tool_registry` still has a single Arc owner)

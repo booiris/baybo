@@ -227,6 +227,26 @@ impl Job {
         final_result: Option<JobOutput>,
         reason: Option<String>,
     ) -> Result<JobTransition> {
+        self.transition_at(target, final_result, reason, Utc::now())
+    }
+
+    /// Apply a state transition at an explicit point in time. Used by
+    /// the boot-time recovery sweep to roll an orphaned `InProgress`
+    /// job to `Cancelled { SystemCrash }` with `ended_at` set to the
+    /// last observed activity (`max(child_step.ended_at)`) rather than
+    /// the boot wall-clock — the process may have crashed hours or days
+    /// before the next start, and using `Utc::now()` here would make
+    /// duration metrics meaningless.
+    ///
+    /// Live callers should keep using [`Self::transition`]; only
+    /// recovery code should reach for this variant.
+    pub fn transition_at(
+        &mut self,
+        target: JobStatus,
+        final_result: Option<JobOutput>,
+        reason: Option<String>,
+        at: DateTime<Utc>,
+    ) -> Result<JobTransition> {
         let from = self.status.clone();
         if !from.kind().can_transition_to(target.kind()) {
             return Err(JobError::InvalidTransition(format!(
@@ -237,12 +257,11 @@ impl Job {
             )));
         }
 
-        let now = Utc::now();
         if matches!(target, JobStatus::InProgress) && self.started_at.is_none() {
-            self.started_at = Some(now);
+            self.started_at = Some(at);
         }
         if target.kind().is_terminal() {
-            self.ended_at = Some(now);
+            self.ended_at = Some(at);
         }
         // `final_result` is the contractual output of a successful run.
         // Reject Failed/Cancelled/Stuck targets that try to write one —
@@ -269,7 +288,7 @@ impl Job {
             from,
             to,
             reason,
-            timestamp: now,
+            timestamp: at,
         })
     }
 
@@ -308,6 +327,25 @@ impl Job {
             },
             None,
             None,
+        )
+    }
+
+    /// Cancel at an explicit point in time. Used only by the boot-time
+    /// recovery sweep — live cancels go through [`Self::cancel`].
+    pub fn cancel_at(
+        &mut self,
+        reason: CancelReason,
+        partial_artifacts: Vec<SpanId>,
+        at: DateTime<Utc>,
+    ) -> Result<JobTransition> {
+        self.transition_at(
+            JobStatus::Cancelled {
+                reason,
+                partial_artifacts,
+            },
+            None,
+            None,
+            at,
         )
     }
 

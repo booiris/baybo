@@ -14,6 +14,7 @@
 
 pub mod actor;
 pub mod cron_tools;
+pub mod recovery;
 pub mod runtime;
 pub mod security;
 pub mod service;
