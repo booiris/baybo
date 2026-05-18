@@ -120,6 +120,51 @@
         }
       }
     },
+    "/v1/chat/cron-messages": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "list_cron_messages",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of cron messages to return. Defaults to\n[`DEFAULT_CRON_MESSAGE_LIMIT`], clamped to\n[`MAX_CRON_MESSAGE_LIMIT`].",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cron-triggered http sessions with prompt + agent response previews, newest fire first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatCronMessagesList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions": {
       "get": {
         "tags": [
@@ -131,6 +176,15 @@
             "name": "include_hidden",
             "in": "query",
             "description": "Include hidden sessions in the response. Defaults to false.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "include_cron",
+            "in": "query",
+            "description": "Include cron-triggered sessions in the response. Defaults to\nfalse so the chat sidebar stays free of background fires; the\ndedicated `GET /v1/chat/cron-messages` endpoint surfaces those\nin their own pane.",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -2400,6 +2454,62 @@
       "ChannelType": {
         "type": "string",
         "description": "Admin-surface mirror of [`aura_model::ChannelType`]. Transparent\nwrapper around a snake_case string so the OpenAPI surface stays\nstable while the core type is open-ended (runtime-registered\nsidecars like `\"slack\"` pass through unchanged)."
+      },
+      "ChatCronMessage": {
+        "type": "object",
+        "description": "One entry in the cron-messages list. Each row corresponds to a\ndistinct cron fire (cron creates a fresh session per trigger, so\n`session_id` uniquely identifies the fire). The chat surface\nsurfaces these in a right-side notification pane rather than the\nmain sidebar so unattended cron output doesn't bury user-driven\nconversations.",
+        "required": [
+          "session_id",
+          "cron_job_id",
+          "fired_at",
+          "last_active",
+          "prompt"
+        ],
+        "properties": {
+          "cron_job_id": {
+            "type": "string",
+            "description": "Cron job that produced this fire. Stable across fires of the\nsame job; missing in the (theoretically impossible) case of a\ntrigger without a job id."
+          },
+          "fired_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the cron session was created — the actual fire time, to\nwithin scheduler tick precision."
+          },
+          "last_active": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Latest activity timestamp on the session. Lets the panel sort\nby \"freshest\" without the client having to fetch transcripts."
+          },
+          "prompt": {
+            "type": "string",
+            "description": "The user-facing prompt for this fire. Truncated to\n[`PREVIEW_MAX_CHARS`]. The persisted user row carries a\n`[cron:<job>] <prompt>` prefix; this strips the prefix so the\npanel doesn't redundantly re-show what the cron job already\nhas."
+          },
+          "response": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Latest assistant text — what the agent produced in response.\n`None` while the fire is still running or if the agent emitted\nonly tool calls / attachments."
+          },
+          "session_id": {
+            "type": "string",
+            "description": "The session created for this cron fire. Reuse against\n`/v1/chat/sessions/{id}` to drill into the full transcript."
+          }
+        }
+      },
+      "ChatCronMessagesList": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatCronMessage"
+            }
+          }
+        }
       },
       "ChatSessionCredential": {
         "type": "object",

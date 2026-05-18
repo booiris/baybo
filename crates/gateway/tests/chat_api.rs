@@ -365,6 +365,120 @@ async fn list_sessions_exposes_last_user_text_preview() {
     );
 }
 
+// Cron-spawned sessions are filtered out of `GET /v1/chat/sessions` so
+// the operator's chat sidebar isn't buried under background fires;
+// they instead surface via `GET /v1/chat/cron-messages`. The opt-in
+// `?include_cron=true` query restores them for parity with
+// `include_hidden`.
+#[tokio::test]
+async fn cron_sessions_split_into_dedicated_endpoint() {
+    use aura_model::{ChannelType, TriggerSource, User};
+
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let user_cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let user_id = user_cred["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+
+    let cron_session = tg
+        .deps
+        .session_manager
+        .create_session_with_trigger(
+            User {
+                id: "operator".into(),
+                name: None,
+                channel: ChannelType::http(),
+            },
+            ChannelType::http(),
+            TriggerSource::Cron {
+                cron_job_id: "cj-test".into(),
+            },
+        )
+        .await
+        .expect("create cron session");
+    let cron_id = cron_session.id.to_string();
+
+    let cron_rows: &[ChatMessage] = &[
+        ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("[cron:cj-test] morning brief".into())],
+            from_user: true,
+        },
+        ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text("daily summary\nready".into())],
+            from_user: false,
+        },
+    ];
+    for msg in cron_rows {
+        tg.deps
+            .session_manager
+            .append_session_message(&cron_session.id, msg)
+            .await
+            .expect("append cron row");
+    }
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let items = list["items"].as_array().expect("items");
+    assert!(
+        items
+            .iter()
+            .any(|row| row["session_id"].as_str() == Some(user_id.as_str())),
+        "user session must show up in default list",
+    );
+    assert!(
+        items
+            .iter()
+            .all(|row| row["session_id"].as_str() != Some(cron_id.as_str())),
+        "cron session must be hidden from default chat list, got {items:?}",
+    );
+
+    let list_inc = get(
+        &router,
+        "/v1/chat/sessions?include_cron=true",
+        StatusCode::OK,
+    )
+    .await;
+    let items_inc = list_inc["items"].as_array().expect("items");
+    assert!(
+        items_inc
+            .iter()
+            .any(|row| row["session_id"].as_str() == Some(cron_id.as_str())),
+        "include_cron=true must bring cron sessions back",
+    );
+
+    let inbox = get(&router, "/v1/chat/cron-messages", StatusCode::OK).await;
+    let inbox_items = inbox["items"].as_array().expect("items");
+    let cron_row = inbox_items
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(cron_id.as_str()))
+        .expect("cron inbox should surface the cron session");
+    assert_eq!(cron_row["cron_job_id"].as_str(), Some("cj-test"));
+    assert_eq!(
+        cron_row["prompt"].as_str(),
+        Some("morning brief"),
+        "prompt must strip the `[cron:<id>] ` routing prefix",
+    );
+    assert_eq!(
+        cron_row["response"].as_str(),
+        Some("daily summary ready"),
+        "response must collapse to a single-line preview",
+    );
+    assert!(
+        inbox_items
+            .iter()
+            .all(|row| row["session_id"].as_str() != Some(user_id.as_str())),
+        "cron inbox must not contain user-triggered sessions",
+    );
+}
+
 // Channel kind sanity: every kind the boot path declares must match
 // the protocol invariant that http is `Subscribed`.
 #[test]

@@ -28,7 +28,9 @@
 //! [`crate::auth::AuthedClient::Web`].
 
 use aura_channels::wire::{SessionPatch, SlashCommandSpec};
-use aura_model::{ChannelType, ChatMessage, ContentBlock, Role, Session, SessionId, User};
+use aura_model::{
+    ChannelType, ChatMessage, ContentBlock, Role, Session, SessionId, TriggerSource, User,
+};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use chrono::{DateTime, Utc};
@@ -54,6 +56,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(unhide_session))
         .routes(routes!(refresh_session_token))
         .routes(routes!(slash_manifest))
+        .routes(routes!(list_cron_messages))
 }
 
 /// Query string for `GET /v1/chat/sessions`.
@@ -62,6 +65,12 @@ pub struct ListSessionsQuery {
     /// Include hidden sessions in the response. Defaults to false.
     #[serde(default)]
     pub include_hidden: bool,
+    /// Include cron-triggered sessions in the response. Defaults to
+    /// false so the chat sidebar stays free of background fires; the
+    /// dedicated `GET /v1/chat/cron-messages` endpoint surfaces those
+    /// in their own pane.
+    #[serde(default)]
+    pub include_cron: bool,
 }
 
 /// Default page size for reverse transcript pagination — large enough
@@ -83,6 +92,18 @@ const PREVIEW_SCAN_DEPTH: usize = 10;
 /// session. Sized to fit a 260px-wide sidebar row at the web client's
 /// font without wrapping; the client may truncate further with CSS.
 const PREVIEW_MAX_CHARS: usize = 120;
+
+/// Default page size for the cron-messages list. Tuned to roughly
+/// match what the right-side panel renders before the user scrolls.
+const DEFAULT_CRON_MESSAGE_LIMIT: usize = 50;
+/// Hard cap on the cron-messages list so a curious client can't ask
+/// the gateway to walk thousands of cron sessions in one shot.
+const MAX_CRON_MESSAGE_LIMIT: usize = 200;
+/// How deep to walk a cron session's transcript when extracting the
+/// prompt/response previews. Cron sessions are one-shot — a small
+/// constant covers the realistic shape (`[cron:..] prompt` followed by
+/// one or two assistant turns).
+const CRON_PREVIEW_SCAN_DEPTH: usize = 12;
 
 /// Query string for `GET /v1/chat/sessions/{session_id}`. Reverse-
 /// paginates the active transcript: the response carries the
@@ -200,6 +221,55 @@ pub struct ChatSessionsList {
     pub items: Vec<ChatSessionSummary>,
 }
 
+/// One entry in the cron-messages list. Each row corresponds to a
+/// distinct cron fire (cron creates a fresh session per trigger, so
+/// `session_id` uniquely identifies the fire). The chat surface
+/// surfaces these in a right-side notification pane rather than the
+/// main sidebar so unattended cron output doesn't bury user-driven
+/// conversations.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatCronMessage {
+    /// The session created for this cron fire. Reuse against
+    /// `/v1/chat/sessions/{id}` to drill into the full transcript.
+    pub session_id: String,
+    /// Cron job that produced this fire. Stable across fires of the
+    /// same job; missing in the (theoretically impossible) case of a
+    /// trigger without a job id.
+    pub cron_job_id: String,
+    /// When the cron session was created — the actual fire time, to
+    /// within scheduler tick precision.
+    pub fired_at: DateTime<Utc>,
+    /// Latest activity timestamp on the session. Lets the panel sort
+    /// by "freshest" without the client having to fetch transcripts.
+    pub last_active: DateTime<Utc>,
+    /// The user-facing prompt for this fire. Truncated to
+    /// [`PREVIEW_MAX_CHARS`]. The persisted user row carries a
+    /// `[cron:<job>] <prompt>` prefix; this strips the prefix so the
+    /// panel doesn't redundantly re-show what the cron job already
+    /// has.
+    pub prompt: String,
+    /// Latest assistant text — what the agent produced in response.
+    /// `None` while the fire is still running or if the agent emitted
+    /// only tool calls / attachments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatCronMessagesList {
+    pub items: Vec<ChatCronMessage>,
+}
+
+/// Query string for `GET /v1/chat/cron-messages`.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct ListCronMessagesQuery {
+    /// Maximum number of cron messages to return. Defaults to
+    /// [`DEFAULT_CRON_MESSAGE_LIMIT`], clamped to
+    /// [`MAX_CRON_MESSAGE_LIMIT`].
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// Wire DTO for slash command entries. Mirror of
 /// [`aura_channels::wire::SlashCommandSpec`] so the OpenAPI surface
 /// stays inside this crate's DTOs (the wire type lives in
@@ -287,6 +357,7 @@ async fn list_sessions(
     let visible: Vec<Session> = scoped
         .into_iter()
         .filter(|s| query.include_hidden || !s.hidden)
+        .filter(|s| query.include_cron || !is_cron_triggered(s))
         .collect();
     // Fan out the per-session preview fetch — each row needs its own
     // reverse-tail walk against `session_messages`, which is cheap
@@ -487,6 +558,53 @@ async fn refresh_session_token(
 
 #[utoipa::path(
     get,
+    path = "/chat/cron-messages",
+    tag = "chat",
+    params(ListCronMessagesQuery),
+    responses(
+        (status = 200, description = "Cron-triggered http sessions with prompt + agent response previews, newest fire first", body = ChatCronMessagesList),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
+async fn list_cron_messages(
+    State(state): State<AdminState>,
+    Query(query): Query<ListCronMessagesQuery>,
+) -> Result<Json<ChatCronMessagesList>> {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_CRON_MESSAGE_LIMIT)
+        .clamp(1, MAX_CRON_MESSAGE_LIMIT);
+    let scoped = state
+        .session_manager
+        .list_by_channel(&ChannelType::http())
+        .await
+        .map_err(|e| GatewayError::Internal(format!("list cron messages: {e}")))?;
+    // `list_by_channel` already returns rows ordered by `last_active`
+    // desc; the filter preserves order so the take(limit) below is the
+    // freshest N cron fires.
+    let cron_sessions: Vec<Session> = scoped
+        .into_iter()
+        .filter(|s| !s.hidden)
+        .filter_map(|s| match &s.trigger {
+            TriggerSource::Cron { cron_job_id } if !cron_job_id.is_empty() => Some(s),
+            _ => None,
+        })
+        .take(limit)
+        .collect();
+    let manager = state.session_manager.clone();
+    let items = futures::future::join_all(cron_sessions.into_iter().map(|s| {
+        let manager = manager.clone();
+        async move { cron_message_from_session(&manager, s).await }
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+    Ok(Json(ChatCronMessagesList { items }))
+}
+
+#[utoipa::path(
+    get,
     path = "/chat/slash-manifest",
     tag = "chat",
     responses(
@@ -608,6 +726,84 @@ pub(crate) fn broadcast_session_patch(
 /// at most [`PREVIEW_SCAN_DEPTH`] rows back; deeper user turns
 /// (e.g. a session whose recent activity is purely tool churn) fall
 /// off the window and are accepted as missing rather than chased.
+fn is_cron_triggered(session: &Session) -> bool {
+    matches!(session.trigger, TriggerSource::Cron { .. })
+}
+
+/// Walk a cron session's tail to extract the prompt + freshest
+/// assistant response. Returns `None` only when the walk itself fails;
+/// a fire that's still running (no assistant turn yet) returns the
+/// prompt with `response = None`, and a fire with no decodable rows
+/// at all surfaces empty strings so the panel still pins the
+/// timestamp instead of silently dropping the row.
+async fn cron_message_from_session(
+    manager: &aura_session::SessionManager,
+    session: Session,
+) -> Option<ChatCronMessage> {
+    let cron_job_id = match &session.trigger {
+        TriggerSource::Cron { cron_job_id } => cron_job_id.clone(),
+        _ => return None,
+    };
+    let tail = manager
+        .history_tail(&session.id, None, CRON_PREVIEW_SCAN_DEPTH)
+        .await
+        .ok()?;
+    let mut prompt: Option<String> = None;
+    let mut response: Option<String> = None;
+    // `history_tail` returns ascending; the cron prompt is the first
+    // user row (oldest) and the assistant response is the freshest
+    // assistant row (newest). Walk forward for the prompt; walk in
+    // reverse for the response so we land on the last assistant turn
+    // even when the agent emitted multiple.
+    for (_ord, _at, msg) in &tail {
+        if matches!(msg.role, Role::User) && msg.from_user {
+            prompt = Some(strip_cron_prefix(&extract_text(&msg.content)));
+            break;
+        }
+    }
+    for (_ord, _at, msg) in tail.iter().rev() {
+        if matches!(msg.role, Role::Assistant) {
+            let text = extract_text(&msg.content);
+            if !text.is_empty() {
+                response = Some(truncate_preview(&text));
+                break;
+            }
+        }
+    }
+    Some(ChatCronMessage {
+        session_id: session.id.to_string(),
+        cron_job_id,
+        fired_at: session.created_at,
+        last_active: session.last_active,
+        prompt: prompt.map(|p| truncate_preview(&p)).unwrap_or_default(),
+        response,
+    })
+}
+
+fn extract_text(content: &[ContentBlock]) -> String {
+    let mut text = String::new();
+    for block in content {
+        if let ContentBlock::Text(t) = block {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(t);
+        }
+    }
+    text
+}
+
+/// The cron dispatcher synthesises `[cron:<job_id>] <prompt>` content
+/// before the agent loop sees it (see `AgentActor::dispatch_prompt`).
+/// Strip that wire prefix here so the panel renders the original
+/// prompt the user (or LLM) configured, not the routing tag.
+fn strip_cron_prefix(text: &str) -> String {
+    text.strip_prefix("[cron:")
+        .and_then(|rest| rest.find(']').map(|end| &rest[end + 1..]))
+        .map(|s| s.trim_start().to_owned())
+        .unwrap_or_else(|| text.to_owned())
+}
+
 async fn last_user_preview(
     manager: &aura_session::SessionManager,
     session_id: &SessionId,

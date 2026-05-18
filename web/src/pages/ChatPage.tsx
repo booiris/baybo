@@ -31,6 +31,7 @@ import {
   type ResourceAccess,
   type SessionPatch,
 } from '../api/chatWs';
+import { CronInbox } from '../components/CronInbox';
 
 interface TranscriptRow {
   /** Stable key for React. Synthetic; not part of any server schema. */
@@ -201,6 +202,15 @@ export function ChatPage() {
   // background sessions get a cleared `historyLoaded` flag so they
   // refetch lazily on next visit.
   const [historyEpoch, setHistoryEpoch] = useState(0);
+
+  // Bumped whenever the WS reports activity for a session_id we don't
+  // track in the main `sessions` list — cron creates fresh sessions
+  // server-side that the chat-list endpoint filters out, so the only
+  // hint a tab has that a cron fire just happened is a
+  // SessionActivity ping for an unknown id. Cascaded into the
+  // CronInbox panel so it can refetch right when something new lands
+  // instead of waiting on the next 30s poll.
+  const [cronInboxRefresh, setCronInboxRefresh] = useState(0);
 
   const [status, setStatus] = useState<ConnectionStatus>({ state: 'connecting' });
   const [composer, setComposer] = useState('');
@@ -503,9 +513,20 @@ export function ChatPage() {
           // exists. Foreground sessions don't bump (the user can see
           // it), background sessions get a +1 badge.
           const isForeground = currentSessionIdRef.current === frame.session_id;
-          setSessions((prev) =>
-            applySessionActivity(prev, frame.session_id, frame.at, isForeground),
-          );
+          let known = true;
+          setSessions((prev) => {
+            known = prev.some((s) => s.session_id === frame.session_id);
+            return applySessionActivity(prev, frame.session_id, frame.at, isForeground);
+          });
+          if (!known) {
+            // Probably a cron-spawned session — those are filtered out
+            // of the main chat list server-side, so the only signal
+            // the tab has is activity for an id it doesn't know.
+            // Nudging the CronInbox panel triggers an immediate
+            // refetch so the fire shows up without waiting on the
+            // polling interval.
+            setCronInboxRefresh((n) => n + 1);
+          }
           return;
         }
         // Catch-up replays carry an explicit ordinal — advance the WS
@@ -1064,6 +1085,7 @@ export function ChatPage() {
 
       {/* Main column */}
       <main className="flex-1 flex flex-col overflow-hidden relative">
+        <CronInbox refreshSignal={cronInboxRefresh} />
         <header className="h-12 px-4 border-b-2 border-black flex items-center justify-between gap-3 bg-white">
           <div className="flex items-baseline gap-2 min-w-0 flex-1">
             {sessionId ? (
