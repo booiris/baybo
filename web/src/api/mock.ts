@@ -384,6 +384,9 @@ export function getMockSessionReplay(sessionId: string): SessionReplay {
       {
         job_id: job1,
         job_status_kind: 'completed',
+        created_at: new Date(t0 - 120).toISOString(),
+        started_at: new Date(t0).toISOString(),
+        ended_at: new Date(t0 + 2400).toISOString(),
         steps: [
           { step: skillStep, spans: [skillLlm] },
           { step: it1Step, spans: [it1Llm, tool1, tool2] },

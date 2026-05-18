@@ -236,6 +236,9 @@ export interface ReplayStep {
 export interface ReplayJob {
   job_id: string;
   job_status_kind: JobStatusKind;
+  created_at?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
   steps: ReplayStep[];
 }
 

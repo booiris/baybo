@@ -841,6 +841,48 @@ function SpanDetailPanel({
 
 // ── Job tokens helper ───────────────────────────────────────────────
 
+// Total job execution time. Prefers the backend's `started_at`/`ended_at`
+// (covers setup, teardown, and gaps that fall outside any step) and
+// falls back to deriving from step timestamps for older replays where
+// the wire didn't carry job-level times. For in-flight jobs we use
+// `now` as the upper bound so the counter keeps ticking; callers
+// re-render on each poll.
+function jobDurationMs(job: ReplayJob): number | null {
+  if (job.started_at) {
+    const start = new Date(job.started_at).getTime();
+    const end = job.ended_at ? new Date(job.ended_at).getTime() : Date.now();
+    return Math.max(0, end - start);
+  }
+  let minStart = Infinity;
+  let maxEnd = -Infinity;
+  let inFlight = false;
+  for (const rs of job.steps) {
+    const start = new Date(rs.step.started_at).getTime();
+    if (start < minStart) minStart = start;
+    if (rs.step.ended_at) {
+      const end = new Date(rs.step.ended_at).getTime();
+      if (end > maxEnd) maxEnd = end;
+    } else {
+      inFlight = true;
+    }
+  }
+  if (minStart === Infinity) return null;
+  const end = inFlight ? Date.now() : maxEnd;
+  if (end === -Infinity) return null;
+  return Math.max(0, end - minStart);
+}
+
+// Time the job sat in queue before execution started. Only meaningful
+// when both timestamps are present; returns null for legacy replays or
+// jobs that never started.
+function jobQueuedMs(job: ReplayJob): number | null {
+  if (!job.created_at || !job.started_at) return null;
+  return Math.max(
+    0,
+    new Date(job.started_at).getTime() - new Date(job.created_at).getTime(),
+  );
+}
+
 function jobTokens(job: ReplayJob): {
   input: number;
   output: number;
@@ -994,6 +1036,8 @@ function JobSummaryPanel({
     }
   }
   const stepCount = job.steps.length;
+  const durMs = jobDurationMs(job);
+  const queuedMs = jobQueuedMs(job);
 
   return (
     <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-white flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
@@ -1007,7 +1051,8 @@ function JobSummaryPanel({
               {totalJobs > 1 ? `Job #${jobIndex + 1}` : 'Job Overview'}
             </h3>
             <div className="text-ink-soft text-[0.8rem] font-mono truncate">
-              {job.job_status_kind} • {stepCount} {stepCount === 1 ? 'step' : 'steps'}
+              {job.job_status_kind} • {stepCount} {stepCount === 1 ? 'step' : 'steps'} •{' '}
+              {formatDuration(durMs)}
             </div>
           </div>
         </div>
@@ -1053,6 +1098,14 @@ function JobSummaryPanel({
             </dd>
             <dt className="font-bold text-ink-soft">Status</dt>
             <dd>{job.job_status_kind}</dd>
+            <dt className="font-bold text-ink-soft">Duration</dt>
+            <dd>{formatDuration(durMs)}</dd>
+            {queuedMs !== null && queuedMs > 0 && (
+              <>
+                <dt className="font-bold text-ink-soft">Queued</dt>
+                <dd>{formatDuration(queuedMs)}</dd>
+              </>
+            )}
             <dt className="font-bold text-ink-soft">Steps</dt>
             <dd>{stepCount}</dd>
             <dt className="font-bold text-ink-soft">LLM calls</dt>
@@ -1319,10 +1372,12 @@ export function TraceSessionPage() {
                 </span>
                 {(() => {
                   const t = jobTokens(activeJob);
+                  const d = jobDurationMs(activeJob);
                   return (
                     <>
                       <span className="text-ink">↑ {t.inputTotal.toLocaleString()}</span>
                       <span className="text-ink">↓ {t.output.toLocaleString()}</span>
+                      <span className="text-ink-soft">• {formatDuration(d)}</span>
                     </>
                   );
                 })()}

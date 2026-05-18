@@ -112,6 +112,9 @@ async fn get_trace(
             json!({
                 "job_id": rj.job.id.to_string(),
                 "job_status_kind": rj.job.status.kind().as_snake_case(),
+                "created_at": rj.job.created_at,
+                "started_at": rj.job.started_at,
+                "ended_at": rj.job.ended_at,
                 "steps": rj
                     .steps
                     .iter()
