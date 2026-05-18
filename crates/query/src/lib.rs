@@ -318,6 +318,71 @@ pub struct ReplayStep {
     pub spans: Vec<Span>,
 }
 
+/// Wire-friendly mirror of [`aura_session::StoredMessage`]. Carried
+/// once at the top of [`TraceOverview`] so the client can hydrate
+/// every `LlmCallInputs::Persisted { last_ordinal }` span locally
+/// instead of the server re-inlining the same prefix per span — the
+/// duplicated payload that motivates the split in the first place.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMessageRow {
+    pub ordinal: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<i64>,
+    pub created_at: DateTime<Utc>,
+    pub message: aura_model::ChatMessage,
+}
+
+impl From<StoredMessage> for SessionMessageRow {
+    fn from(m: StoredMessage) -> Self {
+        Self {
+            ordinal: m.ordinal,
+            superseded_by: m.superseded_by,
+            created_at: m.created_at,
+            message: m.message,
+        }
+    }
+}
+
+/// Per-job entry in [`TraceOverview`]: a [`JobSummary`] augmented with
+/// the token aggregates the trace sidebar needs to render the
+/// `↑in ↓out` chips before the user has clicked into the job. Token
+/// fields are zeros when the underlying `QueryApi` has no `CostStore`
+/// (CLI-style construction via `QueryApi::without_costs`) or when the
+/// cost lookup errors — we'd rather show 0 than fail the whole page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceJobSummary {
+    #[serde(flatten)]
+    pub summary: JobSummary,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
+}
+
+/// Cheap session overview for the trace detail UI: the full
+/// `session_messages` log + a list of job summaries, ordered
+/// oldest-first to match the sidebar's `#1 #2 ...` numbering.
+///
+/// Compared to [`ReplayedConversation`] this drops the per-job
+/// step/span tree — the client lazily fetches that via
+/// [`QueryApi::load_job_trace`] on demand.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceOverview {
+    pub session_id: SessionId,
+    pub session_messages: Vec<SessionMessageRow>,
+    pub jobs: Vec<TraceJobSummary>,
+}
+
+/// Full step/span tree for a single job, served by
+/// [`QueryApi::load_job_trace`]. Spans keep their original
+/// `LlmCallInputs::Persisted` shape — clients slice the message log
+/// from [`TraceOverview::session_messages`] themselves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobTrace {
+    pub job: Job,
+    pub steps: Vec<ReplayStep>,
+}
+
 // ── QueryApi ────────────────────────────────────────────────────────
 
 /// Read-only view onto the session/job/trace/cost stores.
@@ -851,6 +916,102 @@ impl QueryApi {
         Ok(ReplayedConversation {
             session_id: session_id.clone(),
             jobs,
+        })
+    }
+
+    // ── 12. load_trace_overview ────────────────────────────────
+
+    /// Trace detail page's first call: returns the session message
+    /// log + job summaries, **without** any step/span data. Cheap.
+    /// The client lazily fetches each job's tree via
+    /// [`Self::load_job_trace`] when the user selects it.
+    ///
+    /// This split exists because the old single-shot `replay`
+    /// inlined the whole transcript into every `LlmCall` span — for a
+    /// session with N jobs × S spans the response payload was
+    /// O(N · S · message_count), even though storage is already
+    /// O(N · S) thanks to the `LlmCallInputs::Persisted` ordinal
+    /// indirection. Returning the message log once and letting the
+    /// client hydrate slices keeps the wire payload linear in
+    /// `message_count + span_count`.
+    pub async fn load_trace_overview(&self, session_id: &SessionId) -> Result<TraceOverview> {
+        // Reuse `list_jobs` so fork-prefix UNION is honoured, then
+        // re-sort oldest-first to match the trace sidebar's job
+        // numbering (`#1, #2, ...` from earliest to latest).
+        let mut summaries = self.list_jobs(session_id, JobFilter::default()).await?;
+        summaries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+        let session_messages = self
+            .sessions
+            .load_session_messages_with_supersede(session_id)
+            .await?
+            .into_iter()
+            .map(SessionMessageRow::from)
+            .collect();
+
+        // Per-job token aggregates power the sidebar's `↑in ↓out`
+        // chips. One cost-store lookup per job: cheap (each is an
+        // indexed range scan on `cost_records.job_id`) and bounded by
+        // the typical 1-5 jobs per session.
+        let mut jobs = Vec::with_capacity(summaries.len());
+        for summary in summaries {
+            let (input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens) =
+                match self.costs.as_ref() {
+                    Some(c) => match c.query_job(&summary.id).await {
+                        Ok(s) => (
+                            s.total_input_tokens,
+                            s.total_output_tokens,
+                            s.total_cached_input_tokens,
+                            s.total_cache_creation_input_tokens,
+                        ),
+                        Err(_) => (0, 0, 0, 0),
+                    },
+                    None => (0, 0, 0, 0),
+                };
+            jobs.push(TraceJobSummary {
+                summary,
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                cache_creation_input_tokens,
+            });
+        }
+
+        Ok(TraceOverview {
+            session_id: session_id.clone(),
+            session_messages,
+            jobs,
+        })
+    }
+
+    // ── 13. load_job_trace ─────────────────────────────────────
+
+    /// Per-job follow-up to [`Self::load_trace_overview`]: returns
+    /// one job's full `steps → spans → events` tree. `Persisted`
+    /// `input_messages` references stay as ordinal pointers; the
+    /// client resolves them against the message log it already
+    /// received from the overview call.
+    pub async fn load_job_trace(&self, job_id: &JobId) -> Result<JobTrace> {
+        let job = self
+            .jobs
+            .get(job_id)
+            .await?
+            .ok_or_else(|| QueryError::NotFound(format!("job {job_id}")))?;
+        let mut steps = self.trace.list_steps_by_job(job_id).await?;
+        steps.sort_by_key(|s| s.started_at);
+        let mut step_blocks = Vec::with_capacity(steps.len());
+        for step in steps {
+            let mut spans = self.trace.list_spans_by_step(&step.id).await?;
+            for span in &mut spans {
+                if span.events.is_empty() {
+                    span.events = self.trace.list_span_events(&span.id).await?;
+                }
+            }
+            step_blocks.push(ReplayStep { step, spans });
+        }
+        Ok(JobTrace {
+            job,
+            steps: step_blocks,
         })
     }
 
@@ -1702,5 +1863,189 @@ mod tests {
             .unwrap();
         assert_eq!(hydrated_post, &post_active);
         assert_eq!(hydrated_post.len(), 4); // [sys-v2, summary, follow-up, again]
+    }
+
+    /// `load_trace_overview` returns the full `session_messages`
+    /// log (including superseded rows so the client can still slice
+    /// pre-compaction spans) and the job summaries oldest-first.
+    /// No step/span data — that's the cheap-on-purpose contract.
+    #[tokio::test]
+    async fn load_trace_overview_returns_message_log_and_summaries() {
+        use aura_model::{ChatMessage, ContentBlock, Role};
+
+        fn user_msg(text: &str) -> ChatMessage {
+            ChatMessage {
+                role: Role::User,
+                content: vec![ContentBlock::Text(text.into())],
+                from_user: false,
+            }
+        }
+
+        let session_store = Arc::new(MemSessionStore::default());
+        let s = make_session("overview-1");
+        session_store.save(&s).await.unwrap();
+        session_store
+            .append_session_message(&s.id, &user_msg("m0"))
+            .await
+            .unwrap();
+        session_store
+            .append_session_message(&s.id, &user_msg("m1"))
+            .await
+            .unwrap();
+        // Compact so `m0`/`m1` get a `superseded_by` marker.
+        session_store
+            .apply_session_compaction(&s.id, &[user_msg("summary")])
+            .await
+            .unwrap();
+
+        let job_store = Arc::new(MemoryJobStore::new());
+        let lifecycle = Arc::new(JobLifecycle::new(job_store));
+        let _j1 = lifecycle
+            .start_job(
+                s.id.clone(),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        let _j2 = lifecycle
+            .start_job(
+                s.id.clone(),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let api = QueryApi::new(
+            session_store,
+            lifecycle,
+            Arc::new(MemoryTraceStore::new()),
+            Arc::new(MemoryCostStore::default()),
+        );
+        let overview = api.load_trace_overview(&s.id).await.unwrap();
+
+        assert_eq!(overview.session_id, s.id);
+        // Pre-compaction rows are preserved, with `superseded_by`
+        // set so the client can replicate the "active as of X" filter.
+        assert_eq!(overview.session_messages.len(), 3);
+        assert_eq!(overview.session_messages[0].ordinal, 0);
+        assert_eq!(overview.session_messages[0].superseded_by, Some(2));
+        assert_eq!(overview.session_messages[1].ordinal, 1);
+        assert_eq!(overview.session_messages[1].superseded_by, Some(2));
+        assert_eq!(overview.session_messages[2].ordinal, 2);
+        assert_eq!(overview.session_messages[2].superseded_by, None);
+
+        assert_eq!(overview.jobs.len(), 2);
+        assert!(overview.jobs[0].summary.created_at <= overview.jobs[1].summary.created_at);
+    }
+
+    /// `load_job_trace` returns the per-job step/span tree with
+    /// `LlmCallInputs::Persisted` references **unchanged** — the
+    /// client is expected to slice them against the message log
+    /// served by `load_trace_overview`.
+    #[tokio::test]
+    async fn load_job_trace_preserves_persisted_inputs() {
+        use aura_model::{ChatMessage, ContentBlock, Role, SpanId, StepId};
+        use aura_trace::{
+            LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind, TraceStore,
+        };
+
+        fn user_msg(text: &str) -> ChatMessage {
+            ChatMessage {
+                role: Role::User,
+                content: vec![ContentBlock::Text(text.into())],
+                from_user: false,
+            }
+        }
+
+        let session_store = Arc::new(MemSessionStore::default());
+        let s = make_session("job-trace-1");
+        session_store.save(&s).await.unwrap();
+        session_store
+            .append_session_message(&s.id, &user_msg("hi"))
+            .await
+            .unwrap();
+        let last = session_store
+            .latest_session_ordinal(&s.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let job_store = Arc::new(MemoryJobStore::new());
+        let lifecycle = Arc::new(JobLifecycle::new(job_store));
+        let j = lifecycle
+            .start_job(
+                s.id.clone(),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lifecycle.start(&j.id).await.unwrap();
+
+        let trace_store: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
+        let step_id = StepId::new();
+        let now = Utc::now();
+        trace_store
+            .save_step(&Step {
+                id: step_id,
+                job_id: j.id,
+                kind: StepKind::LlmIteration,
+                started_at: now,
+                ended_at: None,
+                outcome: LifecycleState::Pending,
+            })
+            .await
+            .unwrap();
+        let span_id = SpanId::new();
+        trace_store
+            .save_span(&Span {
+                id: span_id,
+                step_id,
+                kind: SpanKind::LlmCall {
+                    begin: LlmCallBegin {
+                        model_id: "claude".into(),
+                        provider: "anthropic".into(),
+                        provider_config_hash: String::new(),
+                        input_messages: LlmCallInputs::Persisted { last_ordinal: last },
+                        temperature: None,
+                    },
+                    result: None,
+                },
+                parallel_group: None,
+                started_at: now,
+                ended_at: None,
+                outcome: LifecycleState::Pending,
+                events: vec![],
+            })
+            .await
+            .unwrap();
+
+        let api = QueryApi::new(
+            session_store,
+            lifecycle,
+            trace_store,
+            Arc::new(MemoryCostStore::default()),
+        );
+        let job_trace = api.load_job_trace(&j.id).await.unwrap();
+
+        assert_eq!(job_trace.job.id, j.id);
+        assert_eq!(job_trace.steps.len(), 1);
+        assert_eq!(job_trace.steps[0].spans.len(), 1);
+        let SpanKind::LlmCall { begin, .. } = &job_trace.steps[0].spans[0].kind else {
+            panic!("expected LlmCall span");
+        };
+        assert!(
+            matches!(begin.input_messages, LlmCallInputs::Persisted { .. }),
+            "load_job_trace must preserve Persisted refs; got {:?}",
+            begin.input_messages
+        );
     }
 }

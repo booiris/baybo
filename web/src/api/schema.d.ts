@@ -452,6 +452,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/traces/{session_id}/jobs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_job_trace"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -2529,14 +2545,14 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Session id whose trace to export */
+                /** @description Session id whose trace overview to fetch */
                 session_id: string;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Per-session trace tree: jobs, their steps, and the spans under each step. Untyped JSON to keep the admin surface decoupled from internal trace crate changes. */
+            /** @description Per-session trace overview: session_messages log + job summaries (no step/span data). Untyped JSON to keep the admin surface decoupled from internal trace crate changes. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -2555,6 +2571,58 @@ export interface operations {
                 };
             };
             /** @description No trace for that session */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_job_trace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id this job belongs to (or inherits from); used for route scoping only */
+                session_id: string;
+                /** @description Job id whose step/span tree to fetch */
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64 }` (Persisted) or `ChatMessage[]` (Inline); the client slices the message log it received from the overview call. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Invalid job id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such job */
             404: {
                 headers: {
                     [name: string]: unknown;

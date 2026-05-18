@@ -19,22 +19,25 @@ import type { IconType } from 'react-icons';
 import { IconButton } from '../components/IconButton';
 import { Button } from '../components/Button';
 import { useAdminClient, useAuth } from '../api/auth';
-import { getMockSessionReplay } from '../api/mock';
+import { getMockJobTrace, getMockTraceOverview } from '../api/mock';
 import { useMockMode } from '../api/mock';
 import type {
+  ChatMessage,
+  JobTrace,
   LifecycleState,
-  ReplayJob,
   ReplayStep,
   SecretKind,
-  SessionReplay,
+  SessionMessageRow,
   Span,
   SpanEvent,
   SpanKindTag,
   Step,
   StepKindTag,
   ToolEventPayload,
+  TraceJobSummary,
+  TraceOverview,
 } from '../types/trace';
-import { isTerminal } from '../types/trace';
+import { isTerminal, resolveInputMessages } from '../types/trace';
 import { MessageList } from '../components/trace/MessageList';
 import { renderWithSanitizeChips, SanitizeChip } from '../components/trace/SanitizeChip';
 
@@ -376,12 +379,23 @@ function SanitizeKindHint(events: SpanEvent[] | undefined): SecretKind | undefin
   return undefined;
 }
 
-function LlmCallDetail({ span }: { span: Span }) {
+function LlmCallDetail({
+  span,
+  messageLog,
+}: {
+  span: Span;
+  messageLog: SessionMessageRow[];
+}) {
   if (span.kind.kind !== 'llm_call') return null;
   const { begin, result } = span.kind;
   const hint = SanitizeKindHint(span.events);
   const failureReason =
     span.outcome.outcome === 'failed' ? span.outcome.reason : null;
+  const inputMessages = resolveInputMessages(
+    begin.input_messages,
+    messageLog,
+    span.started_at,
+  );
 
   return (
     <div className="space-y-6">
@@ -400,7 +414,7 @@ function LlmCallDetail({ span }: { span: Span }) {
         <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
           Input messages
         </h4>
-        <MessageList messages={begin.input_messages} kindHint={hint} />
+        <MessageList messages={inputMessages} kindHint={hint} />
       </section>
 
       {result && (
@@ -765,12 +779,14 @@ function EventsTab({ events }: { events: SpanEvent[] }) {
 
 function SpanDetailPanel({
   span,
+  messageLog,
   tab,
   onTabChange,
   onJumpToLlm,
   onDrillIn,
 }: {
   span: Span;
+  messageLog: SessionMessageRow[];
   tab: 'io' | 'meta' | 'events';
   onTabChange: (t: 'io' | 'meta' | 'events') => void;
   onJumpToLlm: (id: string) => void;
@@ -826,7 +842,7 @@ function SpanDetailPanel({
       <div className="flex-1 overflow-y-scroll p-5">
         {tab === 'io' &&
           (span.kind.kind === 'llm_call' ? (
-            <LlmCallDetail span={span} />
+            <LlmCallDetail span={span} messageLog={messageLog} />
           ) : span.kind.kind === 'tool_call' ? (
             <ToolCallDetail span={span} onJumpToLlm={onJumpToLlm} />
           ) : (
@@ -839,24 +855,30 @@ function SpanDetailPanel({
   );
 }
 
-// ── Job tokens helper ───────────────────────────────────────────────
+// ── Job helpers (summary-level vs trace-level) ──────────────────────
 
 // Total job execution time. Prefers the backend's `started_at`/`ended_at`
 // (covers setup, teardown, and gaps that fall outside any step) and
-// falls back to deriving from step timestamps for older replays where
+// falls back to deriving from step timestamps for older traces where
 // the wire didn't carry job-level times. For in-flight jobs we use
 // `now` as the upper bound so the counter keeps ticking; callers
-// re-render on each poll.
-function jobDurationMs(job: ReplayJob): number | null {
+// re-render on each poll. Accepts an optional loaded trace so we can
+// fall back when the summary is missing `started_at` (mid-fork prefix
+// rows, etc.).
+function jobDurationMs(
+  job: { started_at?: string | null; ended_at?: string | null },
+  trace: JobTrace | undefined,
+): number | null {
   if (job.started_at) {
     const start = new Date(job.started_at).getTime();
     const end = job.ended_at ? new Date(job.ended_at).getTime() : Date.now();
     return Math.max(0, end - start);
   }
+  if (!trace) return null;
   let minStart = Infinity;
   let maxEnd = -Infinity;
   let inFlight = false;
-  for (const rs of job.steps) {
+  for (const rs of trace.steps) {
     const start = new Date(rs.step.started_at).getTime();
     if (start < minStart) minStart = start;
     if (rs.step.ended_at) {
@@ -873,9 +895,9 @@ function jobDurationMs(job: ReplayJob): number | null {
 }
 
 // Time the job sat in queue before execution started. Only meaningful
-// when both timestamps are present; returns null for legacy replays or
+// when both timestamps are present; returns null for legacy traces or
 // jobs that never started.
-function jobQueuedMs(job: ReplayJob): number | null {
+function jobQueuedMs(job: { created_at?: string | null; started_at?: string | null }): number | null {
   if (!job.created_at || !job.started_at) return null;
   return Math.max(
     0,
@@ -883,18 +905,35 @@ function jobQueuedMs(job: ReplayJob): number | null {
   );
 }
 
-function jobTokens(job: ReplayJob): {
+interface JobTokenTotals {
   input: number;
   output: number;
   cached: number;
   cacheCreate: number;
   inputTotal: number;
-} {
+}
+
+function summaryTokens(summary: TraceJobSummary): JobTokenTotals {
+  return {
+    input: summary.input_tokens,
+    output: summary.output_tokens,
+    cached: summary.cached_input_tokens,
+    cacheCreate: summary.cache_creation_input_tokens,
+    inputTotal:
+      summary.input_tokens + summary.cached_input_tokens + summary.cache_creation_input_tokens,
+  };
+}
+
+// Derive token totals from a loaded JobTrace's spans. Used when we
+// have the full step/span tree (active job that finished loading).
+// Otherwise prefer `summaryTokens` so the sidebar stays populated for
+// jobs the user hasn't drilled into yet.
+function traceTokens(trace: JobTrace): JobTokenTotals {
   let input = 0;
   let output = 0;
   let cached = 0;
   let cacheCreate = 0;
-  for (const rs of job.steps) {
+  for (const rs of trace.steps) {
     for (const span of rs.spans) {
       if (span.kind.kind === 'llm_call' && span.kind.result) {
         input += span.kind.result.input_tokens ?? 0;
@@ -911,12 +950,17 @@ function jobTokens(job: ReplayJob): {
 // message in the *first* LLM call's input_messages flagged with
 // `from_user`. The agent injects several `Role::User` messages of its
 // own (skill reminders, system-reminders) so role alone isn't enough
-// to identify the genuine prompt.
-function jobInputText(job: ReplayJob): string | null {
-  for (const rs of job.steps) {
+// to identify the genuine prompt. Requires the message log because
+// the LLM call may reference it via `LlmCallInputs::Persisted`.
+function jobInputText(trace: JobTrace, messageLog: SessionMessageRow[]): string | null {
+  for (const rs of trace.steps) {
     for (const span of rs.spans) {
       if (span.kind.kind === 'llm_call') {
-        const messages = span.kind.begin.input_messages;
+        const messages: ChatMessage[] = resolveInputMessages(
+          span.kind.begin.input_messages,
+          messageLog,
+          span.started_at,
+        );
         for (let i = messages.length - 1; i >= 0; i--) {
           if (messages[i].from_user) {
             const parts: string[] = [];
@@ -940,9 +984,9 @@ function jobInputText(job: ReplayJob): string | null {
 
 // Derive the final output text of the job: the most recent LLM call's
 // output_content (walking jobs back-to-front).
-function jobOutputText(job: ReplayJob): string | null {
-  for (let i = job.steps.length - 1; i >= 0; i--) {
-    const rs = job.steps[i];
+function jobOutputText(trace: JobTrace): string | null {
+  for (let i = trace.steps.length - 1; i >= 0; i--) {
+    const rs = trace.steps[i];
     for (let j = rs.spans.length - 1; j >= 0; j--) {
       const span = rs.spans[j];
       if (span.kind.kind === 'llm_call' && span.kind.result?.output_content) {
@@ -966,7 +1010,7 @@ function JobSidebar({
   active,
   onChange,
 }: {
-  jobs: ReplayJob[];
+  jobs: TraceJobSummary[];
   active: string;
   onChange: (id: string) => void;
 }) {
@@ -978,7 +1022,7 @@ function JobSidebar({
       <div className="flex flex-col">
         {jobs.map((j, i) => {
           const isActive = j.job_id === active;
-          const { inputTotal, output } = jobTokens(j);
+          const { inputTotal, output } = summaryTokens(j);
           return (
             <button
               type="button"
@@ -1008,36 +1052,48 @@ function JobSidebar({
 // ── Right panel default: job-level summary ─────────────────────────
 
 function JobSummaryPanel({
-  job,
+  summary,
+  trace,
+  traceLoading,
+  messageLog,
   jobIndex,
   totalJobs,
 }: {
-  job: ReplayJob | undefined;
+  summary: TraceJobSummary | undefined;
+  trace: JobTrace | undefined;
+  traceLoading: boolean;
+  messageLog: SessionMessageRow[];
   jobIndex: number;
   totalJobs: number;
 }) {
-  if (!job) {
+  if (!summary) {
     return (
       <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-white flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
         <div className="p-5 text-ink-soft italic text-[0.85rem]">No job available.</div>
       </div>
     );
   }
-  const { input, output, cached, cacheCreate, inputTotal } = jobTokens(job);
+  // Tokens come from the summary (always present); span-derived figures
+  // (llm/tool counts, input/output text) need the loaded trace.
+  const { input, output, cached, cacheCreate, inputTotal } = trace
+    ? traceTokens(trace)
+    : summaryTokens(summary);
   const total = inputTotal + output;
-  const inputText = jobInputText(job);
-  const outputText = jobOutputText(job);
+  const inputText = trace ? jobInputText(trace, messageLog) : null;
+  const outputText = trace ? jobOutputText(trace) : null;
   let llmCount = 0;
   let toolCount = 0;
-  for (const rs of job.steps) {
-    for (const span of rs.spans) {
-      if (span.kind.kind === 'llm_call') llmCount += 1;
-      else if (span.kind.kind === 'tool_call') toolCount += 1;
+  if (trace) {
+    for (const rs of trace.steps) {
+      for (const span of rs.spans) {
+        if (span.kind.kind === 'llm_call') llmCount += 1;
+        else if (span.kind.kind === 'tool_call') toolCount += 1;
+      }
     }
   }
-  const stepCount = job.steps.length;
-  const durMs = jobDurationMs(job);
-  const queuedMs = jobQueuedMs(job);
+  const stepCount = trace?.steps.length ?? 0;
+  const durMs = jobDurationMs(summary, trace);
+  const queuedMs = jobQueuedMs(summary);
 
   return (
     <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-white flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
@@ -1051,8 +1107,12 @@ function JobSummaryPanel({
               {totalJobs > 1 ? `Job #${jobIndex + 1}` : 'Job Overview'}
             </h3>
             <div className="text-ink-soft text-[0.8rem] font-mono truncate">
-              {job.job_status_kind} • {stepCount} {stepCount === 1 ? 'step' : 'steps'} •{' '}
-              {formatDuration(durMs)}
+              {summary.job_status_kind}
+              {trace
+                ? ` • ${stepCount} ${stepCount === 1 ? 'step' : 'steps'} • ${formatDuration(durMs)}`
+                : traceLoading
+                  ? ' • loading…'
+                  : ` • ${formatDuration(durMs)}`}
             </div>
           </div>
         </div>
@@ -1067,6 +1127,10 @@ function JobSummaryPanel({
             <pre className="whitespace-pre-wrap break-all font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3 max-h-72 overflow-y-auto">
               {inputText}
             </pre>
+          ) : traceLoading ? (
+            <div className="text-ink-soft text-[0.8rem] italic flex items-center gap-2">
+              <RiLoader4Line className="animate-spin" /> Loading job…
+            </div>
           ) : (
             <div className="text-ink-soft text-[0.8rem] italic">No user input recorded.</div>
           )}
@@ -1080,9 +1144,15 @@ function JobSummaryPanel({
             <pre className="whitespace-pre-wrap break-all font-mono text-[0.85rem] bg-gray-50 border-2 border-black rounded-md p-3 max-h-72 overflow-y-auto">
               {outputText}
             </pre>
+          ) : traceLoading ? (
+            <div className="text-ink-soft text-[0.8rem] italic flex items-center gap-2">
+              <RiLoader4Line className="animate-spin" /> Loading job…
+            </div>
           ) : (
             <div className="text-ink-soft text-[0.8rem] italic">
-              {job.job_status_kind === 'completed' ? 'No output text.' : 'Awaiting final output…'}
+              {summary.job_status_kind === 'completed'
+                ? 'No output text.'
+                : 'Awaiting final output…'}
             </div>
           )}
         </section>
@@ -1094,10 +1164,10 @@ function JobSummaryPanel({
           <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 font-mono text-[0.85rem]">
             <dt className="font-bold text-ink-soft">Job ID</dt>
             <dd className="break-all">
-              <code>{job.job_id}</code>
+              <code>{summary.job_id}</code>
             </dd>
             <dt className="font-bold text-ink-soft">Status</dt>
-            <dd>{job.job_status_kind}</dd>
+            <dd>{summary.job_status_kind}</dd>
             <dt className="font-bold text-ink-soft">Duration</dt>
             <dd>{formatDuration(durMs)}</dd>
             {queuedMs !== null && queuedMs > 0 && (
@@ -1143,54 +1213,35 @@ function JobSummaryPanel({
 
 // ── Page ─────────────────────────────────────────────────────────────
 
-function deriveSpanIndex(replay: SessionReplay | null): Map<string, Span> {
+function deriveSpanIndex(trace: JobTrace | undefined): Map<string, Span> {
   const m = new Map<string, Span>();
-  if (!replay) return m;
-  for (const job of replay.jobs) {
-    for (const rs of job.steps) {
-      for (const span of rs.spans) {
-        m.set(span.id, span);
-      }
+  if (!trace) return m;
+  for (const rs of trace.steps) {
+    for (const span of rs.spans) {
+      m.set(span.id, span);
     }
   }
   return m;
 }
 
-function findStepIdForSpan(replay: SessionReplay | null, spanId: string): string | null {
-  if (!replay) return null;
-  for (const job of replay.jobs) {
-    for (const rs of job.steps) {
-      if (rs.spans.some((s) => s.id === spanId)) return rs.step.id;
-    }
+function findStepIdForSpan(trace: JobTrace | undefined, spanId: string): string | null {
+  if (!trace) return null;
+  for (const rs of trace.steps) {
+    if (rs.spans.some((s) => s.id === spanId)) return rs.step.id;
   }
   return null;
 }
 
-function findJobIdForSpan(replay: SessionReplay | null, spanId: string): string | null {
-  if (!replay) return null;
-  for (const job of replay.jobs) {
-    for (const rs of job.steps) {
-      if (rs.spans.some((s) => s.id === spanId)) return job.job_id;
-    }
-  }
-  return null;
+function isJobLive(status: string): boolean {
+  return status === 'pending' || status === 'in_progress' || status === 'stuck';
 }
 
-function anyJobNonTerminal(replay: SessionReplay | null): boolean {
-  if (!replay) return false;
-  return replay.jobs.some(
-    (j) => j.job_status_kind === 'pending' || j.job_status_kind === 'in_progress' || j.job_status_kind === 'stuck',
-  );
-}
-
-function anySpanPending(replay: SessionReplay | null): boolean {
-  if (!replay) return false;
-  for (const job of replay.jobs) {
-    for (const rs of job.steps) {
-      if (!isTerminal(rs.step.outcome)) return true;
-      for (const s of rs.spans) {
-        if (!isTerminal(s.outcome)) return true;
-      }
+function traceHasPendingSpan(trace: JobTrace | undefined): boolean {
+  if (!trace) return false;
+  for (const rs of trace.steps) {
+    if (!isTerminal(rs.step.outcome)) return true;
+    for (const s of rs.spans) {
+      if (!isTerminal(s.outcome)) return true;
     }
   }
   return false;
@@ -1204,28 +1255,32 @@ export function TraceSessionPage() {
   const client = useAdminClient();
   const { logout } = useAuth();
 
-  const [replay, setReplay] = useState<SessionReplay | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [overview, setOverview] = useState<TraceOverview | null>(null);
+  const [jobTraces, setJobTraces] = useState<Map<string, JobTrace>>(() => new Map());
+  const [overviewLoading, setOverviewLoading] = useState(false);
+  const [activeJobLoading, setActiveJobLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [refreshKey, setRefreshKey] = useState(0);
+  const [overviewRefreshKey, setOverviewRefreshKey] = useState(0);
+  const [jobRefreshKey, setJobRefreshKey] = useState(0);
 
   const sessionId = id ?? '';
   const jobIdParam = searchParams.get('job');
   const spanIdParam = searchParams.get('span');
   const tabParam = (searchParams.get('tab') as 'io' | 'meta' | 'events' | null) ?? 'io';
 
-  // Fetch / refetch.
+  // Fetch the cheap overview (session messages + job summaries).
+  // Reset per-session caches when the session id changes.
   useEffect(() => {
     let cancelled = false;
-    async function fetchReplay() {
+    async function fetchOverview() {
       if (!sessionId) return;
       if (isMock) {
-        setReplay(getMockSessionReplay(sessionId));
+        setOverview(getMockTraceOverview(sessionId));
         setError(null);
-        setLoading(false);
+        setOverviewLoading(false);
         return;
       }
-      setLoading(true);
+      setOverviewLoading(true);
       setError(null);
       try {
         const { data, error: apiError, response } = await client.GET('/v1/traces/{session_id}', {
@@ -1240,41 +1295,118 @@ export function TraceSessionPage() {
           setError((apiError as { error?: string })?.error || `HTTP Error ${response.status}`);
           return;
         }
-        // Endpoint is untyped JSON server-side; cast to mirrored shape.
-        setReplay(data as unknown as SessionReplay);
+        setOverview(data as unknown as TraceOverview);
       } catch (e) {
         if (cancelled) return;
         setError(
           e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway',
         );
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) setOverviewLoading(false);
       }
     }
-    void fetchReplay();
+    void fetchOverview();
     return () => {
       cancelled = true;
     };
-  }, [client, isMock, logout, sessionId, refreshKey]);
+  }, [client, isMock, logout, sessionId, overviewRefreshKey]);
 
-  // Smart polling — visibility-aware. 2s while non-terminal, 10s once
-  // terminal. Stops entirely if every span is terminal AND every job is
-  // terminal.
-  const polling = useMemo(() => anyJobNonTerminal(replay) || anySpanPending(replay), [replay]);
+  // Reset cached per-job traces whenever the session changes so a fork
+  // navigation doesn't surface a stale tree.
   useEffect(() => {
-    if (isMock) return;
-    const cadence = polling ? POLL_ACTIVE_MS : POLL_TERMINAL_MS;
-    if (!polling && replay !== null) return; // fully terminal, stop
-    const tick = () => {
-      if (document.visibilityState === 'visible') {
-        setRefreshKey((k) => k + 1);
+    setJobTraces(new Map());
+  }, [sessionId]);
+
+  // Derive the active job id from URL ∩ overview. Default to the
+  // oldest job (sidebar's `#1`) when no URL hint resolves.
+  const activeJobId =
+    jobIdParam && overview?.jobs.some((j) => j.job_id === jobIdParam)
+      ? jobIdParam
+      : (overview?.jobs[0]?.job_id ?? '');
+  const activeJobSummary = overview?.jobs.find((j) => j.job_id === activeJobId);
+  const activeJobTrace = activeJobId ? jobTraces.get(activeJobId) : undefined;
+  const messageLog = overview?.session_messages ?? [];
+
+  // Fetch the active job's step/span tree on demand. Re-fires when the
+  // user picks a different sidebar entry or the polling tick bumps
+  // `jobRefreshKey`. Caches per job id; bumping the key re-fetches the
+  // active job only.
+  useEffect(() => {
+    if (!activeJobId) return;
+    let cancelled = false;
+    async function fetchJobTrace() {
+      if (isMock) {
+        const mock = getMockJobTrace(sessionId, activeJobId);
+        if (mock) {
+          setJobTraces((prev) => {
+            const next = new Map(prev);
+            next.set(activeJobId, mock);
+            return next;
+          });
+        }
+        setActiveJobLoading(false);
+        return;
       }
+      setActiveJobLoading(true);
+      try {
+        const { data, error: apiError, response } = await client.GET(
+          '/v1/traces/{session_id}/jobs/{job_id}',
+          { params: { path: { session_id: sessionId, job_id: activeJobId } } },
+        );
+        if (cancelled) return;
+        if (response.status === 401) {
+          logout();
+          return;
+        }
+        if (apiError || !response.ok) {
+          // Don't blow away the overview-level page; show inline panel
+          // hints instead. A 404 here is harmless (job deleted between
+          // overview and detail fetches).
+          return;
+        }
+        const trace = data as unknown as JobTrace;
+        setJobTraces((prev) => {
+          const next = new Map(prev);
+          next.set(activeJobId, trace);
+          return next;
+        });
+      } catch {
+        // Network errors on the per-job fetch are non-fatal — keep the
+        // overview visible and let the next poll retry.
+      } finally {
+        if (!cancelled) setActiveJobLoading(false);
+      }
+    }
+    void fetchJobTrace();
+    return () => {
+      cancelled = true;
     };
+  }, [client, isMock, logout, sessionId, activeJobId, jobRefreshKey]);
+
+  // Polling — visibility-aware, two-tier.
+  //   * Active job non-terminal → bump `jobRefreshKey` every 2s.
+  //   * Any *other* job non-terminal → bump `overviewRefreshKey` every
+  //     10s so the sidebar reflects state changes elsewhere.
+  // If everything is fully terminal, no polling at all.
+  const activeIsLive =
+    !!activeJobSummary &&
+    (isJobLive(activeJobSummary.job_status_kind) || traceHasPendingSpan(activeJobTrace));
+  const anyJobLive = overview?.jobs.some((j) => isJobLive(j.job_status_kind)) ?? false;
+  const polling = activeIsLive || anyJobLive;
+
+  useEffect(() => {
+    if (isMock || !polling) return;
+    const tick = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (activeIsLive) setJobRefreshKey((k) => k + 1);
+      setOverviewRefreshKey((k) => k + 1);
+    };
+    const cadence = activeIsLive ? POLL_ACTIVE_MS : POLL_TERMINAL_MS;
     const t = window.setInterval(tick, cadence);
     return () => window.clearInterval(t);
-  }, [isMock, polling, replay]);
+  }, [isMock, polling, activeIsLive]);
 
-  const spanIndex = useMemo(() => deriveSpanIndex(replay), [replay]);
+  const spanIndex = useMemo(() => deriveSpanIndex(activeJobTrace), [activeJobTrace]);
 
   const updateUrl = useCallback(
     (next: Partial<{ job: string | null; span: string | null; tab: string | null }>) => {
@@ -1297,11 +1429,10 @@ export function TraceSessionPage() {
 
   const handleJumpToLlm = useCallback(
     (llmSpanId: string) => {
+      // Stays within the active job — `tool_call` `triggered_by` only
+      // ever points at an LLM span in the same step.
       updateUrl({ span: llmSpanId });
-      // Scroll the step into view.
-      const stepId = findStepIdForSpan(replay, llmSpanId);
-      const jobId = findJobIdForSpan(replay, llmSpanId);
-      if (jobId) updateUrl({ job: jobId, span: llmSpanId });
+      const stepId = findStepIdForSpan(activeJobTrace, llmSpanId);
       if (stepId) {
         // setTimeout so the panel re-renders with the new selection first.
         setTimeout(() => {
@@ -1311,7 +1442,7 @@ export function TraceSessionPage() {
         }, 16);
       }
     },
-    [replay, updateUrl],
+    [activeJobTrace, updateUrl],
   );
 
   const handleDrillIntoChild = useCallback(
@@ -1321,14 +1452,19 @@ export function TraceSessionPage() {
     [navigate],
   );
 
-  if (loading && !replay) {
+  const handleManualRefresh = useCallback(() => {
+    setOverviewRefreshKey((k) => k + 1);
+    setJobRefreshKey((k) => k + 1);
+  }, []);
+
+  if (overviewLoading && !overview) {
     return (
       <div className="p-5 text-ink-soft text-[0.95rem] flex items-center gap-2">
         <RiLoader4Line className="animate-spin" /> Loading trace…
       </div>
     );
   }
-  if (error && !replay) {
+  if (error && !overview) {
     return (
       <div className="p-5">
         <div className="bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
@@ -1337,16 +1473,12 @@ export function TraceSessionPage() {
       </div>
     );
   }
-  if (!replay) {
+  if (!overview) {
     return <div className="p-5 text-ink-soft">No trace.</div>;
   }
 
-  const activeJobId =
-    jobIdParam && replay.jobs.some((j) => j.job_id === jobIdParam)
-      ? jobIdParam
-      : (replay.jobs[0]?.job_id ?? '');
-  const activeJob = replay.jobs.find((j) => j.job_id === activeJobId) ?? replay.jobs[0];
   const selectedSpan = spanIdParam ? (spanIndex.get(spanIdParam) ?? null) : null;
+  const activeJobIndex = activeJobSummary ? overview.jobs.indexOf(activeJobSummary) : 0;
 
   return (
     <div className="flex flex-col h-full overflow-hidden bg-canvas">
@@ -1360,19 +1492,21 @@ export function TraceSessionPage() {
           </h2>
           <div className="text-ink-soft text-[0.85rem] font-mono truncate flex items-center gap-3 flex-wrap">
             <span className="inline-flex items-center gap-1">
-              <RiCpuLine /> Session: {replay.session_id}
+              <RiCpuLine /> Session: {overview.session_id}
             </span>
             <span>
-              {replay.jobs.length} {replay.jobs.length === 1 ? 'job' : 'jobs'}
+              {overview.jobs.length} {overview.jobs.length === 1 ? 'job' : 'jobs'}
             </span>
-            {activeJob && (
+            {activeJobSummary && (
               <span className="inline-flex items-center gap-2">
                 <span className="text-ink-soft uppercase text-[0.7rem] font-bold tracking-wider">
-                  {replay.jobs.length === 1 ? 'Tokens' : `Job #${replay.jobs.indexOf(activeJob) + 1}`}
+                  {overview.jobs.length === 1 ? 'Tokens' : `Job #${activeJobIndex + 1}`}
                 </span>
                 {(() => {
-                  const t = jobTokens(activeJob);
-                  const d = jobDurationMs(activeJob);
+                  const t = activeJobTrace
+                    ? traceTokens(activeJobTrace)
+                    : summaryTokens(activeJobSummary);
+                  const d = jobDurationMs(activeJobSummary, activeJobTrace);
                   return (
                     <>
                       <span className="text-ink">↑ {t.inputTotal.toLocaleString()}</span>
@@ -1391,8 +1525,8 @@ export function TraceSessionPage() {
           </div>
         </div>
         <Button
-          onClick={() => setRefreshKey((k) => k + 1)}
-          disabled={loading || isMock}
+          onClick={handleManualRefresh}
+          disabled={overviewLoading || activeJobLoading || isMock}
           className="!py-2 !px-3 !text-[0.85rem] h-9 gap-1.5"
         >
           <RiRefreshLine className="text-lg shrink-0" /> Refresh
@@ -1401,19 +1535,24 @@ export function TraceSessionPage() {
 
       <div className="flex-1 flex overflow-hidden min-h-0">
         <JobSidebar
-          jobs={replay.jobs}
+          jobs={overview.jobs}
           active={activeJobId}
           onChange={(j) => updateUrl({ job: j, span: null })}
         />
 
         <div className="flex-1 overflow-y-scroll p-5">
           <div className="max-w-4xl mx-auto space-y-4 pb-10">
-            {activeJob?.steps.map((rs) => (
+            {activeJobTrace?.steps.map((rs) => (
               <div key={rs.step.id} data-step-id={rs.step.id}>
                 <StepBlock rs={rs} selectedSpanId={spanIdParam} onSelect={handleSelectSpan} />
               </div>
             ))}
-            {(!activeJob || activeJob.steps.length === 0) && (
+            {activeJobLoading && !activeJobTrace && (
+              <div className="text-ink-soft text-[0.95rem] italic flex items-center gap-2">
+                <RiLoader4Line className="animate-spin" /> Loading job…
+              </div>
+            )}
+            {activeJobTrace && activeJobTrace.steps.length === 0 && (
               <div className="text-ink-soft text-[0.95rem] italic">No steps yet for this job.</div>
             )}
           </div>
@@ -1422,6 +1561,7 @@ export function TraceSessionPage() {
         {selectedSpan ? (
           <SpanDetailPanel
             span={selectedSpan}
+            messageLog={messageLog}
             tab={tabParam}
             onTabChange={(t) => updateUrl({ tab: t })}
             onJumpToLlm={handleJumpToLlm}
@@ -1429,9 +1569,12 @@ export function TraceSessionPage() {
           />
         ) : (
           <JobSummaryPanel
-            job={activeJob}
-            jobIndex={activeJob ? replay.jobs.indexOf(activeJob) : 0}
-            totalJobs={replay.jobs.length}
+            summary={activeJobSummary}
+            trace={activeJobTrace}
+            traceLoading={activeJobLoading}
+            messageLog={messageLog}
+            jobIndex={activeJobIndex}
+            totalJobs={overview.jobs.length}
           />
         )}
       </div>

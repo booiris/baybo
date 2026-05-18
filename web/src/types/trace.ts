@@ -103,11 +103,23 @@ export interface ToolCallOrigin {
   tool_use_id: string;
 }
 
+/**
+ * Mirrors `aura_trace::LlmCallInputs` (`#[serde(untagged)]`). The
+ * inline array variant matches the long-standing wire shape; the
+ * `{ last_ordinal }` object variant is what the per-job trace endpoint
+ * returns for main-agent spans whose transcript lives in
+ * `session_messages`. Use `resolveInputMessages` to flatten either
+ * form into a `ChatMessage[]` for rendering.
+ */
+export type LlmCallInputs =
+  | ChatMessage[]
+  | { last_ordinal: number };
+
 export interface LlmCallBegin {
   model_id: string;
   provider: string;
   provider_config_hash: string;
-  input_messages: ChatMessage[];
+  input_messages: LlmCallInputs;
   temperature?: number | null;
 }
 
@@ -233,8 +245,53 @@ export interface ReplayStep {
   spans: Span[];
 }
 
-export interface ReplayJob {
+// ── Trace overview / per-job split (matches aura_query) ──────────────
+
+/**
+ * Mirrors `aura_session::StoredMessage` on the wire. Used to hydrate
+ * `LlmCallInputs::Persisted` slices in the client without the server
+ * re-inlining the same prefix into every span.
+ */
+export interface SessionMessageRow {
+  ordinal: number;
+  superseded_by?: number | null;
+  created_at: string;
+  message: ChatMessage;
+}
+
+/**
+ * Per-job row in `TraceOverview`. Carries everything the sidebar +
+ * job-summary panel need before the user drills into a specific job —
+ * notably the `↑in ↓out` token chips, aggregated server-side from the
+ * cost store so the client doesn't need the span tree to render them.
+ * `is_inherited === true` rows live in the parent of a UserFork session.
+ */
+export interface TraceJobSummary {
   job_id: string;
+  session_id: string;
+  job_status_kind: JobStatusKind;
+  created_at: string;
+  started_at?: string | null;
+  ended_at?: string | null;
+  is_inherited: boolean;
+  inherited_from_session_id?: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens: number;
+  cache_creation_input_tokens: number;
+}
+
+/** Response shape of `GET /v1/traces/{session_id}`. */
+export interface TraceOverview {
+  session_id: string;
+  session_messages: SessionMessageRow[];
+  jobs: TraceJobSummary[];
+}
+
+/** Response shape of `GET /v1/traces/{session_id}/jobs/{job_id}`. */
+export interface JobTrace {
+  job_id: string;
+  session_id: string;
   job_status_kind: JobStatusKind;
   created_at?: string | null;
   started_at?: string | null;
@@ -242,7 +299,45 @@ export interface ReplayJob {
   steps: ReplayStep[];
 }
 
-export interface SessionReplay {
-  session_id: string;
-  jobs: ReplayJob[];
+/**
+ * Slice the active-as-of-`lastOrdinal` window out of
+ * `session_messages`, mirroring `QueryApi::hydrate_persisted_inputs`:
+ *
+ *   WHERE ordinal <= lastOrdinal
+ *     AND (superseded_by IS NULL OR superseded_by > lastOrdinal)
+ *
+ * If any candidate row was written *after* the span started, the
+ * current log is from a different epoch (parent session reset, ordinal
+ * reuse) and we return an empty slice rather than misleading content.
+ */
+export function hydratePersistedInput(
+  log: SessionMessageRow[],
+  lastOrdinal: number,
+  spanStartedAt: string,
+): ChatMessage[] {
+  const candidates = log.filter(
+    (m) =>
+      m.ordinal <= lastOrdinal &&
+      (m.superseded_by == null || m.superseded_by > lastOrdinal),
+  );
+  const spanStart = new Date(spanStartedAt).getTime();
+  if (candidates.some((m) => new Date(m.created_at).getTime() > spanStart)) {
+    return [];
+  }
+  return candidates.map((c) => c.message);
+}
+
+/**
+ * Flatten an `LlmCallBegin.input_messages` field to a `ChatMessage[]`
+ * regardless of which variant the wire used. `log` is the
+ * `session_messages` array from the overview call; `spanStartedAt`
+ * comes from the owning `Span.started_at`.
+ */
+export function resolveInputMessages(
+  input: LlmCallInputs,
+  log: SessionMessageRow[],
+  spanStartedAt: string,
+): ChatMessage[] {
+  if (Array.isArray(input)) return input;
+  return hydratePersistedInput(log, input.last_ordinal, spanStartedAt);
 }

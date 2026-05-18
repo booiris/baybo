@@ -2135,7 +2135,7 @@
           {
             "name": "session_id",
             "in": "path",
-            "description": "Session id whose trace to export",
+            "description": "Session id whose trace overview to fetch",
             "required": true,
             "schema": {
               "type": "string"
@@ -2144,7 +2144,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Per-session trace tree: jobs, their steps, and the spans under each step. Untyped JSON to keep the admin surface decoupled from internal trace crate changes.",
+            "description": "Per-session trace overview: session_messages log + job summaries (no step/span data). Untyped JSON to keep the admin surface decoupled from internal trace crate changes.",
             "content": {
               "application/json": {
                 "schema": {}
@@ -2163,6 +2163,74 @@
           },
           "404": {
             "description": "No trace for that session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/traces/{session_id}/jobs/{job_id}": {
+      "get": {
+        "tags": [
+          "traces"
+        ],
+        "operationId": "get_job_trace",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id this job belongs to (or inherits from); used for route scoping only",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Job id whose step/span tree to fetch",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64 }` (Persisted) or `ChatMessage[]` (Inline); the client slices the message log it received from the overview call.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid job id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job",
             "content": {
               "application/json": {
                 "schema": {
