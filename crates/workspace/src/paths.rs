@@ -4,7 +4,7 @@
 //! libsql database, MCP config, sidecar cache — is resolved through one of
 //! the constants or helpers in this module. Keeping the strings in a single
 //! leaf-level crate prevents the same filename from drifting across
-//! `gateway`, `tools`, `code-builder`, the binary entrypoints, etc.
+//! `gateway`, `tools`, the binary entrypoints, etc.
 //!
 //! Layout under a workspace root:
 //!
@@ -15,7 +15,7 @@
 //!   skills/            # standalone git repo: user skill definitions
 //!   .key/              # not version-controlled: encryption.key
 //!   state/             # not version-controlled: storage.db, aura.lock, channel.port, browser/profile
-//!   work/              # not version-controlled: sandbox FS scope; code-builder/<uuid>/, future scratch
+//!   work/              # not version-controlled: sandbox FS scope; .uv/ (uv cache + downloaded pythons + tools), other scratch
 //!   logs/              # not version-controlled: aura.log.YYYY-MM-DD, channel/<type>.log, sessions/<id>.jsonl
 //! ```
 //!
@@ -49,7 +49,7 @@ pub const KEY_DIR: &str = ".key";
 /// Persistent runtime state (db, locks, ports, browser profile). Not version-controlled.
 pub const STATE_DIR: &str = "state";
 
-/// Tool-generated scratch (code-builder runs, future scratch dirs). Not version-controlled.
+/// Tool-generated scratch (uv state, future scratch dirs). Not version-controlled.
 pub const WORK_DIR: &str = "work";
 
 /// Rolling log files (gateway, channels, per-session LLM call logs). Not version-controlled.
@@ -124,20 +124,12 @@ pub const SUMMARY_FILE_TMP: &str = "summary.md.tmp";
 // Files inside `work/` (not version-controlled)
 // ---------------------------------------------------------------------------
 
-/// Code-builder scratch parent inside [`WORK_DIR`]. Per-call scratch dirs
-/// sit directly under `<WORK_DIR>/<CODE_BUILDER_SUBDIR>/<uuid>/`. Hidden
-/// (leading dot) so the agent's working directory stays uncluttered.
-pub const CODE_BUILDER_SUBDIR: &str = ".code-builder";
-
-/// Per-call code-builder run dir layout, all relative to
-/// `<WORK_DIR>/<CODE_BUILDER_SUBDIR>/<uuid>/`. The `*.txt` overflow
-/// files are only written when stdout/stderr exceed the inline cap.
-pub const CODE_BUILDER_SCRIPT_FILE: &str = "script.py";
-pub const CODE_BUILDER_STDOUT_FILE: &str = "stdout.txt";
-pub const CODE_BUILDER_STDERR_FILE: &str = "stderr.txt";
-pub const CODE_BUILDER_TOOL_CALL_FILE: &str = "tool_call.json";
-pub const CODE_BUILDER_UV_CACHE_SUBDIR: &str = "uv-cache";
-pub const CODE_BUILDER_WORKDIR_SUBDIR: &str = "workdir";
+/// Workspace-scoped `uv` state parent inside [`WORK_DIR`]. The Bash tool
+/// exports `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, `UV_TOOL_DIR`, and
+/// `UV_TOOL_BIN_DIR` rooted here so any `uv …` invocation caches into the
+/// workspace instead of polluting `~/.cache/uv` / `~/.local/share/uv`.
+/// Hidden (leading dot) so the agent's working directory stays uncluttered.
+pub const UV_STATE_SUBDIR: &str = ".uv";
 
 /// Browser sidecar font drop-in dir inside [`WORK_DIR`]. Pinned as a
 /// Chrome fontconfig `<dir>` at boot — drop a font here and the next
@@ -475,8 +467,29 @@ impl WorkspacePaths {
 
     // -- work/ contents --
 
-    pub fn code_builder_dir(&self) -> PathBuf {
-        self.work_dir().join(CODE_BUILDER_SUBDIR)
+    /// Workspace-scoped uv state parent: `<root>/work/.uv/`.
+    pub fn uv_state_dir(&self) -> PathBuf {
+        self.work_dir().join(UV_STATE_SUBDIR)
+    }
+
+    /// uv download / wheel cache: `<root>/work/.uv/cache/`.
+    pub fn uv_cache_dir(&self) -> PathBuf {
+        self.uv_state_dir().join("cache")
+    }
+
+    /// uv-managed Python installations: `<root>/work/.uv/python/`.
+    pub fn uv_python_dir(&self) -> PathBuf {
+        self.uv_state_dir().join("python")
+    }
+
+    /// `uv tool install` target: `<root>/work/.uv/tools/`.
+    pub fn uv_tool_dir(&self) -> PathBuf {
+        self.uv_state_dir().join("tools")
+    }
+
+    /// `uv tool install` bin shim dir: `<root>/work/.uv/bin/`.
+    pub fn uv_tool_bin_dir(&self) -> PathBuf {
+        self.uv_state_dir().join("bin")
     }
 
     pub fn browser_fonts_dir(&self) -> PathBuf {
@@ -548,10 +561,14 @@ mod tests {
             PathBuf::from("/var/aura/logs/sessions"),
         );
         assert_eq!(p.skills_dir(), PathBuf::from("/var/aura/skills"));
+        assert_eq!(p.uv_state_dir(), PathBuf::from("/var/aura/work/.uv"));
+        assert_eq!(p.uv_cache_dir(), PathBuf::from("/var/aura/work/.uv/cache"));
         assert_eq!(
-            p.code_builder_dir(),
-            PathBuf::from("/var/aura/work/.code-builder"),
+            p.uv_python_dir(),
+            PathBuf::from("/var/aura/work/.uv/python"),
         );
+        assert_eq!(p.uv_tool_dir(), PathBuf::from("/var/aura/work/.uv/tools"));
+        assert_eq!(p.uv_tool_bin_dir(), PathBuf::from("/var/aura/work/.uv/bin"));
         assert_eq!(
             p.browser_fonts_dir(),
             PathBuf::from("/var/aura/work/.fonts"),

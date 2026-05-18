@@ -4,19 +4,17 @@ use std::time::{Duration, SystemTime};
 use crate::error::JanitorError;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum EntryShape {
-    File,
-    Dir,
-}
-
-#[derive(Debug, Clone, Copy)]
 pub(crate) struct DirSweep<'a, F: Fn(&str) -> bool> {
     pub dir: &'a Path,
     pub ttl: Duration,
-    pub shape: EntryShape,
     pub name_predicate: F,
 }
 
+/// Walk `plan.dir`, removing **regular files** whose name matches
+/// `plan.name_predicate` and whose mtime is older than `plan.ttl`. The
+/// janitor doesn't sweep whole subtrees today — uv manages its own
+/// cache eviction (`uv cache prune`), and session-log + log-file
+/// sweeps are file-shaped.
 pub(crate) async fn sweep_directory<F>(plan: DirSweep<'_, F>) -> Result<usize, JanitorError>
 where
     F: Fn(&str) -> bool,
@@ -50,10 +48,8 @@ where
             Err(e) => return Err(JanitorError::fs(entry.path().display(), e)),
         };
 
-        match plan.shape {
-            EntryShape::File if !metadata.is_file() => continue,
-            EntryShape::Dir if !metadata.is_dir() => continue,
-            _ => {}
+        if !metadata.is_file() {
+            continue;
         }
 
         let modified = match metadata.modified() {
@@ -66,11 +62,7 @@ where
         }
 
         let path = entry.path();
-        let result = match plan.shape {
-            EntryShape::File => tokio::fs::remove_file(&path).await,
-            EntryShape::Dir => tokio::fs::remove_dir_all(&path).await,
-        };
-        match result {
+        match tokio::fs::remove_file(&path).await {
             Ok(()) => removed += 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -87,10 +79,6 @@ where
 
 pub(crate) fn is_session_log(name: &str) -> bool {
     name.ends_with(".jsonl")
-}
-
-pub(crate) fn is_uuid_dir(name: &str) -> bool {
-    uuid::Uuid::parse_str(name).is_ok()
 }
 
 pub(crate) fn is_log_file(name: &str) -> bool {
@@ -114,9 +102,6 @@ mod tests {
     fn name_predicates_match_expected_shapes() {
         assert!(is_session_log("abc.jsonl"));
         assert!(!is_session_log("abc.json"));
-
-        assert!(is_uuid_dir("00000000-0000-0000-0000-000000000000"));
-        assert!(!is_uuid_dir("not-a-uuid"));
 
         assert!(is_log_file("aura.log.2026-04-27"));
         assert!(is_log_file("telegram.log.2026-04-27"));

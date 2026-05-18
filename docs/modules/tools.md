@@ -186,7 +186,6 @@ Each `Tool` impl declares its own outer wall-clock cap via `fn max_timeout(&self
 Current overrides:
 
 - `BashTool` → 600 s — builds, test suites, and migrations regularly run for minutes; the per-call `timeout_ms` parameter still tightens further inside the tool.
-- `CodeBuilderTool` → 180 s — the sandboxed program is hard-capped at 120 s; the extra 60 s covers planner LLM round-trip, uv setup, and per-path approval prompts.
 - `WebFetchTool` → 120 s — slow upstreams need headroom, but a stuck host shouldn't pin a turn forever; `connect_timeout` independently caps the connect phase at 10 s.
 - `SkillInstallTool` → 120 s — risk-assessor LLM call + recursive directory copy + registry hot-reload, against bundles that may carry templates + scripts + reference docs.
 - `GlobTool`, `GrepTool`, `SendFileTool`, `SkillTool`, `McpTool` → 60 s — recursive walks against large monorepos (`Glob`, `Grep`), 100-MiB file streams into the blob store (`SendFile`), the per-call risk-assessor LLM round-trip (`Skill`), and arbitrary upstream MCP servers (`McpTool`) all routinely overflow the 30 s default.

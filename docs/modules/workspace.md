@@ -4,10 +4,10 @@
 
 The `workspace` crate is the single source of truth for Aura's workspace layout. It owns:
 
-- **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for every workspace-relative file/dir name (`profile/`, `skills/`, `state/`, `work/`, `logs/`, `aura.json`, `.mcp.json`, `storage.db`, `aura.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `.code-builder/`), the `ENV_CONFIG_PATH` constant (whose value is the env-var name `AURA_CONFIG_PATH`), and the `default_workspace_root` / `default_config_file` / `aura_cache_root` resolvers.
+- **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for every workspace-relative file/dir name (`profile/`, `skills/`, `state/`, `work/`, `logs/`, `aura.json`, `.mcp.json`, `storage.db`, `aura.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `.uv/`), the `ENV_CONFIG_PATH` constant (whose value is the env-var name `AURA_CONFIG_PATH`), and the `default_workspace_root` / `default_config_file` / `aura_cache_root` resolvers.
 - **Identity I/O** (`io` feature, default-on): `WorkspaceManager`, `IdentityFiles`, `load_identity_files`, `write_identity_file`, `WorkspaceManager::ensure_layout` — the async readers/writers backing the three identity documents and the workspace-skeleton initializer.
 
-Pure-data consumers (e.g. `aura-config`, `aura-tools`, `aura-code-builder`) take this crate with `default-features = false` so they never inherit a transitive `tokio`/`anyhow` dependency just to read a path constant. Crates that actually drive workspace I/O (`aura-agent`, `aura-cli`, `aura-gateway`, the binary) depend on it with `features = ["io"]`.
+Pure-data consumers (e.g. `aura-config`, `aura-tools`) take this crate with `default-features = false` so they never inherit a transitive `tokio`/`anyhow` dependency just to read a path constant. Crates that actually drive workspace I/O (`aura-agent`, `aura-cli`, `aura-gateway`, the binary) depend on it with `features = ["io"]`.
 
 ## Layout
 
@@ -18,7 +18,7 @@ The workspace root is the single **project root** for the entire runtime: every 
   profile/         # standalone git repo: aura.json, .mcp.json, identity .md files
   skills/          # standalone git repo: workspace-local skill definitions
   state/           # not version-controlled: storage.db, aura.lock, channel.port, browser/profile
-  work/            # not version-controlled: .code-builder/<uuid>/, future scratch
+  work/            # not version-controlled: .uv/ (uv cache + downloaded pythons + tools), future scratch
   logs/            # not version-controlled: aura.log.<date>, channel/<type>.log.<date>, sessions/<id>.jsonl
 ```
 
@@ -41,7 +41,7 @@ checkout rather than polluting the real user home.
 | singleton lock   | `<workspace.path>/state/aura.lock`         |
 | channel port     | `<workspace.path>/state/channel.port`      |
 | browser profile  | `<workspace.path>/state/browser/profile/`  |
-| code-builder     | `<workspace.path>/work/.code-builder/<uuid>/` |
+| uv state         | `<workspace.path>/work/.uv/{cache,python,tools,bin}/` |
 | gateway logs     | `<workspace.path>/logs/aura.log.<date>`    |
 | channel logs     | `<workspace.path>/logs/channel/<channel_type>.log.<date>` |
 | session logs     | `<workspace.path>/logs/sessions/<session_id>.jsonl` |
@@ -83,7 +83,7 @@ They complement each other without overlapping.
 
 ### Why split state/work/logs from profile/skills
 
-The split exists so the user's git workflow stays clean: `profile/` and `skills/` are declarative, hand-edited content that belongs in source control; `state/` is mutable runtime state (libsql DB, locks, ports, browser profile) that would create churn or conflicts if committed; `work/` holds tool-generated scratch (code-builder runs) that has no long-term value; `logs/` is ephemeral. Each of the two declarative dirs is its own git repo, so the boundary is enforced by repo scope rather than a top-level ignore list — users can never accidentally commit `state/` because no enclosing repo includes it.
+The split exists so the user's git workflow stays clean: `profile/` and `skills/` are declarative, hand-edited content that belongs in source control; `state/` is mutable runtime state (libsql DB, locks, ports, browser profile) that would create churn or conflicts if committed; `work/` holds tool-generated scratch (uv caches, downloaded Python toolchains, ad-hoc shell output) that has no long-term value; `logs/` is ephemeral. Each of the two declarative dirs is its own git repo, so the boundary is enforced by repo scope rather than a top-level ignore list — users can never accidentally commit `state/` because no enclosing repo includes it.
 
 ## Constraints
 

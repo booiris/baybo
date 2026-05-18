@@ -77,6 +77,8 @@ WORK-DIR SCOPE: Bash may only touch files inside the workspace work directory ({
 
 BEFORE BROAD SCANS: Do not run `find`, `du`, recursive `ls`, or similar walks against unknown directories without first checking their size with a bounded probe (e.g. `ls -1 <dir> | wc -l`, or a shallow `find -maxdepth 2`). Large trees can hang the process.
 
+PYTHON: `python`, `python3`, and `pip` are shimmed to `uv run python` / `uv pip` inside this shell. For one-file scripts with third-party deps, declare them via PEP 723 inline metadata (`# /// script` block) so `uv run --script my.py` resolves them per-call. The shims are shell functions scoped to the outer `sh -c` — `bash -c '…'` subshells, `/usr/bin/python`, and Python's own `subprocess` calls bypass them.
+
 ENVIRONMENT:
 - Working directory: {{work_dir}}
 - Platform: {{platform}}"#;
@@ -90,17 +92,43 @@ pub struct BashTool {
     /// Absolute work directory (`<workspace>/work`). Sole writable area
     /// for Bash invocations.
     work_dir: PathBuf,
+    /// Pre-rendered `export UV_*=…; ` chain prepended to every command so
+    /// any `uv` invocation caches inside the workspace rather than
+    /// `~/.cache/uv` / `~/.local/share/uv`. Non-uv processes inherit and
+    /// ignore the variables — same loose-coupling rationale as
+    /// [`inject_aura_env`].
+    uv_env_prefix: String,
 }
 
 impl BashTool {
     pub fn new(workspace_paths: WorkspacePaths) -> Self {
-        let workspace_root = absolutise(workspace_paths.root());
-        let work_dir = absolutise(&workspace_paths.work_dir());
+        // Re-anchor at the absolutised root so the env-var values
+        // rendered by `build_uv_env_exports` are absolute regardless
+        // of whether `config.workspace.path` came in absolute — the
+        // subshell inherits these as-is and tools running with a
+        // different cwd must still resolve them.
+        let paths = WorkspacePaths::new(absolutise(workspace_paths.root()));
+        let workspace_root = paths.root().to_path_buf();
+        let work_dir = paths.work_dir();
         Self {
             description: build_description(&work_dir, std::env::consts::OS),
             workspace_root,
             work_dir,
+            uv_env_prefix: build_uv_env_exports(&paths),
         }
+    }
+
+    /// Prefix `command` with the workspace-scoped UV exports and the
+    /// Aura-CLI env injection. Two callers (the sandboxed `execute` path
+    /// and the unsandboxed retry below) compose the same `sh -c` body —
+    /// keep the ordering in one place so a future reshuffle doesn't
+    /// drift between them.
+    fn wrap_command(&self, command: &str) -> String {
+        let injected = inject_aura_env(command);
+        let mut out = String::with_capacity(self.uv_env_prefix.len() + injected.len());
+        out.push_str(&self.uv_env_prefix);
+        out.push_str(&injected);
+        out
     }
 }
 
@@ -109,6 +137,96 @@ fn build_description(work_dir: &Path, platform: &str) -> String {
         .replace("{{max_output_kib}}", &MAX_OUTPUT_KIB.to_string())
         .replace("{{work_dir}}", &work_dir.display().to_string())
         .replace("{{platform}}", platform)
+}
+
+type UvEnvVar = (&'static str, fn(&WorkspacePaths) -> PathBuf);
+
+/// `(env-var name, path accessor)` driving [`build_uv_env_exports`].
+/// Single source for the var-name → dir-helper pairing so adding a
+/// fifth `UV_…` knob is one row instead of four parallel call sites.
+const UV_ENV_VARS: &[UvEnvVar] = &[
+    ("UV_CACHE_DIR", WorkspacePaths::uv_cache_dir),
+    ("UV_PYTHON_INSTALL_DIR", WorkspacePaths::uv_python_dir),
+    ("UV_TOOL_DIR", WorkspacePaths::uv_tool_dir),
+    ("UV_TOOL_BIN_DIR", WorkspacePaths::uv_tool_bin_dir),
+];
+
+/// sh function definitions that shim `python` / `python3` / `pip` to the
+/// uv-managed equivalents. Functions only affect the immediate `sh -c`
+/// body — they don't propagate into `bash -c '…'` subshells or absolute
+/// `/usr/bin/python` invocations. That partial coverage is the trade-off
+/// for not touching `$PATH` (no on-disk shim dir, no surprising
+/// `which python` answer for tools that ask).
+const UV_SHELL_SHIMS: &str = "python() { uv run python \"$@\"; }; \
+                              python3() { uv run python \"$@\"; }; \
+                              pip() { uv pip \"$@\"; }; ";
+
+/// Trailing `; ` lets callers concatenate the command body directly
+/// without a separator.
+fn build_uv_env_exports(paths: &WorkspacePaths) -> String {
+    let mut out = String::new();
+    for (name, get) in UV_ENV_VARS {
+        let path = get(paths);
+        out.push_str("export ");
+        out.push_str(name);
+        out.push('=');
+        out.push_str(&sh_quote(&path.to_string_lossy()));
+        out.push_str("; ");
+    }
+    out.push_str(UV_SHELL_SHIMS);
+    out
+}
+
+/// Default Python toolchain prefetched at boot. Pinning to a specific
+/// minor keeps the resolved interpreter stable across boots (uv's
+/// "latest stable" tracks releases). Bumping this in code is the right
+/// mechanism — users who want a different version run `uv python
+/// install <ver>` themselves and uv picks the newest installed.
+const UV_PREWARM_PYTHON: &str = "3.13";
+
+/// Best-effort: prefetch a default Python toolchain into the workspace
+/// `UV_PYTHON_INSTALL_DIR` so the first agent-issued `python …` call
+/// doesn't stall on a cold ~30 MB cpython download. Spawns a detached
+/// tokio task; failure (uv not installed, network down, …) is logged
+/// at WARN and otherwise swallowed — the agent loop must not depend on
+/// this completing.
+pub fn spawn_uv_python_prewarm(paths: &WorkspacePaths) {
+    let env: Vec<(&'static str, PathBuf)> = UV_ENV_VARS
+        .iter()
+        .map(|(name, get)| (*name, get(paths)))
+        .collect();
+    tokio::spawn(async move {
+        let mut cmd = tokio::process::Command::new("uv");
+        cmd.args(["python", "install", UV_PREWARM_PYTHON]);
+        for (k, v) in &env {
+            cmd.env(k, v);
+        }
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
+        match cmd.output().await {
+            Ok(out) if out.status.success() => {
+                tracing::info!(
+                    version = UV_PREWARM_PYTHON,
+                    "uv python toolchain prefetched",
+                );
+            }
+            Ok(out) => {
+                tracing::warn!(
+                    version = UV_PREWARM_PYTHON,
+                    status = ?out.status,
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "uv python install exited non-zero",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not spawn `uv python install` (uv not on PATH?)",
+                );
+            }
+        }
+    });
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -252,7 +370,7 @@ impl Tool for BashTool {
             )));
         }
 
-        let args = vec!["-c".into(), inject_aura_env(&command)];
+        let args = vec!["-c".into(), self.wrap_command(&command)];
 
         let out = if matches!(aura_resolution, AuraResolution::Bypass) {
             // The OS sandbox masks `~/.aura`/`$AURA_HOME`, so a
@@ -290,8 +408,14 @@ impl Tool for BashTool {
                     // runner error, …). Offer the user a one-shot
                     // unsandboxed retry that surfaces the failure
                     // reason in the approval prompt.
-                    prompt_and_run_unsandboxed_retry(&command, cwd_ref, timeout, ctx, sandbox_err)
-                        .await?
+                    self.prompt_and_run_unsandboxed_retry(
+                        &command,
+                        cwd_ref,
+                        timeout,
+                        ctx,
+                        sandbox_err,
+                    )
+                    .await?
                 }
             }
         };
@@ -919,53 +1043,56 @@ fn split_into_subcommands(command: &str) -> Vec<Vec<&str>> {
     subs
 }
 
-async fn prompt_and_run_unsandboxed_retry(
-    command: &str,
-    cwd: Option<&Path>,
-    timeout: Duration,
-    ctx: &ToolContext,
-    sandbox_err: ToolError,
-) -> crate::Result<crate::SandboxedOutput> {
-    let Some(approval) = ctx.approval.as_ref() else {
-        return Err(ToolError::Execution(format!(
-            "sandboxed run failed and no mid-execution approval handle is wired, \
-             cannot offer unsandboxed retry: {sandbox_err}"
-        )));
-    };
-    let preview = format!(
-        "Sandboxed `Bash` invocation failed.\n\
-         Command : {command}\n\
-         Reason  : {sandbox_err}\n\
-         Approve to retry the SAME command WITHOUT the OS sandbox \
-         (full shell, no workspace cwd guard, no resource limits)."
-    );
-    // Cache must be bypassed: a prior sandboxed approval for this
-    // command does NOT cover an unsandboxed run, and we never persist
-    // an "approve always" on this elevated path either.
-    let decision = approval
-        .request_uncached(
-            "Bash",
-            &ctx.session_id,
-            &ctx.user,
-            vec![ResourceAccess::ExecCommand {
-                command: command.to_string(),
-            }],
-            preview,
-        )
-        .await;
-    match decision {
-        ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => {
-            let args = ["-c".to_string(), inject_aura_env(command)];
-            tokio::select! {
-                _ = ctx.cancellation_token.cancelled() => {
-                    Err(ToolError::Execution("cancelled".into()))
+impl BashTool {
+    async fn prompt_and_run_unsandboxed_retry(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        timeout: Duration,
+        ctx: &ToolContext,
+        sandbox_err: ToolError,
+    ) -> crate::Result<crate::SandboxedOutput> {
+        let Some(approval) = ctx.approval.as_ref() else {
+            return Err(ToolError::Execution(format!(
+                "sandboxed run failed and no mid-execution approval handle is wired, \
+                 cannot offer unsandboxed retry: {sandbox_err}"
+            )));
+        };
+        let preview = format!(
+            "Sandboxed `Bash` invocation failed.\n\
+             Command : {command}\n\
+             Reason  : {sandbox_err}\n\
+             Approve to retry the SAME command WITHOUT the OS sandbox \
+             (full shell, no workspace cwd guard, no resource limits)."
+        );
+        // Cache must be bypassed: a prior sandboxed approval for this
+        // command does NOT cover an unsandboxed run, and we never persist
+        // an "approve always" on this elevated path either.
+        let decision = approval
+            .request_uncached(
+                "Bash",
+                &ctx.session_id,
+                &ctx.user,
+                vec![ResourceAccess::ExecCommand {
+                    command: command.to_string(),
+                }],
+                preview,
+            )
+            .await;
+        match decision {
+            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => {
+                let args = ["-c".to_string(), self.wrap_command(command)];
+                tokio::select! {
+                    _ = ctx.cancellation_token.cancelled() => {
+                        Err(ToolError::Execution("cancelled".into()))
+                    }
+                    res = run_unsandboxed("sh", &args, cwd, timeout) => res,
                 }
-                res = run_unsandboxed("sh", &args, cwd, timeout) => res,
             }
+            ApprovalDecision::Deny => Err(ToolError::Execution(format!(
+                "sandboxed run failed and the unsandboxed retry was denied: {sandbox_err}"
+            ))),
         }
-        ApprovalDecision::Deny => Err(ToolError::Execution(format!(
-            "sandboxed run failed and the unsandboxed retry was denied: {sandbox_err}"
-        ))),
     }
 }
 
@@ -1161,6 +1288,54 @@ mod tests {
         assert!(
             after_eq.starts_with('/'),
             "exported path should be absolute, got: {after_eq}"
+        );
+    }
+
+    #[test]
+    fn build_uv_env_exports_points_at_workspace_subdirs() {
+        let paths = WorkspacePaths::new("/var/aura");
+        let prefix = build_uv_env_exports(&paths);
+        assert!(
+            prefix.contains("export UV_CACHE_DIR='/var/aura/work/.uv/cache'"),
+            "UV_CACHE_DIR missing or wrong, got: {prefix}",
+        );
+        assert!(
+            prefix.contains("export UV_PYTHON_INSTALL_DIR='/var/aura/work/.uv/python'"),
+            "UV_PYTHON_INSTALL_DIR missing or wrong, got: {prefix}",
+        );
+        assert!(
+            prefix.contains("export UV_TOOL_DIR='/var/aura/work/.uv/tools'"),
+            "UV_TOOL_DIR missing or wrong, got: {prefix}",
+        );
+        assert!(
+            prefix.contains("export UV_TOOL_BIN_DIR='/var/aura/work/.uv/bin'"),
+            "UV_TOOL_BIN_DIR missing or wrong, got: {prefix}",
+        );
+        assert!(
+            prefix.contains("python() { uv run python \"$@\"; }"),
+            "python shim function missing, got: {prefix}",
+        );
+        assert!(
+            prefix.contains("python3() { uv run python \"$@\"; }"),
+            "python3 shim function missing, got: {prefix}",
+        );
+        assert!(
+            prefix.contains("pip() { uv pip \"$@\"; }"),
+            "pip shim function missing, got: {prefix}",
+        );
+        assert!(
+            prefix.ends_with("; "),
+            "prefix must terminate with `; ` so the user command appends cleanly, got: {prefix}",
+        );
+    }
+
+    #[test]
+    fn build_uv_env_exports_quotes_paths_with_special_chars() {
+        let paths = WorkspacePaths::new("/tmp/aura's space");
+        let prefix = build_uv_env_exports(&paths);
+        assert!(
+            prefix.contains("export UV_CACHE_DIR='/tmp/aura'\\''s space/work/.uv/cache'"),
+            "UV_CACHE_DIR must be POSIX-quoted, got: {prefix}",
         );
     }
 
@@ -1504,9 +1679,18 @@ mod tests {
         let calls = fake.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].program, std::path::PathBuf::from("sh"));
-        assert_eq!(
-            calls[0].args,
-            vec!["-c".to_string(), "echo hello".to_string()]
+        assert_eq!(calls[0].args[0], "-c");
+        // Tighter than `contains` — locks the prefix to the head so a
+        // future reorder can't accidentally drop it and still pass.
+        assert!(
+            calls[0].args[1].starts_with("export UV_CACHE_DIR="),
+            "uv env prefix must lead the sh -c body, got: {}",
+            calls[0].args[1],
+        );
+        assert!(
+            calls[0].args[1].ends_with("echo hello"),
+            "command body should land at the tail of the sh -c arg, got: {}",
+            calls[0].args[1],
         );
     }
 
@@ -1613,7 +1797,17 @@ mod tests {
             .expect("pwd must run");
         let calls = fake.calls();
         assert_eq!(calls.len(), 1, "pwd must consult the sandbox now");
-        assert_eq!(calls[0].args, vec!["-c".to_string(), "pwd".to_string()]);
+        assert_eq!(calls[0].args[0], "-c");
+        assert!(
+            calls[0].args[1].starts_with("export UV_CACHE_DIR="),
+            "uv env prefix must lead the sh -c body, got: {}",
+            calls[0].args[1],
+        );
+        assert!(
+            calls[0].args[1].ends_with("pwd"),
+            "command body should land at the tail of the sh -c arg, got: {}",
+            calls[0].args[1],
+        );
     }
 
     #[tokio::test]

@@ -54,8 +54,8 @@ pub fn collect_profiles(
     let node_cmd = node_binary().display().to_string();
     let browser_font_dir = workspace_paths.browser_fonts_dir();
     // Pin the Chrome profile under the workspace by default so it sits
-    // next to other workspace-scoped state (logs, code-builder scratch)
-    // and follows the operator's `workspace.path` rather than living in
+    // next to other workspace-scoped state (logs, uv cache, …) and
+    // follows the operator's `workspace.path` rather than living in
     // `$XDG_CACHE_HOME`. Operator override (`browser.profile_dir`) still
     // wins when set.
     let workspace_browser_profile = workspace_paths.browser_profile_dir();
