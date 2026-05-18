@@ -373,9 +373,7 @@ async fn get_session(
     // WS-replayed one agree on what's a user-visible bubble.
     let transcript = tail
         .into_iter()
-        .filter_map(|(ordinal, created_at, msg)| {
-            chat_to_transcript_item(ordinal, created_at, msg)
-        })
+        .filter_map(|(ordinal, created_at, msg)| chat_to_transcript_item(ordinal, created_at, msg))
         .collect();
     Ok(Json(ChatSessionDetail {
         session_id,
@@ -640,10 +638,7 @@ async fn last_user_preview(
 /// them here rather than ship the raw multi-line text just to have
 /// the client throw the structure away.
 fn truncate_preview(text: &str) -> String {
-    let collapsed: String = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= PREVIEW_MAX_CHARS {
         return collapsed;
     }
