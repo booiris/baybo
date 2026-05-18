@@ -55,7 +55,7 @@ fn parse_spawn_request(value: &Value) -> Result<SubagentSpawnRequest, String> {
         task_description: p.task_description,
         must_include_context: p.must_include_context,
         timeout: Duration::from_secs(secs),
-        llm: p.llm,
+        llm: p.llm.filter(|s| !s.trim().is_empty()),
     })
 }
 
@@ -292,6 +292,18 @@ mod tests {
     fn parse_spawn_request_rejects_missing_task() {
         let v = json!({"timeout_secs": 60});
         assert!(parse_spawn_request(&v).is_err());
+    }
+
+    #[test]
+    fn parse_spawn_request_treats_blank_llm_as_unset() {
+        // Strict-JSON-schema LLMs sometimes emit `"llm": ""` instead of
+        // omitting the key — that must not reach the pool as a HashMap
+        // lookup key (it would log a spurious "entry not found" warning).
+        for blank in ["", "   ", "\t"] {
+            let v = json!({"task_description": "x", "llm": blank});
+            let req = parse_spawn_request(&v).unwrap();
+            assert_eq!(req.llm, None, "blank llm {blank:?} should be None");
+        }
     }
 
     #[test]

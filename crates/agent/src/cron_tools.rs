@@ -137,7 +137,10 @@ impl Tool for CronCreateTool {
 
         let timezone = p.timezone;
 
-        let schedule = match (p.schedule, p.at) {
+        let schedule = p.schedule.filter(|s| !s.trim().is_empty());
+        let at = p.at.filter(|s| !s.trim().is_empty());
+
+        let schedule = match (schedule, at) {
             (Some(_), Some(_)) => {
                 return Err(ToolError::InvalidParams(
                     "`schedule` and `at` are mutually exclusive".into(),
