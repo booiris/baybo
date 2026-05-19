@@ -7,6 +7,7 @@ use aura_model::{
     SubagentResult, SubagentSpawnRequest, User,
 };
 use chrono::Utc;
+use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -14,7 +15,7 @@ use tracing::warn;
 use crate::actor::AgentMessage;
 use crate::actor::router::Router;
 use crate::actor::subagent::await_subagent_terminal;
-use crate::external_agent::{ExternalAgent, ExternalAgentRequest};
+use crate::external_agent::{ExternalAgent, ExternalAgentEvent, ExternalAgentRequest};
 
 /// `output_tx` buffer for a subagent's actor. Intentionally smaller than
 /// the operator-configured channel size for top-level actors — a child
@@ -373,42 +374,83 @@ async fn run_external_agent(
     child_session_id: SessionId,
     session_manager: Arc<aura_session::SessionManager>,
 ) -> SubagentResult {
-    // The agent's own driver enforces the timeout and watches the
-    // cancel token; no outer select! needed here.
-    let outcome = match agent.run(request).await {
-        Ok(o) => o,
+    let cancel = request.cancel.clone();
+    let mut stream = match agent.run(request).await {
+        Ok(s) => s,
         Err(e) => {
-            let msg = e.to_string();
-            let status = if msg.contains("exceeded declared timeout") {
-                SubagentExitStatus::Timeout
-            } else if msg.contains("cancelled by parent") {
-                SubagentExitStatus::Cancelled
-            } else {
-                SubagentExitStatus::Failed(format!("external agent run: {e}"))
-            };
             return SubagentResult {
                 child_session_id,
                 final_content: None,
-                status,
+                status: SubagentExitStatus::Failed(format!("external agent run: {e}")),
             };
         }
     };
 
-    if let Some(key) = outcome.resume_key.as_deref()
-        && let Err(e) = persist_resume_key(&session_manager, &child_session_id, kind, key).await
-    {
-        warn!(
-            session_id = %child_session_id,
-            kind = %kind.as_str(),
-            error = %e,
-            "failed to persist resume_key; --resume will not work on the next call",
-        );
+    let mut final_content: Option<Vec<ContentBlock>> = None;
+    let mut final_status: Option<SubagentExitStatus> = None;
+
+    // The parser inside the agent already enforces the timeout against
+    // its own deadline. Adding a second wall-clock deadline here would
+    // (a) double the effective budget on cancel/timeout and (b) fire
+    // during long reasoning pauses where the parser is correctly idle.
+    // The cancel token is the only outer signal we need.
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                final_status = Some(SubagentExitStatus::Cancelled);
+                break;
+            }
+            n = stream.next() => n,
+        };
+        match next {
+            Some(Ok(ExternalAgentEvent::TextDelta(_) | ExternalAgentEvent::Usage(_))) => {
+                // Deltas + token usage not surfaced to the parent yet.
+                // The agent's final transcript reaches the parent via
+                // the FinalContent event below; cost ledger
+                // integration is a future task.
+            }
+            Some(Ok(ExternalAgentEvent::ResumeKey(key))) => {
+                if let Err(e) =
+                    persist_resume_key(&session_manager, &child_session_id, kind, &key).await
+                {
+                    warn!(
+                        session_id = %child_session_id,
+                        kind = %kind.as_str(),
+                        error = %e,
+                        "failed to persist resume_key; --resume will not work on the next call",
+                    );
+                }
+            }
+            Some(Ok(ExternalAgentEvent::FinalContent(blocks))) => {
+                final_content = Some(blocks);
+                final_status = Some(SubagentExitStatus::Completed);
+                break;
+            }
+            Some(Err(e)) => {
+                let msg = e.to_string();
+                final_status = Some(if msg.contains("exceeded declared timeout") {
+                    SubagentExitStatus::Timeout
+                } else {
+                    SubagentExitStatus::Failed(msg)
+                });
+                break;
+            }
+            None => {
+                if final_status.is_none() {
+                    final_status = Some(SubagentExitStatus::Failed(
+                        "external agent stream ended without FinalContent".into(),
+                    ));
+                }
+                break;
+            }
+        }
     }
 
     SubagentResult {
         child_session_id,
-        final_content: Some(outcome.final_content),
-        status: SubagentExitStatus::Completed,
+        final_content,
+        status: final_status.unwrap_or(SubagentExitStatus::Completed),
     }
 }
 

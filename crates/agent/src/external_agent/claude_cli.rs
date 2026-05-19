@@ -15,14 +15,16 @@ use async_trait::async_trait;
 use aura_llm::TokenUsage;
 use aura_model::{ContentBlock, ExternalAgentKind};
 use serde::Deserialize;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 use super::probe::{
-    check_binary_runs, ensure_workspace_dir, resolve_binary, wait_with_cancel_timeout,
+    KILL_GRACE, check_binary_runs, ensure_workspace_dir, reap_after_stream_close, resolve_binary,
+    spawn_stderr_tee, take_child_io,
 };
 use super::{
-    ExternalAgent, ExternalAgentError, ExternalAgentOutcome, ExternalAgentRequest, Result,
+    ExternalAgent, ExternalAgentError, ExternalAgentEvent, ExternalAgentRequest,
+    ExternalAgentStream, Result,
 };
 
 const AGENT_NAME: &str = "claude";
@@ -74,7 +76,7 @@ impl ExternalAgent for ClaudeCliAgent {
         ExternalAgentKind::Claude
     }
 
-    async fn run(&self, request: ExternalAgentRequest) -> Result<ExternalAgentOutcome> {
+    async fn run(&self, request: ExternalAgentRequest) -> Result<ExternalAgentStream> {
         ensure_workspace_dir(&request.workspace_dir, AGENT_NAME).await?;
 
         let child = self
@@ -84,13 +86,12 @@ impl ExternalAgent for ClaudeCliAgent {
                 &request.task,
             )
             .await?;
-        drive_claude_subprocess(
+        spawn_stream_parser(
             child,
             request.cancel.clone(),
             request.timeout,
             request.resume_key.is_none(),
         )
-        .await
     }
 }
 
@@ -142,89 +143,130 @@ impl ClaudeCliAgent {
     }
 }
 
-async fn drive_claude_subprocess(
-    child: Child,
+fn spawn_stream_parser(
+    mut child: Child,
     cancel: tokio_util::sync::CancellationToken,
     timeout: std::time::Duration,
     is_fresh_session: bool,
-) -> Result<ExternalAgentOutcome> {
-    let output = wait_with_cancel_timeout(child, cancel, timeout, AGENT_NAME).await?;
-    let stdout = std::str::from_utf8(&output.stdout).unwrap_or("");
+) -> Result<ExternalAgentStream> {
+    let (stdout, stderr) = take_child_io(&mut child, AGENT_NAME)?;
+    let stderr_buf = spawn_stderr_tee(stderr, AGENT_NAME);
 
-    let mut resume_key: Option<String> = None;
-    let mut accumulated = String::new();
-    let mut usage: Option<TokenUsage> = None;
+    let stream = async_stream::stream! {
+        let mut reader = BufReader::new(stdout).lines();
+        let mut session_persisted = false;
+        let mut accumulated = String::new();
+        let mut final_emitted = false;
+        let deadline = tokio::time::Instant::now() + timeout;
 
-    for line in stdout.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        // Skip unknown line shapes — claude-code emits hook events,
-        // rate_limit_event, and other informational lines between the
-        // session/init and result events.
-        let Ok(event) = serde_json::from_str::<StreamJsonEvent>(line) else {
-            continue;
-        };
-        match event {
-            StreamJsonEvent::System {
-                subtype: SystemSubtype::Init,
-                session_id: Some(id),
-            } if is_fresh_session && resume_key.is_none() => {
-                resume_key = Some(id);
-            }
-            StreamJsonEvent::Assistant { message } => {
-                for block in message.content {
-                    if let AssistantBlock::Text { text } = block
-                        && !text.is_empty()
-                    {
-                        accumulated.push_str(&text);
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
+                    yield Err(ExternalAgentError::Transient(
+                        "claude: cancelled by parent".into()
+                    ));
+                    return;
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
+                    yield Err(ExternalAgentError::Transient(
+                        "claude: exceeded declared timeout".into()
+                    ));
+                    return;
+                }
+                line_result = reader.next_line() => {
+                    let line = match line_result {
+                        Ok(Some(l)) => l,
+                        Ok(None) => break,
+                        Err(e) => {
+                            yield Err(ExternalAgentError::Transient(format!(
+                                "claude: read stdout: {e}"
+                            )));
+                            return;
+                        }
+                    };
+                    if line.is_empty() {
+                        continue;
+                    }
+                    // Skip unknown line shapes — claude-code emits
+                    // hook lifecycle, rate_limit_event, and other
+                    // informational lines between init and result.
+                    let Ok(event) = serde_json::from_str::<StreamJsonEvent>(&line) else {
+                        continue;
+                    };
+                    match event {
+                        StreamJsonEvent::System {
+                            subtype: SystemSubtype::Init,
+                            session_id: Some(id),
+                        } if is_fresh_session && !session_persisted => {
+                            session_persisted = true;
+                            yield Ok(ExternalAgentEvent::ResumeKey(id));
+                        }
+                        StreamJsonEvent::Assistant { message } => {
+                            for block in message.content {
+                                if let AssistantBlock::Text { text } = block
+                                    && !text.is_empty()
+                                {
+                                    accumulated.push_str(&text);
+                                    yield Ok(ExternalAgentEvent::TextDelta(text));
+                                }
+                            }
+                        }
+                        StreamJsonEvent::Result {
+                            subtype,
+                            usage,
+                            result,
+                            is_error,
+                        } => {
+                            if is_error.unwrap_or(false) || matches!(subtype, ResultSubtype::Error(_)) {
+                                let stderr_snapshot = stderr_buf.lock().clone();
+                                let kind = match &subtype {
+                                    ResultSubtype::Error(s) => s.as_str(),
+                                    ResultSubtype::Success => "unknown",
+                                };
+                                let detail = result.unwrap_or_else(|| stderr_snapshot.trim().to_string());
+                                yield Err(classify_claude_error(kind, &detail));
+                                return;
+                            }
+                            if let Some(u) = usage {
+                                yield Ok(ExternalAgentEvent::Usage(u.into_token_usage()));
+                            }
+                            if !final_emitted {
+                                let blocks = if accumulated.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![ContentBlock::Text(accumulated.clone())]
+                                };
+                                yield Ok(ExternalAgentEvent::FinalContent(blocks));
+                                final_emitted = true;
+                            }
+                        }
+                        // claude runs its own tool loop; tool_use /
+                        // tool_result / user-echo events aren't surfaced.
+                        _ => {}
                     }
                 }
             }
-            StreamJsonEvent::Result {
-                subtype,
-                usage: u,
-                result,
-                is_error,
-            } => {
-                if is_error.unwrap_or(false) || matches!(subtype, ResultSubtype::Error(_)) {
-                    let stderr_text = String::from_utf8_lossy(&output.stderr);
-                    let kind = match &subtype {
-                        ResultSubtype::Error(s) => s.as_str(),
-                        ResultSubtype::Success => "unknown",
-                    };
-                    let detail = result.unwrap_or_else(|| stderr_text.trim().to_string());
-                    return Err(classify_claude_error(kind, &detail));
-                }
-                if let Some(u) = u {
-                    usage = Some(u.into_token_usage());
-                }
-            }
-            // claude runs its own tool loop; tool_use / tool_result /
-            // user-echo events aren't surfaced.
-            _ => {}
         }
-    }
-
-    if !output.status.success() {
-        let stderr_text = String::from_utf8_lossy(&output.stderr);
-        return Err(ExternalAgentError::Transient(format!(
-            "claude: exited with {}: {}",
-            output.status,
-            stderr_text.trim()
-        )));
-    }
-
-    let final_content = if accumulated.is_empty() {
-        Vec::new()
-    } else {
-        vec![ContentBlock::Text(accumulated)]
+        if let Err(e) = reap_after_stream_close(&mut child, AGENT_NAME, &stderr_buf).await {
+            yield Err(e);
+            return;
+        }
+        if !final_emitted {
+            let blocks = if accumulated.is_empty() {
+                Vec::new()
+            } else {
+                vec![ContentBlock::Text(accumulated.clone())]
+            };
+            yield Ok(ExternalAgentEvent::FinalContent(blocks));
+        }
     };
-    Ok(ExternalAgentOutcome {
-        final_content,
-        resume_key,
-        usage,
-    })
+
+    Ok(Box::pin(stream))
 }
 
 /// `Config` (operator must act) vs `Transient` (retry might help).

@@ -1,16 +1,29 @@
 //! Shared subprocess helpers for external-agent impls — boot-time
-//! probe (binary resolution + `<bin> --version` check), workspace
-//! dir prep, and the cancel/timeout-aware `wait_with_output` shell
-//! used by both run-time drivers. The per-agent drivers (claude_cli,
-//! codex_cli) own the protocol-specific stdout parsing.
+//! probe (binary resolution + `<bin> --version` check) and run-time
+//! plumbing (stderr tee buffer, workspace dir prep, child reap).
+//! The per-agent stream parsers (claude_cli, codex_cli) handle the
+//! protocol-specific event matching; this module owns the parts
+//! that don't vary.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::process::Child;
+use parking_lot::Mutex;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdout};
 
 use super::{ExternalAgentError, Result};
+
+/// Grace window between `start_kill()` and the forced wait when an
+/// external agent is cancelled / times out.
+pub(crate) const KILL_GRACE: Duration = Duration::from_secs(3);
+
+/// Cap on the in-memory stderr capture used to fold a useful message
+/// into the error returned on non-zero exit. Beyond this, lines are
+/// still teed to tracing but dropped from the buffer.
+const STDERR_BUFFER_CAP: usize = 8_192;
 
 /// How long to wait for `<bin> --version` to print. Stuck binaries
 /// (NFS hang, broken loader) error fast rather than blocking boot.
@@ -144,30 +157,73 @@ pub(crate) async fn ensure_workspace_dir(dir: &Path, agent_name: &str) -> Result
     })
 }
 
-/// Run the child to completion, racing it against a cancel token and
-/// a wall-clock timeout. The Child is moved in, so on cancel/timeout
-/// the future drops it — `kill_on_drop` (which both drivers set when
-/// building the Command) then sends SIGKILL. Returns the full
-/// captured stdout+stderr+status on natural exit; otherwise a
-/// `Transient` error with text the consumer recognises (`exceeded
-/// declared timeout`, `cancelled by parent`) for status mapping.
-pub(crate) async fn wait_with_cancel_timeout(
-    child: Child,
-    cancel: tokio_util::sync::CancellationToken,
-    timeout: Duration,
+/// Take the captured `stdout` / `stderr` halves off a piped child, or
+/// emit a `Transient` error if either is missing. Both stream parsers
+/// need both halves with the same failure shape.
+pub(crate) fn take_child_io(
+    child: &mut Child,
+    agent_name: &str,
+) -> Result<(ChildStdout, ChildStderr)> {
+    let stdout = child.stdout.take().ok_or_else(|| {
+        ExternalAgentError::Transient(format!("{agent_name}: stdout not captured"))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        ExternalAgentError::Transient(format!("{agent_name}: stderr not captured"))
+    })?;
+    Ok((stdout, stderr))
+}
+
+/// Tee the child's stderr to tracing (target `external_agent_stderr`)
+/// and capture the first `STDERR_BUFFER_CAP` bytes into a shared
+/// buffer so the caller can fold them into a non-zero-exit error
+/// message. Returns the buffer handle.
+pub(crate) fn spawn_stderr_tee(
+    stderr: ChildStderr,
     agent_name: &'static str,
-) -> Result<Output> {
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(ExternalAgentError::Transient(format!(
-            "{agent_name}: cancelled by parent"
+) -> Arc<Mutex<String>> {
+    let buf = Arc::new(Mutex::new(String::new()));
+    let buf_clone = Arc::clone(&buf);
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::warn!(target: "external_agent_stderr", agent = agent_name, "{line}");
+            let mut b = buf_clone.lock();
+            if b.len() < STDERR_BUFFER_CAP {
+                b.push_str(&line);
+                b.push('\n');
+            }
+        }
+    });
+    buf
+}
+
+/// Reap the child after the event stream closes naturally (stdout
+/// EOF). Yields an error variant matching what the per-agent stream
+/// parsers used to inline. Returns `Ok(())` when reap succeeds with
+/// a 0 status, `Err` otherwise.
+pub(crate) async fn reap_after_stream_close(
+    child: &mut Child,
+    agent_name: &str,
+    stderr_buf: &Arc<Mutex<String>>,
+) -> Result<()> {
+    match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(Ok(status)) if !status.success() => {
+            let snapshot = stderr_buf.lock().clone();
+            Err(ExternalAgentError::Transient(format!(
+                "{agent_name}: process exited {} with stderr: {}",
+                status,
+                snapshot.trim()
+            )))
+        }
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(ExternalAgentError::Transient(format!(
+            "{agent_name}: wait: {e}"
         ))),
-        _ = tokio::time::sleep(timeout) => Err(ExternalAgentError::Transient(format!(
-            "{agent_name}: exceeded declared timeout"
-        ))),
-        result = child.wait_with_output() => result.map_err(|e| {
-            ExternalAgentError::Transient(format!("{agent_name}: wait_with_output: {e}"))
-        }),
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
+            Ok(())
+        }
     }
 }
 

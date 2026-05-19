@@ -20,18 +20,16 @@ result" for binary-backed agents. They're a different shape, not a
 different flavor of LLM:
 
 - **Request-response, not conversational.** Each `run()` invocation
-  drives the agent through one task and returns a single
-  `ExternalAgentOutcome` with the final content (+ optional
-  `resume_key` and `usage`). There's no mailbox you keep poking;
+  drives the agent through one task and emits a stream of events
+  terminating in `FinalContent`. There's no mailbox you keep poking;
   follow-ups happen via a fresh spawn with `resume_session_id`.
 - **Autonomous internal tool loop.** claude makes its own
   `Bash`/`Read`/`Write`/`WebFetch` calls. aura's `sandbox` /
   `sensitive_paths` / `approval gate` do **not** apply to those tool
   calls — see the security note below.
 - **External-side state.** Resume continuity lives in the agent's own
-  session store (e.g. claude's local session uuid), exposed via the
-  outcome's `resume_key` field that aura persists onto the child
-  Session.
+  session store (e.g. claude's local session uuid), exposed via a
+  `resume_key` event that aura persists onto the child Session.
 
 ## Where things live
 
@@ -45,7 +43,7 @@ different flavor of LLM:
   `SubagentBackendTag` for runtime decisions that don't care about
   per-instance state (resume validation, error labels, dispatch).
 - `aura_agent::external_agent::ExternalAgent` — async trait with one
-  method: `run(request) -> Result<ExternalAgentOutcome>`.
+  method: `run(request) -> Result<Stream<ExternalAgentEvent>>`.
 - `aura_agent::external_agent::ExternalAgentRegistry` — built at boot
   in `src/runtime.rs`; the spawn router looks impls up by kind.
 - `aura_agent::external_agent::claude_cli::ClaudeCliAgent` — concrete
@@ -54,8 +52,8 @@ different flavor of LLM:
 - `aura_agent::actor::router::system_spawn::subagent` — branches on
   `request.backend`: `Aura` takes the existing `AgentActor` spawn
   path; `External` looks up the agent, builds a fresh child Session
-  (or loads an existing one on resume), awaits the agent's outcome,
-  persists any `resume_key`, returns a `SubagentResult`.
+  (or loads an existing one on resume), runs the agent, persists any
+  emitted resume_key, returns a `SubagentResult`.
 
 ## Spawn protocol
 
@@ -81,14 +79,14 @@ LLM can echo it back as `resume_session_id` on a follow-up spawn.
 
 ## Resume / continue
 
-External agents return a `resume_key` on the outcome of the first
-run only. The spawn router updates the existing
+External agents emit a `ResumeKey` event on the first turn's init
+event. The spawn router updates the existing
 `SubagentBackendTag::External` tag in place — preserving
 `external_kind` and `workspace_dir` — and writes
-`resume_key: Some(...)`. Effectively **write-once**: the driver
-only populates `outcome.resume_key` when `is_fresh_session = true`
-(i.e. the request carried no prior `resume_key`). Subsequent resume
-calls reuse the stored key without overwriting.
+`resume_key: Some(...)`. Effectively **write-once**: the parser
+emits `ResumeKey` only when `is_fresh_session = true` (i.e. the
+request carried no prior `resume_key`), and only once per stream.
+Subsequent resume calls reuse the stored key without overwriting.
 
 On a resume spawn, the router:
 
@@ -206,11 +204,11 @@ codex exec --json --skip-git-repo-check
 ```
 
 Event mapping (vs claude's `stream-json`):
-- `thread.started { thread_id }` → record on `outcome.resume_key`
-  (codex calls its session uuid a `thread_id`).
+- `thread.started { thread_id }` → emit `ResumeKey(thread_id)` (codex
+  calls its session uuid a `thread_id`).
 - `item.completed { item: { type: "agent_message", text } }` →
   accumulate as final assistant text.
-- `turn.completed { usage }` → record on `outcome.usage`.
+- `turn.completed { usage }` → emit `Usage` + `FinalContent`.
 - `turn.failed` / top-level `error` → terminal error.
 - `reasoning` / tool-call items / `item.started` / `item.updated` are
   ignored (codex's autonomous tool loop is opaque to aura).
@@ -276,10 +274,10 @@ may resolve it.
 
 1. Add a variant to `aura_model::ExternalAgentKind`.
 2. Write a new module under `crates/agent/src/external_agent/`
-   implementing the `ExternalAgent` trait. Populate
-   `outcome.resume_key` if the underlying tool supports continuation;
-   otherwise leave it `None` (a parent-side `resume_session_id` for
-   that agent will then return "doesn't support resume").
+   implementing the `ExternalAgent` trait. Emit `ResumeKey` if the
+   underlying tool supports continuation; otherwise just emit
+   `FinalContent` (and a parent-side `resume_session_id` for that
+   agent will return "doesn't support resume").
 3. Optionally add a config section under
    `crates/config/src/external_agents.rs`.
 4. Register in `src/runtime.rs` alongside the `claude`

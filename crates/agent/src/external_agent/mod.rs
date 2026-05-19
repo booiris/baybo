@@ -2,22 +2,23 @@
 //! `docs/external-agents.md` for the full design.
 //!
 //! One-shot request-response shape: each `run()` invocation drives the
-//! agent through a single task and returns an `ExternalAgentOutcome`
-//! with the final assistant content (+ optional `resume_key` for
-//! continuation, optional `usage` for cost ledger). The spawn router
-//! calls `run()` once per `spawn_subagent` with `backend: external`,
-//! persists any emitted `resume_key` on the child
-//! `Session.state.subagent_backend.External.resume_key`, and forwards
-//! the final content to the parent.
+//! agent through a single task and returns a stream of events
+//! terminating in `FinalContent` (+ optionally `Usage` /
+//! `ResumeKey`). The spawn router calls `run()` once per
+//! `spawn_subagent` with `backend: external`, pipes events to the
+//! parent, and stores any emitted `resume_key` on the child
+//! `Session.state.subagent_backend.External.resume_key`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_llm::TokenUsage;
 use aura_model::{ContentBlock, ExternalAgentKind};
+use futures::Stream;
 use tokio_util::sync::CancellationToken;
 
 pub mod claude_cli;
@@ -57,28 +58,32 @@ pub struct ExternalAgentRequest {
     pub timeout: Duration,
 }
 
-/// Final state of one `ExternalAgent::run()` call.
-#[derive(Debug, Clone, Default)]
-pub struct ExternalAgentOutcome {
-    /// Assistant text the agent produced. Empty if the agent finished
-    /// without emitting any user-facing content.
-    pub final_content: Vec<ContentBlock>,
-    /// Continuation pointer the agent emitted on a *fresh* run
-    /// (`request.resume_key` was `None`). Stored on
-    /// `Session.state.subagent_backend.External.resume_key`. Resume
-    /// runs preserve the prior key; this field is `None` for them.
-    pub resume_key: Option<String>,
-    /// Token usage if the agent reported it. Optional — subscription-
-    /// billed agents (claude code Max, codex on ChatGPT Plus) don't
-    /// always emit it.
-    pub usage: Option<TokenUsage>,
+#[derive(Debug, Clone)]
+pub enum ExternalAgentEvent {
+    /// Incremental assistant text. The spawn router can forward these
+    /// to the parent as `AgentOutput::Delta` for live progress.
+    TextDelta(String),
+    /// Resume-key the parent's next spawn can pass back via
+    /// `ExternalAgentRequest.resume_key`. The spawn router stores
+    /// it on `Session.state.subagent_backend.External.resume_key`.
+    ResumeKey(String),
+    /// Token usage for cost-records / observability. Subscription-
+    /// billed agents (claude code Max, codex on ChatGPT Plus) report
+    /// it on the final result event.
+    Usage(TokenUsage),
+    /// Terminal event — the agent has finished. Emitted exactly once,
+    /// as the last item before the stream closes.
+    FinalContent(Vec<ContentBlock>),
 }
+
+pub type ExternalAgentStream =
+    Pin<Box<dyn Stream<Item = Result<ExternalAgentEvent>> + Send>>;
 
 #[async_trait]
 pub trait ExternalAgent: Send + Sync {
     fn kind(&self) -> ExternalAgentKind;
 
-    async fn run(&self, request: ExternalAgentRequest) -> Result<ExternalAgentOutcome>;
+    async fn run(&self, request: ExternalAgentRequest) -> Result<ExternalAgentStream>;
 }
 
 #[derive(Default)]
@@ -153,6 +158,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::stream;
 
     struct StaticAgent {
         kind: ExternalAgentKind,
@@ -163,12 +169,10 @@ mod tests {
         fn kind(&self) -> ExternalAgentKind {
             self.kind
         }
-        async fn run(&self, _request: ExternalAgentRequest) -> Result<ExternalAgentOutcome> {
-            Ok(ExternalAgentOutcome {
-                final_content: vec![ContentBlock::Text("ok".into())],
-                resume_key: None,
-                usage: None,
-            })
+        async fn run(&self, _request: ExternalAgentRequest) -> Result<ExternalAgentStream> {
+            Ok(Box::pin(stream::iter(vec![Ok(
+                ExternalAgentEvent::FinalContent(vec![ContentBlock::Text("ok".into())]),
+            )])))
         }
     }
 
@@ -183,13 +187,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_agent_run_returns_final_content() {
+    async fn registered_agent_run_emits_final_content() {
+        use futures::StreamExt;
         let mut reg = ExternalAgentRegistry::new();
         reg.register(Arc::new(StaticAgent {
             kind: ExternalAgentKind::Claude,
         }));
         let agent = reg.get(ExternalAgentKind::Claude).unwrap();
-        let outcome = agent
+        let mut stream = agent
             .run(ExternalAgentRequest {
                 task: "hi".into(),
                 workspace_dir: PathBuf::from("/tmp"),
@@ -199,12 +204,16 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(outcome.final_content.len(), 1);
-        match &outcome.final_content[0] {
-            ContentBlock::Text(t) => assert_eq!(t, "ok"),
-            other => panic!("unexpected block: {other:?}"),
+        let event = stream.next().await.unwrap().unwrap();
+        match event {
+            ExternalAgentEvent::FinalContent(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                match &blocks[0] {
+                    ContentBlock::Text(t) => assert_eq!(t, "ok"),
+                    other => panic!("unexpected block: {other:?}"),
+                }
+            }
+            other => panic!("unexpected event: {other:?}"),
         }
-        assert!(outcome.resume_key.is_none());
-        assert!(outcome.usage.is_none());
     }
 }

@@ -226,6 +226,7 @@ name = "aura-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "aura-channels",
  "aura-context",
