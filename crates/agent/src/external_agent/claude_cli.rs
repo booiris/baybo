@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aura_llm::TokenUsage;
-use aura_model::{ContentBlock, ExternalAgentKind};
+use aura_model::{ChatMessage, ContentBlock, ExternalAgentKind, Role, ThinkingContent};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -207,13 +207,46 @@ fn spawn_stream_parser(
                             yield Ok(ExternalAgentEvent::ResumeKey(id));
                         }
                         StreamJsonEvent::Assistant { message } => {
+                            // Two passes: (a) emit live `TextDelta` for
+                            // text blocks and update `accumulated` so
+                            // `FinalContent` reflects the visible
+                            // assistant text; (b) map every block to a
+                            // `ContentBlock` and emit one
+                            // `Intermediate(Assistant)` message so the
+                            // session transcript captures thinking +
+                            // tool_use turns alongside text.
+                            let mut blocks: Vec<ContentBlock> = Vec::new();
                             for block in message.content {
-                                if let AssistantBlock::Text { text } = block
+                                if let AssistantBlock::Text { text } = &block
                                     && !text.is_empty()
                                 {
-                                    accumulated.push_str(&text);
-                                    yield Ok(ExternalAgentEvent::TextDelta(text));
+                                    accumulated.push_str(text);
+                                    yield Ok(ExternalAgentEvent::TextDelta(text.clone()));
                                 }
+                                if let Some(cb) = block.into_content_block() {
+                                    blocks.push(cb);
+                                }
+                            }
+                            if !blocks.is_empty() {
+                                yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
+                                    role: Role::Assistant,
+                                    content: blocks,
+                                    from_user: false,
+                                }));
+                            }
+                        }
+                        StreamJsonEvent::User { message } => {
+                            let blocks: Vec<ContentBlock> = message
+                                .content
+                                .into_iter()
+                                .filter_map(UserBlock::into_content_block)
+                                .collect();
+                            if !blocks.is_empty() {
+                                yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
+                                    role: Role::Tool,
+                                    content: blocks,
+                                    from_user: false,
+                                }));
                             }
                         }
                         StreamJsonEvent::Result {
@@ -300,6 +333,13 @@ enum StreamJsonEvent {
     Assistant {
         message: AssistantMessage,
     },
+    /// claude emits `type:"user"` events to echo tool_result content
+    /// back into its own log between turns. We capture them so the
+    /// child session's transcript shows tool outcomes alongside the
+    /// matching `tool_use` calls.
+    User {
+        message: UserMessage,
+    },
     Result {
         subtype: ResultSubtype,
         #[serde(default)]
@@ -350,9 +390,108 @@ struct AssistantMessage {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AssistantBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        #[serde(default)]
+        signature: Option<String>,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: serde_json::Value,
+    },
     #[serde(other)]
     Other,
+}
+
+impl AssistantBlock {
+    /// Project the wire-format block into aura's `ContentBlock` shape.
+    /// Empty text / unknown variants drop out (`None`).
+    fn into_content_block(self) -> Option<ContentBlock> {
+        match self {
+            Self::Text { text } if !text.is_empty() => Some(ContentBlock::Text(text)),
+            Self::Text { .. } => None,
+            Self::Thinking {
+                thinking,
+                signature,
+            } if !thinking.is_empty() => Some(ContentBlock::Thinking {
+                id: None,
+                content: vec![ThinkingContent::Text {
+                    text: thinking,
+                    signature,
+                }],
+            }),
+            Self::Thinking { .. } => None,
+            Self::ToolUse { id, name, input } => Some(ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                signature: None,
+            }),
+            Self::Other => None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UserMessage {
+    #[serde(default)]
+    content: Vec<UserBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum UserBlock {
+    ToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: ToolResultContent,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// claude allows `tool_result.content` to be either a plain string or
+/// an array of structured blocks (text/image). aura's `ToolResult`
+/// stores a single string, so the array form is JSON-stringified
+/// rather than dropped.
+#[derive(Debug, Default, Deserialize)]
+#[serde(untagged)]
+enum ToolResultContent {
+    #[default]
+    Empty,
+    Text(String),
+    Blocks(Vec<serde_json::Value>),
+}
+
+impl ToolResultContent {
+    fn into_string(self) -> String {
+        match self {
+            Self::Empty => String::new(),
+            Self::Text(s) => s,
+            Self::Blocks(blocks) => serde_json::to_string(&blocks).unwrap_or_default(),
+        }
+    }
+}
+
+impl UserBlock {
+    fn into_content_block(self) -> Option<ContentBlock> {
+        match self {
+            Self::ToolResult {
+                tool_use_id,
+                content,
+            } => Some(ContentBlock::ToolResult {
+                tool_use_id,
+                content: content.into_string(),
+            }),
+            Self::Other => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -513,6 +652,71 @@ mod tests {
                 }
             }
             other => panic!("expected Assistant event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_block_thinking_projects_to_content_block() {
+        let block = AssistantBlock::Thinking {
+            thinking: "weighing options".into(),
+            signature: Some("sig".into()),
+        };
+        match block.into_content_block().expect("non-empty thinking") {
+            ContentBlock::Thinking { content, .. } => {
+                assert_eq!(content.len(), 1);
+                match &content[0] {
+                    ThinkingContent::Text { text, signature } => {
+                        assert_eq!(text, "weighing options");
+                        assert_eq!(signature.as_deref(), Some("sig"));
+                    }
+                    other => panic!("expected Text thinking, got {other:?}"),
+                }
+            }
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_block_tool_use_projects_to_content_block() {
+        let block = AssistantBlock::ToolUse {
+            id: "toolu_1".into(),
+            name: "Write".into(),
+            input: serde_json::json!({"file_path": "foo.txt", "content": "bar"}),
+        };
+        match block.into_content_block().expect("tool_use projects") {
+            ContentBlock::ToolUse { id, name, input, .. } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "Write");
+                assert_eq!(input["file_path"], "foo.txt");
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_block_tool_result_projects_to_content_block() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"ok"}]}}"#;
+        let StreamJsonEvent::User { message } = serde_json::from_str::<StreamJsonEvent>(line)
+            .unwrap()
+        else {
+            panic!("expected User event");
+        };
+        let block = message
+            .content
+            .into_iter()
+            .next()
+            .expect("one block")
+            .into_content_block()
+            .expect("tool_result projects");
+        match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
+                assert_eq!(tool_use_id, "toolu_1");
+                assert_eq!(content, "ok");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
         }
     }
 

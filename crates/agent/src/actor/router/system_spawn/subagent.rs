@@ -374,13 +374,17 @@ async fn run_external_agent(
     child_session_id: SessionId,
     session_manager: Arc<aura_session::SessionManager>,
 ) -> SubagentResult {
-    let task_text = request.task.clone();
+    // Persist the operator-supplied task up-front so the transcript
+    // shows something even if the external agent crashes before
+    // emitting its first event.
     append_subagent_message(
         &session_manager,
         &child_session_id,
-        Role::User,
-        vec![ContentBlock::Text(task_text)],
-        true,
+        ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text(request.task.clone())],
+            from_user: true,
+        },
     )
     .await;
 
@@ -437,6 +441,9 @@ async fn run_external_agent(
                     );
                 }
             }
+            Some(Ok(ExternalAgentEvent::Intermediate(msg))) => {
+                append_subagent_message(&session_manager, &child_session_id, msg).await;
+            }
             Some(Ok(ExternalAgentEvent::FinalContent(blocks))) => {
                 final_content = Some(blocks);
                 final_status = Some(SubagentExitStatus::Completed);
@@ -467,18 +474,8 @@ async fn run_external_agent(
     // `kill_on_drop` and skip the parser's exit-status check.
     while stream.next().await.is_some() {}
 
-    if let Some(blocks) = final_content.as_ref()
-        && !blocks.is_empty()
-    {
-        append_subagent_message(
-            &session_manager,
-            &child_session_id,
-            Role::Assistant,
-            blocks.clone(),
-            false,
-        )
-        .await;
-    }
+    // The FinalContent text duplicates the last `Intermediate(Assistant)`
+    // event we already persisted, so don't write it again here.
 
     SubagentResult {
         child_session_id,
@@ -490,15 +487,8 @@ async fn run_external_agent(
 async fn append_subagent_message(
     session_manager: &Arc<aura_session::SessionManager>,
     session_id: &SessionId,
-    role: Role,
-    content: Vec<ContentBlock>,
-    from_user: bool,
+    msg: ChatMessage,
 ) {
-    let msg = ChatMessage {
-        role,
-        content,
-        from_user,
-    };
     if let Err(e) = session_manager.append_session_message(session_id, &msg).await {
         warn!(
             session_id = %session_id,

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_llm::TokenUsage;
-use aura_model::{ContentBlock, ExternalAgentKind};
+use aura_model::{ChatMessage, ContentBlock, ExternalAgentKind};
 use futures::Stream;
 use tokio_util::sync::CancellationToken;
 
@@ -71,8 +71,18 @@ pub enum ExternalAgentEvent {
     /// billed agents (claude code Max, codex on ChatGPT Plus) report
     /// it on the final result event.
     Usage(TokenUsage),
+    /// A complete intermediate turn emitted by the external agent —
+    /// the spawn router appends each one to `session_messages` so
+    /// the child session's transcript mirrors the agent's own log
+    /// (assistant thinking / tool_use, tool results, …). External
+    /// agents bypass aura's sandbox + approval gate, so these
+    /// records describe what the external agent did, not what aura
+    /// authorised.
+    Intermediate(ChatMessage),
     /// Terminal event — the agent has finished. Emitted exactly once,
-    /// as the last item before the stream closes.
+    /// as the last item before the stream closes. The same content
+    /// has already been delivered through `Intermediate` events; this
+    /// duplicates it on the result channel only.
     FinalContent(Vec<ContentBlock>),
 }
 

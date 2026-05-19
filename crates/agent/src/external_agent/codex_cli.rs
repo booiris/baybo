@@ -27,8 +27,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_llm::TokenUsage;
-use aura_model::{ContentBlock, ExternalAgentKind};
+use aura_model::{ChatMessage, ContentBlock, ExternalAgentKind, Role, ThinkingContent};
 use serde::Deserialize;
+use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -45,6 +46,14 @@ const AGENT_NAME: &str = "codex";
 
 const INSTALL_HINT: &str =
     "Install codex (npm install -g @openai/codex) or configure an explicit binary path.";
+
+/// Synthetic tool names attached to codex's `command_execution` /
+/// `file_change` items when projected into aura's `ContentBlock::ToolUse`.
+/// Prefixed so a session reader can tell at a glance these are
+/// codex-internal calls and were NOT routed through aura's tool
+/// registry / approval gate.
+const CODEX_TOOL_SHELL: &str = "codex_shell";
+const CODEX_TOOL_FILE_CHANGE: &str = "codex_file_change";
 
 #[derive(Debug)]
 pub struct CodexCliAgent {
@@ -198,14 +207,94 @@ fn spawn_stream_parser(
                             session_persisted = true;
                             yield Ok(ExternalAgentEvent::ResumeKey(thread_id));
                         }
-                        // Other item kinds (reasoning, tool calls,
-                        // file changes, …) are not surfaced. codex
-                        // runs its own internal loop and the final
-                        // assistant message is what we hand back.
                         ThreadEvent::ItemCompleted {
                             item: ThreadItem::AgentMessage { text },
                         } => {
-                            final_text = text;
+                            if !text.is_empty() {
+                                final_text.clone_from(&text);
+                                yield Ok(ExternalAgentEvent::TextDelta(text.clone()));
+                                yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
+                                    role: Role::Assistant,
+                                    content: vec![ContentBlock::Text(text)],
+                                    from_user: false,
+                                }));
+                            }
+                        }
+                        ThreadEvent::ItemCompleted {
+                            item: ThreadItem::Reasoning { summary },
+                        } => {
+                            if !summary.is_empty() {
+                                yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
+                                    role: Role::Assistant,
+                                    content: vec![ContentBlock::Thinking {
+                                        id: None,
+                                        content: vec![ThinkingContent::Summary { text: summary }],
+                                    }],
+                                    from_user: false,
+                                }));
+                            }
+                        }
+                        ThreadEvent::ItemCompleted {
+                            item:
+                                ThreadItem::CommandExecution {
+                                    id,
+                                    command,
+                                    aggregated_output,
+                                    exit_code,
+                                },
+                        } => {
+                            // Pair (Assistant tool_use) + (Tool
+                            // tool_result) just like aura's own agent
+                            // loop. `name` is deliberately codex-
+                            // qualified so a transcript reader can't
+                            // confuse it with an aura-audited tool
+                            // invocation.
+                            let tool_use_id = format!("codex-{id}");
+                            yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
+                                role: Role::Assistant,
+                                content: vec![ContentBlock::ToolUse {
+                                    id: tool_use_id.clone(),
+                                    name: CODEX_TOOL_SHELL.to_string(),
+                                    input: json!({ "command": command }),
+                                    signature: None,
+                                }],
+                                from_user: false,
+                            }));
+                            let result = match exit_code {
+                                Some(code) => format!("exit_code={code}\n{aggregated_output}"),
+                                None => aggregated_output,
+                            };
+                            yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
+                                role: Role::Tool,
+                                content: vec![ContentBlock::ToolResult {
+                                    tool_use_id,
+                                    content: result,
+                                }],
+                                from_user: false,
+                            }));
+                        }
+                        ThreadEvent::ItemCompleted {
+                            item: ThreadItem::FileChange { id, changes },
+                        } => {
+                            let tool_use_id = format!("codex-{id}");
+                            yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
+                                role: Role::Assistant,
+                                content: vec![ContentBlock::ToolUse {
+                                    id: tool_use_id.clone(),
+                                    name: CODEX_TOOL_FILE_CHANGE.to_string(),
+                                    input: json!({ "changes": changes }),
+                                    signature: None,
+                                }],
+                                from_user: false,
+                            }));
+                            yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
+                                role: Role::Tool,
+                                content: vec![ContentBlock::ToolResult {
+                                    tool_use_id,
+                                    content: "applied".to_string(),
+                                }],
+                                from_user: false,
+                            }));
                         }
                         ThreadEvent::TurnCompleted { usage } => {
                             buffered_usage = usage.map(CodexUsage::into_token_usage);
@@ -310,16 +399,39 @@ enum ThreadEvent {
     Other,
 }
 
-/// Subset of `ThreadItemDetails` we care about. Codex emits many
-/// other `type` values (reasoning, command_execution, file_change,
-/// mcp_tool_call, …) which we ignore — only `agent_message` carries
-/// the final user-facing text.
+/// `item.completed` payloads codex emits. We surface the four kinds
+/// that map onto aura's `ContentBlock` set (text / thinking /
+/// tool_use+tool_result for shell + file edits). Newer codex item
+/// kinds fall through `Other`.
+///
+/// Codex assigns synthetic `item_<N>` ids; the spawn router pairs the
+/// tool_use / tool_result halves of a command_execution or
+/// file_change via these ids so a downstream session reader can see
+/// "what was run" right next to "what it returned".
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ThreadItem {
     AgentMessage {
         #[serde(default)]
         text: String,
+    },
+    Reasoning {
+        #[serde(default)]
+        summary: String,
+    },
+    CommandExecution {
+        id: String,
+        #[serde(default)]
+        command: String,
+        #[serde(default)]
+        aggregated_output: String,
+        #[serde(default)]
+        exit_code: Option<i64>,
+    },
+    FileChange {
+        id: String,
+        #[serde(default)]
+        changes: serde_json::Value,
     },
     #[serde(other)]
     Other,
@@ -412,14 +524,50 @@ mod tests {
     }
 
     #[test]
-    fn parse_reasoning_item_completed_is_other() {
-        // Codex emits reasoning items which we skip.
+    fn parse_reasoning_item_completed() {
         let line = r#"{"type":"item.completed","item":{"id":"item_4","type":"reasoning","summary":"thinking"}}"#;
         match serde_json::from_str::<ThreadEvent>(line).unwrap() {
             ThreadEvent::ItemCompleted {
-                item: ThreadItem::Other,
-            } => {}
-            other => panic!("expected Other item, got {other:?}"),
+                item: ThreadItem::Reasoning { summary },
+            } => assert_eq!(summary, "thinking"),
+            other => panic!("expected Reasoning item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_command_execution_item_completed() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"ls","aggregated_output":"foo\n","exit_code":0,"status":"completed"}}"#;
+        match serde_json::from_str::<ThreadEvent>(line).unwrap() {
+            ThreadEvent::ItemCompleted {
+                item:
+                    ThreadItem::CommandExecution {
+                        id,
+                        command,
+                        aggregated_output,
+                        exit_code,
+                    },
+            } => {
+                assert_eq!(id, "item_1");
+                assert_eq!(command, "ls");
+                assert_eq!(aggregated_output, "foo\n");
+                assert_eq!(exit_code, Some(0));
+            }
+            other => panic!("expected CommandExecution item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_file_change_item_completed() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_3","type":"file_change","changes":[{"path":"/x","kind":"add"}],"status":"completed"}}"#;
+        match serde_json::from_str::<ThreadEvent>(line).unwrap() {
+            ThreadEvent::ItemCompleted {
+                item: ThreadItem::FileChange { id, changes },
+            } => {
+                assert_eq!(id, "item_3");
+                let arr = changes.as_array().expect("array");
+                assert_eq!(arr.len(), 1);
+            }
+            other => panic!("expected FileChange item, got {other:?}"),
         }
     }
 

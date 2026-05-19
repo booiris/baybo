@@ -133,7 +133,31 @@ field and demands matching identity. Three rejection paths:
    start a new conversation under the existing child_session_id,
    so we refuse and tell the parent to spawn fresh.
 
-## claude — security note
+## Transcript persistence
+
+Each `run()` call produces an `ExternalAgentEvent::Intermediate(ChatMessage)`
+stream alongside the existing `TextDelta` / `ResumeKey` / `Usage` /
+`FinalContent` events. The spawn router persists every `Intermediate`
+to `session_messages` via `SessionManager::append_session_message`, so
+the child session's transcript looks like a normal agent loop:
+
+- Initial `User` message with the spawn request's `task` text
+  (recorded *before* `agent.run()` so failures still leave a trace).
+- claude: one `Assistant` message per `type:"assistant"` event,
+  mapped from claude's content blocks — `text` → `Text`, `thinking` →
+  `Thinking`, `tool_use` → `ToolUse` (id and input preserved). One
+  `Tool` message per `type:"user"` event carrying `tool_result`
+  blocks, with `ToolResult.tool_use_id` linking back to the matching
+  `ToolUse`.
+- codex: `agent_message` → `Assistant Text`; `reasoning` →
+  `Assistant Thinking::Summary`; `command_execution` and `file_change`
+  emit a paired `Assistant ToolUse` + `Tool ToolResult`. Tool names
+  are codex-prefixed (`codex_shell`, `codex_file_change`) so a reader
+  cannot mistake them for aura-routed tool invocations — these
+  bypass aura's sandbox + approval gate by design.
+
+`FinalContent` duplicates the last assistant text, so the consumer
+treats it as a result signal only and does not double-write.
 
 `claude -p` runs with `--permission-mode bypassPermissions`
 hardcoded. claude's interactive permission prompts can't reach
@@ -207,11 +231,19 @@ Event mapping (vs claude's `stream-json`):
 - `thread.started { thread_id }` → emit `ResumeKey(thread_id)` (codex
   calls its session uuid a `thread_id`).
 - `item.completed { item: { type: "agent_message", text } }` →
-  accumulate as final assistant text.
+  emit `Intermediate(Assistant text)` and accumulate as final
+  assistant text.
+- `item.completed { item: { type: "reasoning", summary } }` →
+  emit `Intermediate(Assistant Thinking::Summary)`.
+- `item.completed { item: { type: "command_execution", … } }` →
+  emit `Intermediate(Assistant ToolUse name="codex_shell")` followed by
+  `Intermediate(Tool ToolResult)`. Name is codex-prefixed so transcript
+  readers don't confuse it with an aura-audited tool call.
+- `item.completed { item: { type: "file_change", changes } }` →
+  same `ToolUse` + `ToolResult` pair with `name="codex_file_change"`.
 - `turn.completed { usage }` → emit `Usage` + `FinalContent`.
 - `turn.failed` / top-level `error` → terminal error.
-- `reasoning` / tool-call items / `item.started` / `item.updated` are
-  ignored (codex's autonomous tool loop is opaque to aura).
+- `item.started` / `item.updated` and newer item kinds are ignored.
 
 Differences from claude that matter:
 - **Prompt is positional argv, not stdin.** Pass after `--`.
