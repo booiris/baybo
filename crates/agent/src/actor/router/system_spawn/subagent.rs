@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use aura_channels::{AgentOutput, IncomingMessage, Message};
 use aura_model::{
-    ChannelType, ContentBlock, ExternalAgentKind, JobId, Lineage, LineageKind, MessageMetadata,
-    SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend, SubagentExitStatus,
-    SubagentResult, SubagentSpawnRequest, User,
+    ChannelType, ChatMessage, ContentBlock, ExternalAgentKind, JobId, Lineage, LineageKind,
+    MessageMetadata, Role, SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend,
+    SubagentExitStatus, SubagentResult, SubagentSpawnRequest, User,
 };
 use chrono::Utc;
 use futures::StreamExt;
@@ -374,6 +374,16 @@ async fn run_external_agent(
     child_session_id: SessionId,
     session_manager: Arc<aura_session::SessionManager>,
 ) -> SubagentResult {
+    let task_text = request.task.clone();
+    append_subagent_message(
+        &session_manager,
+        &child_session_id,
+        Role::User,
+        vec![ContentBlock::Text(task_text)],
+        true,
+    )
+    .await;
+
     let cancel = request.cancel.clone();
     let mut stream = match agent.run(request).await {
         Ok(s) => s,
@@ -394,6 +404,11 @@ async fn run_external_agent(
     // (a) double the effective budget on cancel/timeout and (b) fire
     // during long reasoning pauses where the parser is correctly idle.
     // The cancel token is the only outer signal we need.
+    //
+    // Parsers defer `FinalContent` (and `Usage`) until after the child
+    // is reaped, so breaking on `FinalContent` does not drop the stream
+    // mid-cleanup. On a non-`FinalContent` exit we still drain the
+    // remaining events below to give the parser a chance to reap.
     loop {
         let next = tokio::select! {
             biased;
@@ -447,10 +462,50 @@ async fn run_external_agent(
         }
     }
 
+    // Drain any residual events so the parser finishes its `reap_after_stream_close`
+    // path naturally. Without this, dropping the stream here would trigger
+    // `kill_on_drop` and skip the parser's exit-status check.
+    while stream.next().await.is_some() {}
+
+    if let Some(blocks) = final_content.as_ref()
+        && !blocks.is_empty()
+    {
+        append_subagent_message(
+            &session_manager,
+            &child_session_id,
+            Role::Assistant,
+            blocks.clone(),
+            false,
+        )
+        .await;
+    }
+
     SubagentResult {
         child_session_id,
         final_content,
         status: final_status.unwrap_or(SubagentExitStatus::Completed),
+    }
+}
+
+async fn append_subagent_message(
+    session_manager: &Arc<aura_session::SessionManager>,
+    session_id: &SessionId,
+    role: Role,
+    content: Vec<ContentBlock>,
+    from_user: bool,
+) {
+    let msg = ChatMessage {
+        role,
+        content,
+        from_user,
+    };
+    if let Err(e) = session_manager.append_session_message(session_id, &msg).await {
+        warn!(
+            session_id = %session_id,
+            role = ?msg.role,
+            error = %e,
+            "failed to persist external-agent turn to session_messages",
+        );
     }
 }
 

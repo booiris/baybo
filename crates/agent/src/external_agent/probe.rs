@@ -30,7 +30,11 @@ const STDERR_BUFFER_CAP: usize = 8_192;
 pub(crate) const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resolve the binary path: explicit override when set, otherwise
-/// PATH-walk for `binary_name`.
+/// PATH-walk for `binary_name`. Explicit overrides MUST be absolute —
+/// relative paths resolve against whichever cwd happens to be in
+/// effect (different for `aura external-agent setup` vs the gateway
+/// service), which would let probe succeed under one and fail under
+/// the other.
 pub(crate) fn resolve_binary(
     configured: Option<&str>,
     binary_name: &str,
@@ -38,6 +42,14 @@ pub(crate) fn resolve_binary(
 ) -> Result<PathBuf> {
     if let Some(explicit) = configured {
         let path = PathBuf::from(explicit);
+        if !path.is_absolute() {
+            return Err(ExternalAgentError::Config(format!(
+                "{binary_name}: `binary_path` {explicit:?} must be an absolute path. Relative \
+                 paths resolve against whichever cwd the process has (CLI vs gateway service \
+                 differ). Use an absolute path, or leave the field empty to fall back to PATH \
+                 lookup."
+            )));
+        }
         if !path.exists() {
             return Err(ExternalAgentError::NotInstalled(format!(
                 "{binary_name}: `binary_path` {explicit:?} does not exist; either fix the path or \

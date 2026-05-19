@@ -153,7 +153,7 @@ fn spawn_stream_parser(
         let mut reader = BufReader::new(stdout).lines();
         let mut session_persisted = false;
         let mut final_text = String::new();
-        let mut final_emitted = false;
+        let mut buffered_usage: Option<TokenUsage> = None;
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
@@ -208,18 +208,11 @@ fn spawn_stream_parser(
                             final_text = text;
                         }
                         ThreadEvent::TurnCompleted { usage } => {
-                            if let Some(u) = usage {
-                                yield Ok(ExternalAgentEvent::Usage(u.into_token_usage()));
-                            }
-                            if !final_emitted {
-                                let blocks = if final_text.is_empty() {
-                                    Vec::new()
-                                } else {
-                                    vec![ContentBlock::Text(std::mem::take(&mut final_text))]
-                                };
-                                yield Ok(ExternalAgentEvent::FinalContent(blocks));
-                                final_emitted = true;
-                            }
+                            buffered_usage = usage.map(CodexUsage::into_token_usage);
+                            // Hold FinalContent / Usage until after
+                            // stdout EOF + reap so a consumer that
+                            // breaks on FinalContent doesn't drop the
+                            // stream while codex is still flushing.
                         }
                         ThreadEvent::TurnFailed { error } => {
                             let stderr_snapshot = stderr_buf.lock().clone();
@@ -246,14 +239,15 @@ fn spawn_stream_parser(
             yield Err(e);
             return;
         }
-        if !final_emitted {
-            let blocks = if final_text.is_empty() {
-                Vec::new()
-            } else {
-                vec![ContentBlock::Text(final_text)]
-            };
-            yield Ok(ExternalAgentEvent::FinalContent(blocks));
+        if let Some(u) = buffered_usage {
+            yield Ok(ExternalAgentEvent::Usage(u));
         }
+        let blocks = if final_text.is_empty() {
+            Vec::new()
+        } else {
+            vec![ContentBlock::Text(final_text)]
+        };
+        yield Ok(ExternalAgentEvent::FinalContent(blocks));
     };
 
     Ok(Box::pin(stream))

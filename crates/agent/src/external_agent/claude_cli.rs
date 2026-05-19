@@ -156,7 +156,7 @@ fn spawn_stream_parser(
         let mut reader = BufReader::new(stdout).lines();
         let mut session_persisted = false;
         let mut accumulated = String::new();
-        let mut final_emitted = false;
+        let mut buffered_usage: Option<TokenUsage> = None;
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
@@ -232,18 +232,13 @@ fn spawn_stream_parser(
                                 yield Err(classify_claude_error(kind, &detail));
                                 return;
                             }
-                            if let Some(u) = usage {
-                                yield Ok(ExternalAgentEvent::Usage(u.into_token_usage()));
-                            }
-                            if !final_emitted {
-                                let blocks = if accumulated.is_empty() {
-                                    Vec::new()
-                                } else {
-                                    vec![ContentBlock::Text(accumulated.clone())]
-                                };
-                                yield Ok(ExternalAgentEvent::FinalContent(blocks));
-                                final_emitted = true;
-                            }
+                            buffered_usage = usage.map(StreamJsonUsage::into_token_usage);
+                            // The result event is the producer's final
+                            // beat; let the loop drain through stdout
+                            // EOF and reap below before emitting
+                            // FinalContent / Usage so consumers that
+                            // break on FinalContent don't trigger
+                            // kill_on_drop on a still-flushing child.
                         }
                         // claude runs its own tool loop; tool_use /
                         // tool_result / user-echo events aren't surfaced.
@@ -256,14 +251,15 @@ fn spawn_stream_parser(
             yield Err(e);
             return;
         }
-        if !final_emitted {
-            let blocks = if accumulated.is_empty() {
-                Vec::new()
-            } else {
-                vec![ContentBlock::Text(accumulated.clone())]
-            };
-            yield Ok(ExternalAgentEvent::FinalContent(blocks));
+        if let Some(u) = buffered_usage {
+            yield Ok(ExternalAgentEvent::Usage(u));
         }
+        let blocks = if accumulated.is_empty() {
+            Vec::new()
+        } else {
+            vec![ContentBlock::Text(accumulated)]
+        };
+        yield Ok(ExternalAgentEvent::FinalContent(blocks));
     };
 
     Ok(Box::pin(stream))
@@ -423,6 +419,19 @@ mod tests {
                 assert!(msg.contains("xyzzy"), "msg: {msg}");
             }
             other => panic!("expected NotInstalled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_rejects_relative_binary_path() {
+        let err = ClaudeCliAgent::probe_and_build(Some("./claude"))
+            .expect_err("expected error for relative binary path");
+        match err {
+            ExternalAgentError::Config(msg) => {
+                assert!(msg.contains("absolute"), "msg: {msg}");
+                assert!(msg.contains("./claude"), "msg: {msg}");
+            }
+            other => panic!("expected Config, got {other:?}"),
         }
     }
 
