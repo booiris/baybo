@@ -13,6 +13,7 @@ pub async fn run(ctx: &CommandContext, cmd: Commands) -> Result<CommandOutput> {
         Commands::Mcp { cmd } => commands::mcp::handle(ctx, cmd).await,
         Commands::Pair { cmd } => commands::pair::handle(ctx, cmd).await,
         Commands::Llm { cmd } => commands::llm::handle(ctx, cmd).await,
+        Commands::ExternalAgent { cmd } => commands::external_agent::handle(ctx, cmd).await,
         Commands::Session { cmd } => commands::session::handle(ctx, cmd).await,
         Commands::Job { cmd } => commands::job::handle(ctx, cmd).await,
         Commands::Cron { cmd } => commands::cron::handle(ctx, cmd).await,

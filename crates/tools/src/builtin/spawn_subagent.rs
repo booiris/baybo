@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_model::{
-    MAX_SUBAGENT_TIMEOUT_SECS, SPAWN_SUBAGENT_TOOL_NAME, SubagentParentContext, SubagentResult,
-    SubagentSpawnRequest, SystemSpawnRequest,
+    AURA_BACKEND_TAG, ExternalAgentKind, MAX_SUBAGENT_TIMEOUT_SECS, SPAWN_SUBAGENT_TOOL_NAME,
+    SessionId, SubagentBackend, SubagentParentContext, SubagentResult, SubagentSpawnRequest,
+    SystemSpawnRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -41,9 +42,18 @@ struct SpawnParams {
     must_include_context: Vec<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// `"aura"` (default), `"claude"`, or `"codex"`.
+    #[serde(default)]
+    backend: Option<String>,
     #[serde(default)]
     llm: Option<String>,
+    #[serde(default)]
+    workspace_name: Option<String>,
+    #[serde(default)]
+    resume_session_id: Option<String>,
 }
+
+const MAX_WORKSPACE_NAME_BASE_LEN: usize = 32;
 
 fn parse_spawn_request(value: &Value) -> Result<SubagentSpawnRequest, String> {
     let p: SpawnParams = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
@@ -51,12 +61,87 @@ fn parse_spawn_request(value: &Value) -> Result<SubagentSpawnRequest, String> {
         .timeout_secs
         .unwrap_or(DEFAULT_SUBAGENT_TIMEOUT_SECS)
         .clamp(1, MAX_SUBAGENT_TIMEOUT_SECS);
+    let workspace_name = p
+        .workspace_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(sanitize_workspace_name);
+    let llm = p.llm.filter(|s| !s.trim().is_empty());
+    let backend = match p.backend.as_deref().map(str::trim) {
+        None | Some("") => SubagentBackend::Aura { llm },
+        Some(t) if t == AURA_BACKEND_TAG => SubagentBackend::Aura { llm },
+        Some(other) => {
+            if let Some(kind) = ExternalAgentKind::parse(other) {
+                if llm.is_some() {
+                    return Err(format!(
+                        "`llm` is not valid when backend={other:?}; external backends have no \
+                         LLM-entry choice"
+                    ));
+                }
+                SubagentBackend::External {
+                    external_kind: kind,
+                }
+            } else {
+                return Err(format!("unknown backend {other:?}"));
+            }
+        }
+    };
+    let resume_session_id = p
+        .resume_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(SessionId::from);
+    if resume_session_id.is_some() && workspace_name.is_some() {
+        return Err(
+            "`workspace_name` is fixed at the genesis spawn — drop it from resume calls; the \
+             original dir is reused automatically"
+                .into(),
+        );
+    }
     Ok(SubagentSpawnRequest {
         task_description: p.task_description,
         must_include_context: p.must_include_context,
         timeout: Duration::from_secs(secs),
-        llm: p.llm.filter(|s| !s.trim().is_empty()),
+        backend,
+        workspace_name,
+        resume_session_id,
     })
+}
+
+/// Lowercase + kebab-case `[a-z0-9-]`, truncated to
+/// `MAX_WORKSPACE_NAME_BASE_LEN`. Two spawns with the same input
+/// share the same on-disk dir on purpose — letting a sibling
+/// subagent see the prior one's files is the legitimate reason to
+/// pass an explicit `workspace_name`.
+fn sanitize_workspace_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_was_dash = true;
+    for ch in raw.chars() {
+        let lowered = ch.to_ascii_lowercase();
+        let keep = lowered.is_ascii_lowercase() || lowered.is_ascii_digit();
+        if keep {
+            out.push(lowered);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("subagent");
+    }
+    if out.len() > MAX_WORKSPACE_NAME_BASE_LEN {
+        out.truncate(MAX_WORKSPACE_NAME_BASE_LEN);
+        while out.ends_with('-') {
+            out.pop();
+        }
+    }
+    out
 }
 
 pub struct SpawnSubagentTool {
@@ -88,9 +173,22 @@ fn parameters_schema() -> Value {
                 "minimum": 1,
                 "description": "Hard wait limit in seconds. Defaults to 600."
             },
+            "backend": {
+                "type": "string",
+                "enum": ["aura", "claude", "codex"],
+                "description": "Backend that runs the subagent. 'aura' (default) spawns a full in-process aura agent that uses the configured LLMs/tools/skills. 'claude' delegates to a local Claude Code subprocess; 'codex' delegates to OpenAI's codex CLI — both are one-shot, run their own internal tool loops with bypassed permissions, and are best for heavy autonomous tasks where you want claude/codex (not aura) to drive."
+            },
             "llm": {
                 "type": "string",
-                "description": "Optional LLM entry-name override for the spawned child (must match an entry in aura.json `llm[*].name`)."
+                "description": "Only valid when backend='aura'. Optional LLM entry-name override (must match an entry in aura.json `llm[*].name`)."
+            },
+            "workspace_name": {
+                "type": "string",
+                "description": "Optional short human-readable slug naming the subagent's working area (e.g. 'investigate-auth-bug', 'refactor-payment-flow'). Used by external-agent backends (claude, codex) so artifacts land under a meaningful path. Sanitised to kebab-case ASCII and capped at 32 chars. Two spawns with the same workspace_name share the same on-disk dir — pass the same name when you want a sibling subagent to pick up where another left off. Leave unset to fall back to the (unique) child session_id."
+            },
+            "resume_session_id": {
+                "type": "string",
+                "description": "Continue a prior subagent's conversation. Use a child_session_id value the user previously saw in a 'subagent_session_id: ...' tail on this same parent session — passing an arbitrary id will be rejected. The new task_description is appended to that child's existing context (for claude / codex, via the agent's own --resume). Do NOT also pass `workspace_name` — the original spawn's dir is reused automatically. Leave unset to start a fresh subagent."
             }
         }
     })
@@ -224,13 +322,22 @@ mod tests {
             .await
             .unwrap();
         match out {
-            ToolOutput::Text(s) => assert_eq!(s, "done"),
+            ToolOutput::Text(s) => {
+                assert!(s.contains("done"), "got: {s}");
+                assert!(
+                    s.contains("[subagent_session_id: child-1]"),
+                    "missing resume-id tail: {s}",
+                );
+            }
             _ => panic!("expected Text output"),
         }
         let (req, parent_id) = router.await.unwrap().expect("router saw a Subagent frame");
         assert_eq!(req.task_description, "look up X");
         assert_eq!(req.timeout, Duration::from_secs(30));
-        assert_eq!(req.llm.as_deref(), Some("fast"));
+        match &req.backend {
+            SubagentBackend::Aura { llm } => assert_eq!(llm.as_deref(), Some("fast")),
+            other => panic!("expected Aura backend, got {other:?}"),
+        }
         assert_eq!(parent_id.as_ref(), "parent-sess");
     }
 
@@ -270,7 +377,82 @@ mod tests {
             req.timeout,
             Duration::from_secs(DEFAULT_SUBAGENT_TIMEOUT_SECS)
         );
-        assert!(req.llm.is_none());
+        assert_eq!(req.backend, SubagentBackend::Aura { llm: None });
+        assert!(req.workspace_name.is_none());
+        assert!(req.resume_session_id.is_none());
+    }
+
+    #[test]
+    fn parse_spawn_request_sanitises_workspace_name() {
+        let v = json!({
+            "task_description": "investigate",
+            "workspace_name": "Investigate Auth Bug!!",
+        });
+        let req = parse_spawn_request(&v).unwrap();
+        assert_eq!(req.workspace_name.as_deref(), Some("investigate-auth-bug"));
+    }
+
+    #[test]
+    fn parse_spawn_request_same_workspace_name_yields_same_sanitized_output() {
+        // Two spawns with the same workspace_name MUST resolve to the
+        // same on-disk dir so a follow-up subagent can pick up where
+        // the prior one left off. No uuid suffixes.
+        let a = parse_spawn_request(&json!({
+            "task_description": "first",
+            "workspace_name": "shared-work",
+        }))
+        .unwrap();
+        let b = parse_spawn_request(&json!({
+            "task_description": "second",
+            "workspace_name": "shared-work",
+        }))
+        .unwrap();
+        assert_eq!(a.workspace_name, b.workspace_name);
+    }
+
+    #[test]
+    fn parse_spawn_request_blank_workspace_name_is_treated_as_unset() {
+        for blank in ["", "   ", "\t"] {
+            let v = json!({"task_description": "x", "workspace_name": blank});
+            let req = parse_spawn_request(&v).unwrap();
+            assert_eq!(req.workspace_name, None, "blank {blank:?} should be None");
+        }
+    }
+
+    #[test]
+    fn sanitize_workspace_name_handles_punctuation_and_unicode() {
+        assert_eq!(
+            sanitize_workspace_name("Fix the BUG_123 (中文 case)"),
+            "fix-the-bug-123-case",
+        );
+    }
+
+    #[test]
+    fn sanitize_workspace_name_truncates_long_input_at_cap() {
+        let out = sanitize_workspace_name(
+            "this-is-a-very-very-long-investigation-name-that-overflows-the-cap",
+        );
+        assert!(
+            out.len() <= MAX_WORKSPACE_NAME_BASE_LEN,
+            "len {} > cap {MAX_WORKSPACE_NAME_BASE_LEN}",
+            out.len()
+        );
+        assert!(!out.ends_with('-'));
+    }
+
+    #[test]
+    fn sanitize_workspace_name_empty_input_falls_back_to_subagent() {
+        assert_eq!(sanitize_workspace_name("***"), "subagent");
+    }
+
+    #[test]
+    fn sanitize_workspace_name_is_deterministic() {
+        // Same input must produce the same output — sibling subagents
+        // sharing a workspace_name share a dir.
+        assert_eq!(
+            sanitize_workspace_name("same-name"),
+            sanitize_workspace_name("same-name"),
+        );
     }
 
     #[test]
@@ -285,7 +467,68 @@ mod tests {
         assert_eq!(req.task_description, "investigate");
         assert_eq!(req.must_include_context.len(), 2);
         assert_eq!(req.timeout, Duration::from_secs(30));
-        assert_eq!(req.llm.as_deref(), Some("fast"));
+        match req.backend {
+            SubagentBackend::Aura { llm } => assert_eq!(llm.as_deref(), Some("fast")),
+            other => panic!("expected Aura backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_spawn_request_backend_claude() {
+        let v = json!({
+            "task_description": "investigate",
+            "backend": "claude",
+        });
+        let req = parse_spawn_request(&v).unwrap();
+        assert_eq!(
+            req.backend,
+            SubagentBackend::External {
+                external_kind: ExternalAgentKind::Claude,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_spawn_request_backend_claude_rejects_llm() {
+        // Strict shape: claude has no aura.json[llm] choice.
+        let v = json!({
+            "task_description": "x",
+            "backend": "claude",
+            "llm": "fast",
+        });
+        assert!(parse_spawn_request(&v).is_err());
+    }
+
+    #[test]
+    fn parse_spawn_request_unknown_backend_rejected() {
+        let v = json!({"task_description": "x", "backend": "nope"});
+        assert!(parse_spawn_request(&v).is_err());
+    }
+
+    #[test]
+    fn parse_spawn_request_with_resume_session_id() {
+        let v = json!({
+            "task_description": "follow-up",
+            "resume_session_id": "child-abc",
+        });
+        let req = parse_spawn_request(&v).unwrap();
+        assert_eq!(
+            req.resume_session_id.as_ref().map(|s| s.as_ref()),
+            Some("child-abc"),
+        );
+    }
+
+    #[test]
+    fn parse_spawn_request_rejects_workspace_name_on_resume() {
+        // The genesis spawn's dir is durable on the child Session,
+        // so resume calls can't choose a new one.
+        let v = json!({
+            "task_description": "follow-up",
+            "resume_session_id": "child-abc",
+            "workspace_name": "different-dir",
+        });
+        let err = parse_spawn_request(&v).expect_err("must reject");
+        assert!(err.contains("workspace_name"), "got: {err}");
     }
 
     #[test]
@@ -296,13 +539,13 @@ mod tests {
 
     #[test]
     fn parse_spawn_request_treats_blank_llm_as_unset() {
-        // Strict-JSON-schema LLMs sometimes emit `"llm": ""` instead of
-        // omitting the key — that must not reach the pool as a HashMap
-        // lookup key (it would log a spurious "entry not found" warning).
         for blank in ["", "   ", "\t"] {
             let v = json!({"task_description": "x", "llm": blank});
             let req = parse_spawn_request(&v).unwrap();
-            assert_eq!(req.llm, None, "blank llm {blank:?} should be None");
+            match req.backend {
+                SubagentBackend::Aura { llm } => assert_eq!(llm, None, "blank {blank:?}"),
+                other => panic!("expected Aura, got {other:?}"),
+            }
         }
     }
 

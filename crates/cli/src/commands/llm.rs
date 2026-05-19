@@ -579,7 +579,13 @@ async fn set_default(ctx: &CommandContext) -> Result<CommandOutput> {
         ));
     }
     let target = resolve_target_path(ctx)?;
-    let entry = pick_entry(entries, "Set default-llm to:")?;
+    let labels: Vec<String> = entries
+        .iter()
+        .map(|e| format!("{} ({} :: {})", e.name, e.provider, e.model))
+        .collect();
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let idx = crate::commands::select::select_one("Set default-llm to:", &refs)?;
+    let entry = &entries[idx];
     let mut new_config: AuraConfig = ctx.config.as_ref().clone();
     new_config.default_llm = entry.name.clone();
     new_config

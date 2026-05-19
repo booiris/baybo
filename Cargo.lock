@@ -249,6 +249,7 @@ dependencies = [
  "dashmap",
  "futures",
  "hex",
+ "libc",
  "parking_lot",
  "regex",
  "serde",
@@ -682,6 +683,7 @@ name = "aura-setup"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aura-agent",
  "aura-channels",
  "aura-config",
  "aura-gateway",

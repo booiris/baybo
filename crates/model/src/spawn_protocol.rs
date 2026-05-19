@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::{BackgroundCompressionPayload, ContentBlock, JobId, SessionId, SpanId};
+use crate::{BackgroundCompressionPayload, ContentBlock, JobId, SessionId, SpanId, SubagentBackend};
 
 /// Tool name the LLM emits to spawn a subagent.
 pub const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";
@@ -75,10 +75,25 @@ pub struct SubagentSpawnRequest {
     #[serde(default)]
     pub must_include_context: Vec<String>,
     pub timeout: Duration,
-    /// Optional LLM entry-name override for the spawned child.
-    /// `None` ⇒ fall back to the pool default at spawn time.
+    /// Backend that runs this subagent. `Aura` is the default (full
+    /// in-process `AgentActor`). `External` routes to a registered
+    /// external-agent impl (claude_cli, …) for one-shot delegation.
+    #[serde(default)]
+    pub backend: SubagentBackend,
+    /// Sanitised kebab-case slug for the child's working directory:
+    /// `<root>/work/<backend>/<workspace_name>/`. `None` falls back
+    /// to the child session_id. Format: ASCII `[a-z0-9-]`, capped
+    /// at 32 chars. Deterministic — two spawns with the same input
+    /// share the same on-disk dir on purpose, so a sibling subagent
+    /// can pick up where another left off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub llm: Option<String>,
+    pub workspace_name: Option<String>,
+    /// Continue a prior subagent's session. The id MUST come from a
+    /// previous `SubagentResult.child_session_id` in this same parent
+    /// session. The router verifies parent + backend match before
+    /// routing the new task into the existing child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_session_id: Option<SessionId>,
 }
 
 impl SubagentSpawnRequest {
@@ -142,9 +157,12 @@ impl SubagentResult {
     }
 
     /// Render this result into a synthetic `tool_result` payload the
-    /// parent's next LLM iteration sees.
+    /// parent's next LLM iteration sees. On `Completed`, the
+    /// child_session_id is suffixed in a parseable form so the parent
+    /// can `spawn_subagent(..., resume_session_id: "...")` to continue
+    /// the same child.
     pub fn to_tool_result_text(&self) -> String {
-        match (&self.status, &self.final_content) {
+        let body = match (&self.status, &self.final_content) {
             (SubagentExitStatus::Completed, Some(blocks)) => extract_text(blocks),
             (SubagentExitStatus::Completed, None) => {
                 "[subagent completed without producing a final message]".to_string()
@@ -158,6 +176,12 @@ impl SubagentResult {
             (SubagentExitStatus::Timeout, _) => {
                 "[subagent exceeded its declared timeout]".to_string()
             }
+        };
+        let id = self.child_session_id.as_ref();
+        if matches!(self.status, SubagentExitStatus::Completed) && !id.is_empty() {
+            format!("{body}\n[subagent_session_id: {id}]")
+        } else {
+            body
         }
     }
 }
@@ -183,7 +207,9 @@ mod tests {
             task_description: "just the task".to_string(),
             must_include_context: vec![],
             timeout: Duration::from_secs(60),
-            llm: None,
+            backend: SubagentBackend::default(),
+            workspace_name: None,
+            resume_session_id: None,
         };
         assert_eq!(req.initial_prompt(), "just the task");
     }
@@ -194,7 +220,9 @@ mod tests {
             task_description: "do X".to_string(),
             must_include_context: vec!["fact a".into(), "fact b".into()],
             timeout: Duration::from_secs(60),
-            llm: None,
+            backend: SubagentBackend::default(),
+            workspace_name: None,
+            resume_session_id: None,
         };
         let p = req.initial_prompt();
         assert!(p.contains("do X"));
@@ -203,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_text_completed_concatenates_text_blocks() {
+    fn tool_result_text_completed_concatenates_text_blocks_and_tails_session_id() {
         let r = SubagentResult {
             child_session_id: SessionId::from("child-1"),
             final_content: Some(vec![
@@ -212,7 +240,23 @@ mod tests {
             ]),
             status: SubagentExitStatus::Completed,
         };
-        assert_eq!(r.to_tool_result_text(), "line one\nline two");
+        let text = r.to_tool_result_text();
+        assert!(text.starts_with("line one\nline two"), "got: {text}");
+        assert!(
+            text.contains("[subagent_session_id: child-1]"),
+            "missing session-id tail: {text}",
+        );
+    }
+
+    #[test]
+    fn tool_result_text_failure_does_not_tail_session_id() {
+        let r = SubagentResult::failed("boom");
+        let text = r.to_tool_result_text();
+        assert!(text.contains("boom"));
+        assert!(
+            !text.contains("subagent_session_id"),
+            "failed result should not advertise a resume id: {text}",
+        );
     }
 
     #[test]

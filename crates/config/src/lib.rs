@@ -18,6 +18,7 @@ pub mod browser;
 pub mod channels;
 pub mod cost;
 pub mod error;
+pub mod external_agents;
 pub mod gateway;
 pub mod llm;
 pub mod security;
@@ -37,6 +38,7 @@ pub use crate::channels::{
 };
 pub use crate::cost::{CostConfig, RateLimitConfig, SpendingLimitsConfig};
 pub use crate::error::{ConfigError, Result, ValidationError};
+pub use crate::external_agents::{ClaudeConfig, CodexConfig, ExternalAgentsConfig};
 pub use crate::gateway::GatewayConfig;
 pub use crate::llm::{LlmEntry, LlmPricingOverride};
 pub use crate::security::SecurityConfig;
@@ -66,6 +68,7 @@ pub struct AuraConfig {
     pub workspace: WorkspaceConfig,
     pub gateway: GatewayConfig,
     pub browser: BrowserConfig,
+    pub external_agents: ExternalAgentsConfig,
 }
 
 impl AuraConfig {
