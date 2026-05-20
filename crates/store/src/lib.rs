@@ -7,6 +7,10 @@
 //! low-level crates depend on a store interface without pulling the heavy
 //! libsql adapter, and keeps the dependency graph acyclic.
 
+pub mod blob;
+pub mod channel_bot;
+pub mod channel_pairing;
+pub mod channel_session;
 pub mod cost;
 pub mod cron;
 pub mod error;
@@ -14,7 +18,12 @@ pub mod memory;
 pub mod secret;
 pub mod session;
 pub mod session_summary;
+pub mod skill_risk;
 
+pub use blob::{BlobMeta, BlobReader, BlobStore, ByteStream, SHA256_PREFIX};
+pub use channel_bot::{ChannelBotRow, ChannelBotStore};
+pub use channel_pairing::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
+pub use channel_session::ChannelSessionStore;
 pub use cost::CostStore;
 pub use cron::CronStore;
 pub use error::StorageError;
@@ -22,3 +31,4 @@ pub use memory::MemoryStore;
 pub use secret::SecretStore;
 pub use session::{SessionStore, StoredMessage};
 pub use session_summary::{SessionSummaryRow, SessionSummaryStore};
+pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};

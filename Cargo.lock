@@ -793,8 +793,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aura-model",
+ "bytes",
  "chrono",
+ "futures",
+ "serde",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
