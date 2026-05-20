@@ -2,16 +2,15 @@
 
 ## Overview
 
-The `storage` crate hosts libsql implementations for every Store trait in the workspace plus the remaining trait definitions whose domain doesn't have its own crate. Domain crates that do exist own their own trait surface: `SessionStore` / `SessionSummaryStore` in `aura-session`, `JobStore` in `aura-job`, `TraceStore` in `aura-trace`, `MemoryStore` in `aura-memory`, `CostStore` in `aura-cost`, `SecretStore` in `aura-security`. **libsql** is the sole backend.
+The `storage` crate is the **libsql adapter**: it implements every `*Store` trait over a single libsql backend. The trait *contracts* now live in the `aura-store` ports crate (see [`README.md`](README.md)), not here — `aura-storage` re-exports them (`aura_storage::BlobStore` etc.) for back-compat. **libsql** is the sole backend.
 
 Its job is:
 
-- Define the remaining Store traits whose domain has no dedicated crate (`channel_session`, `channel_bot`, `channel_pairing`, `cron`, `skill_risk`, `blob`)
-- Implement every Store trait — including those owned by domain crates — via libsql
+- Implement every `*Store` trait from `aura-store` (`SessionStore`, `SessionSummaryStore`, `JobStore`, `TraceStore`, `MemoryStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`, `SkillRiskStore`) via libsql
 - Provide `Store` for dependency injection
 - Manage database schema initialization
 
-Domain crates own their full persistence vertical (trait + manager + test-support fake). `aura-storage` depends on each one for the trait it must implement.
+Because the trait contracts and their row/DTO types live in `aura-store` (a leaf over `aura-model`), `aura-storage` no longer depends on the domain crates whose stores it implements — only on `aura-store` + `aura-model`, plus `aura-job` / `aura-trace` (and those two only because `JobStore` / `TraceStore` stayed in their domain crates, their row types carrying domain logic). Domain crates depend on `aura-store` to *call* a store; the assembly layer wires in `aura-storage`.
 
 ## Design Decisions
 

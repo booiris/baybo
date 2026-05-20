@@ -172,7 +172,6 @@ impl SessionManager {
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
         self.create_session_with_trigger(user, channel, TriggerSource::User)
             .await
-            .map_err(SessionError::from)
     }
 
     /// Mint a brand-new session with an explicit `TriggerSource`. Used
@@ -197,7 +196,6 @@ impl SessionManager {
         let id = SessionId::from(format!("{prefix}{}", uuid::Uuid::new_v4()));
         self.create_session_with_id(id, user, channel, trigger)
             .await
-            .map_err(SessionError::from)
     }
 
     /// Create a `LineageKind::SystemMaintenance` session for
@@ -384,7 +382,6 @@ impl SessionManager {
         debug!(session_id = %session_id, "session not found, creating new session");
         self.create_session_with_id(session_id.clone(), user, channel, TriggerSource::User)
             .await
-            .map_err(SessionError::from)
     }
 
     pub async fn get(&self, session_id: &SessionId) -> Result<Option<Session>> {
