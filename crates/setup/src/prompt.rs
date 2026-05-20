@@ -8,6 +8,16 @@ use crate::error::Result;
 /// `aura_channels::registration::Prompter`'s own `Send` bound.
 pub trait Prompter: Send {
     fn select(&mut self, label: &str, options: &[&str]) -> Result<usize>;
+    /// Multi-select checkbox picker. `initial[i]` seeds option `i`'s
+    /// checked state (missing entries default to unchecked). Returns the
+    /// checked indices in ascending order — empty when the operator
+    /// confirms with nothing checked.
+    fn multi_select(
+        &mut self,
+        label: &str,
+        options: &[&str],
+        initial: &[bool],
+    ) -> Result<Vec<usize>>;
     /// Empty submission returns the default verbatim.
     fn text(&mut self, label: &str, default: &str) -> Result<String>;
     /// `[Y/n]` when `default = true`, `[y/N]` otherwise.
