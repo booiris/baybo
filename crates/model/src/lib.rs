@@ -1,4 +1,5 @@
 pub mod approval;
+mod cost;
 mod cron;
 mod external_agent;
 mod governance;
@@ -12,6 +13,7 @@ mod session;
 pub mod spawn_protocol;
 
 pub use approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
+pub use cost::{CostRecord, CostSummary, TimeRange};
 pub use cron::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
 pub use external_agent::{
     AURA_BACKEND_TAG, ExternalAgentKind, SubagentBackend, SubagentBackendKind, SubagentBackendTag,

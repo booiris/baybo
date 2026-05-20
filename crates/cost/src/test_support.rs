@@ -9,7 +9,9 @@ use async_trait::async_trait;
 use aura_model::{JobId, SessionId};
 use parking_lot::Mutex;
 
-use crate::store::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
+use crate::store::CostError;
+use aura_model::{CostRecord, CostSummary, TimeRange};
+use aura_store::cost::{CostStore, Result as CostResult};
 
 const fn assert_send<T: Send>() {}
 const _: () = assert_send::<CostError>();

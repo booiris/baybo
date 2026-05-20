@@ -593,9 +593,14 @@ impl QueryApi {
             .as_ref()
             .ok_or_else(|| QueryError::Unsupported("cost_summary requires a CostStore".into()))?;
         match scope {
-            CostScope::TimeRange(range) => Ok(costs.query_global(range).await?),
+            CostScope::TimeRange(range) => {
+                Ok(costs.query_global(range).await.map_err(CostError::from)?)
+            }
             CostScope::User { user_id, range } => {
-                let records = costs.query_user(&user_id, range).await?;
+                let records = costs
+                    .query_user(&user_id, range)
+                    .await
+                    .map_err(CostError::from)?;
                 let mut summary = CostSummary::default();
                 for r in records {
                     summary.total_cost_usd += r.cost_usd;
@@ -607,8 +612,10 @@ impl QueryApi {
                 }
                 Ok(summary)
             }
-            CostScope::Session(sid) => Ok(costs.query_session(&sid).await?),
-            CostScope::Job(jid) => Ok(costs.query_job(&jid).await?),
+            CostScope::Session(sid) => {
+                Ok(costs.query_session(&sid).await.map_err(CostError::from)?)
+            }
+            CostScope::Job(jid) => Ok(costs.query_job(&jid).await.map_err(CostError::from)?),
         }
     }
 
@@ -777,7 +784,10 @@ impl QueryApi {
         let mut total_records = 0usize;
         let mut by_model: HashMap<String, AnalyticsModelBucket> = HashMap::new();
 
-        let records = costs.query_records_in_range(range.clone()).await?;
+        let records = costs
+            .query_records_in_range(range.clone())
+            .await
+            .map_err(CostError::from)?;
         for r in &records {
             total_input += r.input_tokens;
             total_output += r.output_tokens;

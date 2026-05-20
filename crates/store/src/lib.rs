@@ -7,11 +7,13 @@
 //! low-level crates depend on a store interface without pulling the heavy
 //! libsql adapter, and keeps the dependency graph acyclic.
 
+pub mod cost;
 pub mod cron;
 pub mod error;
 pub mod memory;
 pub mod secret;
 
+pub use cost::CostStore;
 pub use cron::CronStore;
 pub use error::StorageError;
 pub use memory::MemoryStore;

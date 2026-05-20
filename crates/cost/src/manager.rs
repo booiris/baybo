@@ -9,7 +9,8 @@ use parking_lot::RwLock;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::store::{CostRecord, CostStore, TimeRange};
+use aura_model::{CostRecord, TimeRange};
+use aura_store::CostStore;
 
 #[derive(Debug, Error)]
 pub enum CostGuardError {
