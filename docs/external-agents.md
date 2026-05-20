@@ -183,8 +183,24 @@ Traces list with a `subagent` badge + job status, and opening it
 shows the full transcript (thinking / tool_use / tool_result) via the
 shared `MessageList` component.
 
-Token usage (`ExternalAgentEvent::Usage`) is still dropped — wiring it
-into `cost_records` is a separate follow-up.
+## Cost / token accounting
+
+External agents are subscription-billed (claude code Max, codex on
+ChatGPT), so their token usage costs the operator nothing per-call.
+The `ExternalAgentEvent::Usage` the parser emits is captured by
+`run_external_agent` and logged via
+`CostManager::record_external_tokens` after the run closes:
+
+- `cost_usd` is **always `MicroUsd::ZERO`** — the method never prices
+  the tokens and never touches the daily/monthly budget accumulators,
+  so an external run can't trip a spend cap.
+- Tokens (input / output / cached / cache-creation) are persisted to
+  `cost_records` so the analytics per-session / per-model breakdowns
+  include external runs.
+- `model` is recorded as `"<kind> (external agent)"` (e.g.
+  `"claude (external agent)"`) — deliberately not a priced model slug.
+- `span_id` is `SpanId::default()` (nil) since external runs record no
+  span tree.
 
 `claude -p` runs with `--permission-mode bypassPermissions`
 hardcoded. claude's interactive permission prompts can't reach

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use aura_channels::{AgentOutput, IncomingMessage, Message};
+use aura_cost::CostManager;
 use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
+use aura_llm::TokenUsage;
 use aura_model::{
     ChannelType, ChatMessage, ContentBlock, ExternalAgentKind, JobId, Lineage, LineageKind,
     MessageMetadata, Role, SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend,
@@ -216,6 +218,8 @@ impl Router {
         let session_manager = Arc::clone(&self.session_manager);
         let job_ctx = ExternalJobCtx {
             lifecycle: Arc::clone(&self.job_lifecycle),
+            cost_manager: Arc::clone(&self.cost_manager),
+            user_id: child_session.user.id.clone(),
             trigger_kind: child_session.trigger.kind(),
             soul_version: child_session.bound_soul_version.clone(),
             parent_job_id,
@@ -381,6 +385,8 @@ fn validate_resume_session(
 /// `get_trace` 404s on them.
 struct ExternalJobCtx {
     lifecycle: Arc<JobLifecycle>,
+    cost_manager: Arc<CostManager>,
+    user_id: String,
     trigger_kind: TriggerKind,
     soul_version: String,
     parent_job_id: JobId,
@@ -441,7 +447,26 @@ async fn run_external_agent_job(
         };
     }
 
-    let result = run_external_agent(agent, kind, request, child_session_id, session_manager).await;
+    let (result, token_usage) =
+        run_external_agent(agent, kind, request, child_session_id, session_manager).await;
+
+    // Subscription-billed: log token consumption with cost $0 so the
+    // analytics per-session/model breakdowns include external runs
+    // without charging the operator's budget. No span tree exists, so
+    // the record is keyed to a nil span id.
+    if let Some(usage) = token_usage {
+        job_ctx.cost_manager.record_external_tokens(
+            &job_ctx.user_id,
+            job.session_id.clone(),
+            job.id,
+            SpanId::default(),
+            &format!("{} (external agent)", kind.as_str()),
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens,
+        );
+    }
 
     match &result.status {
         SubagentExitStatus::Completed => {
@@ -471,13 +496,17 @@ async fn run_external_agent_job(
     result
 }
 
+/// Drives the agent stream → persists transcript turns, captures the
+/// terminal status, and returns any `Usage` the agent reported (for
+/// the caller to log into `cost_records`). Stays job-agnostic;
+/// [`run_external_agent_job`] owns the surrounding job lifecycle.
 async fn run_external_agent(
     agent: Arc<dyn ExternalAgent>,
     kind: ExternalAgentKind,
     request: ExternalAgentRequest,
     child_session_id: SessionId,
     session_manager: Arc<aura_session::SessionManager>,
-) -> SubagentResult {
+) -> (SubagentResult, Option<TokenUsage>) {
     // Persist the operator-supplied task up-front so the transcript
     // shows something even if the external agent crashes before
     // emitting its first event.
@@ -496,16 +525,20 @@ async fn run_external_agent(
     let mut stream = match agent.run(request).await {
         Ok(s) => s,
         Err(e) => {
-            return SubagentResult {
-                child_session_id,
-                final_content: None,
-                status: SubagentExitStatus::Failed(format!("external agent run: {e}")),
-            };
+            return (
+                SubagentResult {
+                    child_session_id,
+                    final_content: None,
+                    status: SubagentExitStatus::Failed(format!("external agent run: {e}")),
+                },
+                None,
+            );
         }
     };
 
     let mut final_content: Option<Vec<ContentBlock>> = None;
     let mut final_status: Option<SubagentExitStatus> = None;
+    let mut token_usage: Option<TokenUsage> = None;
 
     // The parser inside the agent already enforces the timeout against
     // its own deadline. Adding a second wall-clock deadline here would
@@ -527,11 +560,13 @@ async fn run_external_agent(
             n = stream.next() => n,
         };
         match next {
-            Some(Ok(ExternalAgentEvent::TextDelta(_) | ExternalAgentEvent::Usage(_))) => {
-                // Deltas + token usage not surfaced to the parent yet.
-                // The agent's final transcript reaches the parent via
-                // the FinalContent event below; cost ledger
-                // integration is a future task.
+            Some(Ok(ExternalAgentEvent::TextDelta(_))) => {
+                // Deltas not forwarded to the parent yet.
+            }
+            Some(Ok(ExternalAgentEvent::Usage(usage))) => {
+                // Logged into cost_records (cost $0, tokens only) by
+                // run_external_agent_job after the stream closes.
+                token_usage = Some(usage);
             }
             Some(Ok(ExternalAgentEvent::ResumeKey(key))) => {
                 if let Err(e) =
@@ -581,11 +616,14 @@ async fn run_external_agent(
     // The FinalContent text duplicates the last `Intermediate(Assistant)`
     // event we already persisted, so don't write it again here.
 
-    SubagentResult {
-        child_session_id,
-        final_content,
-        status: final_status.unwrap_or(SubagentExitStatus::Completed),
-    }
+    (
+        SubagentResult {
+            child_session_id,
+            final_content,
+            status: final_status.unwrap_or(SubagentExitStatus::Completed),
+        },
+        token_usage,
+    )
 }
 
 async fn append_subagent_message(
