@@ -1,4 +1,5 @@
 pub mod approval;
+mod external_agent;
 mod governance;
 mod ids;
 mod memory;
@@ -10,6 +11,9 @@ mod session;
 pub mod spawn_protocol;
 
 pub use approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
+pub use external_agent::{
+    AURA_BACKEND_TAG, ExternalAgentKind, SubagentBackend, SubagentBackendKind, SubagentBackendTag,
+};
 pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLevel};
 pub use ids::{CostRecordId, JobId, ParallelGroup, SessionId, SpanId, StepId};
 pub use memory::{MemoryCategory, MemoryEntry};

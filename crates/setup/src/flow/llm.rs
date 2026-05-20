@@ -173,8 +173,8 @@ async fn add_entry<P: Prompter>(
 
     config.llm.push(entry.clone());
 
-    // Promote default-llm when there's only one entry (no real choice)
-    // OR when the prior default is empty / dangling.
+    // Promote default-llm when there's only one entry OR the prior
+    // default is empty / dangling.
     let prior_default_valid = config.llm.iter().any(|e| e.name == config.default_llm);
     let auto_promote = config.llm.len() == 1 || !prior_default_valid;
     let became_default = if auto_promote {

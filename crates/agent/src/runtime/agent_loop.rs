@@ -222,13 +222,8 @@ pub struct AgentLoop {
 /// post-construction mutability.
 pub struct AgentLoopConfig {
     /// Process-wide pool of guarded LLM clients keyed by entry name.
-    /// The active client is resolved from this pool at construction
-    /// (using `initial_llm`) and on every subsequent
-    /// [`AgentLoop::set_current_llm`].
     pub llm_pool: Arc<crate::runtime::llm_pool::LlmClientPool>,
     /// Initial pick for the active LLM. `None` ⇒ pool default.
-    /// Typically sourced from `Session.state.last_llm` for cold-start
-    /// hydration; can be overridden by the spawner for fresh actors.
     pub initial_llm: Option<String>,
     pub tool_registry: Arc<ToolRegistry>,
     pub skill_registry: Arc<SkillRegistry>,
@@ -283,6 +278,7 @@ impl AgentLoop {
         );
         let mut context_manager = context_manager;
         context_manager.set_active_model_context_window(llm_client.model_info().context_window);
+
         Self {
             llm_client,
             billed_chat_factory,

@@ -1,4 +1,8 @@
-use aura_config::{AuraConfig, ConfigError, DiscordChannelConfig, LlmEntry, TelegramChannelConfig};
+use aura_config::{
+    AuraConfig, ClaudeConfig, CodexConfig, ConfigError, DiscordChannelConfig, ExternalAgentsConfig,
+    LlmEntry, TelegramChannelConfig,
+};
+use aura_model::ExternalAgentKind;
 
 fn has_field(errors: &[aura_config::ValidationError], field: &str) -> bool {
     errors.iter().any(|e| e.field == field)
@@ -389,6 +393,95 @@ fn unset_at_path_rejects_empty() {
     let cfg = AuraConfig::default();
     let err = cfg.unset_at_path("").expect_err("empty should fail");
     assert!(matches!(err, ConfigError::InvalidPath { .. }));
+}
+
+#[test]
+fn external_agents_disabled_by_default() {
+    // Default config has no external agents enabled — even if a
+    // claude/codex binary happens to be on PATH at boot, registration
+    // must require an explicit operator opt-in.
+    let c = AuraConfig::default();
+    assert!(c.external_agents.enabled_kinds().is_empty());
+    c.validate().expect("default config validates");
+}
+
+#[test]
+fn external_agents_zero_or_one_enabled_default_optional() {
+    // Zero enabled.
+    let c = AuraConfig::default();
+    c.validate()
+        .expect("no external agents = no default needed");
+
+    // Exactly one enabled, no default set: still fine.
+    let mut c = AuraConfig::default();
+    c.external_agents.claude.enabled = true;
+    c.external_agents.claude.binary_path = Some("/usr/bin/claude".into());
+    c.validate()
+        .expect("single external agent = implicit default");
+}
+
+#[test]
+fn external_agents_multiple_enabled_require_default() {
+    let c = AuraConfig {
+        external_agents: ExternalAgentsConfig {
+            claude: ClaudeConfig {
+                enabled: true,
+                binary_path: Some("/usr/bin/claude".into()),
+            },
+            codex: CodexConfig {
+                enabled: true,
+                binary_path: Some("/usr/bin/codex".into()),
+            },
+            default_external_agent: None,
+        },
+        ..AuraConfig::default()
+    };
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "external_agents.default_external_agent"));
+}
+
+#[test]
+fn external_agents_default_among_enabled_is_ok() {
+    let c = AuraConfig {
+        external_agents: ExternalAgentsConfig {
+            claude: ClaudeConfig {
+                enabled: true,
+                binary_path: Some("/usr/bin/claude".into()),
+            },
+            codex: CodexConfig {
+                enabled: true,
+                binary_path: Some("/usr/bin/codex".into()),
+            },
+            default_external_agent: Some(ExternalAgentKind::Claude),
+        },
+        ..AuraConfig::default()
+    };
+    c.validate().expect("default among enabled = OK");
+}
+
+#[test]
+fn external_agents_binary_path_without_enabled_does_not_count() {
+    // An operator who set binary_path but left enabled=false has not
+    // actually opted in. Validation must NOT treat this as "configured"
+    // for the multi-enabled default-required rule, since boot will
+    // skip the kind entirely.
+    let c = AuraConfig {
+        external_agents: ExternalAgentsConfig {
+            claude: ClaudeConfig {
+                enabled: false,
+                binary_path: Some("/usr/bin/claude".into()),
+            },
+            codex: CodexConfig {
+                enabled: false,
+                binary_path: Some("/usr/bin/codex".into()),
+            },
+            default_external_agent: None,
+        },
+        ..AuraConfig::default()
+    };
+    c.validate()
+        .expect("binary_path without enabled = not opted in");
+    assert!(c.external_agents.enabled_kinds().is_empty());
 }
 
 #[test]

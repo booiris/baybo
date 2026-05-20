@@ -371,6 +371,44 @@ impl CostManager {
         cost
     }
 
+    /// Record token consumption for a subscription-billed external
+    /// agent run (claude code Max, codex on ChatGPT). Cost is
+    /// **always [`MicroUsd::ZERO`]** — the operator's subscription
+    /// covers it, so we never price these tokens and never touch the
+    /// daily/monthly budget accumulators. Tokens are still persisted
+    /// for observability (the analytics per-model/session breakdowns).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_external_tokens(
+        self: &Arc<Self>,
+        user_id: &str,
+        session_id: SessionId,
+        job_id: JobId,
+        span_id: SpanId,
+        model_id: &str,
+        input_tokens: usize,
+        output_tokens: usize,
+        cached_input_tokens: usize,
+        cache_creation_input_tokens: usize,
+    ) {
+        let record = CostRecord {
+            user_id: user_id.to_string(),
+            session_id,
+            job_id,
+            span_id,
+            model: model_id.to_string(),
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+            cost_usd: MicroUsd::ZERO,
+            timestamp: Utc::now(),
+        };
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            me.persist(record).await;
+        });
+    }
+
     async fn persist(self: Arc<Self>, record: CostRecord) {
         if let Err(e) = self.store.record(&record).await {
             warn!(error = %e, "failed to write cost_record");

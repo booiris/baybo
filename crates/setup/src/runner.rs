@@ -9,8 +9,9 @@ use aura_gateway::{LISTENING_BANNER_PREFIX, SidecarRuntime};
 use crate::bootstrap::SetupContext;
 use crate::error::{Result, SetupError};
 use crate::flow::{
-    BrowserStepOutcome, ChannelStepOutcome, LlmStepOutcome, configure_browser_step,
-    configure_channel_step, configure_llm_step,
+    BrowserStepOutcome, ChannelStepOutcome, ExternalAgentsStepOutcome, LlmStepOutcome,
+    configure_browser_step, configure_channel_step, configure_external_agents_step,
+    configure_llm_step,
 };
 use crate::prompt::Prompter;
 
@@ -26,6 +27,7 @@ pub struct SetupOutcome {
     pub llm_added: Option<String>,
     pub channel_added: Option<String>,
     pub browser_enabled: bool,
+    pub external_agents: ExternalAgentsStepOutcome,
 }
 
 pub async fn run<P: Prompter>(prompter: &mut P, ctx: &mut SetupContext) -> Result<SetupOutcome> {
@@ -54,6 +56,9 @@ pub async fn run_quick<P: Prompter>(
     eprintln!("Browser tool: enabled (docker mode; falls back to host-headless if unavailable)");
     print_step_separator();
 
+    let external_agents = configure_external_agents_step(prompter, &mut ctx.config).await?;
+    print_step_separator();
+
     commit_config(ctx).await?;
 
     Ok(SetupOutcome {
@@ -61,6 +66,7 @@ pub async fn run_quick<P: Prompter>(
         llm_added,
         channel_added,
         browser_enabled: ctx.config.browser.enable,
+        external_agents,
     })
 }
 
@@ -77,6 +83,9 @@ pub async fn run_full<P: Prompter>(
     let browser_enabled = matches!(browser, BrowserStepOutcome::Enabled { .. });
     print_step_separator();
 
+    let external_agents = configure_external_agents_step(prompter, &mut ctx.config).await?;
+    print_step_separator();
+
     commit_config(ctx).await?;
 
     Ok(SetupOutcome {
@@ -84,6 +93,7 @@ pub async fn run_full<P: Prompter>(
         llm_added,
         channel_added,
         browser_enabled,
+        external_agents,
     })
 }
 

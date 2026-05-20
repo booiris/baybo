@@ -694,21 +694,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                   initial_llm: Option<String>,
                   response_tx: mpsc::Sender<AgentOutput>,
                   actor_token: CancellationToken| {
-                // LLM pinning is exclusively a subagent-spawn affair —
-                // user-channel actors always run on `default-llm`.
-                // `initial_llm` is `Some` only when the router's
-                // `handle_subagent_spawn` forwards a
-                // `SubagentSpawnRequest.llm`.
-                let effective_initial = initial_llm;
-
-                // `summary_state_dir` connects the compressor's
-                // fast-path to the background refresh runner's output.
-                // Without it the background passes still run and bill
-                // LLM, but their summaries never reach the hot path.
-                // See `docs/background-compression.md`.
                 let agent_loop = AgentLoop::from_config(AgentLoopConfig {
                     llm_pool: Arc::clone(&llm_pool),
-                    initial_llm: effective_initial,
+                    initial_llm,
                     tool_registry: Arc::clone(&tool_registry),
                     skill_registry: Arc::clone(&skill_registry),
                     tool_executor: Arc::clone(&tool_executor),
@@ -786,6 +774,19 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         graph.actor_parent_token.clone(),
     );
 
+    let workspace_paths_for_router = Arc::new(aura_workspace::WorkspacePaths::new(
+        graph.workspace.root.clone(),
+    ));
+
+    // External-agent registry: only kinds the operator has explicitly
+    // opted into (`enabled: true` in aura.json) are probed and
+    // registered. An installed-but-not-enabled binary on PATH is
+    // NOT a trust signal — registration would expose the LLM to a
+    // host-execution channel that bypasses aura's sandbox + approval
+    // gate.
+    let external_agents =
+        aura_agent::external_agent::build_registry(graph.config.external_agents.boot_entries());
+
     let router = Router::from_config(aura_agent::router::RouterConfig {
         session_manager: Arc::clone(&graph.session_manager),
         supervisor,
@@ -799,6 +800,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         actor_parent_token: graph.actor_parent_token.clone(),
         rate_limit_max_requests: rate_limit_cfg.max_requests,
         rate_limit_window: std::time::Duration::from_secs(rate_limit_cfg.window_secs),
+        external_agents: Arc::new(external_agents),
+        workspace_paths: workspace_paths_for_router,
     });
 
     RouterRunHandle {
