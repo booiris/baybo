@@ -1,15 +1,16 @@
 use async_trait::async_trait;
 
-use crate::SecurityError;
+use crate::StorageError;
 
-pub type Result<T> = std::result::Result<T, SecurityError>;
+pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Async trait for encrypted secret persistence.
 ///
 /// Implemented by `aura_storage::libsql::LibsqlSecretStore` (production)
-/// and `aura_security::test_support::MemorySecretStore` (tests). The
-/// trait lives here, next to `SecretVault`, so downstream callers and
-/// tests can depend on `aura-security` alone for vault-shaped work.
+/// and `aura_security::test_support::MemorySecretStore` (tests). The bytes
+/// handed in are already AES-256-GCM ciphertext minted by
+/// `aura_security::SecretVault` — this layer only persists opaque blobs
+/// keyed by name and never sees plaintext.
 #[async_trait]
 pub trait SecretStore: Send + Sync {
     async fn store(&self, name: &str, encrypted_value: &[u8]) -> Result<()>;

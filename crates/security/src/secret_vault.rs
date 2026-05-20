@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::crypto::{self, EncryptionKey};
-use crate::secret_store::SecretStore;
+use aura_store::SecretStore;
 use crate::secret_value::SecretValue;
 use crate::{Result, SecurityError};
 

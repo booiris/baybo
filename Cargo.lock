@@ -484,6 +484,7 @@ dependencies = [
  "aura-setup",
  "aura-skills",
  "aura-storage",
+ "aura-store",
  "aura-tools",
  "aura-trace",
  "aura-workspace",
@@ -540,6 +541,7 @@ dependencies = [
  "aura-model",
  "aura-security",
  "aura-storage",
+ "aura-store",
  "base64",
  "bytes",
  "chrono",
@@ -644,6 +646,7 @@ dependencies = [
  "async-trait",
  "aura-model",
  "aura-security",
+ "aura-store",
  "chrono",
  "hex",
  "hkdf",
@@ -669,6 +672,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aura-model",
+ "aura-store",
  "chrono",
  "futures",
  "parking_lot",
@@ -759,8 +763,8 @@ dependencies = [
  "aura-job",
  "aura-memory",
  "aura-model",
- "aura-security",
  "aura-session",
+ "aura-store",
  "aura-trace",
  "bytes",
  "chrono",
@@ -778,6 +782,16 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "aura-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aura-model",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

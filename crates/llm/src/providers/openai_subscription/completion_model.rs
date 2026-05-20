@@ -1612,18 +1612,18 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl aura_security::SecretStore for FailingStoreNTimes {
+    impl aura_store::SecretStore for FailingStoreNTimes {
         async fn store(
             &self,
             name: &str,
             encrypted_value: &[u8],
-        ) -> std::result::Result<(), aura_security::SecurityError> {
+        ) -> std::result::Result<(), aura_store::StorageError> {
             if self
                 .fails_remaining
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
                 > 0
             {
-                return Err(aura_security::SecurityError::Storage(
+                return Err(aura_store::StorageError::Storage(
                     "simulated vault failure".into(),
                 ));
             }
@@ -1632,16 +1632,16 @@ mod tests {
         async fn retrieve(
             &self,
             name: &str,
-        ) -> std::result::Result<Option<Vec<u8>>, aura_security::SecurityError> {
+        ) -> std::result::Result<Option<Vec<u8>>, aura_store::StorageError> {
             self.inner.retrieve(name).await
         }
         async fn delete(
             &self,
             name: &str,
-        ) -> std::result::Result<(), aura_security::SecurityError> {
+        ) -> std::result::Result<(), aura_store::StorageError> {
             self.inner.delete(name).await
         }
-        async fn list(&self) -> std::result::Result<Vec<String>, aura_security::SecurityError> {
+        async fn list(&self) -> std::result::Result<Vec<String>, aura_store::StorageError> {
             self.inner.list().await
         }
     }

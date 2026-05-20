@@ -11,6 +11,7 @@ test-support = ["dep:parking_lot"]
 
 [dependencies]
 aura-model = { workspace = true }
+aura-store = { workspace = true }
 parking_lot = { workspace = true, optional = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
