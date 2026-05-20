@@ -199,7 +199,6 @@ async fn add_entry<P: Prompter>(
     Ok(LlmStepOutcome::Added(Box::new(entry)))
 }
 
-
 fn unique_default_name(provider: &str, existing: &[LlmEntry]) -> String {
     let mut candidate = provider.to_string();
     let mut suffix = 2;

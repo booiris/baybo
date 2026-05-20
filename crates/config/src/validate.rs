@@ -236,7 +236,10 @@ fn validate_cross_section(config: &AuraConfig, errors: &mut Vec<ValidationError>
 
 fn validate_default_external_agent(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
     let enabled = config.external_agents.enabled_kinds();
-    match (enabled.len(), &config.external_agents.default_external_agent) {
+    match (
+        enabled.len(),
+        &config.external_agents.default_external_agent,
+    ) {
         // Zero or one enabled: default is optional. Single enabled
         // kind is implicitly the default.
         (0 | 1, _) => {}

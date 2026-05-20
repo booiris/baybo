@@ -627,7 +627,9 @@ mod tests {
     fn classify_rate_limit_is_transient() {
         let e = classify_codex_error("rate limit exceeded");
         match e {
-            ExternalAgentError::Transient(msg) => assert!(msg.contains("rate limited"), "msg: {msg}"),
+            ExternalAgentError::Transient(msg) => {
+                assert!(msg.contains("rate limited"), "msg: {msg}")
+            }
             other => panic!("expected Transient, got {other:?}"),
         }
     }

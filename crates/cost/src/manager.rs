@@ -377,6 +377,7 @@ impl CostManager {
     /// covers it, so we never price these tokens and never touch the
     /// daily/monthly budget accumulators. Tokens are still persisted
     /// for observability (the analytics per-model/session breakdowns).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_external_tokens(
         self: &Arc<Self>,
         user_id: &str,

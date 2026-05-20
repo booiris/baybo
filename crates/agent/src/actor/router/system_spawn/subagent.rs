@@ -631,7 +631,10 @@ async fn append_subagent_message(
     session_id: &SessionId,
     msg: ChatMessage,
 ) {
-    if let Err(e) = session_manager.append_session_message(session_id, &msg).await {
+    if let Err(e) = session_manager
+        .append_session_message(session_id, &msg)
+        .await
+    {
         warn!(
             session_id = %session_id,
             role = ?msg.role,
@@ -679,9 +682,7 @@ async fn persist_resume_key(
 #[cfg(test)]
 mod resume_validation_tests {
     use super::*;
-    use aura_model::{
-        ChannelType, JobId, SessionState, SpanId, TriggerSource, User,
-    };
+    use aura_model::{ChannelType, JobId, SessionState, SpanId, TriggerSource, User};
     use chrono::Utc;
 
     fn mk_parent(id: &str) -> Session {
@@ -779,12 +780,7 @@ mod resume_validation_tests {
     #[test]
     fn rejects_non_subagent_lineage_kind() {
         let parent = mk_parent("p");
-        let child = mk_child(
-            "c",
-            "p",
-            LineageKind::SystemMaintenance,
-            Some(aura_tag()),
-        );
+        let child = mk_child("c", "p", LineageKind::SystemMaintenance, Some(aura_tag()));
         let err = validate_resume_session(&child, &parent, aura_request())
             .expect_err("non-Subagent lineage must reject");
         assert!(err.contains("Subagent lineage"), "got: {err}");

@@ -81,10 +81,7 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
     let kind = ExternalAgentKind::ALL[idx];
 
     let binary_input = prompt_with_default(
-        &format!(
-            "`{}` binary path (empty = PATH lookup)",
-            kind.binary_name()
-        ),
+        &format!("`{}` binary path (empty = PATH lookup)", kind.binary_name()),
         "",
     )?;
     let binary_path = if binary_input.trim().is_empty() {

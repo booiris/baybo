@@ -784,9 +784,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     // NOT a trust signal — registration would expose the LLM to a
     // host-execution channel that bypasses aura's sandbox + approval
     // gate.
-    let external_agents = aura_agent::external_agent::build_registry(
-        graph.config.external_agents.boot_entries(),
-    );
+    let external_agents =
+        aura_agent::external_agent::build_registry(graph.config.external_agents.boot_entries());
 
     let router = Router::from_config(aura_agent::router::RouterConfig {
         session_manager: Arc::clone(&graph.session_manager),

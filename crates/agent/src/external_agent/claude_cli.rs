@@ -35,8 +35,7 @@ const PERMISSION_MODE: &str = "bypassPermissions";
 /// subscription supports; a date-versioned id would rot.
 const DEFAULT_MODEL_FLAG: &str = "opus";
 
-const INSTALL_HINT: &str =
-    "Install Claude Code (npm install -g @anthropic-ai/claude-code) or configure an explicit binary path.";
+const INSTALL_HINT: &str = "Install Claude Code (npm install -g @anthropic-ai/claude-code) or configure an explicit binary path.";
 
 #[derive(Debug)]
 pub struct ClaudeCliAgent {
@@ -135,9 +134,10 @@ impl ClaudeCliAgent {
             .stdin
             .take()
             .ok_or_else(|| ExternalAgentError::Transient("claude: stdin not captured".into()))?;
-        stdin.write_all(prompt.as_bytes()).await.map_err(|e| {
-            ExternalAgentError::Transient(format!("claude: write stdin: {e}"))
-        })?;
+        stdin
+            .write_all(prompt.as_bytes())
+            .await
+            .map_err(|e| ExternalAgentError::Transient(format!("claude: write stdin: {e}")))?;
         drop(stdin);
         Ok(child)
     }
@@ -583,8 +583,8 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
 
-        let err = ClaudeCliAgent::probe_and_build(Some(bin.to_str().unwrap()))
-            .expect_err("must fail");
+        let err =
+            ClaudeCliAgent::probe_and_build(Some(bin.to_str().unwrap())).expect_err("must fail");
         match err {
             ExternalAgentError::Config(msg) => {
                 assert!(msg.contains("printed nothing"), "msg: {msg}")
@@ -602,8 +602,8 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
 
-        let err = ClaudeCliAgent::probe_and_build(Some(bin.to_str().unwrap()))
-            .expect_err("must fail");
+        let err =
+            ClaudeCliAgent::probe_and_build(Some(bin.to_str().unwrap())).expect_err("must fail");
         match err {
             ExternalAgentError::Config(msg) => {
                 assert!(msg.contains("exited"), "msg: {msg}");
@@ -684,7 +684,9 @@ mod tests {
             input: serde_json::json!({"file_path": "foo.txt", "content": "bar"}),
         };
         match block.into_content_block().expect("tool_use projects") {
-            ContentBlock::ToolUse { id, name, input, .. } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "toolu_1");
                 assert_eq!(name, "Write");
                 assert_eq!(input["file_path"], "foo.txt");
@@ -696,8 +698,8 @@ mod tests {
     #[test]
     fn user_block_tool_result_projects_to_content_block() {
         let line = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"ok"}]}}"#;
-        let StreamJsonEvent::User { message } = serde_json::from_str::<StreamJsonEvent>(line)
-            .unwrap()
+        let StreamJsonEvent::User { message } =
+            serde_json::from_str::<StreamJsonEvent>(line).unwrap()
         else {
             panic!("expected User event");
         };
@@ -787,8 +789,10 @@ mod tests {
 
     #[test]
     fn classify_rate_limit_is_transient() {
-        let e =
-            classify_claude_error("error_during_execution", "rate limit exceeded for your plan");
+        let e = classify_claude_error(
+            "error_during_execution",
+            "rate limit exceeded for your plan",
+        );
         match e {
             ExternalAgentError::Transient(msg) => {
                 assert!(msg.contains("rate limited"), "msg: {msg}")

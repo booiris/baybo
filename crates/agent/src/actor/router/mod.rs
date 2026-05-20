@@ -255,8 +255,7 @@ impl Router {
         parent_token: &CancellationToken,
     ) -> (mpsc::Sender<AgentMessage>, CancellationToken) {
         let actor_token = parent_token.child_token();
-        let mailbox =
-            (self.actor_spawner)(session, initial_llm, response_tx, actor_token.clone());
+        let mailbox = (self.actor_spawner)(session, initial_llm, response_tx, actor_token.clone());
         (mailbox, actor_token)
     }
 }

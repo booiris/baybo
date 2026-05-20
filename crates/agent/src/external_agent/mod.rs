@@ -86,8 +86,7 @@ pub enum ExternalAgentEvent {
     FinalContent(Vec<ContentBlock>),
 }
 
-pub type ExternalAgentStream =
-    Pin<Box<dyn Stream<Item = Result<ExternalAgentEvent>> + Send>>;
+pub type ExternalAgentStream = Pin<Box<dyn Stream<Item = Result<ExternalAgentEvent>> + Send>>;
 
 #[async_trait]
 pub trait ExternalAgent: Send + Sync {

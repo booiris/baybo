@@ -1,6 +1,6 @@
 use aura_config::{
-    AuraConfig, ClaudeConfig, CodexConfig, ConfigError, DiscordChannelConfig,
-    ExternalAgentsConfig, LlmEntry, TelegramChannelConfig,
+    AuraConfig, ClaudeConfig, CodexConfig, ConfigError, DiscordChannelConfig, ExternalAgentsConfig,
+    LlmEntry, TelegramChannelConfig,
 };
 use aura_model::ExternalAgentKind;
 
@@ -409,13 +409,15 @@ fn external_agents_disabled_by_default() {
 fn external_agents_zero_or_one_enabled_default_optional() {
     // Zero enabled.
     let c = AuraConfig::default();
-    c.validate().expect("no external agents = no default needed");
+    c.validate()
+        .expect("no external agents = no default needed");
 
     // Exactly one enabled, no default set: still fine.
     let mut c = AuraConfig::default();
     c.external_agents.claude.enabled = true;
     c.external_agents.claude.binary_path = Some("/usr/bin/claude".into());
-    c.validate().expect("single external agent = implicit default");
+    c.validate()
+        .expect("single external agent = implicit default");
 }
 
 #[test]
@@ -477,7 +479,8 @@ fn external_agents_binary_path_without_enabled_does_not_count() {
         },
         ..AuraConfig::default()
     };
-    c.validate().expect("binary_path without enabled = not opted in");
+    c.validate()
+        .expect("binary_path without enabled = not opted in");
     assert!(c.external_agents.enabled_kinds().is_empty());
 }
 

@@ -40,11 +40,7 @@ pub async fn configure_external_agents_step<P: Prompter>(
     }
 
     if outcome.enabled.len() > 1 {
-        let labels: Vec<&str> = outcome
-            .enabled
-            .iter()
-            .map(|k| k.display_name())
-            .collect();
+        let labels: Vec<&str> = outcome.enabled.iter().map(|k| k.display_name()).collect();
         let idx = prompter.select("Pick a default external agent:", &labels)?;
         let chosen = outcome.enabled[idx];
         config.external_agents.default_external_agent = Some(chosen);

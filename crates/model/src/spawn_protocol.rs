@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::{BackgroundCompressionPayload, ContentBlock, JobId, SessionId, SpanId, SubagentBackend};
+use crate::{
+    BackgroundCompressionPayload, ContentBlock, JobId, SessionId, SpanId, SubagentBackend,
+};
 
 /// Tool name the LLM emits to spawn a subagent.
 pub const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";

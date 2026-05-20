@@ -73,10 +73,7 @@ pub(crate) fn check_binary_runs(binary: &PathBuf, binary_name: &str) -> Result<(
     // wrote the binary, and concurrent test fixtures racing on shims.
     let mut attempts = 0;
     let output = loop {
-        match run_with_timeout(
-            Command::new(binary).arg("--version"),
-            VERSION_CHECK_TIMEOUT,
-        ) {
+        match run_with_timeout(Command::new(binary).arg("--version"), VERSION_CHECK_TIMEOUT) {
             Ok(out) => break out,
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempts < 5 => {
                 attempts += 1;
@@ -111,10 +108,7 @@ pub(crate) fn check_binary_runs(binary: &PathBuf, binary_name: &str) -> Result<(
     Ok(())
 }
 
-fn run_with_timeout(
-    cmd: &mut Command,
-    timeout: Duration,
-) -> std::io::Result<std::process::Output> {
+fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<std::process::Output> {
     // Synchronous (probe runs sync inside `probe_and_build`); tokio
     // timeout would force async up the chain for one shell-out.
     let mut child = cmd
