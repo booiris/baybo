@@ -12,9 +12,13 @@ pub mod cron;
 pub mod error;
 pub mod memory;
 pub mod secret;
+pub mod session;
+pub mod session_summary;
 
 pub use cost::CostStore;
 pub use cron::CronStore;
 pub use error::StorageError;
 pub use memory::MemoryStore;
 pub use secret::SecretStore;
+pub use session::{SessionStore, StoredMessage};
+pub use session_summary::{SessionSummaryRow, SessionSummaryStore};

@@ -9,13 +9,11 @@
 
 mod error;
 mod manager;
-mod store;
-mod summary_store;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+pub use aura_store::{SessionStore, SessionSummaryRow, SessionSummaryStore, StoredMessage};
 pub use error::SessionError;
 pub use manager::SessionManager;
-pub use store::{Result, SessionStore, StoredMessage};
-pub use summary_store::{SessionSummaryRow, SessionSummaryStore};
+pub type Result<T> = std::result::Result<T, SessionError>;

@@ -8,6 +8,7 @@ doctest = false
 
 [dependencies]
 aura-model = { workspace = true }
+chrono = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }

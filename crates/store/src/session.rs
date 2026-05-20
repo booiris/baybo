@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use aura_model::{ChannelType, ChatMessage, LineageKind, Session, SessionId};
 use chrono::{DateTime, Utc};
 
-use crate::error::SessionError;
+use crate::StorageError;
 
-pub type Result<T> = std::result::Result<T, SessionError>;
+pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// One row of `session_messages`, paired with its supersede marker.
 /// Yielded by [`SessionStore::load_session_messages_with_supersede`]
@@ -55,7 +55,7 @@ pub trait SessionStore: Send + Sync {
     ///
     /// Returns `Ok(true)` if the row existed and was removed, `Ok(false)`
     /// if it did not exist (idempotent).
-    /// Returns `Err(SessionError::HasLiveForks { .. })` if any session has a
+    /// Returns `Err(StorageError::HasLiveForks { .. })` if any session has a
     /// `LineageKind::UserFork` pointing into `session_id`. The live-fork
     /// scan and the parent-row delete run inside one `BEGIN IMMEDIATE`
     /// write transaction — a fork inserted concurrently either lands

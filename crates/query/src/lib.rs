@@ -47,6 +47,14 @@ pub enum QueryError {
 
 pub type Result<T> = std::result::Result<T, QueryError>;
 
+impl From<aura_store::StorageError> for QueryError {
+    // The only StorageError source reaching the query layer is the session
+    // store, so route it through SessionError.
+    fn from(e: aura_store::StorageError) -> Self {
+        QueryError::Session(e.into())
+    }
+}
+
 // ── DTOs ────────────────────────────────────────────────────────────
 
 /// Filter for `list_jobs`. All fields are AND-combined; `None` means
@@ -1151,10 +1159,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SessionStore for MemSessionStore {
-        async fn get(&self, id: &SessionId) -> std::result::Result<Option<Session>, SessionError> {
+        async fn get(
+            &self,
+            id: &SessionId,
+        ) -> std::result::Result<Option<Session>, aura_store::StorageError> {
             Ok(self.sessions.lock().get(id).cloned())
         }
-        async fn save(&self, session: &Session) -> std::result::Result<(), SessionError> {
+        async fn save(
+            &self,
+            session: &Session,
+        ) -> std::result::Result<(), aura_store::StorageError> {
             self.sessions
                 .lock()
                 .insert(session.id.clone(), session.clone());
@@ -1164,7 +1178,7 @@ mod tests {
             &self,
             id: &SessionId,
             hidden: bool,
-        ) -> std::result::Result<bool, SessionError> {
+        ) -> std::result::Result<bool, aura_store::StorageError> {
             let mut data = self.sessions.lock();
             match data.get_mut(id) {
                 Some(s) => {
@@ -1174,28 +1188,31 @@ mod tests {
                 None => Ok(false),
             }
         }
-        async fn delete(&self, _id: &SessionId) -> std::result::Result<bool, SessionError> {
+        async fn delete(
+            &self,
+            _id: &SessionId,
+        ) -> std::result::Result<bool, aura_store::StorageError> {
             Ok(true)
         }
         async fn list_expired(
             &self,
             _before: DateTime<Utc>,
-        ) -> std::result::Result<Vec<SessionId>, SessionError> {
+        ) -> std::result::Result<Vec<SessionId>, aura_store::StorageError> {
             Ok(Vec::new())
         }
-        async fn list_all(&self) -> std::result::Result<Vec<Session>, SessionError> {
+        async fn list_all(&self) -> std::result::Result<Vec<Session>, aura_store::StorageError> {
             Ok(self.sessions.lock().values().cloned().collect())
         }
         async fn list_live_forks(
             &self,
             _src: &SessionId,
-        ) -> std::result::Result<Vec<SessionId>, SessionError> {
+        ) -> std::result::Result<Vec<SessionId>, aura_store::StorageError> {
             Ok(Vec::new())
         }
         async fn list_lineage_children(
             &self,
             parent: &SessionId,
-        ) -> std::result::Result<Vec<(SessionId, LineageKind)>, SessionError> {
+        ) -> std::result::Result<Vec<(SessionId, LineageKind)>, aura_store::StorageError> {
             Ok(self
                 .children
                 .lock()
@@ -1206,24 +1223,24 @@ mod tests {
         async fn list_active_maintenance_for_parent(
             &self,
             _parent: &SessionId,
-        ) -> std::result::Result<Vec<SessionId>, SessionError> {
+        ) -> std::result::Result<Vec<SessionId>, aura_store::StorageError> {
             Ok(Vec::new())
         }
         async fn list_all_maintenance_sessions(
             &self,
-        ) -> std::result::Result<Vec<SessionId>, SessionError> {
+        ) -> std::result::Result<Vec<SessionId>, aura_store::StorageError> {
             Ok(Vec::new())
         }
         async fn list_unfinished_maintenance_sessions(
             &self,
-        ) -> std::result::Result<Vec<SessionId>, SessionError> {
+        ) -> std::result::Result<Vec<SessionId>, aura_store::StorageError> {
             Ok(Vec::new())
         }
         async fn append_session_message(
             &self,
             id: &SessionId,
             message: &aura_model::ChatMessage,
-        ) -> std::result::Result<i64, SessionError> {
+        ) -> std::result::Result<i64, aura_store::StorageError> {
             let mut guard = self.messages.lock();
             let log = guard.entry(id.clone()).or_default();
             let ordinal: i64 = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
@@ -1239,7 +1256,7 @@ mod tests {
             &self,
             id: &SessionId,
             new_active: &[aura_model::ChatMessage],
-        ) -> std::result::Result<(), SessionError> {
+        ) -> std::result::Result<(), aura_store::StorageError> {
             let mut guard = self.messages.lock();
             let log = guard.entry(id.clone()).or_default();
             let next_ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
@@ -1262,7 +1279,7 @@ mod tests {
         async fn load_active_session_messages(
             &self,
             id: &SessionId,
-        ) -> std::result::Result<Vec<aura_model::ChatMessage>, SessionError> {
+        ) -> std::result::Result<Vec<aura_model::ChatMessage>, aura_store::StorageError> {
             Ok(self
                 .messages
                 .lock()
@@ -1278,7 +1295,7 @@ mod tests {
         async fn latest_session_ordinal(
             &self,
             id: &SessionId,
-        ) -> std::result::Result<Option<i64>, SessionError> {
+        ) -> std::result::Result<Option<i64>, aura_store::StorageError> {
             Ok(self
                 .messages
                 .lock()
@@ -1288,14 +1305,14 @@ mod tests {
         async fn load_session_messages_with_supersede(
             &self,
             id: &SessionId,
-        ) -> std::result::Result<Vec<StoredMessage>, SessionError> {
+        ) -> std::result::Result<Vec<StoredMessage>, aura_store::StorageError> {
             Ok(self.messages.lock().get(id).cloned().unwrap_or_default())
         }
         async fn active_index_of_ordinal(
             &self,
             id: &SessionId,
             ordinal: i64,
-        ) -> std::result::Result<Option<usize>, SessionError> {
+        ) -> std::result::Result<Option<usize>, aura_store::StorageError> {
             Ok(self.messages.lock().get(id).and_then(|log| {
                 log.iter()
                     .filter(|m| m.superseded_by.is_none())
@@ -1305,7 +1322,7 @@ mod tests {
         async fn count_active_messages(
             &self,
             id: &SessionId,
-        ) -> std::result::Result<usize, SessionError> {
+        ) -> std::result::Result<usize, aura_store::StorageError> {
             Ok(self
                 .messages
                 .lock()
@@ -1317,7 +1334,7 @@ mod tests {
             &self,
             id: &SessionId,
             up_to_ordinal: i64,
-        ) -> std::result::Result<Vec<aura_model::ChatMessage>, SessionError> {
+        ) -> std::result::Result<Vec<aura_model::ChatMessage>, aura_store::StorageError> {
             Ok(self
                 .messages
                 .lock()
@@ -1337,7 +1354,7 @@ mod tests {
             limit: usize,
         ) -> std::result::Result<
             Vec<(i64, chrono::DateTime<chrono::Utc>, aura_model::ChatMessage)>,
-            SessionError,
+            aura_store::StorageError,
         > {
             if limit == 0 {
                 return Ok(Vec::new());
@@ -1368,7 +1385,8 @@ mod tests {
             id: &SessionId,
             after_ordinal: i64,
             limit: usize,
-        ) -> std::result::Result<Vec<(i64, aura_model::ChatMessage)>, SessionError> {
+        ) -> std::result::Result<Vec<(i64, aura_model::ChatMessage)>, aura_store::StorageError>
+        {
             if limit == 0 {
                 return Ok(Vec::new());
             }

@@ -18,10 +18,10 @@ pub use channel_session::ChannelSessionStore;
 pub use error::StorageError;
 
 use aura_job::JobStore;
-use aura_session::{SessionStore, SessionSummaryStore};
 use aura_store::CostStore;
 use aura_store::CronStore;
 use aura_store::MemoryStore;
+use aura_store::{SessionStore, SessionSummaryStore};
 use aura_trace::TraceStore;
 pub use retry::retry_on_busy;
 pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};

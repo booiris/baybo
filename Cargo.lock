@@ -617,6 +617,7 @@ dependencies = [
  "aura-model",
  "aura-session",
  "aura-storage",
+ "aura-store",
  "aura-trace",
  "chrono",
  "parking_lot",
@@ -765,7 +766,6 @@ dependencies = [
  "async-trait",
  "aura-job",
  "aura-model",
- "aura-session",
  "aura-store",
  "aura-trace",
  "bytes",
@@ -793,6 +793,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aura-model",
+ "chrono",
  "thiserror 2.0.18",
 ]
 
