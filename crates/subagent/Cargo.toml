@@ -1,0 +1,19 @@
+[package]
+name = "aura-subagent"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+aura-model = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

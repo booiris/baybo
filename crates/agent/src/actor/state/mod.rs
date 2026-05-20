@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 use crate::actor::supervisor::AgentSupervisor;
 use crate::runtime::agent_loop::AgentLoop;
 use aura_job::JobLifecycle;
+use aura_session::SessionManager;
 use aura_trace::SpanRecorder;
 
 pub mod marker;
@@ -94,6 +95,14 @@ pub struct VolatileResources {
     /// task exits. `None` for one-shot actors that are not tracked by
     /// the supervisor (cron fires, maintenance spawns, tests).
     pub supervisor: Option<AgentSupervisor>,
+    /// Session-row writer used by handlers whose state mutations must
+    /// survive actor eviction. Today only the background-subagent
+    /// path reaches for this — `AgentMessage::SubagentFinished`
+    /// persists `session.state.pending_subagent_results`, and the
+    /// next-turn drain re-persists the cleared list, so a parent that
+    /// the idle reaper eventually reclaims still hands the pending
+    /// notifications to the fresh actor on hydration.
+    pub session_manager: Arc<SessionManager>,
 }
 
 /// Compile-time assertion: every field type of [`VolatileResources`]
@@ -111,6 +120,7 @@ const _ASSERT_VOLATILE_FIELDS: fn() = || {
     assert_volatile::<Arc<SpanRecorder>>();
     assert_volatile::<CancellationToken>();
     assert_volatile::<Option<AgentSupervisor>>();
+    assert_volatile::<Arc<SessionManager>>();
 };
 
 /// Compile-time assertion: [`DurableActorState`] is fully

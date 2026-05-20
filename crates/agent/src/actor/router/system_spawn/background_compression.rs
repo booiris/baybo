@@ -45,7 +45,7 @@ impl Router {
         // parent's effective LLM through `SystemSpawnRequest`.
         let response_tx = self.supervisor.response_tx().clone();
         let (mailbox, _actor_token) =
-            self.spawn_oneshot_actor(maint, None, response_tx, &parent_actor_token);
+            self.spawn_oneshot_actor(maint, None, response_tx, &parent_actor_token, None);
 
         if let Err(e) = mailbox
             .send(AgentMessage::BackgroundCompression(payload))

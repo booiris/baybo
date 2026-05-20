@@ -3,6 +3,7 @@ mod governance;
 mod ids;
 mod memory;
 mod message;
+mod model_tier;
 mod money;
 mod pricing;
 mod security_types;
@@ -14,6 +15,7 @@ pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLeve
 pub use ids::{CostRecordId, JobId, ParallelGroup, SessionId, SpanId, StepId};
 pub use memory::{MemoryCategory, MemoryEntry};
 pub use message::{BlobRef, ChatMessage, ContentBlock, MessageMetadata, Role, ThinkingContent};
+pub use model_tier::ModelTier;
 pub use money::{MicroUsd, usd_decimal_option};
 pub use pricing::LlmPricingOverride;
 pub use security_types::{PlaceholderId, SecretKind};
@@ -22,6 +24,8 @@ pub use session::{
     SystemReason, TriggerKind, TriggerSource, User,
 };
 pub use spawn_protocol::{
-    MAX_SUBAGENT_TIMEOUT_SECS, SPAWN_SUBAGENT_TOOL_NAME, SUBAGENT_CHANNEL_TAG, SubagentExitStatus,
-    SubagentParentContext, SubagentResult, SubagentSpawnRequest, SystemSpawnRequest,
+    BACKGROUND_NOTIFICATIONS_POSTAMBLE, BACKGROUND_NOTIFICATIONS_PREAMBLE,
+    BACKGROUND_SUBAGENT_HANDLE_PREFIX, MAX_SUBAGENT_TIMEOUT_SECS, PendingSubagentResult,
+    SPAWN_SUBAGENT_TOOL_NAME, SUBAGENT_CHANNEL_TAG, SubagentExitStatus, SubagentParentContext,
+    SubagentResult, SubagentReturn, SubagentSpawnRequest, SystemSpawnRequest,
 };

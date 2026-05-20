@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agents;
 pub mod channel;
 pub mod completion;
 pub mod config;

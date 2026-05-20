@@ -13,7 +13,8 @@ use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
 use aura_storage::{ChannelBotStore, ChannelPairingStore};
-use aura_tools::ToolRegistry;
+use aura_subagent::SubagentRegistry;
+use aura_tools::{SubagentDispatchLimiter, ToolRegistry};
 use aura_trace::TraceStore;
 use aura_workspace::WorkspaceManager;
 
@@ -36,6 +37,14 @@ pub struct CommandContext {
     pub config: Arc<AuraConfig>,
     pub config_path: Option<PathBuf>,
     pub skills: Arc<SkillRegistry>,
+    /// Catalogue of typed subagent profiles. Powers `aura agents list /
+    /// info / search`. Always populated; defaults to an empty registry
+    /// when the caller didn't wire it.
+    pub subagent_profiles: Arc<SubagentRegistry>,
+    /// Live fan-out limiter. Powers `aura agents in-flight`. `None`
+    /// for one-shot argv contexts that bypass the runtime (the spawn
+    /// path isn't reachable from those anyway).
+    pub subagent_dispatch_limiter: Option<Arc<dyn SubagentDispatchLimiter>>,
     pub tools: Arc<ToolRegistry>,
     pub channels: Arc<ChannelRegistry>,
     pub llm: Option<Arc<GuardedLlm>>,
@@ -96,6 +105,8 @@ pub struct ContextBuilder {
     config: Arc<AuraConfig>,
     config_path: Option<PathBuf>,
     skills: Option<Arc<SkillRegistry>>,
+    subagent_profiles: Option<Arc<SubagentRegistry>>,
+    subagent_dispatch_limiter: Option<Arc<dyn SubagentDispatchLimiter>>,
     tools: Option<Arc<ToolRegistry>>,
     channels: Option<Arc<ChannelRegistry>>,
     llm: Option<Arc<GuardedLlm>>,
@@ -120,6 +131,8 @@ impl ContextBuilder {
             config,
             config_path: None,
             skills: None,
+            subagent_profiles: None,
+            subagent_dispatch_limiter: None,
             tools: None,
             channels: None,
             llm: None,
@@ -146,6 +159,19 @@ impl ContextBuilder {
 
     pub fn skills(mut self, skills: Arc<SkillRegistry>) -> Self {
         self.skills = Some(skills);
+        self
+    }
+
+    pub fn subagent_profiles(mut self, profiles: Arc<SubagentRegistry>) -> Self {
+        self.subagent_profiles = Some(profiles);
+        self
+    }
+
+    pub fn subagent_dispatch_limiter(
+        mut self,
+        limiter: Arc<dyn SubagentDispatchLimiter>,
+    ) -> Self {
+        self.subagent_dispatch_limiter = Some(limiter);
         self
     }
 
@@ -247,6 +273,10 @@ impl ContextBuilder {
             skills: self
                 .skills
                 .unwrap_or_else(|| Arc::new(SkillRegistry::new())),
+            subagent_profiles: self
+                .subagent_profiles
+                .unwrap_or_else(|| Arc::new(SubagentRegistry::new())),
+            subagent_dispatch_limiter: self.subagent_dispatch_limiter,
             tools: self.tools.unwrap_or_else(|| Arc::new(ToolRegistry::new())),
             channels: self
                 .channels

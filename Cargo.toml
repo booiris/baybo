@@ -19,6 +19,7 @@ members = [
     "crates/storage",
     "crates/skills",
     "crates/skills-assessor",
+    "crates/subagent",
     "crates/cron",
     "crates/code-builder",
     "crates/config",
@@ -57,6 +58,7 @@ aura-agent = { path = "crates/agent" }
 aura-storage = { path = "crates/storage" }
 aura-skills = { path = "crates/skills" }
 aura-skills-assessor = { path = "crates/skills-assessor" }
+aura-subagent = { path = "crates/subagent" }
 aura-cron = { path = "crates/cron" }
 aura-code-builder = { path = "crates/code-builder" }
 aura-config = { path = "crates/config" }
@@ -188,6 +190,7 @@ aura-code-builder = { workspace = true }
 aura-storage = { workspace = true }
 aura-skills = { workspace = true }
 aura-skills-assessor = { workspace = true }
+aura-subagent = { workspace = true }
 aura-config = { workspace = true }
 aura-cli = { workspace = true }
 aura-gateway = { workspace = true }

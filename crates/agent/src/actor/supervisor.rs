@@ -27,10 +27,19 @@ pub struct ActorHandle {
 /// via [`ActorRegistryGuard`], preventing the `actors` map from leaking
 /// entries when actors die for any reason (Shutdown / panic / mailbox
 /// close).
+///
+/// `in_flight_background_subagents` counts background subagents still
+/// running per parent session. The idle reaper consults it before
+/// shutting an actor down: a parent with outstanding background work
+/// is protected so its mailbox stays alive to receive the eventual
+/// `AgentMessage::SubagentFinished` when each child terminates. The
+/// counter is process-local (background dispatches don't survive
+/// restart anyway).
 #[derive(Clone)]
 pub struct AgentSupervisor {
     actors: Arc<DashMap<SessionId, ActorHandle>>,
     response_tx: mpsc::Sender<AgentOutput>,
+    in_flight_background_subagents: Arc<DashMap<SessionId, u32>>,
 }
 
 impl AgentSupervisor {
@@ -38,7 +47,52 @@ impl AgentSupervisor {
         Self {
             actors: Arc::new(DashMap::new()),
             response_tx,
+            in_flight_background_subagents: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Mark that a `background: true` subagent has been dispatched
+    /// from `parent_session_id`. Increments the per-session counter
+    /// consulted by [`Self::has_in_flight_background_subagents`].
+    /// Idempotency is the caller's responsibility — pair each
+    /// `note_background_subagent_started` with exactly one
+    /// [`Self::note_background_subagent_finished`] from the wait
+    /// task that observes the child's terminal event.
+    pub fn note_background_subagent_started(&self, parent_session_id: &SessionId) {
+        let mut entry = self
+            .in_flight_background_subagents
+            .entry(parent_session_id.clone())
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    /// Counterpart to [`Self::note_background_subagent_started`].
+    /// Decrements the per-session counter and removes the entry when
+    /// it falls to zero so the map doesn't accumulate stale keys.
+    pub fn note_background_subagent_finished(&self, parent_session_id: &SessionId) {
+        let now_zero = match self
+            .in_flight_background_subagents
+            .get_mut(parent_session_id)
+        {
+            Some(mut entry) => {
+                let new = entry.saturating_sub(1);
+                *entry = new;
+                new == 0
+            }
+            None => return,
+        };
+        if now_zero {
+            self.in_flight_background_subagents
+                .remove(parent_session_id);
+        }
+    }
+
+    /// True iff at least one background subagent dispatched from
+    /// `parent_session_id` is still running.
+    pub fn has_in_flight_background_subagents(&self, parent_session_id: &SessionId) -> bool {
+        self.in_flight_background_subagents
+            .get(parent_session_id)
+            .is_some_and(|v| *v > 0)
     }
 
     /// Send a message to the actor for a given session.
@@ -199,6 +253,19 @@ impl AgentSupervisor {
         let mut reaped = 0usize;
         for session_id in candidates {
             if !registered.contains(&session_id) {
+                continue;
+            }
+            if self.has_in_flight_background_subagents(&session_id) {
+                // Parent has at least one background `spawn_subagent`
+                // still running; reaping now would kill the mailbox
+                // before the wait task can deliver
+                // `AgentMessage::SubagentFinished`. Skip — the next
+                // tick after every subagent finishes will see the
+                // counter at zero and proceed.
+                debug!(
+                    %session_id,
+                    "idle reaper: skipping parent with in-flight background subagent(s)"
+                );
                 continue;
             }
             if let Err(e) = sessions.clear_summary_in_flight(&session_id).await {
@@ -557,5 +624,81 @@ mod tests {
         // The in_flight flag on the reaped session is cleared.
         let row = summary_store.get(&idle.id).await.unwrap().unwrap();
         assert!(!row.in_flight);
+    }
+
+    #[test]
+    fn background_subagent_counter_increments_decrements_and_clears() {
+        let sup = make_supervisor();
+        let id = SessionId::from("parent");
+        assert!(!sup.has_in_flight_background_subagents(&id));
+        sup.note_background_subagent_started(&id);
+        sup.note_background_subagent_started(&id);
+        assert!(sup.has_in_flight_background_subagents(&id));
+        sup.note_background_subagent_finished(&id);
+        assert!(
+            sup.has_in_flight_background_subagents(&id),
+            "still one in-flight after one finished"
+        );
+        sup.note_background_subagent_finished(&id);
+        assert!(
+            !sup.has_in_flight_background_subagents(&id),
+            "counter must clear once every dispatch finishes"
+        );
+    }
+
+    #[test]
+    fn background_subagent_finished_on_unknown_parent_is_a_noop() {
+        let sup = make_supervisor();
+        // Decrement without a prior increment must not panic or
+        // wrap-around — the wait task's decrement is unconditional in
+        // the router, so this edge case is reachable if the spawn
+        // path bailed before incrementing.
+        sup.note_background_subagent_finished(&SessionId::from("ghost"));
+        assert!(!sup.has_in_flight_background_subagents(&SessionId::from("ghost")));
+    }
+
+    #[tokio::test]
+    async fn reap_idle_skips_parent_with_in_flight_background_subagent() {
+        use chrono::Utc;
+
+        let session_store = Arc::new(MemorySessionStore::new());
+        let summary_store = Arc::new(MemorySessionSummaryStore::new());
+        let sessions = SessionManager::new(session_store.clone(), summary_store.clone());
+
+        let user = User {
+            id: "u".to_string(),
+            name: None,
+            channel: ChannelType::tui(),
+        };
+        let mut parent = sessions
+            .create_session(user, ChannelType::tui())
+            .await
+            .unwrap();
+        parent.last_active = Utc::now() - Duration::seconds(120);
+        session_store.save(&parent).await.unwrap();
+
+        let supervisor = make_supervisor();
+        let (mailbox_tx, mut mailbox_rx) = mpsc::channel(8);
+        supervisor
+            .register_if_absent(parent.id.clone(), mailbox_tx)
+            .expect("first insert");
+
+        // Dispatch a background subagent.
+        supervisor.note_background_subagent_started(&parent.id);
+
+        // Reaper should skip the parent.
+        let reaped = supervisor
+            .reap_idle(&sessions, Duration::seconds(60))
+            .await;
+        assert_eq!(reaped, 0, "parent must be protected while subagent runs");
+        assert!(mailbox_rx.try_recv().is_err(), "no Shutdown queued");
+
+        // Once the subagent finishes, the reaper proceeds on the next tick.
+        supervisor.note_background_subagent_finished(&parent.id);
+        let reaped = supervisor
+            .reap_idle(&sessions, Duration::seconds(60))
+            .await;
+        assert_eq!(reaped, 1, "parent must be reaped after subagent clears");
+        assert!(matches!(mailbox_rx.try_recv(), Ok(AgentMessage::Shutdown)));
     }
 }

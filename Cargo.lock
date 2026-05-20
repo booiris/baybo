@@ -203,6 +203,7 @@ dependencies = [
  "aura-skills",
  "aura-skills-assessor",
  "aura-storage",
+ "aura-subagent",
  "aura-tools",
  "aura-trace",
  "aura-tui",
@@ -307,6 +308,7 @@ dependencies = [
  "aura-skills",
  "aura-skills-assessor",
  "aura-storage",
+ "aura-subagent",
  "aura-tools",
  "aura-trace",
  "aura-tui",
@@ -803,6 +805,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aura-subagent"
+version = "0.1.0"
+dependencies = [
+ "aura-model",
+ "dashmap",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "aura-tools"
 version = "0.1.0"
 dependencies = [
@@ -811,7 +827,9 @@ dependencies = [
  "aura-llm",
  "aura-model",
  "aura-security",
+ "aura-session",
  "aura-storage",
+ "aura-subagent",
  "aura-trace",
  "aura-workspace",
  "axum",

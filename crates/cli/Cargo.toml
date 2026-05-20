@@ -26,6 +26,7 @@ aura-memory = { workspace = true }
 aura-query = { workspace = true }
 aura-skills = { workspace = true }
 aura-skills-assessor = { workspace = true }
+aura-subagent = { workspace = true }
 aura-session = { workspace = true }
 aura-storage = { workspace = true }
 aura-security = { workspace = true }

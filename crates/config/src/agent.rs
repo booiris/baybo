@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use aura_model::ModelTier;
 use serde::{Deserialize, Serialize};
 
 /// Top-level agent configuration: execution policy and context window.
@@ -8,6 +11,24 @@ pub struct AgentConfig {
     pub max_iterations: usize,
     /// Context window configuration.
     pub context: ContextConfig,
+    /// Recursion cap for `spawn_subagent`. A parent session at depth
+    /// `>= max_subagent_depth` is rejected with
+    /// `ToolError::SubagentDepthExceeded` rather than spawning. Depth
+    /// 0 = top-level session, depth N = subagent N levels deep.
+    pub max_subagent_depth: u32,
+    /// Horizontal fan-out cap. The fan-out limiter rejects
+    /// `spawn_subagent` once `max_subagents_per_root` subagents
+    /// (foreground + background) are already running under the same
+    /// root session, surfacing as
+    /// `ToolError::SubagentFanoutExceeded`. Independent of depth.
+    pub max_subagents_per_root: u32,
+    /// Maps coarse `ModelTier` (Fast / Balanced / Deep) to a concrete
+    /// `llm[*].name`. Consumed by `spawn_subagent`'s tier resolution
+    /// when neither the call's explicit `llm` override nor the
+    /// profile's default supplies a name. Unmapped tiers fall through
+    /// to the pool's `default-llm` with a `warn!` so operator misconfig
+    /// is visible.
+    pub model_tiers: HashMap<ModelTier, String>,
 }
 
 impl Default for AgentConfig {
@@ -15,6 +36,9 @@ impl Default for AgentConfig {
         Self {
             max_iterations: 300,
             context: ContextConfig::default(),
+            max_subagent_depth: 3,
+            max_subagents_per_root: 8,
+            model_tiers: HashMap::new(),
         }
     }
 }

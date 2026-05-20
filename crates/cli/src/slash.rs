@@ -6,8 +6,8 @@ use aura_model::ContentBlock;
 use clap::{CommandFactory, Parser};
 
 use crate::cli::{
-    AgentCmd, ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, JobCmd, LlmCmd, LogCmd,
-    McpCmd, PairCmd, SessionCmd, SkillsCmd,
+    AgentCmd, AgentsCmd, ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, JobCmd, LlmCmd,
+    LogCmd, McpCmd, PairCmd, SessionCmd, SkillsCmd,
 };
 use crate::context::{CommandContext, Invocation};
 use crate::dispatch;
@@ -67,6 +67,8 @@ impl CliSlashHandler {
             config: self.ctx.config.clone(),
             config_path: self.ctx.config_path.clone(),
             skills: self.ctx.skills.clone(),
+            subagent_profiles: self.ctx.subagent_profiles.clone(),
+            subagent_dispatch_limiter: self.ctx.subagent_dispatch_limiter.clone(),
             tools: self.ctx.tools.clone(),
             channels: self.ctx.channels.clone(),
             llm: self.ctx.llm.clone(),
@@ -292,6 +294,12 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
             | SkillsCmd::Info { .. }
             | SkillsCmd::Search { .. }
             | SkillsCmd::Check { .. } => Ok(()),
+        },
+        Commands::Agents { cmd } => match cmd {
+            AgentsCmd::List
+            | AgentsCmd::Info { .. }
+            | AgentsCmd::Search { .. }
+            | AgentsCmd::InFlight => Ok(()),
         },
         Commands::Channel {
             cmd: ChannelCmd::List,

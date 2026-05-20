@@ -278,6 +278,16 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approved_resources: Vec<ApprovedResource>,
 
+    /// Background `spawn_subagent` results that completed while the
+    /// parent actor was between turns. The agent loop drains this on
+    /// the next user input, prepending them as a System reminder so
+    /// the parent LLM sees the work in time. Persisted with the
+    /// session so an actor evicted by the idle reaper still surfaces
+    /// the deliveries on hydration. See
+    /// `aura_model::spawn_protocol::PendingSubagentResult`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_subagent_results: Vec<crate::spawn_protocol::PendingSubagentResult>,
+
     /// Reserved extension fields for plugins and experiments.
     #[serde(default)]
     pub extra: HashMap<String, Value>,

@@ -1,30 +1,125 @@
-//! `spawn_subagent` builtin. Blocking tool: ships a
-//! [`SystemSpawnRequest::Subagent`] envelope onto the agent runtime's
-//! system-spawn channel and waits on the oneshot for the child's
-//! terminal [`SubagentResult`].
+//! `spawn_subagent` builtin — typed-subagent dispatch.
 //!
-//! Registered by the runtime wiring code (not [`crate::builtin::default_tools`])
-//! because it needs the runtime-owned `system_spawn_tx` sender.
+//! Blocking tool that:
+//!
+//! 1. Resolves `subagent_type` against
+//!    [`aura_subagent::SubagentRegistry`].
+//! 2. Packs the resolved profile's `system_prompt` (and the parent's
+//!    `prompt` brief) into a [`SubagentSpawnRequest`].
+//! 3. Ships a [`SystemSpawnRequest::Subagent`] envelope onto the agent
+//!    runtime's system-spawn channel and awaits the child's terminal
+//!    [`SubagentResult`].
+//!
+//! Registered by the runtime wiring code (not
+//! [`crate::builtin::default_tools`]) because it needs the
+//! runtime-owned `system_spawn_tx` sender AND the live
+//! `SubagentRegistry` so its description can enumerate available
+//! types every LLM turn.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_model::{
-    MAX_SUBAGENT_TIMEOUT_SECS, SPAWN_SUBAGENT_TOOL_NAME, SubagentParentContext, SubagentResult,
-    SubagentSpawnRequest, SystemSpawnRequest,
+    MAX_SUBAGENT_TIMEOUT_SECS, ModelTier, SPAWN_SUBAGENT_TOOL_NAME, SessionId,
+    SubagentParentContext, SubagentResult, SubagentSpawnRequest, SystemSpawnRequest,
 };
+use aura_session::SessionManager;
+use aura_subagent::SubagentRegistry;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::builtin::trusted;
-use crate::{Tool, ToolContext, ToolError, ToolManifest, ToolOutput};
+use crate::{SubagentDispatchLimiter, Tool, ToolContext, ToolError, ToolManifest, ToolOutput};
 
-const DESCRIPTION: &str = r#"Spawn a child subagent to investigate or perform a focused sub-task.
-The subagent runs as an independent session with its own transcript and tool budget.
-This call blocks until the subagent returns its final message (or hits its declared timeout).
-Use sparingly — each spawn incurs a fresh LLM cost stream."#;
+/// Default recursion cap. A typed subagent that itself dispatches a
+/// subagent is fine (`parent → child → grandchild`), but past depth 3
+/// the model is usually fan-out for its own sake. Override via the
+/// constructor for deployments that need a different ceiling.
+pub const DEFAULT_MAX_SUBAGENT_DEPTH: u32 = 3;
+
+/// Default cap on concurrent subagents under a single root session.
+/// Distinct from [`DEFAULT_MAX_SUBAGENT_DEPTH`]: depth bounds the
+/// lineage chain, fan-out bounds breadth. Eight covers "dispatch a
+/// few specialists in parallel" without letting a confused model
+/// spin up a hundred siblings.
+pub const DEFAULT_MAX_SUBAGENTS_PER_ROOT: u32 = 8;
+
+/// Cycle-protection cap on the lineage walk. A corrupt chain (e.g.
+/// from a buggy migration) shouldn't be allowed to spin the executor
+/// forever. Pegged well above any realistic depth.
+const MAX_LINEAGE_WALK_HOPS: u32 = 128;
+
+const STATIC_DESCRIPTION: &str = r#"Spawn a child subagent — a fresh, independent agent session — to investigate
+or perform a focused sub-task. Use when the work is decomposable: the
+parent agent stays focused on the conversation while the subagent
+runs to completion and returns a single final message.
+
+# How subagents see the world
+
+The subagent does NOT see your transcript. It starts with an empty
+context, a system prompt fixed by its `subagent_type` profile, and the
+self-contained `prompt` you authored. Everything it needs to know must
+be inside that prompt.
+
+This call BLOCKS until the subagent's final assistant message arrives
+or its declared timeout fires. The parent then sees the final message
+text as this tool's result. Intermediate tool output and streaming
+deltas inside the subagent are not surfaced.
+
+# Picking a subagent_type
+
+`subagent_type` is a free string but must match one of the registered
+profiles. Each profile has its own description ("when to use / when
+NOT to use") shown below in the live registry section. Pick the most
+specific match; fall back to `general-purpose` only when none fits.
+
+If you emit an unknown type the call returns a hard error listing the
+catalogue — there's no soft fallback.
+
+# Writing the prompt
+
+Brief the subagent like a teammate who just sat down: it hasn't seen
+this conversation and doesn't know what you've tried.
+
+- State the goal in one or two sentences, then the relevant facts.
+- Include exact paths and line numbers (`crate/foo.rs:123`) — the
+  subagent should not have to grep for what you already located.
+- If the task involves a fix, write what specifically to change. Do
+  NOT push the synthesis onto the subagent (avoid phrases like
+  "based on your findings, decide what to do"); that nullifies the
+  point of dispatching one in the first place.
+- If you need short output, say so ("under 200 words").
+- Include the relevant span ids or job ids when the subagent should
+  hop across traces.
+
+# Cost and parallelism
+
+Each spawn starts a fresh LLM cost stream. Use sparingly. If you have
+multiple independent sub-tasks, emit multiple `spawn_subagent`
+tool_use blocks IN ONE message — the runtime executes parallel tool
+calls concurrently. Sequential spawns serialise needlessly.
+
+# Background mode
+
+`background: true` returns immediately with a handle and lets the
+parent continue talking. The subagent's result is delivered as an
+out-of-band notification on the next user turn. (Not yet wired —
+emitting `background: true` returns an error until that path lands.)
+
+# Trust but verify
+
+A subagent's final message reports what it INTENDED to do, not
+necessarily what landed. When it claims to have made a change, verify
+with `Read` / `Bash(git diff)` before acting on the report.
+
+# Recursion
+
+Subagents may themselves call `spawn_subagent`, but the runtime
+enforces a hard depth cap. Use the parent's perspective: most useful
+work is "parent dispatches one or two specialists", not deep trees.
+"#;
 
 /// Mirrors [`aura_model::MAX_SUBAGENT_TIMEOUT_SECS`] (single source of truth).
 const MAX_OUTER_TIMEOUT: Duration = Duration::from_secs(MAX_SUBAGENT_TIMEOUT_SECS);
@@ -32,65 +127,328 @@ const MAX_OUTER_TIMEOUT: Duration = Duration::from_secs(MAX_SUBAGENT_TIMEOUT_SEC
 const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 600;
 
 /// Raw JSON shape the LLM emits as `spawn_subagent`'s arguments.
-/// `timeout_secs` defaults to [`DEFAULT_SUBAGENT_TIMEOUT_SECS`] and is
-/// clamped to `[1, MAX_SUBAGENT_TIMEOUT_SECS]` in [`parse_spawn_request`].
+/// `subagent_type` and `prompt` are required; everything else is
+/// optional with documented defaults.
 #[derive(Debug, Clone, Deserialize)]
 struct SpawnParams {
-    task_description: String,
+    subagent_type: String,
+    /// 3-5 word task summary. Surfaced in traces for operator UI. The
+    /// subagent itself does NOT see this — its brief lives in `prompt`.
+    description: String,
+    /// Self-contained brief the child sees as its first user message.
+    prompt: String,
     #[serde(default)]
     must_include_context: Vec<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
     #[serde(default)]
+    model_tier: Option<String>,
+    #[serde(default)]
     llm: Option<String>,
+    #[serde(default)]
+    background: bool,
 }
 
-fn parse_spawn_request(value: &Value) -> Result<SubagentSpawnRequest, String> {
+/// Outcome of parameter parsing — either a fully-built request and the
+/// resolved profile name (for trace), or a structured error the
+/// executor surfaces as `ToolError::InvalidParams`.
+struct ParsedSpawn {
+    request: SubagentSpawnRequest,
+}
+
+/// Output of [`SpawnSubagentTool::lineage_summary`]: parent's depth
+/// plus the root session id. The fan-out gate keys on the root, the
+/// depth gate compares against the cap directly.
+struct LineageSummary {
+    depth: u32,
+    root_session_id: SessionId,
+}
+
+fn parse_spawn_request(
+    value: &Value,
+    registry: &SubagentRegistry,
+) -> Result<ParsedSpawn, String> {
     let p: SpawnParams = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+
+    if p.subagent_type.trim().is_empty() {
+        return Err("`subagent_type` must be a non-empty string".into());
+    }
+    let profile = match registry.get(&p.subagent_type) {
+        Some(profile) => profile,
+        None => {
+            let available: Vec<String> = registry
+                .all_summaries_sorted()
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            return Err(format!(
+                "unknown subagent_type '{}'; available types: {}",
+                p.subagent_type,
+                if available.is_empty() {
+                    "<none registered>".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ));
+        }
+    };
+
+    if p.description.trim().is_empty() {
+        return Err("`description` must be a non-empty 3-5 word task summary".into());
+    }
+    if p.prompt.trim().is_empty() {
+        return Err("`prompt` must be a non-empty self-contained brief".into());
+    }
+
+    let model_tier = match p.model_tier.as_deref() {
+        Some(label) => match ModelTier::parse(label) {
+            Some(t) => Some(t),
+            None => {
+                return Err(format!(
+                    "unknown model_tier '{label}'; expected fast|balanced|deep"
+                ));
+            }
+        },
+        // Precedence at this boundary: explicit > profile default.
+        // The runtime's `LlmClientPool` falls back to its pool default
+        // when neither is set.
+        None => profile.default_tier,
+    };
+
     let secs = p
         .timeout_secs
         .unwrap_or(DEFAULT_SUBAGENT_TIMEOUT_SECS)
         .clamp(1, MAX_SUBAGENT_TIMEOUT_SECS);
-    Ok(SubagentSpawnRequest {
-        task_description: p.task_description,
-        must_include_context: p.must_include_context,
-        timeout: Duration::from_secs(secs),
-        llm: p.llm,
+
+    Ok(ParsedSpawn {
+        request: SubagentSpawnRequest {
+            subagent_type: profile.name.clone(),
+            system_prompt: profile.system_prompt.clone(),
+            task_summary: p.description,
+            prompt: p.prompt,
+            must_include_context: p.must_include_context,
+            timeout: Duration::from_secs(secs),
+            model_tier,
+            llm: p.llm,
+            background: p.background,
+            // Filled in by the tool after the lineage walk; the
+            // synthesized request leaves it `None` so test fixtures
+            // can build a `SubagentSpawnRequest` without knowing the
+            // dispatch limiter.
+            fan_out_root: None,
+        },
     })
+}
+
+/// Construction bundle for [`SpawnSubagentTool`]. The number of
+/// required deps crossed the "two or three" threshold once the
+/// fan-out cap landed; per the workspace style guide a sibling
+/// config struct makes every required value show up by name at the
+/// call site.
+pub struct SpawnSubagentToolConfig {
+    pub system_spawn_tx: mpsc::Sender<SystemSpawnRequest>,
+    pub registry: Arc<SubagentRegistry>,
+    pub sessions: Arc<SessionManager>,
+    pub dispatch_limiter: Arc<dyn SubagentDispatchLimiter>,
+    pub max_depth: u32,
+    pub max_subagents_per_root: u32,
 }
 
 pub struct SpawnSubagentTool {
     system_spawn_tx: mpsc::Sender<SystemSpawnRequest>,
+    registry: Arc<SubagentRegistry>,
+    sessions: Arc<SessionManager>,
+    dispatch_limiter: Arc<dyn SubagentDispatchLimiter>,
+    max_depth: u32,
+    max_subagents_per_root: u32,
+    /// Cache of the rendered `description_for_llm` string keyed by
+    /// `SubagentRegistry::version()`. The LLM sees this catalogue
+    /// every turn but the registry only mutates at boot / on
+    /// `reload`, so a per-turn rebuild is wasted. Holds an
+    /// `Arc<String>` so reads clone a pointer, not the body.
+    description_cache: parking_lot::Mutex<Option<(u64, Arc<String>)>>,
 }
 
 impl SpawnSubagentTool {
-    pub fn new(system_spawn_tx: mpsc::Sender<SystemSpawnRequest>) -> Self {
-        Self { system_spawn_tx }
+    pub fn from_config(config: SpawnSubagentToolConfig) -> Self {
+        let SpawnSubagentToolConfig {
+            system_spawn_tx,
+            registry,
+            sessions,
+            dispatch_limiter,
+            max_depth,
+            max_subagents_per_root,
+        } = config;
+        Self {
+            system_spawn_tx,
+            registry,
+            sessions,
+            dispatch_limiter,
+            max_depth,
+            max_subagents_per_root,
+            description_cache: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Walk the parent's lineage chain, returning the number of
+    /// ancestors above it AND the root session id. `0` ⇒ parent is a
+    /// root session (root_id == parent_id). A corrupt chain that
+    /// exceeds [`MAX_LINEAGE_WALK_HOPS`] surfaces as
+    /// `ToolError::Execution` so the LLM sees a clean failure
+    /// instead of hanging the executor.
+    async fn lineage_summary(
+        &self,
+        parent_session_id: &SessionId,
+    ) -> crate::Result<LineageSummary> {
+        let parent = self
+            .sessions
+            .get(parent_session_id)
+            .await
+            .map_err(|e| ToolError::Execution(format!("load session for depth check: {e}")))?
+            .ok_or_else(|| {
+                ToolError::Execution(format!(
+                    "lineage walk hit unknown session '{parent_session_id}' — store inconsistency"
+                ))
+            })?;
+        // `Session.root_session_id` is denormalized at create-time, so
+        // the root can be read off the parent row without traversing
+        // the chain. Depth still needs the walk.
+        let root_session_id = parent.root_session_id.clone();
+        let mut current_id = parent_session_id.clone();
+        let mut depth: u32 = 0;
+        let mut current = Some(parent);
+        for _ in 0..MAX_LINEAGE_WALK_HOPS {
+            let session = match current.take() {
+                Some(s) => s,
+                None => self
+                    .sessions
+                    .get(&current_id)
+                    .await
+                    .map_err(|e| {
+                        ToolError::Execution(format!("load session for depth check: {e}"))
+                    })?
+                    .ok_or_else(|| {
+                        ToolError::Execution(format!(
+                            "lineage walk hit unknown session '{current_id}' — store inconsistency"
+                        ))
+                    })?,
+            };
+            let Some(parent_link) = session.lineage else {
+                return Ok(LineageSummary {
+                    depth,
+                    root_session_id,
+                });
+            };
+            depth = depth.saturating_add(1);
+            current_id = parent_link.parent_session_id;
+        }
+        Err(ToolError::Execution(format!(
+            "lineage walk exceeded {MAX_LINEAGE_WALK_HOPS} hops starting at '{parent_session_id}'; possible cycle"
+        )))
+    }
+
+    /// Return the rendered description (static body + dynamic
+    /// catalogue) for the LLM. Cached against the registry's
+    /// `version()`; the rebuild only fires on `register` /
+    /// `register_builtins` / `reload` / `remove`. The shared
+    /// `Arc<String>` is cheap to clone for read-only consumers
+    /// (`description_for_llm` clones the body once at the trait
+    /// boundary, which the tool registry serialises into the
+    /// per-turn `tools` payload).
+    fn cached_description(&self) -> Arc<String> {
+        let registry_version = self.registry.version();
+        let mut cache = self.description_cache.lock();
+        if let Some((cached_version, body)) = &*cache
+            && *cached_version == registry_version
+        {
+            return Arc::clone(body);
+        }
+        let mut out = String::with_capacity(STATIC_DESCRIPTION.len() + 256);
+        out.push_str(STATIC_DESCRIPTION);
+        out.push_str(&self.render_type_catalogue());
+        let body = Arc::new(out);
+        *cache = Some((registry_version, Arc::clone(&body)));
+        body
+    }
+
+    /// Render the dynamic "available types" tail appended to the
+    /// static description every LLM turn. Pulled out so unit tests can
+    /// assert on the exact shape without spinning up the full tool.
+    fn render_type_catalogue(&self) -> String {
+        let mut out = String::from("\n# Available subagent_type values\n\n");
+        let summaries = self.registry.all_summaries_sorted();
+        if summaries.is_empty() {
+            out.push_str(
+                "(none registered — `spawn_subagent` cannot be called until the workspace's `agents/` directory contains at least one profile, or `register_builtins` has run.)\n",
+            );
+            return out;
+        }
+        for s in summaries {
+            out.push_str("- **");
+            out.push_str(&s.name);
+            out.push_str("**");
+            if let Some(tier) = s.default_tier {
+                out.push_str(" (default tier: ");
+                out.push_str(tier.as_str());
+                out.push(')');
+            }
+            out.push_str(" — ");
+            // Description is multi-line in literal blocks; indent
+            // continuation lines so the bullet stays readable.
+            let mut first = true;
+            for line in s.description.lines() {
+                if first {
+                    first = false;
+                } else {
+                    out.push_str("\n  ");
+                }
+                out.push_str(line);
+            }
+            out.push('\n');
+        }
+        out
     }
 }
 
 fn parameters_schema() -> Value {
     json!({
         "type": "object",
-        "required": ["task_description"],
+        "required": ["subagent_type", "description", "prompt"],
         "properties": {
-            "task_description": {
+            "subagent_type": {
                 "type": "string",
-                "description": "Self-contained task statement for the subagent. The subagent does NOT see the parent's transcript — include every fact it needs."
+                "description": "Name of a registered SubagentProfile (see live list in the description). Unknown values return an error."
+            },
+            "description": {
+                "type": "string",
+                "description": "Short (3-5 word) task summary. Trace/UI display only — does NOT seed the subagent's context."
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Self-contained brief the subagent sees as its first user message. The subagent does NOT see the parent transcript — include every fact, path, and line number it needs."
             },
             "must_include_context": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Optional bullets of context the subagent must keep visible (span ids, facts, constraints)."
+                "description": "Optional bullets appended verbatim after `prompt` (span ids, facts, constraints)."
             },
             "timeout_secs": {
                 "type": "integer",
                 "minimum": 1,
                 "description": "Hard wait limit in seconds. Defaults to 600."
             },
+            "model_tier": {
+                "type": "string",
+                "enum": ["fast", "balanced", "deep"],
+                "description": "Coarse model selection. Falls back to the profile's default_tier, then the pool default. Beaten by `llm` if set."
+            },
             "llm": {
                 "type": "string",
-                "description": "Optional LLM entry-name override for the spawned child (must match an entry in aura.json `llm[*].name`)."
+                "description": "Explicit `aura.json` llm entry name. Super-escape that overrides `model_tier`."
+            },
+            "background": {
+                "type": "boolean",
+                "description": "Reserved. When true, returns a handle immediately and surfaces the result via a follow-up notification. Currently returns an error until that path lands."
             }
         }
     })
@@ -103,7 +461,11 @@ impl Tool for SpawnSubagentTool {
     }
 
     fn description(&self) -> &str {
-        DESCRIPTION
+        STATIC_DESCRIPTION
+    }
+
+    fn description_for_llm(&self) -> Option<String> {
+        Some((*self.cached_description()).clone())
     }
 
     fn parameters_schema(&self) -> Value {
@@ -115,13 +477,41 @@ impl Tool for SpawnSubagentTool {
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
-        let request = parse_spawn_request(&params).map_err(ToolError::InvalidParams)?;
+        let ParsedSpawn { request } =
+            parse_spawn_request(&params, &self.registry).map_err(ToolError::InvalidParams)?;
+
+        let LineageSummary {
+            depth,
+            root_session_id,
+        } = self.lineage_summary(&ctx.session_id).await?;
+        if depth >= self.max_depth {
+            return Err(ToolError::SubagentDepthExceeded {
+                current_depth: depth,
+                cap: self.max_depth,
+            });
+        }
+
+        // Reserve a fan-out slot under the root BEFORE shipping the
+        // envelope. Failure paths below release it; on the happy
+        // path the router's wait task releases on terminal.
+        if let Err(current_count) = self
+            .dispatch_limiter
+            .try_reserve(&root_session_id, self.max_subagents_per_root)
+        {
+            return Err(ToolError::SubagentFanoutExceeded {
+                current_count,
+                cap: self.max_subagents_per_root,
+            });
+        }
+
         let parent = SubagentParentContext {
             session_id: ctx.session_id.clone(),
             job_id: ctx.job_id,
             span_id: ctx.span_id,
             cancel_token: ctx.cancellation_token.clone(),
         };
+        let mut request = request;
+        request.fan_out_root = Some(root_session_id.clone());
         let (result_tx, result_rx) = oneshot::channel();
         let envelope = SystemSpawnRequest::Subagent {
             parent_session_id: parent.session_id,
@@ -131,33 +521,59 @@ impl Tool for SpawnSubagentTool {
             request,
             result_tx,
         };
-        let result = if self.system_spawn_tx.send(envelope).await.is_err() {
-            SubagentResult::failed("system spawn channel closed")
-        } else {
-            result_rx.await.unwrap_or_else(|_| {
+        let result = match self.system_spawn_tx.send(envelope).await {
+            Ok(()) => result_rx.await.unwrap_or_else(|_| {
+                // Channel closed before delivery: the router never
+                // produced a terminal, so its wait task will never
+                // release. Release here so the count doesn't leak.
+                self.dispatch_limiter.release(&root_session_id);
                 SubagentResult::failed("subagent result channel closed before delivery")
-            })
+            }),
+            Err(_) => {
+                // Envelope never reached the router. Release here.
+                self.dispatch_limiter.release(&root_session_id);
+                SubagentResult::failed("system spawn channel closed")
+            }
         };
-        Ok(ToolOutput::Text(result.to_tool_result_text()))
+        let parts = result.split_for_parent();
+        Ok(if parts.llm_images.is_empty() {
+            ToolOutput::Text(parts.text)
+        } else {
+            // `multi_modal_text` re-filters to image-only blocks so any
+            // accidental non-image entry the child surfaces is silently
+            // dropped at this boundary.
+            ToolOutput::multi_modal_text(parts.text, parts.llm_images)
+        })
     }
 }
 
-pub fn make(system_spawn_tx: mpsc::Sender<SystemSpawnRequest>) -> (Arc<dyn Tool>, ToolManifest) {
-    trusted(SpawnSubagentTool::new(system_spawn_tx), vec![])
+pub fn make(config: SpawnSubagentToolConfig) -> (Arc<dyn Tool>, ToolManifest) {
+    trusted(SpawnSubagentTool::from_config(config), vec![])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, SubagentExitStatus, SubagentSpawnRequest, User};
+    use aura_model::{ChannelType, Lineage, LineageKind, Session, SessionId,
+        SubagentExitStatus, User};
+    use aura_session::SessionStore;
+    use aura_session::test_support::{MemorySessionStore, MemorySessionSummaryStore};
+    use aura_subagent::SubagentRegistry;
     use serde_json::json;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
+    const TEST_PARENT_SESSION: &str = "parent-sess";
+
     fn ctx() -> ToolContext {
+        ctx_with_session(TEST_PARENT_SESSION)
+    }
+
+    fn ctx_with_session(session_id: &str) -> ToolContext {
         ToolContext {
-            session_id: "parent-sess".into(),
+            session_id: session_id.into(),
             job_id: aura_model::JobId::default(),
             span_id: aura_model::SpanId::default(),
             user: User {
@@ -175,6 +591,121 @@ mod tests {
             events: crate::noop_event_sink(),
             llm: None,
         }
+    }
+
+    fn registry_with_builtins() -> Arc<SubagentRegistry> {
+        let r = SubagentRegistry::new();
+        r.register_builtins();
+        Arc::new(r)
+    }
+
+    /// Build an in-memory `SessionManager` seeded with a single root
+    /// session at `TEST_PARENT_SESSION`. The tests that don't care
+    /// about lineage call this; the depth tests build a longer chain
+    /// directly against the underlying store.
+    async fn sessions_with_root() -> Arc<SessionManager> {
+        let store = Arc::new(MemorySessionStore::new());
+        let summary_store = Arc::new(MemorySessionSummaryStore::new());
+        let manager = Arc::new(SessionManager::new(store.clone(), summary_store));
+        let user = User {
+            id: "u".into(),
+            name: None,
+            channel: ChannelType::tui(),
+        };
+        let session = manager
+            .create_session(user, ChannelType::tui())
+            .await
+            .unwrap();
+        // Override the auto-generated id so ctx() lines up.
+        let mut renamed = session;
+        renamed.id = SessionId::from(TEST_PARENT_SESSION);
+        renamed.root_session_id = renamed.id.clone();
+        store.save(&renamed).await.unwrap();
+        manager
+    }
+
+    /// Persist a child session whose lineage points at `parent_id`.
+    /// Returns the child's id so callers can chain further levels.
+    async fn save_child_session(
+        sessions: &SessionManager,
+        child_id: &str,
+        parent_id: &str,
+    ) -> SessionId {
+        let parent = sessions
+            .get(&SessionId::from(parent_id))
+            .await
+            .unwrap()
+            .expect("parent must exist before linking child");
+        let child = Session {
+            id: SessionId::from(child_id),
+            user: parent.user.clone(),
+            channel: ChannelType::from("subagent"),
+            created_at: chrono::Utc::now(),
+            last_active: chrono::Utc::now(),
+            state: Default::default(),
+            root_session_id: parent.root_session_id.clone(),
+            trigger: parent.trigger.clone(),
+            lineage: Some(Lineage {
+                parent_session_id: parent.id.clone(),
+                parent_job_id: aura_model::JobId::default(),
+                parent_span_id: None,
+                kind: LineageKind::Subagent,
+            }),
+            bound_soul_version: parent.bound_soul_version.clone(),
+            hidden: false,
+        };
+        sessions.store().save(&child).await.unwrap();
+        SessionId::from(child_id)
+    }
+
+    /// Build an empty in-memory `SessionManager` for tests that
+    /// reach `execute()` but don't care about lineage depth. Returns
+    /// a manager with no sessions persisted — the depth check will
+    /// fall through to "parent session unknown" unless the test
+    /// pre-saves a root.
+    fn empty_session_manager() -> Arc<SessionManager> {
+        Arc::new(SessionManager::new(
+            Arc::new(MemorySessionStore::new()),
+            Arc::new(MemorySessionSummaryStore::new()),
+        ))
+    }
+
+    /// Convenience constructor used by every test that doesn't care
+    /// about depth or fan-out — pre-seeds a root session at
+    /// `TEST_PARENT_SESSION` and instantiates the tool with the
+    /// defaults plus an `UnboundedDispatchLimiter` so test runs can't
+    /// trip the fan-out cap.
+    async fn tool_with_default(
+        tx: mpsc::Sender<SystemSpawnRequest>,
+    ) -> SpawnSubagentTool {
+        SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
+            system_spawn_tx: tx,
+            registry: registry_with_builtins(),
+            sessions: sessions_with_root().await,
+            dispatch_limiter: crate::unbounded_limiter(),
+            max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
+            max_subagents_per_root: DEFAULT_MAX_SUBAGENTS_PER_ROOT,
+        })
+    }
+
+    /// Shared bridge for tests that DO care about a specific dispatch
+    /// limiter / max_depth / max fan-out — every other knob falls
+    /// back to the same defaults `tool_with_default` uses.
+    async fn tool_with(
+        tx: mpsc::Sender<SystemSpawnRequest>,
+        sessions: Arc<SessionManager>,
+        dispatch_limiter: Arc<dyn crate::SubagentDispatchLimiter>,
+        max_depth: u32,
+        max_subagents_per_root: u32,
+    ) -> SpawnSubagentTool {
+        SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
+            system_spawn_tx: tx,
+            registry: registry_with_builtins(),
+            sessions,
+            dispatch_limiter,
+            max_depth,
+            max_subagents_per_root,
+        })
     }
 
     /// Spin a fake router: pull one `SystemSpawnRequest::Subagent` off
@@ -200,7 +731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwards_parsed_request_and_parent_ctx_to_channel() {
+    async fn forwards_resolved_profile_and_brief_to_channel() {
         let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(8);
         let router = fake_router(
             rx,
@@ -211,13 +742,15 @@ mod tests {
             },
         );
 
-        let tool = SpawnSubagentTool::new(tx);
+        let tool = tool_with_default(tx).await;
         let out = tool
             .execute(
                 json!({
-                    "task_description": "look up X",
+                    "subagent_type": "general-purpose",
+                    "description": "look up X",
+                    "prompt": "Investigate X and report what you find.",
                     "timeout_secs": 30,
-                    "llm": "fast",
+                    "model_tier": "fast",
                 }),
                 &ctx(),
             )
@@ -228,30 +761,192 @@ mod tests {
             _ => panic!("expected Text output"),
         }
         let (req, parent_id) = router.await.unwrap().expect("router saw a Subagent frame");
-        assert_eq!(req.task_description, "look up X");
+        assert_eq!(req.subagent_type, "general-purpose");
+        assert_eq!(req.task_summary, "look up X");
+        assert_eq!(req.prompt, "Investigate X and report what you find.");
         assert_eq!(req.timeout, Duration::from_secs(30));
-        assert_eq!(req.llm.as_deref(), Some("fast"));
+        assert_eq!(req.model_tier, Some(ModelTier::Fast));
+        assert!(!req.system_prompt.is_empty());
+        assert!(req.system_prompt.contains("subagent"));
+        assert!(!req.background);
         assert_eq!(parent_id.as_ref(), "parent-sess");
     }
 
     #[tokio::test]
-    async fn invalid_params_surface_as_tool_error() {
+    async fn unknown_subagent_type_returns_helpful_error() {
         let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
-        let tool = SpawnSubagentTool::new(tx);
+        let tool = tool_with_default(tx).await;
         let err = tool
-            .execute(json!({"missing": "task_description"}), &ctx())
+            .execute(
+                json!({
+                    "subagent_type": "ghost",
+                    "description": "x",
+                    "prompt": "x",
+                }),
+                &ctx(),
+            )
             .await
-            .expect_err("missing task_description must error");
-        assert!(matches!(err, ToolError::InvalidParams(_)));
+            .expect_err("ghost type must error");
+        match err {
+            ToolError::InvalidParams(msg) => {
+                assert!(msg.contains("ghost"));
+                assert!(msg.contains("general-purpose"));
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_required_fields_surface_as_tool_error() {
+        let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
+        let tool = tool_with_default(tx).await;
+
+        let cases = [
+            json!({"description": "x", "prompt": "x"}), // missing subagent_type
+            json!({"subagent_type": "general-purpose", "prompt": "x"}), // missing description
+            json!({"subagent_type": "general-purpose", "description": "x"}), // missing prompt
+        ];
+        for case in cases {
+            let err = tool
+                .execute(case.clone(), &ctx())
+                .await
+                .expect_err("missing required field must error");
+            assert!(matches!(err, ToolError::InvalidParams(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn background_flag_routes_through_envelope() {
+        // The tool surface for background mode is identical to
+        // foreground from the *tool's* perspective — it still sends
+        // a `SystemSpawnRequest::Subagent` envelope and renders
+        // whatever `SubagentResult` the router fills the oneshot
+        // with. The router-side branch (use parent_actor_token,
+        // post `AgentMessage::SubagentFinished` on terminal) is
+        // tested in the agent crate alongside the supervisor
+        // fixtures. Here we just confirm the tool propagates the
+        // `background: true` flag and the resulting ack lands as
+        // Text output.
+        let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(1);
+        let ack_text = "[background subagent dispatched]";
+        let router = fake_router(
+            rx,
+            SubagentResult {
+                child_session_id: aura_model::SessionId::from("child"),
+                final_content: Some(vec![aura_model::ContentBlock::Text(ack_text.into())]),
+                status: SubagentExitStatus::Completed,
+            },
+        );
+        let tool = tool_with_default(tx).await;
+        let out = tool
+            .execute(
+                json!({
+                    "subagent_type": "general-purpose",
+                    "description": "x",
+                    "prompt": "x",
+                    "background": true,
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        match out {
+            ToolOutput::Text(s) => assert_eq!(s, ack_text),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        let (req, _) = router
+            .await
+            .unwrap()
+            .expect("router saw an envelope");
+        assert!(req.background, "tool must propagate background=true");
+    }
+
+    #[tokio::test]
+    async fn image_attachments_surface_as_multi_modal_text() {
+        let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(8);
+        let img = aura_model::ContentBlock::Image {
+            blob: aura_model::BlobRef {
+                blob_id: "b-1".into(),
+            },
+            mime_type: "image/png".into(),
+        };
+        let router = fake_router(
+            rx,
+            SubagentResult {
+                child_session_id: aura_model::SessionId::from("child"),
+                final_content: Some(vec![
+                    aura_model::ContentBlock::Text("here's what I found".into()),
+                    img.clone(),
+                ]),
+                status: SubagentExitStatus::Completed,
+            },
+        );
+        let tool = tool_with_default(tx).await;
+        let out = tool
+            .execute(
+                json!({
+                    "subagent_type": "general-purpose",
+                    "description": "x",
+                    "prompt": "x",
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        match out {
+            ToolOutput::MultiModalText { text, llm_images } => {
+                assert_eq!(text, "here's what I found");
+                assert_eq!(llm_images, vec![img]);
+            }
+            other => panic!("expected MultiModalText, got {other:?}"),
+        }
+        let _ = router.await;
+    }
+
+    #[tokio::test]
+    async fn text_only_result_stays_as_text_variant() {
+        let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(8);
+        let router = fake_router(
+            rx,
+            SubagentResult {
+                child_session_id: aura_model::SessionId::from("child"),
+                final_content: Some(vec![aura_model::ContentBlock::Text("just text".into())]),
+                status: SubagentExitStatus::Completed,
+            },
+        );
+        let tool = tool_with_default(tx).await;
+        let out = tool
+            .execute(
+                json!({
+                    "subagent_type": "general-purpose",
+                    "description": "x",
+                    "prompt": "x",
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        match out {
+            ToolOutput::Text(s) => assert_eq!(s, "just text"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        let _ = router.await;
     }
 
     #[tokio::test]
     async fn channel_closed_renders_failed_result() {
         let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(1);
         drop(rx);
-        let tool = SpawnSubagentTool::new(tx);
+        let tool = tool_with_default(tx).await;
         let out = tool
-            .execute(json!({"task_description": "x"}), &ctx())
+            .execute(
+                json!({
+                    "subagent_type": "general-purpose",
+                    "description": "x",
+                    "prompt": "x",
+                }),
+                &ctx(),
+            )
             .await
             .unwrap();
         match out {
@@ -260,54 +955,310 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_spawn_request_minimal() {
-        let v = json!({"task_description": "do the thing"});
-        let req = parse_spawn_request(&v).unwrap();
-        assert_eq!(req.task_description, "do the thing");
-        assert_eq!(req.must_include_context.len(), 0);
-        assert_eq!(
-            req.timeout,
-            Duration::from_secs(DEFAULT_SUBAGENT_TIMEOUT_SECS)
+    #[tokio::test]
+    async fn lineage_depth_at_cap_rejects_spawn() {
+        let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(1);
+        let _router_drop = rx;
+        let sessions = sessions_with_root().await;
+        // Build a chain: parent → c1 → c2 → c3.  Depth of c3 is 3.
+        save_child_session(&sessions, "c1", TEST_PARENT_SESSION).await;
+        save_child_session(&sessions, "c2", "c1").await;
+        save_child_session(&sessions, "c3", "c2").await;
+
+        let tool = tool_with(
+            tx,
+            sessions,
+            crate::unbounded_limiter(),
+            /* max_depth */ 3,
+            DEFAULT_MAX_SUBAGENTS_PER_ROOT,
+        )
+        .await;
+        let err = tool
+            .execute(
+                json!({
+                    "subagent_type": "general-purpose",
+                    "description": "x",
+                    "prompt": "x",
+                }),
+                &ctx_with_session("c3"),
+            )
+            .await
+            .expect_err("at-cap parent must be rejected");
+        match err {
+            ToolError::SubagentDepthExceeded { current_depth, cap } => {
+                assert_eq!(current_depth, 3);
+                assert_eq!(cap, 3);
+            }
+            other => panic!("expected SubagentDepthExceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lineage_depth_below_cap_is_accepted() {
+        let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(8);
+        let router = fake_router(
+            rx,
+            SubagentResult {
+                child_session_id: aura_model::SessionId::from("grandchild"),
+                final_content: Some(vec![aura_model::ContentBlock::Text("done".into())]),
+                status: SubagentExitStatus::Completed,
+            },
         );
-        assert!(req.llm.is_none());
+        let sessions = sessions_with_root().await;
+        save_child_session(&sessions, "c1", TEST_PARENT_SESSION).await;
+        // Spawning from c1 with cap=3 must succeed (depth 1 < 3).
+        let tool = tool_with(
+            tx,
+            sessions,
+            crate::unbounded_limiter(),
+            /* max_depth */ 3,
+            DEFAULT_MAX_SUBAGENTS_PER_ROOT,
+        )
+        .await;
+        let out = tool
+            .execute(
+                json!({
+                    "subagent_type": "general-purpose",
+                    "description": "x",
+                    "prompt": "x",
+                }),
+                &ctx_with_session("c1"),
+            )
+            .await
+            .unwrap();
+        match out {
+            ToolOutput::Text(s) => assert_eq!(s, "done"),
+            _ => panic!("expected Text output"),
+        }
+        let _ = router.await;
+    }
+
+    #[tokio::test]
+    async fn unknown_parent_session_surfaces_as_execution_error() {
+        let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
+        let tool = tool_with(
+            tx,
+            empty_session_manager(),
+            crate::unbounded_limiter(),
+            DEFAULT_MAX_SUBAGENT_DEPTH,
+            DEFAULT_MAX_SUBAGENTS_PER_ROOT,
+        )
+        .await;
+        let err = tool
+            .execute(
+                json!({
+                    "subagent_type": "general-purpose",
+                    "description": "x",
+                    "prompt": "x",
+                }),
+                &ctx_with_session("not-persisted"),
+            )
+            .await
+            .expect_err("unknown parent must surface as execution error");
+        assert!(matches!(err, ToolError::Execution(_)));
     }
 
     #[test]
-    fn parse_spawn_request_full() {
-        let v = json!({
-            "task_description": "investigate",
-            "must_include_context": ["span:abc", "user wanted X"],
-            "timeout_secs": 30,
-            "llm": "fast",
+    fn description_for_llm_appends_type_catalogue() {
+        let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
+        let tool = SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
+            system_spawn_tx: tx,
+            registry: registry_with_builtins(),
+            sessions: empty_session_manager(),
+            dispatch_limiter: crate::unbounded_limiter(),
+            max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
+            max_subagents_per_root: DEFAULT_MAX_SUBAGENTS_PER_ROOT,
         });
-        let req = parse_spawn_request(&v).unwrap();
-        assert_eq!(req.task_description, "investigate");
-        assert_eq!(req.must_include_context.len(), 2);
-        assert_eq!(req.timeout, Duration::from_secs(30));
-        assert_eq!(req.llm.as_deref(), Some("fast"));
+        let desc = tool.description_for_llm().expect("dynamic description");
+        assert!(desc.starts_with(STATIC_DESCRIPTION));
+        assert!(desc.contains("# Available subagent_type values"));
+        // Every built-in profile must appear in the catalogue so the
+        // parent LLM has a stable enum of names to pick from.
+        for expected in ["general-purpose", "explorer", "planner", "reviewer"] {
+            assert!(
+                desc.contains(expected),
+                "catalogue missing built-in `{expected}` — full text:\n{desc}"
+            );
+        }
+        // Tier hints surface so the LLM can read the default tier
+        // without guessing.
+        assert!(desc.contains("(default tier: fast)"));
+        assert!(desc.contains("(default tier: deep)"));
+        // Sorted by name: explorer < general-purpose < planner < reviewer.
+        let pos = |needle: &str| desc.find(needle).expect("present");
+        let p_explorer = pos("- **explorer**");
+        let p_general = pos("- **general-purpose**");
+        let p_planner = pos("- **planner**");
+        let p_reviewer = pos("- **reviewer**");
+        assert!(
+            p_explorer < p_general && p_general < p_planner && p_planner < p_reviewer,
+            "catalogue must be sorted alphabetically"
+        );
+    }
+
+    /// Limiter that records every reserve / release event so tests
+    /// can assert on the dispatcher's bookkeeping.
+    #[derive(Default)]
+    struct RecordingLimiter {
+        events: parking_lot::Mutex<Vec<&'static str>>,
+        reserved: parking_lot::Mutex<u32>,
+        deny_after: u32,
+    }
+
+    impl RecordingLimiter {
+        fn new(deny_after: u32) -> Self {
+            Self {
+                events: parking_lot::Mutex::new(Vec::new()),
+                reserved: parking_lot::Mutex::new(0),
+                deny_after,
+            }
+        }
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().clone()
+        }
+    }
+
+    impl crate::SubagentDispatchLimiter for RecordingLimiter {
+        fn try_reserve(
+            &self,
+            _root_session_id: &aura_model::SessionId,
+            _cap: u32,
+        ) -> Result<(), u32> {
+            let mut held = self.reserved.lock();
+            if *held >= self.deny_after {
+                self.events.lock().push("deny");
+                return Err(*held);
+            }
+            *held += 1;
+            self.events.lock().push("reserve");
+            Ok(())
+        }
+        fn release(&self, _root_session_id: &aura_model::SessionId) {
+            let mut held = self.reserved.lock();
+            *held = held.saturating_sub(1);
+            self.events.lock().push("release");
+        }
+        fn in_flight(&self, _root_session_id: &aura_model::SessionId) -> u32 {
+            *self.reserved.lock()
+        }
+    }
+
+    #[tokio::test]
+    async fn fan_out_cap_rejects_with_helpful_error() {
+        let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
+        let limiter = Arc::new(RecordingLimiter::new(/* deny_after */ 0));
+        let tool = tool_with(
+            tx,
+            sessions_with_root().await,
+            limiter.clone() as Arc<dyn crate::SubagentDispatchLimiter>,
+            DEFAULT_MAX_SUBAGENT_DEPTH,
+            /* max_subagents_per_root */ 4,
+        )
+        .await;
+        let err = tool
+            .execute(
+                json!({
+                    "subagent_type": "general-purpose",
+                    "description": "x",
+                    "prompt": "x",
+                }),
+                &ctx(),
+            )
+            .await
+            .expect_err("limiter must reject when over cap");
+        match err {
+            ToolError::SubagentFanoutExceeded { current_count, cap } => {
+                assert_eq!(current_count, 0);
+                assert_eq!(cap, 4);
+            }
+            other => panic!("expected SubagentFanoutExceeded, got {other:?}"),
+        }
+        // Tool must not have leaked a reservation: only the deny was
+        // recorded; no matching release happened.
+        assert_eq!(limiter.events(), vec!["deny"]);
+    }
+
+    #[tokio::test]
+    async fn channel_closed_after_reserve_releases_slot() {
+        let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(1);
+        drop(rx);
+        let limiter = Arc::new(RecordingLimiter::new(/* deny_after */ 8));
+        let tool = tool_with(
+            tx,
+            sessions_with_root().await,
+            limiter.clone() as Arc<dyn crate::SubagentDispatchLimiter>,
+            DEFAULT_MAX_SUBAGENT_DEPTH,
+            8,
+        )
+        .await;
+        let _ = tool
+            .execute(
+                json!({
+                    "subagent_type": "general-purpose",
+                    "description": "x",
+                    "prompt": "x",
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        // Reserve happened, then the envelope send failed (channel
+        // closed). The tool's local fallback path must release the
+        // slot itself — the router never saw the envelope, so its
+        // wait task will never release.
+        assert_eq!(limiter.events(), vec!["reserve", "release"]);
     }
 
     #[test]
-    fn parse_spawn_request_rejects_missing_task() {
-        let v = json!({"timeout_secs": 60});
-        assert!(parse_spawn_request(&v).is_err());
+    fn description_for_llm_handles_empty_registry() {
+        let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
+        let tool = SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
+            system_spawn_tx: tx,
+            registry: Arc::new(SubagentRegistry::new()),
+            sessions: empty_session_manager(),
+            dispatch_limiter: crate::unbounded_limiter(),
+            max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
+            max_subagents_per_root: DEFAULT_MAX_SUBAGENTS_PER_ROOT,
+        });
+        let desc = tool.description_for_llm().expect("dynamic description");
+        assert!(desc.contains("none registered"));
     }
 
     #[test]
-    fn timeout_clamped_to_at_least_1s() {
-        let v = json!({"task_description": "x", "timeout_secs": 0});
-        let req = parse_spawn_request(&v).unwrap();
-        assert_eq!(req.timeout, Duration::from_secs(1));
-    }
-
-    #[test]
-    fn timeout_clamped_to_outer_cap() {
+    fn parse_spawn_request_clamps_timeout_to_at_least_1s() {
+        let registry = registry_with_builtins();
         let v = json!({
-            "task_description": "x",
+            "subagent_type": "general-purpose",
+            "description": "x",
+            "prompt": "x",
+            "timeout_secs": 0,
+        });
+        let p = parse_spawn_request(&v, &registry).unwrap();
+        assert_eq!(p.request.timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn parse_spawn_request_clamps_timeout_to_outer_cap() {
+        let registry = registry_with_builtins();
+        let v = json!({
+            "subagent_type": "general-purpose",
+            "description": "x",
+            "prompt": "x",
             "timeout_secs": MAX_SUBAGENT_TIMEOUT_SECS + 1
         });
-        let req = parse_spawn_request(&v).unwrap();
-        assert_eq!(req.timeout, Duration::from_secs(MAX_SUBAGENT_TIMEOUT_SECS));
+        let p = parse_spawn_request(&v, &registry).unwrap();
+        assert_eq!(p.request.timeout, Duration::from_secs(MAX_SUBAGENT_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn parse_spawn_request_rejects_unknown_model_tier() {
+        let registry = registry_with_builtins();
+        let v = json!({
+            "subagent_type": "general-purpose",
+            "description": "x",
+            "prompt": "x",
+            "model_tier": "ultradeep",
+        });
+        assert!(parse_spawn_request(&v, &registry).is_err());
     }
 }

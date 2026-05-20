@@ -13,6 +13,7 @@
 //!   config/            # standalone git repo: aura.json, .mcp.json
 //!   profile/           # standalone git repo: *.md identity files
 //!   skills/            # standalone git repo: user skill definitions
+//!   agents/            # standalone git repo: subagent profile definitions
 //!   .key/              # not version-controlled: encryption.key
 //!   state/             # not version-controlled: storage.db, aura.lock, channel.port, browser/profile
 //!   work/              # not version-controlled: sandbox FS scope; code-builder/<uuid>/, future scratch
@@ -40,6 +41,12 @@ pub const PROFILE_DIR: &str = "profile";
 
 /// Standalone git repo at `<root>/skills/`: workspace-local skill definitions.
 pub const SKILLS_DIR: &str = "skills";
+
+/// Standalone git repo at `<root>/agents/`: workspace-local subagent
+/// profile definitions. One `<name>.md` per profile (no
+/// directory-per-profile ceremony — a profile has no linked-files
+/// concern, only a frontmatter + system-prompt body).
+pub const AGENTS_DIR: &str = "agents";
 
 /// Master encryption-key directory at `<root>/.key/`. Not
 /// version-controlled. Setup mints the key file inside on first run with
@@ -362,6 +369,10 @@ impl WorkspacePaths {
         self.root.join(SKILLS_DIR)
     }
 
+    pub fn agents_dir(&self) -> PathBuf {
+        self.root.join(AGENTS_DIR)
+    }
+
     pub fn key_dir(&self) -> PathBuf {
         self.root.join(KEY_DIR)
     }
@@ -548,6 +559,7 @@ mod tests {
             PathBuf::from("/var/aura/logs/sessions"),
         );
         assert_eq!(p.skills_dir(), PathBuf::from("/var/aura/skills"));
+        assert_eq!(p.agents_dir(), PathBuf::from("/var/aura/agents"));
         assert_eq!(
             p.code_builder_dir(),
             PathBuf::from("/var/aura/work/.code-builder"),

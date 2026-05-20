@@ -103,6 +103,23 @@ fn validate_agent(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
             "must be >= 1",
         ));
     }
+    if agent.max_subagent_depth > 32 {
+        errors.push(ValidationError::new(
+            "agent.max_subagent_depth",
+            "must be <= 32 (chains deeper than this stress the lineage walker and rarely reflect deliberate design)",
+        ));
+    }
+    if agent.max_subagents_per_root == 0 {
+        errors.push(ValidationError::new(
+            "agent.max_subagents_per_root",
+            "must be >= 1 (setting to 0 disables `spawn_subagent` entirely; if that's the intent, remove the tool from the registry instead)",
+        ));
+    } else if agent.max_subagents_per_root > 256 {
+        errors.push(ValidationError::new(
+            "agent.max_subagents_per_root",
+            "must be <= 256 (caps higher than this rarely reflect deliberate design and trade safety for cost)",
+        ));
+    }
 }
 
 fn validate_channels(channels: &ChannelsConfig, errors: &mut Vec<ValidationError>) {

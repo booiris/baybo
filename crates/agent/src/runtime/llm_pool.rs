@@ -5,17 +5,24 @@
 //! dispatch time. `resolve(None)` returns the default entry;
 //! `resolve(Some(name))` returns that entry if present, otherwise the
 //! default with a `warn!` (stranded reference).
+//!
+//! Optional `model_tiers` (Fast / Balanced / Deep → entry name) lets
+//! `spawn_subagent` ask for "a fast model" without knowing which
+//! `aura.json` entry happens to be wired to that tier. Unmapped tiers
+//! return `None` and the caller falls through to the pool default.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use aura_llm::GuardedLlm;
+use aura_model::ModelTier;
 use tracing::warn;
 
 pub struct LlmClientPool {
     clients: HashMap<String, Arc<GuardedLlm>>,
     default_name: String,
     default_client: Arc<GuardedLlm>,
+    tier_map: HashMap<ModelTier, String>,
 }
 
 impl LlmClientPool {
@@ -23,17 +30,45 @@ impl LlmClientPool {
         clients: HashMap<String, Arc<GuardedLlm>>,
         default_name: String,
     ) -> Result<Self, String> {
+        Self::with_tier_map(clients, default_name, HashMap::new())
+    }
+
+    /// Construct a pool with a tier→entry-name lookup. Each value in
+    /// `tier_map` must already exist in `clients` — a stranded
+    /// reference would surface as a default-fallback every spawn,
+    /// which is hard to diagnose at runtime, so we reject it at boot.
+    pub fn with_tier_map(
+        clients: HashMap<String, Arc<GuardedLlm>>,
+        default_name: String,
+        tier_map: HashMap<ModelTier, String>,
+    ) -> Result<Self, String> {
         let default_client = clients.get(&default_name).cloned().ok_or_else(|| {
             format!(
                 "default-llm {default_name:?} not present in client pool; configured entries: [{}]",
                 clients.keys().cloned().collect::<Vec<_>>().join(", ")
             )
         })?;
+        for (tier, target) in &tier_map {
+            if !clients.contains_key(target) {
+                return Err(format!(
+                    "model_tiers[{tier}] points at unknown llm entry {target:?}; configured entries: [{}]",
+                    clients.keys().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
         Ok(Self {
             clients,
             default_name,
             default_client,
+            tier_map,
         })
+    }
+
+    /// Look up the entry name bound to a `ModelTier`. Returns `None`
+    /// when the tier is unmapped — callers (typically the subagent
+    /// router) treat that as "fall back to pool default".
+    pub fn resolve_tier(&self, tier: ModelTier) -> Option<String> {
+        self.tier_map.get(&tier).cloned()
     }
 
     pub fn default_client(&self) -> Arc<GuardedLlm> {
@@ -135,5 +170,30 @@ mod tests {
         let direct = pool.default_client();
         let (resolved, _) = pool.resolve(None);
         assert!(Arc::ptr_eq(&direct, &resolved));
+    }
+
+    #[test]
+    fn resolve_tier_returns_mapped_entry() {
+        let mut clients = HashMap::new();
+        clients.insert("primary".to_string(), stub_with_id("model-primary"));
+        clients.insert("fast".to_string(), stub_with_id("model-fast"));
+        let mut tiers = HashMap::new();
+        tiers.insert(ModelTier::Fast, "fast".to_string());
+        let pool = LlmClientPool::with_tier_map(clients, "primary".into(), tiers).unwrap();
+        assert_eq!(pool.resolve_tier(ModelTier::Fast).as_deref(), Some("fast"));
+        assert!(pool.resolve_tier(ModelTier::Deep).is_none());
+    }
+
+    #[test]
+    fn with_tier_map_rejects_stranded_reference() {
+        let mut clients = HashMap::new();
+        clients.insert("primary".to_string(), stub_with_id("primary"));
+        let mut tiers = HashMap::new();
+        tiers.insert(ModelTier::Deep, "missing".to_string());
+        let err = match LlmClientPool::with_tier_map(clients, "primary".into(), tiers) {
+            Ok(_) => panic!("stranded tier reference must be rejected at boot"),
+            Err(msg) => msg,
+        };
+        assert!(err.contains("missing"));
     }
 }

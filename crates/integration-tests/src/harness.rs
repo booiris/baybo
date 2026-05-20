@@ -436,6 +436,7 @@ impl AgentTestHarnessBuilder {
                 span_recorder,
                 actor_token,
                 supervisor: None,
+                session_manager: Arc::clone(&session_manager),
             },
         );
         let actor_handle = tokio::spawn(actor.run(mailbox_rx));

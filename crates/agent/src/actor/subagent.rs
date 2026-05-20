@@ -48,9 +48,9 @@ pub async fn await_subagent_terminal(
                             captured = Some(m.content);
                         }
                         Some(_) => continue,
-                        None => return Err(SubagentExitStatus::Failed(
-                            "child output channel closed before terminal event".into(),
-                        )),
+                        None => return Err(SubagentExitStatus::Failed {
+                            reason: "child output channel closed before terminal event".into(),
+                        }),
                     }
                 }
                 event = terminal_rx.recv() => {
@@ -88,9 +88,9 @@ pub async fn await_subagent_terminal(
                             continue;
                         }
                         Err(broadcast::error::RecvError::Closed) => {
-                            return Err(SubagentExitStatus::Failed(
-                                "job lifecycle terminal-event bus closed".into(),
-                            ));
+                            return Err(SubagentExitStatus::Failed {
+                                reason: "job lifecycle terminal-event bus closed".into(),
+                            });
                         }
                     }
                 }
@@ -141,11 +141,13 @@ fn terminal_event_to_status(
 ) -> Result<Option<Vec<ContentBlock>>, SubagentExitStatus> {
     match kind {
         JobStatusKind::Completed => Ok(captured),
-        JobStatusKind::Failed => Err(SubagentExitStatus::Failed("child job failed".into())),
+        JobStatusKind::Failed => Err(SubagentExitStatus::Failed {
+            reason: "child job failed".into(),
+        }),
         JobStatusKind::Cancelled => Err(SubagentExitStatus::Cancelled),
-        other => Err(SubagentExitStatus::Failed(format!(
-            "unexpected non-terminal terminal-event kind: {other:?}"
-        ))),
+        other => Err(SubagentExitStatus::Failed {
+            reason: format!("unexpected non-terminal terminal-event kind: {other:?}"),
+        }),
     }
 }
 
@@ -369,7 +371,7 @@ mod tests {
         let mut h = Harness::new();
         h.close_output();
         let result = h.spawn_waiter(Duration::from_secs(60)).finish().await;
-        assert!(matches!(result.status, SubagentExitStatus::Failed(_)));
+        assert!(matches!(result.status, SubagentExitStatus::Failed { .. }));
     }
 
     /// `JobLifecycle::complete` publishes the terminal event inside

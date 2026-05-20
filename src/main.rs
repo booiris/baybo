@@ -180,9 +180,22 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Argv-mode subagent profile registry. Cheap to build — built-in
+    // profiles are bundled and workspace `<root>/agents/*.md` is read
+    // off disk once. The `aura agents` command consults it; other
+    // argv paths ignore the registry but keeping it populated keeps
+    // the context shape stable regardless of which command shipped.
+    let subagent_profiles = {
+        let reg = Arc::new(aura_subagent::SubagentRegistry::new());
+        reg.register_builtins();
+        reg.load_dir(&workspace_paths.agents_dir());
+        reg
+    };
+
     let mut builder = ContextBuilder::new(Arc::clone(&config))
         .config_path(resolve_config_path())
         .skills(Arc::clone(&skill_registry))
+        .subagent_profiles(Arc::clone(&subagent_profiles))
         .tools(Arc::clone(&tool_registry))
         .channels(Arc::clone(&channels_registry))
         .workspace(Arc::clone(&workspace));

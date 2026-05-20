@@ -125,24 +125,12 @@ impl ToolRegistry {
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut defs: HashMap<String, ToolDefinition> = HashMap::new();
         for tool in self.builtin.values() {
-            defs.insert(
-                tool.name().to_string(),
-                ToolDefinition {
-                    name: tool.name().to_string(),
-                    description: tool.description().to_string(),
-                    parameters_schema: tool.parameters_schema(),
-                },
-            );
+            let def = tool_definition_for(tool.as_ref());
+            defs.insert(def.name.clone(), def);
         }
         for tool in self.dynamic.read().tools.values() {
-            defs.insert(
-                tool.name().to_string(),
-                ToolDefinition {
-                    name: tool.name().to_string(),
-                    description: tool.description().to_string(),
-                    parameters_schema: tool.parameters_schema(),
-                },
-            );
+            let def = tool_definition_for(tool.as_ref());
+            defs.insert(def.name.clone(), def);
         }
         // Sort by name so the serialized `tools` array is byte-identical
         // across calls. Anthropic's prompt cache keys on the exact
@@ -183,6 +171,16 @@ impl ToolRegistry {
             return Some(m.clone());
         }
         self.builtin_manifests.get(name).cloned()
+    }
+}
+
+fn tool_definition_for(tool: &dyn Tool) -> ToolDefinition {
+    ToolDefinition {
+        name: tool.name().to_string(),
+        description: tool
+            .description_for_llm()
+            .unwrap_or_else(|| tool.description().to_string()),
+        parameters_schema: tool.parameters_schema(),
     }
 }
 

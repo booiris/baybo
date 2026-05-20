@@ -3,6 +3,7 @@ pub mod builtin;
 pub mod error;
 pub mod mcp;
 pub mod registry;
+pub mod subagent_dispatch;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -24,6 +25,7 @@ pub use approval::{
     ApprovedResource, AutoDenyGate, ChannelApprovalGate, HostPattern, ResourceAccess,
 };
 pub use error::ToolError;
+pub use subagent_dispatch::{FanOutLimiter, SubagentDispatchLimiter, unbounded_limiter};
 
 pub type Result<T> = std::result::Result<T, ToolError>;
 
@@ -36,6 +38,18 @@ pub type Result<T> = std::result::Result<T, ToolError>;
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
+
+    /// Override the LLM-facing description with a freshly computed
+    /// string. Default `None` so existing tools keep their static
+    /// [`Self::description`] body. Used by tools whose description
+    /// depends on runtime state (e.g. `spawn_subagent` enumerates the
+    /// registered [`aura_subagent::SubagentProfile`] catalogue
+    /// once per LLM turn). Consumed by
+    /// [`crate::registry::ToolRegistry::tool_definitions`].
+    fn description_for_llm(&self) -> Option<String> {
+        None
+    }
+
     fn parameters_schema(&self) -> Value;
 
     /// Resources this call will touch, derived from the parameters.
