@@ -306,20 +306,28 @@ impl SubagentResult {
         }
     }
 
-    /// Flat text rendering for the parent's synthetic `tool_result`.
-    /// On `Completed` with a real child session, appends a parseable
-    /// `[subagent_session_id: …]` tail so the parent can resume the
-    /// same child via `spawn_subagent(resume_session_id: …)`. Image
-    /// attachments are dropped — callers that need them reach for
-    /// [`Self::split_for_parent`].
-    pub fn to_tool_result_text(&self) -> String {
-        let body = self.split_for_parent().text;
+    /// The parseable `[subagent_session_id: …]` suffix appended to a
+    /// completed result's text so the parent can continue the child via
+    /// `spawn_subagent(resume_session_id: …)`. `None` for non-completed
+    /// exits or early failures that never minted a child session. Single
+    /// source of truth for the tail format — the tool boundary applies
+    /// it to its already-split text rather than re-rendering.
+    pub fn resume_tail(&self) -> Option<String> {
         let id = self.child_session_id.as_ref();
-        if matches!(self.status, SubagentExitStatus::Completed) && !id.is_empty() {
-            format!("{body}\n[subagent_session_id: {id}]")
-        } else {
-            body
+        (matches!(self.status, SubagentExitStatus::Completed) && !id.is_empty())
+            .then(|| format!("\n[subagent_session_id: {id}]"))
+    }
+
+    /// Flat text rendering for the parent's synthetic `tool_result`:
+    /// [`Self::split_for_parent`]'s text plus the [`Self::resume_tail`]
+    /// suffix on completion. Image attachments are dropped — callers
+    /// that need them reach for `split_for_parent` and apply the tail.
+    pub fn to_tool_result_text(&self) -> String {
+        let mut text = self.split_for_parent().text;
+        if let Some(tail) = self.resume_tail() {
+            text.push_str(&tail);
         }
+        text
     }
 }
 

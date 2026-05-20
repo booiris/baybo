@@ -250,9 +250,7 @@ impl Router {
                 // the reaper can't tear the parent down in the window
                 // between terminal-observe and deliver.
                 supervisor.note_background_subagent_finished(&parent_id_for_task);
-                if let Some(root) = fan_out_root_for_task {
-                    limiter_for_task.release(&root);
-                }
+                release_reserved_slot(limiter_for_task.as_ref(), &fan_out_root_for_task);
             });
             return Ok(());
         }
@@ -272,9 +270,7 @@ impl Router {
             )
             .await;
             let _ = result_tx.send(result);
-            if let Some(root) = fan_out_root_for_task {
-                limiter_for_task.release(&root);
-            }
+            release_reserved_slot(limiter_for_task.as_ref(), &fan_out_root_for_task);
         });
         Ok(())
     }
@@ -367,17 +363,13 @@ impl Router {
             )
             .await;
             let _ = result_tx.send(result);
-            if let Some(root) = fan_out_root {
-                limiter_for_task.release(&root);
-            }
+            release_reserved_slot(limiter_for_task.as_ref(), &fan_out_root);
         });
         Ok(())
     }
 
     fn release_fan_out_slot(&self, root: &Option<SessionId>) {
-        if let Some(id) = root {
-            self.dispatch_limiter.release(id);
-        }
+        release_reserved_slot(self.dispatch_limiter.as_ref(), root);
     }
 
     /// Returns the child Session — loading an existing one when
@@ -452,6 +444,19 @@ impl Router {
             }
             Ok(child)
         }
+    }
+}
+
+/// Release a reserved fan-out slot for `root`, if any. A free fn so the
+/// detached wait tasks — which capture only an
+/// `Arc<dyn SubagentDispatchLimiter>`, not `&self` — share the `&self`
+/// method's single implementation.
+fn release_reserved_slot(
+    limiter: &dyn aura_tools::SubagentDispatchLimiter,
+    root: &Option<SessionId>,
+) {
+    if let Some(id) = root {
+        limiter.release(id);
     }
 }
 

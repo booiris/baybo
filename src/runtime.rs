@@ -741,10 +741,10 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                   system_prompt_override: Option<String>| {
                 // LLM pinning is exclusively a subagent-spawn affair —
                 // user-channel actors always run on `default-llm`.
-                // `initial_llm` is `Some` only when the router's
-                // `handle_subagent_spawn` forwards a
-                // `SubagentSpawnRequest.llm`.
-                let effective_initial = initial_llm;
+                // `initial_llm` is `Some` only when the router's subagent
+                // handler resolved a model for the child (from the spawn
+                // request's `backend = Aura { llm }` or `model_tier`) and
+                // forwarded it here.
 
                 // Subagent profiles replace Soul wholesale; user / cron /
                 // background-compression spawns pass `None` and inherit
@@ -759,7 +759,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // See `docs/background-compression.md`.
                 let agent_loop = AgentLoop::from_config(AgentLoopConfig {
                     llm_pool: Arc::clone(&llm_pool),
-                    initial_llm: effective_initial,
+                    initial_llm,
                     tool_registry: Arc::clone(&tool_registry),
                     skill_registry: Arc::clone(&skill_registry),
                     tool_executor: Arc::clone(&tool_executor),

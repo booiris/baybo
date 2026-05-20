@@ -639,11 +639,13 @@ impl Tool for SpawnSubagentTool {
             }
         };
         let parts = result.split_for_parent();
-        let text = if background {
-            parts.text
-        } else {
-            result.to_tool_result_text()
-        };
+        let mut text = parts.text;
+        // Foreground results carry the resume-id tail; the background ack
+        // is a dispatch notice whose escorted delivery surfaces the id
+        // separately, so it stays tail-free.
+        if !background && let Some(tail) = result.resume_tail() {
+            text.push_str(&tail);
+        }
         Ok(if parts.llm_images.is_empty() {
             ToolOutput::Text(text)
         } else {
