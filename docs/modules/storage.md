@@ -34,9 +34,13 @@ libsql/channel_pairing.rs → impl ChannelPairingStore                  (trait +
 libsql/blob.rs            → impl BlobStore                            (trait + BlobMeta here)
 ```
 
+Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `libsql/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one.
+
 `Session`, `User`, `ChannelType`, and `SessionState` live in `aura-model` so that both `aura-session` (trait + manager) and `aura-storage` (libsql impl) can type against them without either crate dragging the other along. The `SessionStore` / `SessionSummaryStore` traits themselves now live in `aura-session`; `aura-storage` depends on `aura-session` to implement them.
 
 The conversation transcript itself is **not** stored on `Session` — it's owned by `aura_context::ContextManager` while the actor is alive and persisted via the per-message `SessionStore` log: `append_session_message` for new turns, `apply_session_compaction` for `/compact`, `load_active_session_messages` for cold-start hydration. Rows live in the `session_messages` table (append-only, with a `superseded_by` marker for compactions).
+
+The row schema carries **no read/unread state** — there is no `read_at`, `seen`, or unread-count column, and none exists anywhere server-side. "Unread" is a purely client-side derivation: the web sidebar counts `Frame::SessionActivity` pulses (see [channels.md](channels.md)) and the cron inbox tracks acknowledged fires in `localStorage`; neither is persisted, so read status doesn't survive a cleared browser or follow the user across devices. Adding server-trusted read state would be a from-scratch change spanning storage → `aura-model` → gateway API → web.
 
 `CostStore` and `SkillRiskStore` are unique in that they also define their own data types: cost has no separate domain crate, and risk types live in storage to keep `aura-skills` LLM-free while still allowing the assessor crate to persist verdicts. `ChannelPairingStore` follows the same pattern: its row + status types (`ChannelPairingRow`, `PairingStatus`) sit next to the trait so `aura-pairing` can depend on `aura-storage` alone rather than owning its own persistence contract.
 
