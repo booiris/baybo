@@ -159,6 +159,33 @@ the child session's transcript looks like a normal agent loop:
 `FinalContent` duplicates the last assistant text, so the consumer
 treats it as a result signal only and does not double-write.
 
+## Job lifecycle + trace visibility
+
+`run_external_agent_job` wraps each run in a `Spawned` job
+(`JobLifecycle::start_job` → `start` → terminal transition), the same
+job kind the in-process Aura backend mints per turn. Without a job the
+child session is invisible to the trace browser:
+`QueryApi::list_session_summaries` drops zero-job sessions and
+`GET /v1/traces/{id}` 404s on them. The terminal `SubagentExitStatus`
+maps onto the job: `Completed` → `complete(JobOutput::Message)`,
+`Failed` → `fail`, `Timeout` → `cancel(SubagentTimeout)`, `Cancelled`
+→ `cancel(ParentCancelled)`. The run's cancel token is registered via
+`register_running`, so an operator-issued job cancel trips the
+subprocess.
+
+External runs record **no step/span tree** — the agent's internal
+loop is opaque, and faking `LlmCall` spans would pollute cost /
+analytics with calls aura never made. So the trace detail page
+(`web/src/pages/TraceSessionPage.tsx`) falls back to rendering the
+persisted `session_messages` transcript directly when a job has zero
+steps. Net frontend behaviour: the external subagent appears in the
+Traces list with a `subagent` badge + job status, and opening it
+shows the full transcript (thinking / tool_use / tool_result) via the
+shared `MessageList` component.
+
+Token usage (`ExternalAgentEvent::Usage`) is still dropped — wiring it
+into `cost_records` is a separate follow-up.
+
 `claude -p` runs with `--permission-mode bypassPermissions`
 hardcoded. claude's interactive permission prompts can't reach
 aura's non-TTY subprocess; bypass means every file edit, bash

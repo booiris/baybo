@@ -1553,7 +1553,20 @@ export function TraceSessionPage() {
               </div>
             )}
             {activeJobTrace && activeJobTrace.steps.length === 0 && (
-              <div className="text-ink-soft text-[0.95rem] italic">No steps yet for this job.</div>
+              messageLog.length > 0 ? (
+                // External-agent (claude/codex) jobs record no step/span
+                // tree — their internal loop is opaque. Surface the
+                // persisted session transcript instead so the run is
+                // still inspectable.
+                <div className="space-y-2">
+                  <div className="text-ink-soft text-[0.7rem] font-bold uppercase tracking-wider">
+                    Session transcript
+                  </div>
+                  <MessageList messages={messageLog} />
+                </div>
+              ) : (
+                <div className="text-ink-soft text-[0.95rem] italic">No steps yet for this job.</div>
+              )
             )}
           </div>
         </div>

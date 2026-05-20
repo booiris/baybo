@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use aura_channels::{AgentOutput, IncomingMessage, Message};
+use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
 use aura_model::{
     ChannelType, ChatMessage, ContentBlock, ExternalAgentKind, JobId, Lineage, LineageKind,
     MessageMetadata, Role, SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend,
-    SubagentExitStatus, SubagentResult, SubagentSpawnRequest, User,
+    SubagentExitStatus, SubagentResult, SubagentSpawnRequest, TriggerKind, User,
 };
 use chrono::Utc;
 use futures::StreamExt;
@@ -213,9 +214,15 @@ impl Router {
         let timeout = request.timeout;
         let child_session_id = child_session.id.clone();
         let session_manager = Arc::clone(&self.session_manager);
+        let job_ctx = ExternalJobCtx {
+            lifecycle: Arc::clone(&self.job_lifecycle),
+            trigger_kind: child_session.trigger.kind(),
+            soul_version: child_session.bound_soul_version.clone(),
+            parent_job_id,
+        };
 
         tokio::spawn(async move {
-            let result = run_external_agent(
+            let result = run_external_agent_job(
                 agent,
                 kind,
                 ExternalAgentRequest {
@@ -227,6 +234,7 @@ impl Router {
                 },
                 child_session_id.clone(),
                 session_manager,
+                job_ctx,
             )
             .await;
             let _ = result_tx.send(result);
@@ -365,6 +373,102 @@ fn validate_resume_session(
         ));
     }
     Ok(())
+}
+
+/// Job-lifecycle metadata for an external subagent run. The child
+/// session needs its own `Spawned` job for the trace browser to
+/// surface it — `list_session_summaries` drops zero-job sessions and
+/// `get_trace` 404s on them.
+struct ExternalJobCtx {
+    lifecycle: Arc<JobLifecycle>,
+    trigger_kind: TriggerKind,
+    soul_version: String,
+    parent_job_id: JobId,
+}
+
+/// Wrap [`run_external_agent`] in a `Spawned` job so the external
+/// subagent's child session is visible/inspectable in the trace
+/// browser, mirroring how the in-process Aura backend's actor creates
+/// a job per turn. The terminal `SubagentExitStatus` maps onto the
+/// job's terminal transition (Completed→complete, Failed→fail,
+/// Timeout→cancel(SubagentTimeout), Cancelled→cancel(ParentCancelled)).
+///
+/// Uses the `JobLifecycle` primitives directly rather than
+/// `scope::with_job` because `with_job` collapses every non-success
+/// exit into `fail()`; the subagent contract needs the distinct
+/// `SubagentTimeout` / `ParentCancelled` cancel reasons preserved.
+/// Terminal-race transitions (operator cancel landing as the run
+/// completes) surface as `InvalidTransition`, swallowed via `let _`.
+async fn run_external_agent_job(
+    agent: Arc<dyn ExternalAgent>,
+    kind: ExternalAgentKind,
+    request: ExternalAgentRequest,
+    child_session_id: SessionId,
+    session_manager: Arc<aura_session::SessionManager>,
+    job_ctx: ExternalJobCtx,
+) -> SubagentResult {
+    let cancel = request.cancel.clone();
+    let initial_prompt = vec![ContentBlock::Text(request.task.clone())];
+    let job = match job_ctx
+        .lifecycle
+        .start_job(
+            child_session_id.clone(),
+            job_ctx.trigger_kind,
+            JobInput::Spawned { initial_prompt },
+            job_ctx.soul_version,
+            Some(job_ctx.parent_job_id),
+        )
+        .await
+    {
+        Ok(j) => j,
+        Err(e) => {
+            return SubagentResult {
+                child_session_id,
+                final_content: None,
+                status: SubagentExitStatus::Failed(format!("start subagent job: {e}")),
+            };
+        }
+    };
+    // Register the cancel token so an operator-issued job cancel trips
+    // the run, then move Pending → InProgress.
+    let _cancel_guard = job_ctx.lifecycle.register_running(job.id, cancel);
+    if let Err(e) = job_ctx.lifecycle.start(&job.id).await {
+        let _ = job_ctx.lifecycle.fail(&job.id, format!("start: {e}")).await;
+        return SubagentResult {
+            child_session_id,
+            final_content: None,
+            status: SubagentExitStatus::Failed(format!("start subagent job: {e}")),
+        };
+    }
+
+    let result = run_external_agent(agent, kind, request, child_session_id, session_manager).await;
+
+    match &result.status {
+        SubagentExitStatus::Completed => {
+            let content = result.final_content.clone().unwrap_or_default();
+            let _ = job_ctx
+                .lifecycle
+                .complete(&job.id, JobOutput::Message { content })
+                .await;
+        }
+        SubagentExitStatus::Failed(reason) => {
+            let _ = job_ctx.lifecycle.fail(&job.id, reason.clone()).await;
+        }
+        SubagentExitStatus::Timeout => {
+            let _ = job_ctx
+                .lifecycle
+                .cancel(&job.id, CancelReason::SubagentTimeout, vec![])
+                .await;
+        }
+        SubagentExitStatus::Cancelled => {
+            let _ = job_ctx
+                .lifecycle
+                .cancel(&job.id, CancelReason::ParentCancelled, vec![])
+                .await;
+        }
+    }
+
+    result
 }
 
 async fn run_external_agent(
