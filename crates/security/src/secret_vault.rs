@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use crate::crypto::{self, EncryptionKey};
-use aura_store::SecretStore;
 use crate::secret_value::SecretValue;
 use crate::{Result, SecurityError};
+use aura_store::SecretStore;
 
 pub struct SecretVault {
     master_key: EncryptionKey,

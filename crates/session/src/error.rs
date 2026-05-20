@@ -48,6 +48,7 @@ impl From<aura_store::StorageError> for SessionError {
             }
             aura_store::StorageError::NotFound(s) => SessionError::NotFound(s),
             aura_store::StorageError::Storage(s) => SessionError::Storage(s),
+            aura_store::StorageError::Conflict(s) => SessionError::Storage(s),
             other @ aura_store::StorageError::TooLarge { .. } => {
                 SessionError::Storage(other.to_string())
             }

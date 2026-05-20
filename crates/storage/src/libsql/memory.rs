@@ -2,9 +2,9 @@ use async_trait::async_trait;
 
 use super::LibsqlPool;
 
+use aura_model::MemoryEntry;
 use aura_store::StorageError;
 use aura_store::memory::{MemoryStore, Result};
-use aura_model::MemoryEntry;
 
 pub struct LibsqlMemoryStore {
     pool: LibsqlPool,

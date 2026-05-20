@@ -1635,10 +1635,7 @@ mod tests {
         ) -> std::result::Result<Option<Vec<u8>>, aura_store::StorageError> {
             self.inner.retrieve(name).await
         }
-        async fn delete(
-            &self,
-            name: &str,
-        ) -> std::result::Result<(), aura_store::StorageError> {
+        async fn delete(&self, name: &str) -> std::result::Result<(), aura_store::StorageError> {
             self.inner.delete(name).await
         }
         async fn list(&self) -> std::result::Result<Vec<String>, aura_store::StorageError> {

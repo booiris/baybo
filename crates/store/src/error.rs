@@ -13,6 +13,12 @@ pub enum StorageError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// A uniqueness/idempotency constraint rejected a write — e.g. two
+    /// schedulers racing on the same cron execution slot. Callers that
+    /// expect benign races (the cron tick) match on this to skip.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// Streaming put exceeded the caller-supplied byte cap. Surfaces as
     /// HTTP 413 at the gateway boundary; internal callers can also use
     /// it to short-circuit oversized writes without buffering the rest.
