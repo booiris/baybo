@@ -137,6 +137,11 @@ pub struct Router {
     /// each actor derives its `actor_token` as a child of this so
     /// process shutdown cascades into every in-flight job.
     actor_parent_token: CancellationToken,
+    /// External-agent backends registered at boot.
+    pub(crate) external_agents: Arc<crate::external_agent::ExternalAgentRegistry>,
+    /// Workspace paths; used to compute external-agent working dirs
+    /// (`<root>/work/<kind>/<name-or-session>/`).
+    pub(crate) workspace_paths: Arc<aura_workspace::WorkspacePaths>,
 }
 
 /// Construction bundle for [`Router`]. Every field is required — call
@@ -162,6 +167,8 @@ pub struct RouterConfig {
     /// config; tests pass whatever they want.
     pub rate_limit_max_requests: usize,
     pub rate_limit_window: std::time::Duration,
+    pub external_agents: Arc<crate::external_agent::ExternalAgentRegistry>,
+    pub workspace_paths: Arc<aura_workspace::WorkspacePaths>,
 }
 
 impl Router {
@@ -181,6 +188,8 @@ impl Router {
             actor_parent_token,
             rate_limit_max_requests,
             rate_limit_window,
+            external_agents,
+            workspace_paths,
         } = config;
         Self {
             session_manager,
@@ -196,6 +205,8 @@ impl Router {
             cron_trigger_rx: Some(cron_trigger_rx),
             system_trigger_rx: Some(system_trigger_rx),
             actor_parent_token,
+            external_agents,
+            workspace_paths,
         }
     }
 

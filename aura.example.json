@@ -47,5 +47,16 @@
     "docker": {
       "enable": false
     }
+  },
+  "external_agents": {
+    "claude": {
+      "enabled": false,
+      "binary_path": null
+    },
+    "codex": {
+      "enabled": false,
+      "binary_path": null
+    },
+    "default_external_agent": null
   }
 }

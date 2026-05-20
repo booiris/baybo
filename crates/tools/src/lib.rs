@@ -110,11 +110,11 @@ pub struct ToolContext {
     pub workspace_paths: WorkspacePaths,
     pub sandbox: Option<Arc<dyn ExecSandbox>>,
     /// Mid-execution approval handle. Tools that decide which resources
-    /// they will touch only after some internal work (e.g. CodeBuilder
-    /// runs an LLM to draft the program before knowing what files it
-    /// will read or whether it needs network) prompt the user through
-    /// this handle. `None` means the executor did not wire one in;
-    /// callers must fail-closed.
+    /// they will touch only after some internal work (e.g. one that
+    /// runs an LLM to draft a program before knowing what files it will
+    /// read or whether it needs network) prompt the user through this
+    /// handle. `None` means the executor did not wire one in; callers
+    /// must fail-closed.
     pub approval: Option<ApprovalHandle>,
     /// Side-channel to surface non-fatal verdicts (warnings, blocks)
     /// to the user channel without going through the LLM-visible tool

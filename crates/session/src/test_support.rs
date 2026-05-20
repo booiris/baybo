@@ -269,7 +269,7 @@ impl SessionStore for MemorySessionStore {
         session_id: &SessionId,
         before_ordinal: Option<i64>,
         limit: usize,
-    ) -> Result<Vec<(i64, ChatMessage)>> {
+    ) -> Result<Vec<(i64, DateTime<Utc>, ChatMessage)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -290,7 +290,7 @@ impl SessionStore for MemorySessionStore {
                 active
                     .into_iter()
                     .skip(skip)
-                    .map(|m| (m.ordinal as i64, m.message.clone()))
+                    .map(|m| (m.ordinal as i64, m.created_at, m.message.clone()))
                     .collect()
             })
             .unwrap_or_default())

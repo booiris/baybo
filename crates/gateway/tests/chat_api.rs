@@ -15,6 +15,7 @@ use aura_config::ChannelsConfig;
 use aura_gateway::auth::WEB_CLIENT_LABEL_PREFIX;
 use aura_gateway::channel::boot;
 use aura_gateway::test_support::build_test_deps;
+use aura_model::{ChatMessage, ContentBlock, Role, SessionId};
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
@@ -104,12 +105,24 @@ async fn chat_api_round_trip() {
         "new token must be live after refresh",
     );
 
-    // ── 5. Slash manifest is non-empty ──────────────────────────────
+    // ── 5. Slash manifest exposes /compact but hides /new ───────────
     let manifest = get(&router, "/v1/chat/slash-manifest", StatusCode::OK).await;
     let manifest_items = manifest["items"].as_array().expect("items");
     assert!(
         !manifest_items.is_empty(),
         "/v1/chat/slash-manifest exposes the gateway's slash commands",
+    );
+    let commands: Vec<&str> = manifest_items
+        .iter()
+        .map(|c| c["command"].as_str().expect("command"))
+        .collect();
+    assert!(
+        commands.contains(&"compact"),
+        "manifest must advertise /compact, got {commands:?}",
+    );
+    assert!(
+        !commands.contains(&"new"),
+        "web composer should not see /new — it has a 'New chat' button instead, got {commands:?}",
     );
 
     // ── 6. DELETE hides — row + token both stay live ────────────────
@@ -271,6 +284,199 @@ async fn get(router: &axum::Router, uri: &str, expected: StatusCode) -> Value {
         .await
         .expect("body bytes");
     serde_json::from_slice(&bytes).expect("response is json")
+}
+
+// Sidebar preview: `list_sessions` must surface each session's most
+// recent user-authored text under `last_user_text`, with multi-line
+// content collapsed to a single line. The web client uses this as the
+// row label and drops it on `null` for sessions that have no user
+// turn yet — both branches are exercised here.
+#[tokio::test]
+async fn list_sessions_exposes_last_user_text_preview() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    // Two sessions: the first will get a transcript, the second stays
+    // empty so the response covers the "no user turn yet" branch.
+    let with_text = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let with_text_id = with_text["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    let empty = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let empty_id = empty["session_id"].as_str().expect("session_id").to_owned();
+
+    // Append two user turns + an interleaved assistant turn — the
+    // preview must surface the *latest* user message and reach past
+    // any trailing assistant row that landed on top of it.
+    let sid = SessionId::from(with_text_id.as_str());
+    let rows: &[ChatMessage] = &[
+        ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("first ask".into())],
+            from_user: true,
+        },
+        ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text("first reply".into())],
+            from_user: false,
+        },
+        ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("second\nask\nwith   newlines".into())],
+            from_user: true,
+        },
+        ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text("second reply".into())],
+            from_user: false,
+        },
+    ];
+    for msg in rows {
+        tg.deps
+            .session_manager
+            .append_session_message(&sid, msg)
+            .await
+            .expect("append");
+    }
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let items = list["items"].as_array().expect("items");
+    let with_row = items
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(with_text_id.as_str()))
+        .expect("with-text row");
+    assert_eq!(
+        with_row["last_user_text"].as_str(),
+        Some("second ask with newlines"),
+        "preview must surface the latest user turn with collapsed whitespace, got {with_row:?}",
+    );
+    let empty_row = items
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(empty_id.as_str()))
+        .expect("empty row");
+    assert!(
+        empty_row.get("last_user_text").is_none() || empty_row["last_user_text"].is_null(),
+        "empty session has no preview, got {empty_row:?}",
+    );
+}
+
+// Cron-spawned sessions are filtered out of `GET /v1/chat/sessions` so
+// the operator's chat sidebar isn't buried under background fires;
+// they instead surface via `GET /v1/chat/cron-messages`. The opt-in
+// `?include_cron=true` query restores them for parity with
+// `include_hidden`.
+#[tokio::test]
+async fn cron_sessions_split_into_dedicated_endpoint() {
+    use aura_model::{ChannelType, TriggerSource, User};
+
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let user_cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let user_id = user_cred["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+
+    let cron_session = tg
+        .deps
+        .session_manager
+        .create_session_with_trigger(
+            User {
+                id: "operator".into(),
+                name: None,
+                channel: ChannelType::http(),
+            },
+            ChannelType::http(),
+            TriggerSource::Cron {
+                cron_job_id: "cj-test".into(),
+            },
+        )
+        .await
+        .expect("create cron session");
+    let cron_id = cron_session.id.to_string();
+
+    let cron_rows: &[ChatMessage] = &[
+        ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("[cron:cj-test] morning brief".into())],
+            from_user: true,
+        },
+        ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text("daily summary\nready".into())],
+            from_user: false,
+        },
+    ];
+    for msg in cron_rows {
+        tg.deps
+            .session_manager
+            .append_session_message(&cron_session.id, msg)
+            .await
+            .expect("append cron row");
+    }
+
+    let list = get(&router, "/v1/chat/sessions", StatusCode::OK).await;
+    let items = list["items"].as_array().expect("items");
+    assert!(
+        items
+            .iter()
+            .any(|row| row["session_id"].as_str() == Some(user_id.as_str())),
+        "user session must show up in default list",
+    );
+    assert!(
+        items
+            .iter()
+            .all(|row| row["session_id"].as_str() != Some(cron_id.as_str())),
+        "cron session must be hidden from default chat list, got {items:?}",
+    );
+
+    let list_inc = get(
+        &router,
+        "/v1/chat/sessions?include_cron=true",
+        StatusCode::OK,
+    )
+    .await;
+    let items_inc = list_inc["items"].as_array().expect("items");
+    assert!(
+        items_inc
+            .iter()
+            .any(|row| row["session_id"].as_str() == Some(cron_id.as_str())),
+        "include_cron=true must bring cron sessions back",
+    );
+
+    let inbox = get(&router, "/v1/chat/cron-messages", StatusCode::OK).await;
+    let inbox_items = inbox["items"].as_array().expect("items");
+    let cron_row = inbox_items
+        .iter()
+        .find(|row| row["session_id"].as_str() == Some(cron_id.as_str()))
+        .expect("cron inbox should surface the cron session");
+    assert_eq!(cron_row["cron_job_id"].as_str(), Some("cj-test"));
+    assert_eq!(
+        cron_row["prompt"].as_str(),
+        Some("morning brief"),
+        "prompt must strip the `[cron:<id>] ` routing prefix",
+    );
+    assert_eq!(
+        cron_row["response"].as_str(),
+        Some("daily summary ready"),
+        "response must collapse to a single-line preview",
+    );
+    assert!(
+        inbox_items
+            .iter()
+            .all(|row| row["session_id"].as_str() != Some(user_id.as_str())),
+        "cron inbox must not contain user-triggered sessions",
+    );
 }
 
 // Channel kind sanity: every kind the boot path declares must match

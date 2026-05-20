@@ -288,6 +288,13 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_subagent_results: Vec<crate::spawn_protocol::PendingSubagentResult>,
 
+    /// Which backend created this subagent session, plus (for
+    /// External) the agent's `workspace_dir` and `resume_key`.
+    /// `None` for non-subagent sessions (top-level user, cron,
+    /// maintenance) and for pre-tag subagent rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_backend: Option<crate::SubagentBackendTag>,
+
     /// Reserved extension fields for plugins and experiments.
     #[serde(default)]
     pub extra: HashMap<String, Value>,

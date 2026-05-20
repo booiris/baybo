@@ -10,6 +10,7 @@ import { useMockMode, MOCK_TRACE_SUMMARIES } from '../api/mock';
 
 type TraceSessionSummary = components['schemas']['TraceSessionSummary'];
 type JobStatusKind = components['schemas']['JobStatusKind'];
+type SessionKind = components['schemas']['SessionKind'];
 
 const PAGE_SIZE_OPTIONS = [20, 50, 100];
 const DEFAULT_PAGE_SIZE = 20;
@@ -28,6 +29,14 @@ const STATUS_OPTIONS: { value: 'all' | JobStatusKind; label: string }[] = [
   { value: 'cancelled', label: 'Cancelled' },
 ];
 
+const KIND_OPTIONS: { value: 'all' | SessionKind; label: string }[] = [
+  { value: 'all', label: 'All Kinds' },
+  { value: 'user', label: 'User' },
+  { value: 'subagent', label: 'Subagent' },
+  { value: 'cron', label: 'Cron' },
+  { value: 'compression', label: 'Compression' },
+];
+
 const STATUS_BADGE_CLASS: Record<JobStatusKind, string> = {
   pending: 'bg-gray-200 text-ink border-ink',
   in_progress: 'bg-info text-white',
@@ -35,6 +44,20 @@ const STATUS_BADGE_CLASS: Record<JobStatusKind, string> = {
   completed: 'bg-ok text-white',
   failed: 'bg-err text-white',
   cancelled: 'bg-gray-300 text-ink border-ink-soft',
+};
+
+const KIND_BADGE_CLASS: Record<SessionKind, string> = {
+  user: 'bg-white text-ink',
+  cron: 'bg-warn/15 text-warn',
+  compression: 'bg-gray-100 text-ink-soft',
+  subagent: 'bg-brand/10 text-brand',
+};
+
+const KIND_BADGE_LABEL: Record<SessionKind, string> = {
+  user: 'user',
+  cron: 'cron',
+  compression: 'compress',
+  subagent: 'subagent',
 };
 
 const ACTIVE_KINDS: JobStatusKind[] = ['pending', 'in_progress', 'stuck'];
@@ -65,6 +88,7 @@ function formatNumber(n: number): string {
 function applyMockFilters(
   rows: TraceSessionSummary[],
   status: 'all' | JobStatusKind,
+  kind: 'all' | SessionKind,
   query: string,
   since?: string,
   until?: string,
@@ -72,6 +96,9 @@ function applyMockFilters(
   let out = rows;
   if (status !== 'all') {
     out = out.filter((r) => r.latest_job_status?.kind === status);
+  }
+  if (kind !== 'all') {
+    out = out.filter((r) => r.kind === kind);
   }
   if (query) {
     const needle = query.toLowerCase();
@@ -86,6 +113,16 @@ function applyMockFilters(
     out = out.filter((r) => new Date(r.last_active).getTime() < t);
   }
   return out;
+}
+
+function KindBadge({ kind }: { kind: SessionKind }) {
+  return (
+    <span
+      className={`inline-flex items-center px-1.5 py-0.5 rounded-md text-[0.65rem] font-bold uppercase tracking-wider border-2 border-black ${KIND_BADGE_CLASS[kind]}`}
+    >
+      {KIND_BADGE_LABEL[kind]}
+    </span>
+  );
 }
 
 function StatusBadge({ status }: { status?: components['schemas']['JobStatus'] | null }) {
@@ -117,6 +154,7 @@ export function TracesPage() {
   const [filter, setFilter] = useState('');
   const [debouncedFilter, setDebouncedFilter] = useState('');
   const [status, setStatus] = useState<'all' | JobStatusKind>('all');
+  const [kind, setKind] = useState<'all' | SessionKind>('all');
   const [since, setSince] = useState<string>('');
   const [until, setUntil] = useState<string>('');
 
@@ -142,7 +180,7 @@ export function TracesPage() {
       return;
     }
     setOffset(0);
-  }, [debouncedFilter, status, pageSize, since, until]);
+  }, [debouncedFilter, status, kind, pageSize, since, until]);
 
   useEffect(() => {
     let canceled = false;
@@ -151,6 +189,7 @@ export function TracesPage() {
         const filtered = applyMockFilters(
           MOCK_TRACE_SUMMARIES,
           status,
+          kind,
           debouncedFilter.trim(),
           since || undefined,
           until || undefined,
@@ -169,6 +208,7 @@ export function TracesPage() {
         offset,
       };
       if (status !== 'all') query.status = status;
+      if (kind !== 'all') query.kind = kind;
       if (debouncedFilter.trim()) query.q = debouncedFilter.trim();
       if (since) query.since = new Date(since).toISOString();
       if (until) query.until = new Date(until).toISOString();
@@ -201,7 +241,19 @@ export function TracesPage() {
     return () => {
       canceled = true;
     };
-  }, [client, debouncedFilter, status, since, until, logout, offset, pageSize, refreshKey, isMock]);
+  }, [
+    client,
+    debouncedFilter,
+    status,
+    kind,
+    since,
+    until,
+    logout,
+    offset,
+    pageSize,
+    refreshKey,
+    isMock,
+  ]);
 
   // Smart polling: tick every ACTIVE_POLL_MS only when at least one
   // visible row is in a non-terminal state, and only while the tab is
@@ -295,6 +347,17 @@ export function TracesPage() {
             </option>
           ))}
         </SelectBox>
+        <SelectBox
+          value={kind}
+          onChange={(e) => setKind(e.target.value as 'all' | SessionKind)}
+          className="h-10 px-3"
+        >
+          {KIND_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
+            </option>
+          ))}
+        </SelectBox>
         <label className="flex items-center gap-2 text-[0.85rem] uppercase font-bold tracking-wider text-ink-soft">
           From
           <input
@@ -380,9 +443,12 @@ export function TracesPage() {
                       </div>
                     </td>
                     <td className={cell}>
-                      <code className="font-mono text-[0.9rem] break-all group-hover:text-brand">
-                        {row.session_id}
-                      </code>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <code className="font-mono text-[0.9rem] break-all group-hover:text-brand">
+                          {row.session_id}
+                        </code>
+                        <KindBadge kind={row.kind} />
+                      </div>
                       <div className="text-ink-soft text-[0.75rem] mt-1">
                         {row.job_count} {row.job_count === 1 ? 'job' : 'jobs'}
                       </div>

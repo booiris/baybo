@@ -1,4 +1,4 @@
-import { NavLink } from 'react-router-dom';
+import { Link, NavLink } from 'react-router-dom';
 import {
   RiAlarmLine,
   RiBarChartBoxLine,
@@ -60,14 +60,17 @@ export function Sidebar({ version }: { version?: string }) {
           <RiCpuLine className="text-xl" />
           LLM
         </NavLink>
-        <NavLink
-          to="/chat"
-          className={({ isActive }) => `${navItem} ${isActive ? navItemActive : ''}`}
-        >
-          <RiChat3Line className="text-xl" />
-          Chat
-        </NavLink>
       </nav>
+
+      <div className="px-3 py-3 border-t-2 border-black">
+        <Link
+          to="/chat"
+          className="w-full flex items-center justify-center gap-1.5 px-2 py-2 bg-brand text-white border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:bg-brand-hover active:translate-x-[2px] active:translate-y-[2px] active:shadow-none"
+        >
+          <RiChat3Line className="text-sm" />
+          Open Chat
+        </Link>
+      </div>
 
       <div className="px-3 py-2 border-t-2 border-black">
         <button

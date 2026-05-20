@@ -116,6 +116,18 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: LlmCmd,
     },
+    /// Manage external-agent backends (Claude Code, Codex) used by
+    /// `spawn_subagent(backend: ...)`. `setup` is an interactive
+    /// wizard that picks a kind, prompts for a binary path (empty
+    /// = $PATH lookup), runs an existence + version probe, then
+    /// persists the resulting `external_agents.<kind>.binary_path`
+    /// to `aura.json`. `status` lists each kind's current
+    /// configuration + offline probe result.
+    #[command(name = "external-agent")]
+    ExternalAgent {
+        #[command(subcommand)]
+        cmd: ExternalAgentCmd,
+    },
     /// Inspect chat sessions: `list` all sessions, `show <id>` for
     /// metadata + (when wired) execution-trace counts, `history <id>`
     /// for the conversation transcript (with
@@ -521,6 +533,18 @@ pub enum PairCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ExternalAgentCmd {
+    /// Show each external-agent kind's current config + an offline
+    /// re-probe result (binary path, version-check outcome). Pure
+    /// read — the running daemon's registry is unaffected.
+    Status,
+    /// Interactive wizard: pick a kind, prompt binary path (empty
+    /// = $PATH), run the probe, persist `external_agents.<kind>
+    /// .binary_path` to `aura.json` on success.
+    Setup,
 }
 
 #[derive(Debug, Subcommand)]

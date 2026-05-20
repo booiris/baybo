@@ -28,7 +28,9 @@
 //! [`crate::auth::AuthedClient::Web`].
 
 use aura_channels::wire::{SessionPatch, SlashCommandSpec};
-use aura_model::{ChannelType, ChatMessage, ContentBlock, Role, Session, SessionId, User};
+use aura_model::{
+    ChannelType, ChatMessage, ContentBlock, Role, Session, SessionId, TriggerSource, User,
+};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use chrono::{DateTime, Utc};
@@ -54,6 +56,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(unhide_session))
         .routes(routes!(refresh_session_token))
         .routes(routes!(slash_manifest))
+        .routes(routes!(list_cron_messages))
 }
 
 /// Query string for `GET /v1/chat/sessions`.
@@ -62,6 +65,12 @@ pub struct ListSessionsQuery {
     /// Include hidden sessions in the response. Defaults to false.
     #[serde(default)]
     pub include_hidden: bool,
+    /// Include cron-triggered sessions in the response. Defaults to
+    /// false so the chat sidebar stays free of background fires; the
+    /// dedicated `GET /v1/chat/cron-messages` endpoint surfaces those
+    /// in their own pane.
+    #[serde(default)]
+    pub include_cron: bool,
 }
 
 /// Default page size for reverse transcript pagination — large enough
@@ -71,6 +80,30 @@ pub const DEFAULT_HISTORY_LIMIT: usize = 50;
 /// Hard cap so a misbehaving (or curious) client can't ask for the
 /// whole transcript by passing `limit=999999`.
 pub const MAX_HISTORY_LIMIT: usize = 200;
+
+/// How far back to scan when fetching each session's sidebar preview.
+/// A typical conversation alternates user / assistant, so the most-
+/// recent user row is usually within the last couple of messages — but
+/// trailing assistant tool-only turns can push it further. Ten rows
+/// covers realistic shapes without paying a deep walk on long sessions.
+const PREVIEW_SCAN_DEPTH: usize = 10;
+
+/// Maximum length of the truncated preview the sidebar shows for each
+/// session. Sized to fit a 260px-wide sidebar row at the web client's
+/// font without wrapping; the client may truncate further with CSS.
+const PREVIEW_MAX_CHARS: usize = 120;
+
+/// Default page size for the cron-messages list. Tuned to roughly
+/// match what the right-side panel renders before the user scrolls.
+const DEFAULT_CRON_MESSAGE_LIMIT: usize = 50;
+/// Hard cap on the cron-messages list so a curious client can't ask
+/// the gateway to walk thousands of cron sessions in one shot.
+const MAX_CRON_MESSAGE_LIMIT: usize = 200;
+/// How deep to walk a cron session's transcript when extracting the
+/// prompt/response previews. Cron sessions are one-shot — a small
+/// constant covers the realistic shape (`[cron:..] prompt` followed by
+/// one or two assistant turns).
+const CRON_PREVIEW_SCAN_DEPTH: usize = 12;
 
 /// Query string for `GET /v1/chat/sessions/{session_id}`. Reverse-
 /// paginates the active transcript: the response carries the
@@ -131,6 +164,14 @@ pub struct ChatTranscriptItem {
     /// `true` when this row had non-text content (image / audio /
     /// file). The web client currently shows a placeholder.
     pub has_attachments: bool,
+    /// Wall-clock time the row was persisted, sourced from
+    /// `session_messages.created_at`. Lets the client render a
+    /// per-message timestamp without a second lookup. Live WS frames
+    /// don't carry this — the web client falls back to the receive
+    /// time for those, which is close enough for live emissions and
+    /// drifts only on catch-up replays (where the row is also
+    /// reachable via the REST history surface with the real value).
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -161,6 +202,14 @@ pub struct ChatSessionSummary {
     /// `include_hidden=true` was requested.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden: bool,
+    /// Preview text drawn from the session's most-recent user-authored
+    /// message, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar
+    /// renders this as the row label so users can scan past
+    /// conversations by what they last asked. `None` for sessions
+    /// without a user turn yet (a freshly-created row, or one whose
+    /// transcript holds only system/tool rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_user_text: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -170,6 +219,55 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatSessionsList {
     pub items: Vec<ChatSessionSummary>,
+}
+
+/// One entry in the cron-messages list. Each row corresponds to a
+/// distinct cron fire (cron creates a fresh session per trigger, so
+/// `session_id` uniquely identifies the fire). The chat surface
+/// surfaces these in a right-side notification pane rather than the
+/// main sidebar so unattended cron output doesn't bury user-driven
+/// conversations.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatCronMessage {
+    /// The session created for this cron fire. Reuse against
+    /// `/v1/chat/sessions/{id}` to drill into the full transcript.
+    pub session_id: String,
+    /// Cron job that produced this fire. Stable across fires of the
+    /// same job; missing in the (theoretically impossible) case of a
+    /// trigger without a job id.
+    pub cron_job_id: String,
+    /// When the cron session was created — the actual fire time, to
+    /// within scheduler tick precision.
+    pub fired_at: DateTime<Utc>,
+    /// Latest activity timestamp on the session. Lets the panel sort
+    /// by "freshest" without the client having to fetch transcripts.
+    pub last_active: DateTime<Utc>,
+    /// The user-facing prompt for this fire. Truncated to
+    /// [`PREVIEW_MAX_CHARS`]. The persisted user row carries a
+    /// `[cron:<job>] <prompt>` prefix; this strips the prefix so the
+    /// panel doesn't redundantly re-show what the cron job already
+    /// has.
+    pub prompt: String,
+    /// Latest assistant text — what the agent produced in response.
+    /// `None` while the fire is still running or if the agent emitted
+    /// only tool calls / attachments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatCronMessagesList {
+    pub items: Vec<ChatCronMessage>,
+}
+
+/// Query string for `GET /v1/chat/cron-messages`.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct ListCronMessagesQuery {
+    /// Maximum number of cron messages to return. Defaults to
+    /// [`DEFAULT_CRON_MESSAGE_LIMIT`], clamped to
+    /// [`MAX_CRON_MESSAGE_LIMIT`].
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// Wire DTO for slash command entries. Mirror of
@@ -256,14 +354,35 @@ async fn list_sessions(
         .list_by_channel(&ChannelType::http())
         .await
         .map_err(|e| GatewayError::Internal(format!("list sessions: {e}")))?;
-    let items: Vec<ChatSessionSummary> = scoped
+    let visible: Vec<Session> = scoped
         .into_iter()
         .filter(|s| query.include_hidden || !s.hidden)
-        .map(|s| ChatSessionSummary {
+        .filter(|s| query.include_cron || !is_cron_triggered(s))
+        .collect();
+    // Fan out the per-session preview fetch — each row needs its own
+    // reverse-tail walk against `session_messages`, which is cheap
+    // individually (back-of-the-index walk capped at
+    // `PREVIEW_SCAN_DEPTH` rows) but adds up serially when a tab has
+    // dozens of conversations open. `join_all` runs the libsql queries
+    // concurrently against the shared connection pool. A preview that
+    // fails to load is dropped to `None` rather than failing the whole
+    // list — the sidebar still renders the row, just without a
+    // preview, and the next list refresh will retry.
+    let previews = futures::future::join_all(visible.iter().map(|s| {
+        let manager = state.session_manager.clone();
+        let sid = s.id.clone();
+        async move { last_user_preview(&manager, &sid).await }
+    }))
+    .await;
+    let items: Vec<ChatSessionSummary> = visible
+        .into_iter()
+        .zip(previews)
+        .map(|(s, last_user_text)| ChatSessionSummary {
             session_id: s.id.to_string(),
             created_at: s.created_at,
             last_active: s.last_active,
             hidden: s.hidden,
+            last_user_text,
         })
         .collect();
     Ok(Json(ChatSessionsList { items }))
@@ -325,7 +444,7 @@ async fn get_session(
     // WS-replayed one agree on what's a user-visible bubble.
     let transcript = tail
         .into_iter()
-        .filter_map(|(ordinal, msg)| chat_to_transcript_item(ordinal, msg))
+        .filter_map(|(ordinal, created_at, msg)| chat_to_transcript_item(ordinal, created_at, msg))
         .collect();
     Ok(Json(ChatSessionDetail {
         session_id,
@@ -439,6 +558,53 @@ async fn refresh_session_token(
 
 #[utoipa::path(
     get,
+    path = "/chat/cron-messages",
+    tag = "chat",
+    params(ListCronMessagesQuery),
+    responses(
+        (status = 200, description = "Cron-triggered http sessions with prompt + agent response previews, newest fire first", body = ChatCronMessagesList),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
+async fn list_cron_messages(
+    State(state): State<AdminState>,
+    Query(query): Query<ListCronMessagesQuery>,
+) -> Result<Json<ChatCronMessagesList>> {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_CRON_MESSAGE_LIMIT)
+        .clamp(1, MAX_CRON_MESSAGE_LIMIT);
+    let scoped = state
+        .session_manager
+        .list_by_channel(&ChannelType::http())
+        .await
+        .map_err(|e| GatewayError::Internal(format!("list cron messages: {e}")))?;
+    // `list_by_channel` already returns rows ordered by `last_active`
+    // desc; the filter preserves order so the take(limit) below is the
+    // freshest N cron fires.
+    let cron_sessions: Vec<Session> = scoped
+        .into_iter()
+        .filter(|s| !s.hidden)
+        .filter_map(|s| match &s.trigger {
+            TriggerSource::Cron { cron_job_id } if !cron_job_id.is_empty() => Some(s),
+            _ => None,
+        })
+        .take(limit)
+        .collect();
+    let manager = state.session_manager.clone();
+    let items = futures::future::join_all(cron_sessions.into_iter().map(|s| {
+        let manager = manager.clone();
+        async move { cron_message_from_session(&manager, s).await }
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+    Ok(Json(ChatCronMessagesList { items }))
+}
+
+#[utoipa::path(
+    get,
     path = "/chat/slash-manifest",
     tag = "chat",
     responses(
@@ -451,10 +617,18 @@ async fn slash_manifest(
 ) -> Result<Json<ListResponse<SlashCommandEntry>>> {
     let items = crate::channel::slash::manifest()
         .into_iter()
+        .filter(|c| !WEB_HIDDEN_SLASH_COMMANDS.contains(&c.command.as_str()))
         .map(SlashCommandEntry::from)
         .collect();
     Ok(Json(ListResponse::new(items)))
 }
+
+/// Slash commands the gateway dispatcher owns for sidecars but the web
+/// composer should NOT advertise. `/new` is a sidecar affordance for
+/// resetting a session over a chat surface that has no UI — the web
+/// already exposes a "New chat" button, so listing it in the slash
+/// palette is just clutter.
+const WEB_HIDDEN_SLASH_COMMANDS: &[&str] = &["new"];
 
 // ── helpers ──────────────────────────────────────────────────────────
 
@@ -543,7 +717,136 @@ pub(crate) fn broadcast_session_patch(
     }
 }
 
-fn chat_to_transcript_item(ordinal: i64, msg: ChatMessage) -> Option<ChatTranscriptItem> {
+/// Fetch the most-recent user-authored text for `session_id` and shape
+/// it into the sidebar preview the list endpoint serves. Returns
+/// `None` when the session has no user turn yet, when the user turn's
+/// content is media-only, or when the underlying tail query fails —
+/// the sidebar treats all three as "no preview" rather than surfacing
+/// an error, so a single bad row never breaks the whole list. Walks
+/// at most [`PREVIEW_SCAN_DEPTH`] rows back; deeper user turns
+/// (e.g. a session whose recent activity is purely tool churn) fall
+/// off the window and are accepted as missing rather than chased.
+fn is_cron_triggered(session: &Session) -> bool {
+    matches!(session.trigger, TriggerSource::Cron { .. })
+}
+
+/// Walk a cron session's tail to extract the prompt + freshest
+/// assistant response. Returns `None` only when the walk itself fails;
+/// a fire that's still running (no assistant turn yet) returns the
+/// prompt with `response = None`, and a fire with no decodable rows
+/// at all surfaces empty strings so the panel still pins the
+/// timestamp instead of silently dropping the row.
+async fn cron_message_from_session(
+    manager: &aura_session::SessionManager,
+    session: Session,
+) -> Option<ChatCronMessage> {
+    let cron_job_id = match &session.trigger {
+        TriggerSource::Cron { cron_job_id } => cron_job_id.clone(),
+        _ => return None,
+    };
+    let tail = manager
+        .history_tail(&session.id, None, CRON_PREVIEW_SCAN_DEPTH)
+        .await
+        .ok()?;
+    let mut prompt: Option<String> = None;
+    let mut response: Option<String> = None;
+    // `history_tail` returns ascending; the cron prompt is the first
+    // user row (oldest) and the assistant response is the freshest
+    // assistant row (newest). Walk forward for the prompt; walk in
+    // reverse for the response so we land on the last assistant turn
+    // even when the agent emitted multiple.
+    for (_ord, _at, msg) in &tail {
+        if matches!(msg.role, Role::User) && msg.from_user {
+            prompt = Some(strip_cron_prefix(&extract_text(&msg.content)));
+            break;
+        }
+    }
+    for (_ord, _at, msg) in tail.iter().rev() {
+        if matches!(msg.role, Role::Assistant) {
+            let text = extract_text(&msg.content);
+            if !text.is_empty() {
+                response = Some(truncate_preview(&text));
+                break;
+            }
+        }
+    }
+    Some(ChatCronMessage {
+        session_id: session.id.to_string(),
+        cron_job_id,
+        fired_at: session.created_at,
+        last_active: session.last_active,
+        prompt: prompt.map(|p| truncate_preview(&p)).unwrap_or_default(),
+        response,
+    })
+}
+
+fn extract_text(content: &[ContentBlock]) -> String {
+    let mut text = String::new();
+    for block in content {
+        if let ContentBlock::Text(t) = block {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(t);
+        }
+    }
+    text
+}
+
+/// The cron dispatcher synthesises `[cron:<job_id>] <prompt>` content
+/// before the agent loop sees it (see `AgentActor::dispatch_prompt`).
+/// Strip that wire prefix here so the panel renders the original
+/// prompt the user (or LLM) configured, not the routing tag.
+fn strip_cron_prefix(text: &str) -> String {
+    text.strip_prefix("[cron:")
+        .and_then(|rest| rest.find(']').map(|end| &rest[end + 1..]))
+        .map(|s| s.trim_start().to_owned())
+        .unwrap_or_else(|| text.to_owned())
+}
+
+async fn last_user_preview(
+    manager: &aura_session::SessionManager,
+    session_id: &SessionId,
+) -> Option<String> {
+    let tail = manager
+        .history_tail(session_id, None, PREVIEW_SCAN_DEPTH)
+        .await
+        .ok()?;
+    // `history_tail` returns ascending; iterate in reverse so we hit
+    // the freshest user row first and stop scanning the moment we
+    // find it.
+    for (_ord, created_at, msg) in tail.into_iter().rev() {
+        if !matches!(msg.role, Role::User) || !msg.from_user {
+            continue;
+        }
+        let item = chat_to_transcript_item(0, created_at, msg)?;
+        if item.text.is_empty() {
+            return None;
+        }
+        return Some(truncate_preview(&item.text));
+    }
+    None
+}
+
+/// Collapse whitespace and clip to [`PREVIEW_MAX_CHARS`] for the
+/// sidebar preview. Newlines and runs of spaces would render as a
+/// single line in the sidebar's truncating row anyway, so we collapse
+/// them here rather than ship the raw multi-line text just to have
+/// the client throw the structure away.
+fn truncate_preview(text: &str) -> String {
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= PREVIEW_MAX_CHARS {
+        return collapsed;
+    }
+    let cut: String = collapsed.chars().take(PREVIEW_MAX_CHARS).collect();
+    format!("{cut}…")
+}
+
+fn chat_to_transcript_item(
+    ordinal: i64,
+    created_at: DateTime<Utc>,
+    msg: ChatMessage,
+) -> Option<ChatTranscriptItem> {
     // Same gate as `channel::route::chat_to_visible_wire_message` —
     // see that fn for why each excluded variant doesn't belong on the
     // chat surface.
@@ -581,5 +884,6 @@ fn chat_to_transcript_item(ordinal: i64, msg: ChatMessage) -> Option<ChatTranscr
         role: role.to_owned(),
         text,
         has_attachments,
+        created_at,
     })
 }

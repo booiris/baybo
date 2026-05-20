@@ -837,6 +837,39 @@ pub struct LogsResponse {
 
 // ── Trace session summary (list view) ───────────────────────────────
 
+/// Wire mirror of [`aura_query::SessionKind`]. Coarse trigger/lineage
+/// label for the trace browser list view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    User,
+    Cron,
+    Compression,
+    Subagent,
+}
+
+impl From<aura_query::SessionKind> for SessionKind {
+    fn from(v: aura_query::SessionKind) -> Self {
+        match v {
+            aura_query::SessionKind::User => Self::User,
+            aura_query::SessionKind::Cron => Self::Cron,
+            aura_query::SessionKind::Compression => Self::Compression,
+            aura_query::SessionKind::Subagent => Self::Subagent,
+        }
+    }
+}
+
+impl From<SessionKind> for aura_query::SessionKind {
+    fn from(v: SessionKind) -> Self {
+        match v {
+            SessionKind::User => Self::User,
+            SessionKind::Cron => Self::Cron,
+            SessionKind::Compression => Self::Compression,
+            SessionKind::Subagent => Self::Subagent,
+        }
+    }
+}
+
 /// `GET /v1/traces` query params. All fields are optional; `None`
 /// removes that constraint.
 #[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
@@ -854,6 +887,10 @@ pub struct TracesListQuery {
     /// Case-insensitive substring on session id.
     #[serde(default)]
     pub q: Option<String>,
+    /// Filter on coarse trigger/lineage label. `compression` opts into
+    /// background-maintenance sessions that the default list hides.
+    #[serde(default)]
+    pub kind: Option<SessionKind>,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
@@ -872,6 +909,7 @@ pub struct TraceSessionSummary {
     /// if the policy ever flips).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_job_status: Option<JobStatus>,
+    pub kind: SessionKind,
     pub job_count: usize,
     pub span_count: usize,
     pub input_tokens: usize,
@@ -887,6 +925,7 @@ impl From<aura_query::SessionSummary> for TraceSessionSummary {
             created_at: v.created_at,
             last_active: v.last_active,
             latest_job_status: v.latest_job_status.map(Into::into),
+            kind: v.kind.into(),
             job_count: v.job_count,
             span_count: v.span_count,
             input_tokens: v.input_tokens,

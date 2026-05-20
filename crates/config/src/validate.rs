@@ -248,6 +248,48 @@ fn validate_gateway(gateway: &GatewayConfig, errors: &mut Vec<ValidationError>) 
 fn validate_cross_section(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
     validate_encryption_key_source(&config.security, errors);
     validate_default_llm(config, errors);
+    validate_default_external_agent(config, errors);
+}
+
+fn validate_default_external_agent(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
+    let enabled = config.external_agents.enabled_kinds();
+    match (
+        enabled.len(),
+        &config.external_agents.default_external_agent,
+    ) {
+        // Zero or one enabled: default is optional. Single enabled
+        // kind is implicitly the default.
+        (0 | 1, _) => {}
+        (_, Some(d)) => {
+            if !enabled.contains(d) {
+                let joined = enabled
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                errors.push(ValidationError::new(
+                    "external_agents.default_external_agent",
+                    format!(
+                        "{:?} is not among the enabled external agents [{joined}]",
+                        d.as_str(),
+                    ),
+                ));
+            }
+        }
+        (_, None) => {
+            let joined = enabled
+                .iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            errors.push(ValidationError::new(
+                "external_agents.default_external_agent",
+                format!(
+                    "multiple external agents are enabled ([{joined}]); set `default_external_agent` to one of them",
+                ),
+            ));
+        }
+    }
 }
 
 fn validate_default_llm(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
@@ -272,7 +314,7 @@ fn validate_default_llm(config: &AuraConfig, errors: &mut Vec<ValidationError>) 
         ));
         return;
     }
-    if !config.llm.iter().any(|e| e.name == config.default_llm) {
+    if config.llm.iter().all(|e| e.name != config.default_llm) {
         errors.push(ValidationError::new(
             "default-llm",
             format!(

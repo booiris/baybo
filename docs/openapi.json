@@ -120,6 +120,51 @@
         }
       }
     },
+    "/v1/chat/cron-messages": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "list_cron_messages",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of cron messages to return. Defaults to\n[`DEFAULT_CRON_MESSAGE_LIMIT`], clamped to\n[`MAX_CRON_MESSAGE_LIMIT`].",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cron-triggered http sessions with prompt + agent response previews, newest fire first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatCronMessagesList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions": {
       "get": {
         "tags": [
@@ -131,6 +176,15 @@
             "name": "include_hidden",
             "in": "query",
             "description": "Include hidden sessions in the response. Defaults to false.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "include_cron",
+            "in": "query",
+            "description": "Include cron-triggered sessions in the response. Defaults to\nfalse so the chat sidebar stays free of background fires; the\ndedicated `GET /v1/chat/cron-messages` endpoint surfaces those\nin their own pane.",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -2074,6 +2128,15 @@
             }
           },
           {
+            "name": "kind",
+            "in": "query",
+            "description": "Filter on coarse trigger/lineage label. `compression` opts into\nbackground-maintenance sessions that the default list hides.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SessionKind"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
             "required": false,
@@ -2126,7 +2189,7 @@
           {
             "name": "session_id",
             "in": "path",
-            "description": "Session id whose trace to export",
+            "description": "Session id whose trace overview to fetch",
             "required": true,
             "schema": {
               "type": "string"
@@ -2135,7 +2198,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Per-session trace tree: jobs, their steps, and the spans under each step. Untyped JSON to keep the admin surface decoupled from internal trace crate changes.",
+            "description": "Per-session trace overview: session_messages log + job summaries (no step/span data). Untyped JSON to keep the admin surface decoupled from internal trace crate changes.",
             "content": {
               "application/json": {
                 "schema": {}
@@ -2154,6 +2217,74 @@
           },
           "404": {
             "description": "No trace for that session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/traces/{session_id}/jobs/{job_id}": {
+      "get": {
+        "tags": [
+          "traces"
+        ],
+        "operationId": "get_job_trace",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id this job belongs to (or inherits from); used for route scoping only",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Job id whose step/span tree to fetch",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64 }` (Persisted) or `ChatMessage[]` (Inline); the client slices the message log it received from the overview call.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid job id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such job",
             "content": {
               "application/json": {
                 "schema": {
@@ -2324,6 +2455,62 @@
         "type": "string",
         "description": "Admin-surface mirror of [`aura_model::ChannelType`]. Transparent\nwrapper around a snake_case string so the OpenAPI surface stays\nstable while the core type is open-ended (runtime-registered\nsidecars like `\"slack\"` pass through unchanged)."
       },
+      "ChatCronMessage": {
+        "type": "object",
+        "description": "One entry in the cron-messages list. Each row corresponds to a\ndistinct cron fire (cron creates a fresh session per trigger, so\n`session_id` uniquely identifies the fire). The chat surface\nsurfaces these in a right-side notification pane rather than the\nmain sidebar so unattended cron output doesn't bury user-driven\nconversations.",
+        "required": [
+          "session_id",
+          "cron_job_id",
+          "fired_at",
+          "last_active",
+          "prompt"
+        ],
+        "properties": {
+          "cron_job_id": {
+            "type": "string",
+            "description": "Cron job that produced this fire. Stable across fires of the\nsame job; missing in the (theoretically impossible) case of a\ntrigger without a job id."
+          },
+          "fired_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the cron session was created — the actual fire time, to\nwithin scheduler tick precision."
+          },
+          "last_active": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Latest activity timestamp on the session. Lets the panel sort\nby \"freshest\" without the client having to fetch transcripts."
+          },
+          "prompt": {
+            "type": "string",
+            "description": "The user-facing prompt for this fire. Truncated to\n[`PREVIEW_MAX_CHARS`]. The persisted user row carries a\n`[cron:<job>] <prompt>` prefix; this strips the prefix so the\npanel doesn't redundantly re-show what the cron job already\nhas."
+          },
+          "response": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Latest assistant text — what the agent produced in response.\n`None` while the fire is still running or if the agent emitted\nonly tool calls / attachments."
+          },
+          "session_id": {
+            "type": "string",
+            "description": "The session created for this cron fire. Reuse against\n`/v1/chat/sessions/{id}` to drill into the full transcript."
+          }
+        }
+      },
+      "ChatCronMessagesList": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatCronMessage"
+            }
+          }
+        }
+      },
       "ChatSessionCredential": {
         "type": "object",
         "description": "Response from `POST /v1/chat/sessions` and the\n`POST /v1/chat/sessions/:id/token` token-refresh endpoint. Carries\nthe freshly-minted channel-token the web client presents on its\n`/v1/channel-ws` upgrade via the\n[`CHANNEL_TOKEN_HEADER`](crate::auth::CHANNEL_TOKEN_HEADER) header\n(or the `?token=` query when the browser's WebSocket API can't set\ncustom headers — which it never can).",
@@ -2405,6 +2592,13 @@
             "type": "string",
             "format": "date-time"
           },
+          "last_user_text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Preview text drawn from the session's most-recent user-authored\nmessage, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar\nrenders this as the row label so users can scan past\nconversations by what they last asked. `None` for sessions\nwithout a user turn yet (a freshly-created row, or one whose\ntranscript holds only system/tool rows)."
+          },
           "session_id": {
             "type": "string"
           }
@@ -2431,9 +2625,15 @@
           "ordinal",
           "role",
           "text",
-          "has_attachments"
+          "has_attachments",
+          "created_at"
         ],
         "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Wall-clock time the row was persisted, sourced from\n`session_messages.created_at`. Lets the client render a\nper-message timestamp without a second lookup. Live WS frames\ndon't carry this — the web client falls back to the receive\ntime for those, which is close enough for live emissions and\ndrifts only on catch-up replays (where the row is also\nreachable via the REST history surface with the real value)."
+          },
           "has_attachments": {
             "type": "boolean",
             "description": "`true` when this row had non-text content (image / audio /\nfile). The web client currently shows a placeholder."
@@ -3274,6 +3474,16 @@
           }
         }
       },
+      "SessionKind": {
+        "type": "string",
+        "description": "Wire mirror of [`aura_query::SessionKind`]. Coarse trigger/lineage\nlabel for the trace browser list view.",
+        "enum": [
+          "user",
+          "cron",
+          "compression",
+          "subagent"
+        ]
+      },
       "SetConfigRequest": {
         "type": "object",
         "description": "`PUT /v1/config` body.",
@@ -3377,6 +3587,7 @@
           "session_id",
           "created_at",
           "last_active",
+          "kind",
           "job_count",
           "span_count",
           "input_tokens",
@@ -3404,6 +3615,9 @@
           "job_count": {
             "type": "integer",
             "minimum": 0
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SessionKind"
           },
           "last_active": {
             "type": "string",

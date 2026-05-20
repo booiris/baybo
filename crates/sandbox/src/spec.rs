@@ -13,7 +13,7 @@ pub struct SandboxSpec {
     pub readable_paths: Vec<PathBuf>,
     /// Extra host paths the child may read **and** write through. The
     /// workspace bind is always RW; this list is for opt-in writes
-    /// outside the workspace (e.g. a CodeBuilder script writing a
+    /// outside the workspace (e.g. a sandboxed script writing a
     /// rendered artefact into a project directory the agent owns). Each
     /// entry mounts at the same path inside the sandbox.
     #[serde(default)]
@@ -65,8 +65,9 @@ pub fn default_sensitive_denylist(home: Option<&Path>, aura_state: Option<&Path>
 ///
 /// `Workspace` (default) is the historical "deny by default" model:
 /// only `workspace_root`, `readable_paths`, and `writable_paths` are
-/// visible. CodeBuilder uses this to keep LLM-generated scripts
-/// blast-radius-zero.
+/// visible. No tool ships this in production today; the variant is
+/// retained for future per-call deny-by-default tools (e.g. an
+/// LLM-generated script runner that wants blast-radius-zero).
 ///
 /// `Permissive` widens that scope by *one extra RW root* — typically
 /// the user's `$HOME` — alongside `workspace_root`. FHS roots

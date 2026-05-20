@@ -6,6 +6,7 @@
 
 mod browser;
 mod channel;
+mod external_agents;
 mod llm;
 
 pub use browser::{BrowserStepOutcome, configure_browser_step};
@@ -13,6 +14,7 @@ pub use channel::{
     ChannelStepOutcome, REGISTRATION_TIMEOUT, RegisteredBot, configure_channel_step,
     run_registration,
 };
+pub use external_agents::{ExternalAgentsStepOutcome, configure_external_agents_step};
 pub use llm::{LlmStepOutcome, configure_llm_step};
 
 use crate::error::Result;

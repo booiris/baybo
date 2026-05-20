@@ -180,10 +180,11 @@ its manifest:
   in-process inside the gateway and there is nothing for the runner
   to enforce).
 
-CodeBuilder is **not** an `ExecCommand` tool — it constructs its own
-`SandboxSpec` directly with `FilesystemPolicy::Workspace` and
-`NetworkPolicy` driven by the plan, so the LLM-generated Python it
-runs stays workspace-bound regardless of the Bash policy here.
+`FilesystemPolicy::Workspace` (the historical "deny by default" model
+described below) currently has no production consumer — Bash is the
+only `ExecCommand` tool today and it always opts into `Permissive`.
+The variant remains on `SandboxSpec` for future tools that want a
+per-call deny-by-default scope (e.g. an LLM-driven script runner).
 
 `Http` is broad-allow when `SandboxSpec.allowed_hosts` is empty: the
 tool gets `--share-net` (Linux) / `--network bridge` (Docker) /
@@ -230,7 +231,8 @@ reach. When `allowed_hosts` is non-empty the runners diverge sharply:
 that don't set it inherit `FilesystemPolicy::Workspace` (backward
 compatible default).
 
-**`Workspace`** — the historical strict model used by CodeBuilder.
+**`Workspace`** — the historical strict model (no current production
+consumer; retained for future per-call deny-by-default tools).
 Only `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`, and
 `/run/systemd/resolve` are RO-bound (via `--ro-bind-try` so missing
 entries don't fail the call). `workspace_root` is the only RW host
@@ -320,16 +322,15 @@ section.
 `$TMPDIR` / `$TMP` / `$TEMP` are always set to the in-sandbox `/tmp`,
 but what `/tmp` actually points at depends on the filesystem policy:
 
-- **`Workspace`** (used by CodeBuilder): `/tmp` is a fresh per-call
-  scratch — `--tmpfs /tmp` on bwrap, `tempdir_in(workspace_root)` on
-  macOS with `TMPDIR` pointed at it. The macOS scratch dir is removed
+- **`Workspace`** (no current production consumer): `/tmp` is a fresh
+  per-call scratch — `--tmpfs /tmp` on bwrap, `tempdir_in(workspace_root)`
+  on macOS with `TMPDIR` pointed at it. The macOS scratch dir is removed
   when the call returns (best-effort — `kill -9` of the gateway
   leaves it behind, recognizable by the `.aura-sandbox-` prefix). The
   SBPL profile still denies writes to host `/tmp` / `/private/tmp`,
-  so a CodeBuilder script that ignores `$TMPDIR` and hardcodes `/tmp`
-  gets `EPERM` from the kernel on macOS; on Linux it writes into the
-  per-call tmpfs which is disposed on exit. Either way, nothing leaks
-  out of the call.
+  so a script that ignores `$TMPDIR` and hardcodes `/tmp` gets `EPERM`
+  from the kernel on macOS; on Linux it writes into the per-call tmpfs
+  which is disposed on exit. Either way, nothing leaks out of the call.
 
 - **`Permissive`** (used by `BashTool`): `/tmp` is the host's real
   `/tmp` — bwrap binds it with `--bind /tmp /tmp`; sandbox-exec adds

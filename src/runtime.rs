@@ -133,8 +133,8 @@ pub struct ManagerGraph {
     pub tool_registry: Arc<ToolRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
     /// Always already wrapped via `GuardedLlm` — every
-    /// consumer (main loop, side-LLM in tools, code_builder,
-    /// skill_assessor) shares the same budget gate. Constructed in
+    /// consumer (main loop, side-LLM in tools, skill_assessor)
+    /// shares the same budget gate. Constructed in
     /// [`build_managers`] so a new consumer added downstream can't
     /// accidentally pull a raw `Arc<LlmClient>` and bypass the gate;
     /// the type signature alone is enough to refuse a raw
@@ -213,6 +213,10 @@ pub async fn build_managers(
     let workspace_paths =
         aura_workspace::WorkspacePaths::new(std::path::PathBuf::from(&config.workspace.path));
     let workspace_root = workspace_paths.root().to_path_buf();
+    // Best-effort: warm the workspace-scoped uv python cache so the
+    // first agent-issued `python …` call doesn't stall on a cold
+    // cpython download. Runs detached; failure is logged and swallowed.
+    aura_tools::builtin::bash::spawn_uv_python_prewarm(&workspace_paths);
     let skill_registry = {
         let reg = Arc::new(SkillRegistry::new());
         let builtins = reg.register_builtins();
@@ -265,7 +269,7 @@ pub async fn build_managers(
     // child crashes), the LLM does not see `browser/*` tools at all.
     //
     // Built as a plain mutable up front so the registration steps
-    // below (cron, code-builder) can `register` directly. Wrapped in
+    // below (cron) can `register` directly. Wrapped in
     // `Arc` once all registrations are done — that way the "single
     // owner" invariant the registrations relied on is enforced by the
     // type system, not by an `Arc::get_mut().expect()` runtime check.
@@ -415,6 +419,18 @@ pub async fn build_managers(
         .await;
 
     let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
+
+    // Crash recovery: roll forward orphan trace rows (steps/spans left
+    // `Pending` because their `with_step` future was dropped before
+    // close) and the surrounding non-terminal jobs. `ended_at` is
+    // backfilled from observed activity, not boot wall-clock.
+    // Best-effort — errors warn but never block boot.
+    aura_agent::recovery::recover_orphaned_traces_and_jobs(
+        stores.trace.clone(),
+        Arc::clone(&job_lifecycle),
+    )
+    .await;
+
     // CostTracker has been retired in favour of a process-wide
     // --- cron scheduler (built before ToolExecutor so its tools register
     // while `tool_registry` still has a single Arc owner)
@@ -528,26 +544,6 @@ pub async fn build_managers(
             return Err(e.into());
         }
     };
-
-    // --- code-builder tool: needs the sandbox runner (to execute
-    // generated code under per-call caps) and the leak detector +
-    // vault so revealed tool args can be re-sanitized before they
-    // reach the nested planning LLM. The planner LLM is NOT captured
-    // here — CodeBuilder reads `ctx.llm` (per-call billed handle
-    // bound to the surrounding actor's current LLM) so a session
-    // pinned to a non-default model cascades into the planner. Skip
-    // registration if the sandbox is unavailable — CodeBuilder would
-    // refuse every call without it.
-    if let Some(runner) = sandbox_runner.as_ref() {
-        let (tool, manifest) = aura_code_builder::agent_tool(
-            Arc::clone(runner),
-            Arc::clone(&leak_detector),
-            Arc::clone(&secret_vault),
-        );
-        tool_registry.register(tool, manifest);
-    } else {
-        tracing::warn!("CodeBuilder tool not registered: OS sandbox unavailable");
-    }
 
     // Freeze the registry now that mutation is done; downstream
     // consumers (`tool_executor`, `McpReconciler`, the actor spawner)
@@ -707,9 +703,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
     // `cost_manager` and the guarded `llm_client` are both built in
     // `build_managers` and live on `graph` — every consumer (main
-    // loop, side-LLM in tools, code_builder, skill_assessor) shares
-    // the same gate. Re-binding here just to keep the local name
-    // changes below minimal.
+    // loop, side-LLM in tools, skill_assessor) shares the same gate.
+    // Re-binding here just to keep the local name changes below
+    // minimal.
     let cost_manager = Arc::clone(&graph.cost_manager);
     let llm_pool = Arc::clone(&graph.llm_pool);
 
@@ -842,6 +838,19 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         graph.actor_parent_token.clone(),
     );
 
+    let workspace_paths_for_router = Arc::new(aura_workspace::WorkspacePaths::new(
+        graph.workspace.root.clone(),
+    ));
+
+    // External-agent registry: only kinds the operator has explicitly
+    // opted into (`enabled: true` in aura.json) are probed and
+    // registered. An installed-but-not-enabled binary on PATH is
+    // NOT a trust signal — registration would expose the LLM to a
+    // host-execution channel that bypasses aura's sandbox + approval
+    // gate.
+    let external_agents =
+        aura_agent::external_agent::build_registry(graph.config.external_agents.boot_entries());
+
     let router = Router::from_config(aura_agent::router::RouterConfig {
         session_manager: Arc::clone(&graph.session_manager),
         supervisor,
@@ -857,6 +866,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         actor_parent_token: graph.actor_parent_token.clone(),
         rate_limit_max_requests: rate_limit_cfg.max_requests,
         rate_limit_window: std::time::Duration::from_secs(rate_limit_cfg.window_secs),
+        external_agents: Arc::new(external_agents),
+        workspace_paths: workspace_paths_for_router,
     });
 
     RouterRunHandle {

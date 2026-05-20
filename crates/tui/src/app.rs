@@ -1,37 +1,24 @@
-//! TUI application state: scrollback, input buffer, input history, view mode.
+//! TUI application state: live viewport content, input buffer, input history,
+//! view mode.
 //!
-//! State mutation is intentionally synchronous and side-effect-free — all I/O
-//! happens in [`super::TuiAdapter`]'s event loop. This keeps logic unit-testable
-//! against synthetic key events.
+//! State mutation is synchronous and side-effect-free. With the inline-viewport
+//! rendering model, chat history is *not* held here — it lives in the
+//! terminal's own scrollback buffer, written via [`ratatui::Terminal::insert_before`].
+//! This module only tracks what's currently *live* in the viewport: the input
+//! draft, the streaming-response preview, and the (single) pending approval.
 
 use std::collections::VecDeque;
 use std::time::Instant;
 
 use aura_channels::{DashboardSnapshot, SlashCommand, ViewKind};
-use aura_model::ContentBlock;
 use ratatui::widgets::TableState;
 
 use aura_tools::{ApprovalDecision, ApprovalQueue, ResourceAccess};
 
-use crate::event::LogRecord;
-
-const SCROLLBACK_CAP: usize = 5000;
 const HISTORY_CAP: usize = 500;
 
-/// One rendered line in the chat scrollback.
-#[derive(Debug, Clone)]
-pub(crate) enum ChatLine {
-    User(String),
-    Assistant(Vec<ContentBlock>),
-    System(String),
-    Log(LogRecord),
-    /// Inline tool-approval prompt. Rendered expanded while pending (with
-    /// selectable options) and collapsed to a single summary line once
-    /// resolved.
-    Approval(ApprovalChatEntry),
-}
-
-/// An approval request rendered inline in the chat scrollback.
+/// An approval request rendered inline in the viewport (when pending) and
+/// committed as a one-line summary to scrollback (once resolved).
 #[derive(Debug, Clone)]
 pub(crate) struct ApprovalChatEntry {
     pub tool: String,
@@ -62,21 +49,26 @@ pub(crate) enum ViewMode {
 
 pub(crate) struct AppState {
     pub(crate) mode: ViewMode,
-    /// Persistent one-line banner pinned above the scrollback in chat mode.
-    /// Empty string means no banner is rendered.
-    pub(crate) banner: String,
-    pub(crate) scrollback: VecDeque<ChatLine>,
     pub(crate) input: String,
     pub(crate) cursor: usize,
     pub(crate) history: VecDeque<String>,
     pub(crate) history_cursor: Option<usize>,
-    /// Offset from the bottom of the scrollback, in rendered lines.
-    /// `0` means "tail"; larger values scroll up.
-    pub(crate) scroll_offset: u16,
-    /// In-progress streaming response. `None` when no stream is active;
-    /// `Some(buffer)` once `AppEvent::StreamDelta` has arrived. The final
-    /// `AppEvent::Outgoing` replaces this with a persistent `ChatLine`.
+    /// Trailing partial line of the in-flight agent response — the
+    /// suffix that hasn't yet been terminated by a `\n` and committed
+    /// to scrollback. Each `AppEvent::StreamDelta` appends to it, and
+    /// [`drain_complete_stream_lines`] pops everything up to (and
+    /// including) the most recent `\n`. The final `AppEvent::Outgoing`
+    /// flushes whatever remains.
     pub(crate) streaming: Option<String>,
+    /// Whether the current agent response has already committed any
+    /// line to scrollback. Drives the prefix choice: the very first
+    /// committed line uses `aura> ` (bold green), subsequent lines use
+    /// the `      ` (six-space) continuation indent so the conversation
+    /// reads as one coherent block.
+    pub(crate) streaming_committed_any: bool,
+    /// Active inline approval prompt. At most one is live at a time; further
+    /// queued requests stay on [`ApprovalQueue`] until the head is resolved.
+    pub(crate) pending_approval: Option<ApprovalChatEntry>,
     /// Full list of slash commands for completion; sourced once at startup
     /// from `SlashHandler::commands()`.
     pub(crate) commands: Vec<SlashCommand>,
@@ -87,11 +79,24 @@ pub(crate) struct AppState {
     /// (see [`CONFIRM_EXIT_WINDOW`]) commits the exit. Cleared by any other
     /// key so the confirmation doesn't linger across unrelated input.
     pub(crate) confirm_exit_at: Option<Instant>,
-    /// Shared pending-approval queue. A modal overlays the scrollback
-    /// whenever this queue is non-empty; keystrokes `a/A/d/Esc` resolve
-    /// the head entry. None means approval gating is disabled for the
-    /// test harness — production always wires this up.
+    /// Shared pending-approval queue. Cloned into the event loop so key
+    /// handlers can drain entries. `None` means approval gating is disabled
+    /// for the test harness — production always wires this up.
     pub(crate) approval: Option<ApprovalQueue>,
+    /// User submissions parked while the agent is mid-response or a
+    /// resource approval is pending. Each `AppEvent::Outgoing` pops the
+    /// next one and dispatches it, so messages always commit to
+    /// scrollback in chronological send order
+    /// (`you>1 / aura>1 / you>2 / aura>2`) instead of interleaving with
+    /// in-flight streams.
+    pub(crate) outgoing_queue: VecDeque<String>,
+    /// User messages that have been dispatched to the agent but whose
+    /// `AppEvent::Outgoing` reply hasn't arrived yet. Tracked separately
+    /// from [`streaming`] / [`pending_approval`] because there's a race
+    /// window between dispatch and the first `StreamDelta`: without
+    /// this counter, a second submission inside that window would be
+    /// dispatched concurrently and the two responses would interleave.
+    pub(crate) outstanding_responses: usize,
 }
 
 /// How long the "press Ctrl-D again to exit" prompt stays armed. Matches
@@ -102,19 +107,60 @@ impl AppState {
     pub(crate) fn new() -> Self {
         Self {
             mode: ViewMode::Chat,
-            banner: String::new(),
-            scrollback: VecDeque::new(),
             input: String::new(),
             cursor: 0,
             history: VecDeque::new(),
             history_cursor: None,
-            scroll_offset: 0,
             streaming: None,
+            streaming_committed_any: false,
+            pending_approval: None,
             commands: Vec::new(),
             completion_cursor: 0,
             confirm_exit_at: None,
             approval: None,
+            outgoing_queue: VecDeque::new(),
+            outstanding_responses: 0,
         }
+    }
+
+    /// True iff the chat loop is currently waiting on the agent to
+    /// finish a response or for the user to resolve a pending approval.
+    /// Submissions made while this is true should be queued rather than
+    /// committed immediately, otherwise they'd interleave between the
+    /// streaming preview and the eventual `aura> …` reply in scrollback.
+    pub(crate) fn is_busy(&self) -> bool {
+        self.streaming.is_some()
+            || self.pending_approval.is_some()
+            || self.outstanding_responses > 0
+    }
+
+    /// Bump the outstanding-response counter — call right before
+    /// dispatching a real user message to the agent. The counter stays
+    /// elevated through the inevitable streaming phase and is cleared
+    /// by [`note_response_received`] when `AppEvent::Outgoing` lands.
+    pub(crate) fn note_response_pending(&mut self) {
+        self.outstanding_responses += 1;
+    }
+
+    /// Decrement the outstanding-response counter. Idempotent at zero
+    /// so spurious `Outgoing` events (e.g. an agent restart sending an
+    /// empty reply) don't underflow the counter.
+    pub(crate) fn note_response_received(&mut self) {
+        self.outstanding_responses = self.outstanding_responses.saturating_sub(1);
+    }
+
+    /// Park a user submission until the agent finishes streaming and
+    /// any pending approval resolves. Cleared one-at-a-time by
+    /// [`AppState::dequeue_submission`].
+    pub(crate) fn queue_submission(&mut self, text: String) {
+        self.outgoing_queue.push_back(text);
+    }
+
+    /// Pop the next parked submission, if any. Called by the run loop
+    /// after each `AppEvent::Outgoing` so queued messages dispatch in
+    /// chronological order.
+    pub(crate) fn dequeue_submission(&mut self) -> Option<String> {
+        self.outgoing_queue.pop_front()
     }
 
     pub(crate) fn with_approval(mut self, shared: ApprovalQueue) -> Self {
@@ -122,33 +168,29 @@ impl AppState {
         self
     }
 
-    /// True iff an inline approval prompt is pending in the scrollback.
+    /// True iff an inline approval prompt is currently live in the viewport.
     pub(crate) fn approval_pending(&self) -> bool {
-        self.scrollback.iter().rev().any(|line| {
-            matches!(
-                line,
-                ChatLine::Approval(e) if matches!(e.state, ApprovalChatState::Pending { .. })
-            )
-        })
+        self.pending_approval.is_some()
     }
 
-    /// Push an approval entry into the scrollback.
-    pub(crate) fn push_approval(&mut self, entry: ApprovalChatEntry) {
-        self.push(ChatLine::Approval(entry));
+    /// Install a fresh approval entry as the live prompt. Caller has
+    /// already confirmed no entry is currently pending.
+    pub(crate) fn set_pending_approval(&mut self, entry: ApprovalChatEntry) {
+        self.pending_approval = Some(entry);
     }
 
-    /// Move the selection cursor up on the active (pending) approval.
+    /// Move the selection cursor up on the live approval.
     pub(crate) fn approval_select_prev(&mut self) {
-        if let Some(entry) = self.active_approval_mut()
+        if let Some(entry) = self.pending_approval.as_mut()
             && let ApprovalChatState::Pending { selected } = &mut entry.state
         {
             *selected = selected.saturating_sub(1);
         }
     }
 
-    /// Move the selection cursor down on the active (pending) approval.
+    /// Move the selection cursor down on the live approval.
     pub(crate) fn approval_select_next(&mut self) {
-        if let Some(entry) = self.active_approval_mut()
+        if let Some(entry) = self.pending_approval.as_mut()
             && let ApprovalChatState::Pending { selected } = &mut entry.state
         {
             *selected = (*selected + 1).min(2);
@@ -156,59 +198,42 @@ impl AppState {
     }
 
     /// Return the decision mapped to the currently highlighted option on
-    /// the active approval. `None` when no approval is pending.
+    /// the live approval. `None` when no approval is pending.
     pub(crate) fn active_approval_selected_decision(&self) -> Option<ApprovalDecision> {
-        self.scrollback.iter().rev().find_map(|line| {
-            if let ChatLine::Approval(entry) = line
-                && let ApprovalChatState::Pending { selected } = entry.state
-            {
-                Some(match selected {
-                    0 => ApprovalDecision::Approve,
-                    1 => ApprovalDecision::ApproveAlways,
-                    _ => ApprovalDecision::Deny,
-                })
-            } else {
-                None
-            }
+        let entry = self.pending_approval.as_ref()?;
+        let ApprovalChatState::Pending { selected } = entry.state else {
+            return None;
+        };
+        Some(match selected {
+            0 => ApprovalDecision::Approve,
+            1 => ApprovalDecision::ApproveAlways,
+            _ => ApprovalDecision::Deny,
         })
     }
 
-    /// Resolve the active inline approval with the given decision:
-    /// collapse the scrollback entry and fire the queue's oneshot. If
-    /// the queue still has pending items, the next one is pushed into
-    /// the scrollback automatically.
-    pub(crate) fn resolve_active_approval(&mut self, decision: ApprovalDecision) {
-        // Collapse the scrollback entry.
-        if let Some(entry) = self.active_approval_mut() {
-            entry.state = ApprovalChatState::Resolved(decision);
-        }
-        // Fire the oneshot on the shared queue.
+    /// Resolve the live approval with the given decision. Returns the
+    /// resolved entry (for the caller to commit as a summary line) plus
+    /// the next queued approval (if any) to install as the new live
+    /// prompt. Returns `None` if no approval was pending.
+    pub(crate) fn resolve_active_approval(
+        &mut self,
+        decision: ApprovalDecision,
+    ) -> Option<ResolvedApproval> {
+        let mut entry = self.pending_approval.take()?;
+        entry.state = ApprovalChatState::Resolved(decision);
+
         if let Some(queue) = self.approval.as_ref() {
             queue.resolve_head(decision);
-            // If more items are already queued (concurrent tool calls),
-            // surface the next one immediately.
             if let Some(req) = queue.peek_head() {
-                self.push(ChatLine::Approval(ApprovalChatEntry {
+                self.pending_approval = Some(ApprovalChatEntry {
                     tool: req.tool,
                     accesses: req.accesses,
                     params_preview: req.params_preview,
                     state: ApprovalChatState::Pending { selected: 0 },
-                }));
+                });
             }
         }
-    }
-
-    /// Mutable reference to the active (pending) approval entry, if any.
-    fn active_approval_mut(&mut self) -> Option<&mut ApprovalChatEntry> {
-        self.scrollback.iter_mut().rev().find_map(|line| {
-            if let ChatLine::Approval(entry) = line
-                && matches!(entry.state, ApprovalChatState::Pending { .. })
-            {
-                Some(entry)
-            } else {
-                None
-            }
-        })
+        Some(ResolvedApproval { resolved: entry })
     }
 
     pub(crate) fn set_commands(&mut self, commands: Vec<SlashCommand>) {
@@ -222,10 +247,6 @@ impl AppState {
         let skip = entries.len().saturating_sub(HISTORY_CAP);
         self.history = entries.into_iter().skip(skip).collect();
         self.history_cursor = None;
-    }
-
-    pub(crate) fn set_banner(&mut self, text: String) {
-        self.banner = text;
     }
 
     /// Return the filtered completion list for the current input. Only
@@ -293,46 +314,54 @@ impl AppState {
         true
     }
 
-    pub(crate) fn push_user(&mut self, text: String) {
-        self.push(ChatLine::User(text));
-    }
-
-    pub(crate) fn push_assistant(&mut self, blocks: Vec<ContentBlock>) {
-        self.push(ChatLine::Assistant(blocks));
-    }
-
     /// Append a chunk of text to the currently streaming assistant response.
     /// Creates a fresh streaming buffer on the first chunk.
     pub(crate) fn append_stream_delta(&mut self, delta: &str) {
         self.streaming
             .get_or_insert_with(String::new)
             .push_str(delta);
-        self.scroll_offset = 0;
     }
 
-    /// Finalise the streaming response. `blocks` comes from the router's
-    /// full `OutgoingMessage`; it supersedes whatever we streamed so the
-    /// persisted chat line exactly reflects the canonical content
-    /// (including tool calls, images, etc. that deltas don't carry).
-    pub(crate) fn finish_stream(&mut self, blocks: Vec<ContentBlock>) {
-        self.streaming = None;
-        self.push(ChatLine::Assistant(blocks));
-    }
-
-    pub(crate) fn push_system(&mut self, text: String) {
-        self.push(ChatLine::System(text));
-    }
-
-    pub(crate) fn push_log(&mut self, record: LogRecord) {
-        self.push(ChatLine::Log(record));
-    }
-
-    fn push(&mut self, line: ChatLine) {
-        if self.scrollback.len() >= SCROLLBACK_CAP {
-            self.scrollback.pop_front();
+    /// Drain every newline-terminated line currently in the streaming
+    /// buffer, leaving the trailing partial (if any) for the next
+    /// delta. Used by the event loop to commit complete lines to
+    /// scrollback the moment they're ready, instead of buffering the
+    /// whole response in a viewport-side preview.
+    pub(crate) fn drain_complete_stream_lines(&mut self) -> Vec<String> {
+        let Some(buf) = self.streaming.as_mut() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Some(idx) = buf.find('\n') {
+            let mut line: String = buf.drain(..=idx).collect();
+            // Strip the terminating `\n`; CRs from `\r\n` get stripped too.
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            out.push(line);
         }
-        self.scrollback.push_back(line);
-        self.scroll_offset = 0;
+        out
+    }
+
+    /// Take whatever partial line remains in the streaming buffer,
+    /// leaving `streaming = None`. Returns `None` if no partial is
+    /// pending. Called when finalizing the response on `Outgoing`.
+    pub(crate) fn take_stream_partial(&mut self) -> Option<String> {
+        let partial = self.streaming.take()?;
+        if partial.is_empty() {
+            None
+        } else {
+            Some(partial)
+        }
+    }
+
+    /// Clear the streaming buffer + reset the "first line committed"
+    /// flag. Called after `Outgoing` finalises the response so the
+    /// next stream starts with `aura> ` again.
+    pub(crate) fn clear_stream(&mut self) {
+        self.streaming = None;
+        self.streaming_committed_any = false;
     }
 
     pub(crate) fn take_input(&mut self) -> Option<String> {
@@ -444,7 +473,6 @@ impl AppState {
         let prefix = &self.input[..self.cursor];
         let cur_line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
         let col = self.cursor - cur_line_start;
-        // Cursor is not on last line, so there is a '\n' at or after cursor.
         let next_newline = cur_line_start + self.input[cur_line_start..].find('\n').unwrap();
         let next_line_start = next_newline + 1;
         let next_line_end = self.input[next_line_start..]
@@ -460,11 +488,6 @@ impl AppState {
         if self.history.is_empty() {
             return;
         }
-        // Shell-like gate: history is only loadable from a clean prompt.
-        // Once the user has typed anything of their own, Up is inert for
-        // history until the draft is cleared or submitted. While already
-        // walking history (`history_cursor` is `Some`), keep walking so
-        // repeated Up presses flow through the ring.
         if self.history_cursor.is_none() && !self.input.is_empty() {
             return;
         }
@@ -489,19 +512,6 @@ impl AppState {
             self.input = self.history[i + 1].clone();
             self.cursor = self.input.len();
         }
-    }
-
-    pub(crate) fn clear_scrollback(&mut self) {
-        self.scrollback.clear();
-        self.scroll_offset = 0;
-    }
-
-    pub(crate) fn scroll_up(&mut self, lines: u16) {
-        self.scroll_offset = self.scroll_offset.saturating_add(lines);
-    }
-
-    pub(crate) fn scroll_down(&mut self, lines: u16) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
     }
 
     pub(crate) fn enter_dashboard(&mut self, kind: ViewKind, snapshot: DashboardSnapshot) {
@@ -590,9 +600,16 @@ impl AppState {
     }
 }
 
-/// Round `idx` down to the nearest UTF-8 char boundary. Used when
-/// translating byte-column targets (from multi-line cursor movement) back
-/// into safe insertion indices.
+/// Outcome of resolving the live approval prompt. The resolved entry is
+/// returned for the caller to commit to scrollback as a one-line summary.
+/// Any next-queued entry is promoted to the new live prompt internally
+/// (see [`AppState::resolve_active_approval`]) so the caller doesn't need
+/// to touch it — a redraw will surface it.
+pub(crate) struct ResolvedApproval {
+    pub resolved: ApprovalChatEntry,
+}
+
+/// Round `idx` down to the nearest UTF-8 char boundary.
 fn clamp_to_boundary(s: &str, mut idx: usize) -> usize {
     if idx > s.len() {
         idx = s.len();
@@ -642,7 +659,7 @@ mod tests {
         app.cursor = 0;
         assert!(app.cursor_at_first_line());
         assert!(!app.cursor_at_last_line());
-        app.cursor = 2; // just past '\n', start of line 2
+        app.cursor = 2;
         assert!(!app.cursor_at_first_line());
         assert!(app.cursor_at_last_line());
     }
@@ -651,17 +668,12 @@ mod tests {
     fn move_up_and_down_line_clamp_to_line_length() {
         let mut app = AppState::new();
         app.input = "abcd\nef\nghij".to_string();
-        app.cursor = 12; // end of "ghij"
+        app.cursor = 12;
         app.move_up_line();
-        // Middle line "ef" has len 2; col 4 clamps to 2, so cursor lands at
-        // the byte just past "ef" (the next '\n' boundary).
         assert_eq!(app.cursor, 7);
         app.move_up_line();
-        // No sticky preferred column: col is recomputed from the current
-        // cursor (col 2 on "ef"), then applied to "abcd" → cursor = 2.
         assert_eq!(app.cursor, 2);
         app.move_down_line();
-        // Col 2 from "abcd" applies to "ef" (len 2) → end-of-line, cursor 7.
         assert_eq!(app.cursor, 7);
     }
 
@@ -734,8 +746,6 @@ mod tests {
 
     #[test]
     fn history_prev_is_inert_with_nonempty_draft() {
-        // Shell-style: once the user has typed content, Up is a no-op for
-        // history until the draft clears (or they submit it).
         let mut app = AppState::new();
         app.input = "past".to_string();
         app.cursor = app.input.len();
@@ -757,8 +767,6 @@ mod tests {
         }
         app.history_prev();
         assert_eq!(app.input, "b");
-        // input is no longer empty, but we're already walking — guard
-        // should not block further presses.
         app.history_prev();
         assert_eq!(app.input, "a");
     }
@@ -774,15 +782,6 @@ mod tests {
         app.history_next();
         assert_eq!(app.input, "");
         assert!(app.history_cursor.is_none());
-    }
-
-    #[test]
-    fn scrollback_caps_at_limit() {
-        let mut app = AppState::new();
-        for i in 0..(SCROLLBACK_CAP + 10) {
-            app.push_user(format!("m{i}"));
-        }
-        assert_eq!(app.scrollback.len(), SCROLLBACK_CAP);
     }
 
     #[test]

@@ -75,16 +75,10 @@ impl LlmClientPool {
         self.default_client.clone()
     }
 
-    pub fn get(&self, name: &str) -> Option<Arc<GuardedLlm>> {
-        self.clients.get(name).cloned()
-    }
-
     pub fn entry_names(&self) -> Vec<String> {
         self.clients.keys().cloned().collect()
     }
 
-    /// Resolve to a concrete client + the effective entry name (useful
-    /// for logging / cost-attribution sanity checks).
     pub(crate) fn resolve(&self, name: Option<&str>) -> (Arc<GuardedLlm>, String) {
         match name {
             None => (self.default_client(), self.default_name.clone()),

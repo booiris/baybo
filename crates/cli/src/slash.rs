@@ -6,8 +6,8 @@ use aura_model::ContentBlock;
 use clap::{CommandFactory, Parser};
 
 use crate::cli::{
-    AgentCmd, AgentsCmd, ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, JobCmd, LlmCmd,
-    LogCmd, McpCmd, PairCmd, SessionCmd, SkillsCmd,
+    AgentCmd, AgentsCmd, ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, ExternalAgentCmd,
+    JobCmd, LlmCmd, LogCmd, McpCmd, PairCmd, SessionCmd, SkillsCmd,
 };
 use crate::context::{CommandContext, Invocation};
 use crate::dispatch;
@@ -277,6 +277,9 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
         Commands::Llm {
             cmd: LlmCmd::Add | LlmCmd::Edit | LlmCmd::Remove | LlmCmd::Default,
         } => Err("interactive LLM editor; run it from a shell"),
+        Commands::ExternalAgent {
+            cmd: ExternalAgentCmd::Setup,
+        } => Err("`external-agent setup` is interactive; run it from a shell"),
 
         // Bounded reads + opt-in mutations: allowed.
         Commands::Config { cmd } => match cmd {
@@ -312,6 +315,9 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
         },
         Commands::Llm {
             cmd: LlmCmd::Status | LlmCmd::Probe { .. } | LlmCmd::LiveModel { .. },
+        } => Ok(()),
+        Commands::ExternalAgent {
+            cmd: ExternalAgentCmd::Status,
         } => Ok(()),
         Commands::Session { cmd } => match cmd {
             SessionCmd::List

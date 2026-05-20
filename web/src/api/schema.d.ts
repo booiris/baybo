@@ -36,6 +36,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/cron-messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_cron_messages"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions": {
         parameters: {
             query?: never;
@@ -452,6 +468,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/traces/{session_id}/jobs/{job_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_job_trace"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -523,6 +555,56 @@ export interface components {
          */
         ChannelType: string;
         /**
+         * @description One entry in the cron-messages list. Each row corresponds to a
+         *     distinct cron fire (cron creates a fresh session per trigger, so
+         *     `session_id` uniquely identifies the fire). The chat surface
+         *     surfaces these in a right-side notification pane rather than the
+         *     main sidebar so unattended cron output doesn't bury user-driven
+         *     conversations.
+         */
+        ChatCronMessage: {
+            /**
+             * @description Cron job that produced this fire. Stable across fires of the
+             *     same job; missing in the (theoretically impossible) case of a
+             *     trigger without a job id.
+             */
+            cron_job_id: string;
+            /**
+             * Format: date-time
+             * @description When the cron session was created — the actual fire time, to
+             *     within scheduler tick precision.
+             */
+            fired_at: string;
+            /**
+             * Format: date-time
+             * @description Latest activity timestamp on the session. Lets the panel sort
+             *     by "freshest" without the client having to fetch transcripts.
+             */
+            last_active: string;
+            /**
+             * @description The user-facing prompt for this fire. Truncated to
+             *     [`PREVIEW_MAX_CHARS`]. The persisted user row carries a
+             *     `[cron:<job>] <prompt>` prefix; this strips the prefix so the
+             *     panel doesn't redundantly re-show what the cron job already
+             *     has.
+             */
+            prompt: string;
+            /**
+             * @description Latest assistant text — what the agent produced in response.
+             *     `None` while the fire is still running or if the agent emitted
+             *     only tool calls / attachments.
+             */
+            response?: string | null;
+            /**
+             * @description The session created for this cron fire. Reuse against
+             *     `/v1/chat/sessions/{id}` to drill into the full transcript.
+             */
+            session_id: string;
+        };
+        ChatCronMessagesList: {
+            items: components["schemas"]["ChatCronMessage"][];
+        };
+        /**
          * @description Response from `POST /v1/chat/sessions` and the
          *     `POST /v1/chat/sessions/:id/token` token-refresh endpoint. Carries
          *     the freshly-minted channel-token the web client presents on its
@@ -580,6 +662,15 @@ export interface components {
             hidden?: boolean;
             /** Format: date-time */
             last_active: string;
+            /**
+             * @description Preview text drawn from the session's most-recent user-authored
+             *     message, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar
+             *     renders this as the row label so users can scan past
+             *     conversations by what they last asked. `None` for sessions
+             *     without a user turn yet (a freshly-created row, or one whose
+             *     transcript holds only system/tool rows).
+             */
+            last_user_text?: string | null;
             session_id: string;
         };
         ChatSessionsList: {
@@ -591,6 +682,17 @@ export interface components {
          *     matcher.
          */
         ChatTranscriptItem: {
+            /**
+             * Format: date-time
+             * @description Wall-clock time the row was persisted, sourced from
+             *     `session_messages.created_at`. Lets the client render a
+             *     per-message timestamp without a second lookup. Live WS frames
+             *     don't carry this — the web client falls back to the receive
+             *     time for those, which is close enough for live emissions and
+             *     drifts only on catch-up replays (where the row is also
+             *     reachable via the REST history surface with the real value).
+             */
+            created_at: string;
             /**
              * @description `true` when this row had non-text content (image / audio /
              *     file). The web client currently shows a placeholder.
@@ -936,6 +1038,12 @@ export interface components {
             requires_restart: boolean;
             written_to: string;
         };
+        /**
+         * @description Wire mirror of [`aura_query::SessionKind`]. Coarse trigger/lineage
+         *     label for the trace browser list view.
+         * @enum {string}
+         */
+        SessionKind: "user" | "cron" | "compression" | "subagent";
         /** @description `PUT /v1/config` body. */
         SetConfigRequest: {
             path: string;
@@ -981,6 +1089,7 @@ export interface components {
             created_at: string;
             input_tokens: number;
             job_count: number;
+            kind: components["schemas"]["SessionKind"];
             /** Format: date-time */
             last_active: string;
             latest_job_status?: null | components["schemas"]["JobStatus"];
@@ -1106,11 +1215,54 @@ export interface operations {
             };
         };
     };
+    list_cron_messages: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Maximum number of cron messages to return. Defaults to
+                 *     [`DEFAULT_CRON_MESSAGE_LIMIT`], clamped to
+                 *     [`MAX_CRON_MESSAGE_LIMIT`].
+                 */
+                limit?: number | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cron-triggered http sessions with prompt + agent response previews, newest fire first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatCronMessagesList"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_sessions: {
         parameters: {
             query?: {
                 /** @description Include hidden sessions in the response. Defaults to false. */
                 include_hidden?: boolean;
+                /**
+                 * @description Include cron-triggered sessions in the response. Defaults to
+                 *     false so the chat sidebar stays free of background fires; the
+                 *     dedicated `GET /v1/chat/cron-messages` endpoint surfaces those
+                 *     in their own pane.
+                 */
+                include_cron?: boolean;
             };
             header?: never;
             path?: never;
@@ -2463,6 +2615,11 @@ export interface operations {
                 until?: string;
                 /** @description Case-insensitive substring on session id. */
                 q?: string;
+                /**
+                 * @description Filter on coarse trigger/lineage label. `compression` opts into
+                 *     background-maintenance sessions that the default list hides.
+                 */
+                kind?: components["schemas"]["SessionKind"];
                 limit?: number;
                 offset?: number;
             };
@@ -2497,14 +2654,14 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Session id whose trace to export */
+                /** @description Session id whose trace overview to fetch */
                 session_id: string;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Per-session trace tree: jobs, their steps, and the spans under each step. Untyped JSON to keep the admin surface decoupled from internal trace crate changes. */
+            /** @description Per-session trace overview: session_messages log + job summaries (no step/span data). Untyped JSON to keep the admin surface decoupled from internal trace crate changes. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -2523,6 +2680,58 @@ export interface operations {
                 };
             };
             /** @description No trace for that session */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_job_trace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id this job belongs to (or inherits from); used for route scoping only */
+                session_id: string;
+                /** @description Job id whose step/span tree to fetch */
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64 }` (Persisted) or `ChatMessage[]` (Inline); the client slices the message log it received from the overview call. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Invalid job id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description No such job */
             404: {
                 headers: {
                     [name: string]: unknown;

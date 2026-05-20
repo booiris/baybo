@@ -1,11 +1,12 @@
 import { useSearchParams } from 'react-router-dom';
 import type { components } from './schema';
 import type {
-  SessionReplay,
+  ChatMessage,
+  JobTrace,
   Span,
   Step,
   StepKind,
-  ChatMessage,
+  TraceOverview,
 } from '../types/trace';
 
 type LogEntry = components['schemas']['LogEntry'];
@@ -87,18 +88,33 @@ function generateMockSummaries(count: number): TraceSessionSummary[] {
     'cancelled',
     'completed',
   ];
+  // Weighted to reflect typical traffic: user chats dominate, subagent
+  // spawns + cron are common, compression is a thin background tail.
+  const kinds: components['schemas']['SessionKind'][] = [
+    'user',
+    'user',
+    'user',
+    'user',
+    'cron',
+    'cron',
+    'subagent',
+    'subagent',
+    'compression',
+  ];
 
   for (let i = 0; i < count; i++) {
     const lastActive = new Date(now - i * 1000 * 60 * 15 - Math.random() * 10_000_000);
     const created = new Date(lastActive.getTime() - Math.random() * 1000 * 60 * 60);
-    const kind = statuses[Math.floor(Math.random() * statuses.length)];
+    const status = statuses[Math.floor(Math.random() * statuses.length)];
+    const kind = kinds[Math.floor(Math.random() * kinds.length)];
     out.push({
       session_id: `sess-${Math.random().toString(36).substring(2, 12)}-${Math.random()
         .toString(36)
         .substring(2, 8)}`,
       created_at: created.toISOString(),
       last_active: lastActive.toISOString(),
-      latest_job_status: makeJobStatus(kind),
+      latest_job_status: makeJobStatus(status),
+      kind,
       job_count: Math.floor(Math.random() * 4) + 1,
       span_count: Math.floor(Math.random() * 60) + 1,
       input_tokens: Math.floor(Math.random() * 80_000),
@@ -262,7 +278,21 @@ function systemMsg(text: string): ChatMessage {
   return { role: 'system', content: [{ Text: text }], from_user: false };
 }
 
-export function getMockSessionReplay(sessionId: string): SessionReplay {
+// Shared mock fixture: builds one job's worth of steps/spans + the
+// session_messages log it would have produced. Kept module-private so
+// the overview and job-trace mocks stay in lock-step. Cached per
+// session id so successive calls return stable ids (the page issues
+// overview + job fetches separately).
+interface MockSessionFixture {
+  job: JobTrace;
+  overview: TraceOverview;
+}
+const mockFixtures = new Map<string, MockSessionFixture>();
+
+function buildMockSession(sessionId: string): MockSessionFixture {
+  const cached = mockFixtures.get(sessionId);
+  if (cached) return cached;
+
   const t0 = Date.now() - 5 * 60 * 1000;
   const job1 = mid('job');
 
@@ -326,7 +356,6 @@ export function getMockSessionReplay(sessionId: string): SessionReplay {
     new Date(t0 + 1450),
     parallelGroup,
   );
-  // Sanitize event on tool2 (mock placeholder hit)
   tool2.events = [
     {
       span_id: tool2.id,
@@ -378,20 +407,59 @@ export function getMockSessionReplay(sessionId: string): SessionReplay {
     it2End,
   );
 
-  return {
+  const createdAt = new Date(t0 - 120).toISOString();
+  const startedAt = new Date(t0).toISOString();
+  const endedAt = new Date(t0 + 2400).toISOString();
+
+  const job: JobTrace = {
+    job_id: job1,
     session_id: sessionId,
+    job_status_kind: 'completed',
+    created_at: createdAt,
+    started_at: startedAt,
+    ended_at: endedAt,
+    steps: [
+      { step: skillStep, spans: [skillLlm] },
+      { step: it1Step, spans: [it1Llm, tool1, tool2] },
+      { step: it2Step, spans: [it2Llm] },
+    ],
+  };
+
+  const overview: TraceOverview = {
+    session_id: sessionId,
+    // Mock spans use `LlmCallInputs::Inline`, so the message log can
+    // stay empty — `resolveInputMessages` short-circuits on inline.
+    session_messages: [],
     jobs: [
       {
         job_id: job1,
+        session_id: sessionId,
         job_status_kind: 'completed',
-        steps: [
-          { step: skillStep, spans: [skillLlm] },
-          { step: it1Step, spans: [it1Llm, tool1, tool2] },
-          { step: it2Step, spans: [it2Llm] },
-        ],
+        created_at: createdAt,
+        started_at: startedAt,
+        ended_at: endedAt,
+        is_inherited: false,
+        inherited_from_session_id: null,
+        input_tokens: 380,
+        output_tokens: 96,
+        cached_input_tokens: 228,
+        cache_creation_input_tokens: 38,
       },
     ],
   };
+
+  const fixture = { job, overview };
+  mockFixtures.set(sessionId, fixture);
+  return fixture;
+}
+
+export function getMockTraceOverview(sessionId: string): TraceOverview {
+  return buildMockSession(sessionId).overview;
+}
+
+export function getMockJobTrace(sessionId: string, jobId: string): JobTrace | null {
+  const fx = buildMockSession(sessionId);
+  return fx.job.job_id === jobId ? fx.job : null;
 }
 
 

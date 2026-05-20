@@ -14,10 +14,9 @@ use std::time::{Duration, Instant};
 use aura_storage::{BlobStore, ChannelPairingStore};
 use aura_workspace::WorkspacePaths;
 
-use fs_sweep::{DirSweep, EntryShape, is_log_file, is_session_log, is_uuid_dir, sweep_directory};
+use fs_sweep::{DirSweep, is_log_file, is_session_log, sweep_directory};
 
 const SESSION_LOG_TTL: Duration = Duration::from_secs(3 * 86_400);
-const PYTHON_SCRATCH_TTL: Duration = Duration::from_secs(3 * 86_400);
 const LOG_FILE_TTL: Duration = Duration::from_secs(14 * 86_400);
 // LRU window for blobs — touched on every successful stat/get/open. A
 // blob whose `last_accessed_at` falls behind this window is reaped on
@@ -50,7 +49,6 @@ const SIDECAR_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JanitorReport {
     pub session_logs_removed: usize,
-    pub python_dirs_removed: usize,
     pub log_files_removed: usize,
     pub blobs_purged: u64,
     pub sidecar_dirs_removed: usize,
@@ -112,7 +110,6 @@ impl Janitor {
         match sweep_directory(DirSweep {
             dir: &sessions_dir,
             ttl: SESSION_LOG_TTL,
-            shape: EntryShape::File,
             name_predicate: is_session_log,
         })
         .await
@@ -121,25 +118,11 @@ impl Janitor {
             Err(e) => tracing::warn!(error = %e, "session-log sweep failed"),
         }
 
-        let scratch_dir = self.paths.code_builder_dir();
-        match sweep_directory(DirSweep {
-            dir: &scratch_dir,
-            ttl: PYTHON_SCRATCH_TTL,
-            shape: EntryShape::Dir,
-            name_predicate: is_uuid_dir,
-        })
-        .await
-        {
-            Ok(n) => report.python_dirs_removed = n,
-            Err(e) => tracing::warn!(error = %e, "python-scratch sweep failed"),
-        }
-
         let mut logs_total = 0;
         for dir in [self.paths.logs_dir(), self.paths.channel_logs_dir()] {
             match sweep_directory(DirSweep {
                 dir: &dir,
                 ttl: LOG_FILE_TTL,
-                shape: EntryShape::File,
                 name_predicate: is_log_file,
             })
             .await
@@ -164,7 +147,6 @@ impl Janitor {
 
         tracing::info!(
             session_logs_removed = report.session_logs_removed,
-            python_dirs_removed = report.python_dirs_removed,
             log_files_removed = report.log_files_removed,
             blobs_purged = report.blobs_purged,
             pairings_purged = report.pairings_purged,
@@ -325,47 +307,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn python_scratch_sweep_removes_old_uuid_dirs_only() {
-        let tmp = TempDir::new().unwrap();
-        let paths = workspace_paths(tmp.path());
-        let dir = paths.code_builder_dir();
-        std::fs::create_dir_all(&dir).unwrap();
-        let stale = dir.join("00000000-0000-0000-0000-000000000001");
-        let fresh = dir.join("00000000-0000-0000-0000-000000000002");
-        let other = dir.join("not-a-uuid");
-        std::fs::create_dir_all(&stale).unwrap();
-        std::fs::create_dir_all(&fresh).unwrap();
-        std::fs::create_dir_all(&other).unwrap();
-        std::fs::write(
-            stale.join(aura_workspace::paths::CODE_BUILDER_SCRIPT_FILE),
-            b"print(1)\n",
-        )
-        .unwrap();
-        std::fs::write(
-            fresh.join(aura_workspace::paths::CODE_BUILDER_SCRIPT_FILE),
-            b"print(2)\n",
-        )
-        .unwrap();
-        // Make stale dir mtime old by setting on its inner file then
-        // re-stating: tokio::fs uses the dir entry's mtime, which on
-        // Linux is set when the dir is last modified (e.g., when we
-        // wrote script.py). Backdate via set_modified on the dir.
-        back_date_dir(
-            &stale,
-            Duration::from_secs(PYTHON_SCRATCH_TTL.as_secs() + 60),
-        );
-
-        let report = Janitor::new(paths, Arc::new(MemoryBlobStore::new()))
-            .sweep_once()
-            .await;
-
-        assert_eq!(report.python_dirs_removed, 1);
-        assert!(!stale.exists());
-        assert!(fresh.exists());
-        assert!(other.exists(), "non-UUID dirs must survive");
-    }
-
-    #[tokio::test]
     async fn log_sweep_removes_old_log_files_in_both_dirs() {
         let tmp = TempDir::new().unwrap();
         let paths = workspace_paths(tmp.path());
@@ -505,7 +446,6 @@ mod tests {
             .sweep_once()
             .await;
         assert_eq!(report.session_logs_removed, 0);
-        assert_eq!(report.python_dirs_removed, 0);
         assert_eq!(report.log_files_removed, 0);
         assert_eq!(report.blobs_purged, 0);
     }

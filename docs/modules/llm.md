@@ -18,6 +18,10 @@ Core responsibilities:
 
 `LlmClient` wraps `AnyCompletionModel`, an enum with four variants: `OpenAI`, `Anthropic`, `Gemini`, and `OpenAiSubscription` (the ChatGPT/Codex OAuth path, documented in [`llm-openai-subscription.md`](llm-openai-subscription.md)). The MiniMax provider also routes through the `Anthropic` variant by reusing rig's Anthropic client against MiniMax's Anthropic-compatible endpoint. This uses compile-time enum dispatch instead of trait objects — rig's `CompletionModel` trait is not object-safe (`Clone` + `impl Future`), and the deprecated `CompletionModelDyn` has been removed. Adding a new provider means adding an enum variant and a match arm.
 
+`OpenAiSubscription` bypasses the rig adapter: it speaks the Codex Responses API directly over HTTP with its own OAuth dance, intercepted by `LlmClient::chat` / `chat_stream` before the rig `CompletionRequest` is built.
+
+Subprocess-driven agents (the `claude` binary) are **not** LLM providers and live outside this crate. See [`external-agents.md`](../external-agents.md).
+
 ### Streaming
 
 `LlmClient::chat_stream()` returns `LlmStream`, a type-erased `futures::Stream<Item = Result<StreamEvent>>`. `StreamEvent` has five variants: `Text`, `ToolCall`, `Reasoning` (incremental delta), `ThinkingBlock(aura_model::ContentBlock)` (complete structured reasoning block, preserved for providers that require thinking to be echoed back), and `Usage`. The stream maps rig's `StreamedAssistantContent` to these unified events, hiding provider-specific response types.
@@ -40,8 +44,9 @@ Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` thr
 
 ## Constraints
 
-- Depends only on `model` (plus `rig-core`, `futures`, `serde`)
+- Depends only on `model` (plus `rig-core`, `futures`, `serde`, `tokio`)
 - Does not depend on `cost` — instead, `cost` consumes `TokenUsage` produced by `llm`, assembled by `agent`
+- Does not depend on `aura-storage` / `aura-session`
 - API keys should use environment-variable placeholders and must not be stored directly in config files
 
 ## Collaboration

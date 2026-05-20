@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::{BackgroundCompressionPayload, ContentBlock, JobId, ModelTier, SessionId, SpanId};
+use crate::{
+    BackgroundCompressionPayload, ContentBlock, JobId, ModelTier, SessionId, SpanId,
+    SubagentBackend,
+};
 
 /// Tool name the LLM emits to spawn a subagent.
 pub const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";
@@ -81,7 +84,10 @@ pub enum SystemSpawnRequest {
         /// job stay distinguishable.
         parent_span_id: SpanId,
         parent_actor_token: CancellationToken,
-        request: SubagentSpawnRequest,
+        /// Boxed: the in-line variant is ~3× the size of
+        /// `BackgroundCompression`, so the box keeps `SystemSpawnRequest`
+        /// small on the channel (`clippy::large_enum_variant`).
+        request: Box<SubagentSpawnRequest>,
         result_tx: oneshot::Sender<SubagentResult>,
     },
 }
@@ -115,19 +121,16 @@ pub struct SubagentSpawnRequest {
     #[serde(default)]
     pub must_include_context: Vec<String>,
     pub timeout: Duration,
-    /// Coarse model tier. Resolution precedence (highest first):
-    /// explicit [`Self::llm`] → this field → profile's `default_tier`
-    /// → pool default. Wired up in task 6.
+    /// Coarse model tier for the Aura backend. Resolution precedence
+    /// (highest first): explicit `backend = Aura { llm }` → this field
+    /// → profile's `default_tier` → pool default. Ignored for the
+    /// External backend, which runs its own model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_tier: Option<ModelTier>,
-    /// Explicit `llm[*].name` override (super-escape). Beats
-    /// `model_tier`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub llm: Option<String>,
-    /// Fire-and-forget mode. Reserved for task 8 — when `true` the
-    /// router will surface a handle id and parent the child's wait
-    /// task on the parent actor's token rather than the parent job's
-    /// token. The current router rejects this until that path lands.
+    /// Fire-and-forget mode. When `true` the router surfaces a handle
+    /// id and parents the child's wait task on the parent actor's
+    /// token rather than the parent job's token, so the child outlives
+    /// the dispatching turn and escorts its result back later.
     #[serde(default)]
     pub background: bool,
     /// Root session id used by the dispatcher's fan-out limiter.
@@ -138,6 +141,25 @@ pub struct SubagentSpawnRequest {
     /// programmatic call sites that don't go through the limiter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fan_out_root: Option<SessionId>,
+    /// Backend that runs this subagent. `Aura` is the default (full
+    /// in-process `AgentActor`). `External` routes to a registered
+    /// external-agent impl (claude_cli, …) for one-shot delegation.
+    #[serde(default)]
+    pub backend: SubagentBackend,
+    /// Sanitised kebab-case slug for the child's working directory:
+    /// `<root>/work/<backend>/<workspace_name>/`. `None` falls back
+    /// to the child session_id. Format: ASCII `[a-z0-9-]`, capped
+    /// at 32 chars. Deterministic — two spawns with the same input
+    /// share the same on-disk dir on purpose, so a sibling subagent
+    /// can pick up where another left off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_name: Option<String>,
+    /// Continue a prior subagent's session. The id MUST come from a
+    /// previous `SubagentResult.child_session_id` in this same parent
+    /// session. The router verifies parent + backend match before
+    /// routing the new task into the existing child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_session_id: Option<SessionId>,
 }
 
 impl SubagentSpawnRequest {
@@ -284,12 +306,20 @@ impl SubagentResult {
         }
     }
 
-    /// Backwards-compatible flat text rendering. New call sites should
-    /// reach for [`Self::split_for_parent`] so image attachments survive
-    /// the boundary; this stays for log/audit dumps where only text
-    /// matters.
+    /// Flat text rendering for the parent's synthetic `tool_result`.
+    /// On `Completed` with a real child session, appends a parseable
+    /// `[subagent_session_id: …]` tail so the parent can resume the
+    /// same child via `spawn_subagent(resume_session_id: …)`. Image
+    /// attachments are dropped — callers that need them reach for
+    /// [`Self::split_for_parent`].
     pub fn to_tool_result_text(&self) -> String {
-        self.split_for_parent().text
+        let body = self.split_for_parent().text;
+        let id = self.child_session_id.as_ref();
+        if matches!(self.status, SubagentExitStatus::Completed) && !id.is_empty() {
+            format!("{body}\n[subagent_session_id: {id}]")
+        } else {
+            body
+        }
     }
 }
 
@@ -317,9 +347,11 @@ mod tests {
             must_include_context: ctx.into_iter().map(String::from).collect(),
             timeout: Duration::from_secs(60),
             model_tier: None,
-            llm: None,
             background: false,
             fan_out_root: None,
+            backend: SubagentBackend::default(),
+            workspace_name: None,
+            resume_session_id: None,
         }
     }
 
@@ -339,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_text_completed_concatenates_text_blocks() {
+    fn tool_result_text_completed_concatenates_text_blocks_and_tails_session_id() {
         let r = SubagentResult {
             child_session_id: SessionId::from("child-1"),
             final_content: Some(vec![
@@ -348,7 +380,23 @@ mod tests {
             ]),
             status: SubagentExitStatus::Completed,
         };
-        assert_eq!(r.to_tool_result_text(), "line one\nline two");
+        let text = r.to_tool_result_text();
+        assert!(text.starts_with("line one\nline two"), "got: {text}");
+        assert!(
+            text.contains("[subagent_session_id: child-1]"),
+            "missing session-id tail: {text}",
+        );
+    }
+
+    #[test]
+    fn tool_result_text_failure_does_not_tail_session_id() {
+        let r = SubagentResult::failed("boom");
+        let text = r.to_tool_result_text();
+        assert!(text.contains("boom"));
+        assert!(
+            !text.contains("subagent_session_id"),
+            "failed result should not advertise a resume id: {text}",
+        );
     }
 
     #[test]

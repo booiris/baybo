@@ -1,15 +1,22 @@
 //! `/v1/traces` — trace browser endpoints.
 //!
-//! Two surfaces:
+//! Three surfaces:
 //!
 //! * `GET /v1/traces` — paginated, filtered list of session summaries
 //!   used by the trace browser table. Typed via [`TraceSessionSummary`]
 //!   so the OpenAPI/ts-rs surface picks it up.
-//! * `GET /v1/traces/{session_id}` — full per-session export. Stays
-//!   untyped JSON because the columnar Step/Span tree is polymorphic
-//!   and re-mirroring the closed enums in this crate would double the
-//!   surface for no benefit; the web client mirrors the trace types
-//!   directly.
+//! * `GET /v1/traces/{session_id}` — session overview: the full
+//!   `session_messages` log + job summaries (no step/span tree).
+//!   The client lazily fetches each job's tree via the third endpoint.
+//! * `GET /v1/traces/{session_id}/jobs/{job_id}` — per-job step/span
+//!   tree. Spans carry `LlmCallInputs::Persisted` references in their
+//!   original ordinal form; the client slices the message log it
+//!   already has from the overview call.
+//!
+//! Both per-session endpoints stay untyped `serde_json::Value` because
+//! the columnar Step/Span tree is polymorphic and re-mirroring the
+//! closed enums in this crate would double the surface for no benefit;
+//! the web client mirrors the trace types directly.
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -30,6 +37,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
     OpenApiRouter::new()
         .routes(routes!(list_traces))
         .routes(routes!(get_trace))
+        .routes(routes!(get_job_trace))
 }
 
 #[utoipa::path(
@@ -51,6 +59,7 @@ async fn list_traces(
         since: q.since,
         until: q.until,
         session_id_prefix: q.q.clone(),
+        kind: q.kind.map(Into::into),
     };
     let page = SessionSummaryPage {
         offset: q.offset.unwrap_or(0),
@@ -77,12 +86,12 @@ async fn list_traces(
     path = "/traces/{session_id}",
     tag = "traces",
     params(
-        ("session_id" = String, Path, description = "Session id whose trace to export"),
+        ("session_id" = String, Path, description = "Session id whose trace overview to fetch"),
     ),
     responses(
         (
             status = 200,
-            description = "Per-session trace tree: jobs, their steps, and the spans under each step. Untyped JSON to keep the admin surface decoupled from internal trace crate changes.",
+            description = "Per-session trace overview: session_messages log + job summaries (no step/span data). Untyped JSON to keep the admin surface decoupled from internal trace crate changes.",
             body = serde_json::Value,
             content_type = "application/json",
         ),
@@ -95,34 +104,91 @@ async fn get_trace(
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     let typed_session = aura_model::SessionId::from(session_id.as_str());
-    let replay = state
+    let overview = state
         .query_api
-        .replay(&typed_session, None)
+        .load_trace_overview(&typed_session)
         .await
         .map_err(|e| GatewayError::Trace(e.to_string()))?;
 
-    if replay.jobs.is_empty() {
+    if overview.jobs.is_empty() {
         return Err(GatewayError::NotFound(format!("trace {session_id}")));
     }
 
-    let job_blocks: Vec<serde_json::Value> = replay
+    let jobs: Vec<serde_json::Value> = overview
         .jobs
         .iter()
-        .map(|rj| {
+        .map(|j| {
+            let s = &j.summary;
             json!({
-                "job_id": rj.job.id.to_string(),
-                "job_status_kind": rj.job.status.kind().as_snake_case(),
-                "steps": rj
-                    .steps
-                    .iter()
-                    .map(|rs| json!({ "step": rs.step, "spans": rs.spans }))
-                    .collect::<Vec<_>>(),
+                "job_id": s.id.to_string(),
+                "session_id": s.session_id.as_str(),
+                "job_status_kind": s.status.kind().as_snake_case(),
+                "created_at": s.created_at,
+                "started_at": s.started_at,
+                "ended_at": s.ended_at,
+                "is_inherited": s.is_inherited,
+                "inherited_from_session_id": s.inherited_from_session_id.as_ref().map(|sid| sid.as_str()),
+                "input_tokens": j.input_tokens,
+                "output_tokens": j.output_tokens,
+                "cached_input_tokens": j.cached_input_tokens,
+                "cache_creation_input_tokens": j.cache_creation_input_tokens,
             })
         })
         .collect();
 
     Ok(Json(json!({
-        "session_id": session_id,
-        "jobs": job_blocks,
+        "session_id": overview.session_id.as_str(),
+        "session_messages": overview.session_messages,
+        "jobs": jobs,
+    })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/traces/{session_id}/jobs/{job_id}",
+    tag = "traces",
+    params(
+        ("session_id" = String, Path, description = "Session id this job belongs to (or inherits from); used for route scoping only"),
+        ("job_id" = String, Path, description = "Job id whose step/span tree to fetch"),
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Per-job step/span tree. `LlmCall` spans keep `input_messages` as `{ last_ordinal: i64 }` (Persisted) or `ChatMessage[]` (Inline); the client slices the message log it received from the overview call.",
+            body = serde_json::Value,
+            content_type = "application/json",
+        ),
+        (status = 400, description = "Invalid job id", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "No such job", body = ErrorBody),
+    )
+)]
+async fn get_job_trace(
+    State(state): State<AdminState>,
+    Path((_session_id, job_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    let parsed_job: aura_model::JobId = job_id
+        .parse()
+        .map_err(|e| GatewayError::BadRequest(format!("invalid job id: {e}")))?;
+    let job_trace = state
+        .query_api
+        .load_job_trace(&parsed_job)
+        .await
+        .map_err(|e| GatewayError::Trace(e.to_string()))?;
+
+    let steps: Vec<serde_json::Value> = job_trace
+        .steps
+        .iter()
+        .map(|rs| json!({ "step": rs.step, "spans": rs.spans }))
+        .collect();
+
+    Ok(Json(json!({
+        "job_id": job_trace.job.id.to_string(),
+        "session_id": job_trace.job.session_id.as_str(),
+        "job_status_kind": job_trace.job.status.kind().as_snake_case(),
+        "created_at": job_trace.job.created_at,
+        "started_at": job_trace.job.started_at,
+        "ended_at": job_trace.job.ended_at,
+        "steps": steps,
     })))
 }

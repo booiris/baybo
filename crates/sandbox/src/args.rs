@@ -88,10 +88,11 @@ pub fn build_bwrap_argv(
             // survive across calls (the host directory itself is the
             // persistence mechanism — usually a kernel tmpfs that
             // clears on reboot). Permissive mode is the Bash tool's
-            // policy; CodeBuilder uses `Workspace` and keeps its
-            // per-call tmpfs above. There is no per-session isolation:
-            // every sandboxed Bash call sees the same `/tmp` as the
-            // host user and any other agent session.
+            // policy; the `Workspace` variant above keeps a fresh
+            // per-call tmpfs for any future tool that opts into it.
+            // There is no per-session isolation: every sandboxed Bash
+            // call sees the same `/tmp` as the host user and any
+            // other agent session.
             push(&mut argv, "--bind");
             push(&mut argv, "/tmp");
             push(&mut argv, "/tmp");
@@ -160,10 +161,11 @@ pub(crate) fn resolve_env(spec: &SandboxSpec) -> Vec<(String, String)> {
     out.push(("HOME".into(), workspace));
     // Point temp env vars at the in-sandbox `/tmp` so callers that
     // respect $TMPDIR land on whatever the bwrap filesystem policy
-    // mapped there: a fresh per-call tmpfs (`Workspace`, used by
-    // CodeBuilder) or the host's `/tmp` bind (`Permissive`, used by
-    // Bash). The two policies have different persistence and isolation
-    // properties; see the bwrap branch above and `docs/modules/sandbox.md`.
+    // mapped there: a fresh per-call tmpfs (`Workspace`, no current
+    // production consumer) or the host's `/tmp` bind (`Permissive`,
+    // used by Bash). The two policies have different persistence and
+    // isolation properties; see the bwrap branch above and
+    // `docs/modules/sandbox.md`.
     out.push(("TMPDIR".into(), "/tmp".into()));
     out.push(("TMP".into(), "/tmp".into()));
     out.push(("TEMP".into(), "/tmp".into()));
@@ -747,9 +749,9 @@ mod tests {
 
     #[test]
     fn bwrap_argv_workspace_keeps_tmpfs_at_tmp() {
-        // Workspace mode (CodeBuilder) stays on per-call tmpfs. The
-        // Bash-only `Permissive` swap above must not bleed into the
-        // CodeBuilder policy.
+        // Workspace mode stays on per-call tmpfs. The Bash-only
+        // `Permissive` swap above must not bleed into the Workspace
+        // policy.
         let argv = build_bwrap_argv(&spec_for(NetworkPolicy::None, "/tmp/ws"), None);
         let strs = argv_strs(&argv);
         assert!(

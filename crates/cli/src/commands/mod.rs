@@ -6,6 +6,7 @@ pub mod config;
 pub mod cost;
 pub mod cron;
 pub mod doctor;
+pub mod external_agent;
 pub mod job;
 pub mod llm;
 pub mod log;
