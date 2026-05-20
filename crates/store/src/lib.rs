@@ -8,7 +8,9 @@
 //! libsql adapter, and keeps the dependency graph acyclic.
 
 pub mod error;
+pub mod memory;
 pub mod secret;
 
 pub use error::StorageError;
+pub use memory::MemoryStore;
 pub use secret::SecretStore;

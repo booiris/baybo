@@ -20,7 +20,7 @@ pub use aura_store::SecretStore;
 use aura_cost::CostStore;
 use aura_cron::CronStore;
 use aura_job::JobStore;
-use aura_memory::MemoryStore;
+use aura_store::MemoryStore;
 use aura_session::{SessionStore, SessionSummaryStore};
 use aura_trace::TraceStore;
 pub use retry::retry_on_busy;

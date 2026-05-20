@@ -18,7 +18,6 @@ aura-model = { workspace = true }
 aura-store = { workspace = true }
 aura-trace = { workspace = true }
 aura-job = { workspace = true }
-aura-memory = { workspace = true }
 aura-cost = { workspace = true }
 aura-cron = { workspace = true }
 aura-session = { workspace = true }

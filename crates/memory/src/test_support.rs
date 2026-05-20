@@ -11,8 +11,7 @@ use async_trait::async_trait;
 use aura_model::MemoryEntry;
 use parking_lot::Mutex;
 
-use crate::Result;
-use crate::store::MemoryStore;
+use aura_store::memory::{MemoryStore, Result};
 
 /// In-memory `MemoryStore` for tests. Keyed by `entry.id`. Search is a
 /// case-insensitive substring match against the entry's `content` —

@@ -11,13 +11,11 @@
 
 mod error;
 mod manager;
-mod store;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
 pub use error::MemoryError;
 pub use manager::MemoryManager;
-pub use store::MemoryStore;
 
 pub type Result<T> = std::result::Result<T, MemoryError>;

@@ -17,3 +17,13 @@ pub enum MemoryError {
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
+
+impl From<aura_store::StorageError> for MemoryError {
+    fn from(e: aura_store::StorageError) -> Self {
+        match e {
+            aura_store::StorageError::NotFound(s) => MemoryError::NotFound(s),
+            aura_store::StorageError::Internal(e) => MemoryError::Internal(e),
+            other => MemoryError::Storage(other.to_string()),
+        }
+    }
+}
