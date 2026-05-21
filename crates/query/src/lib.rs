@@ -47,14 +47,6 @@ pub enum QueryError {
 
 pub type Result<T> = std::result::Result<T, QueryError>;
 
-impl From<aura_store::StorageError> for QueryError {
-    // The only StorageError source reaching the query layer is the session
-    // store, so route it through SessionError.
-    fn from(e: aura_store::StorageError) -> Self {
-        QueryError::Session(e.into())
-    }
-}
-
 // ── DTOs ────────────────────────────────────────────────────────────
 
 /// Filter for `list_jobs`. All fields are AND-combined; `None` means
@@ -443,7 +435,7 @@ impl QueryApi {
     // ── 1. load_session ────────────────────────────────────────
 
     pub async fn load_session(&self, id: &SessionId) -> Result<Option<Session>> {
-        Ok(self.sessions.get(id).await?)
+        Ok(self.sessions.get(id).await.map_err(SessionError::from)?)
     }
 
     // ── 2. list_jobs (with fork-prefix UNION) ──────────────────
@@ -464,7 +456,11 @@ impl QueryApi {
             .collect();
 
         // If this is a UserFork session, prepend the source's prefix.
-        if let Some(session) = self.sessions.get(session_id).await?
+        if let Some(session) = self
+            .sessions
+            .get(session_id)
+            .await
+            .map_err(SessionError::from)?
             && let Some(Lineage {
                 parent_session_id,
                 kind: LineageKind::UserFork { fork_at_job_id, .. },
@@ -515,7 +511,8 @@ impl QueryApi {
         let steps = self
             .trace
             .list_steps_by_job(id)
-            .await?
+            .await
+            .map_err(TraceError::from)?
             .into_iter()
             .map(Step::from_row)
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -528,13 +525,15 @@ impl QueryApi {
         let step = Step::from_row(
             self.trace
                 .load_step(id)
-                .await?
+                .await
+                .map_err(TraceError::from)?
                 .ok_or_else(|| QueryError::NotFound(format!("step {id}")))?,
         )?;
         let mut spans = self
             .trace
             .list_spans_by_step(id)
-            .await?
+            .await
+            .map_err(TraceError::from)?
             .into_iter()
             .map(Span::from_row)
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -545,7 +544,8 @@ impl QueryApi {
                 let evs: Vec<SpanEvent> = self
                     .trace
                     .list_span_events(&span.id)
-                    .await?
+                    .await
+                    .map_err(TraceError::from)?
                     .into_iter()
                     .map(SpanEvent::from_row)
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -564,7 +564,11 @@ impl QueryApi {
     // ── 6. list_active_subagents ───────────────────────────────
 
     pub async fn list_active_subagents(&self, session_id: &SessionId) -> Result<Vec<SessionId>> {
-        let children = self.sessions.list_lineage_children(session_id).await?;
+        let children = self
+            .sessions
+            .list_lineage_children(session_id)
+            .await
+            .map_err(SessionError::from)?;
         let mut out = Vec::new();
         for (child_id, kind) in children {
             if !matches!(kind, LineageKind::Subagent) {
@@ -600,7 +604,11 @@ impl QueryApi {
             if depth >= MAX_DEPTH {
                 continue;
             }
-            let kids = self.sessions.list_lineage_children(&parent_id).await?;
+            let kids = self
+                .sessions
+                .list_lineage_children(&parent_id)
+                .await
+                .map_err(SessionError::from)?;
             for (cid, kind) in kids {
                 edges
                     .entry(parent_id.clone())
@@ -668,17 +676,21 @@ impl QueryApi {
         // `list_all` deliberately excludes; every other kind reads
         // user-facing rows only.
         let mut sessions = if matches!(filter.kind, Some(SessionKind::Compression)) {
-            let ids = self.sessions.list_all_maintenance_sessions().await?;
+            let ids = self
+                .sessions
+                .list_all_maintenance_sessions()
+                .await
+                .map_err(SessionError::from)?;
             let mut out = Vec::with_capacity(ids.len());
             for id in &ids {
-                if let Some(session) = self.sessions.get(id).await? {
+                if let Some(session) = self.sessions.get(id).await.map_err(SessionError::from)? {
                     out.push(session);
                 }
             }
             out.sort_by(|a, b| b.last_active.cmp(&a.last_active));
             out
         } else {
-            self.sessions.list_all().await?
+            self.sessions.list_all().await.map_err(SessionError::from)?
         };
 
         // Cheap filters first so we don't pay per-session aggregate
@@ -720,7 +732,8 @@ impl QueryApi {
                 let steps = self
                     .trace
                     .list_steps_by_job(&job.id)
-                    .await?
+                    .await
+                    .map_err(TraceError::from)?
                     .into_iter()
                     .map(Step::from_row)
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -728,7 +741,8 @@ impl QueryApi {
                     let spans = self
                         .trace
                         .list_spans_by_step(&step.id)
-                        .await?
+                        .await
+                        .map_err(TraceError::from)?
                         .into_iter()
                         .map(Span::from_row)
                         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -866,7 +880,7 @@ impl QueryApi {
 
         // sessions_created per day. Single SessionStore::list_all call;
         // sessions outside the range are skipped.
-        for s in self.sessions.list_all().await? {
+        for s in self.sessions.list_all().await.map_err(SessionError::from)? {
             if s.created_at < range.from || s.created_at >= range.to {
                 continue;
             }
@@ -918,7 +932,8 @@ impl QueryApi {
                     let steps = self
                         .trace
                         .list_steps_by_job(&s.id)
-                        .await?
+                        .await
+                        .map_err(TraceError::from)?
                         .into_iter()
                         .map(Step::from_row)
                         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -939,7 +954,8 @@ impl QueryApi {
             let mut steps = self
                 .trace
                 .list_steps_by_job(&job.id)
-                .await?
+                .await
+                .map_err(TraceError::from)?
                 .into_iter()
                 .map(Step::from_row)
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -949,7 +965,8 @@ impl QueryApi {
                 let mut spans = self
                     .trace
                     .list_spans_by_step(&step.id)
-                    .await?
+                    .await
+                    .map_err(TraceError::from)?
                     .into_iter()
                     .map(Span::from_row)
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -958,7 +975,8 @@ impl QueryApi {
                         span.events = self
                             .trace
                             .list_span_events(&span.id)
-                            .await?
+                            .await
+                            .map_err(TraceError::from)?
                             .into_iter()
                             .map(SpanEvent::from_row)
                             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1017,7 +1035,8 @@ impl QueryApi {
         let session_messages = self
             .sessions
             .load_session_messages_with_supersede(session_id)
-            .await?
+            .await
+            .map_err(SessionError::from)?
             .into_iter()
             .map(SessionMessageRow::from)
             .collect();
@@ -1073,7 +1092,8 @@ impl QueryApi {
         let mut steps = self
             .trace
             .list_steps_by_job(job_id)
-            .await?
+            .await
+            .map_err(TraceError::from)?
             .into_iter()
             .map(Step::from_row)
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1083,7 +1103,8 @@ impl QueryApi {
             let mut spans = self
                 .trace
                 .list_spans_by_step(&step.id)
-                .await?
+                .await
+                .map_err(TraceError::from)?
                 .into_iter()
                 .map(Span::from_row)
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1092,7 +1113,8 @@ impl QueryApi {
                     span.events = self
                         .trace
                         .list_span_events(&span.id)
-                        .await?
+                        .await
+                        .map_err(TraceError::from)?
                         .into_iter()
                         .map(SpanEvent::from_row)
                         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1135,7 +1157,8 @@ impl QueryApi {
         let log = self
             .sessions
             .load_session_messages_with_supersede(session_id)
-            .await?;
+            .await
+            .map_err(SessionError::from)?;
 
         for job in jobs.iter_mut() {
             for step in job.steps.iter_mut() {
@@ -1505,6 +1528,74 @@ mod tests {
         let cost_store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
         let lifecycle = Arc::new(JobLifecycle::new(job_store));
         QueryApi::new(sessions, lifecycle, trace_store, cost_store)
+    }
+
+    /// A `TraceStore` whose reads all fail with a storage error. Used to
+    /// prove a trace-store failure surfaces as `QueryError::Trace`, not
+    /// `QueryError::Session` — a regression guard against the blanket
+    /// `From<StorageError>` that once funnelled every store's failure into
+    /// the session variant.
+    struct FailingTraceStore;
+
+    #[async_trait::async_trait]
+    impl TraceStore for FailingTraceStore {
+        async fn save_step(&self, _: &aura_store::StepRow) -> aura_store::trace::Result<()> {
+            Ok(())
+        }
+        async fn load_step(
+            &self,
+            _: &StepId,
+        ) -> aura_store::trace::Result<Option<aura_store::StepRow>> {
+            Err(aura_store::StorageError::Storage("boom".into()))
+        }
+        async fn list_steps_by_job(
+            &self,
+            _: &JobId,
+        ) -> aura_store::trace::Result<Vec<aura_store::StepRow>> {
+            Err(aura_store::StorageError::Storage("boom".into()))
+        }
+        async fn save_span(&self, _: &aura_store::SpanRow) -> aura_store::trace::Result<()> {
+            Ok(())
+        }
+        async fn load_span(
+            &self,
+            _: &aura_model::SpanId,
+        ) -> aura_store::trace::Result<Option<aura_store::SpanRow>> {
+            Err(aura_store::StorageError::Storage("boom".into()))
+        }
+        async fn list_spans_by_step(
+            &self,
+            _: &StepId,
+        ) -> aura_store::trace::Result<Vec<aura_store::SpanRow>> {
+            Err(aura_store::StorageError::Storage("boom".into()))
+        }
+        async fn append_span_event(
+            &self,
+            _: &aura_store::SpanEventRow,
+        ) -> aura_store::trace::Result<()> {
+            Ok(())
+        }
+        async fn list_span_events(
+            &self,
+            _: &aura_model::SpanId,
+        ) -> aura_store::trace::Result<Vec<aura_store::SpanEventRow>> {
+            Err(aura_store::StorageError::Storage("boom".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_store_failure_surfaces_as_trace_error() {
+        let sessions: Arc<dyn SessionStore> = Arc::new(MemSessionStore::default());
+        let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
+        let trace: Arc<dyn TraceStore> = Arc::new(FailingTraceStore);
+        let cost: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        let api = QueryApi::new(sessions, lifecycle, trace, cost);
+
+        let err = api.load_step(&StepId::new()).await.unwrap_err();
+        assert!(
+            matches!(err, QueryError::Trace(_)),
+            "a trace-store failure must surface as QueryError::Trace, got {err:?}"
+        );
     }
 
     #[tokio::test]
