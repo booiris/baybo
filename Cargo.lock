@@ -397,6 +397,7 @@ dependencies = [
  "async-trait",
  "aura-model",
  "aura-store",
+ "aura-tools",
  "chrono",
  "chrono-tz",
  "cron",

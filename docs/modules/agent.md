@@ -102,7 +102,7 @@ Cron jobs flow through the Actor model and observability chain: `CronScheduler` 
 
 ### LLM-invocable cron tools
 
-`aura_cron::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule/cancel/inspect cron jobs mid-conversation. They live in `aura-cron` (not `aura-tools`) because they each hold `Arc<CronScheduler>`, and `aura-tools` cannot pull in `aura-cron` without creating a circular dependency. `src/main.rs` registers them after the scheduler is constructed, via `Arc::get_mut(&mut tool_registry)` while no other clones exist yet.
+`aura_cron::tools::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule/cancel/inspect cron jobs mid-conversation. They live in `aura-cron::tools` (not `aura-tools`) because they each hold `Arc<CronScheduler>`, and `aura-tools` cannot depend on `aura-cron` without creating a cycle. `src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
 
 ### Startup recovery
 
