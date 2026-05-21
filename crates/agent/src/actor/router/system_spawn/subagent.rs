@@ -61,14 +61,13 @@ impl Router {
         };
 
         match request.backend.clone() {
-            SubagentBackend::Aura { llm } => {
+            SubagentBackend::Aura => {
                 self.spawn_aura_subagent(
                     parent,
                     parent_job_id,
                     parent_span_id,
                     parent_actor_token,
                     request,
-                    llm,
                     result_tx,
                 )
                 .await
@@ -91,7 +90,6 @@ impl Router {
     /// In-process backend: spawn a full `AgentActor` for the child.
     /// Supports `background` fire-and-forget dispatch (result escorted
     /// back to the parent's mailbox) and resume of a prior Aura child.
-    #[allow(clippy::too_many_arguments)]
     async fn spawn_aura_subagent(
         &mut self,
         parent: Session,
@@ -99,7 +97,6 @@ impl Router {
         parent_span_id: SpanId,
         parent_actor_token: CancellationToken,
         request: SubagentSpawnRequest,
-        llm: Option<String>,
         result_tx: oneshot::Sender<SubagentResult>,
     ) -> anyhow::Result<()> {
         let fan_out_root = request.fan_out_root.clone();
@@ -142,16 +139,13 @@ impl Router {
         };
         let child_session_id = child_session.id.clone();
         let timeout = request.timeout;
-        // Tier resolution: explicit `backend = Aura { llm }` > `model_tier`
-        // lookup > pool default (the last handled inside the spawner
-        // closure when `None` is passed). The tool already merged the
-        // profile's default_tier into `model_tier`, so this is the final
-        // step.
-        let llm = llm.or_else(|| {
-            request
-                .model_tier
-                .and_then(|t| self.llm_pool.resolve_tier(t))
-        });
+        // Tier resolution: `model_tier` lookup, falling through to the
+        // pool default (handled inside the spawner closure when `None`
+        // is passed). The tool already merged the profile's default_tier
+        // into `model_tier`, so this is the final step.
+        let llm = request
+            .model_tier
+            .and_then(|t| self.llm_pool.resolve_tier(t));
         let system_prompt_override = Some(request.system_prompt.clone());
         let background = request.background;
         let subagent_type = request.subagent_type.clone();

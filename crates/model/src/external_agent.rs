@@ -58,22 +58,14 @@ impl ExternalAgentKind {
 /// `External` is one-shot and routes to the matching `ExternalAgent`
 /// impl registered at boot. No `AgentActor` is built; the agent's
 /// stream of events is piped straight back to the parent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SubagentBackend {
-    Aura {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        llm: Option<String>,
-    },
+    #[default]
+    Aura,
     External {
         external_kind: ExternalAgentKind,
     },
-}
-
-impl Default for SubagentBackend {
-    fn default() -> Self {
-        Self::Aura { llm: None }
-    }
 }
 
 impl SubagentBackend {
@@ -83,7 +75,7 @@ impl SubagentBackend {
     /// router after the child Session exists.
     pub fn kind(&self) -> SubagentBackendKind {
         match self {
-            Self::Aura { .. } => SubagentBackendKind::Aura,
+            Self::Aura => SubagentBackendKind::Aura,
             Self::External { external_kind } => SubagentBackendKind::External(*external_kind),
         }
     }

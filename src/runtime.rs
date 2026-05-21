@@ -743,8 +743,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // user-channel actors always run on `default-llm`.
                 // `initial_llm` is `Some` only when the router's subagent
                 // handler resolved a model for the child (from the spawn
-                // request's `backend = Aura { llm }` or `model_tier`) and
-                // forwarded it here.
+                // request's `model_tier`) and forwarded it here.
 
                 // Subagent profiles replace Soul wholesale; user / cron /
                 // background-compression spawns pass `None` and inherit

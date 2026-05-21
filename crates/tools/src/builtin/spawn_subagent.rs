@@ -148,8 +148,6 @@ struct SpawnParams {
     #[serde(default)]
     model_tier: Option<String>,
     #[serde(default)]
-    llm: Option<String>,
-    #[serde(default)]
     background: bool,
     #[serde(default)]
     workspace_name: Option<String>,
@@ -235,18 +233,11 @@ fn parse_spawn_request(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(sanitize_workspace_name);
-    let llm = p.llm.filter(|s| !s.trim().is_empty());
     let backend = match p.backend.as_deref().map(str::trim) {
-        None | Some("") => SubagentBackend::Aura { llm },
-        Some(t) if t == AURA_BACKEND_TAG => SubagentBackend::Aura { llm },
+        None | Some("") => SubagentBackend::Aura,
+        Some(t) if t == AURA_BACKEND_TAG => SubagentBackend::Aura,
         Some(other) => {
             if let Some(kind) = ExternalAgentKind::parse(other) {
-                if llm.is_some() {
-                    return Err(format!(
-                        "`llm` is not valid when backend={other:?}; external backends have no \
-                         LLM-entry choice"
-                    ));
-                }
                 SubagentBackend::External {
                     external_kind: kind,
                 }
@@ -525,16 +516,12 @@ fn parameters_schema() -> Value {
             "model_tier": {
                 "type": "string",
                 "enum": ["fast", "balanced", "deep"],
-                "description": "Coarse model selection. Falls back to the profile's default_tier, then the pool default. Beaten by `llm` if set. Only applies to backend='aura'."
+                "description": "Coarse model selection. Falls back to the profile's default_tier, then the pool default. Only applies to backend='aura'."
             },
             "backend": {
                 "type": "string",
                 "enum": ["aura", "claude", "codex"],
                 "description": "Backend that runs the subagent. 'aura' (default) spawns a full in-process aura agent that uses the configured LLMs/tools/skills. 'claude' delegates to a local Claude Code subprocess; 'codex' delegates to OpenAI's codex CLI — both are one-shot, run their own internal tool loops with bypassed permissions, and are best for heavy autonomous tasks where you want claude/codex (not aura) to drive."
-            },
-            "llm": {
-                "type": "string",
-                "description": "Explicit `aura.json` llm entry name. Super-escape that overrides `model_tier`. Only valid when backend='aura'; external backends have no LLM-entry choice."
             },
             "background": {
                 "type": "boolean",
@@ -886,8 +873,8 @@ mod tests {
         assert!(req.system_prompt.contains("subagent"));
         assert!(!req.background);
         assert!(
-            matches!(&req.backend, SubagentBackend::Aura { llm: None }),
-            "default backend should be Aura with no llm override, got {:?}",
+            matches!(&req.backend, SubagentBackend::Aura),
+            "default backend should be Aura, got {:?}",
             req.backend
         );
         assert_eq!(parent_id.as_ref(), "parent-sess");
@@ -1444,20 +1431,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_spawn_request_backend_claude_rejects_llm() {
-        // Strict shape: claude has no aura.json[llm] choice.
-        let reg = registry_with_builtins();
-        let v = json!({
-            "subagent_type": "general-purpose",
-            "description": "x",
-            "prompt": "x",
-            "backend": "claude",
-            "llm": "fast",
-        });
-        assert!(parse_spawn_request(&v, &reg).is_err());
-    }
-
-    #[test]
     fn parse_spawn_request_unknown_backend_rejected() {
         let reg = registry_with_builtins();
         let v = json!({
@@ -1514,24 +1487,6 @@ mod tests {
         });
         let desc = tool.description_for_llm().expect("dynamic description");
         assert!(desc.contains("none registered"));
-    }
-
-    #[test]
-    fn parse_spawn_request_treats_blank_llm_as_unset() {
-        let reg = registry_with_builtins();
-        for blank in ["", "   ", "\t"] {
-            let v = json!({
-                "subagent_type": "general-purpose",
-                "description": "x",
-                "prompt": "x",
-                "llm": blank,
-            });
-            let req = parse_spawn_request(&v, &reg).unwrap().request;
-            match req.backend {
-                SubagentBackend::Aura { llm } => assert_eq!(llm, None, "blank {blank:?}"),
-                other => panic!("expected Aura, got {other:?}"),
-            }
-        }
     }
 
     #[test]

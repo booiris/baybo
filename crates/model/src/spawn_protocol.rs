@@ -122,9 +122,9 @@ pub struct SubagentSpawnRequest {
     pub must_include_context: Vec<String>,
     pub timeout: Duration,
     /// Coarse model tier for the Aura backend. Resolution precedence
-    /// (highest first): explicit `backend = Aura { llm }` → this field
-    /// → profile's `default_tier` → pool default. Ignored for the
-    /// External backend, which runs its own model.
+    /// (highest first): this field → profile's `default_tier` → pool
+    /// default. Ignored for the External backend, which runs its own
+    /// model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_tier: Option<ModelTier>,
     /// Fire-and-forget mode. When `true` the router surfaces a handle
