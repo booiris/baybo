@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use aura_model::{JobId, SessionId};
 use parking_lot::Mutex;
 
-use crate::store::CostError;
+use crate::error::CostError;
 use aura_model::{CostRecord, CostSummary, TimeRange};
 use aura_store::cost::{CostStore, Result as CostResult};
 

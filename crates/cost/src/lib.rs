@@ -6,13 +6,13 @@
 //!
 //! `aura-storage` provides the libsql implementation of `CostStore`.
 
+mod error;
 mod manager;
-mod store;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
 pub use aura_model::{CostRecord, CostSummary, TimeRange};
 pub use aura_store::CostStore;
+pub use error::{CostError, CostResult};
 pub use manager::{CostGuardError, CostManager, CostMetrics, SpendingLimits, cost_call_guard};
-pub use store::{CostError, CostResult};
