@@ -319,7 +319,7 @@ mod tests {
         );
         job.status = JobStatus::InProgress;
         job.started_at = Some(started);
-        store.create(&job).await.unwrap();
+        store.create(&job.to_row().unwrap()).await.unwrap();
         let lifecycle = Arc::new(JobLifecycle::new(store));
         (lifecycle, job)
     }
@@ -505,7 +505,7 @@ mod tests {
             None,
         );
         job.created_at = t0;
-        store.create(&job).await.unwrap();
+        store.create(&job.to_row().unwrap()).await.unwrap();
         let lifecycle = Arc::new(JobLifecycle::new(store));
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
@@ -532,7 +532,7 @@ mod tests {
         job.status = JobStatus::Completed;
         job.started_at = Some(t0);
         job.ended_at = Some(t0 + Duration::seconds(10));
-        store.create(&job).await.unwrap();
+        store.create(&job.to_row().unwrap()).await.unwrap();
         let lifecycle = Arc::new(JobLifecycle::new(store));
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 

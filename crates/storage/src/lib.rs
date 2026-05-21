@@ -12,9 +12,9 @@ pub use aura_store::{ChannelBotRow, ChannelBotStore};
 pub use aura_store::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
 pub use error::StorageError;
 
-use aura_job::JobStore;
 use aura_store::CostStore;
 use aura_store::CronStore;
+use aura_store::JobStore;
 use aura_store::MemoryStore;
 pub use aura_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 use aura_store::{SessionStore, SessionSummaryStore};
