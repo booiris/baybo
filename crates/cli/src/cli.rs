@@ -77,13 +77,6 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: SkillsCmd,
     },
-    /// Inspect typed subagent profiles + in-flight fan-out: `list`,
-    /// `info <name>`, `in-flight`. Read-only. Mirrors `aura skills`
-    /// for the subagent catalogue introduced by `spawn_subagent`.
-    Agents {
-        #[command(subcommand)]
-        cmd: AgentsCmd,
-    },
     /// Manage channel bots (Telegram/Slack/Discord/…): `list` the
     /// registered bots, `add` an interactive registration flow,
     /// `remove` deregisters and cleans up the vault token.
@@ -291,32 +284,6 @@ pub enum ConfigCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AgentsCmd {
-    /// List registered subagent profile names with default tier.
-    List,
-    /// Show a profile's metadata (system prompt body, description,
-    /// default tier, source).
-    Info {
-        /// Profile name.
-        name: String,
-    },
-    /// Case-insensitive substring search over name + description.
-    /// Omit `query` to return every profile.
-    Search {
-        /// Substring to match.
-        query: Option<String>,
-    },
-    /// Snapshot the live fan-out limiter: in-flight subagent count
-    /// per root session. Reads the process-wide counter shared
-    /// between `spawn_subagent` (reserves at dispatch) and the
-    /// router (releases on terminal). `aura agents in-flight` from a
-    /// one-shot argv invocation returns "(no live runtime)" because
-    /// the limiter is only populated when the agent process is
-    /// running.
-    InFlight,
 }
 
 #[derive(Debug, Subcommand)]

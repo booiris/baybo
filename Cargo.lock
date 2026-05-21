@@ -309,7 +309,6 @@ dependencies = [
  "aura-skills",
  "aura-skills-assessor",
  "aura-storage",
- "aura-subagent",
  "aura-tools",
  "aura-trace",
  "aura-tui",
