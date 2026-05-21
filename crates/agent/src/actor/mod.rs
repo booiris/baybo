@@ -233,6 +233,7 @@ impl AgentActor {
         content: Vec<ContentBlock>,
         parent_job_id: Option<aura_model::JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
+        background_notice: Option<String>,
     ) -> anyhow::Result<OutgoingMessage> {
         self.volatile
             .agent_loop
@@ -244,6 +245,7 @@ impl AgentActor {
                 &self.volatile.span_recorder,
                 parent_job_id,
                 delta_tx,
+                background_notice,
                 self.volatile.actor_token.child_token(),
             )
             .await
@@ -269,7 +271,7 @@ impl AgentActor {
             "[{source}:{source_id}] {prompt}"
         ))];
         let response = self
-            .run_agent_loop(job_input, content, parent_job_id, None)
+            .run_agent_loop(job_input, content, parent_job_id, None, None)
             .await?;
         self.send_response(AgentOutput::Message(response), source)
             .await;
@@ -282,16 +284,13 @@ impl AgentActor {
             return self.handle_compact().await;
         }
         // Drain any background `spawn_subagent` results that landed
-        // between this turn and the previous one — they get prepended
-        // to the parent LLM's next turn as a synthetic "[background
-        // notifications: …]" preamble so the model sees the work that
-        // completed off-thread before reading the user's new message.
-        // We persist immediately after draining so a crash mid-turn
-        // can't replay the same notifications on the next attempt.
-        let had_pending =
-            !self.durable.session.state.pending_subagent_results.is_empty();
-        let content = self.drain_pending_subagent_notice_into(content);
-        if had_pending {
+        // between this turn and the previous one. They're injected as a
+        // separate context message ahead of the user's turn (NOT merged
+        // into the user's content — that would mask a leading `/command`
+        // from slash detection). We persist immediately after draining so
+        // a crash mid-turn can't replay the same notifications.
+        let background_notice = self.drain_pending_subagent_notice();
+        if background_notice.is_some() {
             self.persist_session_state_after_pending_change("user_input_drain")
                 .await;
         }
@@ -307,6 +306,7 @@ impl AgentActor {
                 content,
                 None,
                 Some(response_tx),
+                background_notice,
             )
             .await?;
         self.send_response(AgentOutput::Message(response), "user")
@@ -380,13 +380,15 @@ impl AgentActor {
     /// Drain pending background results into a system-reminder text
     /// block prepended to `content`. Returns `content` unchanged when
     /// the buffer is empty so callers don't pay the allocation.
-    fn drain_pending_subagent_notice_into(
-        &mut self,
-        content: Vec<ContentBlock>,
-    ) -> Vec<ContentBlock> {
+    /// Drain any background `spawn_subagent` results into a formatted
+    /// notice body, or `None` when there are none. Returned as a
+    /// standalone string — NOT merged into the user's content — so the
+    /// agent loop can inject it as its own context message; merging it
+    /// would push a leading `/command` out of slash-detection range.
+    fn drain_pending_subagent_notice(&mut self) -> Option<String> {
         let pending = std::mem::take(&mut self.durable.session.state.pending_subagent_results);
         if pending.is_empty() {
-            return content;
+            return None;
         }
         let mut body = String::from(BACKGROUND_NOTIFICATIONS_PREAMBLE);
         for p in &pending {
@@ -401,10 +403,7 @@ impl AgentActor {
             ));
         }
         body.push_str(BACKGROUND_NOTIFICATIONS_POSTAMBLE);
-        let mut new_content: Vec<ContentBlock> = Vec::with_capacity(content.len() + 1);
-        new_content.push(ContentBlock::Text(body));
-        new_content.extend(content);
-        new_content
+        Some(body)
     }
 
     /// `/compact` is a control command, not an assistant turn, so the
@@ -452,6 +451,7 @@ impl AgentActor {
                 content,
                 Some(parent_job_id),
                 Some(response_tx),
+                None,
             )
             .await?;
         self.send_response(AgentOutput::Message(response), "subagent")

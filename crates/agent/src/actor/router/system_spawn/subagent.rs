@@ -186,34 +186,9 @@ impl Router {
         }
 
         if background {
-            let handle_id = format!(
-                "{}{}",
-                BACKGROUND_SUBAGENT_HANDLE_PREFIX,
-                uuid::Uuid::new_v4()
-            );
-            let ack_text = format!(
-                "[background subagent dispatched]\n- handle: {handle_id}\n- subagent_type: {subagent_type}\n- child_session: {child_session_id}\n\nThe runtime will surface the subagent's final message as a system reminder prepended to your next user turn."
-            );
-            let ack = SubagentResult {
-                child_session_id: child_session_id.clone(),
-                final_content: Some(vec![ContentBlock::Text(ack_text)]),
-                status: SubagentExitStatus::Completed,
-            };
-            let _ = result_tx.send(ack);
-
-            // Pin the parent against the idle reaper for the
-            // duration of the background child; the wait task below
-            // clears the counter on every terminal path.
-            self.supervisor
-                .note_background_subagent_started(&parent.id);
-            if let Err(e) = self.session_manager.touch(&parent.id).await {
-                warn!(
-                    parent_session_id = %parent.id,
-                    error = %e,
-                    "background spawn: failed to touch parent session"
-                );
-            }
-
+            let handle_id = self
+                .ack_background_dispatch(&parent.id, &child_session_id, &subagent_type, result_tx)
+                .await;
             let job_lifecycle = Arc::clone(&self.job_lifecycle);
             let supervisor = self.supervisor.clone();
             let parent_id_for_task = parent.id.clone();
@@ -230,21 +205,17 @@ impl Router {
                     job_lifecycle,
                 )
                 .await;
-                deliver_background_result(
+                escort_background_terminal(
                     &supervisor,
                     &parent_id_for_task,
                     handle_id,
                     subagent_type,
                     task_summary,
                     result,
+                    &limiter_for_task,
+                    &fan_out_root_for_task,
                 )
                 .await;
-                // Clear the per-parent reaper counter only AFTER the
-                // SubagentFinished message has reached the mailbox, so
-                // the reaper can't tear the parent down in the window
-                // between terminal-observe and deliver.
-                supervisor.note_background_subagent_finished(&parent_id_for_task);
-                release_reserved_slot(limiter_for_task.as_ref(), &fan_out_root_for_task);
             });
             return Ok(());
         }
@@ -325,9 +296,15 @@ impl Router {
             .join(kind.as_str())
             .join(dir_name);
 
-        let actor_token = parent_actor_token.child_token();
-        let task = request.initial_prompt();
-        let timeout = request.timeout;
+        // Background external runs anchor to the process-wide token so
+        // they outlive the dispatching turn (claude/codex runs are long
+        // — that's the point of background here); the foreground path
+        // stays bound to the parent's per-job token.
+        let actor_token = if request.background {
+            self.actor_parent_token.child_token()
+        } else {
+            parent_actor_token.child_token()
+        };
         let child_session_id = child_session.id.clone();
         let session_manager = Arc::clone(&self.session_manager);
         let job_ctx = ExternalJobCtx {
@@ -339,18 +316,58 @@ impl Router {
             parent_job_id,
         };
         let limiter_for_task = Arc::clone(&self.dispatch_limiter);
+        let external_request = ExternalAgentRequest {
+            task: request.initial_prompt(),
+            workspace_dir,
+            resume_key,
+            cancel: actor_token,
+            timeout: request.timeout,
+        };
+
+        if request.background {
+            let handle_id = self
+                .ack_background_dispatch(
+                    &parent.id,
+                    &child_session_id,
+                    &request.subagent_type,
+                    result_tx,
+                )
+                .await;
+            let supervisor = self.supervisor.clone();
+            let parent_id_for_task = parent.id.clone();
+            let subagent_type = request.subagent_type.clone();
+            let task_summary = request.task_summary.clone();
+            let fan_out_root_for_task = fan_out_root.clone();
+            tokio::spawn(async move {
+                let result = run_external_agent_job(
+                    agent,
+                    kind,
+                    external_request,
+                    child_session_id.clone(),
+                    session_manager,
+                    job_ctx,
+                )
+                .await;
+                escort_background_terminal(
+                    &supervisor,
+                    &parent_id_for_task,
+                    handle_id,
+                    subagent_type,
+                    task_summary,
+                    result,
+                    &limiter_for_task,
+                    &fan_out_root_for_task,
+                )
+                .await;
+            });
+            return Ok(());
+        }
 
         tokio::spawn(async move {
             let result = run_external_agent_job(
                 agent,
                 kind,
-                ExternalAgentRequest {
-                    task,
-                    workspace_dir,
-                    resume_key,
-                    cancel: actor_token,
-                    timeout,
-                },
+                external_request,
                 child_session_id.clone(),
                 session_manager,
                 job_ctx,
@@ -364,6 +381,42 @@ impl Router {
 
     fn release_fan_out_slot(&self, root: &Option<SessionId>) {
         release_reserved_slot(self.dispatch_limiter.as_ref(), root);
+    }
+
+    /// Send the immediate "[background subagent dispatched]" ack to the
+    /// parent's tool boundary and pin the parent against the idle reaper
+    /// for the lifetime of the background child. Returns the synthetic
+    /// handle id stamped on the ack (and later on the escorted result).
+    /// Shared by the Aura and External background paths.
+    async fn ack_background_dispatch(
+        &self,
+        parent_id: &SessionId,
+        child_session_id: &SessionId,
+        subagent_type: &str,
+        result_tx: oneshot::Sender<SubagentResult>,
+    ) -> String {
+        let handle_id = format!(
+            "{}{}",
+            BACKGROUND_SUBAGENT_HANDLE_PREFIX,
+            uuid::Uuid::new_v4()
+        );
+        let ack_text = format!(
+            "[background subagent dispatched]\n- handle: {handle_id}\n- subagent_type: {subagent_type}\n- child_session: {child_session_id}\n\nThe runtime will surface the subagent's final message as a system reminder prepended to your next user turn."
+        );
+        let _ = result_tx.send(SubagentResult {
+            child_session_id: child_session_id.clone(),
+            final_content: Some(vec![ContentBlock::Text(ack_text)]),
+            status: SubagentExitStatus::Completed,
+        });
+        self.supervisor.note_background_subagent_started(parent_id);
+        if let Err(e) = self.session_manager.touch(parent_id).await {
+            warn!(
+                parent_session_id = %parent_id,
+                error = %e,
+                "background spawn: failed to touch parent session"
+            );
+        }
+        handle_id
     }
 
     /// Returns the child Session — loading an existing one when
@@ -392,7 +445,9 @@ impl Router {
                     )));
                 }
             };
-            if let Err(reason) = validate_resume_session(&child, parent, backend) {
+            if let Err(reason) =
+                validate_resume_session(&child, parent, backend, &request.subagent_type)
+            {
                 return Err(SubagentResult::failed(reason));
             }
             Ok(child)
@@ -430,6 +485,7 @@ impl Router {
                     }
                 }
             });
+            child.state.subagent_type = Some(request.subagent_type.clone());
             if let Err(e) = self.session_manager.store().save(&child).await {
                 return Err(SubagentResult::failed(format!(
                     "persist subagent identity on {}: {e}",
@@ -454,10 +510,33 @@ fn release_reserved_slot(
     }
 }
 
+/// Terminal tail shared by both background backends: escort the result
+/// to the parent's mailbox, THEN clear the reaper counter and release
+/// the fan-out slot. The clear must happen AFTER the escort so the
+/// reaper can't tear the parent down in the window between
+/// terminal-observe and delivery.
+#[allow(clippy::too_many_arguments)]
+async fn escort_background_terminal(
+    supervisor: &AgentSupervisor,
+    parent_id: &SessionId,
+    handle_id: String,
+    subagent_type: String,
+    task_summary: String,
+    result: SubagentResult,
+    limiter: &Arc<dyn aura_tools::SubagentDispatchLimiter>,
+    fan_out_root: &Option<SessionId>,
+) {
+    deliver_background_result(supervisor, parent_id, handle_id, subagent_type, task_summary, result)
+        .await;
+    supervisor.note_background_subagent_finished(parent_id);
+    release_reserved_slot(limiter.as_ref(), fan_out_root);
+}
+
 fn validate_resume_session(
     child: &Session,
     parent: &Session,
     backend: aura_model::SubagentBackendKind,
+    request_subagent_type: &str,
 ) -> Result<(), String> {
     let resume_id = &child.id;
     if child.hidden {
@@ -492,6 +571,18 @@ fn validate_resume_session(
             "resume_session_id {resume_id:?} was created with backend={}; cannot resume as backend={}",
             stored.kind().label(),
             backend.label(),
+        ));
+    }
+    // Profile identity is pinned at genesis: a child spawned as one
+    // `subagent_type` can't be resumed as another, which would run a
+    // different profile's prompt/contract over the existing transcript.
+    // `None` (pre-pin rows) can't be checked.
+    if let Some(stored_type) = child.state.subagent_type.as_deref()
+        && stored_type != request_subagent_type
+    {
+        return Err(format!(
+            "resume_session_id {resume_id:?} was spawned as subagent_type {stored_type:?}; \
+             cannot resume it as {request_subagent_type:?} (different profile)"
         ));
     }
     // External resume requires the persisted resume_key. If `None`,
@@ -930,7 +1021,7 @@ mod resume_validation_tests {
         let parent = mk_parent("p");
         let mut child = mk_child("c", "p", LineageKind::Subagent, Some(aura_tag()));
         child.hidden = true;
-        let err = validate_resume_session(&child, &parent, aura_request())
+        let err = validate_resume_session(&child, &parent, aura_request(), "general-purpose")
             .expect_err("hidden child must reject");
         assert!(err.contains("hidden"), "got: {err}");
     }
@@ -940,7 +1031,7 @@ mod resume_validation_tests {
         let parent = mk_parent("p");
         let mut child = mk_parent("c");
         child.lineage = None;
-        let err = validate_resume_session(&child, &parent, aura_request())
+        let err = validate_resume_session(&child, &parent, aura_request(), "general-purpose")
             .expect_err("non-subagent child must reject");
         assert!(err.contains("is not a subagent"), "got: {err}");
     }
@@ -954,7 +1045,7 @@ mod resume_validation_tests {
             LineageKind::Subagent,
             Some(aura_tag()),
         );
-        let err = validate_resume_session(&child, &parent, aura_request())
+        let err = validate_resume_session(&child, &parent, aura_request(), "general-purpose")
             .expect_err("foreign-parent child must reject");
         assert!(err.contains("different parent"), "got: {err}");
     }
@@ -963,7 +1054,7 @@ mod resume_validation_tests {
     fn rejects_non_subagent_lineage_kind() {
         let parent = mk_parent("p");
         let child = mk_child("c", "p", LineageKind::SystemMaintenance, Some(aura_tag()));
-        let err = validate_resume_session(&child, &parent, aura_request())
+        let err = validate_resume_session(&child, &parent, aura_request(), "general-purpose")
             .expect_err("non-Subagent lineage must reject");
         assert!(err.contains("Subagent lineage"), "got: {err}");
     }
@@ -975,7 +1066,7 @@ mod resume_validation_tests {
         // tag, no inference fallback.
         let parent = mk_parent("p");
         let child = mk_child("c", "p", LineageKind::Subagent, None);
-        let err = validate_resume_session(&child, &parent, aura_request())
+        let err = validate_resume_session(&child, &parent, aura_request(), "general-purpose")
             .expect_err("untagged child must reject");
         assert!(err.contains("no recorded subagent_backend"), "got: {err}");
     }
@@ -990,7 +1081,7 @@ mod resume_validation_tests {
             LineageKind::Subagent,
             Some(claude_tag(Some("uuid"))),
         );
-        let err = validate_resume_session(&child, &parent, aura_request())
+        let err = validate_resume_session(&child, &parent, aura_request(), "general-purpose")
             .expect_err("backend mismatch must reject");
         assert!(err.contains("backend="), "got: {err}");
         assert!(err.contains("claude"), "got: {err}");
@@ -1001,7 +1092,7 @@ mod resume_validation_tests {
         // Reverse mismatch: child tagged Aura, resumed as External.
         let parent = mk_parent("p");
         let child = mk_child("c", "p", LineageKind::Subagent, Some(aura_tag()));
-        let err = validate_resume_session(&child, &parent, claude_request())
+        let err = validate_resume_session(&child, &parent, claude_request(), "general-purpose")
             .expect_err("aura tag must not pass for external resume");
         assert!(err.contains("backend="), "got: {err}");
     }
@@ -1015,7 +1106,7 @@ mod resume_validation_tests {
             LineageKind::Subagent,
             Some(claude_tag(Some("claude-uuid"))),
         );
-        validate_resume_session(&child, &parent, claude_request())
+        validate_resume_session(&child, &parent, claude_request(), "general-purpose")
             .expect("matching tag + persisted resume_key must accept");
     }
 
@@ -1028,7 +1119,7 @@ mod resume_validation_tests {
         // spawn fresh.
         let parent = mk_parent("p");
         let child = mk_child("c", "p", LineageKind::Subagent, Some(claude_tag(None)));
-        let err = validate_resume_session(&child, &parent, claude_request())
+        let err = validate_resume_session(&child, &parent, claude_request(), "general-purpose")
             .expect_err("missing resume_key must reject");
         assert!(err.contains("no persisted"), "got: {err}");
         assert!(err.contains("claude"), "got: {err}");
@@ -1038,7 +1129,30 @@ mod resume_validation_tests {
     fn aura_accepts_fresh_aura_child() {
         let parent = mk_parent("p");
         let child = mk_child("c", "p", LineageKind::Subagent, Some(aura_tag()));
-        validate_resume_session(&child, &parent, aura_request())
+        validate_resume_session(&child, &parent, aura_request(), "general-purpose")
             .expect("aura→aura with matching tag must accept");
+    }
+
+    #[test]
+    fn rejects_resume_with_mismatched_subagent_type() {
+        // A child spawned as `planner` can't be resumed as
+        // `general-purpose` — that would run a different profile's
+        // prompt over the existing transcript.
+        let parent = mk_parent("p");
+        let mut child = mk_child("c", "p", LineageKind::Subagent, Some(aura_tag()));
+        child.state.subagent_type = Some("planner".into());
+        let err = validate_resume_session(&child, &parent, aura_request(), "general-purpose")
+            .expect_err("profile swap must reject");
+        assert!(err.contains("planner"), "got: {err}");
+        assert!(err.contains("general-purpose"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_resume_with_matching_subagent_type() {
+        let parent = mk_parent("p");
+        let mut child = mk_child("c", "p", LineageKind::Subagent, Some(aura_tag()));
+        child.state.subagent_type = Some("planner".into());
+        validate_resume_session(&child, &parent, aura_request(), "planner")
+            .expect("matching subagent_type must accept");
     }
 }

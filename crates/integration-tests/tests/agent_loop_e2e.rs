@@ -452,8 +452,9 @@ async fn background_subagent_finished_is_persisted_and_drained_on_next_turn() {
     harness.send_text("anything").await.unwrap();
     let _ = harness.drain_outputs(Duration::from_millis(500)).await;
 
-    // The LLM call captured the user-side message; its first text
-    // block carries the preamble + the user's text.
+    // The drained notice is injected as its own user-role context
+    // message ahead of the user's turn (no longer merged into the
+    // user's content), so it's the first user message the LLM sees.
     let captured = harness.stub_llm.captured_requests();
     assert!(
         !captured.is_empty(),

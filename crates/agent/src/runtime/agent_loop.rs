@@ -329,6 +329,7 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         parent_job_id: Option<JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
+        background_notice: Option<String>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
         // `job_input` records why this job exists (provenance: which
@@ -357,6 +358,7 @@ impl AgentLoop {
                         span_recorder,
                         job_id,
                         delta_tx,
+                        background_notice,
                         cancel_token,
                     )
                     .await?;
@@ -378,6 +380,7 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
+        background_notice: Option<String>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
         let _ = job_lifecycle;
@@ -394,6 +397,19 @@ impl AgentLoop {
                 channel: session.channel.clone(),
             }) as Arc<dyn aura_tools::SessionNotifier>
         });
+
+        // Background-subagent notice (work that finished off-thread since
+        // the parent's last turn) is appended as its own context message
+        // ahead of the user's — never merged into `user_content`, which
+        // would push a leading `/command` past slash detection below.
+        if let Some(notice) = background_notice {
+            let notice_msg = ChatMessage {
+                role: Role::User,
+                content: vec![ContentBlock::Text(notice)],
+                from_user: false,
+            };
+            self.append_context_message(session, &notice_msg).await?;
+        }
 
         let user_text = aura_llm::multimodal::extract_text(&user_content);
         let skills_for_turn = if self.skill_registry.is_empty() {

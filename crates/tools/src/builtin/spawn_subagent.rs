@@ -107,7 +107,8 @@ calls concurrently. Sequential spawns serialise needlessly.
 `background: true` returns immediately with a handle and lets the
 parent continue talking. The subagent's result is delivered as an
 out-of-band notification (a system reminder) prepended to your next
-user turn. Aura backend only.
+user turn. Works for any backend — especially handy for long external
+(claude/codex) runs you don't want to block on.
 
 # Trust but verify
 
@@ -525,7 +526,7 @@ fn parameters_schema() -> Value {
             },
             "background": {
                 "type": "boolean",
-                "description": "When true, returns a handle immediately and surfaces the subagent's final result as an out-of-band notification prepended to your next user turn, letting the parent keep working. Aura backend only."
+                "description": "When true, returns a handle immediately and surfaces the subagent's final result as an out-of-band notification prepended to your next user turn, letting the parent keep working. Works for any backend; especially useful for long external (claude/codex) runs."
             },
             "workspace_name": {
                 "type": "string",

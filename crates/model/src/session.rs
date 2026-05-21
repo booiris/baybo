@@ -295,6 +295,14 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_backend: Option<crate::SubagentBackendTag>,
 
+    /// `subagent_type` (profile name) this subagent session was spawned
+    /// with, pinned at genesis. Lets a `resume_session_id` call reject a
+    /// profile swap — resuming a `planner` child as `general-purpose`
+    /// would run a different profile's prompt/contract over the existing
+    /// transcript. `None` for non-subagent sessions and pre-pin rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
+
     /// Reserved extension fields for plugins and experiments.
     #[serde(default)]
     pub extra: HashMap<String, Value>,
