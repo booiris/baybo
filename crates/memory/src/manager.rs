@@ -4,7 +4,7 @@ use aura_model::MemoryEntry;
 
 use crate::MemoryError;
 use crate::Result;
-use crate::store::MemoryStore;
+use aura_store::MemoryStore;
 
 const DEFAULT_MAX_ENTRIES_PER_USER: usize = 1000;
 
@@ -61,7 +61,7 @@ impl MemoryManager {
 
     /// Look a memory entry up by its stable id, without a user scope.
     pub async fn get(&self, id: &str) -> Result<Option<MemoryEntry>> {
-        self.store.get_by_id(id).await
+        self.store.get_by_id(id).await.map_err(MemoryError::from)
     }
 
     /// Delete a single memory entry by id. Returns `Ok(())` even if the entry

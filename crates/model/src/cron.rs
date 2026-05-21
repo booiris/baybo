@@ -1,4 +1,4 @@
-use aura_model::{ChannelType, SessionId};
+use crate::{ChannelType, SessionId};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};

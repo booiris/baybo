@@ -8,6 +8,7 @@ doctest = false
 
 [dependencies]
 aura-storage = { workspace = true }
+aura-store = { workspace = true }
 aura-workspace = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

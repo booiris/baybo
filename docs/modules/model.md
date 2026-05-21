@@ -48,6 +48,6 @@ All `model` types are `Send + Sync + Serialize + Deserialize + Clone`.
 
 | Module | Role |
 |--------|------|
-| `memory` | Owns the `MemoryStore` trait and `MemoryManager` facade (list/search/store/delete/importance, per-user eviction); consumed by the admin REST surface |
-| `storage` | Provides the libsql implementation of `MemoryStore` |
+| `memory` | Owns the `MemoryManager` facade (list/search/store/delete/importance, per-user eviction); consumed by the admin REST surface. The `MemoryStore` trait lives in `aura-store` |
+| `storage` | Provides the libsql implementation of `MemoryStore` (trait from `aura-store`) |
 | `workspace` | Complements with identity/strategy files (no overlap) |

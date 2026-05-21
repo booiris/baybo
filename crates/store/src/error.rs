@@ -1,7 +1,10 @@
 use aura_model::SessionId;
-use aura_session::SessionError;
 use thiserror::Error;
 
+/// Error returned by every `*Store` trait. Concrete adapters (e.g. the
+/// libsql impls in `aura-storage`) map their backend failures onto these
+/// variants; callers that need a domain-specific error convert at the
+/// boundary (e.g. `impl From<StorageError> for SessionError`).
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("storage error: {0}")]
@@ -9,6 +12,12 @@ pub enum StorageError {
 
     #[error("not found: {0}")]
     NotFound(String),
+
+    /// A uniqueness/idempotency constraint rejected a write — e.g. two
+    /// schedulers racing on the same cron execution slot. Callers that
+    /// expect benign races (the cron tick) match on this to skip.
+    #[error("conflict: {0}")]
+    Conflict(String),
 
     /// Streaming put exceeded the caller-supplied byte cap. Surfaces as
     /// HTTP 413 at the gateway boundary; internal callers can also use
@@ -27,22 +36,4 @@ pub enum StorageError {
     /// driver failures that don't map cleanly onto a richer variant).
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
-}
-
-/// Bridge libsql-backed session/summary store errors to the public
-/// `SessionError` returned by the trait. Stringifies generic libsql
-/// failures into `SessionError::Storage`; preserves `HasLiveForks`
-/// structurally so the CLI delete path can render the fork ids back.
-impl From<StorageError> for SessionError {
-    fn from(e: StorageError) -> Self {
-        match e {
-            StorageError::HasLiveForks { fork_session_ids } => {
-                SessionError::HasLiveForks { fork_session_ids }
-            }
-            StorageError::NotFound(s) => SessionError::NotFound(s),
-            StorageError::Storage(s) => SessionError::Storage(s),
-            other @ StorageError::TooLarge { .. } => SessionError::Storage(other.to_string()),
-            StorageError::Internal(e) => SessionError::Internal(e),
-        }
-    }
 }

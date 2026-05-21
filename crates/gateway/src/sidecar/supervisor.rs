@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use aura_agent::service::ShutdownSignal;
 use aura_model::ChannelType;
 use aura_security::{LeakDetector, RedactingMakeWriter};
-use aura_storage::ChannelBotStore;
+use aura_store::ChannelBotStore;
 use tokio::io::{AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::time::sleep;

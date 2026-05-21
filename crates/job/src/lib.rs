@@ -22,13 +22,13 @@ use aura_model::{JobId, SessionId, SpanId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub use aura_store::{JobRow, JobStore, JobTransitionRow};
 pub use cancel::CancelReason;
 pub use cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
 pub use drift::DriftRecord;
 pub use error::JobError;
 pub use kind::{JobInput, JobKind, JobOutput};
 pub use lifecycle::{JobLifecycle, JobTerminalEvent};
-pub use store::JobStore;
 
 pub type Result<T> = std::result::Result<T, JobError>;
 

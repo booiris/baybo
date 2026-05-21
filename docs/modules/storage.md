@@ -2,47 +2,46 @@
 
 ## Overview
 
-The `storage` crate hosts libsql implementations for every Store trait in the workspace plus the remaining trait definitions whose domain doesn't have its own crate. Domain crates that do exist own their own trait surface: `SessionStore` / `SessionSummaryStore` in `aura-session`, `JobStore` in `aura-job`, `TraceStore` in `aura-trace`, `MemoryStore` in `aura-memory`, `CostStore` in `aura-cost`, `SecretStore` in `aura-security`. **libsql** is the sole backend.
+The `storage` crate is the **libsql adapter**: it implements every `*Store` trait over a single libsql backend. The trait *contracts* live in the `aura-store` ports crate (see [`README.md`](README.md)), not here, and consumers import them from `aura_store` directly — `aura-storage` does **not** re-export them. What it exposes is the concrete surface: the `Store` DI bundle, the `libsql` module, and the `retry` helper. **libsql** is the sole backend.
 
 Its job is:
 
-- Define the remaining Store traits whose domain has no dedicated crate (`channel_session`, `channel_bot`, `channel_pairing`, `cron`, `skill_risk`, `blob`)
-- Implement every Store trait — including those owned by domain crates — via libsql
+- Implement every `*Store` trait from `aura-store` (`SessionStore`, `SessionSummaryStore`, `JobStore`, `TraceStore`, `MemoryStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`, `SkillRiskStore`) via libsql
 - Provide `Store` for dependency injection
 - Manage database schema initialization
 
-Domain crates own their full persistence vertical (trait + manager + test-support fake). `aura-storage` depends on each one for the trait it must implement.
+Because the trait contracts and their row/DTO types live in `aura-store` (a leaf over `aura-model`), `aura-storage` no longer depends on any of the domain crates whose stores it implements — its only normal dependencies are `aura-store` + `aura-model`. `aura-job` and `aura-trace` stay on as `dev-dependencies` alone, so the libsql round-trip tests can build the rich `Job` / `Step` / `Span` types and call their `to_row` / `from_row` helpers. Domain crates depend on `aura-store` to *call* a store; the assembly layer wires in `aura-storage`.
 
 ## Design Decisions
 
-### Trait location follows domain ownership
+### All store traits live in the ports crate
 
-Each domain crate (`session`, `job`, `trace`, `memory`, `cost`, `security`, `cron`) owns its own trait. `aura-storage` implements them. The remaining trait definitions — `SkillRiskStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`, `BlobStore` — live in `aura-storage` because their consumer crates either don't exist (`channel_*`, `blob`) or deliberately keep persistence out of their dependency graph (`skills-assessor` consumes opaque row types).
+Every `*Store` trait contract lives in `aura-store`; `aura-storage` only *implements* them. Most traits trade in plain value types (`aura-model` domain types, or row/DTO types defined alongside the trait in `aura-store`). Two of them — `JobStore` and `TraceStore` — trade in **row DTOs** (`JobRow` / `JobTransitionRow`, `StepRow` / `SpanRow` / `SpanEventRow`: a queryable key plus the serialized entity in a `data` column) so the trait can sit in the leaf ports crate while the rich `Job` / `Step` / `Span` types — which carry the state-machine and recorder logic — stay in `aura-job` / `aura-trace`. Those two crates own the `to_row` / `from_row` conversions and convert at the call boundary.
 
 ```
-libsql/session.rs         → impl SessionStore + SessionSummaryStore   (traits from aura-session)
-libsql/memory.rs          → impl MemoryStore                          (trait from aura-memory)
-libsql/trace.rs           → impl TraceStore                           (trait from aura-trace)
-libsql/secret.rs          → impl SecretStore                          (trait from aura-security)
-libsql/job.rs             → impl JobStore                             (trait from aura-job)
-libsql/cost.rs            → impl CostStore                            (trait from aura-cost)
-libsql/cron.rs            → impl CronStore                            (trait from aura-cron; libsql adapter handles JSON serialization)
-libsql/skill_risk.rs      → impl SkillRiskStore                       (trait + RiskVerdict / RiskLevel here)
-libsql/channel_session.rs → impl ChannelSessionStore                  (trait here)
-libsql/channel_bot.rs     → impl ChannelBotStore                      (trait here)
-libsql/channel_pairing.rs → impl ChannelPairingStore                  (trait + ChannelPairingRow / PairingStatus here)
-libsql/blob.rs            → impl BlobStore                            (trait + BlobMeta here)
+libsql/session.rs         → impl SessionStore + SessionSummaryStore   (traits + StoredMessage / SessionSummaryRow from aura-store)
+libsql/memory.rs          → impl MemoryStore                          (trait from aura-store)
+libsql/trace.rs           → impl TraceStore                           (trait from aura-store; rows ↔ Step/Span/SpanEvent via aura-trace)
+libsql/secret.rs          → impl SecretStore                          (trait from aura-store)
+libsql/job.rs             → impl JobStore                             (trait from aura-store; rows ↔ Job via aura-job)
+libsql/cost.rs            → impl CostStore                            (trait from aura-store)
+libsql/cron.rs            → impl CronStore                            (trait from aura-store; libsql adapter handles JSON serialization)
+libsql/skill_risk.rs      → impl SkillRiskStore                       (trait + RiskVerdict / RiskLevel from aura-store)
+libsql/channel_session.rs → impl ChannelSessionStore                  (trait from aura-store)
+libsql/channel_bot.rs     → impl ChannelBotStore                      (trait + ChannelBotRow from aura-store)
+libsql/channel_pairing.rs → impl ChannelPairingStore                  (trait + ChannelPairingRow / PairingStatus from aura-store)
+libsql/blob.rs            → impl BlobStore                            (trait + BlobMeta from aura-store)
 ```
 
 Each file above holds its store's queries, but the table DDL is not colocated: every `CREATE TABLE` lives in `libsql/mod.rs`'s schema initialization — the single place to read the full set of persisted tables or add a new one.
 
-`Session`, `User`, `ChannelType`, and `SessionState` live in `aura-model` so that both `aura-session` (trait + manager) and `aura-storage` (libsql impl) can type against them without either crate dragging the other along. The `SessionStore` / `SessionSummaryStore` traits themselves now live in `aura-session`; `aura-storage` depends on `aura-session` to implement them.
+`Session`, `User`, `ChannelType`, and `SessionState` live in `aura-model` so that both `aura-session` (the `SessionManager` facade) and `aura-storage` (libsql impl) can type against them without either crate dragging the other along. The `SessionStore` / `SessionSummaryStore` traits and their `StoredMessage` / `SessionSummaryRow` row types live in `aura-store`; `aura-storage` implements them and `aura-session` calls them.
 
 The conversation transcript itself is **not** stored on `Session` — it's owned by `aura_context::ContextManager` while the actor is alive and persisted via the per-message `SessionStore` log: `append_session_message` for new turns, `apply_session_compaction` for `/compact`, `load_active_session_messages` for cold-start hydration. Rows live in the `session_messages` table (append-only, with a `superseded_by` marker for compactions).
 
 The row schema carries **no read/unread state** — there is no `read_at`, `seen`, or unread-count column, and none exists anywhere server-side. "Unread" is a purely client-side derivation: the web sidebar counts `Frame::SessionActivity` pulses (see [channels.md](channels.md)) and the cron inbox tracks acknowledged fires in `localStorage`; neither is persisted, so read status doesn't survive a cleared browser or follow the user across devices. Adding server-trusted read state would be a from-scratch change spanning storage → `aura-model` → gateway API → web.
 
-`CostStore` and `SkillRiskStore` are unique in that they also define their own data types: cost has no separate domain crate, and risk types live in storage to keep `aura-skills` LLM-free while still allowing the assessor crate to persist verdicts. `ChannelPairingStore` follows the same pattern: its row + status types (`ChannelPairingRow`, `PairingStatus`) sit next to the trait so `aura-pairing` can depend on `aura-storage` alone rather than owning its own persistence contract.
+`CostStore` and `SkillRiskStore` are unique in that their data types have no separate domain crate, so those types (`RiskVerdict` / `RiskLevel`, plus cost's `MicroUsd`-based rows) sit next to the trait in `aura-store` — that keeps `aura-skills` LLM-free while still letting the assessor crate persist verdicts against an opaque row type. `ChannelPairingStore` follows the same pattern: its row + status types (`ChannelPairingRow`, `PairingStatus`) live alongside the trait in `aura-store`, so `aura-pairing` depends on the ports crate alone rather than owning its own persistence contract.
 
 `SkillRiskStore` persists two kinds of rows:
 
@@ -81,7 +80,7 @@ All libsql-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tomb
 
 ## Constraints
 
-- Depends on every domain crate whose trait it implements (`model`, `session`, `trace`, `security`, `job`, `memory`, `cost`); reverse edges from those crates back to `aura-storage` do not exist
+- Normal dependencies are just `aura-store` (trait contracts + row/DTO types) and `aura-model` (domain types) — no domain crate; reverse edges from any domain crate back to `aura-storage` do not exist. `aura-job` / `aura-trace` are `dev-dependencies` only (round-trip tests)
 - Exposes trait objects externally, not concrete backend types
 - Assumes upper layers have already sanitized data before persistence
 

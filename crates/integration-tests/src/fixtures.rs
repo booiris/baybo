@@ -27,7 +27,7 @@ pub fn gateway_with_memory_vault() -> (
     let store = Arc::new(MemorySecretStore::new());
     let vault = Arc::new(SecretVault::new(
         master_key_for_tests(),
-        store.clone() as Arc<dyn aura_security::SecretStore>,
+        store.clone() as Arc<dyn aura_store::SecretStore>,
     ));
     let spill_dir = std::env::temp_dir().join(format!(
         "aura-it-tool-spills-{}",

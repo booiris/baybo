@@ -15,6 +15,7 @@ aura-llm = { workspace = true }
 aura-model = { workspace = true }
 aura-security = { workspace = true }
 aura-storage = { workspace = true }
+aura-store = { workspace = true }
 aura-workspace = { workspace = true }
 
 anyhow = { workspace = true }

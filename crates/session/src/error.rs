@@ -35,3 +35,24 @@ pub enum SessionError {
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
+
+/// Bridge the libsql-backed store error to the public `SessionError`.
+/// Stringifies generic failures into [`SessionError::Storage`]; preserves
+/// [`SessionError::HasLiveForks`] structurally so the CLI delete path can
+/// render the fork ids back.
+impl From<aura_store::StorageError> for SessionError {
+    fn from(e: aura_store::StorageError) -> Self {
+        match e {
+            aura_store::StorageError::HasLiveForks { fork_session_ids } => {
+                SessionError::HasLiveForks { fork_session_ids }
+            }
+            aura_store::StorageError::NotFound(s) => SessionError::NotFound(s),
+            aura_store::StorageError::Storage(s) => SessionError::Storage(s),
+            aura_store::StorageError::Conflict(s) => SessionError::Storage(s),
+            other @ aura_store::StorageError::TooLarge { .. } => {
+                SessionError::Storage(other.to_string())
+            }
+            aura_store::StorageError::Internal(e) => SessionError::Internal(e),
+        }
+    }
+}

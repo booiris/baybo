@@ -11,11 +11,11 @@ use aura_model::{JobId, ParallelGroup, SessionId, SpanId, StepId};
 use chrono::Utc;
 use tokio::sync::broadcast;
 
-use crate::store::TraceStore;
 use crate::{
     LifecycleOutcome, LifecycleState, Span, SpanEvent, SpanEventKind, SpanFinalize, SpanHandle,
     SpanKind, Step, StepHandle, StepKind, TraceError,
 };
+use aura_store::TraceStore;
 
 type Result<T> = std::result::Result<T, TraceError>;
 
@@ -162,7 +162,7 @@ impl SpanRecorder {
             ended_at: None,
             outcome: LifecycleState::Pending,
         };
-        self.trace_store.save_step(&step).await?;
+        self.trace_store.save_step(&step.to_row()?).await?;
         self.stream.publish(TraceEvent::StepStarted {
             step_id,
             job_id,
@@ -183,7 +183,7 @@ impl SpanRecorder {
             ended_at: Some(Utc::now()),
             outcome: LifecycleState::Done(outcome.clone()),
         };
-        self.trace_store.save_step(&step).await?;
+        self.trace_store.save_step(&step.to_row()?).await?;
         self.stream.publish(TraceEvent::StepEnded {
             step_id: handle.step_id,
             job_id: handle.job_id,
@@ -214,7 +214,7 @@ impl SpanRecorder {
             events: Vec::new(),
         };
         let kind_tag = kind.tag();
-        self.trace_store.save_span(&span).await?;
+        self.trace_store.save_span(&span.to_row()?).await?;
         self.stream.publish(TraceEvent::SpanStarted {
             span_id,
             step_id: step.step_id,
@@ -274,7 +274,7 @@ impl SpanRecorder {
             outcome: LifecycleState::Done(outcome.clone()),
             events: Vec::new(),
         };
-        self.trace_store.save_span(&span).await?;
+        self.trace_store.save_span(&span.to_row()?).await?;
         self.stream.publish(TraceEvent::SpanEnded {
             span_id: handle.span_id,
             step_id: handle.step_id,
@@ -307,7 +307,7 @@ impl SpanRecorder {
     /// multiple events on the same span manages its own counter.
     pub async fn emit_event(&self, span_id: SpanId, seq: u32, kind: SpanEventKind) -> Result<()> {
         let event = SpanEvent::new(span_id, seq, kind);
-        self.trace_store.append_span_event(&event).await?;
+        self.trace_store.append_span_event(&event.to_row()?).await?;
         self.stream.publish(TraceEvent::SpanEventEmitted(event));
         Ok(())
     }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use aura_llm::{ChatRequest, GuardedLlm};
 use aura_skills::SkillDefinition;
-use aura_storage::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
+use aura_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -21,7 +21,7 @@ pub enum AssessError {
     #[error("hashing skill dir failed: {0}")]
     Hash(#[from] std::io::Error),
     #[error("risk store: {0}")]
-    Store(#[from] aura_storage::StorageError),
+    Store(#[from] aura_store::StorageError),
     #[error("LLM call failed: {0}")]
     Llm(String),
     #[error("LLM reply did not parse as a verdict: {preview}")]

@@ -1,16 +1,16 @@
-//! In-memory `SecretStore` for downstream tests.
+//! In-memory `aura_store::SecretStore` for downstream tests.
 //!
 //! Gated behind the `test-support` cargo feature so it never ships in
-//! release builds. Lives in `aura-security` (next to the trait it
-//! implements) so crates that depend on `aura-security` but not on
-//! `aura-storage` can still spin up a fake store for unit tests.
+//! release builds. Lives in `aura-security` (next to `SecretVault`, the
+//! consumer it backs) so a crate building a vault for its own tests gets
+//! the fake from the same crate as the vault.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
-use crate::secret_store::{Result, SecretStore};
+use aura_store::secret::{Result, SecretStore};
 
 /// In-memory `SecretStore` for tests. Stores raw `(name, encrypted_value)`
 /// pairs in a `Mutex<HashMap>`. No encryption performed here — the bytes

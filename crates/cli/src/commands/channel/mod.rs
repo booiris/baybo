@@ -3,7 +3,8 @@ use std::sync::Arc;
 use aura_gateway::SidecarRuntime;
 use aura_model::ChannelType;
 use aura_security::SecretVault;
-use aura_storage::{ChannelBotStore, retry_on_busy};
+use aura_storage::retry::retry_on_busy;
+use aura_store::ChannelBotStore;
 use serde_json::json;
 
 use crate::cli::ChannelCmd;
@@ -23,9 +24,9 @@ pub async fn handle(ctx: &CommandContext, cmd: ChannelCmd) -> Result<CommandOutp
 
 async fn collect_all_bots(
     store: &Arc<dyn ChannelBotStore>,
-) -> Result<Vec<(ChannelType, aura_storage::ChannelBotRow)>> {
+) -> Result<Vec<(ChannelType, aura_store::ChannelBotRow)>> {
     let runtime = installed_runtime()?;
-    let mut out: Vec<(ChannelType, aura_storage::ChannelBotRow)> = Vec::new();
+    let mut out: Vec<(ChannelType, aura_store::ChannelBotRow)> = Vec::new();
     for ct in offered_channels(&runtime) {
         let rows = store
             .list_live(&ct)

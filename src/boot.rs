@@ -95,7 +95,7 @@ pub fn resolve_config_path() -> Option<PathBuf> {
 pub async fn build_llm_client(
     cfg: &AuraConfig,
     registry: &LlmProviderRegistry,
-    blob_store: Option<std::sync::Arc<dyn aura_storage::BlobStore>>,
+    blob_store: Option<std::sync::Arc<dyn aura_store::BlobStore>>,
     vault: Option<std::sync::Arc<aura_security::SecretVault>>,
     guard: LlmCallGuard,
 ) -> anyhow::Result<std::sync::Arc<GuardedLlm>> {
@@ -126,7 +126,7 @@ pub async fn build_llm_client(
 pub async fn build_llm_client_for_entry(
     entry: &LlmEntry,
     registry: &LlmProviderRegistry,
-    blob_store: Option<std::sync::Arc<dyn aura_storage::BlobStore>>,
+    blob_store: Option<std::sync::Arc<dyn aura_store::BlobStore>>,
     vault: Option<std::sync::Arc<aura_security::SecretVault>>,
     guard: LlmCallGuard,
 ) -> anyhow::Result<std::sync::Arc<GuardedLlm>> {
@@ -159,11 +159,11 @@ pub async fn build_llm_client_for_entry(
         .map_err(|e| anyhow::anyhow!("failed to build LLM client: {e}"))
 }
 
-/// Bridge `aura_storage::BlobStore` into `aura_llm::BlobFetcher`. Lives
+/// Bridge `aura_store::BlobStore` into `aura_llm::BlobFetcher`. Lives
 /// here next to `build_llm_client` because both crates are framework-
 /// agnostic and shouldn't know about each other — the application
 /// boot layer is the only place that's allowed to glue them together.
-struct BlobStoreFetcher(std::sync::Arc<dyn aura_storage::BlobStore>);
+struct BlobStoreFetcher(std::sync::Arc<dyn aura_store::BlobStore>);
 
 #[async_trait::async_trait]
 impl aura_llm::BlobFetcher for BlobStoreFetcher {

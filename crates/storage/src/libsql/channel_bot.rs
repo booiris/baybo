@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use aura_model::ChannelType;
 
 use super::LibsqlPool;
-use crate::StorageError;
-use crate::channel_bot::{ChannelBotRow, ChannelBotStore, Result};
+use aura_store::StorageError;
+use aura_store::channel_bot::{ChannelBotRow, ChannelBotStore, Result};
 
 pub struct LibsqlChannelBotStore {
     pool: LibsqlPool,

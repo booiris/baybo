@@ -110,7 +110,13 @@ async fn compression_call_records_cost_with_matching_span_id() {
     let job_ids: std::collections::BTreeSet<_> = records.iter().map(|r| r.job_id).collect();
     let mut compression_steps = Vec::new();
     for job_id in &job_ids {
-        let steps = trace_store.list_steps_by_job(job_id).await.unwrap();
+        let steps: Vec<aura_trace::Step> = trace_store
+            .list_steps_by_job(job_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| aura_trace::Step::from_row(r).unwrap())
+            .collect();
         compression_steps.extend(
             steps
                 .into_iter()
@@ -124,10 +130,13 @@ async fn compression_call_records_cost_with_matching_span_id() {
     );
     let compression_step = &compression_steps[0];
 
-    let spans = trace_store
+    let spans: Vec<aura_trace::Span> = trace_store
         .list_spans_by_step(&compression_step.id)
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .map(|r| aura_trace::Span::from_row(r).unwrap())
+        .collect();
     let compression_span = spans
         .iter()
         .find(|s| matches!(s.kind, SpanKind::LlmCall { .. }))

@@ -15,6 +15,7 @@ test-support = []
 
 [dependencies]
 aura-model = { workspace = true }
+aura-store = { workspace = true }
 
 chrono = { workspace = true }
 chrono-tz = { workspace = true }

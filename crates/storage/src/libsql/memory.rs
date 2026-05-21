@@ -2,8 +2,9 @@ use async_trait::async_trait;
 
 use super::LibsqlPool;
 
-use aura_memory::{MemoryError, MemoryStore, Result};
 use aura_model::MemoryEntry;
+use aura_store::StorageError;
+use aura_store::memory::{MemoryStore, Result};
 
 pub struct LibsqlMemoryStore {
     pool: LibsqlPool,
@@ -20,7 +21,7 @@ impl MemoryStore for LibsqlMemoryStore {
     async fn store(&self, entry: &MemoryEntry) -> Result<()> {
         let conn = self.pool.conn();
         let data = serde_json::to_string(entry)
-            .map_err(|e| MemoryError::Storage(format!("serialize memory entry: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("serialize memory entry: {e}")))?;
         conn.execute(
             "INSERT OR REPLACE INTO memories (id, user_id, content, data) VALUES (?1, ?2, ?3, ?4)",
             libsql::params![
@@ -31,7 +32,7 @@ impl MemoryStore for LibsqlMemoryStore {
             ],
         )
         .await
-        .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql insert memory: {e}")))?;
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql insert memory: {e}")))?;
         Ok(())
     }
 
@@ -43,20 +44,20 @@ impl MemoryStore for LibsqlMemoryStore {
                 libsql::params![key.to_string(), user_id.to_string()],
             )
             .await
-            .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 
         let row = rows
             .next()
             .await
-            .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql row: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?;
 
         match row {
             Some(row) => {
                 let data: String = row
                     .get(0)
-                    .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
                 let entry: MemoryEntry = serde_json::from_str(&data)
-                    .map_err(|e| MemoryError::Storage(format!("deserialize memory entry: {e}")))?;
+                    .map_err(|e| StorageError::Storage(format!("deserialize memory entry: {e}")))?;
                 Ok(Some(entry))
             }
             None => Ok(None),
@@ -74,19 +75,19 @@ impl MemoryStore for LibsqlMemoryStore {
                 libsql::params![user_id.to_string(), pattern, limit as i64],
             )
             .await
-            .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 
         let mut entries = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
         {
             let data: String = row
                 .get(0)
-                .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             let entry: MemoryEntry = serde_json::from_str(&data)
-                .map_err(|e| MemoryError::Storage(format!("deserialize memory entry: {e}")))?;
+                .map_err(|e| StorageError::Storage(format!("deserialize memory entry: {e}")))?;
             entries.push(entry);
         }
         Ok(entries)
@@ -99,7 +100,7 @@ impl MemoryStore for LibsqlMemoryStore {
             libsql::params![id.to_string()],
         )
         .await
-        .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql delete memory: {e}")))?;
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql delete memory: {e}")))?;
         Ok(())
     }
 
@@ -111,19 +112,19 @@ impl MemoryStore for LibsqlMemoryStore {
                 libsql::params![user_id.to_string()],
             )
             .await
-            .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 
         let mut entries = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
         {
             let data: String = row
                 .get(0)
-                .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             let entry: MemoryEntry = serde_json::from_str(&data)
-                .map_err(|e| MemoryError::Storage(format!("deserialize memory entry: {e}")))?;
+                .map_err(|e| StorageError::Storage(format!("deserialize memory entry: {e}")))?;
             entries.push(entry);
         }
         Ok(entries)
@@ -134,19 +135,19 @@ impl MemoryStore for LibsqlMemoryStore {
         let mut rows = conn
             .query("SELECT data FROM memories", ())
             .await
-            .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 
         let mut entries = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
         {
             let data: String = row
                 .get(0)
-                .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             let entry: MemoryEntry = serde_json::from_str(&data)
-                .map_err(|e| MemoryError::Storage(format!("deserialize memory entry: {e}")))?;
+                .map_err(|e| StorageError::Storage(format!("deserialize memory entry: {e}")))?;
             entries.push(entry);
         }
         Ok(entries)
@@ -160,20 +161,20 @@ impl MemoryStore for LibsqlMemoryStore {
                 libsql::params![id.to_string()],
             )
             .await
-            .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
 
         let row = rows
             .next()
             .await
-            .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql row: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?;
 
         match row {
             Some(row) => {
                 let data: String = row
                     .get(0)
-                    .map_err(|e| MemoryError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
                 let entry: MemoryEntry = serde_json::from_str(&data)
-                    .map_err(|e| MemoryError::Storage(format!("deserialize memory entry: {e}")))?;
+                    .map_err(|e| StorageError::Storage(format!("deserialize memory entry: {e}")))?;
                 Ok(Some(entry))
             }
             None => Ok(None),

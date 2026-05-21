@@ -11,7 +11,7 @@
 
 use aura_model::ChannelType;
 use aura_pairing::CheckOutcome;
-use aura_storage::StorageError;
+use aura_store::StorageError;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Extension, Path, State};
@@ -270,8 +270,8 @@ mod tests {
     //! shape without spinning a real server.
     use super::*;
     use aura_pairing::PairingService;
-    use aura_storage::ChannelPairingStore;
     use aura_storage::libsql::{LibsqlChannelPairingStore, LibsqlPool};
+    use aura_store::ChannelPairingStore;
     use std::sync::Arc;
 
     async fn fresh_pairing() -> (Arc<dyn ChannelPairingStore>, Arc<PairingService>) {

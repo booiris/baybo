@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aura_security::SecretVault;
-use aura_storage::BlobStore;
+use aura_store::BlobStore;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;

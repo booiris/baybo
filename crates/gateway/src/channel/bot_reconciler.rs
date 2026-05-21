@@ -28,7 +28,7 @@ use aura_agent::service::ShutdownSignal;
 use aura_channels::wire::Frame;
 use aura_model::ChannelType;
 use aura_security::SecretVault;
-use aura_storage::ChannelBotStore;
+use aura_store::ChannelBotStore;
 use parking_lot::Mutex;
 
 use super::control::{ChannelControlError, ChannelControlRegistry};

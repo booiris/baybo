@@ -15,6 +15,12 @@ use crate::outcome::{LifecycleOutcome, LifecycleState};
 /// Mutate the two together via [`Step::close`]; never set one without
 /// the other. Recovery, storage rewrites, and replay all rely on this
 /// pairing.
+///
+/// **Storage coupling:** the `steps` table in `aura-storage` derives its
+/// indexed `job_id` / `started_at` columns from this struct's serialized
+/// JSON via `json_extract(data, '$.job_id')` (and `'$.started_at'`). Those
+/// field names are load-bearing — renaming them or adding a container
+/// `#[serde(rename_all)]` silently breaks `list_steps_by_job` and ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
     pub id: StepId,

@@ -9,9 +9,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::error::CronError;
-use crate::job::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
 use crate::shutdown::Shutdown;
-use crate::store::CronStore;
+use aura_model::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
+use aura_store::CronStore;
 
 type Result<T> = std::result::Result<T, CronError>;
 
@@ -114,7 +114,7 @@ impl CronScheduler {
 
     /// Delete a cron job by ID.
     pub async fn delete_job(&self, job_id: &str) -> Result<()> {
-        self.store.delete(job_id).await
+        self.store.delete(job_id).await.map_err(CronError::from)
     }
 
     /// Advance a recurring job to its next fire slot and persist. Used
@@ -175,7 +175,7 @@ impl CronScheduler {
         job.next_trigger_at = next;
         job.updated_at = now;
 
-        self.store.save(&job).await
+        self.store.save(&job).await.map_err(CronError::from)
     }
 
     /// Disable a cron job, clearing its next trigger time.
@@ -191,24 +191,27 @@ impl CronScheduler {
         job.next_trigger_at = None;
         job.updated_at = now;
 
-        self.store.save(&job).await
+        self.store.save(&job).await.map_err(CronError::from)
     }
 
     /// List all cron jobs for a user.
     pub async fn list_jobs(&self, user_id: &str) -> Result<Vec<CronJob>> {
-        self.store.list_by_user(user_id).await
+        self.store
+            .list_by_user(user_id)
+            .await
+            .map_err(CronError::from)
     }
 
     /// List every cron job regardless of user. Used by operator CLI surfaces
     /// where the invoking identity is a CLI session rather than a per-user
     /// identity.
     pub async fn list_all_jobs(&self) -> Result<Vec<CronJob>> {
-        self.store.list_all().await
+        self.store.list_all().await.map_err(CronError::from)
     }
 
     /// Fetch a cron job by id, or `None` if it does not exist.
     pub async fn get_job(&self, job_id: &str) -> Result<Option<CronJob>> {
-        self.store.get(job_id).await
+        self.store.get(job_id).await.map_err(CronError::from)
     }
 
     /// Manually fire a cron job now, outside the regular schedule.
@@ -272,7 +275,10 @@ impl CronScheduler {
 
     /// List execution records for a job.
     pub async fn list_executions(&self, job_id: &str) -> Result<Vec<CronExecution>> {
-        self.store.list_executions_by_job(job_id).await
+        self.store
+            .list_executions_by_job(job_id)
+            .await
+            .map_err(CronError::from)
     }
 
     /// Run the background tick loop. Checks for due jobs at every tick and
@@ -392,7 +398,12 @@ impl CronScheduler {
                 origin_session_id: job.origin_session_id.clone(),
                 status: ExecutionStatus::Pending,
             };
-            match self.store.record_execution(&execution).await {
+            match self
+                .store
+                .record_execution(&execution)
+                .await
+                .map_err(CronError::from)
+            {
                 Ok(()) => {}
                 Err(CronError::AlreadyDispatched(key)) => {
                     debug!(job_id = %job.id, slot = %key, "skipping duplicate cron execution slot");
@@ -523,6 +534,8 @@ mod tests {
     use super::*;
     use crate::shutdown::NeverShutdown;
     use async_trait::async_trait;
+    use aura_store::StorageError;
+    use aura_store::cron::Result;
     use parking_lot::Mutex;
 
     /// In-memory CronStore for testing.
@@ -557,7 +570,7 @@ mod tests {
                 *existing = job.clone();
                 Ok(())
             } else {
-                Err(CronError::NotFound(job.id.clone()))
+                Err(StorageError::NotFound(job.id.clone()))
             }
         }
 
@@ -566,7 +579,7 @@ mod tests {
             let len_before = jobs.len();
             jobs.retain(|j| j.id != job_id);
             if jobs.len() == len_before {
-                Err(CronError::NotFound(job_id.to_string()))
+                Err(StorageError::NotFound(job_id.to_string()))
             } else {
                 Ok(())
             }
@@ -656,7 +669,7 @@ mod tests {
                 exec.status = status;
                 Ok(())
             } else {
-                Err(CronError::NotFound(execution_id.to_string()))
+                Err(StorageError::NotFound(execution_id.to_string()))
             }
         }
 

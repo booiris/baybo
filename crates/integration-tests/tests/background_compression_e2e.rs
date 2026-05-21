@@ -264,14 +264,22 @@ async fn orphan_reaper_preserves_completed_maintenance_sessions() {
         "soul-v1",
         None,
     );
-    store.job.create(&completed_job).await.unwrap();
+    store
+        .job
+        .create(&completed_job.to_row().unwrap())
+        .await
+        .unwrap();
     let _ = completed_job.start().unwrap();
     let _ = completed_job
         .complete(aura_job::JobOutput::Structured {
             value: serde_json::json!({"cursor": 1}),
         })
         .unwrap();
-    store.job.save(&completed_job).await.unwrap();
+    store
+        .job
+        .save(&completed_job.to_row().unwrap())
+        .await
+        .unwrap();
 
     // (b) A maintenance session whose job stayed `InProgress` — a
     //     crash mid-pass. Reaper must delete it.
@@ -291,9 +299,17 @@ async fn orphan_reaper_preserves_completed_maintenance_sessions() {
         "soul-v1",
         None,
     );
-    store.job.create(&in_flight_job).await.unwrap();
+    store
+        .job
+        .create(&in_flight_job.to_row().unwrap())
+        .await
+        .unwrap();
     let _ = in_flight_job.start().unwrap();
-    store.job.save(&in_flight_job).await.unwrap();
+    store
+        .job
+        .save(&in_flight_job.to_row().unwrap())
+        .await
+        .unwrap();
 
     // (c) A maintenance session with **no** job row — also reaped
     //     (process died between session create and `with_job`).

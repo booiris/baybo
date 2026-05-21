@@ -67,7 +67,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use aura_llm::{BilledChat, ChatRequest};
 use aura_model::{ChatMessage, ContentBlock, Role};
-use aura_storage::BlobStore;
+use aura_store::BlobStore;
 use dom_smoothie::Readability;
 use htmd::HtmlToMarkdown;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};

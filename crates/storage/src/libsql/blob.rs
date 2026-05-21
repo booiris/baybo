@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use super::LibsqlPool;
-use crate::StorageError;
-use crate::blob::{BlobMeta, BlobReader, BlobStore, ByteStream, Result, SHA256_PREFIX};
+use aura_store::StorageError;
+use aura_store::blob::{BlobMeta, BlobReader, BlobStore, ByteStream, Result, SHA256_PREFIX};
 
 // `DirBuilder::mode(0o700)` and `OpenOptions::mode(0o600)` lock down
 // every directory and file in the blob tree to the owning UID — the

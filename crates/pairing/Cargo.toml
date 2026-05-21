@@ -8,7 +8,7 @@ doctest = false
 
 [dependencies]
 aura-model = { workspace = true }
-aura-storage = { workspace = true }
+aura-store = { workspace = true }
 
 chrono = { workspace = true }
 rand = { workspace = true }

@@ -1,87 +1,77 @@
 //! In-memory `TraceStore` for downstream tests.
 //!
 //! Gated behind the `test-support` cargo feature so it never ships in
-//! release builds. Lives in `aura-trace` (next to the trait it
-//! implements) so crates that depend on `aura-trace` but not on
-//! `aura-storage` can still spin up a fake store for unit tests.
+//! release builds. Lives in `aura-trace` (next to the row conversions)
+//! so crates that depend on `aura-trace` can spin up a fake store
+//! without pulling the libsql adapter.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use aura_model::{JobId, SpanId, StepId};
+use aura_store::trace::Result;
+use aura_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
 use parking_lot::Mutex;
 
-use crate::store::TraceStore;
-use crate::{Result, Span, SpanEvent, Step};
+use crate::{Span, Step};
 
-/// In-memory `TraceStore` for tests. Steps are keyed by `StepId`,
-/// spans by `SpanId`, span events by `(SpanId, seq)`.
+/// In-memory `TraceStore` for tests. Stores rows verbatim; the
+/// `list_*_by_*` filters deserialize to read the parent id out of the
+/// `data` blob (the libsql backend uses generated columns instead).
 #[derive(Debug, Default)]
 pub struct MemoryTraceStore {
-    steps: Mutex<HashMap<StepId, Step>>,
-    spans: Mutex<HashMap<SpanId, Span>>,
-    span_events: Mutex<HashMap<SpanId, Vec<SpanEvent>>>,
+    steps: Mutex<HashMap<StepId, StepRow>>,
+    spans: Mutex<HashMap<SpanId, SpanRow>>,
+    span_events: Mutex<HashMap<SpanId, Vec<SpanEventRow>>>,
 }
 
 impl MemoryTraceStore {
     pub fn new() -> Self {
         Self::default()
     }
-
-    pub fn len(&self) -> usize {
-        self.spans.lock().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 #[async_trait]
 impl TraceStore for MemoryTraceStore {
-    async fn save_step(&self, step: &Step) -> Result<()> {
+    async fn save_step(&self, step: &StepRow) -> Result<()> {
         self.steps.lock().insert(step.id, step.clone());
         Ok(())
     }
 
-    async fn load_step(&self, step_id: &StepId) -> Result<Option<Step>> {
+    async fn load_step(&self, step_id: &StepId) -> Result<Option<StepRow>> {
         Ok(self.steps.lock().get(step_id).cloned())
     }
 
-    async fn list_steps_by_job(&self, job_id: &JobId) -> Result<Vec<Step>> {
-        let mut out: Vec<Step> = self
+    async fn list_steps_by_job(&self, job_id: &JobId) -> Result<Vec<StepRow>> {
+        Ok(self
             .steps
             .lock()
             .values()
-            .filter(|s| &s.job_id == job_id)
+            .filter(|r| Step::from_row((*r).clone()).is_ok_and(|s| &s.job_id == job_id))
             .cloned()
-            .collect();
-        out.sort_by_key(|s| s.started_at);
-        Ok(out)
+            .collect())
     }
 
-    async fn save_span(&self, span: &Span) -> Result<()> {
+    async fn save_span(&self, span: &SpanRow) -> Result<()> {
         self.spans.lock().insert(span.id, span.clone());
         Ok(())
     }
 
-    async fn load_span(&self, span_id: &SpanId) -> Result<Option<Span>> {
+    async fn load_span(&self, span_id: &SpanId) -> Result<Option<SpanRow>> {
         Ok(self.spans.lock().get(span_id).cloned())
     }
 
-    async fn list_spans_by_step(&self, step_id: &StepId) -> Result<Vec<Span>> {
-        let mut out: Vec<Span> = self
+    async fn list_spans_by_step(&self, step_id: &StepId) -> Result<Vec<SpanRow>> {
+        Ok(self
             .spans
             .lock()
             .values()
-            .filter(|s| &s.step_id == step_id)
+            .filter(|r| Span::from_row((*r).clone()).is_ok_and(|s| &s.step_id == step_id))
             .cloned()
-            .collect();
-        out.sort_by_key(|s| s.started_at);
-        Ok(out)
+            .collect())
     }
 
-    async fn append_span_event(&self, event: &SpanEvent) -> Result<()> {
+    async fn append_span_event(&self, event: &SpanEventRow) -> Result<()> {
         self.span_events
             .lock()
             .entry(event.span_id)
@@ -90,7 +80,7 @@ impl TraceStore for MemoryTraceStore {
         Ok(())
     }
 
-    async fn list_span_events(&self, span_id: &SpanId) -> Result<Vec<SpanEvent>> {
+    async fn list_span_events(&self, span_id: &SpanId) -> Result<Vec<SpanEventRow>> {
         Ok(self
             .span_events
             .lock()

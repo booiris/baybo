@@ -28,7 +28,5 @@ mod prompt;
 mod queue;
 
 pub use assessor::{AssessError, AssessedSkill, AssessmentMode, AssessmentScope, SkillAssessor};
-pub use aura_storage::{
-    AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore,
-};
+pub use aura_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 pub use hash::{hash_skill_dir, hash_skill_primary};
