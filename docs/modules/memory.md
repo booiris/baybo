@@ -2,9 +2,9 @@
 
 ## Overview
 
-The `memory` crate owns the `MemoryStore` trait and a thin `MemoryManager` business-logic facade (list / search / store / delete / importance, with per-user eviction). Domain types (`MemoryEntry`, `MemoryCategory`) live in `aura-model` so the wire shape is reusable from non-storage call sites.
+The `memory` crate owns a thin `MemoryManager` business-logic facade (list / search / store / delete / importance, with per-user eviction). The `MemoryStore` trait lives in the `aura-store` ports crate; domain types (`MemoryEntry`, `MemoryCategory`) live in `aura-model` so the wire shape is reusable from non-storage call sites.
 
-`aura-storage` provides the libsql implementation of `MemoryStore`; the trait itself lives here so downstream callers and tests can depend on `aura-memory` alone for memory work.
+`aura-storage` provides the libsql implementation of `MemoryStore` (the trait itself lives in `aura-store`), so downstream callers and tests can depend on `aura-memory` plus the ports crate for memory work.
 
 There is currently **no automatic recall path and no auto-store path**. The agent loop does not consult the memory subsystem on incoming user content, and it does not write the assistant's response back to memory. The previous heuristic-based `recall` + `maybe_store` pipeline was removed because it pulled in arbitrary substrings, treated entire assistant outputs (including embedded code or document content) as memorable, and re-injected those snapshots as `Role::System` messages in subsequent turns. Any future memory mechanism must be driven by an explicit signal (a tool call, an operator action), not by substring matching against free-form text.
 
@@ -33,4 +33,5 @@ These power the gateway admin REST endpoints (`/v1/memory`) and any future opera
 | --------- | ----------------------------------------------------------------------------------------------------- |
 | `model`   | Provides `MemoryEntry`, `MemoryCategory`                                                              |
 | `gateway` | Wires `MemoryManager` into the admin REST surface (`/v1/memory` list / store / delete)                 |
-| `storage` | Provides the libsql implementation of `MemoryStore`; the trait itself lives in this crate              |
+| `store`   | Owns the `MemoryStore` trait contract and `StorageError`                                              |
+| `storage` | Provides the libsql implementation of `MemoryStore` (trait from `aura-store`)                          |

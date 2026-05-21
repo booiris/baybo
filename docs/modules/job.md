@@ -2,9 +2,9 @@
 
 ## Overview
 
-The `job` crate is the complete home for the Job concept: domain types (`Job`, `JobStatus`, `JobKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, `JobError`), the `JobStore` trait, and the `JobLifecycle` persistence orchestrator. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself; `JobLifecycle` wraps `JobStore` with the cancel state machine, terminal-event bus, and `JobId → CancellationToken` registry the in-flight execution path subscribes to.
+The `job` crate is the home for the Job concept: domain types (`Job`, `JobStatus`, `JobKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, `JobError`), the row conversions that persist them, and the `JobLifecycle` persistence orchestrator. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself; `JobLifecycle` wraps the `JobStore` with the cancel state machine, terminal-event bus, and `JobId → CancellationToken` registry the in-flight execution path subscribes to.
 
-`aura-storage` provides the libsql implementation of `JobStore`; the trait itself lives here so downstream callers and tests can depend on `aura-job` alone for job-management work.
+The `JobStore` trait itself lives in the `aura-store` ports crate and trades in row DTOs — `JobRow` (the queryable columns plus the serialized `Job` in `data`) and `JobTransitionRow`. This crate owns the `Job::to_row` / `Job::from_row` conversions, so the state machine stays here while the trait sits in a leaf crate every store consumer can reach. `aura-storage` provides the libsql implementation, shuttling rows without depending on `aura-job` (it converts in its tests only). `impl From<aura_store::StorageError> for JobError` bridges errors at the call sites.
 
 Job answers **"what step is this operation at"**, not "what exactly did it do." Detailed input/output is recorded by `trace`. Each job carries its own `final_result` for the final contractual value, but progress messages emitted mid-job live in the trace tree — `Job.emitted_span_ids` is an index, not a copy. Spans completed before a cancel are tracked separately on `JobStatus::Cancelled { reason, partial_artifacts }`, not as a top-level `Job` field.
 
@@ -115,5 +115,6 @@ The job state machine itself is trigger-agnostic, but the actor that drives it f
 | --------- | --------------------------------------------------------------------------------------------------------- |
 | `agent`   | Consumes `JobLifecycle` to drive jobs through the agent loop; supplies the cancellation tokens that `register_running` tracks |
 | `trace`   | Provides `SpanId`; `JobStatus::Cancelled.partial_artifacts` references trace spans; recovery coordinates with the trace scan    |
-| `storage` | Provides the libsql implementation of `JobStore`; the trait itself lives in this crate                     |
+| `store`   | Owns the `JobStore` trait + its `JobRow` / `JobTransitionRow` DTOs and `StorageError`; this crate converts `Job` ↔ rows |
+| `storage` | Provides the libsql implementation of `JobStore` (from `aura-store`), shuttling rows; depends on `aura-job` only as a dev-dependency |
 | `session` | `Session.trigger.kind() == Job.kind()` invariant; `Lineage` consumes `parent_job_id`                       |

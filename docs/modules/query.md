@@ -43,8 +43,9 @@ The job read path needs `JobLifecycle::list` (pre-sorted, status-filtered). Usin
 
 | Module    | Role                                                                                                          |
 | --------- | ------------------------------------------------------------------------------------------------------------- |
-| `job`     | `JobLifecycle`, domain types, `JobStore` (consumed via the lifecycle facade)                                   |
-| `trace`   | `Step`, `Span`, `SpanEvent`, `TraceStore` (raw)                                                                |
-| `cost`    | `CostStore` + DTOs (`CostSummary`, `TimeRange`); `CostScope` lives here in `query` as the scope enum            |
-| `storage` | `SessionStore`, `StoredMessage`, `StorageError` — the session read surface                                     |
+| `store`   | Owns the `SessionStore` / `JobStore` / `TraceStore` / `CostStore` trait contracts, the `StoredMessage` row type, and `StorageError`; `QueryApi` reads through these trait objects |
+| `storage` | Provides the libsql implementations those trait objects resolve to (and the in-memory fakes its tests use)      |
+| `job`     | `JobLifecycle` facade + domain types (`Job`, `JobStatus`, …); the `JobStore` it wraps is an `aura-store` trait  |
+| `trace`   | `Step`, `Span`, `SpanEvent` + their `from_row` conversions — `QueryApi` rehydrates rows into rich types here    |
+| `cost`    | DTOs (`CostSummary`, `TimeRange`); `CostScope` lives here in `query` as the scope enum                          |
 | `model`   | `SessionId`, `JobId`, `StepId`, `MicroUsd`, `Lineage`, `LineageKind`                                           |

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `cron` crate owns scheduled recurring work end-to-end: domain types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`, `CronError`), the `CronStore` persistence trait (`store.rs`), the `CronScheduler` (`scheduler.rs`) that ticks against it, and the `Shutdown` trait (`shutdown.rs`) used to bound the scheduler's tick loop. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate) for recurring jobs and an absolute UTC instant for one-shot jobs. The libsql implementation of `CronStore` lives in `aura-storage`; the LLM-invocable cron tools (`CronCreate` / `CronDelete` / `CronList`) live in `aura-agent::cron_tools` so neither domain crate needs to depend on `aura-tools`. `aura-agent` re-exports `CronScheduler` and `CronTriggerEvent` for assembly-layer consumers.
+The `cron` crate owns scheduled recurring work end-to-end: the `CronScheduler` (`scheduler.rs`) that ticks against the store, the `Shutdown` trait (`shutdown.rs`) used to bound the scheduler's tick loop, and `CronError`. The cron data types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`) live in `aura-model` (re-exported here for back-compat); the `CronStore` persistence trait lives in the `aura-store` ports crate. It uses standard cron syntax (5-field expressions normalized to 6-field for the `cron` crate) for recurring jobs and an absolute UTC instant for one-shot jobs. The libsql implementation of `CronStore` lives in `aura-storage`; the LLM-invocable cron tools (`CronCreate` / `CronDelete` / `CronList`) live in `aura-agent::cron_tools` so neither domain crate needs to depend on `aura-tools`. `aura-agent` re-exports `CronScheduler` and `CronTriggerEvent` for assembly-layer consumers.
 
 CronJobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration. Each fire mints a brand-new session in the agent layer — one trigger = one session — so the run sees a clean transcript and fresh `SessionState`. A `CronJob` also records its `origin_session_id` — the session that created it — purely for traceability; trigger-time session creation is unaffected.
 
@@ -34,7 +34,7 @@ The `schedule` field is `CronSchedule`, a tagged enum with two variants: `Cron {
 
 ### LLM-invocable cron tools live in aura-agent
 
-`agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` `Tool` implementations. They live in `aura-agent::cron_tools` (not `aura-cron`) because they depend on `aura-tools::Tool`; if they lived in `aura-cron`, the chain `aura-cron → aura-tools → aura-storage → aura-cron` would be cyclic now that `aura-storage` depends on `aura-cron` for the `CronStore` trait. `aura-agent` already depends on both, so it's the natural home.
+`agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` `Tool` implementations. They live in `aura-agent::cron_tools` (not `aura-cron`) because they depend on `aura-tools::Tool`, and `aura-agent` already depends on both `aura-cron` and `aura-tools`, so it's the natural home. (Historically this also avoided a hard cycle `aura-cron → aura-tools → aura-storage → aura-cron`; once `CronStore` moved to the `aura-store` ports crate the `aura-storage → aura-cron` edge disappeared, so the placement is now a convention rather than a forced constraint.)
 
 ### Storage decoupling
 
