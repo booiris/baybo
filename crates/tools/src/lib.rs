@@ -37,18 +37,12 @@ pub type Result<T> = std::result::Result<T, ToolError>;
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
-    fn description(&self) -> &str;
-
-    /// Override the LLM-facing description with a freshly computed
-    /// string. Default `None` so existing tools keep their static
-    /// [`Self::description`] body. Used by tools whose description
-    /// depends on runtime state (e.g. `spawn_subagent` enumerates the
-    /// registered [`aura_subagent::SubagentProfile`] catalogue
-    /// once per LLM turn). Consumed by
-    /// [`crate::registry::ToolRegistry::tool_definitions`].
-    fn description_for_llm(&self) -> Option<String> {
-        None
-    }
+    /// LLM-facing description. Owned `String`: every consumer
+    /// materialises it into a `ToolDefinition` / `ToolManifest` anyway,
+    /// and tools whose description depends on runtime state (e.g.
+    /// `spawn_subagent` enumerates the registered subagent profiles each
+    /// turn) compute it per call. Static tools just `"...".to_string()`.
+    fn description(&self) -> String;
 
     fn parameters_schema(&self) -> Value;
 

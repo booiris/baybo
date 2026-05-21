@@ -282,7 +282,7 @@ impl Tool for WebFetchTool {
         "WebFetch"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         r#"
 - Fetches content from a specified URL and processes it using an AI model
 - Takes a URL and a prompt as input
@@ -301,6 +301,7 @@ Usage notes:
   - Binary/non-text content types are still refused; for downloading `.zip`/images/archives use Bash with `curl` or `wget` instead.
   - For GitHub URLs, prefer using the gh CLI via Bash instead (e.g., gh pr view, gh issue view, gh api).
 "#
+        .to_string()
     }
 
     fn parameters_schema(&self) -> Value {

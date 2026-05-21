@@ -173,10 +173,7 @@ struct LineageSummary {
 
 const MAX_WORKSPACE_NAME_BASE_LEN: usize = 32;
 
-fn parse_spawn_request(
-    value: &Value,
-    registry: &SubagentRegistry,
-) -> Result<ParsedSpawn, String> {
+fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<ParsedSpawn, String> {
     let p: SpawnParams = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
 
     if p.subagent_type.trim().is_empty() {
@@ -338,7 +335,7 @@ pub struct SpawnSubagentTool {
     dispatch_limiter: Arc<dyn SubagentDispatchLimiter>,
     max_depth: u32,
     max_subagents_per_root: u32,
-    /// Cache of the rendered `description_for_llm` string keyed by
+    /// Cache of the rendered `description()` string keyed by
     /// `SubagentRegistry::version()`. The LLM sees this catalogue
     /// every turn but the registry only mutates at boot / on
     /// `reload`, so a per-turn rebuild is wasted. Holds an
@@ -429,9 +426,9 @@ impl SpawnSubagentTool {
     /// `version()`; the rebuild only fires on `register` /
     /// `register_builtins` / `reload` / `remove`. The shared
     /// `Arc<String>` is cheap to clone for read-only consumers
-    /// (`description_for_llm` clones the body once at the trait
-    /// boundary, which the tool registry serialises into the
-    /// per-turn `tools` payload).
+    /// (`description()` clones the body once at the trait boundary,
+    /// which the tool registry serialises into the per-turn `tools`
+    /// payload).
     fn cached_description(&self) -> Arc<String> {
         let registry_version = self.registry.version();
         let mut cache = self.description_cache.lock();
@@ -546,12 +543,8 @@ impl Tool for SpawnSubagentTool {
         SPAWN_SUBAGENT_TOOL_NAME
     }
 
-    fn description(&self) -> &str {
-        STATIC_DESCRIPTION
-    }
-
-    fn description_for_llm(&self) -> Option<String> {
-        Some((*self.cached_description()).clone())
+    fn description(&self) -> String {
+        (*self.cached_description()).clone()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -652,8 +645,9 @@ pub fn make(config: SpawnSubagentToolConfig) -> (Arc<dyn Tool>, ToolManifest) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, Lineage, LineageKind, Session, SessionId,
-        SubagentExitStatus, User};
+    use aura_model::{
+        ChannelType, Lineage, LineageKind, Session, SessionId, SubagentExitStatus, User,
+    };
     use aura_session::SessionStore;
     use aura_session::test_support::{MemorySessionStore, MemorySessionSummaryStore};
     use aura_subagent::SubagentRegistry;
@@ -773,9 +767,7 @@ mod tests {
     /// `TEST_PARENT_SESSION` and instantiates the tool with the
     /// defaults plus an `UnboundedDispatchLimiter` so test runs can't
     /// trip the fan-out cap.
-    async fn tool_with_default(
-        tx: mpsc::Sender<SystemSpawnRequest>,
-    ) -> SpawnSubagentTool {
+    async fn tool_with_default(tx: mpsc::Sender<SystemSpawnRequest>) -> SpawnSubagentTool {
         SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
             system_spawn_tx: tx,
             registry: registry_with_builtins(),
@@ -963,10 +955,7 @@ mod tests {
             ToolOutput::Text(s) => assert_eq!(s, ack_text),
             other => panic!("expected Text, got {other:?}"),
         }
-        let (req, _) = router
-            .await
-            .unwrap()
-            .expect("router saw an envelope");
+        let (req, _) = router.await.unwrap().expect("router saw an envelope");
         assert!(req.background, "tool must propagate background=true");
     }
 
@@ -1263,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn description_for_llm_appends_type_catalogue() {
+    fn description_appends_type_catalogue() {
         let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
         let tool = SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
             system_spawn_tx: tx,
@@ -1273,7 +1262,7 @@ mod tests {
             max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
             max_subagents_per_root: DEFAULT_MAX_SUBAGENTS_PER_ROOT,
         });
-        let desc = tool.description_for_llm().expect("dynamic description");
+        let desc = tool.description();
         assert!(desc.starts_with(STATIC_DESCRIPTION));
         assert!(desc.contains("# Available subagent_type values"));
         // Every built-in profile must appear in the catalogue so the
@@ -1476,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn description_for_llm_handles_empty_registry() {
+    fn description_handles_empty_registry() {
         let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
         let tool = SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
             system_spawn_tx: tx,
@@ -1486,7 +1475,7 @@ mod tests {
             max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
             max_subagents_per_root: DEFAULT_MAX_SUBAGENTS_PER_ROOT,
         });
-        let desc = tool.description_for_llm().expect("dynamic description");
+        let desc = tool.description();
         assert!(desc.contains("none registered"));
     }
 
@@ -1513,7 +1502,10 @@ mod tests {
             "timeout_secs": MAX_SUBAGENT_TIMEOUT_SECS + 1
         });
         let p = parse_spawn_request(&v, &registry).unwrap();
-        assert_eq!(p.request.timeout, Duration::from_secs(MAX_SUBAGENT_TIMEOUT_SECS));
+        assert_eq!(
+            p.request.timeout,
+            Duration::from_secs(MAX_SUBAGENT_TIMEOUT_SECS)
+        );
     }
 
     #[test]

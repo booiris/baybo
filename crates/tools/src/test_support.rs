@@ -84,8 +84,8 @@ impl Tool for EchoTool {
     fn name(&self) -> &str {
         &self.name
     }
-    fn description(&self) -> &str {
-        "Echo tool — returns its serialized parameters."
+    fn description(&self) -> String {
+        "Echo tool — returns its serialized parameters.".to_string()
     }
     fn parameters_schema(&self) -> Value {
         json!({"type": "object", "additionalProperties": true})
@@ -142,8 +142,8 @@ impl Tool for RecordingTool {
     fn name(&self) -> &str {
         &self.name
     }
-    fn description(&self) -> &str {
-        "Recording tool — captures invocation params."
+    fn description(&self) -> String {
+        "Recording tool — captures invocation params.".to_string()
     }
     fn parameters_schema(&self) -> Value {
         json!({"type": "object", "additionalProperties": true})

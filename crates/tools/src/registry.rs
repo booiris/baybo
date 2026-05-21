@@ -177,9 +177,7 @@ impl ToolRegistry {
 fn tool_definition_for(tool: &dyn Tool) -> ToolDefinition {
     ToolDefinition {
         name: tool.name().to_string(),
-        description: tool
-            .description_for_llm()
-            .unwrap_or_else(|| tool.description().to_string()),
+        description: tool.description(),
         parameters_schema: tool.parameters_schema(),
     }
 }

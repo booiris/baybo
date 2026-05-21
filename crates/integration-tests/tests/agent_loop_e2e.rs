@@ -313,13 +313,17 @@ mod sleep_tool {
         fn name(&self) -> &str {
             &self.name
         }
-        fn description(&self) -> &str {
-            "Sleeping tool — used to exercise parallel dispatch."
+        fn description(&self) -> String {
+            "Sleeping tool — used to exercise parallel dispatch.".to_string()
         }
         fn parameters_schema(&self) -> Value {
             json!({"type": "object", "additionalProperties": true})
         }
-        async fn execute(&self, _params: Value, _ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+        async fn execute(
+            &self,
+            _params: Value,
+            _ctx: &ToolContext,
+        ) -> aura_tools::Result<ToolOutput> {
             *self.observed_start.lock() = Some(Instant::now());
             tokio::time::sleep(self.delay).await;
             Ok(ToolOutput::Text(format!("{} done", self.name)))

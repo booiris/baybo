@@ -253,8 +253,8 @@ impl Tool for BashTool {
         "Bash"
     }
 
-    fn description(&self) -> &str {
-        &self.description
+    fn description(&self) -> String {
+        self.description.clone()
     }
 
     fn parameters_schema(&self) -> Value {

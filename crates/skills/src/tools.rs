@@ -46,7 +46,7 @@ pub fn build(
     });
     let manifest = ToolManifest {
         name: tool.name().to_string(),
-        description: tool.description().to_string(),
+        description: tool.description(),
         trust_level: TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![],
@@ -74,7 +74,7 @@ impl Tool for SkillTool {
         SKILL_TOOL_NAME
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Load a registered skill so its instructions enter the conversation. \
          Available skills are listed in a system reminder each turn — invoke \
          this tool with `skill: \"<name>\"` to pull one in. Pass `args` to \
@@ -82,6 +82,7 @@ impl Tool for SkillTool {
          (relative path inside the skill's directory) referenced from the \
          main SKILL.md. Skills the operator marked untrusted or marked \
          `disable-model-invocation: true` are not callable here."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -405,7 +406,7 @@ pub fn build_install_tool(
     });
     let manifest = ToolManifest {
         name: tool.name().to_string(),
-        description: tool.description().to_string(),
+        description: tool.description(),
         trust_level: TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![ToolCapability::WriteFile],
@@ -430,7 +431,7 @@ impl Tool for SkillInstallTool {
         "SkillInstall"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Install a skill from an on-disk directory into the workspace's \
          skills folder. The directory must contain a valid SKILL.md; the \
          skill is run through the risk assessor (Dangerous verdicts \
@@ -438,6 +439,7 @@ impl Tool for SkillInstallTool {
          skill is available on the next turn. Refuses to overwrite an \
          existing installation; the operator must remove the old copy \
          first."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -576,7 +578,7 @@ pub fn build_uninstall_tool(
     });
     let manifest = ToolManifest {
         name: tool.name().to_string(),
-        description: tool.description().to_string(),
+        description: tool.description(),
         trust_level: TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![ToolCapability::WriteFile],
@@ -600,12 +602,13 @@ impl Tool for SkillUninstallTool {
         "SkillUninstall"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Remove an installed skill from the workspace's skills folder. \
          Refuses skills that aren't on disk under the workspace skills \
          dir (so registry-only or third-party-mounted skills aren't \
          accidentally deleted). The registry is hot-reloaded so the \
          skill disappears from the next turn's listing."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {

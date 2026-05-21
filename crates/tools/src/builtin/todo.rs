@@ -33,8 +33,8 @@ macro_rules! todo_tool {
                 $name
             }
 
-            fn description(&self) -> &str {
-                concat!($desc, " (TODO: ", $reason, ")")
+            fn description(&self) -> String {
+                concat!($desc, " (TODO: ", $reason, ")").to_string()
             }
 
             fn parameters_schema(&self) -> Value {
