@@ -21,6 +21,7 @@ mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+pub use aura_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
 pub use error::TraceError;
 pub use event::{SpanEvent, SpanEventKind, ToolEventPayload};
 pub use outcome::{LifecycleOutcome, LifecycleState};
@@ -30,6 +31,5 @@ pub use span::{
     SpanKind, ToolCallBegin, ToolCallOrigin, ToolCallResult,
 };
 pub use step::{Step, StepHandle, StepKind};
-pub use store::TraceStore;
 
 pub type Result<T> = std::result::Result<T, TraceError>;

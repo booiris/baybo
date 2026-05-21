@@ -1,28 +1,66 @@
-//! Trace persistence — `TraceStore` reads / writes the columnar main
-//! tables (`steps`, `spans`, `span_events`).
+//! Conversions between the rich trace domain types (`Step` / `Span` /
+//! `SpanEvent`) and their persistence rows in `aura-store`.
 //!
-//! See `docs/modules/trace.md` for the lifecycle contract.
+//! The `TraceStore` trait lives in `aura-store` and trades in rows, so
+//! the lifecycle recorder's logic stays in this crate while the store
+//! contract sits alongside every other one. Callers convert at the
+//! boundary via these helpers.
 
-use async_trait::async_trait;
-use aura_model::{JobId, SpanId, StepId};
+use crate::{Result, Span, SpanEvent, Step, TraceError};
+use aura_store::{SpanEventRow, SpanRow, StepRow};
 
-use crate::{Result, Span, SpanEvent, Step};
+impl Step {
+    pub fn to_row(&self) -> Result<StepRow> {
+        Ok(StepRow {
+            id: self.id,
+            data: serde_json::to_string(self)
+                .map_err(|e| TraceError::Storage(format!("serialize step: {e}")))?,
+        })
+    }
 
-/// Reads / writes the columnar main tables (`steps`, `spans`,
-/// `span_events`).
-#[async_trait]
-pub trait TraceStore: Send + Sync {
-    // -- Step --
-    async fn save_step(&self, step: &Step) -> Result<()>;
-    async fn load_step(&self, step_id: &StepId) -> Result<Option<Step>>;
-    async fn list_steps_by_job(&self, job_id: &JobId) -> Result<Vec<Step>>;
+    pub fn from_row(row: StepRow) -> Result<Step> {
+        serde_json::from_str(&row.data)
+            .map_err(|e| TraceError::Storage(format!("deserialize step: {e}")))
+    }
+}
 
-    // -- Span --
-    async fn save_span(&self, span: &Span) -> Result<()>;
-    async fn load_span(&self, span_id: &SpanId) -> Result<Option<Span>>;
-    async fn list_spans_by_step(&self, step_id: &StepId) -> Result<Vec<Span>>;
+impl Span {
+    pub fn to_row(&self) -> Result<SpanRow> {
+        Ok(SpanRow {
+            id: self.id,
+            data: serde_json::to_string(self)
+                .map_err(|e| TraceError::Storage(format!("serialize span: {e}")))?,
+        })
+    }
 
-    // -- SpanEvent --
-    async fn append_span_event(&self, event: &SpanEvent) -> Result<()>;
-    async fn list_span_events(&self, span_id: &SpanId) -> Result<Vec<SpanEvent>>;
+    pub fn from_row(row: SpanRow) -> Result<Span> {
+        serde_json::from_str(&row.data)
+            .map_err(|e| TraceError::Storage(format!("deserialize span: {e}")))
+    }
+}
+
+impl SpanEvent {
+    pub fn to_row(&self) -> Result<SpanEventRow> {
+        Ok(SpanEventRow {
+            span_id: self.span_id,
+            seq: self.seq,
+            data: serde_json::to_string(self)
+                .map_err(|e| TraceError::Storage(format!("serialize span_event: {e}")))?,
+        })
+    }
+
+    pub fn from_row(row: SpanEventRow) -> Result<SpanEvent> {
+        serde_json::from_str(&row.data)
+            .map_err(|e| TraceError::Storage(format!("deserialize span_event: {e}")))
+    }
+}
+
+impl From<aura_store::StorageError> for TraceError {
+    fn from(e: aura_store::StorageError) -> Self {
+        match e {
+            aura_store::StorageError::NotFound(s) => TraceError::NotFound(s),
+            aura_store::StorageError::Internal(e) => TraceError::Internal(e),
+            other => TraceError::Storage(other.to_string()),
+        }
+    }
 }

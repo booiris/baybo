@@ -16,9 +16,9 @@ use aura_store::CostStore;
 use aura_store::CronStore;
 use aura_store::JobStore;
 use aura_store::MemoryStore;
+use aura_store::TraceStore;
 pub use aura_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 use aura_store::{SessionStore, SessionSummaryStore};
-use aura_trace::TraceStore;
 pub use retry::retry_on_busy;
 
 /// Bundles all store implementations into a single container

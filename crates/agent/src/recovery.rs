@@ -133,7 +133,12 @@ async fn close_job_subtree(
     let mut spans_closed = 0usize;
     let mut job_end_floor = job_started;
 
-    let steps = trace_store.list_steps_by_job(job_id).await?;
+    let steps: Vec<Step> = trace_store
+        .list_steps_by_job(job_id)
+        .await?
+        .into_iter()
+        .map(Step::from_row)
+        .collect::<std::result::Result<_, _>>()?;
     for step in steps {
         let step_started = step.started_at;
         let (closed_spans, step_end_floor) =
@@ -148,7 +153,7 @@ async fn close_job_subtree(
                 // available signal and patch the row.
                 let mut patched = step.clone();
                 patched.ended_at = Some(step_end_floor);
-                trace_store.save_step(&patched).await?;
+                trace_store.save_step(&patched.to_row()?).await?;
                 step_end_floor
             }
             (LifecycleState::Pending, _) => {
@@ -159,7 +164,7 @@ async fn close_job_subtree(
                     },
                     step_end_floor,
                 );
-                trace_store.save_step(&closed).await?;
+                trace_store.save_step(&closed.to_row()?).await?;
                 steps_closed += 1;
                 step_end_floor
             }
@@ -181,7 +186,12 @@ async fn close_step_spans(
     step: &Step,
     step_started: DateTime<Utc>,
 ) -> Result<(usize, DateTime<Utc>), TraceError> {
-    let spans = trace_store.list_spans_by_step(&step.id).await?;
+    let spans: Vec<Span> = trace_store
+        .list_spans_by_step(&step.id)
+        .await?
+        .into_iter()
+        .map(Span::from_row)
+        .collect::<std::result::Result<_, _>>()?;
     let mut spans_closed = 0usize;
     let mut step_end_floor = step_started;
 
@@ -192,7 +202,7 @@ async fn close_step_spans(
                 // Same invariant repair as for steps.
                 let mut patched = span.clone();
                 patched.ended_at = Some(span.started_at);
-                trace_store.save_span(&patched).await?;
+                trace_store.save_span(&patched.to_row()?).await?;
                 span.started_at
             }
             (LifecycleState::Pending, _) => {
@@ -204,7 +214,7 @@ async fn close_step_spans(
                     },
                     close_at,
                 );
-                trace_store.save_span(&closed).await?;
+                trace_store.save_span(&closed.to_row()?).await?;
                 spans_closed += 1;
                 close_at
             }
@@ -226,7 +236,12 @@ async fn pick_span_close_time(
     trace_store: &Arc<dyn TraceStore>,
     span: &Span,
 ) -> Result<DateTime<Utc>, TraceError> {
-    let events = trace_store.list_span_events(&span.id).await?;
+    let events: Vec<aura_trace::SpanEvent> = trace_store
+        .list_span_events(&span.id)
+        .await?
+        .into_iter()
+        .map(aura_trace::SpanEvent::from_row)
+        .collect::<std::result::Result<_, _>>()?;
     let mut at = span.started_at;
     for ev in &events {
         if ev.at > at {
@@ -331,7 +346,7 @@ mod tests {
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
         let step = pending_step(job.id, t0 + Duration::seconds(1));
-        trace.save_step(&step).await.unwrap();
+        trace.save_step(&step.to_row().unwrap()).await.unwrap();
 
         let llm_end = t0 + Duration::seconds(20);
         let llm = make_span(
@@ -351,8 +366,8 @@ mod tests {
             }),
             Some(tool_end),
         );
-        trace.save_span(&llm).await.unwrap();
-        trace.save_span(&tool).await.unwrap();
+        trace.save_span(&llm.to_row().unwrap()).await.unwrap();
+        trace.save_span(&tool.to_row().unwrap()).await.unwrap();
 
         let summary = recover_orphaned_traces_and_jobs(trace.clone(), lifecycle.clone()).await;
 
@@ -360,7 +375,7 @@ mod tests {
         assert_eq!(summary.spans_closed, 0);
         assert_eq!(summary.jobs_cancelled, 1);
 
-        let reloaded = trace.load_step(&step.id).await.unwrap().unwrap();
+        let reloaded = Step::from_row(trace.load_step(&step.id).await.unwrap().unwrap()).unwrap();
         assert_eq!(reloaded.ended_at, Some(tool_end));
         assert!(matches!(
             reloaded.outcome,
@@ -380,12 +395,12 @@ mod tests {
 
         let step_started = t0 + Duration::seconds(5);
         let step = pending_step(job.id, step_started);
-        trace.save_step(&step).await.unwrap();
+        trace.save_step(&step.to_row().unwrap()).await.unwrap();
 
         let summary = recover_orphaned_traces_and_jobs(trace.clone(), lifecycle.clone()).await;
         assert_eq!(summary.steps_closed, 1);
 
-        let reloaded = trace.load_step(&step.id).await.unwrap().unwrap();
+        let reloaded = Step::from_row(trace.load_step(&step.id).await.unwrap().unwrap()).unwrap();
         assert_eq!(reloaded.ended_at, Some(step_started));
 
         let job_after = lifecycle.get(&job.id).await.unwrap().unwrap();
@@ -399,7 +414,7 @@ mod tests {
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
         let step = pending_step(job.id, t0 + Duration::seconds(1));
-        trace.save_step(&step).await.unwrap();
+        trace.save_step(&step.to_row().unwrap()).await.unwrap();
 
         let span_started = t0 + Duration::seconds(2);
         let pending_span = make_span(
@@ -409,7 +424,10 @@ mod tests {
             LifecycleState::Pending,
             None,
         );
-        trace.save_span(&pending_span).await.unwrap();
+        trace
+            .save_span(&pending_span.to_row().unwrap())
+            .await
+            .unwrap();
 
         let ev_at = t0 + Duration::seconds(15);
         let ev = SpanEvent {
@@ -423,14 +441,18 @@ mod tests {
                 },
             },
         };
-        trace.append_span_event(&ev).await.unwrap();
+        trace
+            .append_span_event(&ev.to_row().unwrap())
+            .await
+            .unwrap();
 
         let summary = recover_orphaned_traces_and_jobs(trace.clone(), lifecycle.clone()).await;
         assert_eq!(summary.spans_closed, 1);
 
-        let reloaded = trace.load_span(&pending_span.id).await.unwrap().unwrap();
+        let reloaded =
+            Span::from_row(trace.load_span(&pending_span.id).await.unwrap().unwrap()).unwrap();
         assert_eq!(reloaded.ended_at, Some(ev_at));
-        let step_after = trace.load_step(&step.id).await.unwrap().unwrap();
+        let step_after = Step::from_row(trace.load_step(&step.id).await.unwrap().unwrap()).unwrap();
         assert_eq!(step_after.ended_at, Some(ev_at));
     }
 
@@ -441,7 +463,7 @@ mod tests {
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
         let step = pending_step(job.id, t0 + Duration::seconds(1));
-        trace.save_step(&step).await.unwrap();
+        trace.save_step(&step.to_row().unwrap()).await.unwrap();
 
         let pg = ParallelGroup::new();
         let early_end = t0 + Duration::seconds(50);
@@ -463,12 +485,12 @@ mod tests {
             Some(early_end),
         );
         b.parallel_group = Some(pg);
-        trace.save_span(&a).await.unwrap();
-        trace.save_span(&b).await.unwrap();
+        trace.save_span(&a.to_row().unwrap()).await.unwrap();
+        trace.save_span(&b.to_row().unwrap()).await.unwrap();
 
         let _ = recover_orphaned_traces_and_jobs(trace.clone(), lifecycle.clone()).await;
 
-        let step_after = trace.load_step(&step.id).await.unwrap().unwrap();
+        let step_after = Step::from_row(trace.load_step(&step.id).await.unwrap().unwrap()).unwrap();
         assert_eq!(step_after.ended_at, Some(late_end));
     }
 
@@ -479,7 +501,7 @@ mod tests {
         let trace: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
 
         let step = pending_step(job.id, t0 + Duration::seconds(1));
-        trace.save_step(&step).await.unwrap();
+        trace.save_step(&step.to_row().unwrap()).await.unwrap();
 
         let first = recover_orphaned_traces_and_jobs(trace.clone(), lifecycle.clone()).await;
         assert_eq!(first.jobs_cancelled, 1);

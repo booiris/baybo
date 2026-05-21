@@ -20,6 +20,7 @@ pub mod secret;
 pub mod session;
 pub mod session_summary;
 pub mod skill_risk;
+pub mod trace;
 
 pub use blob::{BlobMeta, BlobReader, BlobStore, ByteStream, SHA256_PREFIX};
 pub use channel_bot::{ChannelBotRow, ChannelBotStore};
@@ -34,3 +35,4 @@ pub use secret::SecretStore;
 pub use session::{SessionStore, StoredMessage};
 pub use session_summary::{SessionSummaryRow, SessionSummaryStore};
 pub use skill_risk::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
+pub use trace::{SpanEventRow, SpanRow, StepRow, TraceStore};

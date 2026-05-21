@@ -1,16 +1,18 @@
 //! libsql implementation of `TraceStore`.
 //!
-//! Schema lives in `super::mod::init_db`. Each table stores the entity
-//! as a single canonical JSON `data` blob; queryable fields surface as
+//! Schema lives in `super::mod::init_db`. Each table stores the entity as
+//! a single canonical JSON `data` blob; queryable fields surface as
 //! VIRTUAL generated columns derived from `json_extract`. SQLite keeps
 //! generated columns in lockstep with `data`, so writers only ever set
-//! `data` — no two-side write contract for the storage layer to police.
+//! `data` (plus the natural key) — `aura-trace` owns the rich-type <->
+//! row conversion, this layer just shuttles rows.
 
 use async_trait::async_trait;
 
 use super::LibsqlPool;
 use aura_model::{JobId, SpanId, StepId};
-use aura_trace::{Span, SpanEvent, Step, TraceError, TraceStore};
+use aura_store::trace::Result;
+use aura_store::{SpanEventRow, SpanRow, StepRow, StorageError, TraceStore};
 
 pub struct LibsqlTraceStore {
     pool: LibsqlPool,
@@ -22,22 +24,25 @@ impl LibsqlTraceStore {
     }
 }
 
+fn err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
+    StorageError::Internal(anyhow::anyhow!("libsql {ctx}: {e}"))
+}
+
 #[async_trait]
 impl TraceStore for LibsqlTraceStore {
-    async fn save_step(&self, step: &Step) -> aura_trace::Result<()> {
-        let conn = self.pool.conn();
-        let data = serde_json::to_string(step)
-            .map_err(|e| TraceError::Storage(format!("serialize step: {e}")))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO steps (id, data) VALUES (?1, ?2)",
-            libsql::params![step.id.to_string(), data],
-        )
-        .await
-        .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql insert step: {e}")))?;
+    async fn save_step(&self, step: &StepRow) -> Result<()> {
+        self.pool
+            .conn()
+            .execute(
+                "INSERT OR REPLACE INTO steps (id, data) VALUES (?1, ?2)",
+                libsql::params![step.id.to_string(), step.data.clone()],
+            )
+            .await
+            .map_err(|e| err("insert step", e))?;
         Ok(())
     }
 
-    async fn load_step(&self, step_id: &StepId) -> aura_trace::Result<Option<Step>> {
+    async fn load_step(&self, step_id: &StepId) -> Result<Option<StepRow>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
@@ -45,65 +50,52 @@ impl TraceStore for LibsqlTraceStore {
                 libsql::params![step_id.to_string()],
             )
             .await
-            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
-        match rows
-            .next()
-            .await
-            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            Some(row) => {
-                let data: String = row
-                    .get(0)
-                    .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                Ok(Some(serde_json::from_str(&data).map_err(|e| {
-                    TraceError::Storage(format!("deserialize step: {e}"))
-                })?))
-            }
+            .map_err(|e| err("query step", e))?;
+        match rows.next().await.map_err(|e| err("row", e))? {
+            Some(row) => Ok(Some(StepRow {
+                id: *step_id,
+                data: row.get::<String>(0).map_err(|e| err("get", e))?,
+            })),
             None => Ok(None),
         }
     }
 
-    async fn list_steps_by_job(&self, job_id: &JobId) -> aura_trace::Result<Vec<Step>> {
+    async fn list_steps_by_job(&self, job_id: &JobId) -> Result<Vec<StepRow>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM steps \
-                 WHERE job_id = ?1 ORDER BY started_at",
+                "SELECT id, data FROM steps WHERE job_id = ?1 ORDER BY started_at",
                 libsql::params![job_id.to_string()],
             )
             .await
-            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
-        let mut steps = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let data: String = row
-                .get(0)
-                .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            steps.push(
-                serde_json::from_str(&data)
-                    .map_err(|e| TraceError::Storage(format!("deserialize step: {e}")))?,
-            );
+            .map_err(|e| err("query steps", e))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| err("row", e))? {
+            out.push(StepRow {
+                id: row
+                    .get::<String>(0)
+                    .map_err(|e| err("get", e))?
+                    .parse()
+                    .map_err(|e| err("parse step id", e))?,
+                data: row.get::<String>(1).map_err(|e| err("get", e))?,
+            });
         }
-        Ok(steps)
+        Ok(out)
     }
 
-    async fn save_span(&self, span: &Span) -> aura_trace::Result<()> {
-        let conn = self.pool.conn();
-        let data = serde_json::to_string(span)
-            .map_err(|e| TraceError::Storage(format!("serialize span: {e}")))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO spans (id, data) VALUES (?1, ?2)",
-            libsql::params![span.id.to_string(), data],
-        )
-        .await
-        .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql insert span: {e}")))?;
+    async fn save_span(&self, span: &SpanRow) -> Result<()> {
+        self.pool
+            .conn()
+            .execute(
+                "INSERT OR REPLACE INTO spans (id, data) VALUES (?1, ?2)",
+                libsql::params![span.id.to_string(), span.data.clone()],
+            )
+            .await
+            .map_err(|e| err("insert span", e))?;
         Ok(())
     }
 
-    async fn load_span(&self, span_id: &SpanId) -> aura_trace::Result<Option<Span>> {
+    async fn load_span(&self, span_id: &SpanId) -> Result<Option<SpanRow>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
@@ -111,89 +103,73 @@ impl TraceStore for LibsqlTraceStore {
                 libsql::params![span_id.to_string()],
             )
             .await
-            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
-        match rows
-            .next()
-            .await
-            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            Some(row) => {
-                let data: String = row
-                    .get(0)
-                    .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                Ok(Some(serde_json::from_str(&data).map_err(|e| {
-                    TraceError::Storage(format!("deserialize span: {e}"))
-                })?))
-            }
+            .map_err(|e| err("query span", e))?;
+        match rows.next().await.map_err(|e| err("row", e))? {
+            Some(row) => Ok(Some(SpanRow {
+                id: *span_id,
+                data: row.get::<String>(0).map_err(|e| err("get", e))?,
+            })),
             None => Ok(None),
         }
     }
 
-    async fn list_spans_by_step(&self, step_id: &StepId) -> aura_trace::Result<Vec<Span>> {
+    async fn list_spans_by_step(&self, step_id: &StepId) -> Result<Vec<SpanRow>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM spans \
-                 WHERE step_id = ?1 ORDER BY started_at",
+                "SELECT id, data FROM spans WHERE step_id = ?1 ORDER BY started_at",
                 libsql::params![step_id.to_string()],
             )
             .await
-            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
-        let mut spans = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let data: String = row
-                .get(0)
-                .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            spans.push(
-                serde_json::from_str(&data)
-                    .map_err(|e| TraceError::Storage(format!("deserialize span: {e}")))?,
-            );
+            .map_err(|e| err("query spans", e))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| err("row", e))? {
+            out.push(SpanRow {
+                id: row
+                    .get::<String>(0)
+                    .map_err(|e| err("get", e))?
+                    .parse()
+                    .map_err(|e| err("parse span id", e))?,
+                data: row.get::<String>(1).map_err(|e| err("get", e))?,
+            });
         }
-        Ok(spans)
+        Ok(out)
     }
 
-    async fn append_span_event(&self, event: &SpanEvent) -> aura_trace::Result<()> {
-        let conn = self.pool.conn();
-        let data = serde_json::to_string(event)
-            .map_err(|e| TraceError::Storage(format!("serialize span_event: {e}")))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO span_events (span_id, seq, data) VALUES (?1, ?2, ?3)",
-            libsql::params![event.span_id.to_string(), event.seq as i64, data],
-        )
-        .await
-        .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql insert span_event: {e}")))?;
+    async fn append_span_event(&self, event: &SpanEventRow) -> Result<()> {
+        self.pool
+            .conn()
+            .execute(
+                "INSERT OR REPLACE INTO span_events (span_id, seq, data) VALUES (?1, ?2, ?3)",
+                libsql::params![
+                    event.span_id.to_string(),
+                    event.seq as i64,
+                    event.data.clone()
+                ],
+            )
+            .await
+            .map_err(|e| err("insert span_event", e))?;
         Ok(())
     }
 
-    async fn list_span_events(&self, span_id: &SpanId) -> aura_trace::Result<Vec<SpanEvent>> {
+    async fn list_span_events(&self, span_id: &SpanId) -> Result<Vec<SpanEventRow>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM span_events \
-                 WHERE span_id = ?1 ORDER BY seq",
+                "SELECT seq, data FROM span_events WHERE span_id = ?1 ORDER BY seq",
                 libsql::params![span_id.to_string()],
             )
             .await
-            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
-        let mut events = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let data: String = row
-                .get(0)
-                .map_err(|e| TraceError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            events.push(
-                serde_json::from_str(&data)
-                    .map_err(|e| TraceError::Storage(format!("deserialize span_event: {e}")))?,
-            );
+            .map_err(|e| err("query span_events", e))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| err("row", e))? {
+            out.push(SpanEventRow {
+                span_id: *span_id,
+                seq: row.get::<i64>(0).map_err(|e| err("get", e))? as u32,
+                data: row.get::<String>(1).map_err(|e| err("get", e))?,
+            });
         }
-        Ok(events)
+        Ok(out)
     }
 }
 
@@ -201,7 +177,8 @@ impl TraceStore for LibsqlTraceStore {
 mod tests {
     use super::*;
     use aura_trace::{
-        LifecycleState, LlmCallInputs, SpanEventKind, SpanKind, StepKind, ToolCallOrigin,
+        LifecycleState, LlmCallInputs, Span, SpanEvent, SpanEventKind, SpanKind, Step, StepKind,
+        ToolCallOrigin,
     };
     use chrono::Utc;
 
@@ -267,8 +244,8 @@ mod tests {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlTraceStore::new(pool);
         let s = make_step(JobId::new());
-        store.save_step(&s).await.unwrap();
-        let loaded = store.load_step(&s.id).await.unwrap().unwrap();
+        store.save_step(&s.to_row().unwrap()).await.unwrap();
+        let loaded = Step::from_row(store.load_step(&s.id).await.unwrap().unwrap()).unwrap();
         assert_eq!(loaded.id, s.id);
     }
 
@@ -278,12 +255,12 @@ mod tests {
         let store = LibsqlTraceStore::new(pool);
         let job_id = JobId::new();
         let step = make_step(job_id);
-        store.save_step(&step).await.unwrap();
+        store.save_step(&step.to_row().unwrap()).await.unwrap();
 
         let llm = make_llm_span(step.id);
-        store.save_span(&llm).await.unwrap();
+        store.save_span(&llm.to_row().unwrap()).await.unwrap();
         let tool = make_tool_span(step.id, llm.id);
-        store.save_span(&tool).await.unwrap();
+        store.save_span(&tool.to_row().unwrap()).await.unwrap();
 
         let spans = store.list_spans_by_step(&step.id).await.unwrap();
         assert_eq!(spans.len(), 2);
@@ -304,7 +281,10 @@ mod tests {
                 },
             },
         );
-        store.append_span_event(&event).await.unwrap();
+        store
+            .append_span_event(&event.to_row().unwrap())
+            .await
+            .unwrap();
         let listed = store.list_span_events(&span_id).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].seq, 0);
@@ -347,9 +327,18 @@ mod tests {
                 },
             },
         );
-        store.append_span_event(&approval).await.unwrap();
-        store.append_span_event(&phase).await.unwrap();
-        store.append_span_event(&llm).await.unwrap();
+        store
+            .append_span_event(&approval.to_row().unwrap())
+            .await
+            .unwrap();
+        store
+            .append_span_event(&phase.to_row().unwrap())
+            .await
+            .unwrap();
+        store
+            .append_span_event(&llm.to_row().unwrap())
+            .await
+            .unwrap();
 
         let conn = pool.conn();
         let mut rows = conn
@@ -377,7 +366,6 @@ mod tests {
             ]
         );
 
-        // Sanity-check that the kind index can answer a filtered query.
         let mut count_rows = conn
             .query(
                 "SELECT COUNT(*) FROM span_events \

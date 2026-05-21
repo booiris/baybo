@@ -512,24 +512,43 @@ impl QueryApi {
             .get(id)
             .await?
             .ok_or_else(|| QueryError::NotFound(format!("job {id}")))?;
-        let steps = self.trace.list_steps_by_job(id).await?;
+        let steps = self
+            .trace
+            .list_steps_by_job(id)
+            .await?
+            .into_iter()
+            .map(Step::from_row)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(JobDetail { job, steps })
     }
 
     // ── 4. load_step ───────────────────────────────────────────
 
     pub async fn load_step(&self, id: &StepId) -> Result<StepDetail> {
-        let step = self
+        let step = Step::from_row(
+            self.trace
+                .load_step(id)
+                .await?
+                .ok_or_else(|| QueryError::NotFound(format!("step {id}")))?,
+        )?;
+        let mut spans = self
             .trace
-            .load_step(id)
+            .list_spans_by_step(id)
             .await?
-            .ok_or_else(|| QueryError::NotFound(format!("step {id}")))?;
-        let mut spans = self.trace.list_spans_by_step(id).await?;
+            .into_iter()
+            .map(Span::from_row)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         // Span events are stored separately; fold them in so callers
         // get a fully self-contained `StepDetail`.
         for span in &mut spans {
             if span.events.is_empty() {
-                let evs: Vec<SpanEvent> = self.trace.list_span_events(&span.id).await?;
+                let evs: Vec<SpanEvent> = self
+                    .trace
+                    .list_span_events(&span.id)
+                    .await?
+                    .into_iter()
+                    .map(SpanEvent::from_row)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
                 span.events = evs;
             }
         }
@@ -698,9 +717,21 @@ impl QueryApi {
 
             let mut span_count = 0usize;
             for job in &jobs {
-                let steps = self.trace.list_steps_by_job(&job.id).await?;
+                let steps = self
+                    .trace
+                    .list_steps_by_job(&job.id)
+                    .await?
+                    .into_iter()
+                    .map(Step::from_row)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
                 for step in &steps {
-                    let spans = self.trace.list_spans_by_step(&step.id).await?;
+                    let spans = self
+                        .trace
+                        .list_spans_by_step(&step.id)
+                        .await?
+                        .into_iter()
+                        .map(Span::from_row)
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
                     span_count += spans.len();
                 }
             }
@@ -884,7 +915,13 @@ impl QueryApi {
             Some(target) => {
                 let mut found = None;
                 for s in &summaries {
-                    let steps = self.trace.list_steps_by_job(&s.id).await?;
+                    let steps = self
+                        .trace
+                        .list_steps_by_job(&s.id)
+                        .await?
+                        .into_iter()
+                        .map(Step::from_row)
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
                     if steps.iter().any(|st| &st.id == target) {
                         found = Some(s.id);
                         break;
@@ -899,14 +936,32 @@ impl QueryApi {
                 Some(j) => j,
                 None => continue, // deleted between calls; skip
             };
-            let mut steps = self.trace.list_steps_by_job(&job.id).await?;
+            let mut steps = self
+                .trace
+                .list_steps_by_job(&job.id)
+                .await?
+                .into_iter()
+                .map(Step::from_row)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             steps.sort_by_key(|s| s.started_at);
             let mut step_blocks = Vec::with_capacity(steps.len());
             for step in steps {
-                let mut spans = self.trace.list_spans_by_step(&step.id).await?;
+                let mut spans = self
+                    .trace
+                    .list_spans_by_step(&step.id)
+                    .await?
+                    .into_iter()
+                    .map(Span::from_row)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
                 for span in &mut spans {
                     if span.events.is_empty() {
-                        span.events = self.trace.list_span_events(&span.id).await?;
+                        span.events = self
+                            .trace
+                            .list_span_events(&span.id)
+                            .await?
+                            .into_iter()
+                            .map(SpanEvent::from_row)
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
                     }
                 }
                 let stop_after = until_step_id == Some(step.id);
@@ -1015,14 +1070,32 @@ impl QueryApi {
             .get(job_id)
             .await?
             .ok_or_else(|| QueryError::NotFound(format!("job {job_id}")))?;
-        let mut steps = self.trace.list_steps_by_job(job_id).await?;
+        let mut steps = self
+            .trace
+            .list_steps_by_job(job_id)
+            .await?
+            .into_iter()
+            .map(Step::from_row)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         steps.sort_by_key(|s| s.started_at);
         let mut step_blocks = Vec::with_capacity(steps.len());
         for step in steps {
-            let mut spans = self.trace.list_spans_by_step(&step.id).await?;
+            let mut spans = self
+                .trace
+                .list_spans_by_step(&step.id)
+                .await?
+                .into_iter()
+                .map(Span::from_row)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             for span in &mut spans {
                 if span.events.is_empty() {
-                    span.events = self.trace.list_span_events(&span.id).await?;
+                    span.events = self
+                        .trace
+                        .list_span_events(&span.id)
+                        .await?
+                        .into_iter()
+                        .map(SpanEvent::from_row)
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
                 }
             }
             step_blocks.push(ReplayStep { step, spans });
@@ -1717,39 +1790,47 @@ mod tests {
         let step1_id = StepId::new();
         let now = Utc::now();
         trace_store
-            .save_step(&Step {
-                id: step1_id,
-                job_id: j1.id,
-                kind: StepKind::LlmIteration,
-                started_at: now,
-                ended_at: None,
-                outcome: LifecycleState::Pending,
-            })
+            .save_step(
+                &Step {
+                    id: step1_id,
+                    job_id: j1.id,
+                    kind: StepKind::LlmIteration,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                }
+                .to_row()
+                .unwrap(),
+            )
             .await
             .unwrap();
         let span1_id = SpanId::new();
         trace_store
-            .save_span(&Span {
-                id: span1_id,
-                step_id: step1_id,
-                kind: SpanKind::LlmCall {
-                    begin: LlmCallBegin {
-                        model_id: "claude".into(),
-                        provider: "anthropic".into(),
-                        provider_config_hash: String::new(),
-                        input_messages: LlmCallInputs::Persisted {
-                            last_ordinal: pre_last,
+            .save_span(
+                &Span {
+                    id: span1_id,
+                    step_id: step1_id,
+                    kind: SpanKind::LlmCall {
+                        begin: LlmCallBegin {
+                            model_id: "claude".into(),
+                            provider: "anthropic".into(),
+                            provider_config_hash: String::new(),
+                            input_messages: LlmCallInputs::Persisted {
+                                last_ordinal: pre_last,
+                            },
+                            temperature: None,
                         },
-                        temperature: None,
+                        result: None,
                     },
-                    result: None,
-                },
-                parallel_group: None,
-                started_at: now,
-                ended_at: None,
-                outcome: LifecycleState::Pending,
-                events: vec![],
-            })
+                    parallel_group: None,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                    events: vec![],
+                }
+                .to_row()
+                .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -1793,39 +1874,47 @@ mod tests {
 
         let step2_id = StepId::new();
         trace_store
-            .save_step(&Step {
-                id: step2_id,
-                job_id: j2.id,
-                kind: StepKind::LlmIteration,
-                started_at: Utc::now(),
-                ended_at: None,
-                outcome: LifecycleState::Pending,
-            })
+            .save_step(
+                &Step {
+                    id: step2_id,
+                    job_id: j2.id,
+                    kind: StepKind::LlmIteration,
+                    started_at: Utc::now(),
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                }
+                .to_row()
+                .unwrap(),
+            )
             .await
             .unwrap();
         let span2_id = SpanId::new();
         trace_store
-            .save_span(&Span {
-                id: span2_id,
-                step_id: step2_id,
-                kind: SpanKind::LlmCall {
-                    begin: LlmCallBegin {
-                        model_id: "claude".into(),
-                        provider: "anthropic".into(),
-                        provider_config_hash: String::new(),
-                        input_messages: LlmCallInputs::Persisted {
-                            last_ordinal: post_last,
+            .save_span(
+                &Span {
+                    id: span2_id,
+                    step_id: step2_id,
+                    kind: SpanKind::LlmCall {
+                        begin: LlmCallBegin {
+                            model_id: "claude".into(),
+                            provider: "anthropic".into(),
+                            provider_config_hash: String::new(),
+                            input_messages: LlmCallInputs::Persisted {
+                                last_ordinal: post_last,
+                            },
+                            temperature: None,
                         },
-                        temperature: None,
+                        result: None,
                     },
-                    result: None,
-                },
-                parallel_group: None,
-                started_at: Utc::now(),
-                ended_at: None,
-                outcome: LifecycleState::Pending,
-                events: vec![],
-            })
+                    parallel_group: None,
+                    started_at: Utc::now(),
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                    events: vec![],
+                }
+                .to_row()
+                .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -2022,37 +2111,45 @@ mod tests {
         let step_id = StepId::new();
         let now = Utc::now();
         trace_store
-            .save_step(&Step {
-                id: step_id,
-                job_id: j.id,
-                kind: StepKind::LlmIteration,
-                started_at: now,
-                ended_at: None,
-                outcome: LifecycleState::Pending,
-            })
+            .save_step(
+                &Step {
+                    id: step_id,
+                    job_id: j.id,
+                    kind: StepKind::LlmIteration,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                }
+                .to_row()
+                .unwrap(),
+            )
             .await
             .unwrap();
         let span_id = SpanId::new();
         trace_store
-            .save_span(&Span {
-                id: span_id,
-                step_id,
-                kind: SpanKind::LlmCall {
-                    begin: LlmCallBegin {
-                        model_id: "claude".into(),
-                        provider: "anthropic".into(),
-                        provider_config_hash: String::new(),
-                        input_messages: LlmCallInputs::Persisted { last_ordinal: last },
-                        temperature: None,
+            .save_span(
+                &Span {
+                    id: span_id,
+                    step_id,
+                    kind: SpanKind::LlmCall {
+                        begin: LlmCallBegin {
+                            model_id: "claude".into(),
+                            provider: "anthropic".into(),
+                            provider_config_hash: String::new(),
+                            input_messages: LlmCallInputs::Persisted { last_ordinal: last },
+                            temperature: None,
+                        },
+                        result: None,
                     },
-                    result: None,
-                },
-                parallel_group: None,
-                started_at: now,
-                ended_at: None,
-                outcome: LifecycleState::Pending,
-                events: vec![],
-            })
+                    parallel_group: None,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                    events: vec![],
+                }
+                .to_row()
+                .unwrap(),
+            )
             .await
             .unwrap();
 
