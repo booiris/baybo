@@ -7,7 +7,8 @@ use aura_channels::registration::{Prompter as ChannelPrompter, RegistrationResul
 use aura_gateway::SidecarRuntime;
 use aura_model::ChannelType;
 use aura_security::SecretVault;
-use aura_storage::{ChannelBotStore, retry_on_busy};
+use aura_storage::retry::retry_on_busy;
+use aura_store::ChannelBotStore;
 
 use crate::error::{Result, SetupError};
 use crate::prompt::Prompter;
@@ -92,8 +93,8 @@ fn offered_channels(runtime: &SidecarRuntime) -> Vec<ChannelType> {
 async fn collect_existing(
     store: &Arc<dyn ChannelBotStore>,
     channels: &[ChannelType],
-) -> Result<Vec<(ChannelType, aura_storage::ChannelBotRow)>> {
-    let mut out: Vec<(ChannelType, aura_storage::ChannelBotRow)> = Vec::new();
+) -> Result<Vec<(ChannelType, aura_store::ChannelBotRow)>> {
+    let mut out: Vec<(ChannelType, aura_store::ChannelBotRow)> = Vec::new();
     for ct in channels {
         let rows = store
             .list_live(ct)

@@ -455,7 +455,7 @@ pub async fn build_managers(
     // backpressure alarm rather than routine bursty drops. Bump
     // further if a deployment regularly trips it.
     let (system_spawn_tx, system_spawn_rx) = mpsc::channel::<SystemSpawnRequest>(1024);
-    for (tool, manifest) in aura_agent::cron_tools::agent_tools(Arc::clone(&cron_scheduler)) {
+    for (tool, manifest) in aura_cron::tools::agent_tools(Arc::clone(&cron_scheduler)) {
         tool_registry.register(tool, manifest);
     }
 

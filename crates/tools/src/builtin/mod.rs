@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use aura_model::TrustLevel;
-use aura_storage::BlobStore;
+use aura_store::BlobStore;
 use aura_workspace::WorkspacePaths;
 
 use crate::{Tool, ToolCapability, ToolManifest};

@@ -14,7 +14,7 @@ Core responsibilities:
 - **Cost management**: `CostManager` (in `aura-cost`) records LLM-call cost and gates spend; agent constructs it and threads it through the loop
 - **Runtime logic**: error recovery, timeout control
 
-It does not own low-level storage or backend implementation — it consumes Store traits from `aura-job` (for `JobStore`), `aura-trace` (for `TraceStore`), `aura-memory` (for `MemoryStore`), `aura-cost` (for `CostStore`), `aura-security` (for `SecretStore`), and `aura-storage` (for the rest) through dependency injection. Domain types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`). Each manager defines its own error type for business-level failures (e.g. `MemoryManager` defines errors for embedding and dedup failures).
+It does not own low-level storage or backend implementation — it consumes every `*Store` trait from the `aura-store` ports crate through dependency injection, and the libsql impls (`aura-storage`) are wired in at assembly time. Domain managers and rich types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`); the `JobStore` / `TraceStore` it calls trade in row DTOs that `aura-job` / `aura-trace` convert to and from. Each manager defines its own error type for business-level failures (e.g. `MemoryManager` defines errors for embedding and dedup failures).
 
 ## Source Layout
 
@@ -102,7 +102,7 @@ Cron jobs flow through the Actor model and observability chain: `CronScheduler` 
 
 ### LLM-invocable cron tools
 
-`aura_cron::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule/cancel/inspect cron jobs mid-conversation. They live in `aura-cron` (not `aura-tools`) because they each hold `Arc<CronScheduler>`, and `aura-tools` cannot pull in `aura-cron` without creating a circular dependency. `src/main.rs` registers them after the scheduler is constructed, via `Arc::get_mut(&mut tool_registry)` while no other clones exist yet.
+`aura_cron::tools::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule/cancel/inspect cron jobs mid-conversation. They live in `aura-cron::tools` (not `aura-tools`) because they each hold `Arc<CronScheduler>`, and `aura-tools` cannot depend on `aura-cron` without creating a cycle. `src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
 
 ### Startup recovery
 
@@ -135,10 +135,11 @@ Before a message enters an actor, Router completes: session identification/creat
 | `workspace` | Identity files for system prompt |
 | `cron` | Owns `CronJob`, `CronExecution`, and `CronScheduler`; agent re-exports `CronScheduler` / `CronTriggerEvent` for assembly-layer wiring |
 | `context` | Conversation window and compression |
-| `job` | Owns `Job`, `JobStatus`, `JobKind`, `JobStore` trait, and `JobLifecycle` (persistence orchestrator + cancellation registry + terminal-event bus). Agent constructs and shares one `JobLifecycle` across the loop, router, supervisor, and subagent wait routine |
-| `trace` | Owns `Step`, `Span`, `SpanEvent`, `TraceStore` trait, `SpanRecorder` (lifecycle facade), and `TraceEventStream` (broadcast bus). Agent constructs and shares one `SpanRecorder` per session |
+| `job` | Owns `Job`, `JobStatus`, `JobKind`, and `JobLifecycle` (persistence orchestrator + cancellation registry + terminal-event bus); the `JobStore` trait lives in `aura-store` and this crate owns the `Job` ↔ `JobRow` conversions. Agent constructs and shares one `JobLifecycle` across the loop, router, supervisor, and subagent wait routine |
+| `trace` | Owns `Step`, `Span`, `SpanEvent`, `SpanRecorder` (lifecycle facade), and `TraceEventStream` (broadcast bus); the `TraceStore` trait lives in `aura-store` and this crate owns the row conversions. Agent constructs and shares one `SpanRecorder` per session |
 | `query` | Owns `QueryApi` — the read-only analytics facade over session/job/trace/cost. Agent does not consume `QueryApi` directly; gateway and CLI do |
 | `session` | Provides `SessionManager` and its error type (domain types live in `aura-model`) |
 | `security` | Provides crypto primitives, `SecretVault`, `SecretValue`, `LeakDetector`, `PlaceholderMinter`, `InjectionDetector`; `agent::security::SecurityGateway` composes them |
 | `channels` | `Channel` handles + `ChannelRegistry`; Router owns the registry for dispatch by `ChannelType` |
-| `storage` | Provides remaining Store traits and the libsql implementations of all stores; `JobStore` trait moved to `aura-job` |
+| `store` | The ports crate: owns every `*Store` trait contract, the row/DTO types they exchange, and `StorageError`. Agent injects these trait objects |
+| `storage` | Provides the libsql implementations of every `*Store` trait (the contracts all live in `aura-store`) and bundles them in `Store` for DI |

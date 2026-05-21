@@ -2,9 +2,9 @@
 
 ## Overview
 
-The `cost` crate is the complete home for spend tracking: the `CostStore` trait, domain types (`CostRecord`, `CostSummary`, `TimeRange`, `CostError`), and the `CostManager` business-logic facade plus its budget primitives (`SpendingLimits`, `CostGuardError`, `CostMetrics`).
+The `cost` crate is the home for spend-tracking logic: the `CostManager` business-logic facade plus its budget primitives (`SpendingLimits`, `CostGuardError`, `CostMetrics`) and `CostError`. The `CostStore` trait lives in the `aura-store` ports crate; the data types (`CostRecord`, `CostSummary`, `TimeRange`) live in `aura-model`.
 
-`aura-storage` provides the libsql implementation of `CostStore`; the trait itself lives here so downstream callers and tests can depend on `aura-cost` alone for cost-management work.
+`aura-storage` provides the libsql implementation of `CostStore` (the trait itself lives in `aura-store`), so downstream callers and tests can depend on `aura-cost` plus the ports crate for cost-management work.
 
 ## Design Decisions
 
@@ -46,4 +46,5 @@ The bundled `ModelPricing` snapshot is good enough for first boot, but rates dri
 | `model`   | Provides `MicroUsd`, `SessionId`, `JobId`, `SpanId`                                                                  |
 | `llm`     | Provides `ModelPricing` (rates per 1M tokens) and the `LlmCallGuard` closure shape `cost_call_guard` adapts to       |
 | `agent`   | Constructs one `CostManager` per process; calls `record_call` after every LLM span closes, gates ingress with `check` |
-| `storage` | Provides the libsql implementation of `CostStore`; the trait itself lives in this crate                              |
+| `store`   | Owns the `CostStore` trait contract and `StorageError`                                                              |
+| `storage` | Provides the libsql implementation of `CostStore` (trait from `aura-store`)                                          |

@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use aura_model::ChannelType;
-use aura_storage::{ChannelPairingRow, ChannelPairingStore, PairingStatus, retry_on_busy};
+use aura_storage::retry::retry_on_busy;
+use aura_store::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
 use chrono::Utc;
 use serde_json::json;
 

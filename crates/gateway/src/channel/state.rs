@@ -12,7 +12,7 @@ use aura_agent::SessionManager;
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_pairing::PairingService;
 use aura_security::SecretVault;
-use aura_storage::{BlobStore, ChannelBotStore};
+use aura_store::{BlobStore, ChannelBotStore};
 
 use tokio::sync::mpsc;
 

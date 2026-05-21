@@ -20,6 +20,11 @@ use crate::outcome::{LifecycleOutcome, LifecycleState};
 /// Mutate the two together via [`Span::close`]; never set one without
 /// the other. Recovery, storage rewrites, and replay all rely on this
 /// pairing.
+///
+/// **Storage coupling:** the `spans` table in `aura-storage` derives its
+/// indexed `step_id` / `started_at` columns from this struct's serialized
+/// JSON via `json_extract(data, '$.step_id')` (and `'$.started_at'`) —
+/// those field names are load-bearing for `list_spans_by_step` and ordering.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Span {
     pub id: SpanId,

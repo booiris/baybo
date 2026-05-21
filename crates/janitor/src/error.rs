@@ -1,4 +1,4 @@
-use aura_storage::StorageError;
+use aura_store::StorageError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]

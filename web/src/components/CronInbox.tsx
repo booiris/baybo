@@ -26,12 +26,40 @@ interface CronInboxProps {
  *  list every few seconds. */
 const POLL_INTERVAL_MS = 30_000;
 
+/** localStorage key holding the JSON array of cron fire `session_id`s
+ *  the user has acknowledged (by opening a row or "mark all read").
+ *  Read-state lives only in the browser by design — the gateway has no
+ *  per-fire read tracking. `null` means "no baseline yet" (first run),
+ *  which is distinct from "baselined, nothing unread". */
+const SEEN_KEY = 'aura.cron.seen';
+
+function readSeen(): Set<string> | null {
+  try {
+    const raw = window.localStorage.getItem(SEEN_KEY);
+    if (raw === null) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    return new Set(parsed.filter((x): x is string => typeof x === 'string'));
+  } catch {
+    return null;
+  }
+}
+
+function writeSeen(seen: Set<string>): void {
+  try {
+    window.localStorage.setItem(SEEN_KEY, JSON.stringify([...seen]));
+  } catch {
+    /* storage disabled; in-memory tracking still works this session */
+  }
+}
+
 export function CronInbox({ refreshSignal }: CronInboxProps) {
   const client = useAdminClient();
   const [items, setItems] = useState<CronMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [seen, setSeen] = useState<Set<string> | null>(() => readSeen());
   const reqGenRef = useRef(0);
 
   const fetchMessages = useCallback(async () => {
@@ -69,31 +97,77 @@ export function CronInbox({ refreshSignal }: CronInboxProps) {
     void fetchMessages();
   }, [refreshSignal, fetchMessages]);
 
-  const toggle = useCallback((sessionId: string) => {
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      if (next.has(sessionId)) {
-        next.delete(sessionId);
-      } else {
-        next.add(sessionId);
-      }
+  const markSeen = useCallback((sessionId: string) => {
+    setSeen((prev) => {
+      const base = prev ?? new Set<string>();
+      if (base.has(sessionId)) return prev;
+      const next = new Set(base);
+      next.add(sessionId);
+      writeSeen(next);
       return next;
     });
   }, []);
 
-  const unreadCount = items.length;
+  const toggle = useCallback(
+    (sessionId: string) => {
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        if (next.has(sessionId)) {
+          next.delete(sessionId);
+        } else {
+          next.add(sessionId);
+        }
+        return next;
+      });
+      // Opening a fire (or re-collapsing it) counts as reading it, so
+      // its "new" accent and the header tally clear right away — the
+      // affordance a user reaches for first.
+      markSeen(sessionId);
+    },
+    [markSeen],
+  );
+
+  // First run (no stored baseline) treats every fire already in the
+  // list as seen, so opening the panel the first time doesn't flag the
+  // whole backlog. Afterwards a fire stays unread until its session_id
+  // is acknowledged.
+  useEffect(() => {
+    if (seen !== null || items.length === 0) return;
+    const all = new Set(items.map((m) => m.session_id));
+    setSeen(all);
+    writeSeen(all);
+  }, [items, seen]);
+
+  const markAllSeen = useCallback(() => {
+    const all = new Set(items.map((m) => m.session_id));
+    setSeen(all);
+    writeSeen(all);
+  }, [items]);
+
+  const unreadCount = useMemo(
+    () => (seen === null ? 0 : items.filter((m) => !seen.has(m.session_id)).length),
+    [items, seen],
+  );
 
   return (
     <aside className="hidden xl:flex flex-col w-[260px] border-l-2 border-black bg-white absolute right-0 top-12 bottom-0 z-10">
       <header className="px-3 py-3 border-b-2 border-black flex items-center gap-2">
-        <RiNotification3Line className="text-lg shrink-0" />
+        <RiNotification3Line
+          className={`text-lg shrink-0 ${unreadCount > 0 ? 'text-brand' : ''}`}
+        />
         <span className="font-bold uppercase tracking-wider text-[0.85rem] flex-1">
           Cron Inbox
         </span>
         {unreadCount > 0 ? (
-          <span className="inline-flex items-center justify-center min-w-[20px] h-[20px] px-1.5 bg-brand text-white border-2 border-black rounded-md text-[0.65rem] font-bold">
+          <button
+            type="button"
+            onClick={markAllSeen}
+            title="Mark all as read"
+            aria-label={`${unreadCount} new cron fires — mark all as read`}
+            className="inline-flex items-center justify-center min-w-[20px] h-[20px] px-1.5 bg-brand text-white border-2 border-black rounded-md text-[0.65rem] font-bold shadow-brutal-xs hover:bg-brand-hover active:translate-x-[1px] active:translate-y-[1px] active:shadow-none cursor-pointer"
+          >
             {unreadCount}
-          </span>
+          </button>
         ) : null}
         <button
           type="button"
@@ -129,6 +203,7 @@ export function CronInbox({ refreshSignal }: CronInboxProps) {
               <CronMessageRow
                 key={msg.session_id}
                 message={msg}
+                isNew={seen !== null && !seen.has(msg.session_id)}
                 expanded={expanded.has(msg.session_id)}
                 onToggle={() => toggle(msg.session_id)}
               />
@@ -142,11 +217,12 @@ export function CronInbox({ refreshSignal }: CronInboxProps) {
 
 interface CronMessageRowProps {
   message: CronMessage;
+  isNew: boolean;
   expanded: boolean;
   onToggle: () => void;
 }
 
-function CronMessageRow({ message, expanded, onToggle }: CronMessageRowProps) {
+function CronMessageRow({ message, isNew, expanded, onToggle }: CronMessageRowProps) {
   const summary = useMemo(() => {
     const text = message.response?.trim() || message.prompt.trim();
     if (!text) return '(no content)';
@@ -157,7 +233,9 @@ function CronMessageRow({ message, expanded, onToggle }: CronMessageRowProps) {
   const fireLabel = useMemo(() => formatRelative(message.fired_at), [message.fired_at]);
 
   return (
-    <li className="border-b-2 border-black">
+    <li
+      className={`border-b-2 border-black ${isNew ? 'border-l-4 border-l-brand' : ''}`}
+    >
       <button
         type="button"
         onClick={onToggle}
@@ -172,6 +250,11 @@ function CronMessageRow({ message, expanded, onToggle }: CronMessageRowProps) {
           >
             {message.cron_job_id.slice(0, 8)}
           </code>
+          {isNew ? (
+            <span className="px-1 py-0.5 bg-brand text-white border border-black rounded text-[0.55rem] leading-none">
+              new
+            </span>
+          ) : null}
           <span className="flex-1" />
           <span title={message.fired_at}>{fireLabel}</span>
           {expanded ? (

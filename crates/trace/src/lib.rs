@@ -1,14 +1,15 @@
-//! Trace types, store trait, and span lifecycle — see
+//! Trace types, row conversions, and span lifecycle — see
 //! `docs/modules/trace.md` for the design.
 //!
 //! Hierarchy: `Session > Job > Step > Span (+ SpanEvent)`. `Session`
 //! lives in `aura-model`; `Job` lives in `aura-job`; this crate owns
-//! `Step`, `Span`, `SpanEvent`, the `TraceStore` trait, and the
-//! `SpanRecorder` persistence orchestrator.
+//! `Step`, `Span`, `SpanEvent`, the `SpanRecorder` persistence
+//! orchestrator, and the row conversions that persist them.
 //!
-//! `aura-storage` provides the libsql implementation of `TraceStore`;
-//! the trait itself lives here so downstream callers and tests can
-//! depend on `aura-trace` alone for trace-recording work.
+//! The `TraceStore` trait lives in `aura-store` (the ports crate) and
+//! trades in `StepRow` / `SpanRow` / `SpanEventRow`; this crate owns the
+//! `to_row` / `from_row` conversions and converts at the recorder
+//! boundary, while `aura-storage` provides the libsql implementation.
 
 mod error;
 mod event;
@@ -21,6 +22,7 @@ mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+pub use aura_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
 pub use error::TraceError;
 pub use event::{SpanEvent, SpanEventKind, ToolEventPayload};
 pub use outcome::{LifecycleOutcome, LifecycleState};
@@ -30,6 +32,5 @@ pub use span::{
     SpanKind, ToolCallBegin, ToolCallOrigin, ToolCallResult,
 };
 pub use step::{Step, StepHandle, StepKind};
-pub use store::TraceStore;
 
 pub type Result<T> = std::result::Result<T, TraceError>;

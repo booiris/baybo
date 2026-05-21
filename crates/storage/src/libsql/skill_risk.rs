@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use super::LibsqlPool;
-use crate::error::StorageError;
-use crate::skill_risk::{
+use aura_store::StorageError;
+use aura_store::skill_risk::{
     AssessmentJob, AssessmentJobStatus, Result, RiskLevel, RiskVerdict, SkillRiskStore,
 };
 

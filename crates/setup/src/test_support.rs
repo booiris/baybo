@@ -13,6 +13,7 @@ use crate::prompt::Prompter;
 #[derive(Debug, Default)]
 pub struct MockPrompter {
     pub selects: VecDeque<usize>,
+    pub multi_selects: VecDeque<Vec<usize>>,
     pub texts: VecDeque<String>,
     pub confirms: VecDeque<bool>,
     pub passwords: VecDeque<String>,
@@ -25,6 +26,11 @@ impl MockPrompter {
 
     pub fn push_select(mut self, idx: usize) -> Self {
         self.selects.push_back(idx);
+        self
+    }
+
+    pub fn push_multi_select(mut self, idxs: Vec<usize>) -> Self {
+        self.multi_selects.push_back(idxs);
         self
     }
 
@@ -56,6 +62,26 @@ impl Prompter for MockPrompter {
             )));
         }
         Ok(idx)
+    }
+
+    fn multi_select(
+        &mut self,
+        label: &str,
+        options: &[&str],
+        _initial: &[bool],
+    ) -> Result<Vec<usize>> {
+        let picks = self.multi_selects.pop_front().unwrap_or_else(|| {
+            panic!("MockPrompter: multi_select({label:?}) ran out of scripted answers")
+        });
+        for &idx in &picks {
+            if idx >= options.len() {
+                return Err(SetupError::Prompt(format!(
+                    "MockPrompter scripted index {idx} out of range for {} options",
+                    options.len()
+                )));
+            }
+        }
+        Ok(picks)
     }
 
     fn text(&mut self, label: &str, _default: &str) -> Result<String> {

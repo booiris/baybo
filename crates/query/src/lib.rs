@@ -435,7 +435,7 @@ impl QueryApi {
     // ── 1. load_session ────────────────────────────────────────
 
     pub async fn load_session(&self, id: &SessionId) -> Result<Option<Session>> {
-        Ok(self.sessions.get(id).await?)
+        Ok(self.sessions.get(id).await.map_err(SessionError::from)?)
     }
 
     // ── 2. list_jobs (with fork-prefix UNION) ──────────────────
@@ -456,7 +456,11 @@ impl QueryApi {
             .collect();
 
         // If this is a UserFork session, prepend the source's prefix.
-        if let Some(session) = self.sessions.get(session_id).await?
+        if let Some(session) = self
+            .sessions
+            .get(session_id)
+            .await
+            .map_err(SessionError::from)?
             && let Some(Lineage {
                 parent_session_id,
                 kind: LineageKind::UserFork { fork_at_job_id, .. },
@@ -504,24 +508,47 @@ impl QueryApi {
             .get(id)
             .await?
             .ok_or_else(|| QueryError::NotFound(format!("job {id}")))?;
-        let steps = self.trace.list_steps_by_job(id).await?;
+        let steps = self
+            .trace
+            .list_steps_by_job(id)
+            .await
+            .map_err(TraceError::from)?
+            .into_iter()
+            .map(Step::from_row)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(JobDetail { job, steps })
     }
 
     // ── 4. load_step ───────────────────────────────────────────
 
     pub async fn load_step(&self, id: &StepId) -> Result<StepDetail> {
-        let step = self
+        let step = Step::from_row(
+            self.trace
+                .load_step(id)
+                .await
+                .map_err(TraceError::from)?
+                .ok_or_else(|| QueryError::NotFound(format!("step {id}")))?,
+        )?;
+        let mut spans = self
             .trace
-            .load_step(id)
-            .await?
-            .ok_or_else(|| QueryError::NotFound(format!("step {id}")))?;
-        let mut spans = self.trace.list_spans_by_step(id).await?;
+            .list_spans_by_step(id)
+            .await
+            .map_err(TraceError::from)?
+            .into_iter()
+            .map(Span::from_row)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         // Span events are stored separately; fold them in so callers
         // get a fully self-contained `StepDetail`.
         for span in &mut spans {
             if span.events.is_empty() {
-                let evs: Vec<SpanEvent> = self.trace.list_span_events(&span.id).await?;
+                let evs: Vec<SpanEvent> = self
+                    .trace
+                    .list_span_events(&span.id)
+                    .await
+                    .map_err(TraceError::from)?
+                    .into_iter()
+                    .map(SpanEvent::from_row)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
                 span.events = evs;
             }
         }
@@ -537,7 +564,11 @@ impl QueryApi {
     // ── 6. list_active_subagents ───────────────────────────────
 
     pub async fn list_active_subagents(&self, session_id: &SessionId) -> Result<Vec<SessionId>> {
-        let children = self.sessions.list_lineage_children(session_id).await?;
+        let children = self
+            .sessions
+            .list_lineage_children(session_id)
+            .await
+            .map_err(SessionError::from)?;
         let mut out = Vec::new();
         for (child_id, kind) in children {
             if !matches!(kind, LineageKind::Subagent) {
@@ -573,7 +604,11 @@ impl QueryApi {
             if depth >= MAX_DEPTH {
                 continue;
             }
-            let kids = self.sessions.list_lineage_children(&parent_id).await?;
+            let kids = self
+                .sessions
+                .list_lineage_children(&parent_id)
+                .await
+                .map_err(SessionError::from)?;
             for (cid, kind) in kids {
                 edges
                     .entry(parent_id.clone())
@@ -593,9 +628,14 @@ impl QueryApi {
             .as_ref()
             .ok_or_else(|| QueryError::Unsupported("cost_summary requires a CostStore".into()))?;
         match scope {
-            CostScope::TimeRange(range) => Ok(costs.query_global(range).await?),
+            CostScope::TimeRange(range) => {
+                Ok(costs.query_global(range).await.map_err(CostError::from)?)
+            }
             CostScope::User { user_id, range } => {
-                let records = costs.query_user(&user_id, range).await?;
+                let records = costs
+                    .query_user(&user_id, range)
+                    .await
+                    .map_err(CostError::from)?;
                 let mut summary = CostSummary::default();
                 for r in records {
                     summary.total_cost_usd += r.cost_usd;
@@ -607,8 +647,10 @@ impl QueryApi {
                 }
                 Ok(summary)
             }
-            CostScope::Session(sid) => Ok(costs.query_session(&sid).await?),
-            CostScope::Job(jid) => Ok(costs.query_job(&jid).await?),
+            CostScope::Session(sid) => {
+                Ok(costs.query_session(&sid).await.map_err(CostError::from)?)
+            }
+            CostScope::Job(jid) => Ok(costs.query_job(&jid).await.map_err(CostError::from)?),
         }
     }
 
@@ -634,17 +676,21 @@ impl QueryApi {
         // `list_all` deliberately excludes; every other kind reads
         // user-facing rows only.
         let mut sessions = if matches!(filter.kind, Some(SessionKind::Compression)) {
-            let ids = self.sessions.list_all_maintenance_sessions().await?;
+            let ids = self
+                .sessions
+                .list_all_maintenance_sessions()
+                .await
+                .map_err(SessionError::from)?;
             let mut out = Vec::with_capacity(ids.len());
             for id in &ids {
-                if let Some(session) = self.sessions.get(id).await? {
+                if let Some(session) = self.sessions.get(id).await.map_err(SessionError::from)? {
                     out.push(session);
                 }
             }
             out.sort_by(|a, b| b.last_active.cmp(&a.last_active));
             out
         } else {
-            self.sessions.list_all().await?
+            self.sessions.list_all().await.map_err(SessionError::from)?
         };
 
         // Cheap filters first so we don't pay per-session aggregate
@@ -683,9 +729,23 @@ impl QueryApi {
 
             let mut span_count = 0usize;
             for job in &jobs {
-                let steps = self.trace.list_steps_by_job(&job.id).await?;
+                let steps = self
+                    .trace
+                    .list_steps_by_job(&job.id)
+                    .await
+                    .map_err(TraceError::from)?
+                    .into_iter()
+                    .map(Step::from_row)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
                 for step in &steps {
-                    let spans = self.trace.list_spans_by_step(&step.id).await?;
+                    let spans = self
+                        .trace
+                        .list_spans_by_step(&step.id)
+                        .await
+                        .map_err(TraceError::from)?
+                        .into_iter()
+                        .map(Span::from_row)
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
                     span_count += spans.len();
                 }
             }
@@ -777,7 +837,10 @@ impl QueryApi {
         let mut total_records = 0usize;
         let mut by_model: HashMap<String, AnalyticsModelBucket> = HashMap::new();
 
-        let records = costs.query_records_in_range(range.clone()).await?;
+        let records = costs
+            .query_records_in_range(range.clone())
+            .await
+            .map_err(CostError::from)?;
         for r in &records {
             total_input += r.input_tokens;
             total_output += r.output_tokens;
@@ -817,7 +880,7 @@ impl QueryApi {
 
         // sessions_created per day. Single SessionStore::list_all call;
         // sessions outside the range are skipped.
-        for s in self.sessions.list_all().await? {
+        for s in self.sessions.list_all().await.map_err(SessionError::from)? {
             if s.created_at < range.from || s.created_at >= range.to {
                 continue;
             }
@@ -866,7 +929,14 @@ impl QueryApi {
             Some(target) => {
                 let mut found = None;
                 for s in &summaries {
-                    let steps = self.trace.list_steps_by_job(&s.id).await?;
+                    let steps = self
+                        .trace
+                        .list_steps_by_job(&s.id)
+                        .await
+                        .map_err(TraceError::from)?
+                        .into_iter()
+                        .map(Step::from_row)
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
                     if steps.iter().any(|st| &st.id == target) {
                         found = Some(s.id);
                         break;
@@ -881,14 +951,35 @@ impl QueryApi {
                 Some(j) => j,
                 None => continue, // deleted between calls; skip
             };
-            let mut steps = self.trace.list_steps_by_job(&job.id).await?;
+            let mut steps = self
+                .trace
+                .list_steps_by_job(&job.id)
+                .await
+                .map_err(TraceError::from)?
+                .into_iter()
+                .map(Step::from_row)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             steps.sort_by_key(|s| s.started_at);
             let mut step_blocks = Vec::with_capacity(steps.len());
             for step in steps {
-                let mut spans = self.trace.list_spans_by_step(&step.id).await?;
+                let mut spans = self
+                    .trace
+                    .list_spans_by_step(&step.id)
+                    .await
+                    .map_err(TraceError::from)?
+                    .into_iter()
+                    .map(Span::from_row)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
                 for span in &mut spans {
                     if span.events.is_empty() {
-                        span.events = self.trace.list_span_events(&span.id).await?;
+                        span.events = self
+                            .trace
+                            .list_span_events(&span.id)
+                            .await
+                            .map_err(TraceError::from)?
+                            .into_iter()
+                            .map(SpanEvent::from_row)
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
                     }
                 }
                 let stop_after = until_step_id == Some(step.id);
@@ -944,7 +1035,8 @@ impl QueryApi {
         let session_messages = self
             .sessions
             .load_session_messages_with_supersede(session_id)
-            .await?
+            .await
+            .map_err(SessionError::from)?
             .into_iter()
             .map(SessionMessageRow::from)
             .collect();
@@ -997,14 +1089,35 @@ impl QueryApi {
             .get(job_id)
             .await?
             .ok_or_else(|| QueryError::NotFound(format!("job {job_id}")))?;
-        let mut steps = self.trace.list_steps_by_job(job_id).await?;
+        let mut steps = self
+            .trace
+            .list_steps_by_job(job_id)
+            .await
+            .map_err(TraceError::from)?
+            .into_iter()
+            .map(Step::from_row)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         steps.sort_by_key(|s| s.started_at);
         let mut step_blocks = Vec::with_capacity(steps.len());
         for step in steps {
-            let mut spans = self.trace.list_spans_by_step(&step.id).await?;
+            let mut spans = self
+                .trace
+                .list_spans_by_step(&step.id)
+                .await
+                .map_err(TraceError::from)?
+                .into_iter()
+                .map(Span::from_row)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             for span in &mut spans {
                 if span.events.is_empty() {
-                    span.events = self.trace.list_span_events(&span.id).await?;
+                    span.events = self
+                        .trace
+                        .list_span_events(&span.id)
+                        .await
+                        .map_err(TraceError::from)?
+                        .into_iter()
+                        .map(SpanEvent::from_row)
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
                 }
             }
             step_blocks.push(ReplayStep { step, spans });
@@ -1044,7 +1157,8 @@ impl QueryApi {
         let log = self
             .sessions
             .load_session_messages_with_supersede(session_id)
-            .await?;
+            .await
+            .map_err(SessionError::from)?;
 
         for job in jobs.iter_mut() {
             for step in job.steps.iter_mut() {
@@ -1141,10 +1255,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SessionStore for MemSessionStore {
-        async fn get(&self, id: &SessionId) -> std::result::Result<Option<Session>, SessionError> {
+        async fn get(
+            &self,
+            id: &SessionId,
+        ) -> std::result::Result<Option<Session>, aura_store::StorageError> {
             Ok(self.sessions.lock().get(id).cloned())
         }
-        async fn save(&self, session: &Session) -> std::result::Result<(), SessionError> {
+        async fn save(
+            &self,
+            session: &Session,
+        ) -> std::result::Result<(), aura_store::StorageError> {
             self.sessions
                 .lock()
                 .insert(session.id.clone(), session.clone());
@@ -1154,7 +1274,7 @@ mod tests {
             &self,
             id: &SessionId,
             hidden: bool,
-        ) -> std::result::Result<bool, SessionError> {
+        ) -> std::result::Result<bool, aura_store::StorageError> {
             let mut data = self.sessions.lock();
             match data.get_mut(id) {
                 Some(s) => {
@@ -1164,28 +1284,31 @@ mod tests {
                 None => Ok(false),
             }
         }
-        async fn delete(&self, _id: &SessionId) -> std::result::Result<bool, SessionError> {
+        async fn delete(
+            &self,
+            _id: &SessionId,
+        ) -> std::result::Result<bool, aura_store::StorageError> {
             Ok(true)
         }
         async fn list_expired(
             &self,
             _before: DateTime<Utc>,
-        ) -> std::result::Result<Vec<SessionId>, SessionError> {
+        ) -> std::result::Result<Vec<SessionId>, aura_store::StorageError> {
             Ok(Vec::new())
         }
-        async fn list_all(&self) -> std::result::Result<Vec<Session>, SessionError> {
+        async fn list_all(&self) -> std::result::Result<Vec<Session>, aura_store::StorageError> {
             Ok(self.sessions.lock().values().cloned().collect())
         }
         async fn list_live_forks(
             &self,
             _src: &SessionId,
-        ) -> std::result::Result<Vec<SessionId>, SessionError> {
+        ) -> std::result::Result<Vec<SessionId>, aura_store::StorageError> {
             Ok(Vec::new())
         }
         async fn list_lineage_children(
             &self,
             parent: &SessionId,
-        ) -> std::result::Result<Vec<(SessionId, LineageKind)>, SessionError> {
+        ) -> std::result::Result<Vec<(SessionId, LineageKind)>, aura_store::StorageError> {
             Ok(self
                 .children
                 .lock()
@@ -1196,24 +1319,24 @@ mod tests {
         async fn list_active_maintenance_for_parent(
             &self,
             _parent: &SessionId,
-        ) -> std::result::Result<Vec<SessionId>, SessionError> {
+        ) -> std::result::Result<Vec<SessionId>, aura_store::StorageError> {
             Ok(Vec::new())
         }
         async fn list_all_maintenance_sessions(
             &self,
-        ) -> std::result::Result<Vec<SessionId>, SessionError> {
+        ) -> std::result::Result<Vec<SessionId>, aura_store::StorageError> {
             Ok(Vec::new())
         }
         async fn list_unfinished_maintenance_sessions(
             &self,
-        ) -> std::result::Result<Vec<SessionId>, SessionError> {
+        ) -> std::result::Result<Vec<SessionId>, aura_store::StorageError> {
             Ok(Vec::new())
         }
         async fn append_session_message(
             &self,
             id: &SessionId,
             message: &aura_model::ChatMessage,
-        ) -> std::result::Result<i64, SessionError> {
+        ) -> std::result::Result<i64, aura_store::StorageError> {
             let mut guard = self.messages.lock();
             let log = guard.entry(id.clone()).or_default();
             let ordinal: i64 = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
@@ -1229,7 +1352,7 @@ mod tests {
             &self,
             id: &SessionId,
             new_active: &[aura_model::ChatMessage],
-        ) -> std::result::Result<(), SessionError> {
+        ) -> std::result::Result<(), aura_store::StorageError> {
             let mut guard = self.messages.lock();
             let log = guard.entry(id.clone()).or_default();
             let next_ordinal = log.last().map(|m| m.ordinal + 1).unwrap_or(0);
@@ -1252,7 +1375,7 @@ mod tests {
         async fn load_active_session_messages(
             &self,
             id: &SessionId,
-        ) -> std::result::Result<Vec<aura_model::ChatMessage>, SessionError> {
+        ) -> std::result::Result<Vec<aura_model::ChatMessage>, aura_store::StorageError> {
             Ok(self
                 .messages
                 .lock()
@@ -1268,7 +1391,7 @@ mod tests {
         async fn latest_session_ordinal(
             &self,
             id: &SessionId,
-        ) -> std::result::Result<Option<i64>, SessionError> {
+        ) -> std::result::Result<Option<i64>, aura_store::StorageError> {
             Ok(self
                 .messages
                 .lock()
@@ -1278,14 +1401,14 @@ mod tests {
         async fn load_session_messages_with_supersede(
             &self,
             id: &SessionId,
-        ) -> std::result::Result<Vec<StoredMessage>, SessionError> {
+        ) -> std::result::Result<Vec<StoredMessage>, aura_store::StorageError> {
             Ok(self.messages.lock().get(id).cloned().unwrap_or_default())
         }
         async fn active_index_of_ordinal(
             &self,
             id: &SessionId,
             ordinal: i64,
-        ) -> std::result::Result<Option<usize>, SessionError> {
+        ) -> std::result::Result<Option<usize>, aura_store::StorageError> {
             Ok(self.messages.lock().get(id).and_then(|log| {
                 log.iter()
                     .filter(|m| m.superseded_by.is_none())
@@ -1295,7 +1418,7 @@ mod tests {
         async fn count_active_messages(
             &self,
             id: &SessionId,
-        ) -> std::result::Result<usize, SessionError> {
+        ) -> std::result::Result<usize, aura_store::StorageError> {
             Ok(self
                 .messages
                 .lock()
@@ -1307,7 +1430,7 @@ mod tests {
             &self,
             id: &SessionId,
             up_to_ordinal: i64,
-        ) -> std::result::Result<Vec<aura_model::ChatMessage>, SessionError> {
+        ) -> std::result::Result<Vec<aura_model::ChatMessage>, aura_store::StorageError> {
             Ok(self
                 .messages
                 .lock()
@@ -1327,7 +1450,7 @@ mod tests {
             limit: usize,
         ) -> std::result::Result<
             Vec<(i64, chrono::DateTime<chrono::Utc>, aura_model::ChatMessage)>,
-            SessionError,
+            aura_store::StorageError,
         > {
             if limit == 0 {
                 return Ok(Vec::new());
@@ -1358,7 +1481,8 @@ mod tests {
             id: &SessionId,
             after_ordinal: i64,
             limit: usize,
-        ) -> std::result::Result<Vec<(i64, aura_model::ChatMessage)>, SessionError> {
+        ) -> std::result::Result<Vec<(i64, aura_model::ChatMessage)>, aura_store::StorageError>
+        {
             if limit == 0 {
                 return Ok(Vec::new());
             }
@@ -1404,6 +1528,74 @@ mod tests {
         let cost_store: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
         let lifecycle = Arc::new(JobLifecycle::new(job_store));
         QueryApi::new(sessions, lifecycle, trace_store, cost_store)
+    }
+
+    /// A `TraceStore` whose reads all fail with a storage error. Used to
+    /// prove a trace-store failure surfaces as `QueryError::Trace`, not
+    /// `QueryError::Session` — a regression guard against the blanket
+    /// `From<StorageError>` that once funnelled every store's failure into
+    /// the session variant.
+    struct FailingTraceStore;
+
+    #[async_trait::async_trait]
+    impl TraceStore for FailingTraceStore {
+        async fn save_step(&self, _: &aura_store::StepRow) -> aura_store::trace::Result<()> {
+            Ok(())
+        }
+        async fn load_step(
+            &self,
+            _: &StepId,
+        ) -> aura_store::trace::Result<Option<aura_store::StepRow>> {
+            Err(aura_store::StorageError::Storage("boom".into()))
+        }
+        async fn list_steps_by_job(
+            &self,
+            _: &JobId,
+        ) -> aura_store::trace::Result<Vec<aura_store::StepRow>> {
+            Err(aura_store::StorageError::Storage("boom".into()))
+        }
+        async fn save_span(&self, _: &aura_store::SpanRow) -> aura_store::trace::Result<()> {
+            Ok(())
+        }
+        async fn load_span(
+            &self,
+            _: &aura_model::SpanId,
+        ) -> aura_store::trace::Result<Option<aura_store::SpanRow>> {
+            Err(aura_store::StorageError::Storage("boom".into()))
+        }
+        async fn list_spans_by_step(
+            &self,
+            _: &StepId,
+        ) -> aura_store::trace::Result<Vec<aura_store::SpanRow>> {
+            Err(aura_store::StorageError::Storage("boom".into()))
+        }
+        async fn append_span_event(
+            &self,
+            _: &aura_store::SpanEventRow,
+        ) -> aura_store::trace::Result<()> {
+            Ok(())
+        }
+        async fn list_span_events(
+            &self,
+            _: &aura_model::SpanId,
+        ) -> aura_store::trace::Result<Vec<aura_store::SpanEventRow>> {
+            Err(aura_store::StorageError::Storage("boom".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_store_failure_surfaces_as_trace_error() {
+        let sessions: Arc<dyn SessionStore> = Arc::new(MemSessionStore::default());
+        let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
+        let trace: Arc<dyn TraceStore> = Arc::new(FailingTraceStore);
+        let cost: Arc<dyn CostStore> = Arc::new(MemoryCostStore::default());
+        let api = QueryApi::new(sessions, lifecycle, trace, cost);
+
+        let err = api.load_step(&StepId::new()).await.unwrap_err();
+        assert!(
+            matches!(err, QueryError::Trace(_)),
+            "a trace-store failure must surface as QueryError::Trace, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1689,39 +1881,47 @@ mod tests {
         let step1_id = StepId::new();
         let now = Utc::now();
         trace_store
-            .save_step(&Step {
-                id: step1_id,
-                job_id: j1.id,
-                kind: StepKind::LlmIteration,
-                started_at: now,
-                ended_at: None,
-                outcome: LifecycleState::Pending,
-            })
+            .save_step(
+                &Step {
+                    id: step1_id,
+                    job_id: j1.id,
+                    kind: StepKind::LlmIteration,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                }
+                .to_row()
+                .unwrap(),
+            )
             .await
             .unwrap();
         let span1_id = SpanId::new();
         trace_store
-            .save_span(&Span {
-                id: span1_id,
-                step_id: step1_id,
-                kind: SpanKind::LlmCall {
-                    begin: LlmCallBegin {
-                        model_id: "claude".into(),
-                        provider: "anthropic".into(),
-                        provider_config_hash: String::new(),
-                        input_messages: LlmCallInputs::Persisted {
-                            last_ordinal: pre_last,
+            .save_span(
+                &Span {
+                    id: span1_id,
+                    step_id: step1_id,
+                    kind: SpanKind::LlmCall {
+                        begin: LlmCallBegin {
+                            model_id: "claude".into(),
+                            provider: "anthropic".into(),
+                            provider_config_hash: String::new(),
+                            input_messages: LlmCallInputs::Persisted {
+                                last_ordinal: pre_last,
+                            },
+                            temperature: None,
                         },
-                        temperature: None,
+                        result: None,
                     },
-                    result: None,
-                },
-                parallel_group: None,
-                started_at: now,
-                ended_at: None,
-                outcome: LifecycleState::Pending,
-                events: vec![],
-            })
+                    parallel_group: None,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                    events: vec![],
+                }
+                .to_row()
+                .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -1765,39 +1965,47 @@ mod tests {
 
         let step2_id = StepId::new();
         trace_store
-            .save_step(&Step {
-                id: step2_id,
-                job_id: j2.id,
-                kind: StepKind::LlmIteration,
-                started_at: Utc::now(),
-                ended_at: None,
-                outcome: LifecycleState::Pending,
-            })
+            .save_step(
+                &Step {
+                    id: step2_id,
+                    job_id: j2.id,
+                    kind: StepKind::LlmIteration,
+                    started_at: Utc::now(),
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                }
+                .to_row()
+                .unwrap(),
+            )
             .await
             .unwrap();
         let span2_id = SpanId::new();
         trace_store
-            .save_span(&Span {
-                id: span2_id,
-                step_id: step2_id,
-                kind: SpanKind::LlmCall {
-                    begin: LlmCallBegin {
-                        model_id: "claude".into(),
-                        provider: "anthropic".into(),
-                        provider_config_hash: String::new(),
-                        input_messages: LlmCallInputs::Persisted {
-                            last_ordinal: post_last,
+            .save_span(
+                &Span {
+                    id: span2_id,
+                    step_id: step2_id,
+                    kind: SpanKind::LlmCall {
+                        begin: LlmCallBegin {
+                            model_id: "claude".into(),
+                            provider: "anthropic".into(),
+                            provider_config_hash: String::new(),
+                            input_messages: LlmCallInputs::Persisted {
+                                last_ordinal: post_last,
+                            },
+                            temperature: None,
                         },
-                        temperature: None,
+                        result: None,
                     },
-                    result: None,
-                },
-                parallel_group: None,
-                started_at: Utc::now(),
-                ended_at: None,
-                outcome: LifecycleState::Pending,
-                events: vec![],
-            })
+                    parallel_group: None,
+                    started_at: Utc::now(),
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                    events: vec![],
+                }
+                .to_row()
+                .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -1994,37 +2202,45 @@ mod tests {
         let step_id = StepId::new();
         let now = Utc::now();
         trace_store
-            .save_step(&Step {
-                id: step_id,
-                job_id: j.id,
-                kind: StepKind::LlmIteration,
-                started_at: now,
-                ended_at: None,
-                outcome: LifecycleState::Pending,
-            })
+            .save_step(
+                &Step {
+                    id: step_id,
+                    job_id: j.id,
+                    kind: StepKind::LlmIteration,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                }
+                .to_row()
+                .unwrap(),
+            )
             .await
             .unwrap();
         let span_id = SpanId::new();
         trace_store
-            .save_span(&Span {
-                id: span_id,
-                step_id,
-                kind: SpanKind::LlmCall {
-                    begin: LlmCallBegin {
-                        model_id: "claude".into(),
-                        provider: "anthropic".into(),
-                        provider_config_hash: String::new(),
-                        input_messages: LlmCallInputs::Persisted { last_ordinal: last },
-                        temperature: None,
+            .save_span(
+                &Span {
+                    id: span_id,
+                    step_id,
+                    kind: SpanKind::LlmCall {
+                        begin: LlmCallBegin {
+                            model_id: "claude".into(),
+                            provider: "anthropic".into(),
+                            provider_config_hash: String::new(),
+                            input_messages: LlmCallInputs::Persisted { last_ordinal: last },
+                            temperature: None,
+                        },
+                        result: None,
                     },
-                    result: None,
-                },
-                parallel_group: None,
-                started_at: now,
-                ended_at: None,
-                outcome: LifecycleState::Pending,
-                events: vec![],
-            })
+                    parallel_group: None,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                    events: vec![],
+                }
+                .to_row()
+                .unwrap(),
+            )
             .await
             .unwrap();
 

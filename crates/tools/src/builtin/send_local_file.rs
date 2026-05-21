@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_model::{ContentBlock, TrustLevel};
-use aura_storage::blob::BlobStore;
+use aura_store::BlobStore;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};

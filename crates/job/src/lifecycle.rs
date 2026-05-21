@@ -6,9 +6,9 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::JobStatus;
 use crate::cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
-use crate::store::JobStore;
 use crate::{CancelReason, Job, JobError, JobInput, JobStatusKind, JobTransition};
 use aura_model::{JobId, SessionId, SpanId, TriggerKind};
+use aura_store::JobStore;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -121,7 +121,7 @@ impl JobLifecycle {
             )));
         }
         let job = Job::new(session_id, input, effective_soul_version, parent_job_id);
-        self.store.create(&job).await?;
+        self.store.create(&job.to_row()?).await?;
         Ok(job)
     }
 
@@ -212,18 +212,18 @@ impl JobLifecycle {
     }
 
     pub async fn get(&self, job_id: &JobId) -> Result<Option<Job>> {
-        self.store.get(job_id).await
+        self.store.get(job_id).await?.map(Job::from_row).transpose()
     }
 
     /// List jobs, optionally filtered by status discriminator. Newest
     /// `created_at` first.
     pub async fn list(&self, status: Option<JobStatusKind>) -> Result<Vec<Job>> {
-        let mut jobs = match status {
-            Some(k) => self.store.list_by_status_kind(k).await?,
+        let mut rows = match status {
+            Some(k) => self.store.list_by_status_kind(k.as_snake_case()).await?,
             None => self.store.list_all().await?,
         };
-        jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        Ok(jobs)
+        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        rows.into_iter().map(Job::from_row).collect()
     }
 
     /// List every non-terminal job (`Pending` / `InProgress` / `Stuck`)
@@ -231,7 +231,12 @@ impl JobLifecycle {
     /// `QueryApi::find_recoverable_jobs` used to call `list(Some(k))`
     /// for each kind serially.
     pub async fn list_recoverable(&self) -> Result<Vec<Job>> {
-        self.store.list_recoverable().await
+        self.store
+            .list_recoverable()
+            .await?
+            .into_iter()
+            .map(Job::from_row)
+            .collect()
     }
 
     /// List jobs scoped to one session. Hits the `idx_jobs_session`
@@ -241,7 +246,13 @@ impl JobLifecycle {
         session_id: &aura_model::SessionId,
         status: Option<JobStatusKind>,
     ) -> Result<Vec<Job>> {
-        let mut jobs = self.store.list_by_session(session_id).await?;
+        let mut jobs = self
+            .store
+            .list_by_session(session_id)
+            .await?
+            .into_iter()
+            .map(Job::from_row)
+            .collect::<Result<Vec<_>>>()?;
         if let Some(k) = status {
             jobs.retain(|j| j.status.kind() == k);
         }
@@ -250,7 +261,12 @@ impl JobLifecycle {
     }
 
     pub async fn get_history(&self, job_id: &JobId) -> Result<Vec<JobTransition>> {
-        self.store.get_transitions(job_id).await
+        self.store
+            .get_transitions(job_id)
+            .await?
+            .into_iter()
+            .map(JobTransition::from_row)
+            .collect()
     }
 
     async fn apply<F>(&self, job_id: &JobId, f: F) -> Result<(Job, JobTransition)>
@@ -263,8 +279,8 @@ impl JobLifecycle {
     }
 
     async fn persist(&self, job: Job, transition: JobTransition) -> Result<()> {
-        self.store.save(&job).await?;
-        self.store.record_transition(&transition).await?;
+        self.store.save(&job.to_row()?).await?;
+        self.store.record_transition(&transition.to_row()?).await?;
         Ok(())
     }
 
@@ -291,6 +307,8 @@ impl JobLifecycle {
         self.store
             .get(job_id)
             .await?
+            .map(Job::from_row)
+            .transpose()?
             .ok_or_else(|| JobError::NotFound(format!("job {job_id}")))
     }
 }

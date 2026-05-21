@@ -10,7 +10,9 @@ use async_trait::async_trait;
 use aura_model::SessionId;
 use chrono::{DateTime, Utc};
 
-use crate::store::Result;
+use crate::StorageError;
+
+pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// One row of `session_summaries`. `cursor` is the
 /// `session_messages.ordinal` of the most-recent message included in

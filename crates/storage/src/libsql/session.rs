@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
-use crate::error::StorageError;
 use aura_model::{ChatMessage, Lineage, LineageKind, Session, SessionId};
-use aura_session::{Result, SessionError, SessionStore, StoredMessage};
+use aura_store::StorageError;
+use aura_store::session::{Result, SessionStore, StoredMessage};
 
 pub struct LibsqlSessionStore {
     pool: LibsqlPool,
@@ -184,7 +184,7 @@ impl SessionStore for LibsqlSessionStore {
         drop(rows);
         if !live_forks.is_empty() {
             let _ = tx.rollback().await;
-            return Err(SessionError::HasLiveForks {
+            return Err(StorageError::HasLiveForks {
                 fork_session_ids: live_forks,
             });
         }
@@ -1115,7 +1115,7 @@ mod tests {
 
         let err = store.delete(&parent.id).await.unwrap_err();
         match err {
-            SessionError::HasLiveForks { fork_session_ids } => {
+            StorageError::HasLiveForks { fork_session_ids } => {
                 assert_eq!(fork_session_ids, vec![fork.id.clone()]);
             }
             other => panic!("expected HasLiveForks, got {other:?}"),

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use aura_model::ChannelType;
 
 use super::LibsqlPool;
-use crate::channel_pairing::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
+use aura_store::channel_pairing::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
 
 pub struct LibsqlChannelPairingStore {
     pool: LibsqlPool,

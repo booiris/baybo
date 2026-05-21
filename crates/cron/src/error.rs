@@ -15,3 +15,14 @@ pub enum CronError {
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
+
+impl From<aura_store::StorageError> for CronError {
+    fn from(e: aura_store::StorageError) -> Self {
+        match e {
+            aura_store::StorageError::Conflict(s) => CronError::AlreadyDispatched(s),
+            aura_store::StorageError::NotFound(s) => CronError::NotFound(s),
+            aura_store::StorageError::Internal(e) => CronError::Internal(e),
+            other => CronError::Storage(other.to_string()),
+        }
+    }
+}

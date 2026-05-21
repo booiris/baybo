@@ -15,7 +15,6 @@ pub mod leak_detector;
 pub mod log_redact;
 pub mod network;
 pub mod placeholder;
-pub mod secret_store;
 pub mod secret_value;
 pub mod secret_vault;
 pub mod sensitive_paths;
@@ -24,7 +23,6 @@ pub mod sensitive_paths;
 pub mod test_support;
 
 pub use error::SecurityError;
-pub use secret_store::SecretStore;
 
 pub type Result<T> = std::result::Result<T, SecurityError>;
 

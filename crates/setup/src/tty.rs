@@ -39,6 +39,15 @@ impl Prompter for TtyPrompter {
         select_one(label, options)
     }
 
+    fn multi_select(
+        &mut self,
+        label: &str,
+        options: &[&str],
+        initial: &[bool],
+    ) -> Result<Vec<usize>> {
+        select_many(label, options, initial)
+    }
+
     fn text(&mut self, label: &str, default: &str) -> Result<String> {
         prompt_with_default(label, default)
     }
@@ -206,12 +215,133 @@ fn redraw(out: &mut impl Write, options: &[&str], cursor: usize) -> Result<()> {
     Ok(())
 }
 
+/// Multi-select sibling of [`select_one`]: a checkbox list where space
+/// toggles the row under the cursor and enter confirms the whole set.
+/// `initial[i]` seeds row `i`'s checked state. Returns the checked
+/// indices in ascending order.
+pub(crate) fn select_many(label: &str, options: &[&str], initial: &[bool]) -> Result<Vec<usize>> {
+    if options.is_empty() {
+        return Err(SetupError::Prompt("no options to pick from".into()));
+    }
+    let stdin = io::stdin();
+    let stderr = io::stderr();
+    if !stdin.is_terminal() || !stderr.is_terminal() {
+        return Err(SetupError::NotATerminal);
+    }
+
+    let mut checked: Vec<bool> = (0..options.len())
+        .map(|i| initial.get(i).copied().unwrap_or(false))
+        .collect();
+
+    let mut out = stderr.lock();
+    writeln!(out, "{label}").map_err(|e| SetupError::Prompt(format!("write label: {e}")))?;
+
+    enable_raw_mode().map_err(|e| SetupError::Prompt(format!("enable raw mode: {e}")))?;
+    let _guard = SelectRawGuard;
+    execute!(out, Hide).map_err(|e| SetupError::Prompt(format!("hide cursor: {e}")))?;
+
+    let mut cursor = 0usize;
+    render_multi(&mut out, options, &checked, cursor)?;
+
+    loop {
+        match event::read().map_err(|e| SetupError::Prompt(format!("read event: {e}")))? {
+            Event::Key(KeyEvent {
+                kind: KeyEventKind::Release,
+                ..
+            }) => continue,
+            Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) => match code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    cursor = step(cursor, options.len(), -1);
+                    redraw_multi(&mut out, options, &checked, cursor)?;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    cursor = step(cursor, options.len(), 1);
+                    redraw_multi(&mut out, options, &checked, cursor)?;
+                }
+                KeyCode::Char(' ') => {
+                    checked[cursor] = !checked[cursor];
+                    redraw_multi(&mut out, options, &checked, cursor)?;
+                }
+                KeyCode::Enter => break,
+                KeyCode::Esc => return cancel(&mut out, options.len()),
+                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    return cancel(&mut out, options.len());
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    execute!(out, Show).map_err(|e| SetupError::Prompt(format!("show cursor: {e}")))?;
+    drop(_guard);
+    let picked: Vec<usize> = checked
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &on)| on.then_some(i))
+        .collect();
+    let summary = if picked.is_empty() {
+        "(none)".to_string()
+    } else {
+        picked
+            .iter()
+            .map(|&i| options[i])
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    writeln!(out, "  selected: {summary}")
+        .map_err(|e| SetupError::Prompt(format!("write echo: {e}")))?;
+    Ok(picked)
+}
+
+fn multi_row(index: usize, opt: &str, checked: bool, cursor: usize) -> String {
+    let pointer = if index == cursor { ">" } else { " " };
+    let mark = if checked { "[x]" } else { "[ ]" };
+    format!("{pointer} {mark} {opt}")
+}
+
+fn render_multi(
+    out: &mut impl Write,
+    options: &[&str],
+    checked: &[bool],
+    cursor: usize,
+) -> Result<()> {
+    for (i, opt) in options.iter().enumerate() {
+        writeln!(out, "{}\r", multi_row(i, opt, checked[i], cursor))
+            .map_err(|e| SetupError::Prompt(format!("write row: {e}")))?;
+    }
+    out.flush()
+        .map_err(|e| SetupError::Prompt(format!("flush picker: {e}")))?;
+    Ok(())
+}
+
+fn redraw_multi(
+    out: &mut impl Write,
+    options: &[&str],
+    checked: &[bool],
+    cursor: usize,
+) -> Result<()> {
+    execute!(out, MoveToPreviousLine(options.len() as u16))
+        .map_err(|e| SetupError::Prompt(format!("cursor move: {e}")))?;
+    for (i, opt) in options.iter().enumerate() {
+        execute!(out, Clear(ClearType::CurrentLine))
+            .map_err(|e| SetupError::Prompt(format!("clear line: {e}")))?;
+        writeln!(out, "{}\r", multi_row(i, opt, checked[i], cursor))
+            .map_err(|e| SetupError::Prompt(format!("write row: {e}")))?;
+    }
+    out.flush()
+        .map_err(|e| SetupError::Prompt(format!("flush picker: {e}")))?;
+    Ok(())
+}
+
 fn step(current: usize, len: usize, delta: i32) -> usize {
     let n = len as i32;
     ((current as i32 + delta).rem_euclid(n)) as usize
 }
 
-fn cancel(out: &mut impl Write, rendered_lines: usize) -> Result<usize> {
+fn cancel<T>(out: &mut impl Write, rendered_lines: usize) -> Result<T> {
     execute!(out, Show).ok();
     let _ = disable_raw_mode();
     for _ in 0..rendered_lines {

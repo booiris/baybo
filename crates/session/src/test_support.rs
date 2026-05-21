@@ -12,9 +12,9 @@ use aura_model::{ChannelType, ChatMessage, LineageKind, Session, SessionId};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
-use crate::error::SessionError;
-use crate::store::{Result, SessionStore, StoredMessage};
-use crate::summary_store::{SessionSummaryRow, SessionSummaryStore};
+use aura_store::StorageError;
+use aura_store::session::{Result, SessionStore, StoredMessage};
+use aura_store::session_summary::{SessionSummaryRow, SessionSummaryStore};
 
 /// One stored row in the in-memory session transcript log — mirrors
 /// the libsql layout closely enough that `apply_session_compaction`
@@ -144,7 +144,7 @@ impl SessionStore for MemorySessionStore {
             created_at: Utc::now(),
         });
         i64::try_from(ordinal).map_err(|_| {
-            SessionError::Internal(anyhow::anyhow!("ordinal {ordinal} exceeds i64::MAX"))
+            StorageError::Internal(anyhow::anyhow!("ordinal {ordinal} exceeds i64::MAX"))
         })
     }
 

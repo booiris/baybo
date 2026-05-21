@@ -247,7 +247,7 @@ pub struct Session {
     /// `DELETE /v1/chat/sessions/:id` endpoint, which intentionally
     /// does not remove the row — agent state, transcript, and
     /// channel-token all stay live. The chat list endpoint filters
-    /// `hidden = true` out; `aura_storage::SessionStore::list_all`
+    /// `hidden = true` out; `aura_store::SessionStore::list_all`
     /// does not, so admin / trace browsers continue to see hidden
     /// sessions. Default `false` so legacy JSON blobs deserialize.
     #[serde(default)]

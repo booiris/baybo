@@ -7,7 +7,9 @@
 //! in the cron scheduler) so `aura-cron` can stay free of `aura-storage`.
 
 use async_trait::async_trait;
-use aura_cron::{CronError, CronExecution, CronJob, CronStore, ExecutionStatus, Result};
+use aura_model::{CronExecution, CronJob, ExecutionStatus};
+use aura_store::StorageError;
+use aura_store::cron::{CronStore, Result};
 
 use super::LibsqlPool;
 
@@ -25,21 +27,21 @@ impl LibsqlCronStore {
 
 fn col_string(row: &libsql::Row, i: i32) -> Result<String> {
     row.get::<String>(i)
-        .map_err(|e| CronError::Storage(format!("libsql get column {i}: {e}")))
+        .map_err(|e| StorageError::Storage(format!("libsql get column {i}: {e}")))
 }
 
 fn job_from_row(row: &libsql::Row) -> Result<CronJob> {
     // Cols: (id, user_id, status, next_trigger_at, data)
     let data = col_string(row, 4)?;
     serde_json::from_str(&data)
-        .map_err(|e| CronError::Storage(format!("failed to deserialize cron job: {e}")))
+        .map_err(|e| StorageError::Storage(format!("failed to deserialize cron job: {e}")))
 }
 
 fn execution_from_row(row: &libsql::Row) -> Result<CronExecution> {
     // Cols: (id, job_id, user_id, scheduled_fire_time, triggered_at, status, data)
     let data = col_string(row, 6)?;
     let mut exec: CronExecution = serde_json::from_str(&data)
-        .map_err(|e| CronError::Storage(format!("failed to deserialize execution: {e}")))?;
+        .map_err(|e| StorageError::Storage(format!("failed to deserialize execution: {e}")))?;
     // The row-level `status` column is the source of truth — `update_execution_status`
     // touches the column without rewriting `data`.
     let status_col = col_string(row, 5)?;
@@ -59,12 +61,12 @@ fn execution_status_str(status: ExecutionStatus) -> &'static str {
 
 fn serialize_job(job: &CronJob) -> Result<String> {
     serde_json::to_string(job)
-        .map_err(|e| CronError::Storage(format!("failed to serialize cron job: {e}")))
+        .map_err(|e| StorageError::Storage(format!("failed to serialize cron job: {e}")))
 }
 
 fn serialize_execution(exec: &CronExecution) -> Result<String> {
     serde_json::to_string(exec)
-        .map_err(|e| CronError::Storage(format!("failed to serialize execution: {e}")))
+        .map_err(|e| StorageError::Storage(format!("failed to serialize execution: {e}")))
 }
 
 #[async_trait]
@@ -88,7 +90,7 @@ impl CronStore for LibsqlCronStore {
                 ],
             )
             .await
-            .map_err(|e| CronError::Storage(format!("libsql insert: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("libsql insert: {e}")))?;
         Ok(())
     }
 
@@ -102,12 +104,12 @@ impl CronStore for LibsqlCronStore {
                 libsql::params![job_id.to_string()],
             )
             .await
-            .map_err(|e| CronError::Storage(format!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
 
         match rows
             .next()
             .await
-            .map_err(|e| CronError::Storage(format!("libsql row: {e}")))?
+            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
         {
             Some(row) => Ok(Some(job_from_row(&row)?)),
             None => Ok(None),
@@ -135,10 +137,10 @@ impl CronStore for LibsqlCronStore {
                 ],
             )
             .await
-            .map_err(|e| CronError::Storage(format!("libsql update: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("libsql update: {e}")))?;
 
         if affected == 0 {
-            return Err(CronError::NotFound(job.id.clone()));
+            return Err(StorageError::NotFound(job.id.clone()));
         }
         Ok(())
     }
@@ -152,10 +154,10 @@ impl CronStore for LibsqlCronStore {
                 libsql::params![job_id.to_string()],
             )
             .await
-            .map_err(|e| CronError::Storage(format!("libsql delete: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("libsql delete: {e}")))?;
 
         if affected == 0 {
-            return Err(CronError::NotFound(job_id.to_string()));
+            return Err(StorageError::NotFound(job_id.to_string()));
         }
         Ok(())
     }
@@ -170,13 +172,13 @@ impl CronStore for LibsqlCronStore {
                 libsql::params![user_id.to_string()],
             )
             .await
-            .map_err(|e| CronError::Storage(format!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
 
         let mut out = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| CronError::Storage(format!("libsql row: {e}")))?
+            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
         {
             out.push(job_from_row(&row)?);
         }
@@ -193,13 +195,13 @@ impl CronStore for LibsqlCronStore {
                 (),
             )
             .await
-            .map_err(|e| CronError::Storage(format!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
 
         let mut out = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| CronError::Storage(format!("libsql row: {e}")))?
+            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
         {
             out.push(job_from_row(&row)?);
         }
@@ -216,13 +218,13 @@ impl CronStore for LibsqlCronStore {
                 (),
             )
             .await
-            .map_err(|e| CronError::Storage(format!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
 
         let mut out = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| CronError::Storage(format!("libsql row: {e}")))?
+            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
         {
             out.push(job_from_row(&row)?);
         }
@@ -239,13 +241,13 @@ impl CronStore for LibsqlCronStore {
                 libsql::params![now_us],
             )
             .await
-            .map_err(|e| CronError::Storage(format!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
 
         let mut out = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| CronError::Storage(format!("libsql row: {e}")))?
+            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
         {
             out.push(job_from_row(&row)?);
         }
@@ -278,9 +280,9 @@ impl CronStore for LibsqlCronStore {
                 ],
             )
             .await
-            .map_err(|e| CronError::Storage(format!("libsql insert: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("libsql insert: {e}")))?;
         if affected == 0 {
-            return Err(CronError::AlreadyDispatched(format!(
+            return Err(StorageError::Conflict(format!(
                 "{}@{}",
                 exec.job_id, scheduled_us
             )));
@@ -297,13 +299,13 @@ impl CronStore for LibsqlCronStore {
                 libsql::params![job_id.to_string()],
             )
             .await
-            .map_err(|e| CronError::Storage(format!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
 
         let mut out = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| CronError::Storage(format!("libsql row: {e}")))?
+            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
         {
             out.push(execution_from_row(&row)?);
         }
@@ -319,13 +321,13 @@ impl CronStore for LibsqlCronStore {
                 libsql::params![user_id.to_string()],
             )
             .await
-            .map_err(|e| CronError::Storage(format!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
 
         let mut out = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| CronError::Storage(format!("libsql row: {e}")))?
+            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
         {
             out.push(execution_from_row(&row)?);
         }
@@ -345,12 +347,12 @@ impl CronStore for LibsqlCronStore {
                 libsql::params![job_id.to_string(), scheduled_fire_time_us],
             )
             .await
-            .map_err(|e| CronError::Storage(format!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
 
         let exists = rows
             .next()
             .await
-            .map_err(|e| CronError::Storage(format!("libsql row: {e}")))?
+            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
             .is_some();
         Ok(exists)
     }
@@ -371,10 +373,10 @@ impl CronStore for LibsqlCronStore {
                 ],
             )
             .await
-            .map_err(|e| CronError::Storage(format!("libsql update: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("libsql update: {e}")))?;
 
         if affected == 0 {
-            return Err(CronError::NotFound(execution_id.to_string()));
+            return Err(StorageError::NotFound(execution_id.to_string()));
         }
         Ok(())
     }
@@ -391,13 +393,13 @@ impl CronStore for LibsqlCronStore {
                 libsql::params![execution_status_str(status).to_string()],
             )
             .await
-            .map_err(|e| CronError::Storage(format!("libsql query: {e}")))?;
+            .map_err(|e| StorageError::Storage(format!("libsql query: {e}")))?;
 
         let mut out = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| CronError::Storage(format!("libsql row: {e}")))?
+            .map_err(|e| StorageError::Storage(format!("libsql row: {e}")))?
         {
             out.push(execution_from_row(&row)?);
         }
@@ -408,8 +410,8 @@ impl CronStore for LibsqlCronStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_cron::{CronSchedule, CronStatus};
     use aura_model::ChannelType;
+    use aura_model::{CronSchedule, CronStatus};
     use chrono::Utc;
 
     fn future_dt() -> chrono::DateTime<Utc> {
@@ -491,7 +493,7 @@ mod tests {
             .save(&test_job("nonexistent", "u1", CronStatus::Enabled))
             .await
             .unwrap_err();
-        assert!(matches!(err, CronError::NotFound(_)));
+        assert!(matches!(err, StorageError::NotFound(_)));
     }
 
     #[tokio::test]
@@ -511,7 +513,7 @@ mod tests {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlCronStore::new(pool);
         let err = store.delete("nonexistent").await.unwrap_err();
-        assert!(matches!(err, CronError::NotFound(_)));
+        assert!(matches!(err, StorageError::NotFound(_)));
     }
 
     #[tokio::test]
@@ -598,7 +600,7 @@ mod tests {
         exec.id = "ce-dup-b".into();
         let err = store.record_execution(&exec).await.unwrap_err();
         match err {
-            CronError::AlreadyDispatched(key) => {
+            StorageError::Conflict(key) => {
                 assert!(key.starts_with("cj-dup@"), "key was {key}");
             }
             other => panic!("expected AlreadyDispatched, got {other:?}"),

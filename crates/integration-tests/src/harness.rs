@@ -288,7 +288,7 @@ impl AgentTestHarnessBuilder {
         let secret_store = Arc::new(MemorySecretStore::new());
         let vault = Arc::new(SecretVault::new(
             master_key_for_tests(),
-            secret_store.clone() as Arc<dyn aura_security::SecretStore>,
+            secret_store.clone() as Arc<dyn aura_store::SecretStore>,
         ));
         let spill_dir = std::env::temp_dir().join(format!(
             "aura-it-tool-spills-{}",

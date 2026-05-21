@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 
 use super::LibsqlPool;
-use aura_job::{Job, JobError, JobStatusKind, JobStore, JobTransition};
 use aura_model::{JobId, SessionId};
+use aura_store::job::Result;
+use aura_store::{JobRow, JobStore, JobTransitionRow, StorageError};
 
 pub struct LibsqlJobStore {
     pool: LibsqlPool,
@@ -14,276 +15,193 @@ impl LibsqlJobStore {
     }
 }
 
-fn status_kind_str(k: JobStatusKind) -> &'static str {
-    match k {
-        JobStatusKind::Pending => "pending",
-        JobStatusKind::InProgress => "in_progress",
-        JobStatusKind::Stuck => "stuck",
-        JobStatusKind::Cancelled => "cancelled",
-        JobStatusKind::Failed => "failed",
-        JobStatusKind::Completed => "completed",
-    }
+const SELECT_COLS: &str = "id, session_id, parent_job_id, kind, status_kind, \
+     effective_soul_version, created_at, started_at, ended_at, data";
+
+fn col_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
+    StorageError::Internal(anyhow::anyhow!("libsql {ctx}: {e}"))
 }
 
-fn job_kind_str(k: aura_job::JobKind) -> &'static str {
-    match k {
-        aura_job::JobKind::UserChat => "user_chat",
-        aura_job::JobKind::Cron => "cron",
-        aura_job::JobKind::System => "system",
-        aura_job::JobKind::Spawned => "spawned",
-    }
+fn parse_job_id(s: String) -> Result<JobId> {
+    s.parse::<JobId>().map_err(|e| col_err("parse job id", e))
 }
 
-fn deserialize_job(data: &str) -> aura_job::Result<Job> {
-    serde_json::from_str(data)
-        .map_err(|e| JobError::Storage(format!("failed to deserialize job: {e}")))
+fn job_row_from(row: &libsql::Row) -> Result<JobRow> {
+    let get_s = |i: i32| row.get::<String>(i).map_err(|e| col_err("get col", e));
+    let get_os = |i: i32| {
+        row.get::<Option<String>>(i)
+            .map_err(|e| col_err("get col", e))
+    };
+    let get_oi = |i: i32| row.get::<Option<i64>>(i).map_err(|e| col_err("get col", e));
+    Ok(JobRow {
+        id: parse_job_id(get_s(0)?)?,
+        session_id: SessionId::from(get_s(1)?),
+        parent_job_id: get_os(2)?.map(parse_job_id).transpose()?,
+        kind: get_s(3)?,
+        status_kind: get_s(4)?,
+        effective_soul_version: get_s(5)?,
+        created_at: super::time::from_us(row.get::<i64>(6).map_err(|e| col_err("get col", e))?)
+            .ok_or_else(|| col_err("created_at", "out of range"))?,
+        started_at: get_oi(7)?.and_then(super::time::from_us),
+        ended_at: get_oi(8)?.and_then(super::time::from_us),
+        data: get_s(9)?,
+    })
 }
 
 #[async_trait]
 impl JobStore for LibsqlJobStore {
-    async fn create(&self, job: &Job) -> aura_job::Result<()> {
-        let conn = self.pool.conn();
-        let data = serde_json::to_string(job)
-            .map_err(|e| JobError::Storage(format!("failed to serialize job: {e}")))?;
-        conn.execute(
-            "INSERT INTO jobs \
-             (id, session_id, parent_job_id, kind, status_kind, effective_soul_version, \
-              created_at, started_at, ended_at, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            libsql::params![
-                job.id.to_string(),
-                job.session_id.as_str().to_string(),
-                job.parent_job_id.map(|p| p.to_string()),
-                job_kind_str(job.kind).to_string(),
-                status_kind_str(job.status.kind()).to_string(),
-                job.effective_soul_version.clone(),
-                super::time::to_us(job.created_at),
-                job.started_at.map(super::time::to_us),
-                job.ended_at.map(super::time::to_us),
-                data,
-            ],
-        )
-        .await
-        .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql insert error: {e}")))?;
+    async fn create(&self, job: &JobRow) -> Result<()> {
+        self.pool
+            .conn()
+            .execute(
+                "INSERT INTO jobs \
+                 (id, session_id, parent_job_id, kind, status_kind, effective_soul_version, \
+                  created_at, started_at, ended_at, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                libsql::params![
+                    job.id.to_string(),
+                    job.session_id.as_str().to_string(),
+                    job.parent_job_id.map(|p| p.to_string()),
+                    job.kind.clone(),
+                    job.status_kind.clone(),
+                    job.effective_soul_version.clone(),
+                    super::time::to_us(job.created_at),
+                    job.started_at.map(super::time::to_us),
+                    job.ended_at.map(super::time::to_us),
+                    job.data.clone(),
+                ],
+            )
+            .await
+            .map_err(|e| col_err("insert error", e))?;
         Ok(())
     }
 
-    async fn get(&self, job_id: &JobId) -> aura_job::Result<Option<Job>> {
+    async fn get(&self, job_id: &JobId) -> Result<Option<JobRow>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM jobs WHERE id = ?1",
+                &format!("SELECT {SELECT_COLS} FROM jobs WHERE id = ?1"),
                 libsql::params![job_id.to_string()],
             )
             .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
-
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql row error: {e}")))?;
-
-        match row {
-            Some(row) => {
-                let data: String = row
-                    .get(0)
-                    .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                Ok(Some(deserialize_job(&data)?))
-            }
+            .map_err(|e| col_err("query error", e))?;
+        match rows.next().await.map_err(|e| col_err("row error", e))? {
+            Some(row) => Ok(Some(job_row_from(&row)?)),
             None => Ok(None),
         }
     }
 
-    async fn save(&self, job: &Job) -> aura_job::Result<()> {
-        let conn = self.pool.conn();
-        let data = serde_json::to_string(job)
-            .map_err(|e| JobError::Storage(format!("failed to serialize job: {e}")))?;
-
-        let rows_affected = conn
+    async fn save(&self, job: &JobRow) -> Result<()> {
+        let rows_affected = self
+            .pool
+            .conn()
             .execute(
-                "UPDATE jobs SET status_kind = ?1, started_at = ?2, ended_at = ?3, \
-                                  data = ?4 \
+                "UPDATE jobs SET status_kind = ?1, started_at = ?2, ended_at = ?3, data = ?4 \
                  WHERE id = ?5",
                 libsql::params![
-                    status_kind_str(job.status.kind()).to_string(),
+                    job.status_kind.clone(),
                     job.started_at.map(super::time::to_us),
                     job.ended_at.map(super::time::to_us),
-                    data,
+                    job.data.clone(),
                     job.id.to_string(),
                 ],
             )
             .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql update error: {e}")))?;
-
+            .map_err(|e| col_err("update error", e))?;
         if rows_affected == 0 {
-            return Err(JobError::NotFound(job.id.to_string()));
+            return Err(StorageError::NotFound(job.id.to_string()));
         }
         Ok(())
     }
 
-    async fn list_by_session(&self, session_id: &SessionId) -> aura_job::Result<Vec<Job>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT data FROM jobs \
-                 WHERE session_id = ?1 \
-                 ORDER BY created_at",
-                libsql::params![session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
-
-        let mut jobs = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
-        {
-            let data: String = row
-                .get(0)
-                .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            jobs.push(deserialize_job(&data)?);
-        }
-        Ok(jobs)
-    }
-
-    async fn list_by_status_kind(&self, kind: JobStatusKind) -> aura_job::Result<Vec<Job>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT data FROM jobs \
-                 WHERE status_kind = ?1 \
-                 ORDER BY created_at",
-                libsql::params![status_kind_str(kind).to_string()],
-            )
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
-
-        let mut jobs = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
-        {
-            let data: String = row
-                .get(0)
-                .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            jobs.push(deserialize_job(&data)?);
-        }
-        Ok(jobs)
-    }
-
-    async fn list_recoverable(&self) -> aura_job::Result<Vec<Job>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT data FROM jobs \
-                 WHERE status_kind IN ('pending', 'in_progress', 'stuck') \
-                 ORDER BY created_at",
-                (),
-            )
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
-
-        let mut jobs = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
-        {
-            let data: String = row
-                .get(0)
-                .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            jobs.push(deserialize_job(&data)?);
-        }
-        Ok(jobs)
-    }
-
-    async fn list_children(&self, parent_job_id: &JobId) -> aura_job::Result<Vec<Job>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT data FROM jobs \
-                 WHERE parent_job_id = ?1 \
-                 ORDER BY created_at",
-                libsql::params![parent_job_id.to_string()],
-            )
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
-
-        let mut jobs = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
-        {
-            let data: String = row
-                .get(0)
-                .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            jobs.push(deserialize_job(&data)?);
-        }
-        Ok(jobs)
-    }
-
-    async fn list_all(&self) -> aura_job::Result<Vec<Job>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query("SELECT data FROM jobs", ())
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
-
-        let mut jobs = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
-        {
-            let data: String = row
-                .get(0)
-                .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            jobs.push(deserialize_job(&data)?);
-        }
-        Ok(jobs)
-    }
-
-    async fn record_transition(&self, transition: &JobTransition) -> aura_job::Result<()> {
-        let conn = self.pool.conn();
-        let data = serde_json::to_string(transition)
-            .map_err(|e| JobError::Storage(format!("failed to serialize transition: {e}")))?;
-        conn.execute(
-            "INSERT INTO job_transitions (job_id, data) VALUES (?1, ?2)",
-            libsql::params![transition.job_id.to_string(), data],
+    async fn list_by_session(&self, session_id: &SessionId) -> Result<Vec<JobRow>> {
+        self.collect(
+            &format!("SELECT {SELECT_COLS} FROM jobs WHERE session_id = ?1 ORDER BY created_at"),
+            libsql::params![session_id.as_str().to_string()],
         )
         .await
-        .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql insert error: {e}")))?;
+    }
+
+    async fn list_by_status_kind(&self, status_kind: &str) -> Result<Vec<JobRow>> {
+        self.collect(
+            &format!("SELECT {SELECT_COLS} FROM jobs WHERE status_kind = ?1 ORDER BY created_at"),
+            libsql::params![status_kind.to_string()],
+        )
+        .await
+    }
+
+    async fn list_recoverable(&self) -> Result<Vec<JobRow>> {
+        self.collect(
+            &format!(
+                "SELECT {SELECT_COLS} FROM jobs \
+                 WHERE status_kind IN ('pending', 'in_progress', 'stuck') ORDER BY created_at"
+            ),
+            (),
+        )
+        .await
+    }
+
+    async fn list_children(&self, parent_job_id: &JobId) -> Result<Vec<JobRow>> {
+        self.collect(
+            &format!("SELECT {SELECT_COLS} FROM jobs WHERE parent_job_id = ?1 ORDER BY created_at"),
+            libsql::params![parent_job_id.to_string()],
+        )
+        .await
+    }
+
+    async fn list_all(&self) -> Result<Vec<JobRow>> {
+        self.collect(&format!("SELECT {SELECT_COLS} FROM jobs"), ())
+            .await
+    }
+
+    async fn record_transition(&self, transition: &JobTransitionRow) -> Result<()> {
+        self.pool
+            .conn()
+            .execute(
+                "INSERT INTO job_transitions (job_id, data) VALUES (?1, ?2)",
+                libsql::params![transition.job_id.to_string(), transition.data.clone()],
+            )
+            .await
+            .map_err(|e| col_err("insert error", e))?;
         Ok(())
     }
 
-    async fn get_transitions(&self, job_id: &JobId) -> aura_job::Result<Vec<JobTransition>> {
+    async fn get_transitions(&self, job_id: &JobId) -> Result<Vec<JobTransitionRow>> {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data FROM job_transitions \
-                 WHERE job_id = ?1 ORDER BY id",
+                "SELECT data FROM job_transitions WHERE job_id = ?1 ORDER BY id",
                 libsql::params![job_id.to_string()],
             )
             .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
-
-        let mut transitions = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
-        {
-            let data: String = row
-                .get(0)
-                .map_err(|e| JobError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let t: JobTransition = serde_json::from_str(&data)
-                .map_err(|e| JobError::Storage(format!("failed to deserialize transition: {e}")))?;
-            transitions.push(t);
+            .map_err(|e| col_err("query error", e))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| col_err("row error", e))? {
+            out.push(JobTransitionRow {
+                job_id: *job_id,
+                data: row.get::<String>(0).map_err(|e| col_err("get col", e))?,
+            });
         }
-        Ok(transitions)
+        Ok(out)
+    }
+}
+
+impl LibsqlJobStore {
+    async fn collect(
+        &self,
+        sql: &str,
+        params: impl libsql::params::IntoParams,
+    ) -> Result<Vec<JobRow>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(sql, params)
+            .await
+            .map_err(|e| col_err("query error", e))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|e| col_err("row error", e))? {
+            out.push(job_row_from(&row)?);
+        }
+        Ok(out)
     }
 }
 
@@ -291,7 +209,7 @@ impl JobStore for LibsqlJobStore {
 #[allow(unused_must_use)] // tests build state machines via direct calls; the JobTransition audit record isn't the assertion target
 mod tests {
     use super::*;
-    use aura_job::{JobInput, JobStatus};
+    use aura_job::{Job, JobInput, JobStatus};
     use aura_model::ContentBlock;
 
     fn test_job() -> Job {
@@ -305,14 +223,25 @@ mod tests {
         )
     }
 
+    async fn create(store: &LibsqlJobStore, job: &Job) {
+        store.create(&job.to_row().unwrap()).await.unwrap();
+    }
+
+    async fn load(store: &LibsqlJobStore, id: &JobId) -> Option<Job> {
+        store
+            .get(id)
+            .await
+            .unwrap()
+            .map(|r| Job::from_row(r).unwrap())
+    }
+
     #[tokio::test]
     async fn create_and_get() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlJobStore::new(pool);
         let j = test_job();
-        store.create(&j).await.unwrap();
-        let loaded = store.get(&j.id).await.unwrap().unwrap();
-        assert_eq!(loaded.id, j.id);
+        create(&store, &j).await;
+        assert_eq!(load(&store, &j.id).await.unwrap().id, j.id);
     }
 
     #[tokio::test]
@@ -320,10 +249,10 @@ mod tests {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlJobStore::new(pool);
         let mut j = test_job();
-        store.create(&j).await.unwrap();
+        create(&store, &j).await;
         j.start().unwrap();
-        store.save(&j).await.unwrap();
-        let loaded = store.get(&j.id).await.unwrap().unwrap();
+        store.save(&j.to_row().unwrap()).await.unwrap();
+        let loaded = load(&store, &j.id).await.unwrap();
         assert!(matches!(loaded.status, JobStatus::InProgress));
         assert!(loaded.started_at.is_some());
     }
@@ -333,18 +262,16 @@ mod tests {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlJobStore::new(pool);
         let j = test_job();
-        let err = store.save(&j).await.unwrap_err();
-        assert!(matches!(err, JobError::NotFound(_)));
+        let err = store.save(&j.to_row().unwrap()).await.unwrap_err();
+        assert!(matches!(err, StorageError::NotFound(_)));
     }
 
     #[tokio::test]
     async fn list_by_session_filters() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlJobStore::new(pool);
-        let a = test_job();
-        let b = test_job();
-        store.create(&a).await.unwrap();
-        store.create(&b).await.unwrap();
+        create(&store, &test_job()).await;
+        create(&store, &test_job()).await;
         let jobs = store
             .list_by_session(&SessionId::from("sess-1"))
             .await
@@ -356,17 +283,16 @@ mod tests {
     async fn list_recoverable_includes_pending_in_progress_stuck() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlJobStore::new(pool);
-        let pending = test_job();
-        store.create(&pending).await.unwrap();
+        create(&store, &test_job()).await;
 
         let mut in_progress = test_job();
         in_progress.start().unwrap();
-        store.create(&in_progress).await.unwrap();
+        create(&store, &in_progress).await;
 
         let mut stuck = test_job();
         stuck.start().unwrap();
         stuck.stuck("hung").unwrap();
-        store.create(&stuck).await.unwrap();
+        create(&store, &stuck).await;
 
         let mut completed = test_job();
         completed.start().unwrap();
@@ -375,13 +301,12 @@ mod tests {
                 content: vec![ContentBlock::Text("ok".into())],
             })
             .unwrap();
-        store.create(&completed).await.unwrap();
+        create(&store, &completed).await;
 
         let recoverable = store.list_recoverable().await.unwrap();
         assert_eq!(recoverable.len(), 3);
-        // Completed must be excluded
-        for j in &recoverable {
-            assert!(!matches!(j.status, JobStatus::Completed));
+        for r in &recoverable {
+            assert_ne!(r.status_kind, "completed");
         }
     }
 
@@ -390,11 +315,12 @@ mod tests {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlJobStore::new(pool);
         let mut j = test_job();
-        store.create(&j).await.unwrap();
+        create(&store, &j).await;
         let t = j.start().unwrap();
-        store.record_transition(&t).await.unwrap();
+        store.record_transition(&t.to_row().unwrap()).await.unwrap();
         let ts = store.get_transitions(&j.id).await.unwrap();
         assert_eq!(ts.len(), 1);
-        assert!(matches!(ts[0].to, JobStatus::InProgress));
+        let t0 = aura_job::JobTransition::from_row(ts.into_iter().next().unwrap()).unwrap();
+        assert!(matches!(t0.to, JobStatus::InProgress));
     }
 }

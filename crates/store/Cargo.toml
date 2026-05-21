@@ -1,0 +1,19 @@
+[package]
+name = "aura-store"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+aura-model = { workspace = true }
+chrono = { workspace = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }

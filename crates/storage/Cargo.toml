@@ -15,13 +15,7 @@ test-support = []
 
 [dependencies]
 aura-model = { workspace = true }
-aura-trace = { workspace = true }
-aura-job = { workspace = true }
-aura-memory = { workspace = true }
-aura-cost = { workspace = true }
-aura-cron = { workspace = true }
-aura-security = { workspace = true }
-aura-session = { workspace = true }
+aura-store = { workspace = true }
 
 async-trait = { workspace = true }
 bytes = { workspace = true }
@@ -41,6 +35,8 @@ tokio-util = { workspace = true, features = ["io"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+aura-trace = { workspace = true }
+aura-job = { workspace = true }
 libc = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

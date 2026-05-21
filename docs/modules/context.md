@@ -9,7 +9,7 @@ compression flow. Persistence is wired in directly — every
 construction; `append` and the compression apply mirror to
 `session_messages` through the `SessionManager` wrapper in
 [`aura-session`](session.md). Tests construct an in-memory store via
-`aura_storage::test_support::MemorySessionStore` and pass it through
+`aura_session::test_support::MemorySessionStore` and pass it through
 the same constructor — no separate "in-memory mode" exists.
 
 Core responsibilities:

@@ -12,6 +12,7 @@ test-support = []
 [dependencies]
 aura-llm = { workspace = true }
 aura-model = { workspace = true }
+aura-store = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

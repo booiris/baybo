@@ -183,6 +183,7 @@ prompts don't fit the slash-command shape.
 ```rust
 pub trait Prompter: Send {
     fn select(&mut self, label: &str, options: &[&str]) -> Result<usize>;
+    fn multi_select(&mut self, label: &str, options: &[&str], initial: &[bool]) -> Result<Vec<usize>>;
     fn text(&mut self, label: &str, default: &str) -> Result<String>;
     fn confirm(&mut self, label: &str, default: bool) -> Result<bool>;
     fn password(&mut self, label: &str) -> Result<String>;

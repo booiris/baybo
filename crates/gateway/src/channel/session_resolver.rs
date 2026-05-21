@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use aura_agent::SessionManager;
 use aura_model::{ChannelType, SessionId, User};
-use aura_storage::ChannelSessionStore;
+use aura_store::ChannelSessionStore;
 
 /// Errors surfaced from [`ChannelSessionResolver::resolve_or_create`].
 /// Kept narrow on purpose — the caller just needs to decide whether to

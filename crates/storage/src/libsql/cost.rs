@@ -2,8 +2,10 @@ use async_trait::async_trait;
 
 use super::LibsqlPool;
 use super::time;
-use aura_cost::{CostError, CostRecord, CostResult, CostStore, CostSummary, TimeRange};
+use aura_model::{CostRecord, CostSummary, TimeRange};
 use aura_model::{JobId, MicroUsd, SessionId, SpanId};
+use aura_store::StorageError;
+use aura_store::cost::{CostStore, Result as CostResult};
 
 pub struct LibsqlCostStore {
     pool: LibsqlPool,
@@ -39,7 +41,7 @@ impl CostStore for LibsqlCostStore {
             ],
         )
         .await
-        .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql insert error: {e}")))?;
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql insert error: {e}")))?;
         Ok(())
     }
 
@@ -59,13 +61,13 @@ impl CostStore for LibsqlCostStore {
                 ],
             )
             .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
 
         let mut records = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
         {
             records.push(row_to_cost_record(&row)?);
         }
@@ -85,12 +87,12 @@ impl CostStore for LibsqlCostStore {
                 libsql::params![time::to_us(range.from), time::to_us(range.to)],
             )
             .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
         let row = rows
             .next()
             .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
-            .ok_or_else(|| CostError::Storage("expected aggregate row".to_string()))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
+            .ok_or_else(|| StorageError::Storage("expected aggregate row".to_string()))?;
         summary_from_aggregate_row(&row)
     }
 
@@ -107,12 +109,12 @@ impl CostStore for LibsqlCostStore {
                 libsql::params![session_id.as_str().to_string()],
             )
             .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
         let row = rows
             .next()
             .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
-            .ok_or_else(|| CostError::Storage("expected aggregate row".to_string()))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
+            .ok_or_else(|| StorageError::Storage("expected aggregate row".to_string()))?;
         summary_from_aggregate_row(&row)
     }
 
@@ -129,13 +131,13 @@ impl CostStore for LibsqlCostStore {
                 libsql::params![time::to_us(range.from), time::to_us(range.to)],
             )
             .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
 
         let mut records = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
         {
             records.push(row_to_cost_record(&row)?);
         }
@@ -155,12 +157,12 @@ impl CostStore for LibsqlCostStore {
                 libsql::params![job_id.to_string()],
             )
             .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query error: {e}")))?;
         let row = rows
             .next()
             .await
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
-            .ok_or_else(|| CostError::Storage("expected aggregate row".to_string()))?;
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row error: {e}")))?
+            .ok_or_else(|| StorageError::Storage("expected aggregate row".to_string()))?;
         summary_from_aggregate_row(&row)
     }
 }
@@ -170,26 +172,26 @@ fn summary_from_aggregate_row(row: &libsql::Row) -> CostResult<CostSummary> {
         total_cost_usd: row
             .get::<i64>(0)
             .map(MicroUsd::from_micros)
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
         total_input_tokens: row
             .get::<i64>(1)
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
         total_output_tokens: row
             .get::<i64>(2)
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
         total_cached_input_tokens: row
             .get::<i64>(3)
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
         total_cache_creation_input_tokens: row
             .get::<i64>(4)
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
         record_count: row
             .get::<i64>(5)
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
     })
 }
@@ -197,57 +199,57 @@ fn summary_from_aggregate_row(row: &libsql::Row) -> CostResult<CostSummary> {
 fn row_to_cost_record(row: &libsql::Row) -> CostResult<CostRecord> {
     let timestamp_us: i64 = row
         .get(10)
-        .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
     let timestamp = time::from_us(timestamp_us).ok_or_else(|| {
-        CostError::Storage(format!(
+        StorageError::Storage(format!(
             "cost_records.timestamp out of range: {timestamp_us}"
         ))
     })?;
 
     let session_id_str: String = row
         .get(1)
-        .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
     let job_id_str: String = row
         .get(2)
-        .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
     let span_id_str: String = row
         .get(3)
-        .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
 
     Ok(CostRecord {
         user_id: row
             .get(0)
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
         session_id: SessionId::from(session_id_str),
         job_id: job_id_str
             .parse::<JobId>()
-            .map_err(|e| CostError::Storage(format!("decode job_id: {e}")))?,
+            .map_err(|e| StorageError::Storage(format!("decode job_id: {e}")))?,
         span_id: span_id_str
             .parse::<SpanId>()
-            .map_err(|e| CostError::Storage(format!("decode span_id: {e}")))?,
+            .map_err(|e| StorageError::Storage(format!("decode span_id: {e}")))?,
         model: row
             .get(4)
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
         input_tokens: row
             .get::<i64>(5)
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
         output_tokens: row
             .get::<i64>(6)
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
         cached_input_tokens: row
             .get::<i64>(7)
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
         cache_creation_input_tokens: row
             .get::<i64>(8)
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
         cost_usd: row
             .get::<i64>(9)
             .map(MicroUsd::from_micros)
-            .map_err(|e| CostError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
         timestamp,
     })
 }

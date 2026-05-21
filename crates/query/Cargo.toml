@@ -10,6 +10,7 @@ doctest = false
 aura-cost = { workspace = true }
 aura-job = { workspace = true }
 aura-model = { workspace = true }
+aura-store = { workspace = true }
 aura-session = { workspace = true }
 aura-storage = { workspace = true }
 aura-trace = { workspace = true }

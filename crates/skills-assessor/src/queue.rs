@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use aura_llm::{ChatRequest, GuardedLlm};
 use aura_skills::SkillDefinition;
-use aura_storage::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
+use aura_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 

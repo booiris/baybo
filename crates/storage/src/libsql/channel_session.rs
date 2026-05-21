@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use aura_model::{ChannelType, SessionId};
 
 use super::LibsqlPool;
-use crate::StorageError;
-use crate::channel_session::{ChannelSessionStore, Result};
+use aura_store::StorageError;
+use aura_store::channel_session::{ChannelSessionStore, Result};
 
 pub struct LibsqlChannelSessionStore {
     pool: LibsqlPool,
