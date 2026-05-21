@@ -35,7 +35,10 @@ pub type Result<T> = std::result::Result<T, ToolError>;
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
-    fn description(&self) -> &str;
+    /// LLM-facing description. Owned `String`: every consumer
+    /// materialises it into a `ToolDefinition` / `ToolManifest` anyway.
+    /// Static tools just `"...".to_string()`.
+    fn description(&self) -> String;
     fn parameters_schema(&self) -> Value;
 
     /// Resources this call will touch, derived from the parameters.

@@ -59,8 +59,8 @@ impl Tool for SendFileTool {
         "SendFile"
     }
 
-    fn description(&self) -> &str {
-        &DESCRIPTION
+    fn description(&self) -> String {
+        DESCRIPTION.to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -172,7 +172,7 @@ pub fn tool(blob_store: Arc<dyn BlobStore>) -> (Arc<dyn Tool>, ToolManifest) {
     let send = SendFileTool::new(blob_store);
     let manifest = ToolManifest {
         name: send.name().to_string(),
-        description: send.description().to_string(),
+        description: send.description(),
         trust_level: TrustLevel::Trusted,
         parameters_schema: send.parameters_schema(),
         capabilities: vec![ToolCapability::ReadFile],

@@ -51,8 +51,8 @@ impl Tool for ReadTool {
         "Read"
     }
 
-    fn description(&self) -> &str {
-        &DESCRIPTION
+    fn description(&self) -> String {
+        DESCRIPTION.to_string()
     }
 
     fn parameters_schema(&self) -> Value {

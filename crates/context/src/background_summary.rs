@@ -337,7 +337,7 @@ async fn load_parent_transcript_up_to(
 fn tool_def_from(tool: &dyn Tool) -> ToolDefinitionForLlm {
     ToolDefinitionForLlm {
         name: tool.name().to_string(),
-        description: tool.description().to_string(),
+        description: tool.description(),
         parameters_schema: tool.parameters_schema(),
     }
 }

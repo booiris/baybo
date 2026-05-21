@@ -108,7 +108,7 @@ pub(crate) fn trusted<T: Tool + 'static>(
 ) -> (Arc<dyn Tool>, ToolManifest) {
     let manifest = ToolManifest {
         name: tool.name().to_string(),
-        description: tool.description().to_string(),
+        description: tool.description(),
         trust_level: TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities,

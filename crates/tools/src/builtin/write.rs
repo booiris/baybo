@@ -38,7 +38,7 @@ impl Tool for WriteTool {
         "Write"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Create or overwrite a file with the provided content. \
          Always use this instead of Bash commands like echo with \
          redirection or cat with heredoc. Prefer `Edit` for modifying \
@@ -46,6 +46,7 @@ impl Tool for WriteTool {
          rewrites. Parent directories must already exist.\n\n\
          PATHS: `file_path` MUST be an absolute filesystem path. Relative \
          paths are rejected."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {

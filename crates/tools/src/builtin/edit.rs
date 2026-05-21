@@ -97,7 +97,7 @@ impl Tool for EditTool {
         "Edit"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Perform targeted string replacement inside a file. Always use \
          this instead of Bash commands like sed or awk for editing files. \
          Replace `old_string` with `new_string`; when `replace_all` is \
@@ -106,6 +106,7 @@ impl Tool for EditTool {
          context in `old_string` to ensure a unique match.\n\n\
          PATHS: `file_path` MUST be an absolute filesystem path. Relative \
          paths are rejected."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {

@@ -18,8 +18,8 @@ impl Tool for EchoTool {
         "echo"
     }
 
-    fn description(&self) -> &str {
-        "Echoes back the input message. Useful for testing tool execution."
+    fn description(&self) -> String {
+        "Echoes back the input message. Useful for testing tool execution.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {

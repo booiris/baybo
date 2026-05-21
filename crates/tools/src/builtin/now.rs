@@ -19,10 +19,11 @@ impl Tool for NowTool {
         "Now"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Returns the current date/time in UTC and the host's local timezone. \
          Use this to anchor relative time references (\"tomorrow\", \"in 2 hours\") \
          before scheduling cron jobs or computing deadlines."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {

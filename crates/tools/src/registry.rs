@@ -129,7 +129,7 @@ impl ToolRegistry {
                 tool.name().to_string(),
                 ToolDefinition {
                     name: tool.name().to_string(),
-                    description: tool.description().to_string(),
+                    description: tool.description(),
                     parameters_schema: tool.parameters_schema(),
                 },
             );
@@ -139,7 +139,7 @@ impl ToolRegistry {
                 tool.name().to_string(),
                 ToolDefinition {
                     name: tool.name().to_string(),
-                    description: tool.description().to_string(),
+                    description: tool.description(),
                     parameters_schema: tool.parameters_schema(),
                 },
             );

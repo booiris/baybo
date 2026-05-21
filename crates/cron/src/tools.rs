@@ -59,7 +59,7 @@ pub fn agent_tools(scheduler: Arc<CronScheduler>) -> Vec<(Arc<dyn Tool>, ToolMan
 fn with_manifest(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
     let manifest = ToolManifest {
         name: tool.name().to_string(),
-        description: tool.description().to_string(),
+        description: tool.description(),
         trust_level: aura_model::TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![],
@@ -97,13 +97,14 @@ impl Tool for CronCreateTool {
         "CronCreate"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Schedule a cron job. `timezone` and `prompt` are required — \
          every fire sends `prompt` through the LLM, and every time in \
          inputs and outputs is anchored to `timezone`. Exactly one of \
          `schedule` (recurring cron expression, e.g. \"0 9 * * *\") or \
          `at` (one-shot timestamp) is required — `at` jobs fire once \
          then auto-delete."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -202,8 +203,8 @@ impl Tool for CronDeleteTool {
         "CronDelete"
     }
 
-    fn description(&self) -> &str {
-        "Cancel and remove a scheduled cron job by its ID."
+    fn description(&self) -> String {
+        "Cancel and remove a scheduled cron job by its ID.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -249,9 +250,10 @@ impl Tool for CronListTool {
         "CronList"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "List all scheduled cron jobs. Trigger times are rendered in \
          each job's own `timezone`."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {

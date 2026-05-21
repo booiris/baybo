@@ -78,8 +78,8 @@ impl Tool for McpTool {
         &self.namespaced_name
     }
 
-    fn description(&self) -> &str {
-        &self.description
+    fn description(&self) -> String {
+        self.description.clone()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -129,14 +129,14 @@ impl Tool for McpTool {
 /// `ToolRegistry::register_dynamic`.
 pub(crate) fn build_manifest(
     namespaced_name: &str,
-    description: &str,
+    description: String,
     parameters_schema: Value,
     trust_level: aura_model::TrustLevel,
     capabilities: Vec<crate::ToolCapability>,
 ) -> crate::ToolManifest {
     crate::ToolManifest {
         name: namespaced_name.to_string(),
-        description: description.to_string(),
+        description,
         trust_level,
         parameters_schema,
         capabilities,
