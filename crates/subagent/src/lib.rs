@@ -16,11 +16,13 @@
 //! consume the same registry without a circular dependency.
 
 mod builtin;
+mod dispatch;
 mod loader;
 mod profile;
 mod registry;
 mod validation;
 
+pub use dispatch::{FanOutLimiter, SubagentDispatchLimiter, unbounded_limiter};
 pub use loader::{load_profile_from_file, parse_profile_md};
 pub use profile::{SubagentProfile, SubagentProfileSummary};
 pub use registry::SubagentRegistry;

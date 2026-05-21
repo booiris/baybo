@@ -191,7 +191,7 @@ pub struct ManagerGraph {
     /// [`build_managers`] so a new consumer always pulls the same
     /// `Arc`; otherwise the limiter on the tool and the one on the
     /// router could diverge silently.
-    pub subagent_dispatch_limiter: Arc<dyn aura_tools::SubagentDispatchLimiter>,
+    pub subagent_dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
 }
 
 /// Resolve every domain manager, tying them together with the shared
@@ -467,8 +467,8 @@ pub async fn build_managers(
     // The fan-out limiter is constructed here so it can be shared
     // between the tool (reserves at dispatch) and the router (releases
     // on terminal) — both will hold the same `Arc<FanOutLimiter>`.
-    let subagent_dispatch_limiter: Arc<dyn aura_tools::SubagentDispatchLimiter> =
-        Arc::new(aura_tools::FanOutLimiter::new());
+    let subagent_dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter> =
+        Arc::new(aura_subagent::FanOutLimiter::new());
     {
         let (tool, manifest) = aura_tools::builtin::spawn_subagent::make(
             aura_tools::builtin::spawn_subagent::SpawnSubagentToolConfig {

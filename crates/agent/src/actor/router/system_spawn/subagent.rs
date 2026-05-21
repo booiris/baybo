@@ -502,7 +502,7 @@ impl Router {
 /// `Arc<dyn SubagentDispatchLimiter>`, not `&self` — share the `&self`
 /// method's single implementation.
 fn release_reserved_slot(
-    limiter: &dyn aura_tools::SubagentDispatchLimiter,
+    limiter: &dyn aura_subagent::SubagentDispatchLimiter,
     root: &Option<SessionId>,
 ) {
     if let Some(id) = root {
@@ -523,7 +523,7 @@ async fn escort_background_terminal(
     subagent_type: String,
     task_summary: String,
     result: SubagentResult,
-    limiter: &Arc<dyn aura_tools::SubagentDispatchLimiter>,
+    limiter: &Arc<dyn aura_subagent::SubagentDispatchLimiter>,
     fan_out_root: &Option<SessionId>,
 ) {
     deliver_background_result(supervisor, parent_id, handle_id, subagent_type, task_summary, result)

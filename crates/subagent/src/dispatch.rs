@@ -6,11 +6,12 @@
 //! session (how many parallel siblings + cousins a single LLM can keep
 //! alive at once). Both are soft, configurable cost guards.
 //!
-//! Trait lives here rather than in `aura-agent` so the
-//! `spawn_subagent` builtin can hold an `Arc<dyn
-//! SubagentDispatchLimiter>` without a circular `aura-tools →
-//! aura-agent` dependency. The supervisor impl is in `aura-agent` —
-//! that crate already depends on `aura-tools`.
+//! Lives in this leaf crate (alongside the profile registry) so both
+//! consumers share one definition without a cycle: `aura-tools`'
+//! `spawn_subagent` builtin holds an `Arc<dyn SubagentDispatchLimiter>`
+//! to reserve a slot, and `aura-agent`'s router releases it on the
+//! child's terminal event. `aura-subagent` depends on neither crate,
+//! so neither direction closes a loop.
 //!
 //! Lifecycle contract:
 //!  1. Tool calls `try_reserve(root, cap)`.
@@ -41,11 +42,7 @@ pub trait SubagentDispatchLimiter: Send + Sync {
     ///
     /// `cap == 0` always fails — a deployment configured this way is
     /// effectively disabling subagent dispatch.
-    fn try_reserve(
-        &self,
-        root_session_id: &SessionId,
-        cap: u32,
-    ) -> Result<(), u32>;
+    fn try_reserve(&self, root_session_id: &SessionId, cap: u32) -> Result<(), u32>;
 
     /// Counterpart to a successful [`Self::try_reserve`]. Idempotent
     /// against unknown roots (returns silently) so the eventual

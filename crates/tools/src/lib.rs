@@ -3,7 +3,6 @@ pub mod builtin;
 pub mod error;
 pub mod mcp;
 pub mod registry;
-pub mod subagent_dispatch;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -25,7 +24,6 @@ pub use approval::{
     ApprovedResource, AutoDenyGate, ChannelApprovalGate, HostPattern, ResourceAccess,
 };
 pub use error::ToolError;
-pub use subagent_dispatch::{FanOutLimiter, SubagentDispatchLimiter, unbounded_limiter};
 
 pub type Result<T> = std::result::Result<T, ToolError>;
 

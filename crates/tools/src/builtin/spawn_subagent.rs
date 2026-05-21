@@ -26,13 +26,13 @@ use aura_model::{
     SubagentSpawnRequest, SystemSpawnRequest,
 };
 use aura_session::SessionManager;
-use aura_subagent::SubagentRegistry;
+use aura_subagent::{SubagentDispatchLimiter, SubagentRegistry};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::builtin::trusted;
-use crate::{SubagentDispatchLimiter, Tool, ToolContext, ToolError, ToolManifest, ToolOutput};
+use crate::{Tool, ToolContext, ToolError, ToolManifest, ToolOutput};
 
 /// Default recursion cap. A typed subagent that itself dispatches a
 /// subagent is fine (`parent → child → grandchild`), but past depth 3
@@ -650,7 +650,7 @@ mod tests {
     };
     use aura_session::SessionStore;
     use aura_session::test_support::{MemorySessionStore, MemorySessionSummaryStore};
-    use aura_subagent::SubagentRegistry;
+    use aura_subagent::{SubagentRegistry, unbounded_limiter};
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -772,7 +772,7 @@ mod tests {
             system_spawn_tx: tx,
             registry: registry_with_builtins(),
             sessions: sessions_with_root().await,
-            dispatch_limiter: crate::unbounded_limiter(),
+            dispatch_limiter: unbounded_limiter(),
             max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
             max_subagents_per_root: DEFAULT_MAX_SUBAGENTS_PER_ROOT,
         })
@@ -784,7 +784,7 @@ mod tests {
     async fn tool_with(
         tx: mpsc::Sender<SystemSpawnRequest>,
         sessions: Arc<SessionManager>,
-        dispatch_limiter: Arc<dyn crate::SubagentDispatchLimiter>,
+        dispatch_limiter: Arc<dyn SubagentDispatchLimiter>,
         max_depth: u32,
         max_subagents_per_root: u32,
     ) -> SpawnSubagentTool {
@@ -1066,7 +1066,7 @@ mod tests {
         let tool = tool_with(
             tx,
             sessions,
-            crate::unbounded_limiter(),
+            unbounded_limiter(),
             /* max_depth */ 3,
             DEFAULT_MAX_SUBAGENTS_PER_ROOT,
         )
@@ -1108,7 +1108,7 @@ mod tests {
         let tool = tool_with(
             tx,
             sessions,
-            crate::unbounded_limiter(),
+            unbounded_limiter(),
             /* max_depth */ 3,
             DEFAULT_MAX_SUBAGENTS_PER_ROOT,
         )
@@ -1137,7 +1137,7 @@ mod tests {
         let tool = tool_with(
             tx,
             empty_session_manager(),
-            crate::unbounded_limiter(),
+            unbounded_limiter(),
             DEFAULT_MAX_SUBAGENT_DEPTH,
             DEFAULT_MAX_SUBAGENTS_PER_ROOT,
         )
@@ -1258,7 +1258,7 @@ mod tests {
             system_spawn_tx: tx,
             registry: registry_with_builtins(),
             sessions: empty_session_manager(),
-            dispatch_limiter: crate::unbounded_limiter(),
+            dispatch_limiter: unbounded_limiter(),
             max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
             max_subagents_per_root: DEFAULT_MAX_SUBAGENTS_PER_ROOT,
         });
@@ -1311,7 +1311,7 @@ mod tests {
         }
     }
 
-    impl crate::SubagentDispatchLimiter for RecordingLimiter {
+    impl SubagentDispatchLimiter for RecordingLimiter {
         fn try_reserve(
             &self,
             _root_session_id: &aura_model::SessionId,
@@ -1343,7 +1343,7 @@ mod tests {
         let tool = tool_with(
             tx,
             sessions_with_root().await,
-            limiter.clone() as Arc<dyn crate::SubagentDispatchLimiter>,
+            limiter.clone() as Arc<dyn SubagentDispatchLimiter>,
             DEFAULT_MAX_SUBAGENT_DEPTH,
             /* max_subagents_per_root */ 4,
         )
@@ -1379,7 +1379,7 @@ mod tests {
         let tool = tool_with(
             tx,
             sessions_with_root().await,
-            limiter.clone() as Arc<dyn crate::SubagentDispatchLimiter>,
+            limiter.clone() as Arc<dyn SubagentDispatchLimiter>,
             DEFAULT_MAX_SUBAGENT_DEPTH,
             8,
         )
@@ -1471,7 +1471,7 @@ mod tests {
             system_spawn_tx: tx,
             registry: Arc::new(SubagentRegistry::new()),
             sessions: empty_session_manager(),
-            dispatch_limiter: crate::unbounded_limiter(),
+            dispatch_limiter: unbounded_limiter(),
             max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
             max_subagents_per_root: DEFAULT_MAX_SUBAGENTS_PER_ROOT,
         });

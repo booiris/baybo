@@ -126,7 +126,7 @@ pub struct Router {
     /// tool's local fallback only handles the "envelope never
     /// reached the router" case. Wait tasks call `release` exactly
     /// once when the child reaches a terminal state.
-    pub(crate) dispatch_limiter: Arc<dyn aura_tools::SubagentDispatchLimiter>,
+    pub(crate) dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
     /// Stored as `Option<Receiver>` so `run()` can `take()` them out of
     /// `self` to drive in `select!` arms; populated unconditionally
     /// from `RouterConfig` at construction.
@@ -156,7 +156,7 @@ pub struct RouterConfig {
     pub actor_spawner: ActorSpawner,
     pub job_lifecycle: Arc<JobLifecycle>,
     pub llm_pool: Arc<crate::runtime::llm_pool::LlmClientPool>,
-    pub dispatch_limiter: Arc<dyn aura_tools::SubagentDispatchLimiter>,
+    pub dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
     pub cron_trigger_rx: mpsc::Receiver<CronTriggerEvent>,
     pub system_trigger_rx: mpsc::Receiver<SystemSpawnRequest>,
     /// Cancellation parent passed to every top-level actor the router
