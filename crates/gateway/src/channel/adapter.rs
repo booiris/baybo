@@ -24,7 +24,7 @@ use aura_channels::{
     MessageRole, NoticeLevel, SendOutcome, SessionEvent,
 };
 use aura_model::{ChannelType, ContentBlock};
-use aura_storage::BlobStore;
+use aura_store::BlobStore;
 use aura_tools::ApprovalDecision;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket};
 use futures::SinkExt;

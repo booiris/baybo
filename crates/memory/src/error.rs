@@ -9,7 +9,7 @@ pub enum MemoryError {
     NotFound(String),
 
     /// Wraps a lower-layer storage failure. The libsql `MemoryStore`
-    /// implementation stringifies `aura_storage::StorageError` into this
+    /// implementation stringifies `aura_store::StorageError` into this
     /// variant — mirrors how `aura_job::JobError::Storage` is produced.
     #[error("memory storage error: {0}")]
     Storage(String),

@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use aura_model::BlobRef;
-use aura_storage::BlobStore;
+use aura_store::BlobStore;
 use base64::Engine;
 use rmcp::model::{Annotated, RawContent};
 

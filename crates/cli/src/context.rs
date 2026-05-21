@@ -12,7 +12,7 @@ use aura_query::QueryApi;
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
-use aura_storage::{ChannelBotStore, ChannelPairingStore};
+use aura_store::{ChannelBotStore, ChannelPairingStore};
 use aura_tools::ToolRegistry;
 use aura_trace::TraceStore;
 use aura_workspace::WorkspaceManager;

@@ -1,7 +1,7 @@
 //! Prompt construction and response parsing for the LLM risk check.
 
 use aura_skills::SkillDefinition;
-use aura_storage::RiskLevel;
+use aura_store::RiskLevel;
 use serde::Deserialize;
 
 /// Max total characters of skill file content sent to the LLM. A huge

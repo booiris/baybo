@@ -84,7 +84,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use crate::StorageError;
+    use aura_store::StorageError;
 
     fn busy_err() -> StorageError {
         StorageError::Internal(anyhow::anyhow!("libsql upsert: database is locked"))

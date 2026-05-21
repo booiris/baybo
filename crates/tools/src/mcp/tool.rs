@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_storage::BlobStore;
+use aura_store::BlobStore;
 use rmcp::RoleClient;
 use rmcp::model::{CallToolRequestParams, Tool as RmcpTool};
 use rmcp::service::Peer;

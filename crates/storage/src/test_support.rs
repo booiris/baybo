@@ -14,7 +14,7 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
-use crate::StorageError;
+use aura_store::StorageError;
 use aura_store::blob::{
     BlobMeta, BlobReader, BlobStore, ByteStream, Result as BlobResult, SHA256_PREFIX,
 };

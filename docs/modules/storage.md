@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `storage` crate is the **libsql adapter**: it implements every `*Store` trait over a single libsql backend. The trait *contracts* now live in the `aura-store` ports crate (see [`README.md`](README.md)), not here — `aura-storage` re-exports them (`aura_storage::BlobStore` etc.) for back-compat. **libsql** is the sole backend.
+The `storage` crate is the **libsql adapter**: it implements every `*Store` trait over a single libsql backend. The trait *contracts* live in the `aura-store` ports crate (see [`README.md`](README.md)), not here, and consumers import them from `aura_store` directly — `aura-storage` does **not** re-export them. What it exposes is the concrete surface: the `Store` DI bundle, the `libsql` module, and the `retry` helper. **libsql** is the sole backend.
 
 Its job is:
 

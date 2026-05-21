@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_storage::BlobStore;
+use aura_store::BlobStore;
 
 use crate::error::JanitorError;
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aura_storage::BlobStore;
+use aura_store::BlobStore;
 use aura_workspace::WorkspacePaths;
 use parking_lot::RwLock;
 use serde_json::Value;
@@ -190,8 +190,8 @@ impl ToolRegistry {
 mod tests {
     use std::sync::Arc;
 
-    use aura_storage::BlobStore;
     use aura_storage::test_support::MemoryBlobStore;
+    use aura_store::BlobStore;
 
     use super::ToolRegistry;
 

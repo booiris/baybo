@@ -647,7 +647,7 @@ async fn chat_to_visible_wire_message(
     session_id: &SessionId,
     ordinal: i64,
     msg: ChatMessage,
-    blob_store: &dyn aura_storage::BlobStore,
+    blob_store: &dyn aura_store::BlobStore,
 ) -> Option<WireMessage> {
     let role = match msg.role {
         Role::User if msg.from_user => MessageRole::User,

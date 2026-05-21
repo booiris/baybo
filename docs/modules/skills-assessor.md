@@ -30,7 +30,7 @@ SkillAssessor
 hash_skill_dir(dir)     -> io::Result<String>          — full-scope SHA-256
 hash_skill_primary(dir) -> io::Result<Option<String>>  — SKILL.md-only SHA-256
 
-// re-exported from aura-storage so callers only need to depend on this crate:
+// re-exported from aura-store so callers only need to depend on this crate:
 RiskVerdict, RiskLevel, SkillRiskStore, AssessmentJob, AssessmentJobStatus
 ```
 
@@ -144,8 +144,8 @@ Owned by `storage::risk` (see [storage.md](storage.md)):
 
 ## Constraints
 
-- Depends on `aura-skills` (for `SkillDefinition`), `aura-storage` (for `SkillRiskStore` + types), `aura-llm`, and `aura-model`. Nothing else in the assistant depends on this crate's internals — callers see `AssessedSkill` and trait-object re-exports only.
-- Does not define its own `RiskVerdict` / `RiskLevel` / `AssessmentJob` — those live in `storage`, co-located with the libsql persistence that operates on them. This crate re-exports the types so downstream callers only need one dependency.
+- Depends on `aura-skills` (for `SkillDefinition`), `aura-store` (for `SkillRiskStore` + types), `aura-llm`, and `aura-model` — not on `aura-storage`. Nothing else in the assistant depends on this crate's internals — callers see `AssessedSkill` and trait-object re-exports only.
+- Does not define its own `RiskVerdict` / `RiskLevel` / `AssessmentJob` — those live in `aura-store` (the ports crate), alongside the `SkillRiskStore` trait; the libsql persistence that operates on them lives in `aura-storage`. This crate re-exports the types so downstream callers only need one dependency.
 - Production code has no `.unwrap()` / `.expect()`; all I/O and LLM errors map to `AssessError` variants.
 
 ## Collaboration

@@ -191,23 +191,22 @@ crates/store/src/channel_pairing.rs      // ChannelPairingStore trait
 crates/storage/src/libsql/channel_pairing.rs  // LibsqlChannelPairingStore
 ```
 
-Dependency direction: `aura-pairing → aura-storage` (which re-exports
-the trait), matching how `aura-session` reaches `SessionStore`. The
-trait itself sits in `aura-store` next to every other store trait, so
-`aura-storage` gains no domain dependency to host it.
+Dependency direction: `aura-pairing → aura-store` for the trait +
+row types, matching how `aura-session` reaches `SessionStore`. The
+trait sits in `aura-store` next to every other store trait; the libsql
+impl lives in `aura-storage`, which the assembly layer wires in.
 
 ```
 aura-store   ──► model                       (defines ChannelPairingStore + row + PairingStatus)
-aura-storage ──► store, model                (LibsqlChannelPairingStore; re-exports the trait)
-aura-pairing ──► model, storage              (PairingService + code gen)
-aura-gateway ──► pairing, storage, …
-aura-cli     ──► storage                     (CLI talks to store directly)
+aura-storage ──► store, model                (LibsqlChannelPairingStore; implements the trait)
+aura-pairing ──► model, store                (PairingService + code gen; consumes the trait + row types)
+aura-gateway ──► pairing, store, storage, …  (holds the Arc<dyn ChannelPairingStore>, wires the libsql impl)
+aura-cli     ──► store, storage              (CLI talks to the store directly)
 ```
 
 The gateway consumes `PairingService` (service) and
-`ChannelPairingStore` (trait — defined in `aura-store`, reached via
-`aura-storage`, to hold the `Arc`). The
-CLI consumes only the trait — `list/approve/revoke` are
+`ChannelPairingStore` (trait — imported from `aura-store`, to hold the
+`Arc`). The CLI consumes only the trait — `list/approve/revoke` are
 thin-wrapper store calls, so pulling in the full service would be
 dead weight.
 

@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
-use crate::error::StorageError;
 use aura_model::{ChatMessage, Lineage, LineageKind, Session, SessionId};
+use aura_store::StorageError;
 use aura_store::session::{Result, SessionStore, StoredMessage};
 
 pub struct LibsqlSessionStore {

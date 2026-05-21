@@ -5,7 +5,7 @@ use aura_model::SessionId;
 use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
-use crate::error::StorageError;
+use aura_store::StorageError;
 use aura_store::session_summary::{Result, SessionSummaryRow, SessionSummaryStore};
 
 pub struct LibsqlSessionSummaryStore {

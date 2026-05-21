@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use super::LibsqlPool;
-use crate::StorageError;
+use aura_store::StorageError;
 use aura_store::blob::{BlobMeta, BlobReader, BlobStore, ByteStream, Result, SHA256_PREFIX};
 
 // `DirBuilder::mode(0o700)` and `OpenOptions::mode(0o600)` lock down

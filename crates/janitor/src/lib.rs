@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aura_storage::{BlobStore, ChannelPairingStore};
+use aura_store::{BlobStore, ChannelPairingStore};
 use aura_workspace::WorkspacePaths;
 
 use fs_sweep::{DirSweep, is_log_file, is_session_log, sweep_directory};
@@ -247,8 +247,8 @@ mod tests {
     use std::path::Path;
     use std::time::SystemTime;
 
-    use aura_storage::BlobStore;
     use aura_storage::test_support::MemoryBlobStore;
+    use aura_store::BlobStore;
     use tempfile::TempDir;
 
     use super::*;

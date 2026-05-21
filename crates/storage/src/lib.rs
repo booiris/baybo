@@ -1,25 +1,17 @@
-pub mod error;
 pub mod libsql;
 pub mod retry;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub use aura_store::ChannelSessionStore;
-pub use aura_store::SecretStore;
-pub use aura_store::{BlobMeta, BlobStore, SHA256_PREFIX};
-pub use aura_store::{ChannelBotRow, ChannelBotStore};
-pub use aura_store::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
-pub use error::StorageError;
-
-use aura_store::CostStore;
-use aura_store::CronStore;
-use aura_store::JobStore;
-use aura_store::MemoryStore;
-use aura_store::TraceStore;
-pub use aura_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
-use aura_store::{SessionStore, SessionSummaryStore};
-pub use retry::retry_on_busy;
+// Trait objects named by the `Store` DI bundle below. The contracts and
+// their row/DTO types live in the `aura-store` ports crate; consumers
+// import them from `aura_store` directly, not via this adapter.
+use aura_store::{
+    BlobStore, ChannelBotStore, ChannelPairingStore, ChannelSessionStore, CostStore, CronStore,
+    JobStore, MemoryStore, SecretStore, SessionStore, SessionSummaryStore, SkillRiskStore,
+    TraceStore,
+};
 
 /// Bundles all store implementations into a single container
 /// for dependency injection by the assembly layer.
