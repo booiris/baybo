@@ -267,6 +267,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_steps_by_job_filters_via_generated_column() {
+        // Exercises the `steps.job_id` VIRTUAL column
+        // (`json_extract(data, '$.job_id')`) — the lookup path the
+        // round-trip/load tests don't touch. Guards against a schema
+        // path typo or a rename of `Step::job_id` silently dropping
+        // every step out of the by-job query.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlTraceStore::new(pool);
+        let job_a = JobId::new();
+        let job_b = JobId::new();
+
+        let a1 = make_step(job_a);
+        let a2 = make_step(job_a);
+        let b1 = make_step(job_b);
+        for s in [&a1, &a2, &b1] {
+            store.save_step(&s.to_row().unwrap()).await.unwrap();
+        }
+
+        let got = store.list_steps_by_job(&job_a).await.unwrap();
+        let got_ids: Vec<_> = got.iter().map(|r| r.id).collect();
+        assert_eq!(got.len(), 2, "only the two job_a steps should match");
+        assert!(got_ids.contains(&a1.id) && got_ids.contains(&a2.id));
+
+        assert_eq!(store.list_steps_by_job(&job_b).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn span_event_round_trip() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlTraceStore::new(pool);
