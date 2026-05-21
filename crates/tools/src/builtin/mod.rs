@@ -37,7 +37,6 @@ pub mod now;
 pub(crate) mod paths;
 pub mod read;
 pub mod send_local_file;
-pub mod spawn_subagent;
 pub mod todo;
 pub mod web_fetch;
 pub mod write;

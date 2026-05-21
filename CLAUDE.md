@@ -86,6 +86,8 @@ Prefer generic/extensible architectures over hardcoding specific integrations. A
 
 All I/O is async with tokio. Use `Arc<T>` for shared state, `RwLock` for concurrent access.
 
+**Tool placement — a domain crate owns its tools**: A domain crate (`aura-cron`, `aura-skills`, `aura-subagent`) hosts its own `Tool` impls and depends on `aura-tools` for the `Tool` trait (plus `ToolContext` / `ToolOutput` / `ToolManifest`); the runtime wires them into the registry (`aura_cron::tools::agent_tools(...)`, `aura_skills::tools::build_*(...)`, `aura_subagent::tool::make(...)`). `aura-tools` holds **only** generic/core tools (echo, edit, bash, read, write, glob, grep, web_fetch, now, todo, send_local_file, mcp) and MUST NOT depend on a domain crate — that direction is a dependency cycle. So when a builtin is specific to a domain that already owns a crate, put the `Tool` impl in that crate, not in `aura-tools/builtin` (build the `ToolManifest` inline; `aura-tools`'s `trusted` helper is `pub(crate)`).
+
 ## Module Design Specs
 
 **Before working on any crate, always read its corresponding design document in `docs/modules/` first.** The design doc is the source of truth for that module's architecture, trait definitions, and implementation details. Code should follow the spec; the spec is the tiebreaker when in doubt.

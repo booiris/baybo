@@ -470,8 +470,8 @@ pub async fn build_managers(
     let subagent_dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter> =
         Arc::new(aura_subagent::FanOutLimiter::new());
     {
-        let (tool, manifest) = aura_tools::builtin::spawn_subagent::make(
-            aura_tools::builtin::spawn_subagent::SpawnSubagentToolConfig {
+        let (tool, manifest) = aura_subagent::tool::make(
+            aura_subagent::tool::SpawnSubagentToolConfig {
                 system_spawn_tx: system_spawn_tx.clone(),
                 registry: Arc::clone(&subagent_profile_registry),
                 sessions: Arc::clone(&session_manager),

@@ -3,7 +3,7 @@
 //! Blocking tool that:
 //!
 //! 1. Resolves `subagent_type` against
-//!    [`aura_subagent::SubagentRegistry`].
+//!    [`crate::SubagentRegistry`].
 //! 2. Packs the resolved profile's `system_prompt` (and the parent's
 //!    `prompt` brief) into a [`SubagentSpawnRequest`].
 //! 3. Ships a [`SystemSpawnRequest::Subagent`] envelope onto the agent
@@ -11,7 +11,7 @@
 //!    [`SubagentResult`].
 //!
 //! Registered by the runtime wiring code (not
-//! [`crate::builtin::default_tools`]) because it needs the
+//! [`aura_tools::builtin::default_tools`]) because it needs the
 //! runtime-owned `system_spawn_tx` sender AND the live
 //! `SubagentRegistry` so its description can enumerate available
 //! types every LLM turn.
@@ -23,16 +23,15 @@ use async_trait::async_trait;
 use aura_model::{
     AURA_BACKEND_TAG, ExternalAgentKind, MAX_SUBAGENT_TIMEOUT_SECS, ModelTier,
     SPAWN_SUBAGENT_TOOL_NAME, SessionId, SubagentBackend, SubagentParentContext, SubagentResult,
-    SubagentSpawnRequest, SystemSpawnRequest,
+    SubagentSpawnRequest, SystemSpawnRequest, TrustLevel,
 };
 use aura_session::SessionManager;
-use aura_subagent::{SubagentDispatchLimiter, SubagentRegistry};
+use aura_tools::{Tool, ToolContext, ToolError, ToolManifest, ToolOutput};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::builtin::trusted;
-use crate::{Tool, ToolContext, ToolError, ToolManifest, ToolOutput};
+use crate::{SubagentDispatchLimiter, SubagentRegistry};
 
 /// Default recursion cap. A typed subagent that itself dispatches a
 /// subagent is fine (`parent → child → grandchild`), but past depth 3
@@ -373,7 +372,7 @@ impl SpawnSubagentTool {
     async fn lineage_summary(
         &self,
         parent_session_id: &SessionId,
-    ) -> crate::Result<LineageSummary> {
+    ) -> aura_tools::Result<LineageSummary> {
         let parent = self
             .sessions
             .get(parent_session_id)
@@ -555,7 +554,7 @@ impl Tool for SpawnSubagentTool {
         MAX_OUTER_TIMEOUT
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
         let ParsedSpawn { request } =
             parse_spawn_request(&params, &self.registry).map_err(ToolError::InvalidParams)?;
 
@@ -639,18 +638,26 @@ impl Tool for SpawnSubagentTool {
 }
 
 pub fn make(config: SpawnSubagentToolConfig) -> (Arc<dyn Tool>, ToolManifest) {
-    trusted(SpawnSubagentTool::from_config(config), vec![])
+    let tool = SpawnSubagentTool::from_config(config);
+    let manifest = ToolManifest {
+        name: tool.name().to_string(),
+        description: tool.description(),
+        trust_level: TrustLevel::Trusted,
+        parameters_schema: tool.parameters_schema(),
+        capabilities: vec![],
+    };
+    (Arc::new(tool), manifest)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SubagentRegistry, unbounded_limiter};
     use aura_model::{
         ChannelType, Lineage, LineageKind, Session, SessionId, SubagentExitStatus, User,
     };
     use aura_session::SessionStore;
     use aura_session::test_support::{MemorySessionStore, MemorySessionSummaryStore};
-    use aura_subagent::{SubagentRegistry, unbounded_limiter};
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -680,7 +687,7 @@ mod tests {
             sandbox: None,
             approval: None,
             notifier: None,
-            events: crate::noop_event_sink(),
+            events: aura_tools::noop_event_sink(),
             llm: None,
         }
     }

@@ -814,13 +814,20 @@ dependencies = [
 name = "aura-subagent"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "aura-model",
+ "aura-session",
+ "aura-tools",
+ "aura-workspace",
+ "chrono",
  "dashmap",
  "parking_lot",
  "regex",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -836,7 +843,6 @@ dependencies = [
  "aura-session",
  "aura-storage",
  "aura-store",
- "aura-subagent",
  "aura-trace",
  "aura-workspace",
  "axum",
