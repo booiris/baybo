@@ -205,9 +205,17 @@ function MessageCard({
 export function MessageList({
   messages,
   kindHint,
+  foldHistory = true,
 }: {
   messages: ChatMessage[];
   kindHint?: SecretKind;
+  /**
+   * Hide everything before the trailing non-assistant run behind a
+   * "show earlier messages" toggle. Right for one LLM call's inputs
+   * (focus on the new prompt); wrong for a full session transcript,
+   * where every turn should render as its own visible card.
+   */
+  foldHistory?: boolean;
 }) {
   // Build a lookup so ToolResult blocks can show the tool name they
   // pair with — the wire only carries `tool_use_id` on results.
@@ -226,11 +234,12 @@ export function MessageList({
   // is prior history and stays hidden behind a toggle so the current
   // input is visible without scrolling past long chat histories.
   const currentInputStart = useMemo(() => {
+    if (!foldHistory) return 0;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === 'assistant') return i + 1;
     }
     return 0;
-  }, [messages]);
+  }, [messages, foldHistory]);
 
   const [showHistory, setShowHistory] = useState(false);
 
