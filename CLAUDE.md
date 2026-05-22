@@ -77,6 +77,7 @@ Prefer generic/extensible architectures over hardcoding specific integrations. A
 
 - **Modular**: Each crate is an independent module; traits are defined within their own crate; crates interact via traits — high cohesion, low coupling
 - **Extensible**: Channels, Tools, and Skills all plug in via registries
+- **Domain crates own their tools**: a crate that owns a domain hosts its own `Tool` impls and depends on `aura-tools` for the trait; `aura-tools` carries only generic/core tools and never depends back on a domain crate (that would be a cycle)
 - **Secure**: Encrypted secret storage, input leak detection, least-privilege networking and credential injection
 - **Governable**: All Skill/Tool/extensions must carry source, version, hash, trust level, and capability declarations; selection and execution are auditable
 - **Observable**: Full call-chain tracing; Job system manages all async operation states; supports session replay, trace forking and rollback; logs/traces record only sanitized placeholders and summaries
@@ -85,8 +86,6 @@ Prefer generic/extensible architectures over hardcoding specific integrations. A
 - **Long-running**: Supports cron scheduling, workspace identity files, and daemon-style operation
 
 All I/O is async with tokio. Use `Arc<T>` for shared state, `RwLock` for concurrent access.
-
-**Tool placement — a domain crate owns its tools**: A domain crate (`aura-cron`, `aura-skills`, `aura-subagent`) hosts its own `Tool` impls and depends on `aura-tools` for the `Tool` trait (plus `ToolContext` / `ToolOutput` / `ToolManifest`); the runtime wires them into the registry (`aura_cron::tools::agent_tools(...)`, `aura_skills::tools::build_*(...)`, `aura_subagent::tool::make(...)`). `aura-tools` holds **only** generic/core tools (echo, edit, bash, read, write, glob, grep, web_fetch, now, todo, send_local_file, mcp) and MUST NOT depend on a domain crate — that direction is a dependency cycle. So when a builtin is specific to a domain that already owns a crate, put the `Tool` impl in that crate, not in `aura-tools/builtin` (build the `ToolManifest` inline; `aura-tools`'s `trusted` helper is `pub(crate)`).
 
 ## Module Design Specs
 
