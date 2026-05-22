@@ -32,6 +32,13 @@ The `schedule` field is `CronSchedule`, a tagged enum with two variants: `Cron {
 
 `CronJob` carries `prompt: String` directly — every fire feeds `prompt` through the full agent loop and the LLM decides what tools (if any) to invoke. `CronExecution` records the same `prompt` as an immutable snapshot of what was actually executed at fire time.
 
+### Fire-time framing: a fire is a task, not a user message
+
+A fire is delivered to the model as a *user* turn, so a bare prompt is ambiguous: a job created to "say 你好 in a minute" stores the prompt `你好`, and at fire time the model reads `你好` as the user greeting it and greets back instead of performing the send. Two layers keep the intent unambiguous:
+
+- **At creation**, the `CronCreate` tool (`aura-cron::tools`) steers the model to write `prompt` as a self-contained, imperative *task instruction* ("Send the user a greeting: 你好") rather than the literal phrase.
+- **At fire time**, the agent layer wraps `prompt` via `aura_agent::cron_prompt::frame_cron_prompt` before it reaches the LLM. The framing states that this is a scheduled fire (not a live user message), that the prompt is an instruction to carry out now and report back, and that the `[cron:<job_id>]` routing tag is diagnostic-only and must never surface in the reply. `aura_agent::cron_prompt::original_cron_prompt` reverses the framing for operator previews (the admin chat panel) and stays backward-compatible with legacy `[cron:<id>] <prompt>` rows.
+
 ### LLM-invocable cron tools live in aura-cron
 
 `tools::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` `Tool` implementations (each holding an `Arc<CronScheduler>`). They live in `aura-cron::tools` — the same pattern as `aura-skills::tools` — so the cron domain owns its own LLM surface. This is only possible because `CronStore` moved to the `aura-store` ports crate: the old `aura-storage → aura-cron` edge is gone, so `aura-cron` taking a dependency on `aura-tools` (for the `Tool` trait) no longer closes the cycle `aura-cron → aura-tools → aura-storage → aura-cron`. `src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
