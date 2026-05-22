@@ -42,7 +42,7 @@ fn validate_llm_entries(entries: &[LlmEntry], errors: &mut Vec<ValidationError>)
     let mut seen: HashSet<&str> = HashSet::new();
     for (i, entry) in entries.iter().enumerate() {
         let prefix = format!("llm[{i}]");
-        if entry.name.trim().is_empty() {
+        if entry.name.as_str().trim().is_empty() {
             errors.push(ValidationError::new(
                 format!("{prefix}.name"),
                 "must be non-empty",
@@ -299,7 +299,7 @@ fn validate_default_llm(config: &AuraConfig, errors: &mut Vec<ValidationError>) 
     if config.llm.is_empty() {
         return;
     }
-    if config.default_llm.trim().is_empty() {
+    if config.default_llm.as_str().trim().is_empty() {
         errors.push(ValidationError::new(
             "default-llm",
             format!(

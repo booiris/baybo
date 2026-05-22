@@ -26,7 +26,7 @@ use aura_job::JobLifecycle;
 use aura_job::test_support::MemoryJobStore;
 use aura_llm::test_support::StubLlm;
 use aura_llm::{LlmCompletion, ModelPricing};
-use aura_model::{ChannelType, ContentBlock, MessageMetadata, Session, User};
+use aura_model::{ChannelType, ContentBlock, LlmEntryName, MessageMetadata, Session, User};
 use aura_security::test_support::MemorySecretStore;
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
@@ -396,7 +396,7 @@ impl AgentTestHarnessBuilder {
         // Single-entry pool keyed by the stub model's id; tests that
         // exercise mid-session swap can extend this by registering
         // extra stubs under different names via a builder method.
-        let stub_entry_name = stub_llm.model_info().id.clone();
+        let stub_entry_name = LlmEntryName::from(stub_llm.model_info().id.clone());
         let mut pool_clients = std::collections::HashMap::new();
         pool_clients.insert(stub_entry_name.clone(), guarded_llm);
         let llm_pool = Arc::new(

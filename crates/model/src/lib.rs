@@ -4,6 +4,7 @@ mod cron;
 mod external_agent;
 mod governance;
 mod ids;
+mod llm_entry_name;
 mod memory;
 mod message;
 mod model_tier;
@@ -21,6 +22,7 @@ pub use external_agent::{
 };
 pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLevel};
 pub use ids::{CostRecordId, JobId, ParallelGroup, SessionId, SpanId, StepId};
+pub use llm_entry_name::LlmEntryName;
 pub use memory::{MemoryCategory, MemoryEntry};
 pub use message::{BlobRef, ChatMessage, ContentBlock, MessageMetadata, Role, ThinkingContent};
 pub use model_tier::ModelTier;

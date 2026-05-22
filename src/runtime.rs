@@ -31,7 +31,7 @@ use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager};
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
-use aura_config::AuraConfig;
+use aura_config::{AuraConfig, LlmEntryName};
 use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, Tokenizer};
 use aura_cost::{CostManager, SpendingLimits, cost_call_guard};
 use aura_job::JobLifecycle;
@@ -347,7 +347,7 @@ pub async fn build_managers(
         }
     }))
     .await;
-    let mut pool_clients: std::collections::HashMap<String, Arc<aura_llm::GuardedLlm>> =
+    let mut pool_clients: std::collections::HashMap<LlmEntryName, Arc<aura_llm::GuardedLlm>> =
         std::collections::HashMap::new();
     for (name, result) in entry_results {
         match result {
@@ -379,7 +379,12 @@ pub async fn build_managers(
     info!(
         provider = %info.provider,
         model = %info.id,
-        pool_entries = %llm_pool.entry_names().join(", "),
+        pool_entries = %llm_pool
+            .entry_names()
+            .iter()
+            .map(LlmEntryName::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
         supports_vision = info.supports_vision,
         "configured LLM client pool"
     );
@@ -470,16 +475,15 @@ pub async fn build_managers(
     let subagent_dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter> =
         Arc::new(aura_subagent::FanOutLimiter::new());
     {
-        let (tool, manifest) = aura_subagent::tool::make(
-            aura_subagent::tool::SpawnSubagentToolConfig {
+        let (tool, manifest) =
+            aura_subagent::tool::make(aura_subagent::tool::SpawnSubagentToolConfig {
                 system_spawn_tx: system_spawn_tx.clone(),
                 registry: Arc::clone(&subagent_profile_registry),
                 sessions: Arc::clone(&session_manager),
                 dispatch_limiter: Arc::clone(&subagent_dispatch_limiter),
                 max_depth: config.agent.max_subagent_depth,
                 max_subagents_per_root: config.agent.max_subagents_per_root,
-            },
-        );
+            });
         tool_registry.register(tool, manifest);
     }
 
@@ -735,7 +739,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let supervisor_for_spawn = supervisor.clone();
         Box::new(
             move |session: aura_model::Session,
-                  initial_llm: Option<String>,
+                  initial_llm: Option<LlmEntryName>,
                   response_tx: mpsc::Sender<AgentOutput>,
                   actor_token: CancellationToken,
                   system_prompt_override: Option<String>| {

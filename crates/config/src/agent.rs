@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use aura_model::ModelTier;
+use aura_model::{LlmEntryName, ModelTier};
 use serde::{Deserialize, Serialize};
 
 /// Top-level agent configuration: execution policy and context window.
@@ -28,7 +28,7 @@ pub struct AgentConfig {
     /// profile's default supplies a name. Unmapped tiers fall through
     /// to the pool's `default-llm` with a `warn!` so operator misconfig
     /// is visible.
-    pub model_tiers: HashMap<ModelTier, String>,
+    pub model_tiers: HashMap<ModelTier, LlmEntryName>,
 }
 
 impl Default for AgentConfig {

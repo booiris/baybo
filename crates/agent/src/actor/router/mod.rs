@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_cron::CronTriggerEvent;
-use aura_model::{Session, SystemSpawnRequest};
+use aura_model::{LlmEntryName, Session, SystemSpawnRequest};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -93,7 +93,7 @@ impl RateLimiter {
 pub type ActorSpawner = Box<
     dyn Fn(
             Session,
-            /* initial_llm */ Option<String>,
+            /* initial_llm */ Option<LlmEntryName>,
             mpsc::Sender<AgentOutput>,
             /* actor_token */ CancellationToken,
             /* system_prompt_override */ Option<String>,
@@ -276,7 +276,7 @@ impl Router {
     fn spawn_oneshot_actor(
         &self,
         session: Session,
-        initial_llm: Option<String>,
+        initial_llm: Option<LlmEntryName>,
         response_tx: mpsc::Sender<AgentOutput>,
         parent_token: &CancellationToken,
         system_prompt_override: Option<String>,

@@ -6,7 +6,7 @@ use aura_job::{JobInput, JobLifecycle, JobOutput};
 use aura_llm::{
     ChatRequest, GuardedLlm, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
 };
-use aura_model::{ChatMessage, ContentBlock, JobId, Role, SystemSpawnRequest};
+use aura_model::{ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SystemSpawnRequest};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -224,7 +224,7 @@ pub struct AgentLoopConfig {
     /// Process-wide pool of guarded LLM clients keyed by entry name.
     pub llm_pool: Arc<crate::runtime::llm_pool::LlmClientPool>,
     /// Initial pick for the active LLM. `None` ⇒ pool default.
-    pub initial_llm: Option<String>,
+    pub initial_llm: Option<LlmEntryName>,
     pub tool_registry: Arc<ToolRegistry>,
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
@@ -270,7 +270,7 @@ impl AgentLoop {
             workspace_paths,
             sessions,
         } = config;
-        let (llm_client, _effective_name) = llm_pool.resolve(initial_llm.as_deref());
+        let (llm_client, _effective_name) = llm_pool.resolve(initial_llm.as_ref());
         let billed_chat_factory = crate::runtime::billed_chat::BilledChatFactory::new(
             llm_client.clone(),
             cost_manager.clone(),

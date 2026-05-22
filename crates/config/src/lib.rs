@@ -45,6 +45,7 @@ pub use crate::security::SecurityConfig;
 pub use crate::skills::{RiskCheckConfig, SkillsConfig};
 pub use crate::tools::TrustLevelConfig;
 pub use crate::workspace::WorkspaceConfig;
+pub use aura_model::LlmEntryName;
 
 /// Root configuration object for Aura.
 ///
@@ -59,7 +60,7 @@ pub struct AuraConfig {
     /// Name of the entry in `llm` that the agent loop uses by default.
     /// Must reference an existing `name`.
     #[serde(rename = "default-llm")]
-    pub default_llm: String,
+    pub default_llm: LlmEntryName,
     pub agent: AgentConfig,
     pub channels: ChannelsConfig,
     pub security: SecurityConfig,
@@ -81,7 +82,7 @@ impl AuraConfig {
     /// guarantees this is `Some` for any config that has been through
     /// `validate()`.
     pub fn default_llm_entry(&self) -> Option<&LlmEntry> {
-        self.llm_entry(&self.default_llm)
+        self.llm_entry(self.default_llm.as_str())
     }
 }
 

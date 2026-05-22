@@ -1,3 +1,4 @@
+use aura_model::LlmEntryName;
 pub use aura_model::LlmPricingOverride;
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct LlmEntry {
     /// Stable identifier for this entry. Referenced by `default-llm`
     /// and by the operator CLI. Must be unique within the `llm` list.
-    pub name: String,
+    pub name: LlmEntryName,
     /// Provider id, e.g. `"openai"`, `"anthropic"`, `"gemini"`,
     /// `"minimax"`, `"openai-subscription"`.
     pub provider: String,
