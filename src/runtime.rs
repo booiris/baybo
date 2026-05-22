@@ -31,7 +31,7 @@ use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager};
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
-use aura_config::AuraConfig;
+use aura_config::{AuraConfig, LlmEntryName};
 use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, Tokenizer};
 use aura_cost::{CostManager, SpendingLimits, cost_call_guard};
 use aura_job::JobLifecycle;
@@ -184,6 +184,14 @@ pub struct ManagerGraph {
     /// shared `ShutdownSignal` in [`build_managers`]; cancelling it
     /// cascades down through every actor's per-job cancel tree.
     pub actor_parent_token: CancellationToken,
+
+    /// Fan-out limiter shared between `spawn_subagent` (reserves at
+    /// dispatch) and the router (releases on terminal). The CLI /
+    /// observability surface also reads its snapshot. Constructed in
+    /// [`build_managers`] so a new consumer always pulls the same
+    /// `Arc`; otherwise the limiter on the tool and the one on the
+    /// router could diverge silently.
+    pub subagent_dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
 }
 
 /// Resolve every domain manager, tying them together with the shared
@@ -222,6 +230,23 @@ pub async fn build_managers(
                 count = loaded,
                 path = %workspace_skills.display(),
                 "loaded skills from workspace"
+            );
+        }
+        reg
+    };
+    let subagent_profile_registry = {
+        let reg = Arc::new(aura_subagent::SubagentRegistry::new());
+        let builtins = reg.register_builtins();
+        if builtins > 0 {
+            info!(count = builtins, "registered built-in subagent profiles");
+        }
+        let workspace_agents = workspace_paths.agents_dir();
+        let loaded = reg.load_dir(&workspace_agents);
+        if loaded > 0 {
+            info!(
+                count = loaded,
+                path = %workspace_agents.display(),
+                "loaded subagent profiles from workspace"
             );
         }
         reg
@@ -322,7 +347,7 @@ pub async fn build_managers(
         }
     }))
     .await;
-    let mut pool_clients: std::collections::HashMap<String, Arc<aura_llm::GuardedLlm>> =
+    let mut pool_clients: std::collections::HashMap<LlmEntryName, Arc<aura_llm::GuardedLlm>> =
         std::collections::HashMap::new();
     for (name, result) in entry_results {
         match result {
@@ -342,15 +367,24 @@ pub async fn build_managers(
         }
     }
     let llm_pool = Arc::new(
-        aura_agent::LlmClientPool::new(pool_clients, config.default_llm.clone())
-            .map_err(|e| anyhow::anyhow!("build LLM client pool: {e}"))?,
+        aura_agent::LlmClientPool::with_tier_map(
+            pool_clients,
+            config.default_llm.clone(),
+            config.agent.model_tiers.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("build LLM client pool: {e}"))?,
     );
     let llm_client = llm_pool.default_client();
     let info = llm_client.model_info();
     info!(
         provider = %info.provider,
         model = %info.id,
-        pool_entries = %llm_pool.entry_names().join(", "),
+        pool_entries = %llm_pool
+            .entry_names()
+            .iter()
+            .map(LlmEntryName::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
         supports_vision = info.supports_vision,
         "configured LLM client pool"
     );
@@ -435,8 +469,21 @@ pub async fn build_managers(
     // system-spawn channel that background-compression uses; the router
     // does the session-create + actor-spawn + wait, and ships the
     // final `SubagentResult` back through a oneshot the tool blocks on.
+    // The fan-out limiter is constructed here so it can be shared
+    // between the tool (reserves at dispatch) and the router (releases
+    // on terminal) — both will hold the same `Arc<FanOutLimiter>`.
+    let subagent_dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter> =
+        Arc::new(aura_subagent::FanOutLimiter::new());
     {
-        let (tool, manifest) = aura_tools::builtin::spawn_subagent::make(system_spawn_tx.clone());
+        let (tool, manifest) =
+            aura_subagent::tool::make(aura_subagent::tool::SpawnSubagentToolConfig {
+                system_spawn_tx: system_spawn_tx.clone(),
+                registry: Arc::clone(&subagent_profile_registry),
+                sessions: Arc::clone(&session_manager),
+                dispatch_limiter: Arc::clone(&subagent_dispatch_limiter),
+                max_depth: config.agent.max_subagent_depth,
+                max_subagents_per_root: config.agent.max_subagents_per_root,
+            });
         tool_registry.register(tool, manifest);
     }
 
@@ -601,6 +648,7 @@ pub async fn build_managers(
         system_spawn_tx,
         system_spawn_rx: Some(system_spawn_rx),
         actor_parent_token,
+        subagent_dispatch_limiter,
     })
 }
 
@@ -691,9 +739,27 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let supervisor_for_spawn = supervisor.clone();
         Box::new(
             move |session: aura_model::Session,
-                  initial_llm: Option<String>,
+                  initial_llm: Option<LlmEntryName>,
                   response_tx: mpsc::Sender<AgentOutput>,
-                  actor_token: CancellationToken| {
+                  actor_token: CancellationToken,
+                  system_prompt_override: Option<String>| {
+                // LLM pinning is exclusively a subagent-spawn affair —
+                // user-channel actors always run on `default-llm`.
+                // `initial_llm` is `Some` only when the router's subagent
+                // handler resolved a model for the child (from the spawn
+                // request's `model_tier`) and forwarded it here.
+
+                // Subagent profiles replace Soul wholesale; user / cron /
+                // background-compression spawns pass `None` and inherit
+                // the workspace's resolved Soul.
+                let effective_system_prompt =
+                    system_prompt_override.unwrap_or_else(|| system_prompt.clone());
+
+                // `summary_state_dir` connects the compressor's
+                // fast-path to the background refresh runner's output.
+                // Without it the background passes still run and bill
+                // LLM, but their summaries never reach the hot path.
+                // See `docs/background-compression.md`.
                 let agent_loop = AgentLoop::from_config(AgentLoopConfig {
                     llm_pool: Arc::clone(&llm_pool),
                     initial_llm,
@@ -711,7 +777,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         sessions: Arc::clone(&sessions),
                     }),
                     max_iterations,
-                    soul: Soul::custom(system_prompt.clone()),
+                    soul: Soul::custom(effective_system_prompt),
                     security_gateway: Arc::clone(&security_gateway),
                     cost_manager: Arc::clone(&cost_manager),
                     actor_token: actor_token.clone(),
@@ -737,6 +803,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         span_recorder,
                         actor_token,
                         supervisor: Some(supervisor_for_spawn.clone()),
+                        session_manager: Arc::clone(&sessions),
                     },
                 );
                 let (sender, mailbox) = mpsc::channel(buffer);
@@ -795,6 +862,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         cost_manager: Arc::clone(&cost_manager),
         actor_spawner: spawn_actor_for,
         job_lifecycle: Arc::clone(&graph.job_lifecycle),
+        llm_pool: Arc::clone(&llm_pool),
+        dispatch_limiter: Arc::clone(&graph.subagent_dispatch_limiter),
         cron_trigger_rx,
         system_trigger_rx,
         actor_parent_token: graph.actor_parent_token.clone(),

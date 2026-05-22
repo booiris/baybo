@@ -75,7 +75,7 @@ async fn list_models(State(state): State<AdminState>) -> Result<Json<LlmModelsRe
         items.push(build_model_entry(&state, &cfg, entry).await);
     }
     Ok(Json(LlmModelsResponse {
-        default_name: cfg.default_llm.clone(),
+        default_name: cfg.default_llm.to_string(),
         items,
     }))
 }
@@ -213,7 +213,7 @@ async fn test_model(
 
     let registry = LlmProviderRegistry::with_default_providers();
     let api_key = resolve_api_key(
-        &entry.name,
+        entry.name.as_str(),
         &entry.provider,
         entry.api_key_env.as_deref(),
         Some(state.secret_vault.as_ref()),
@@ -298,7 +298,7 @@ async fn set_default(
             req.name
         )));
     }
-    current.default_llm = req.name.clone();
+    current.default_llm = req.name.clone().into();
     current
         .validate()
         .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
@@ -376,7 +376,7 @@ async fn get_usage(
                 count += 1;
             }
             LlmModelUsage {
-                name: entry.name.clone(),
+                name: entry.name.to_string(),
                 model: entry.model.clone(),
                 call_count: count,
                 input_tokens,
@@ -458,7 +458,7 @@ async fn build_model_entry(
     }
 
     let api_key_configured = resolve_api_key(
-        &entry.name,
+        entry.name.as_str(),
         &entry.provider,
         entry.api_key_env.as_deref(),
         Some(state.secret_vault.as_ref()),
@@ -467,7 +467,7 @@ async fn build_model_entry(
     .is_some();
 
     LlmModelEntry {
-        name: entry.name.clone(),
+        name: entry.name.to_string(),
         provider: entry.provider.clone(),
         model: entry.model.clone(),
         base_url: entry.base_url.clone(),

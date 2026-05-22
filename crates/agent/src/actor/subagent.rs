@@ -6,10 +6,9 @@
 //! router consumes.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use aura_channels::AgentOutput;
-use aura_job::{CancelReason, JobLifecycle, JobStatusKind, JobTerminalEvent};
+use aura_job::{JobLifecycle, JobStatusKind, JobTerminalEvent};
 use aura_model::{ContentBlock, SessionId, SubagentExitStatus, SubagentResult};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -23,20 +22,19 @@ use crate::actor::AgentMessage;
 /// message + terminal_rx for the job's terminal event, with a store
 /// fallback on broadcast lag.
 ///
-/// `actor_token` must be the child actor's own
-/// `VolatileResources::actor_token` — we cancel it on timeout, and a
-/// sibling token here would leak the child's in-flight work.
+/// `actor_token` is the child actor's own
+/// `VolatileResources::actor_token`, observed here so an external
+/// cancel of the child surfaces as `Cancelled`.
 pub async fn await_subagent_terminal(
     child_session_id: SessionId,
     mut output_rx: mpsc::Receiver<AgentOutput>,
     mut terminal_rx: broadcast::Receiver<JobTerminalEvent>,
     mailbox: mpsc::Sender<AgentMessage>,
     actor_token: CancellationToken,
-    timeout: Duration,
     job_lifecycle: Arc<JobLifecycle>,
 ) -> SubagentResult {
     let mut captured: Option<Vec<ContentBlock>> = None;
-    let wait_result = tokio::time::timeout(timeout, async {
+    let wait_result = async {
         loop {
             tokio::select! {
                 _ = actor_token.cancelled() => {
@@ -48,9 +46,9 @@ pub async fn await_subagent_terminal(
                             captured = Some(m.content);
                         }
                         Some(_) => continue,
-                        None => return Err(SubagentExitStatus::Failed(
-                            "child output channel closed before terminal event".into(),
-                        )),
+                        None => return Err(SubagentExitStatus::Failed {
+                            reason: "child output channel closed before terminal event".into(),
+                        }),
                     }
                 }
                 event = terminal_rx.recv() => {
@@ -63,8 +61,6 @@ pub async fn await_subagent_terminal(
                                 // `AgentOutput::Message`. Drain `output_rx` so the
                                 // queued message isn't lost when the terminal
                                 // event wins the select with `captured == None`.
-                                // The outer `tokio::time::timeout` still bounds
-                                // the wait.
                                 captured = drain_for_final_message(&mut output_rx).await;
                             }
                             return terminal_event_to_status(ev.kind, captured.take());
@@ -88,50 +84,30 @@ pub async fn await_subagent_terminal(
                             continue;
                         }
                         Err(broadcast::error::RecvError::Closed) => {
-                            return Err(SubagentExitStatus::Failed(
-                                "job lifecycle terminal-event bus closed".into(),
-                            ));
+                            return Err(SubagentExitStatus::Failed {
+                                reason: "job lifecycle terminal-event bus closed".into(),
+                            });
                         }
                     }
                 }
             }
         }
-    })
+    }
     .await;
 
     let _ = mailbox.send(AgentMessage::Shutdown).await;
 
     match wait_result {
-        Ok(Ok(content)) => SubagentResult {
+        Ok(content) => SubagentResult {
             child_session_id,
             final_content: content,
             status: SubagentExitStatus::Completed,
         },
-        Ok(Err(status)) => SubagentResult {
+        Err(status) => SubagentResult {
             child_session_id,
             final_content: None,
             status,
         },
-        Err(_elapsed) => {
-            // Mark any in-flight child jobs `Cancelled` BEFORE cancelling
-            // the actor token. `with_job`'s "cancel observed → skip
-            // fail()" branch assumes `JobLifecycle::cancel` has already
-            // flipped the row terminal; cancelling only the actor token
-            // would leave the child's job stuck `InProgress` with no
-            // terminal event or history.
-            cancel_in_flight_child_jobs(
-                &job_lifecycle,
-                &child_session_id,
-                CancelReason::SubagentTimeout,
-            )
-            .await;
-            actor_token.cancel();
-            SubagentResult {
-                child_session_id,
-                final_content: None,
-                status: SubagentExitStatus::Timeout,
-            }
-        }
     }
 }
 
@@ -141,11 +117,13 @@ fn terminal_event_to_status(
 ) -> Result<Option<Vec<ContentBlock>>, SubagentExitStatus> {
     match kind {
         JobStatusKind::Completed => Ok(captured),
-        JobStatusKind::Failed => Err(SubagentExitStatus::Failed("child job failed".into())),
+        JobStatusKind::Failed => Err(SubagentExitStatus::Failed {
+            reason: "child job failed".into(),
+        }),
         JobStatusKind::Cancelled => Err(SubagentExitStatus::Cancelled),
-        other => Err(SubagentExitStatus::Failed(format!(
-            "unexpected non-terminal terminal-event kind: {other:?}"
-        ))),
+        other => Err(SubagentExitStatus::Failed {
+            reason: format!("unexpected non-terminal terminal-event kind: {other:?}"),
+        }),
     }
 }
 
@@ -190,51 +168,14 @@ async fn drain_for_final_message(
     None
 }
 
-/// Cancel any non-terminal job on the child session through
-/// `JobLifecycle::cancel`. Used on the subagent timeout path so the
-/// child's `with_job` sees a real `Cancelled` row (and matching
-/// terminal event) instead of staying `InProgress` after the actor
-/// token is tripped. `lifecycle.cancel` is idempotent on terminal
-/// jobs, so a race where the job completes naturally just before this
-/// call is a no-op.
-async fn cancel_in_flight_child_jobs(
-    job_lifecycle: &JobLifecycle,
-    child_session_id: &SessionId,
-    reason: CancelReason,
-) {
-    let jobs = match job_lifecycle.list_by_session(child_session_id, None).await {
-        Ok(j) => j,
-        Err(e) => {
-            warn!(
-                session_id = %child_session_id,
-                error = %e,
-                "subagent timeout: failed to list child jobs to cancel"
-            );
-            return;
-        }
-    };
-    for j in jobs {
-        if j.is_terminal() {
-            continue;
-        }
-        if let Err(e) = job_lifecycle.cancel(&j.id, reason, vec![]).await {
-            warn!(
-                session_id = %child_session_id,
-                job_id = %j.id,
-                error = %e,
-                "subagent timeout: failed to cancel child job"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use aura_channels::OutgoingMessage;
     use aura_job::test_support::MemoryJobStore;
-    use aura_job::{JobInput, JobOutput, JobStatus};
+    use aura_job::{JobInput, JobOutput};
     use aura_model::{ChannelType, MessageMetadata, TriggerKind};
+    use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
 
@@ -275,7 +216,7 @@ mod tests {
             self.output_tx = closed;
         }
 
-        fn spawn_waiter(self, timeout: Duration) -> Waiter {
+        fn spawn_waiter(self) -> Waiter {
             Waiter {
                 actor_token: self.actor_token.clone(),
                 handle: tokio::spawn(await_subagent_terminal(
@@ -284,7 +225,6 @@ mod tests {
                     self.terminal_rx,
                     self.mailbox_tx,
                     self.actor_token,
-                    timeout,
                     self.job_lifecycle,
                 )),
                 output_tx: self.output_tx,
@@ -345,20 +285,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_cancels_passed_in_actor_token() {
-        let w = Harness::new().spawn_waiter(Duration::from_millis(10));
-        let actor_token = w.actor_token.clone();
-        let result = w.finish().await;
-        assert!(matches!(result.status, SubagentExitStatus::Timeout));
-        assert!(
-            actor_token.is_cancelled(),
-            "actor_token must cancel so the child's in-flight work tears down"
-        );
-    }
-
-    #[tokio::test]
     async fn external_cancel_surfaces_as_cancelled() {
-        let w = Harness::new().spawn_waiter(Duration::from_secs(60));
+        let w = Harness::new().spawn_waiter();
         w.actor_token.cancel();
         let result = w.finish().await;
         assert!(matches!(result.status, SubagentExitStatus::Cancelled));
@@ -368,8 +296,8 @@ mod tests {
     async fn output_channel_close_surfaces_as_failed() {
         let mut h = Harness::new();
         h.close_output();
-        let result = h.spawn_waiter(Duration::from_secs(60)).finish().await;
-        assert!(matches!(result.status, SubagentExitStatus::Failed(_)));
+        let result = h.spawn_waiter().finish().await;
+        assert!(matches!(result.status, SubagentExitStatus::Failed { .. }));
     }
 
     /// `JobLifecycle::complete` publishes the terminal event inside
@@ -384,7 +312,7 @@ mod tests {
         let lc = Arc::clone(&h.job_lifecycle);
         let job_id = start_in_progress_child_job(&lc).await;
 
-        let w = h.spawn_waiter(Duration::from_secs(5));
+        let w = h.spawn_waiter();
 
         // Publish terminal Completed BEFORE the final Message lands on
         // output_rx — the precise race the production path produces.
@@ -411,31 +339,5 @@ mod tests {
             .final_content
             .expect("drain must surface the late final Message");
         assert!(matches!(&content[..], [ContentBlock::Text(t)] if t == "hello"));
-    }
-
-    /// On timeout the waiter must flip any in-flight child job to
-    /// `Cancelled { SubagentTimeout }` BEFORE cancelling the actor
-    /// token. Cancelling the token alone takes `with_job` down the
-    /// "cancel observed → skip fail()" branch, which assumes
-    /// `JobLifecycle::cancel` already flipped the row — without the
-    /// explicit cancel the row stays `InProgress` forever with no
-    /// terminal event or transition history.
-    #[tokio::test]
-    async fn timeout_marks_child_job_cancelled_with_subagent_timeout_reason() {
-        let h = Harness::new();
-        let lc = Arc::clone(&h.job_lifecycle);
-        let job_id = start_in_progress_child_job(&lc).await;
-
-        let w = h.spawn_waiter(Duration::from_millis(10));
-        let result = w.finish().await;
-        assert!(matches!(result.status, SubagentExitStatus::Timeout));
-
-        let loaded = lc.get(&job_id).await.unwrap().expect("child job row");
-        match loaded.status {
-            JobStatus::Cancelled { reason, .. } => {
-                assert_eq!(reason, CancelReason::SubagentTimeout);
-            }
-            other => panic!("expected Cancelled, got {other:?}"),
-        }
     }
 }

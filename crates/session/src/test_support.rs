@@ -52,7 +52,15 @@ impl SessionStore for MemorySessionStore {
     }
 
     async fn save(&self, session: &Session) -> Result<()> {
-        self.data.lock().insert(session.id.clone(), session.clone());
+        let mut data = self.data.lock();
+        let mut to_store = session.clone();
+        // `hidden` is owned by `set_hidden`; preserve the existing row's
+        // value so a stale in-memory save can't un-hide it. Mirrors the
+        // libsql impl, whose upsert omits the flat `hidden` column.
+        if let Some(existing) = data.get(&session.id) {
+            to_store.hidden = existing.hidden;
+        }
+        data.insert(session.id.clone(), to_store);
         Ok(())
     }
 

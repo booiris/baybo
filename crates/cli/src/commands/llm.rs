@@ -108,7 +108,7 @@ async fn probe(ctx: &CommandContext, name: Option<String>) -> Result<CommandOutp
     let cfg = LlmProviderConfig {
         provider: entry.provider.clone(),
         api_key: resolve_api_key(
-            &entry.name,
+            entry.name.as_str(),
             &entry.provider,
             entry.api_key_env.as_deref(),
             ctx.secret_vault.as_deref(),
@@ -408,7 +408,10 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
                 eprintln!("(empty input — api key not changed)");
             } else {
                 vault
-                    .store_secret(&vault_api_key_name(&working.name), new_key.as_bytes())
+                    .store_secret(
+                        &vault_api_key_name(working.name.as_str()),
+                        new_key.as_bytes(),
+                    )
                     .await
                     .map_err(|e| CliError::Manager(format!("write api key to vault: {e}")))?;
                 changed.push("api_key");
@@ -508,7 +511,10 @@ async fn remove(ctx: &CommandContext) -> Result<CommandOutput> {
 
     // Best-effort vault clear. A missing key isn't an error — the
     // entry may have been added without an api key (env-only flow).
-    if let Err(e) = vault.delete_secret(&vault_api_key_name(&entry_name)).await {
+    if let Err(e) = vault
+        .delete_secret(&vault_api_key_name(entry_name.as_str()))
+        .await
+    {
         tracing::warn!(
             error = %e,
             entry = %entry_name,
@@ -696,7 +702,7 @@ async fn fetch_live_models(
     let cfg = LlmProviderConfig {
         provider: entry.provider.clone(),
         api_key: resolve_api_key(
-            &entry.name,
+            entry.name.as_str(),
             &entry.provider,
             entry.api_key_env.as_deref(),
             vault.as_deref(),

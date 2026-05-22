@@ -25,9 +25,9 @@ pub enum CancelReason {
     /// kept so the wire/serde shape doesn't churn when the rewrite
     /// is restored.
     SystemCrash,
-    /// `spawn_subagent` exceeded its declared timeout. Triggers
-    /// cancellation of the entire descendant subtree via the
-    /// cancellation-token tree.
+    /// An external `spawn_subagent` subprocess hit its idle safety
+    /// timeout (no output within the window). Triggers cancellation of
+    /// the entire descendant subtree via the cancellation-token tree.
     SubagentTimeout,
     /// A parent session / job was cancelled and the cancel propagated
     /// down via the cancellation-token tree.

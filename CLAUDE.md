@@ -77,6 +77,7 @@ Prefer generic/extensible architectures over hardcoding specific integrations. A
 
 - **Modular**: Each crate is an independent module; traits are defined within their own crate; crates interact via traits — high cohesion, low coupling
 - **Extensible**: Channels, Tools, and Skills all plug in via registries
+- **Domain crates own their tools**: a crate that owns a domain hosts its own `Tool` impls and depends on `aura-tools` for the trait; `aura-tools` carries only generic/core tools and never depends back on a domain crate (that would be a cycle)
 - **Secure**: Encrypted secret storage, input leak detection, least-privilege networking and credential injection
 - **Governable**: All Skill/Tool/extensions must carry source, version, hash, trust level, and capability declarations; selection and execution are auditable
 - **Observable**: Full call-chain tracing; Job system manages all async operation states; supports session replay, trace forking and rollback; logs/traces record only sanitized placeholders and summaries

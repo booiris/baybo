@@ -11,9 +11,19 @@ pub mod supervisor;
 
 use aura_channels::{AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage};
 use aura_job::JobInput;
-use aura_model::{BackgroundCompressionPayload, ContentBlock};
+use aura_model::{
+    BACKGROUND_NOTIFICATIONS_POSTAMBLE, BACKGROUND_NOTIFICATIONS_PREAMBLE,
+    BackgroundCompressionPayload, ContentBlock, PendingSubagentResult,
+};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Hard cap on `session.state.pending_subagent_results`. A parent
+/// that stays idle while many background subagents finish would
+/// otherwise grow this vec without bound — both in memory and on
+/// the persisted row. Once the cap is reached the oldest entry is
+/// dropped (its content still lives in the child session's trace).
+const MAX_PENDING_SUBAGENT_RESULTS: usize = 64;
 
 use crate::actor::state::{DurableActorState, VolatileResources};
 use crate::actor::supervisor::ActorRegistryGuard;
@@ -40,8 +50,39 @@ pub enum AgentMessage {
     /// Bypasses the normal chat-turn cycle (`agent_loop.run`) and
     /// dispatches the carried payload to a dedicated handler.
     BackgroundCompression(BackgroundCompressionPayload),
+    /// A `background: true` subagent dispatched from this session
+    /// reached a terminal state. The wait task posts this to the
+    /// parent actor's mailbox so the result is buffered on
+    /// `session.state.pending_subagent_results`; the next
+    /// `UserInput` drains the buffer and prepends a reminder before
+    /// the parent LLM's next turn.
+    SubagentFinished(Box<PendingSubagentResult>),
     /// Gracefully shut down this actor.
     Shutdown,
+}
+
+/// Render a short status label for the background-notification
+/// preamble — keeps the LLM's reading short and stable.
+fn pending_status_label(status: &aura_model::SubagentExitStatus) -> &'static str {
+    match status {
+        aura_model::SubagentExitStatus::Completed => "completed",
+        aura_model::SubagentExitStatus::Cancelled => "cancelled",
+        aura_model::SubagentExitStatus::Failed { .. } => "failed",
+        aura_model::SubagentExitStatus::Timeout => "timeout",
+    }
+}
+
+/// Cap a subagent's final text when rendered into the parent's
+/// next-turn reminder. The full content is still in the trace and
+/// the persisted child session; this cap exists only so a giant
+/// final message can't dominate the parent's context budget.
+fn truncate_for_notice(text: &str) -> String {
+    const MAX: usize = 1024;
+    if text.chars().count() <= MAX {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(MAX).collect();
+    format!("{truncated}… [truncated; full text in child session transcript]")
 }
 
 /// Mirrors the gateway slash dispatcher's tolerance for casing and
@@ -151,6 +192,9 @@ impl AgentActor {
                         );
                     }
                 }
+                AgentMessage::SubagentFinished(pending) => {
+                    self.handle_subagent_finished(*pending).await;
+                }
                 AgentMessage::Shutdown => {
                     debug!(session_id = %session_id, "actor shutting down");
                     // Cancelling our `actor_token` cascades into every
@@ -181,6 +225,7 @@ impl AgentActor {
         content: Vec<ContentBlock>,
         parent_job_id: Option<aura_model::JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
+        background_notice: Option<String>,
     ) -> anyhow::Result<OutgoingMessage> {
         self.volatile
             .agent_loop
@@ -192,6 +237,7 @@ impl AgentActor {
                 &self.volatile.span_recorder,
                 parent_job_id,
                 delta_tx,
+                background_notice,
                 self.volatile.actor_token.child_token(),
             )
             .await
@@ -215,7 +261,9 @@ impl AgentActor {
         let content = vec![ContentBlock::Text(cron_prompt::frame_cron_prompt(
             job_id, prompt,
         ))];
-        let response = self.run_agent_loop(job_input, content, None, None).await?;
+        let response = self
+            .run_agent_loop(job_input, content, None, None, None)
+            .await?;
         self.send_response(AgentOutput::Message(response), "cron")
             .await;
         Ok(())
@@ -225,6 +273,17 @@ impl AgentActor {
         let content = incoming.message.content;
         if is_compact_command(&content) {
             return self.handle_compact().await;
+        }
+        // Drain any background `spawn_subagent` results that landed
+        // between this turn and the previous one. They're injected as a
+        // separate context message ahead of the user's turn (NOT merged
+        // into the user's content — that would mask a leading `/command`
+        // from slash detection). We persist immediately after draining so
+        // a crash mid-turn can't replay the same notifications.
+        let background_notice = self.drain_pending_subagent_notice();
+        if background_notice.is_some() {
+            self.persist_session_state_after_pending_change("user_input_drain")
+                .await;
         }
         // Pass a clone of the response channel so the loop can stream
         // text deltas as `AgentOutput::Delta` while the final assembled
@@ -238,11 +297,104 @@ impl AgentActor {
                 content,
                 None,
                 Some(response_tx),
+                background_notice,
             )
             .await?;
         self.send_response(AgentOutput::Message(response), "user")
             .await;
         Ok(())
+    }
+
+    /// Idempotent on `handle_id` — the wait task can in principle
+    /// publish twice (mailbox retry, manual recovery) and we don't
+    /// want the parent's preamble to show two copies. Capped at
+    /// `MAX_PENDING_SUBAGENT_RESULTS` with drop-oldest semantics so a
+    /// parent that stays idle while many backgrounds finish can't
+    /// grow the persisted row without bound.
+    async fn handle_subagent_finished(&mut self, pending: PendingSubagentResult) {
+        let buffer = &mut self.durable.session.state.pending_subagent_results;
+        if buffer.iter().any(|p| p.handle_id == pending.handle_id) {
+            debug!(
+                session_id = %self.durable.session.id,
+                handle_id = %pending.handle_id,
+                "duplicate SubagentFinished for handle; ignoring"
+            );
+            return;
+        }
+        debug!(
+            session_id = %self.durable.session.id,
+            handle_id = %pending.handle_id,
+            subagent_type = %pending.subagent_type,
+            "buffered background subagent result for next turn"
+        );
+        if buffer.len() >= MAX_PENDING_SUBAGENT_RESULTS {
+            let dropped = buffer.remove(0);
+            warn!(
+                session_id = %self.durable.session.id,
+                dropped_handle_id = %dropped.handle_id,
+                cap = MAX_PENDING_SUBAGENT_RESULTS,
+                "pending subagent buffer full; dropping oldest entry"
+            );
+        }
+        buffer.push(pending);
+        self.persist_session_state_after_pending_change("subagent_finished")
+            .await;
+    }
+
+    /// Write the actor's current `durable.session` back to the
+    /// session store so the latest `pending_subagent_results` survives
+    /// eviction. Called only by the background-subagent paths today.
+    /// Logs a warn on storage error rather than failing the surrounding
+    /// handler — losing the persisted copy degrades to "delivered to
+    /// the live actor only" rather than "delivered nowhere", which is
+    /// strictly worse than the v1 (mailbox-only) baseline. Updates
+    /// `last_active` in passing so the reaper doesn't immediately
+    /// re-target the actor after the counter clears.
+    async fn persist_session_state_after_pending_change(&mut self, context: &'static str) {
+        self.durable.session.last_active = chrono::Utc::now();
+        if let Err(e) = self
+            .volatile
+            .session_manager
+            .store()
+            .save(&self.durable.session)
+            .await
+        {
+            warn!(
+                session_id = %self.durable.session.id,
+                context = %context,
+                error = %e,
+                "failed to persist session.state after pending-subagent change; live actor still has the latest copy in memory"
+            );
+        }
+    }
+
+    /// Drain pending background results into a system-reminder text
+    /// block prepended to `content`. Returns `content` unchanged when
+    /// the buffer is empty so callers don't pay the allocation.
+    /// Drain any background `spawn_subagent` results into a formatted
+    /// notice body, or `None` when there are none. Returned as a
+    /// standalone string — NOT merged into the user's content — so the
+    /// agent loop can inject it as its own context message; merging it
+    /// would push a leading `/command` out of slash-detection range.
+    fn drain_pending_subagent_notice(&mut self) -> Option<String> {
+        let pending = std::mem::take(&mut self.durable.session.state.pending_subagent_results);
+        if pending.is_empty() {
+            return None;
+        }
+        let mut body = String::from(BACKGROUND_NOTIFICATIONS_PREAMBLE);
+        for p in &pending {
+            body.push_str(&format!(
+                "- handle={} type={} status={} child_session={} summary={:?}\n  text: {}\n",
+                p.handle_id,
+                p.subagent_type,
+                pending_status_label(&p.status),
+                p.child_session_id,
+                p.task_summary,
+                truncate_for_notice(&p.final_text),
+            ));
+        }
+        body.push_str(BACKGROUND_NOTIFICATIONS_POSTAMBLE);
+        Some(body)
     }
 
     /// `/compact` is a control command, not an assistant turn, so the
@@ -290,6 +442,7 @@ impl AgentActor {
                 content,
                 Some(parent_job_id),
                 Some(response_tx),
+                None,
             )
             .await?;
         self.send_response(AgentOutput::Message(response), "subagent")
@@ -365,5 +518,32 @@ mod tests {
             tool_use_id: "x".into(),
             content: "/compact".into(),
         }]));
+    }
+
+    #[test]
+    fn pending_status_label_covers_every_exit_status() {
+        use aura_model::SubagentExitStatus as S;
+        assert_eq!(pending_status_label(&S::Completed), "completed");
+        assert_eq!(pending_status_label(&S::Cancelled), "cancelled");
+        assert_eq!(
+            pending_status_label(&S::Failed {
+                reason: "x".into()
+            }),
+            "failed"
+        );
+        assert_eq!(pending_status_label(&S::Timeout), "timeout");
+    }
+
+    #[test]
+    fn truncate_for_notice_appends_marker_when_over_cap() {
+        let long = "a".repeat(2000);
+        let out = truncate_for_notice(&long);
+        assert!(
+            out.len() > 1024,
+            "marker must be appended on overflow: {out:?}"
+        );
+        assert!(out.contains("truncated"));
+        let short = "hello";
+        assert_eq!(truncate_for_notice(short), "hello");
     }
 }

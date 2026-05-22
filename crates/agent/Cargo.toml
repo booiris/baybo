@@ -11,6 +11,7 @@ aura-cron = { workspace = true }
 aura-model = { workspace = true }
 aura-llm = { workspace = true }
 aura-tools = { workspace = true }
+aura-subagent = { workspace = true }
 aura-skills = { workspace = true }
 aura-skills-assessor = { workspace = true }
 aura-workspace = { workspace = true, features = ["io"] }

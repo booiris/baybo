@@ -44,6 +44,14 @@ pub enum ExternalAgentError {
     Transient(String),
 }
 
+/// Idle (inactivity) safety timeout for an external (claude/codex)
+/// subagent subprocess. Aura subagents are bounded by `max_iterations`,
+/// but an external CLI is an opaque subprocess that can wedge — so it is
+/// killed only after producing NO output for this long. The timer resets
+/// on every line the subprocess emits, so a long-but-active run is never
+/// cut off; only a silent/hung one is. Hardcoded (not LLM-settable).
+pub const EXTERNAL_SUBAGENT_TIMEOUT: Duration = Duration::from_secs(8 * 60 * 60);
+
 #[derive(Debug, Clone)]
 pub struct ExternalAgentRequest {
     pub task: String,

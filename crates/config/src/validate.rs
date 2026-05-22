@@ -42,7 +42,7 @@ fn validate_llm_entries(entries: &[LlmEntry], errors: &mut Vec<ValidationError>)
     let mut seen: HashSet<&str> = HashSet::new();
     for (i, entry) in entries.iter().enumerate() {
         let prefix = format!("llm[{i}]");
-        if entry.name.trim().is_empty() {
+        if entry.name.as_str().trim().is_empty() {
             errors.push(ValidationError::new(
                 format!("{prefix}.name"),
                 "must be non-empty",
@@ -101,6 +101,23 @@ fn validate_agent(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
         errors.push(ValidationError::new(
             "agent.context.keep_recent",
             "must be >= 1",
+        ));
+    }
+    if agent.max_subagent_depth > 32 {
+        errors.push(ValidationError::new(
+            "agent.max_subagent_depth",
+            "must be <= 32 (chains deeper than this stress the lineage walker and rarely reflect deliberate design)",
+        ));
+    }
+    if agent.max_subagents_per_root == 0 {
+        errors.push(ValidationError::new(
+            "agent.max_subagents_per_root",
+            "must be >= 1 (setting to 0 disables `spawn_subagent` entirely; if that's the intent, remove the tool from the registry instead)",
+        ));
+    } else if agent.max_subagents_per_root > 256 {
+        errors.push(ValidationError::new(
+            "agent.max_subagents_per_root",
+            "must be <= 256 (caps higher than this rarely reflect deliberate design and trade safety for cost)",
         ));
     }
 }
@@ -231,7 +248,32 @@ fn validate_gateway(gateway: &GatewayConfig, errors: &mut Vec<ValidationError>) 
 fn validate_cross_section(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
     validate_encryption_key_source(&config.security, errors);
     validate_default_llm(config, errors);
+    validate_model_tiers(config, errors);
     validate_default_external_agent(config, errors);
+}
+
+/// Every `agent.model_tiers` target must name a real `llm` entry.
+/// Without this the misconfig only surfaces at next startup in
+/// `LlmClientPool::with_tier_map`, after a CLI/gateway mutator has
+/// already persisted the broken config.
+fn validate_model_tiers(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
+    if config.agent.model_tiers.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = config.llm.iter().map(|e| e.name.as_str()).collect();
+    for (tier, name) in &config.agent.model_tiers {
+        if !names.contains(&name.as_str()) {
+            errors.push(ValidationError::new(
+                "agent.model_tiers",
+                format!(
+                    "tier `{}` maps to `{}`, which is not a name in `llm`; existing names: [{}]",
+                    tier.as_str(),
+                    name.as_str(),
+                    names.join(", "),
+                ),
+            ));
+        }
+    }
 }
 
 fn validate_default_external_agent(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
@@ -282,7 +324,7 @@ fn validate_default_llm(config: &AuraConfig, errors: &mut Vec<ValidationError>) 
     if config.llm.is_empty() {
         return;
     }
-    if config.default_llm.trim().is_empty() {
+    if config.default_llm.as_str().trim().is_empty() {
         errors.push(ValidationError::new(
             "default-llm",
             format!(

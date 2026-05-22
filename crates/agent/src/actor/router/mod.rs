@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_cron::CronTriggerEvent;
-use aura_model::{Session, SystemSpawnRequest};
+use aura_model::{LlmEntryName, Session, SystemSpawnRequest};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -82,13 +82,21 @@ impl RateLimiter {
 /// the spawned actor (e.g. the subagent waiter on timeout) must
 /// keep their own clone before calling.
 ///
+/// `system_prompt_override` lets a caller swap the inherited workspace
+/// Soul for a profile-specific prompt. Today only the typed
+/// `spawn_subagent` path passes `Some(...)`; user, cron, and
+/// background-compression spawns all keep `None` and inherit the
+/// session-default Soul. When `None` the spawner falls back to the
+/// workspace's resolved Soul.
+///
 /// [`AgentActor`]: crate::actor::AgentActor
 pub type ActorSpawner = Box<
     dyn Fn(
             Session,
-            /* initial_llm */ Option<String>,
+            /* initial_llm */ Option<LlmEntryName>,
             mpsc::Sender<AgentOutput>,
             /* actor_token */ CancellationToken,
+            /* system_prompt_override */ Option<String>,
         ) -> mpsc::Sender<AgentMessage>
         + Send
         + Sync,
@@ -107,6 +115,18 @@ pub struct Router {
     /// broadcasts when waiting on a subagent child to terminate, and
     /// to reconcile via the store on broadcast lag.
     job_lifecycle: Arc<JobLifecycle>,
+    /// LLM pool — held so the subagent handler can resolve
+    /// `request.model_tier` to a concrete entry name before spawning
+    /// the child actor. Other handlers ignore it (top-level / cron /
+    /// maintenance spawns always run on `default-llm`).
+    pub(crate) llm_pool: Arc<crate::runtime::llm_pool::LlmClientPool>,
+    /// Fan-out limiter shared with the `spawn_subagent` tool. The
+    /// router doesn't reserve (the tool does that before sending the
+    /// envelope) but it MUST release on every terminal path — the
+    /// tool's local fallback only handles the "envelope never
+    /// reached the router" case. Wait tasks call `release` exactly
+    /// once when the child reaches a terminal state.
+    pub(crate) dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
     /// Stored as `Option<Receiver>` so `run()` can `take()` them out of
     /// `self` to drive in `select!` arms; populated unconditionally
     /// from `RouterConfig` at construction.
@@ -135,6 +155,8 @@ pub struct RouterConfig {
     pub cost_manager: Arc<CostManager>,
     pub actor_spawner: ActorSpawner,
     pub job_lifecycle: Arc<JobLifecycle>,
+    pub llm_pool: Arc<crate::runtime::llm_pool::LlmClientPool>,
+    pub dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
     pub cron_trigger_rx: mpsc::Receiver<CronTriggerEvent>,
     pub system_trigger_rx: mpsc::Receiver<SystemSpawnRequest>,
     /// Cancellation parent passed to every top-level actor the router
@@ -159,6 +181,8 @@ impl Router {
             cost_manager,
             actor_spawner,
             job_lifecycle,
+            llm_pool,
+            dispatch_limiter,
             cron_trigger_rx,
             system_trigger_rx,
             actor_parent_token,
@@ -176,6 +200,8 @@ impl Router {
             rate_limiter: RateLimiter::new(rate_limit_max_requests, rate_limit_window),
             actor_spawner,
             job_lifecycle,
+            llm_pool,
+            dispatch_limiter,
             cron_trigger_rx: Some(cron_trigger_rx),
             system_trigger_rx: Some(system_trigger_rx),
             actor_parent_token,
@@ -250,12 +276,19 @@ impl Router {
     fn spawn_oneshot_actor(
         &self,
         session: Session,
-        initial_llm: Option<String>,
+        initial_llm: Option<LlmEntryName>,
         response_tx: mpsc::Sender<AgentOutput>,
         parent_token: &CancellationToken,
+        system_prompt_override: Option<String>,
     ) -> (mpsc::Sender<AgentMessage>, CancellationToken) {
         let actor_token = parent_token.child_token();
-        let mailbox = (self.actor_spawner)(session, initial_llm, response_tx, actor_token.clone());
+        let mailbox = (self.actor_spawner)(
+            session,
+            initial_llm,
+            response_tx,
+            actor_token.clone(),
+            system_prompt_override,
+        );
         (mailbox, actor_token)
     }
 }

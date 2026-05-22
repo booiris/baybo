@@ -69,7 +69,7 @@ impl Router {
                     parent_job_id,
                     parent_span_id,
                     parent_actor_token,
-                    request,
+                    *request,
                     result_tx,
                 )
                 .await

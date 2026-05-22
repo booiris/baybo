@@ -14,14 +14,13 @@
 //!    exit-status quadruple the LLM-facing `spawn_subagent` tool
 //!    exchanges with the router.
 
-use std::time::Duration;
-
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    BackgroundCompressionPayload, ContentBlock, JobId, SessionId, SpanId, SubagentBackend,
+    BackgroundCompressionPayload, ContentBlock, JobId, ModelTier, SessionId, SpanId,
+    SubagentBackend,
 };
 
 /// Tool name the LLM emits to spawn a subagent.
@@ -31,10 +30,23 @@ pub const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";
 /// sidecars filter subagent traffic.
 pub const SUBAGENT_CHANNEL_TAG: &str = "subagent";
 
-/// Hard upper bound on a single `spawn_subagent` wait, in seconds.
-/// Shared with the `spawn_subagent` tool's `Tool::max_timeout` so the
-/// router's waiter cannot outlive the executor's wall-clock cap.
-pub const MAX_SUBAGENT_TIMEOUT_SECS: u64 = 3600;
+/// Prefix the router stamps on a background subagent's `handle_id` so
+/// trace viewers and the parent LLM can recognise the dispatch mode at
+/// a glance. Surfaced as a const because the same id flows into
+/// `PendingSubagentResult.handle_id` and the parent's notification
+/// preamble — two sites at minimum, three when the CLI starts listing
+/// in-flight handles.
+pub const BACKGROUND_SUBAGENT_HANDLE_PREFIX: &str = "bg-";
+
+/// Opening line of the system-reminder preamble the parent actor
+/// prepends to the next user turn after one or more background
+/// subagents land their results. Lifted so the actor that writes it
+/// and integration tests that grep for it share one source of truth.
+pub const BACKGROUND_NOTIFICATIONS_PREAMBLE: &str =
+    "[background subagent notifications — work that finished since your last turn]\n";
+
+/// Closing line of the same preamble.
+pub const BACKGROUND_NOTIFICATIONS_POSTAMBLE: &str = "[end of background notifications]\n\n";
 
 /// Request emitted by `AgentLoop`'s parent-side trigger gate and by
 /// the `spawn_subagent` tool, consumed by `Router`'s `system_trigger_rx`
@@ -65,55 +77,71 @@ pub enum SystemSpawnRequest {
         /// job stay distinguishable.
         parent_span_id: SpanId,
         parent_actor_token: CancellationToken,
-        request: SubagentSpawnRequest,
+        /// Boxed: the in-line variant is ~3× the size of
+        /// `BackgroundCompression`, so the box keeps `SystemSpawnRequest`
+        /// small on the channel (`clippy::large_enum_variant`).
+        request: Box<SubagentSpawnRequest>,
         result_tx: oneshot::Sender<SubagentResult>,
     },
 }
 
 /// What the parent LLM asks for when it calls `spawn_subagent`.
+///
+/// The tool resolves the `subagent_type` name into a concrete
+/// `SubagentProfile` BEFORE producing this envelope and stamps the
+/// profile's `system_prompt` here. The router consumes the prompt
+/// verbatim — no further registry lookup happens agent-side.
+///
+/// Field naming follows Claude Code's Agent tool: `task_summary` is
+/// the short 3-5 word title surfaced in traces, while `prompt` is the
+/// self-contained brief that becomes the child's first user message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentSpawnRequest {
-    pub task_description: String,
+    /// Profile name the parent LLM emitted as `subagent_type`. Surfaced
+    /// in trace/audit only — the resolved [`Self::system_prompt`]
+    /// already encodes behaviour. Stored as a plain `String` so this
+    /// crate stays a leaf (no dependency on `aura-subagent`).
+    pub subagent_type: String,
+    /// Child actor's full system prompt. REPLACES the parent's Soul —
+    /// the profile author owns identity / security / output contracts.
+    pub system_prompt: String,
+    /// 3-5 word summary the parent LLM authored. Trace display only;
+    /// not part of the child's initial prompt.
+    pub task_summary: String,
+    /// Self-contained brief — becomes the child actor's first user
+    /// message.
+    pub prompt: String,
+    /// Coarse model tier for the Aura backend. Resolution precedence
+    /// (highest first): this field → profile's `default_tier` → pool
+    /// default. Ignored for the External backend, which runs its own
+    /// model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_tier: Option<ModelTier>,
+    /// Fire-and-forget mode. When `true` the router surfaces a handle
+    /// id and parents the child's wait task on the parent actor's
+    /// token rather than the parent job's token, so the child outlives
+    /// the dispatching turn and escorts its result back later.
     #[serde(default)]
-    pub must_include_context: Vec<String>,
-    pub timeout: Duration,
+    pub background: bool,
+    /// Root session id used by the dispatcher's fan-out limiter.
+    /// Stamped by `spawn_subagent` after it walks the lineage chain
+    /// (and reserves a slot in the limiter), so the router's wait
+    /// task can release the slot on terminal without re-walking.
+    /// `None` only on synthesized requests from tests / future
+    /// programmatic call sites that don't go through the limiter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fan_out_root: Option<SessionId>,
     /// Backend that runs this subagent. `Aura` is the default (full
     /// in-process `AgentActor`). `External` routes to a registered
     /// external-agent impl (claude_cli, …) for one-shot delegation.
     #[serde(default)]
     pub backend: SubagentBackend,
-    /// Sanitised kebab-case slug for the child's working directory:
-    /// `<root>/work/<backend>/<workspace_name>/`. `None` falls back
-    /// to the child session_id. Format: ASCII `[a-z0-9-]`, capped
-    /// at 32 chars. Deterministic — two spawns with the same input
-    /// share the same on-disk dir on purpose, so a sibling subagent
-    /// can pick up where another left off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_name: Option<String>,
     /// Continue a prior subagent's session. The id MUST come from a
     /// previous `SubagentResult.child_session_id` in this same parent
     /// session. The router verifies parent + backend match before
     /// routing the new task into the existing child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<SessionId>,
-}
-
-impl SubagentSpawnRequest {
-    /// Render the child's first user message — task description with
-    /// any `must_include_context` notes appended as bullets.
-    pub fn initial_prompt(&self) -> String {
-        if self.must_include_context.is_empty() {
-            return self.task_description.clone();
-        }
-        let mut text = self.task_description.clone();
-        text.push_str("\n\nMust-include context:\n");
-        for note in &self.must_include_context {
-            text.push_str("- ");
-            text.push_str(note);
-            text.push('\n');
-        }
-        text
-    }
 }
 
 /// Parent-side context the tool builds from its `ToolContext` and
@@ -136,14 +164,59 @@ pub struct SubagentResult {
     pub status: SubagentExitStatus,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SubagentExitStatus {
     Completed,
     /// Parent's `CancellationToken` was tripped before the child
     /// returned. Includes the case where a higher ancestor cancelled.
     Cancelled,
-    Failed(String),
+    Failed {
+        reason: String,
+    },
     Timeout,
+}
+
+/// Persistent record of a `background: true` subagent that completed
+/// while the parent actor was between turns. Held on
+/// [`crate::SessionState::pending_subagent_results`] until the next
+/// user input drains it.
+///
+/// `handle_id` is the synthetic identifier the spawning tool minted
+/// and surfaced to the parent LLM as the "dispatched" handle, so
+/// later turn-prepend messages can name the same id the parent saw
+/// at dispatch time. `images` is empty for non-completed exits so
+/// failure noise can't leak attachment context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingSubagentResult {
+    pub handle_id: String,
+    pub subagent_type: String,
+    pub task_summary: String,
+    pub child_session_id: SessionId,
+    pub final_text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ContentBlock>,
+    pub status: SubagentExitStatus,
+}
+
+/// Split of a [`SubagentResult`] into the components the parent's
+/// tool boundary needs:
+///  * `text` — the always-non-empty string that will populate the
+///    `tool_result` content the parent LLM sees on its next turn.
+///  * `llm_images` — `ContentBlock::Image` entries from the
+///    completed-subagent's final message that vision-capable parent
+///    LLMs should see. Empty for non-completed terminations.
+///
+/// Lives in `aura-model` because the values are pure data and both
+/// `aura-tools` (the tool boundary that builds `ToolOutput`) and the
+/// router/wait routine reach for them. Non-image, non-text blocks
+/// (thinking, tool_use, tool_result) are intentionally dropped —
+/// they're internal subagent state and don't belong on the
+/// parent-visible boundary.
+#[derive(Debug, Clone, Default)]
+pub struct SubagentReturn {
+    pub text: String,
+    pub llm_images: Vec<ContentBlock>,
 }
 
 impl SubagentResult {
@@ -154,37 +227,74 @@ impl SubagentResult {
         Self {
             child_session_id: SessionId::from(""),
             final_content: None,
-            status: SubagentExitStatus::Failed(reason.into()),
+            status: SubagentExitStatus::Failed {
+                reason: reason.into(),
+            },
         }
     }
 
-    /// Render this result into a synthetic `tool_result` payload the
-    /// parent's next LLM iteration sees. On `Completed`, the
-    /// child_session_id is suffixed in a parseable form so the parent
-    /// can `spawn_subagent(..., resume_session_id: "...")` to continue
-    /// the same child.
-    pub fn to_tool_result_text(&self) -> String {
-        let body = match (&self.status, &self.final_content) {
-            (SubagentExitStatus::Completed, Some(blocks)) => extract_text(blocks),
-            (SubagentExitStatus::Completed, None) => {
-                "[subagent completed without producing a final message]".to_string()
+    /// Split this result into text + image components for the parent
+    /// tool boundary. See [`SubagentReturn`] for the contract.
+    pub fn split_for_parent(&self) -> SubagentReturn {
+        match (&self.status, &self.final_content) {
+            (SubagentExitStatus::Completed, Some(blocks)) => {
+                let mut text = extract_text(blocks);
+                let llm_images: Vec<ContentBlock> = blocks
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::Image { .. }))
+                    .cloned()
+                    .collect();
+                if text.is_empty() {
+                    text = if llm_images.is_empty() {
+                        "[subagent completed without producing a final message]".to_string()
+                    } else {
+                        "[subagent returned image attachments only]".to_string()
+                    };
+                }
+                SubagentReturn { text, llm_images }
             }
-            (SubagentExitStatus::Cancelled, _) => {
-                "[subagent cancelled by parent before producing a result]".to_string()
-            }
-            (SubagentExitStatus::Failed(reason), _) => {
-                format!("[subagent failed: {reason}]")
-            }
-            (SubagentExitStatus::Timeout, _) => {
-                "[subagent exceeded its declared timeout]".to_string()
-            }
-        };
-        let id = self.child_session_id.as_ref();
-        if matches!(self.status, SubagentExitStatus::Completed) && !id.is_empty() {
-            format!("{body}\n[subagent_session_id: {id}]")
-        } else {
-            body
+            (SubagentExitStatus::Completed, None) => SubagentReturn {
+                text: "[subagent completed without producing a final message]".to_string(),
+                llm_images: Vec::new(),
+            },
+            (SubagentExitStatus::Cancelled, _) => SubagentReturn {
+                text: "[subagent cancelled by parent before producing a result]".to_string(),
+                llm_images: Vec::new(),
+            },
+            (SubagentExitStatus::Failed { reason }, _) => SubagentReturn {
+                text: format!("[subagent failed: {reason}]"),
+                llm_images: Vec::new(),
+            },
+            (SubagentExitStatus::Timeout, _) => SubagentReturn {
+                text: "[subagent idle timeout — produced no output within the safety window]"
+                    .to_string(),
+                llm_images: Vec::new(),
+            },
         }
+    }
+
+    /// The parseable `[subagent_session_id: …]` suffix appended to a
+    /// completed result's text so the parent can continue the child via
+    /// `spawn_subagent(resume_session_id: …)`. `None` for non-completed
+    /// exits or early failures that never minted a child session. Single
+    /// source of truth for the tail format — the tool boundary applies
+    /// it to its already-split text rather than re-rendering.
+    pub fn resume_tail(&self) -> Option<String> {
+        let id = self.child_session_id.as_ref();
+        (matches!(self.status, SubagentExitStatus::Completed) && !id.is_empty())
+            .then(|| format!("\n[subagent_session_id: {id}]"))
+    }
+
+    /// Flat text rendering for the parent's synthetic `tool_result`:
+    /// [`Self::split_for_parent`]'s text plus the [`Self::resume_tail`]
+    /// suffix on completion. Image attachments are dropped — callers
+    /// that need them reach for `split_for_parent` and apply the tail.
+    pub fn to_tool_result_text(&self) -> String {
+        let mut text = self.split_for_parent().text;
+        if let Some(tail) = self.resume_tail() {
+            text.push_str(&tail);
+        }
+        text
     }
 }
 
@@ -202,35 +312,6 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn initial_prompt_without_context_is_task_only() {
-        let req = SubagentSpawnRequest {
-            task_description: "just the task".to_string(),
-            must_include_context: vec![],
-            timeout: Duration::from_secs(60),
-            backend: SubagentBackend::default(),
-            workspace_name: None,
-            resume_session_id: None,
-        };
-        assert_eq!(req.initial_prompt(), "just the task");
-    }
-
-    #[test]
-    fn initial_prompt_with_context_appends_bullets() {
-        let req = SubagentSpawnRequest {
-            task_description: "do X".to_string(),
-            must_include_context: vec!["fact a".into(), "fact b".into()],
-            timeout: Duration::from_secs(60),
-            backend: SubagentBackend::default(),
-            workspace_name: None,
-            resume_session_id: None,
-        };
-        let p = req.initial_prompt();
-        assert!(p.contains("do X"));
-        assert!(p.contains("- fact a"));
-        assert!(p.contains("- fact b"));
-    }
 
     #[test]
     fn tool_result_text_completed_concatenates_text_blocks_and_tails_session_id() {
@@ -262,11 +343,91 @@ mod tests {
     }
 
     #[test]
+    fn split_for_parent_passes_through_image_attachments() {
+        let img = ContentBlock::Image {
+            blob: crate::BlobRef {
+                blob_id: "b-1".into(),
+            },
+            mime_type: "image/png".into(),
+        };
+        let r = SubagentResult {
+            child_session_id: SessionId::from("child-1"),
+            final_content: Some(vec![ContentBlock::Text("found this".into()), img.clone()]),
+            status: SubagentExitStatus::Completed,
+        };
+        let parts = r.split_for_parent();
+        assert_eq!(parts.text, "found this");
+        assert_eq!(parts.llm_images, vec![img]);
+    }
+
+    #[test]
+    fn split_for_parent_image_only_returns_canned_text() {
+        let img = ContentBlock::Image {
+            blob: crate::BlobRef {
+                blob_id: "b-1".into(),
+            },
+            mime_type: "image/png".into(),
+        };
+        let r = SubagentResult {
+            child_session_id: SessionId::from("child-1"),
+            final_content: Some(vec![img.clone()]),
+            status: SubagentExitStatus::Completed,
+        };
+        let parts = r.split_for_parent();
+        assert!(parts.text.contains("image attachments only"));
+        assert_eq!(parts.llm_images, vec![img]);
+    }
+
+    #[test]
+    fn split_for_parent_failure_drops_images() {
+        let img = ContentBlock::Image {
+            blob: crate::BlobRef {
+                blob_id: "b-1".into(),
+            },
+            mime_type: "image/png".into(),
+        };
+        let r = SubagentResult {
+            child_session_id: SessionId::from("child-1"),
+            final_content: Some(vec![img]),
+            status: SubagentExitStatus::Failed {
+                reason: "boom".into(),
+            },
+        };
+        let parts = r.split_for_parent();
+        assert!(parts.text.contains("boom"));
+        assert!(parts.llm_images.is_empty());
+    }
+
+    #[test]
+    fn split_for_parent_drops_non_text_non_image_blocks() {
+        let r = SubagentResult {
+            child_session_id: SessionId::from("child-1"),
+            final_content: Some(vec![
+                ContentBlock::Text("a".into()),
+                ContentBlock::Thinking {
+                    id: None,
+                    content: vec![],
+                },
+                ContentBlock::ToolUse {
+                    id: "tu".into(),
+                    name: "t".into(),
+                    input: serde_json::json!({}),
+                    signature: None,
+                },
+            ]),
+            status: SubagentExitStatus::Completed,
+        };
+        let parts = r.split_for_parent();
+        assert_eq!(parts.text, "a");
+        assert!(parts.llm_images.is_empty());
+    }
+
+    #[test]
     fn tool_result_text_failed_includes_reason() {
         let r = SubagentResult::failed("boom");
         let s = r.to_tool_result_text();
         assert!(s.contains("boom"));
-        assert!(matches!(&r.status, SubagentExitStatus::Failed(s) if s == "boom"));
+        assert!(matches!(&r.status, SubagentExitStatus::Failed { reason } if reason == "boom"));
     }
 
     #[test]

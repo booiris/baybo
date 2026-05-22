@@ -24,6 +24,7 @@ impl WorkspaceManager {
             paths.config_dir(),
             paths.profile_dir(),
             paths.skills_dir(),
+            paths.agents_dir(),
             paths.key_dir(),
             paths.state_dir(),
             // Per-session writable artifacts (currently `summary.md` for
@@ -39,7 +40,12 @@ impl WorkspaceManager {
                 .map_err(|e| anyhow::anyhow!("create workspace dir {}: {e}", dir.display()))?;
         }
 
-        for dir in [paths.config_dir(), paths.profile_dir(), paths.skills_dir()] {
+        for dir in [
+            paths.config_dir(),
+            paths.profile_dir(),
+            paths.skills_dir(),
+            paths.agents_dir(),
+        ] {
             ensure_git_repo(&dir).await?;
         }
         Ok(())
@@ -151,6 +157,7 @@ mod tests {
             paths.config_dir(),
             paths.profile_dir(),
             paths.skills_dir(),
+            paths.agents_dir(),
             paths.key_dir(),
             paths.state_dir(),
             paths.work_dir(),
@@ -164,6 +171,7 @@ mod tests {
         assert!(paths.config_dir().join(".git").is_dir());
         assert!(paths.profile_dir().join(".git").is_dir());
         assert!(paths.skills_dir().join(".git").is_dir());
+        assert!(paths.agents_dir().join(".git").is_dir());
         // .key/ is NOT a git repo — encryption key must never be tracked.
         assert!(!paths.key_dir().join(".git").exists());
 

@@ -105,7 +105,7 @@ async fn add_entry<P: Prompter>(
     };
 
     let temp_entry = LlmEntry {
-        name: name.clone(),
+        name: name.clone().into(),
         provider: provider.clone(),
         model: String::from("(unset)"),
         api_key_env: api_key_env.clone(),
@@ -160,7 +160,7 @@ async fn add_entry<P: Prompter>(
     };
 
     let entry = LlmEntry {
-        name: name.clone(),
+        name: name.clone().into(),
         provider: provider.clone(),
         model: model.clone(),
         api_key_env,
@@ -189,7 +189,7 @@ async fn add_entry<P: Prompter>(
         )?
     };
     if became_default {
-        config.default_llm = name.clone();
+        config.default_llm = name.clone().into();
     }
 
     config
@@ -217,7 +217,7 @@ async fn fetch_live_models(
     let cfg = LlmProviderConfig {
         provider: entry.provider.clone(),
         api_key: resolve_api_key(
-            &entry.name,
+            entry.name.as_str(),
             &entry.provider,
             entry.api_key_env.as_deref(),
             vault.as_deref(),

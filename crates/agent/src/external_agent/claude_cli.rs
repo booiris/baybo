@@ -157,7 +157,7 @@ fn spawn_stream_parser(
         let mut session_persisted = false;
         let mut accumulated = String::new();
         let mut buffered_usage: Option<TokenUsage> = None;
-        let deadline = tokio::time::Instant::now() + timeout;
+        let mut deadline = tokio::time::Instant::now() + timeout;
 
         loop {
             tokio::select! {
@@ -174,7 +174,7 @@ fn spawn_stream_parser(
                     let _ = child.start_kill();
                     let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
                     yield Err(ExternalAgentError::Transient(
-                        "claude: exceeded declared timeout".into()
+                        "claude: idle timeout — no output within the safety window".into()
                     ));
                     return;
                 }
@@ -189,6 +189,9 @@ fn spawn_stream_parser(
                             return;
                         }
                     };
+                    // Any output means the subprocess is alive — reset the
+                    // idle timer so only a genuinely silent run is killed.
+                    deadline = tokio::time::Instant::now() + timeout;
                     if line.is_empty() {
                         continue;
                     }

@@ -25,6 +25,7 @@ ts-export = ["dep:ts-rs"]
 aura-llm = { workspace = true }
 aura-model = { workspace = true }
 aura-security = { workspace = true }
+aura-session = { workspace = true }
 aura-storage = { workspace = true }
 aura-store = { workspace = true }
 aura-trace = { workspace = true }
@@ -69,5 +70,6 @@ ts-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 aura-llm = { workspace = true, features = ["test-support"] }
+aura-session = { workspace = true, features = ["test-support"] }
 aura-storage = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

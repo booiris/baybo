@@ -166,3 +166,82 @@ async fn clearing_in_flight_unblocks_post_reap_compression() {
         "post-reap rehydration must see in_flight = false so the next pass can run"
     );
 }
+
+/// Background subagent deliveries that landed on the actor are
+/// persisted to the session row immediately, so a parent that the
+/// idle reaper later reclaims still hands the pending notifications
+/// to the next freshly-hydrated actor. We don't run a full actor
+/// here — the contract under test is purely "session.state.pending
+/// survives the storage round-trip", which is the property the
+/// actor's `persist_session_state_after_pending_change` helper is
+/// responsible for upholding.
+#[tokio::test]
+async fn pending_subagent_results_survive_session_round_trip() {
+    use aura_model::{
+        ContentBlock, PendingSubagentResult, SessionId, SubagentExitStatus,
+    };
+
+    let session_store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
+    let summary_store = Arc::new(MemorySessionSummaryStore::new());
+    let sessions = SessionManager::new(session_store.clone(), summary_store);
+
+    let mut session = sessions
+        .create_session(test_user(), ChannelType::tui())
+        .await
+        .expect("create");
+    let session_id = session.id.clone();
+
+    session.state.pending_subagent_results.push(PendingSubagentResult {
+        handle_id: "bg-1".into(),
+        subagent_type: "general-purpose".into(),
+        task_summary: "check the docs".into(),
+        child_session_id: SessionId::from("child-xyz"),
+        final_text: "found three matches".into(),
+        images: vec![],
+        status: SubagentExitStatus::Completed,
+    });
+    session_store.save(&session).await.expect("persist");
+
+    drop(session);
+
+    let reloaded = sessions
+        .get(&session_id)
+        .await
+        .expect("load")
+        .expect("row present");
+    assert_eq!(reloaded.state.pending_subagent_results.len(), 1);
+    let entry = &reloaded.state.pending_subagent_results[0];
+    assert_eq!(entry.handle_id, "bg-1");
+    assert_eq!(entry.subagent_type, "general-purpose");
+    assert_eq!(entry.final_text, "found three matches");
+    assert!(matches!(entry.status, SubagentExitStatus::Completed));
+    assert!(entry.images.is_empty());
+
+    // Round-trip with an image attachment ensures the ContentBlock
+    // serialization in the new field type works too.
+    let mut with_image = reloaded;
+    with_image.state.pending_subagent_results.push(PendingSubagentResult {
+        handle_id: "bg-2".into(),
+        subagent_type: "explorer".into(),
+        task_summary: "screenshot".into(),
+        child_session_id: SessionId::from("child-img"),
+        final_text: "here is the screenshot".into(),
+        images: vec![ContentBlock::Image {
+            blob: aura_model::BlobRef {
+                blob_id: "blob-1".into(),
+            },
+            mime_type: "image/png".into(),
+        }],
+        status: SubagentExitStatus::Completed,
+    });
+    session_store.save(&with_image).await.expect("persist with image");
+    let reloaded = sessions
+        .get(&session_id)
+        .await
+        .expect("load")
+        .expect("row present");
+    assert_eq!(reloaded.state.pending_subagent_results.len(), 2);
+    let entry = &reloaded.state.pending_subagent_results[1];
+    assert_eq!(entry.images.len(), 1);
+    assert!(matches!(&entry.images[0], ContentBlock::Image { .. }));
+}

@@ -278,12 +278,30 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approved_resources: Vec<ApprovedResource>,
 
+    /// Background `spawn_subagent` results that completed while the
+    /// parent actor was between turns. The agent loop drains this on
+    /// the next user input, prepending them as a System reminder so
+    /// the parent LLM sees the work in time. Persisted with the
+    /// session so an actor evicted by the idle reaper still surfaces
+    /// the deliveries on hydration. See
+    /// `aura_model::spawn_protocol::PendingSubagentResult`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_subagent_results: Vec<crate::spawn_protocol::PendingSubagentResult>,
+
     /// Which backend created this subagent session, plus (for
     /// External) the agent's `workspace_dir` and `resume_key`.
     /// `None` for non-subagent sessions (top-level user, cron,
     /// maintenance) and for pre-tag subagent rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_backend: Option<crate::SubagentBackendTag>,
+
+    /// `subagent_type` (profile name) this subagent session was spawned
+    /// with, pinned at genesis. Lets a `resume_session_id` call reject a
+    /// profile swap — resuming a `planner` child as `general-purpose`
+    /// would run a different profile's prompt/contract over the existing
+    /// transcript. `None` for non-subagent sessions and pre-pin rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
 
     /// Reserved extension fields for plugins and experiments.
     #[serde(default)]

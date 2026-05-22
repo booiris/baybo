@@ -131,7 +131,7 @@ pub async fn build_llm_client_for_entry(
     guard: LlmCallGuard,
 ) -> anyhow::Result<std::sync::Arc<GuardedLlm>> {
     let api_key = resolve_api_key(
-        &entry.name,
+        entry.name.as_str(),
         &entry.provider,
         entry.api_key_env.as_deref(),
         vault.as_deref(),

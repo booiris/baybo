@@ -111,7 +111,7 @@ async fn run_llm_step<P: Prompter>(
     let allow_skip = !ctx.config.llm.is_empty();
     let outcome = configure_llm_step(prompter, &ctx.vault, &mut ctx.config, allow_skip).await?;
     Ok(match outcome {
-        LlmStepOutcome::Added(entry) => Some(entry.name),
+        LlmStepOutcome::Added(entry) => Some(entry.name.to_string()),
         LlmStepOutcome::Skipped => None,
     })
 }

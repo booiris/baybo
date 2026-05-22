@@ -300,7 +300,8 @@ Usage notes:
   - The archived file lives under `<workspace>/state/blobs/` and is GC'd by the janitor's LRU sweep, so treat the path as ephemeral within a session.
   - Binary/non-text content types are still refused; for downloading `.zip`/images/archives use Bash with `curl` or `wget` instead.
   - For GitHub URLs, prefer using the gh CLI via Bash instead (e.g., gh pr view, gh issue view, gh api).
-"#.to_string()
+"#
+        .to_string()
     }
 
     fn parameters_schema(&self) -> Value {

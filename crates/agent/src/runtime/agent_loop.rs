@@ -6,7 +6,7 @@ use aura_job::{JobInput, JobLifecycle, JobOutput};
 use aura_llm::{
     ChatRequest, GuardedLlm, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
 };
-use aura_model::{ChatMessage, ContentBlock, JobId, Role, SystemSpawnRequest};
+use aura_model::{ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SystemSpawnRequest};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -224,7 +224,7 @@ pub struct AgentLoopConfig {
     /// Process-wide pool of guarded LLM clients keyed by entry name.
     pub llm_pool: Arc<crate::runtime::llm_pool::LlmClientPool>,
     /// Initial pick for the active LLM. `None` ⇒ pool default.
-    pub initial_llm: Option<String>,
+    pub initial_llm: Option<LlmEntryName>,
     pub tool_registry: Arc<ToolRegistry>,
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
@@ -270,7 +270,7 @@ impl AgentLoop {
             workspace_paths,
             sessions,
         } = config;
-        let (llm_client, _effective_name) = llm_pool.resolve(initial_llm.as_deref());
+        let (llm_client, _effective_name) = llm_pool.resolve(initial_llm.as_ref());
         let billed_chat_factory = crate::runtime::billed_chat::BilledChatFactory::new(
             llm_client.clone(),
             cost_manager.clone(),
@@ -329,6 +329,7 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         parent_job_id: Option<JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
+        background_notice: Option<String>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
         // `job_input` records why this job exists (provenance: which
@@ -357,6 +358,7 @@ impl AgentLoop {
                         span_recorder,
                         job_id,
                         delta_tx,
+                        background_notice,
                         cancel_token,
                     )
                     .await?;
@@ -378,6 +380,7 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
+        background_notice: Option<String>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
         let _ = job_lifecycle;
@@ -394,6 +397,19 @@ impl AgentLoop {
                 channel: session.channel.clone(),
             }) as Arc<dyn aura_tools::SessionNotifier>
         });
+
+        // Background-subagent notice (work that finished off-thread since
+        // the parent's last turn) is appended as its own context message
+        // ahead of the user's — never merged into `user_content`, which
+        // would push a leading `/command` past slash detection below.
+        if let Some(notice) = background_notice {
+            let notice_msg = ChatMessage {
+                role: Role::User,
+                content: vec![ContentBlock::Text(notice)],
+                from_user: false,
+            };
+            self.append_context_message(session, &notice_msg).await?;
+        }
 
         let user_text = aura_llm::multimodal::extract_text(&user_content);
         let skills_for_turn = if self.skill_registry.is_empty() {
@@ -713,42 +729,74 @@ impl AgentLoop {
         };
         self.append_context_message(session, &assistant_msg).await?;
 
-        // Execute tool calls. Approved resources are shared via a Mutex
-        // so concurrent tool calls (when supported) see each other's
-        // grants immediately. Wrapped in an `Arc` so that any
-        // persist-always closure injected into `ToolContext`
-        // mid-execution can clone its handle into the executor boundary
-        // without a borrow-lifetime escape.
+        // Execute tool calls concurrently. Approved resources are shared
+        // via a Mutex so concurrent calls see each other's grants
+        // immediately. Wrapped in an `Arc` so that any persist-always
+        // closure injected into `ToolContext` mid-execution can clone
+        // its handle into the executor boundary without a borrow
+        // escape.
+        //
+        // Concurrency note: every tool call inside a single LLM
+        // response runs in parallel via `futures::future::join_all`.
+        // The post-execution pass that mutates `session.messages` is
+        // kept SEQUENTIAL — appending tool results in original
+        // `tool_calls` order keeps the next turn's context byte-stable
+        // (prompt cache hits) and matches provider expectations that
+        // tool_use ↔ tool_result pairs land in declaration order. The
+        // executor + approval gate are already designed for
+        // concurrency (TUI gate serialises its prompts internally).
         let approved = std::sync::Arc::new(parking_lot::Mutex::new(
             session.state.approved_resources.clone(),
         ));
 
-        for tool_call in &response.tool_calls {
-            debug!(
-                tool = %tool_call.name,
-                "executing tool call"
-            );
+        let executor = Arc::clone(&self.tool_executor);
+        let session_id_for_calls = session.id.clone();
+        let user_for_calls = session.user.clone();
+        let recorder_for_calls = Arc::clone(span_recorder);
+        let step_for_calls = step.clone();
+        let notifier_for_calls = notifier.clone();
+        let bcf_for_calls = Arc::clone(&self.billed_chat_factory);
+        let exec_futures = response.tool_calls.iter().map(|tc| {
+            let executor = Arc::clone(&executor);
+            let session_id = session_id_for_calls.clone();
+            let user = user_for_calls.clone();
+            let approved = Arc::clone(&approved);
+            let recorder = Arc::clone(&recorder_for_calls);
+            let step = step_for_calls.clone();
+            let cancel = cancel_token.child_token();
+            let notifier = notifier_for_calls.clone();
+            let bcf = Arc::clone(&bcf_for_calls);
+            let tool_name = tc.name.clone();
+            let arguments = tc.arguments.clone();
+            let tool_use_id = tc.id.clone();
+            let triggering_llm_span = Some(llm_span_id);
+            async move {
+                debug!(tool = %tool_name, "executing tool call");
+                executor
+                    .execute(
+                        &tool_name,
+                        arguments,
+                        &session_id,
+                        &user,
+                        &approved,
+                        &recorder,
+                        &step,
+                        triggering_llm_span,
+                        tool_use_id,
+                        None,
+                        Some(job_id),
+                        cancel,
+                        notifier,
+                        Some(&bcf),
+                    )
+                    .await
+            }
+        });
+        let tool_results = futures::future::join_all(exec_futures).await;
 
-            let tool_result = self
-                .tool_executor
-                .execute(
-                    &tool_call.name,
-                    tool_call.arguments.clone(),
-                    &session.id,
-                    &session.user,
-                    &approved,
-                    span_recorder,
-                    &step,
-                    Some(llm_span_id),
-                    tool_call.id.clone(),
-                    None,
-                    Some(job_id),
-                    cancel_token.child_token(),
-                    notifier.clone(),
-                    Some(&self.billed_chat_factory),
-                )
-                .await;
-
+        // Sequential post-processing: append results in `tool_calls`
+        // order so context state stays byte-stable across calls.
+        for (tool_call, tool_result) in response.tool_calls.iter().zip(tool_results) {
             let mut llm_visible_images: Vec<ContentBlock> = Vec::new();
             let raw_result_text = match &tool_result {
                 Ok(ToolOutput::Text(s)) => s.clone(),

@@ -1,8 +1,8 @@
 use aura_config::{
     AuraConfig, ClaudeConfig, CodexConfig, ConfigError, DiscordChannelConfig, ExternalAgentsConfig,
-    LlmEntry, TelegramChannelConfig,
+    LlmEntry, LlmEntryName, TelegramChannelConfig,
 };
-use aura_model::ExternalAgentKind;
+use aura_model::{ExternalAgentKind, ModelTier};
 
 fn has_field(errors: &[aura_config::ValidationError], field: &str) -> bool {
     errors.iter().any(|e| e.field == field)
@@ -94,7 +94,7 @@ fn empty_llm_list_is_valid() {
     // LLM.
     let c = AuraConfig::default();
     assert!(c.llm.is_empty());
-    assert!(c.default_llm.is_empty());
+    assert!(c.default_llm.as_str().is_empty());
     assert!(c.validate().is_ok());
 }
 
@@ -102,7 +102,7 @@ fn empty_llm_list_is_valid() {
 fn default_llm_required_when_entries_exist() {
     let c = AuraConfig {
         llm: vec![entry("openai")],
-        default_llm: String::new(),
+        default_llm: LlmEntryName::default(),
         ..AuraConfig::default()
     };
     let errors = unwrap_validation(c.validate().unwrap_err());
@@ -118,6 +118,24 @@ fn default_llm_must_reference_existing_entry() {
     };
     let errors = unwrap_validation(c.validate().unwrap_err());
     assert!(has_field(&errors, "default-llm"));
+}
+
+#[test]
+fn model_tier_mapping_to_unknown_entry_fails_validation() {
+    let mut c = config_with_default_entry();
+    c.agent
+        .model_tiers
+        .insert(ModelTier::Fast, "missing".into());
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "agent.model_tiers"));
+}
+
+#[test]
+fn model_tier_mapping_to_existing_entry_is_valid() {
+    let mut c = config_with_default_entry();
+    c.agent.model_tiers.insert(ModelTier::Fast, "openai".into());
+    c.validate()
+        .expect("model_tier pointing at a real llm entry is valid");
 }
 
 #[test]

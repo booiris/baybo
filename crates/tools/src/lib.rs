@@ -36,9 +36,12 @@ pub type Result<T> = std::result::Result<T, ToolError>;
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     /// LLM-facing description. Owned `String`: every consumer
-    /// materialises it into a `ToolDefinition` / `ToolManifest` anyway.
-    /// Static tools just `"...".to_string()`.
+    /// materialises it into a `ToolDefinition` / `ToolManifest` anyway,
+    /// and tools whose description depends on runtime state (e.g.
+    /// `spawn_subagent` enumerates the registered subagent profiles each
+    /// turn) compute it per call. Static tools just `"...".to_string()`.
     fn description(&self) -> String;
+
     fn parameters_schema(&self) -> Value;
 
     /// Resources this call will touch, derived from the parameters.
