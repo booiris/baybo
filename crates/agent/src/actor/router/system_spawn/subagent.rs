@@ -468,18 +468,16 @@ impl Router {
                 .create_spawned_session(child_user, child_channel, parent, lineage)
                 .await
                 .map_err(|e| SubagentResult::failed(format!("create child session: {e}")))?;
-            // workspace_dir is identity, not per-call state: resolve
-            // once here from request.workspace_name (or child-id
-            // fallback) and reuse verbatim on every resume.
+            // workspace_dir is identity, not per-call state: an external
+            // subagent works under `<root>/work/<backend>/<child_id>/`,
+            // resolved once here from the child session id and reused
+            // verbatim on every resume.
             child.state.subagent_backend = Some(match backend {
                 aura_model::SubagentBackendKind::Aura => aura_model::SubagentBackendTag::Aura,
                 aura_model::SubagentBackendKind::External(kind) => {
                     aura_model::SubagentBackendTag::External {
                         external_kind: kind,
-                        workspace_dir: request
-                            .workspace_name
-                            .clone()
-                            .unwrap_or_else(|| child.id.as_ref().to_string()),
+                        workspace_dir: child.id.as_ref().to_string(),
                         resume_key: None,
                     }
                 }

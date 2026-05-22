@@ -148,8 +148,6 @@ struct SpawnParams {
     #[serde(default)]
     background: bool,
     #[serde(default)]
-    workspace_name: Option<String>,
-    #[serde(default)]
     resume_session_id: Option<String>,
 }
 
@@ -167,8 +165,6 @@ struct LineageSummary {
     depth: u32,
     root_session_id: SessionId,
 }
-
-const MAX_WORKSPACE_NAME_BASE_LEN: usize = 32;
 
 fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<ParsedSpawn, String> {
     let p: SpawnParams = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
@@ -218,12 +214,6 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
         None => profile.default_tier,
     };
 
-    let workspace_name = p
-        .workspace_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(sanitize_workspace_name);
     let backend = match p.backend.as_deref().map(str::trim) {
         None | Some("") => SubagentBackend::Aura,
         Some(t) if t == AURA_BACKEND_TAG => SubagentBackend::Aura,
@@ -243,13 +233,6 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(SessionId::from);
-    if resume_session_id.is_some() && workspace_name.is_some() {
-        return Err(
-            "`workspace_name` is fixed at the genesis spawn — drop it from resume calls; the \
-             original dir is reused automatically"
-                .into(),
-        );
-    }
 
     Ok(ParsedSpawn {
         request: SubagentSpawnRequest {
@@ -265,7 +248,6 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
             // dispatch limiter.
             fan_out_root: None,
             backend,
-            workspace_name,
             resume_session_id,
         },
     })
@@ -283,40 +265,6 @@ pub struct SpawnSubagentToolConfig {
     pub dispatch_limiter: Arc<dyn SubagentDispatchLimiter>,
     pub max_depth: u32,
     pub max_subagents_per_root: u32,
-}
-
-/// Lowercase + kebab-case `[a-z0-9-]`, truncated to
-/// `MAX_WORKSPACE_NAME_BASE_LEN`. Two spawns with the same input
-/// share the same on-disk dir on purpose — letting a sibling
-/// subagent see the prior one's files is the legitimate reason to
-/// pass an explicit `workspace_name`.
-fn sanitize_workspace_name(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut last_was_dash = true;
-    for ch in raw.chars() {
-        let lowered = ch.to_ascii_lowercase();
-        let keep = lowered.is_ascii_lowercase() || lowered.is_ascii_digit();
-        if keep {
-            out.push(lowered);
-            last_was_dash = false;
-        } else if !last_was_dash {
-            out.push('-');
-            last_was_dash = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    if out.is_empty() {
-        out.push_str("subagent");
-    }
-    if out.len() > MAX_WORKSPACE_NAME_BASE_LEN {
-        out.truncate(MAX_WORKSPACE_NAME_BASE_LEN);
-        while out.ends_with('-') {
-            out.pop();
-        }
-    }
-    out
 }
 
 pub struct SpawnSubagentTool {
@@ -506,13 +454,9 @@ fn parameters_schema() -> Value {
                 "type": "boolean",
                 "description": "When true, returns a handle immediately and surfaces the subagent's final result as an out-of-band notification prepended to your next user turn, letting the parent keep working. Works for any backend; especially useful for long external (claude/codex) runs."
             },
-            "workspace_name": {
-                "type": "string",
-                "description": "Optional short human-readable slug naming the subagent's working area (e.g. 'investigate-auth-bug', 'refactor-payment-flow'). Used by external-agent backends (claude, codex) so artifacts land under a meaningful path. Sanitised to kebab-case ASCII and capped at 32 chars. Two spawns with the same workspace_name share the same on-disk dir — pass the same name when you want a sibling subagent to pick up where another left off. Leave unset to fall back to the (unique) child session_id."
-            },
             "resume_session_id": {
                 "type": "string",
-                "description": "Continue a prior subagent's conversation. Use a child_session_id value the user previously saw in a 'subagent_session_id: ...' tail on this same parent session — passing an arbitrary id will be rejected. The new prompt is appended to that child's existing context (for claude / codex, via the agent's own --resume). Do NOT also pass `workspace_name` — the original spawn's dir is reused automatically. Leave unset to start a fresh subagent."
+                "description": "Continue a prior subagent's conversation. Use a child_session_id value the user previously saw in a 'subagent_session_id: ...' tail on this same parent session — passing an arbitrary id will be rejected. The new prompt is appended to that child's existing context (for claude / codex, via the agent's own --resume). Leave unset to start a fresh subagent."
             }
         }
     })
@@ -1144,101 +1088,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_spawn_request_sanitises_workspace_name() {
-        let reg = registry_with_builtins();
-        let v = json!({
-            "subagent_type": "general-purpose",
-            "description": "investigate",
-            "prompt": "investigate",
-            "workspace_name": "Investigate Auth Bug!!",
-        });
-        let req = parse_spawn_request(&v, &reg).unwrap().request;
-        assert_eq!(req.workspace_name.as_deref(), Some("investigate-auth-bug"));
-    }
-
-    #[test]
-    fn parse_spawn_request_same_workspace_name_yields_same_sanitized_output() {
-        // Two spawns with the same workspace_name MUST resolve to the
-        // same on-disk dir so a follow-up subagent can pick up where
-        // the prior one left off. No uuid suffixes.
-        let reg = registry_with_builtins();
-        let a = parse_spawn_request(
-            &json!({
-                "subagent_type": "general-purpose",
-                "description": "first",
-                "prompt": "first",
-                "workspace_name": "shared-work",
-            }),
-            &reg,
-        )
-        .unwrap()
-        .request;
-        let b = parse_spawn_request(
-            &json!({
-                "subagent_type": "general-purpose",
-                "description": "second",
-                "prompt": "second",
-                "workspace_name": "shared-work",
-            }),
-            &reg,
-        )
-        .unwrap()
-        .request;
-        assert_eq!(a.workspace_name, b.workspace_name);
-    }
-
-    #[test]
-    fn parse_spawn_request_blank_workspace_name_is_treated_as_unset() {
-        let reg = registry_with_builtins();
-        for blank in ["", "   ", "\t"] {
-            let v = json!({
-                "subagent_type": "general-purpose",
-                "description": "x",
-                "prompt": "x",
-                "workspace_name": blank,
-            });
-            let req = parse_spawn_request(&v, &reg).unwrap().request;
-            assert_eq!(req.workspace_name, None, "blank {blank:?} should be None");
-        }
-    }
-
-    #[test]
-    fn sanitize_workspace_name_handles_punctuation_and_unicode() {
-        assert_eq!(
-            sanitize_workspace_name("Fix the BUG_123 (中文 case)"),
-            "fix-the-bug-123-case",
-        );
-    }
-
-    #[test]
-    fn sanitize_workspace_name_truncates_long_input_at_cap() {
-        let out = sanitize_workspace_name(
-            "this-is-a-very-very-long-investigation-name-that-overflows-the-cap",
-        );
-        assert!(
-            out.len() <= MAX_WORKSPACE_NAME_BASE_LEN,
-            "len {} > cap {MAX_WORKSPACE_NAME_BASE_LEN}",
-            out.len()
-        );
-        assert!(!out.ends_with('-'));
-    }
-
-    #[test]
-    fn sanitize_workspace_name_empty_input_falls_back_to_subagent() {
-        assert_eq!(sanitize_workspace_name("***"), "subagent");
-    }
-
-    #[test]
-    fn sanitize_workspace_name_is_deterministic() {
-        // Same input must produce the same output — sibling subagents
-        // sharing a workspace_name share a dir.
-        assert_eq!(
-            sanitize_workspace_name("same-name"),
-            sanitize_workspace_name("same-name"),
-        );
-    }
-
-    #[test]
     fn description_appends_type_catalogue() {
         let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
         let tool = SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
@@ -1433,22 +1282,6 @@ mod tests {
             req.resume_session_id.as_ref().map(|s| s.as_ref()),
             Some("child-abc"),
         );
-    }
-
-    #[test]
-    fn parse_spawn_request_rejects_workspace_name_on_resume() {
-        // The genesis spawn's dir is durable on the child Session,
-        // so resume calls can't choose a new one.
-        let reg = registry_with_builtins();
-        let v = json!({
-            "subagent_type": "general-purpose",
-            "description": "follow-up",
-            "prompt": "follow-up",
-            "resume_session_id": "child-abc",
-            "workspace_name": "different-dir",
-        });
-        let err = parse_spawn_request(&v, &reg).expect_err("must reject");
-        assert!(err.contains("workspace_name"), "got: {err}");
     }
 
     #[test]

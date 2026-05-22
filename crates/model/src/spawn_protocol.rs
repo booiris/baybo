@@ -136,14 +136,6 @@ pub struct SubagentSpawnRequest {
     /// external-agent impl (claude_cli, …) for one-shot delegation.
     #[serde(default)]
     pub backend: SubagentBackend,
-    /// Sanitised kebab-case slug for the child's working directory:
-    /// `<root>/work/<backend>/<workspace_name>/`. `None` falls back
-    /// to the child session_id. Format: ASCII `[a-z0-9-]`, capped
-    /// at 32 chars. Deterministic — two spawns with the same input
-    /// share the same on-disk dir on purpose, so a sibling subagent
-    /// can pick up where another left off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_name: Option<String>,
     /// Continue a prior subagent's session. The id MUST come from a
     /// previous `SubagentResult.child_session_id` in this same parent
     /// session. The router verifies parent + backend match before
