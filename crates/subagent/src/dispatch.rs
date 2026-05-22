@@ -127,16 +127,19 @@ impl SubagentDispatchLimiter for FanOutLimiter {
     }
 
     fn release(&self, root_session_id: &SessionId) {
-        let now_zero = match self.counts.get_mut(root_session_id) {
-            Some(mut slot) => {
-                let new = slot.saturating_sub(1);
-                *slot = new;
-                new == 0
+        // Decrement-or-remove must stay atomic within the shard: holding
+        // the `Entry` guard across the whole branch stops a concurrent
+        // `try_reserve` from re-incrementing a zero entry that we then
+        // delete (which would leak the reservation and let the cap be
+        // exceeded). Dropping a `get_mut` guard before a separate
+        // `remove` reopens exactly that window.
+        if let Entry::Occupied(mut slot) = self.counts.entry(root_session_id.clone()) {
+            let new = slot.get().saturating_sub(1);
+            if new == 0 {
+                slot.remove();
+            } else {
+                *slot.get_mut() = new;
             }
-            None => return,
-        };
-        if now_zero {
-            self.counts.remove(root_session_id);
         }
     }
 

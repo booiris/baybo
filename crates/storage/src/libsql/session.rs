@@ -105,12 +105,31 @@ impl SessionStore for LibsqlSessionStore {
         let lineage_kind = lineage_kind_str(session).map(|s| s.to_string());
         let is_normal = is_normal_session_flag(session);
         let hidden_flag: i64 = if session.hidden { 1 } else { 0 };
+        // Upsert in place (NOT `INSERT OR REPLACE`, which delete+reinserts
+        // the row). The DO UPDATE clause deliberately omits `hidden`:
+        // that flat column is owned by `set_hidden`, and `save` carries a
+        // possibly-stale in-memory `Session` (e.g. a background-subagent
+        // persist after the user hid the conversation). `?12` only seeds
+        // `hidden` on a brand-new row; `get` reads the column as
+        // authoritative regardless of the blob's stale field.
         conn.execute(
-            "INSERT OR REPLACE INTO sessions \
+            "INSERT INTO sessions \
              (id, root_session_id, trigger_kind, parent_session_id, parent_job_id, \
               parent_span_id, lineage_kind, bound_soul_version, created_at, last_active, \
               is_normal_session, hidden, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT(id) DO UPDATE SET \
+               root_session_id = excluded.root_session_id, \
+               trigger_kind = excluded.trigger_kind, \
+               parent_session_id = excluded.parent_session_id, \
+               parent_job_id = excluded.parent_job_id, \
+               parent_span_id = excluded.parent_span_id, \
+               lineage_kind = excluded.lineage_kind, \
+               bound_soul_version = excluded.bound_soul_version, \
+               created_at = excluded.created_at, \
+               last_active = excluded.last_active, \
+               is_normal_session = excluded.is_normal_session, \
+               data = excluded.data",
             libsql::params![
                 session.id.as_str().to_string(),
                 session.root_session_id.as_str().to_string(),
@@ -1213,6 +1232,29 @@ mod tests {
         let listed = store.list_by_channel(&ChannelType::http()).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].hidden, "hidden flag must reflect the column");
+    }
+
+    #[tokio::test]
+    async fn save_does_not_clobber_hidden_set_by_set_hidden() {
+        // A background-subagent persist saves the actor's in-memory
+        // `Session` (hidden=false) AFTER the user hid the conversation
+        // via `set_hidden`. `save` must not rewrite the flat `hidden`
+        // column, or it would silently un-hide the row.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let s = make_root_session("hide-then-save");
+        store.save(&s).await.unwrap();
+        assert!(store.set_hidden(&s.id, true).await.unwrap());
+
+        // Re-save the stale in-memory copy (still hidden=false).
+        store.save(&s).await.unwrap();
+
+        let loaded = store.get(&s.id).await.unwrap().expect("row present");
+        assert!(
+            loaded.hidden,
+            "save must preserve the hidden column owned by set_hidden"
+        );
     }
 
     #[tokio::test]

@@ -248,7 +248,32 @@ fn validate_gateway(gateway: &GatewayConfig, errors: &mut Vec<ValidationError>) 
 fn validate_cross_section(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
     validate_encryption_key_source(&config.security, errors);
     validate_default_llm(config, errors);
+    validate_model_tiers(config, errors);
     validate_default_external_agent(config, errors);
+}
+
+/// Every `agent.model_tiers` target must name a real `llm` entry.
+/// Without this the misconfig only surfaces at next startup in
+/// `LlmClientPool::with_tier_map`, after a CLI/gateway mutator has
+/// already persisted the broken config.
+fn validate_model_tiers(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
+    if config.agent.model_tiers.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = config.llm.iter().map(|e| e.name.as_str()).collect();
+    for (tier, name) in &config.agent.model_tiers {
+        if !names.contains(&name.as_str()) {
+            errors.push(ValidationError::new(
+                "agent.model_tiers",
+                format!(
+                    "tier `{}` maps to `{}`, which is not a name in `llm`; existing names: [{}]",
+                    tier.as_str(),
+                    name.as_str(),
+                    names.join(", "),
+                ),
+            ));
+        }
+    }
 }
 
 fn validate_default_external_agent(config: &AuraConfig, errors: &mut Vec<ValidationError>) {

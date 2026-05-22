@@ -2,7 +2,7 @@ use aura_config::{
     AuraConfig, ClaudeConfig, CodexConfig, ConfigError, DiscordChannelConfig, ExternalAgentsConfig,
     LlmEntry, LlmEntryName, TelegramChannelConfig,
 };
-use aura_model::ExternalAgentKind;
+use aura_model::{ExternalAgentKind, ModelTier};
 
 fn has_field(errors: &[aura_config::ValidationError], field: &str) -> bool {
     errors.iter().any(|e| e.field == field)
@@ -118,6 +118,24 @@ fn default_llm_must_reference_existing_entry() {
     };
     let errors = unwrap_validation(c.validate().unwrap_err());
     assert!(has_field(&errors, "default-llm"));
+}
+
+#[test]
+fn model_tier_mapping_to_unknown_entry_fails_validation() {
+    let mut c = config_with_default_entry();
+    c.agent
+        .model_tiers
+        .insert(ModelTier::Fast, "missing".into());
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "agent.model_tiers"));
+}
+
+#[test]
+fn model_tier_mapping_to_existing_entry_is_valid() {
+    let mut c = config_with_default_entry();
+    c.agent.model_tiers.insert(ModelTier::Fast, "openai".into());
+    c.validate()
+        .expect("model_tier pointing at a real llm entry is valid");
 }
 
 #[test]

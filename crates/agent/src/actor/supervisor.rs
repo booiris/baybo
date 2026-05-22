@@ -70,20 +70,23 @@ impl AgentSupervisor {
     /// Decrements the per-session counter and removes the entry when
     /// it falls to zero so the map doesn't accumulate stale keys.
     pub fn note_background_subagent_finished(&self, parent_session_id: &SessionId) {
-        let now_zero = match self
+        use dashmap::mapref::entry::Entry;
+        // Decrement-or-remove must stay atomic within the shard: holding
+        // the `Entry` guard across the branch stops a concurrent
+        // `note_background_subagent_started` from re-incrementing a zero
+        // entry that we then delete — which would drop the in-flight
+        // marker and let the idle reaper reap a parent whose new
+        // background child is still running.
+        if let Entry::Occupied(mut entry) = self
             .in_flight_background_subagents
-            .get_mut(parent_session_id)
+            .entry(parent_session_id.clone())
         {
-            Some(mut entry) => {
-                let new = entry.saturating_sub(1);
-                *entry = new;
-                new == 0
+            let new = entry.get().saturating_sub(1);
+            if new == 0 {
+                entry.remove();
+            } else {
+                *entry.get_mut() = new;
             }
-            None => return,
-        };
-        if now_zero {
-            self.in_flight_background_subagents
-                .remove(parent_session_id);
         }
     }
 
@@ -687,17 +690,13 @@ mod tests {
         supervisor.note_background_subagent_started(&parent.id);
 
         // Reaper should skip the parent.
-        let reaped = supervisor
-            .reap_idle(&sessions, Duration::seconds(60))
-            .await;
+        let reaped = supervisor.reap_idle(&sessions, Duration::seconds(60)).await;
         assert_eq!(reaped, 0, "parent must be protected while subagent runs");
         assert!(mailbox_rx.try_recv().is_err(), "no Shutdown queued");
 
         // Once the subagent finishes, the reaper proceeds on the next tick.
         supervisor.note_background_subagent_finished(&parent.id);
-        let reaped = supervisor
-            .reap_idle(&sessions, Duration::seconds(60))
-            .await;
+        let reaped = supervisor.reap_idle(&sessions, Duration::seconds(60)).await;
         assert_eq!(reaped, 1, "parent must be reaped after subagent clears");
         assert!(matches!(mailbox_rx.try_recv(), Ok(AgentMessage::Shutdown)));
     }
