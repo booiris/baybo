@@ -98,12 +98,7 @@ impl Tool for CronCreateTool {
     }
 
     fn description(&self) -> String {
-        "Schedule a cron job. `timezone` and `prompt` are required — \
-         every fire sends `prompt` through the LLM, and every time in \
-         inputs and outputs is anchored to `timezone`. Exactly one of \
-         `schedule` (recurring cron expression, e.g. \"0 9 * * *\") or \
-         `at` (one-shot timestamp) is required — `at` jobs fire once \
-         then auto-delete."
+        r#"Schedule a job whose `prompt` is run as a task on a timer. `timezone` and `prompt` are required: on every fire the agent executes `prompt` in a fresh session as an instruction to carry out — NOT as a message from the user — and all times in inputs and outputs are anchored to `timezone`. Supply exactly one of `schedule` (recurring cron expression, e.g. "0 9 * * *") or `at` (one-shot timestamp); `at` jobs fire once then auto-delete. Write `prompt` as a self-contained task instruction (see its description) so the fire does the right thing."#
             .to_string()
     }
 
@@ -117,7 +112,7 @@ impl Tool for CronCreateTool {
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Prompt text sent through the LLM on each trigger."
+                    "description": r#"The instruction to execute when the job fires. Each fire runs in a fresh session with NO memory of this conversation, and the text is handed to the agent as a task to perform — NOT as a message from the user. Write it as a self-contained, imperative instruction describing what to DO, and inline every detail the task needs (names, topics, recipients, output format), since nothing from the current chat carries over. When the user wants something said or sent, phrase it as an action rather than the bare words: e.g. for "say hi to me in a minute" use "Send the user a greeting: hi" — NOT "hi" on its own, which the fire would misread as the user greeting the agent."#
                 },
                 "schedule": {
                     "type": "string",
