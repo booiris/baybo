@@ -132,7 +132,7 @@ impl Router {
                 session_id: child_session.id.clone(),
                 channel: child_session.channel.clone(),
                 sender: child_session.user.clone(),
-                content: vec![ContentBlock::Text(request.initial_prompt())],
+                content: vec![ContentBlock::Text(request.prompt.clone())],
                 timestamp: now,
                 reply_to: None,
                 metadata: MessageMetadata::default(),
@@ -316,7 +316,7 @@ impl Router {
         };
         let limiter_for_task = Arc::clone(&self.dispatch_limiter);
         let external_request = ExternalAgentRequest {
-            task: request.initial_prompt(),
+            task: request.prompt.clone(),
             workspace_dir,
             resume_key,
             cancel: actor_token,

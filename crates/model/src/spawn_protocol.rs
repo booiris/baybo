@@ -106,13 +106,11 @@ pub struct SubagentSpawnRequest {
     /// the profile author owns identity / security / output contracts.
     pub system_prompt: String,
     /// 3-5 word summary the parent LLM authored. Trace display only;
-    /// not part of [`Self::initial_prompt`].
+    /// not part of the child's initial prompt.
     pub task_summary: String,
     /// Self-contained brief — becomes the child actor's first user
-    /// message (along with any `must_include_context` bullets).
+    /// message.
     pub prompt: String,
-    #[serde(default)]
-    pub must_include_context: Vec<String>,
     /// Coarse model tier for the Aura backend. Resolution precedence
     /// (highest first): this field → profile's `default_tier` → pool
     /// default. Ignored for the External backend, which runs its own
@@ -152,24 +150,6 @@ pub struct SubagentSpawnRequest {
     /// routing the new task into the existing child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<SessionId>,
-}
-
-impl SubagentSpawnRequest {
-    /// Render the child's first user message — `prompt` with any
-    /// `must_include_context` notes appended as bullets.
-    pub fn initial_prompt(&self) -> String {
-        if self.must_include_context.is_empty() {
-            return self.prompt.clone();
-        }
-        let mut text = self.prompt.clone();
-        text.push_str("\n\nMust-include context:\n");
-        for note in &self.must_include_context {
-            text.push_str("- ");
-            text.push_str(note);
-            text.push('\n');
-        }
-        text
-    }
 }
 
 /// Parent-side context the tool builds from its `ToolContext` and
@@ -340,37 +320,6 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn req(prompt: &str, ctx: Vec<&str>) -> SubagentSpawnRequest {
-        SubagentSpawnRequest {
-            subagent_type: "general-purpose".into(),
-            system_prompt: "You are a test subagent.".into(),
-            task_summary: "test".into(),
-            prompt: prompt.into(),
-            must_include_context: ctx.into_iter().map(String::from).collect(),
-            model_tier: None,
-            background: false,
-            fan_out_root: None,
-            backend: SubagentBackend::default(),
-            workspace_name: None,
-            resume_session_id: None,
-        }
-    }
-
-    #[test]
-    fn initial_prompt_without_context_is_prompt_only() {
-        let r = req("just the task", vec![]);
-        assert_eq!(r.initial_prompt(), "just the task");
-    }
-
-    #[test]
-    fn initial_prompt_with_context_appends_bullets() {
-        let r = req("do X", vec!["fact a", "fact b"]);
-        let p = r.initial_prompt();
-        assert!(p.contains("do X"));
-        assert!(p.contains("- fact a"));
-        assert!(p.contains("- fact b"));
-    }
 
     #[test]
     fn tool_result_text_completed_concatenates_text_blocks_and_tails_session_id() {

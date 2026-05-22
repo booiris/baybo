@@ -140,8 +140,6 @@ struct SpawnParams {
     description: String,
     /// Self-contained brief the child sees as its first user message.
     prompt: String,
-    #[serde(default)]
-    must_include_context: Vec<String>,
     /// `"aura"` (default), `"claude"`, or `"codex"`.
     #[serde(default)]
     backend: Option<String>,
@@ -259,7 +257,6 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
             system_prompt: profile.system_prompt.clone(),
             task_summary: p.description,
             prompt: p.prompt,
-            must_include_context: p.must_include_context,
             model_tier,
             background: p.background,
             // Filled in by the tool after the lineage walk; the
@@ -494,11 +491,6 @@ fn parameters_schema() -> Value {
             "prompt": {
                 "type": "string",
                 "description": "Self-contained brief the subagent sees as its first user message. The subagent does NOT see the parent transcript — include every fact, path, and line number it needs."
-            },
-            "must_include_context": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "Optional bullets appended verbatim after `prompt` (span ids, facts, constraints)."
             },
             "model_tier": {
                 "type": "string",
