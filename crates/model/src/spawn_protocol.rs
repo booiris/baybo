@@ -14,8 +14,6 @@
 //!    exit-status quadruple the LLM-facing `spawn_subagent` tool
 //!    exchanges with the router.
 
-use std::time::Duration;
-
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -49,11 +47,6 @@ pub const BACKGROUND_NOTIFICATIONS_PREAMBLE: &str =
 
 /// Closing line of the same preamble.
 pub const BACKGROUND_NOTIFICATIONS_POSTAMBLE: &str = "[end of background notifications]\n\n";
-
-/// Hard upper bound on a single `spawn_subagent` wait, in seconds.
-/// Shared with the `spawn_subagent` tool's `Tool::max_timeout` so the
-/// router's waiter cannot outlive the executor's wall-clock cap.
-pub const MAX_SUBAGENT_TIMEOUT_SECS: u64 = 3600;
 
 /// Request emitted by `AgentLoop`'s parent-side trigger gate and by
 /// the `spawn_subagent` tool, consumed by `Router`'s `system_trigger_rx`
@@ -120,7 +113,6 @@ pub struct SubagentSpawnRequest {
     pub prompt: String,
     #[serde(default)]
     pub must_include_context: Vec<String>,
-    pub timeout: Duration,
     /// Coarse model tier for the Aura backend. Resolution precedence
     /// (highest first): this field → profile's `default_tier` → pool
     /// default. Ignored for the External backend, which runs its own
@@ -207,7 +199,9 @@ pub enum SubagentExitStatus {
     /// Parent's `CancellationToken` was tripped before the child
     /// returned. Includes the case where a higher ancestor cancelled.
     Cancelled,
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
     Timeout,
 }
 
@@ -300,7 +294,8 @@ impl SubagentResult {
                 llm_images: Vec::new(),
             },
             (SubagentExitStatus::Timeout, _) => SubagentReturn {
-                text: "[subagent exceeded its declared timeout]".to_string(),
+                text: "[subagent idle timeout — produced no output within the safety window]"
+                    .to_string(),
                 llm_images: Vec::new(),
             },
         }
@@ -353,7 +348,6 @@ mod tests {
             task_summary: "test".into(),
             prompt: prompt.into(),
             must_include_context: ctx.into_iter().map(String::from).collect(),
-            timeout: Duration::from_secs(60),
             model_tier: None,
             background: false,
             fan_out_root: None,
@@ -417,10 +411,7 @@ mod tests {
         };
         let r = SubagentResult {
             child_session_id: SessionId::from("child-1"),
-            final_content: Some(vec![
-                ContentBlock::Text("found this".into()),
-                img.clone(),
-            ]),
+            final_content: Some(vec![ContentBlock::Text("found this".into()), img.clone()]),
             status: SubagentExitStatus::Completed,
         };
         let parts = r.split_for_parent();
@@ -457,7 +448,9 @@ mod tests {
         let r = SubagentResult {
             child_session_id: SessionId::from("child-1"),
             final_content: Some(vec![img]),
-            status: SubagentExitStatus::Failed { reason: "boom".into() },
+            status: SubagentExitStatus::Failed {
+                reason: "boom".into(),
+            },
         };
         let parts = r.split_for_parent();
         assert!(parts.text.contains("boom"));

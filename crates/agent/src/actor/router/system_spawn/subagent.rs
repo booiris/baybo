@@ -20,7 +20,9 @@ use crate::actor::AgentMessage;
 use crate::actor::router::Router;
 use crate::actor::subagent::await_subagent_terminal;
 use crate::actor::supervisor::AgentSupervisor;
-use crate::external_agent::{ExternalAgent, ExternalAgentEvent, ExternalAgentRequest};
+use crate::external_agent::{
+    EXTERNAL_SUBAGENT_TIMEOUT, ExternalAgent, ExternalAgentEvent, ExternalAgentRequest,
+};
 
 /// `output_tx` buffer for a subagent's actor. Intentionally smaller than
 /// the operator-configured channel size for top-level actors — a child
@@ -138,7 +140,6 @@ impl Router {
             platform_msg_id: String::new(),
         };
         let child_session_id = child_session.id.clone();
-        let timeout = request.timeout;
         // Tier resolution: `model_tier` lookup, falling through to the
         // pool default (handled inside the spawner closure when `None`
         // is passed). The tool already merged the profile's default_tier
@@ -201,7 +202,6 @@ impl Router {
                     terminal_rx,
                     mailbox,
                     actor_token,
-                    timeout,
                     job_lifecycle,
                 )
                 .await;
@@ -230,7 +230,6 @@ impl Router {
                 terminal_rx,
                 mailbox,
                 actor_token,
-                timeout,
                 job_lifecycle,
             )
             .await;
@@ -321,7 +320,7 @@ impl Router {
             workspace_dir,
             resume_key,
             cancel: actor_token,
-            timeout: request.timeout,
+            timeout: EXTERNAL_SUBAGENT_TIMEOUT,
         };
 
         if request.background {
@@ -526,8 +525,15 @@ async fn escort_background_terminal(
     limiter: &Arc<dyn aura_subagent::SubagentDispatchLimiter>,
     fan_out_root: &Option<SessionId>,
 ) {
-    deliver_background_result(supervisor, parent_id, handle_id, subagent_type, task_summary, result)
-        .await;
+    deliver_background_result(
+        supervisor,
+        parent_id,
+        handle_id,
+        subagent_type,
+        task_summary,
+        result,
+    )
+    .await;
     supervisor.note_background_subagent_finished(parent_id);
     release_reserved_slot(limiter.as_ref(), fan_out_root);
 }
@@ -820,7 +826,7 @@ async fn run_external_agent(
             }
             Some(Err(e)) => {
                 let msg = e.to_string();
-                final_status = Some(if msg.contains("exceeded declared timeout") {
+                final_status = Some(if msg.contains("idle timeout") {
                     SubagentExitStatus::Timeout
                 } else {
                     SubagentExitStatus::Failed { reason: msg }

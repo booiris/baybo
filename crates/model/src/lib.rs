@@ -35,7 +35,7 @@ pub use session::{
 };
 pub use spawn_protocol::{
     BACKGROUND_NOTIFICATIONS_POSTAMBLE, BACKGROUND_NOTIFICATIONS_PREAMBLE,
-    BACKGROUND_SUBAGENT_HANDLE_PREFIX, MAX_SUBAGENT_TIMEOUT_SECS, PendingSubagentResult,
-    SPAWN_SUBAGENT_TOOL_NAME, SUBAGENT_CHANNEL_TAG, SubagentExitStatus, SubagentParentContext,
-    SubagentResult, SubagentReturn, SubagentSpawnRequest, SystemSpawnRequest,
+    BACKGROUND_SUBAGENT_HANDLE_PREFIX, PendingSubagentResult, SPAWN_SUBAGENT_TOOL_NAME,
+    SUBAGENT_CHANNEL_TAG, SubagentExitStatus, SubagentParentContext, SubagentResult,
+    SubagentReturn, SubagentSpawnRequest, SystemSpawnRequest,
 };

@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_model::{
-    AURA_BACKEND_TAG, ExternalAgentKind, MAX_SUBAGENT_TIMEOUT_SECS, ModelTier,
-    SPAWN_SUBAGENT_TOOL_NAME, SessionId, SubagentBackend, SubagentParentContext, SubagentResult,
-    SubagentSpawnRequest, SystemSpawnRequest, TrustLevel,
+    AURA_BACKEND_TAG, ExternalAgentKind, ModelTier, SPAWN_SUBAGENT_TOOL_NAME, SessionId,
+    SubagentBackend, SubagentParentContext, SubagentResult, SubagentSpawnRequest,
+    SystemSpawnRequest, TrustLevel,
 };
 use aura_session::SessionManager;
 use aura_tools::{Tool, ToolContext, ToolError, ToolManifest, ToolOutput};
@@ -63,10 +63,10 @@ context, a system prompt fixed by its `subagent_type` profile, and the
 self-contained `prompt` you authored. Everything it needs to know must
 be inside that prompt.
 
-This call BLOCKS until the subagent's final assistant message arrives
-or its declared timeout fires. The parent then sees the final message
-text as this tool's result. Intermediate tool output and streaming
-deltas inside the subagent are not surfaced.
+This call BLOCKS until the subagent's final assistant message arrives.
+The parent then sees the final message text as this tool's result.
+Intermediate tool output and streaming deltas inside the subagent are
+not surfaced.
 
 # Picking a subagent_type
 
@@ -122,10 +122,12 @@ enforces a hard depth cap. Use the parent's perspective: most useful
 work is "parent dispatches one or two specialists", not deep trees.
 "#;
 
-/// Mirrors [`aura_model::MAX_SUBAGENT_TIMEOUT_SECS`] (single source of truth).
-const MAX_OUTER_TIMEOUT: Duration = Duration::from_secs(MAX_SUBAGENT_TIMEOUT_SECS);
-
-const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 600;
+/// Backstop for the parent's wait on a `spawn_subagent` call. Subagent
+/// execution is no longer wall-clock-bounded — aura subagents stop at
+/// `max_iterations`, external ones at their own internal safety timeout —
+/// so this exists only because the tool executor requires a `max_timeout`.
+/// Pegged high enough never to fire in practice.
+const TOOL_WAIT_BACKSTOP: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Raw JSON shape the LLM emits as `spawn_subagent`'s arguments.
 /// `subagent_type` and `prompt` are required; everything else is
@@ -140,8 +142,6 @@ struct SpawnParams {
     prompt: String,
     #[serde(default)]
     must_include_context: Vec<String>,
-    #[serde(default)]
-    timeout_secs: Option<u64>,
     /// `"aura"` (default), `"claude"`, or `"codex"`.
     #[serde(default)]
     backend: Option<String>,
@@ -220,10 +220,6 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
         None => profile.default_tier,
     };
 
-    let secs = p
-        .timeout_secs
-        .unwrap_or(DEFAULT_SUBAGENT_TIMEOUT_SECS)
-        .clamp(1, MAX_SUBAGENT_TIMEOUT_SECS);
     let workspace_name = p
         .workspace_name
         .as_deref()
@@ -264,7 +260,6 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
             task_summary: p.description,
             prompt: p.prompt,
             must_include_context: p.must_include_context,
-            timeout: Duration::from_secs(secs),
             model_tier,
             background: p.background,
             // Filled in by the tool after the lineage walk; the
@@ -505,11 +500,6 @@ fn parameters_schema() -> Value {
                 "items": { "type": "string" },
                 "description": "Optional bullets appended verbatim after `prompt` (span ids, facts, constraints)."
             },
-            "timeout_secs": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "Hard wait limit in seconds. Defaults to 600."
-            },
             "model_tier": {
                 "type": "string",
                 "enum": ["fast", "balanced", "deep"],
@@ -551,7 +541,7 @@ impl Tool for SpawnSubagentTool {
     }
 
     fn max_timeout(&self) -> Duration {
-        MAX_OUTER_TIMEOUT
+        TOOL_WAIT_BACKSTOP
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
@@ -846,7 +836,6 @@ mod tests {
                     "subagent_type": "general-purpose",
                     "description": "look up X",
                     "prompt": "Investigate X and report what you find.",
-                    "timeout_secs": 30,
                     "model_tier": "fast",
                 }),
                 &ctx(),
@@ -867,7 +856,6 @@ mod tests {
         assert_eq!(req.subagent_type, "general-purpose");
         assert_eq!(req.task_summary, "look up X");
         assert_eq!(req.prompt, "Investigate X and report what you find.");
-        assert_eq!(req.timeout, Duration::from_secs(30));
         assert_eq!(req.model_tier, Some(ModelTier::Fast));
         assert!(!req.system_prompt.is_empty());
         assert!(req.system_prompt.contains("subagent"));
@@ -1484,35 +1472,6 @@ mod tests {
         });
         let desc = tool.description();
         assert!(desc.contains("none registered"));
-    }
-
-    #[test]
-    fn parse_spawn_request_clamps_timeout_to_at_least_1s() {
-        let registry = registry_with_builtins();
-        let v = json!({
-            "subagent_type": "general-purpose",
-            "description": "x",
-            "prompt": "x",
-            "timeout_secs": 0,
-        });
-        let p = parse_spawn_request(&v, &registry).unwrap();
-        assert_eq!(p.request.timeout, Duration::from_secs(1));
-    }
-
-    #[test]
-    fn parse_spawn_request_clamps_timeout_to_outer_cap() {
-        let registry = registry_with_builtins();
-        let v = json!({
-            "subagent_type": "general-purpose",
-            "description": "x",
-            "prompt": "x",
-            "timeout_secs": MAX_SUBAGENT_TIMEOUT_SECS + 1
-        });
-        let p = parse_spawn_request(&v, &registry).unwrap();
-        assert_eq!(
-            p.request.timeout,
-            Duration::from_secs(MAX_SUBAGENT_TIMEOUT_SECS)
-        );
     }
 
     #[test]
