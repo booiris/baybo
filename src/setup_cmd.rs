@@ -2,7 +2,7 @@
 //! because the wizard's job is to create the workspace + key +
 //! `aura.json` that the rest of the binary expects.
 
-use aura_setup::{EndAction, SetupOutcome, TtyPrompter};
+use aura_setup::{SetupOutcome, TtyPrompter};
 use aura_workspace::paths::default_workspace_root;
 
 use crate::tracing_init::{TracingMode, init_tracing};
@@ -26,18 +26,10 @@ pub async fn run() -> anyhow::Result<()> {
 
     print_summary(&outcome);
 
-    let action = aura_setup::pick_end_action(&mut prompter)
-        .map_err(|e| anyhow::anyhow!("end picker failed: {e}"))?;
-    match action {
-        EndAction::LaunchGatewayAndOpenBrowser => {
-            aura_setup::launch_gateway_and_open_browser()
-                .await
-                .map_err(|e| anyhow::anyhow!("gateway launch failed: {e}"))?;
-        }
-        EndAction::Exit => {
-            aura_setup::print_exit_hint(&ctx.config_path);
-        }
-    }
+    // Setup never starts the gateway itself — it points the operator at
+    // the next command. `aura gateway start` then prints the dashboard
+    // URL and admin token.
+    aura_setup::print_exit_hint(&ctx.config_path);
     Ok(())
 }
 

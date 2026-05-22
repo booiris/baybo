@@ -3,6 +3,7 @@
 //! routed to by [`Router`](crate::actor::router::Router), and
 //! checkpointed via [`DurableActorState`](crate::actor::state::DurableActorState).
 
+pub mod cron_prompt;
 pub mod router;
 pub mod state;
 pub mod subagent;
@@ -158,16 +159,7 @@ impl AgentActor {
                 }
                 AgentMessage::CronTrigger { job_id, prompt } => {
                     debug!(session_id = %session_id, job_id = %job_id, "received cron trigger");
-                    let job_input = JobInput::Cron {
-                        action_payload: serde_json::json!({
-                            "cron_job_id": job_id,
-                            "prompt": prompt,
-                        }),
-                    };
-                    if let Err(e) = self
-                        .dispatch_prompt(&prompt, "cron", &job_id, job_input, None)
-                        .await
-                    {
+                    if let Err(e) = self.dispatch_cron_prompt(&prompt, &job_id).await {
                         error!(
                             session_id = %session_id,
                             job_id = %job_id,
@@ -251,29 +243,28 @@ impl AgentActor {
             .await
     }
 
-    /// Dispatch a system-generated prompt (cron or routine) through the
-    /// agent loop and send the response to the output channel.
+    /// Dispatch a fired cron job through the agent loop and send the
+    /// response to the output channel.
     ///
-    /// `job_input` records the trigger provenance (e.g. `JobInput::Cron`
-    /// or `JobInput::System`) — this MUST match the session's root
-    /// trigger or `JobLifecycle::start_job` will reject it. The
-    /// synthesized `[{source}:{source_id}] {prompt}` content is what the
-    /// LLM sees; the `JobInput` is purely for the Job record.
-    async fn dispatch_prompt(
-        &mut self,
-        prompt: &str,
-        source: &str,
-        source_id: &str,
-        job_input: JobInput,
-        parent_job_id: Option<aura_model::JobId>,
-    ) -> anyhow::Result<()> {
-        let content = vec![ContentBlock::Text(format!(
-            "[{source}:{source_id}] {prompt}"
+    /// The `JobInput::Cron` provenance must match the session's root
+    /// trigger or `JobLifecycle::start_job` will reject it; the cron fire
+    /// mints a Cron-rooted session, so it does. The content the LLM sees
+    /// is framed by [`cron_prompt::frame_cron_prompt`] so the model treats
+    /// the fire as a task to perform now rather than a live user message.
+    async fn dispatch_cron_prompt(&mut self, prompt: &str, job_id: &str) -> anyhow::Result<()> {
+        let job_input = JobInput::Cron {
+            action_payload: serde_json::json!({
+                "cron_job_id": job_id,
+                "prompt": prompt,
+            }),
+        };
+        let content = vec![ContentBlock::Text(cron_prompt::frame_cron_prompt(
+            job_id, prompt,
         ))];
         let response = self
-            .run_agent_loop(job_input, content, parent_job_id, None, None)
+            .run_agent_loop(job_input, content, None, None, None)
             .await?;
-        self.send_response(AgentOutput::Message(response), source)
+        self.send_response(AgentOutput::Message(response), "cron")
             .await;
         Ok(())
     }

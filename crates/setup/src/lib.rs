@@ -15,10 +15,7 @@ mod tty;
 pub use bootstrap::{SetupContext, bootstrap_workspace_if_needed};
 pub use error::{Result, SetupError};
 pub use prompt::Prompter;
-pub use runner::{
-    EndAction, SetupMode, SetupOutcome, launch_gateway_and_open_browser, pick_end_action,
-    print_exit_hint, run, run_full, run_quick,
-};
+pub use runner::{SetupMode, SetupOutcome, print_exit_hint, run, run_full, run_quick};
 pub use tty::TtyPrompter;
 
 #[cfg(any(test, feature = "test-support"))]

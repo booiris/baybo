@@ -26,11 +26,12 @@ use std::time::Duration;
 use aura_agent::actor::AgentMessage;
 use aura_channels::AgentOutput;
 use aura_cost::SpendingLimits;
-use aura_integration_tests::{AgentTestHarness, capture_tracing};
+use aura_integration_tests::{AgentTestHarness, SessionBuilder, capture_tracing};
 use aura_llm::test_support::StubLlm;
 use aura_llm::{LlmError, LlmResponse, ModelPricing, StreamEvent, TokenUsage, ToolCallInfo};
 use aura_model::{
     ContentBlock, MicroUsd, PendingSubagentResult, Role, SessionId, SubagentExitStatus,
+    TriggerSource,
 };
 use aura_tools::test_support::RecordingTool;
 use aura_tools::{Tool, ToolOutput};
@@ -540,6 +541,82 @@ async fn subagent_finished_dedupes_on_handle_id() {
         1,
         "duplicate handle_id must collapse"
     );
+
+    harness.shutdown().await;
+}
+
+/// Regression for the cron bad-case: a fire must reach the model as a
+/// *task to perform now*, not as a live user message. A job created to
+/// "say 你好 in a minute" stored the bare prompt `你好`; before framing,
+/// the model read `你好` as the user greeting it and greeted back. Drives
+/// the real actor path (`AgentMessage::CronTrigger` →
+/// `AgentActor::dispatch_cron_prompt` → `cron_prompt::frame_cron_prompt`)
+/// and asserts on the content the `StubLlm` actually received.
+#[tokio::test]
+async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
+    // A fire runs in a Cron-rooted session; the dispatch uses
+    // `JobInput::Cron`, which `JobLifecycle` only admits under a
+    // Cron-triggered session.
+    let mut session = SessionBuilder::new().build();
+    session.trigger = TriggerSource::Cron {
+        cron_job_id: "cj-demo".into(),
+    };
+    let mut harness = AgentTestHarness::builder().session(session).build();
+
+    // Cron dispatch is non-streaming (`delta_tx = None`) → it calls the
+    // stub's `chat`, so prime a plain response rather than a stream.
+    harness.stub_llm.push_response(LlmResponse {
+        content: "你好".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: Default::default(),
+        thinking: None,
+    });
+
+    // Fire exactly as `Router::handle_cron_trigger` would.
+    harness
+        .mailbox
+        .send(AgentMessage::CronTrigger {
+            job_id: "cj-demo".into(),
+            prompt: "你好".into(),
+        })
+        .await
+        .unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert!(
+        outs.iter().any(|o| matches!(o, AgentOutput::Message(_))),
+        "cron fire should produce a Message, got {outs:?}"
+    );
+
+    // The framed user turn the LLM actually saw (the only one carrying
+    // the job id).
+    let requests = harness.stub_llm.captured_requests();
+    let framed = requests
+        .iter()
+        .flat_map(|r| &r.messages)
+        .filter(|m| matches!(m.role, Role::User))
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .find(|t| t.contains("cj-demo"))
+        .expect("a user turn carrying the cron framing");
+
+    assert!(framed.contains("[cron:cj-demo]"), "routing tag: {framed}");
+    assert!(
+        framed.contains("NOT a new message the user just sent"),
+        "must mark this as not-a-user-message: {framed}"
+    );
+    assert!(
+        framed.contains("never repeat that id"),
+        "must tell the model to keep the id out of its reply: {framed}"
+    );
+    assert!(framed.contains("你好"), "carries the instruction: {framed}");
+
+    // The operator panel recovers the original instruction, not the
+    // framing boilerplate.
+    assert_eq!(aura_agent::cron_prompt::original_cron_prompt(framed), "你好");
 
     harness.shutdown().await;
 }

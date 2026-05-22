@@ -101,8 +101,8 @@ const DEFAULT_CRON_MESSAGE_LIMIT: usize = 50;
 const MAX_CRON_MESSAGE_LIMIT: usize = 200;
 /// How deep to walk a cron session's transcript when extracting the
 /// prompt/response previews. Cron sessions are one-shot — a small
-/// constant covers the realistic shape (`[cron:..] prompt` followed by
-/// one or two assistant turns).
+/// constant covers the realistic shape (the framed trigger prompt
+/// followed by one or two assistant turns).
 const CRON_PREVIEW_SCAN_DEPTH: usize = 12;
 
 /// Query string for `GET /v1/chat/sessions/{session_id}`. Reverse-
@@ -243,10 +243,10 @@ pub struct ChatCronMessage {
     /// by "freshest" without the client having to fetch transcripts.
     pub last_active: DateTime<Utc>,
     /// The user-facing prompt for this fire. Truncated to
-    /// [`PREVIEW_MAX_CHARS`]. The persisted user row carries a
-    /// `[cron:<job>] <prompt>` prefix; this strips the prefix so the
-    /// panel doesn't redundantly re-show what the cron job already
-    /// has.
+    /// [`PREVIEW_MAX_CHARS`]. The persisted user row carries the cron
+    /// dispatcher's fire-time framing; `aura_agent::cron_prompt::original_cron_prompt`
+    /// recovers the instruction as configured so the panel shows that,
+    /// not the framing boilerplate.
     pub prompt: String,
     /// Latest assistant text — what the agent produced in response.
     /// `None` while the fire is still running or if the agent emitted
@@ -757,7 +757,8 @@ async fn cron_message_from_session(
     // even when the agent emitted multiple.
     for (_ord, _at, msg) in &tail {
         if matches!(msg.role, Role::User) && msg.from_user {
-            prompt = Some(strip_cron_prefix(&extract_text(&msg.content)));
+            let text = extract_text(&msg.content);
+            prompt = Some(aura_agent::cron_prompt::original_cron_prompt(&text).to_owned());
             break;
         }
     }
@@ -791,17 +792,6 @@ fn extract_text(content: &[ContentBlock]) -> String {
         }
     }
     text
-}
-
-/// The cron dispatcher synthesises `[cron:<job_id>] <prompt>` content
-/// before the agent loop sees it (see `AgentActor::dispatch_prompt`).
-/// Strip that wire prefix here so the panel renders the original
-/// prompt the user (or LLM) configured, not the routing tag.
-fn strip_cron_prefix(text: &str) -> String {
-    text.strip_prefix("[cron:")
-        .and_then(|rest| rest.find(']').map(|end| &rest[end + 1..]))
-        .map(|s| s.trim_start().to_owned())
-        .unwrap_or_else(|| text.to_owned())
 }
 
 async fn last_user_preview(

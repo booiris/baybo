@@ -1,10 +1,9 @@
 //! Wizard orchestrator — mode picker, step sequence, β2 commit, and
-//! the post-setup gateway-launch / exit picker.
+//! the post-setup exit hint.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
 
-use aura_gateway::{LISTENING_BANNER_PREFIX, SidecarRuntime};
+use aura_gateway::SidecarRuntime;
 
 use crate::bootstrap::SetupContext;
 use crate::error::{Result, SetupError};
@@ -151,109 +150,6 @@ async fn commit_config(ctx: &mut SetupContext) -> Result<()> {
         .await
         .map_err(|e| SetupError::Config(format!("write {}: {e}", ctx.config_path.display())))?;
     tracing::info!(path = %ctx.config_path.display(), "wrote final aura.json");
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EndAction {
-    LaunchGatewayAndOpenBrowser,
-    Exit,
-}
-
-pub fn pick_end_action<P: Prompter>(prompter: &mut P) -> Result<EndAction> {
-    let options = [
-        "Start gateway and open dashboard (default)",
-        "Exit (run `aura gateway start` later)",
-    ];
-    let idx = prompter.select("What now?", &options)?;
-    Ok(if idx == 0 {
-        EndAction::LaunchGatewayAndOpenBrowser
-    } else {
-        EndAction::Exit
-    })
-}
-
-/// Spawn `aura gateway start` (resolved via `current_exe`), wait for
-/// its bind banner, open the dashboard URL, then wait on the child so
-/// SIGINT propagates.
-pub async fn launch_gateway_and_open_browser() -> Result<()> {
-    use std::process::Stdio;
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    use tokio::process::Command;
-
-    let exe = std::env::current_exe()
-        .map_err(|e| SetupError::Gateway(format!("resolve current exe: {e}")))?;
-
-    let mut cmd = Command::new(&exe);
-    cmd.arg("gateway")
-        .arg("start")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
-
-    let mut child = cmd.spawn().map_err(|e| {
-        SetupError::Gateway(format!("spawn `{} gateway start`: {e}", exe.display()))
-    })?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| SetupError::Gateway("gateway child stdout missing".into()))?;
-    let mut reader = BufReader::new(stdout).lines();
-
-    // 30s cap so a broken-config gateway-start doesn't hang setup forever.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut url: Option<String> = None;
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let line = match tokio::time::timeout(remaining, reader.next_line()).await {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => break,
-            Ok(Err(e)) => return Err(SetupError::Gateway(format!("read gateway stdout: {e}"))),
-            Err(_) => break,
-        };
-        println!("{line}");
-        if let Some(rest) = line.strip_prefix(LISTENING_BANNER_PREFIX) {
-            url = Some(rest.trim().to_string());
-            break;
-        }
-    }
-
-    let dashboard_url = url.ok_or_else(|| {
-        SetupError::Gateway(
-            "gateway didn't print its 'listening on' banner within 30s; \
-             check stderr above for the underlying error"
-                .into(),
-        )
-    })?;
-
-    // Browser-open failure is non-fatal: operator can visit the URL by hand.
-    if let Err(e) = open::that(&dashboard_url) {
-        tracing::warn!(
-            error = %e,
-            url = %dashboard_url,
-            "failed to open dashboard URL in browser; visit it manually"
-        );
-    } else {
-        tracing::info!(url = %dashboard_url, "opened dashboard in browser");
-    }
-
-    let pump = tokio::spawn(async move {
-        while let Ok(Some(line)) = reader.next_line().await {
-            println!("{line}");
-        }
-    });
-
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| SetupError::Gateway(format!("wait gateway child: {e}")))?;
-    let _ = pump.await;
-
-    if !status.success() {
-        return Err(SetupError::Gateway(format!("gateway exited with {status}")));
-    }
     Ok(())
 }
 

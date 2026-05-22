@@ -490,11 +490,12 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
 
     let server = GatewayServer::new(deps);
     let banner_bind = server.bind();
-    println!(
-        "{}http://{banner_bind}",
-        aura_gateway::LISTENING_BANNER_PREFIX
-    );
-    println!("  Quick URL: http://{banner_bind}/v1/status?token={token}");
+    // Dashboard URL first, then the admin token on its own line for the
+    // operator to paste into the login field. Deliberately NOT a
+    // `?token=…` URL — that would leak the token into the gateway's
+    // access log on the very first request.
+    println!("Web dashboard: http://{banner_bind}");
+    println!("Admin token:   {token}");
 
     tracing::info!(bind = %banner_bind, "gateway start: all components initialized");
 

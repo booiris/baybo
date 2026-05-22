@@ -98,7 +98,7 @@ Parallel tool calls within a turn each go through the gate independently; the ga
 
 Cron jobs flow through the Actor model and observability chain: `CronScheduler` → `Router` → `AgentSupervisor` → `AgentMessage::CronTrigger` → `AgentLoop`. All create Job and Trace records. Background results are delivered asynchronously without polluting foreground conversation. Cron jobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration; sessions are resolved dynamically at trigger time.
 
-`AgentMessage::CronTrigger { job_id, prompt }` carries the cron job id and the prompt string directly. `AgentActor` dispatches `prompt` through `dispatch_prompt` with `JobInput::Cron`, which runs the normal `AgentLoop` path; the LLM decides what tools (if any) to invoke.
+`AgentMessage::CronTrigger { job_id, prompt }` carries the cron job id and the prompt string directly. `AgentActor` dispatches `prompt` through `dispatch_cron_prompt` with `JobInput::Cron`, which wraps `prompt` via `cron_prompt::frame_cron_prompt` (so the fire reads as a task, not a user message) and runs the normal `AgentLoop` path; the LLM decides what tools (if any) to invoke.
 
 ### LLM-invocable cron tools
 
