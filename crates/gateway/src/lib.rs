@@ -49,9 +49,3 @@ pub use crate::sidecar::{
     collect_profiles, node_binary,
 };
 pub use crate::spawn::{ChannelSpawner, ChildHandle, SIDECAR_ENV_ALLOWLIST};
-
-/// Stdout banner the gateway prints once its listeners are bound.
-/// Used by `aura setup` to detect the bind point before opening the
-/// dashboard URL — keep both halves in sync by referencing this const
-/// rather than embedding the literal string.
-pub const LISTENING_BANNER_PREFIX: &str = "Aura gateway listening on ";

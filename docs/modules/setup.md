@@ -141,19 +141,14 @@ Other knobs (viewport, profile_dir, chrome_path, cdp_url) stay at
 defaults — operators wanting custom values edit `aura.json`
 directly.
 
-### End picker
+### Exit hint
 
-Two options, default = launch:
-
-- **Start gateway and open dashboard** (default): spawn
-  `<current_exe> gateway start` as a child process, watch its
-  stdout for the `Aura gateway listening on http://...` banner
-  (30 s timeout), call `open::that(<dashboard_url>)`, then wait on
-  the child so SIGINT propagates. Browser-open failures are
-  non-fatal (logged at warn) — the operator can still visit the URL
-  by hand.
-- **Exit**: print a hint with the `aura gateway start` /
-  `aura tui` commands and return cleanly.
+Setup never starts the gateway itself. Once the config is committed it
+prints a hint with the `aura gateway start` / `aura tui` commands and
+returns cleanly — the operator starts the daemon themselves. `aura
+gateway start` then prints the dashboard URL followed by the admin
+token (each on its own line; the token is deliberately not embedded in
+a `?token=` URL, which would leak it into the access log).
 
 ### Re-run idempotency (the `(B)` policy)
 
