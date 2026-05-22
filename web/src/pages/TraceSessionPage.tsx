@@ -1562,7 +1562,7 @@ export function TraceSessionPage() {
                   <div className="text-ink-soft text-[0.7rem] font-bold uppercase tracking-wider">
                     Session transcript
                   </div>
-                  <MessageList messages={messageLog.map((r) => r.message)} />
+                  <MessageList messages={messageLog.map((r) => r.message)} foldHistory={false} />
                 </div>
               ) : (
                 <div className="text-ink-soft text-[0.95rem] italic">No steps yet for this job.</div>
