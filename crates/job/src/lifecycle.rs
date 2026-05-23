@@ -260,6 +260,38 @@ impl JobLifecycle {
         Ok(jobs)
     }
 
+    /// Non-terminal jobs for one session, status-filtered at the store rather
+    /// than loaded whole and retained. Used by `/stop` to find the in-flight
+    /// turn + background children without a full-history load on a long-lived
+    /// session.
+    pub async fn list_active_by_session(
+        &self,
+        session_id: &aura_model::SessionId,
+    ) -> Result<Vec<Job>> {
+        self.store
+            .list_active_by_session(session_id)
+            .await?
+            .into_iter()
+            .map(Job::from_row)
+            .collect()
+    }
+
+    /// Direct children of `parent_job_id` (one level). Used by `/stop`'s
+    /// subtree walk to stamp `UserStopped` on (and back-stop the cancellation
+    /// of) in-flight descendant jobs such as foreground subagents. Foreground
+    /// children are descendants of the turn's loop cancel token, so cancelling
+    /// the turn job already cascades into them — this walk wins the
+    /// `UserStopped`-vs-`ParentCancelled` reason race and guards any future
+    /// child that re-anchors off the actor token.
+    pub async fn list_children(&self, parent_job_id: &JobId) -> Result<Vec<Job>> {
+        self.store
+            .list_children(parent_job_id)
+            .await?
+            .into_iter()
+            .map(Job::from_row)
+            .collect()
+    }
+
     pub async fn get_history(&self, job_id: &JobId) -> Result<Vec<JobTransition>> {
         self.store
             .get_transitions(job_id)

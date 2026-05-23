@@ -6,6 +6,9 @@
 //!
 //! * `/clear` — clear the chat scrollback (client-local).
 //! * `/quit`, `/exit` — close the TUI.
+//! * `/stop` — listed for completion, but `PassThrough`: it forwards to
+//!   the agent runtime, where the `Router` cancels the in-flight turn +
+//!   subagents out-of-band (the TUI can't reach those handles).
 //! * `/skills`, `/jobs`, `/memory`, `/sessions` — dashboard shortcuts;
 //!   the admin-only views render an "admin surface" footer.
 //!
@@ -16,7 +19,9 @@
 //! keep working without a client-side allow-list.
 
 use async_trait::async_trait;
-use aura_channels::{SlashCommand, SlashHandler, SlashOutcome, ViewKind};
+use aura_channels::{
+    STOP_COMMAND, STOP_COMMAND_DESCRIPTION, SlashCommand, SlashHandler, SlashOutcome, ViewKind,
+};
 use aura_model::ContentBlock;
 
 /// Bundled slash handler used by the TUI.
@@ -40,6 +45,7 @@ impl SlashHandler for TuiSlashHandler {
         let mut out = vec![
             SlashCommand::new("/clear", "Clear the chat scrollback."),
             SlashCommand::new("/new", "Abandon this session and start a fresh one."),
+            SlashCommand::new(STOP_COMMAND, STOP_COMMAND_DESCRIPTION),
             SlashCommand::new("/quit", "Exit the chat session."),
             SlashCommand::new("/exit", "Exit the chat session."),
         ];

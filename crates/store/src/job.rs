@@ -51,6 +51,11 @@ pub trait JobStore: Send + Sync {
     /// Persist the mutable state of a job (status, timestamps, payload).
     async fn save(&self, job: &JobRow) -> Result<()>;
     async fn list_by_session(&self, session_id: &SessionId) -> Result<Vec<JobRow>>;
+    /// Non-terminal jobs (`pending` / `in_progress` / `stuck`) for one session,
+    /// scoped + status-filtered at the store. Lets callers (e.g. `/stop`) find
+    /// a session's live jobs without loading a long-lived session's entire
+    /// job history just to filter it down to the few in flight.
+    async fn list_active_by_session(&self, session_id: &SessionId) -> Result<Vec<JobRow>>;
     /// Filter by the snake_case `JobStatusKind` wire string.
     async fn list_by_status_kind(&self, status_kind: &str) -> Result<Vec<JobRow>>;
     async fn list_children(&self, parent_job_id: &JobId) -> Result<Vec<JobRow>>;

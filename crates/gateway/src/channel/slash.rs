@@ -8,21 +8,22 @@
 //! before [`ChannelSessionResolver::resolve_or_create`].
 //!
 //! `/new` is wired here — it forces a fresh aura session for the
-//! calling user and replies with a confirmation. `/compact` is
-//! published in the manifest so sidecars register it natively (e.g.
-//! Telegram's `setMyCommands`) but is **not** intercepted: the
-//! dispatcher returns `PassThrough` so the message flows through to
-//! the agent actor, which recognises the leading-slash token and
-//! drives a compression pass on the live session. Trailing arguments
-//! are ignored. Matching is case-insensitive on the command token.
+//! calling user and replies with a confirmation. `/compact` and `/stop`
+//! are published in the manifest so sidecars register them natively (e.g.
+//! Telegram's `setMyCommands`) but are **not** intercepted: the
+//! dispatcher returns `PassThrough` so the message flows through to the
+//! agent runtime — `/compact` to the actor (compression pass) and `/stop`
+//! to the `Router` (cancel the in-flight turn + subagents out-of-band).
+//! Trailing arguments are ignored. Matching is case-insensitive on the
+//! command token.
 //!
 //! Adapter-side commands (TUI's `/clear`, `/quit`, …) live in their
 //! respective channels and never reach the gateway.
 
 use std::sync::LazyLock;
 
-use aura_channels::COMPACT_COMMAND_NAME;
 use aura_channels::wire::{Message as WireMessage, SlashCommandSpec};
+use aura_channels::{COMPACT_COMMAND_NAME, STOP_COMMAND_DESCRIPTION, STOP_COMMAND_NAME};
 use aura_model::{ChannelType, SessionId};
 
 use super::session_resolver::ChannelSessionResolver;
@@ -43,6 +44,10 @@ static MANIFEST: LazyLock<Vec<SlashCommandSpec>> = LazyLock::new(|| {
         SlashCommandSpec {
             command: COMPACT_COMMAND_NAME.to_string(),
             description: "Summarize the conversation and free context".to_string(),
+        },
+        SlashCommandSpec {
+            command: STOP_COMMAND_NAME.to_string(),
+            description: STOP_COMMAND_DESCRIPTION.to_string(),
         },
     ]
 });

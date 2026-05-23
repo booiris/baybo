@@ -13,6 +13,7 @@
 
 export type CancelReason =
   | 'user_preempt'
+  | 'user_stopped'
   | 'system_crash'
   | 'parent_cancelled'
   | 'timeout'

@@ -12,6 +12,20 @@ pub const COMPACT_COMMAND_NAME: &str = "compact";
 /// compression pass.
 pub const COMPACT_COMMAND: &str = "/compact";
 
+/// Bare name (no leading `/`) of the stop slash command. Published in the
+/// gateway slash manifest + TUI command list for discoverability; paired
+/// with [`STOP_COMMAND`] for the form users type.
+pub const STOP_COMMAND_NAME: &str = "stop";
+
+/// Full leading-slash form of the stop command. Recognised by the agent
+/// `Router` (out-of-band of any running turn) to cancel the in-flight turn
+/// and every in-flight subagent the session spawned. Like [`COMPACT_COMMAND`]
+/// it is published but `PassThrough` at every edge — execution is central.
+pub const STOP_COMMAND: &str = "/stop";
+
+/// One-line description shared by every surface that lists `/stop`.
+pub const STOP_COMMAND_DESCRIPTION: &str = "Stop the in-progress reply and any background tasks";
+
 /// Outcome of inspecting a `/`-prefixed line.
 ///
 /// Channel adapters call [`SlashHandler::handle`] on any input that starts
