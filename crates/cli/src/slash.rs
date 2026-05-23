@@ -6,8 +6,8 @@ use aura_model::ContentBlock;
 use clap::{CommandFactory, Parser};
 
 use crate::cli::{
-    AgentCmd, ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, ExternalAgentCmd,
-    JobCmd, LlmCmd, LogCmd, McpCmd, PairCmd, SessionCmd, SkillsCmd,
+    AgentCmd, ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, ExternalAgentCmd, JobCmd,
+    LlmCmd, LogCmd, McpCmd, PairCmd, SessionCmd, SkillsCmd,
 };
 use crate::context::{CommandContext, Invocation};
 use crate::dispatch;

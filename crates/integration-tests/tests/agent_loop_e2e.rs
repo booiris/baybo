@@ -33,9 +33,9 @@ use aura_model::{
     ContentBlock, MessageMetadata, MicroUsd, PendingSubagentResult, Role, SessionId,
     SubagentExitStatus, TriggerSource,
 };
-use chrono::Utc;
 use aura_tools::test_support::RecordingTool;
 use aura_tools::{Tool, ToolOutput};
+use chrono::Utc;
 use serde_json::json;
 use tracing::Level;
 
@@ -449,7 +449,10 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
             _ => None,
         })
         .expect("text block on notice");
-    assert!(text.contains("<subagent_results>"), "XML notice missing: {text}");
+    assert!(
+        text.contains("<subagent_results>"),
+        "XML notice missing: {text}"
+    );
     assert!(text.contains("bg-42"));
     assert!(text.contains("explorer"));
     assert!(text.contains("found FOO at lib/foo.rs:7"));
@@ -590,7 +593,10 @@ async fn subagent_notification_failure_keeps_pending_for_retry() {
         1,
         "failed notification turn must keep the pending result"
     );
-    assert_eq!(stored.state.pending_subagent_results[0].handle_id, "bg-keep");
+    assert_eq!(
+        stored.state.pending_subagent_results[0].handle_id,
+        "bg-keep"
+    );
 
     harness.shutdown().await;
 }
@@ -965,9 +971,7 @@ async fn user_turn_empty_reply_surfaces_fallback_notice() {
     let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
 
     assert!(
-        !outputs
-            .iter()
-            .any(|o| matches!(o, AgentOutput::Message(_))),
+        !outputs.iter().any(|o| matches!(o, AgentOutput::Message(_))),
         "blank user reply must not be sent as an empty assistant message"
     );
     assert!(
@@ -1051,7 +1055,10 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
 
     // The operator panel recovers the original instruction, not the
     // framing boilerplate.
-    assert_eq!(aura_agent::cron_prompt::original_cron_prompt(framed), "你好");
+    assert_eq!(
+        aura_agent::cron_prompt::original_cron_prompt(framed),
+        "你好"
+    );
 
     harness.shutdown().await;
 }

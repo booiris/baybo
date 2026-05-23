@@ -433,9 +433,7 @@ impl AgentActor {
         let content = vec![ContentBlock::Text(cron_prompt::frame_cron_prompt(
             job_id, prompt,
         ))];
-        let response = self
-            .run_agent_loop(job_input, content, None, None)
-            .await?;
+        let response = self.run_agent_loop(job_input, content, None, None).await?;
         if is_blank_reply(&response.content) {
             debug!(
                 session_id = %self.durable.session.id,
@@ -601,8 +599,14 @@ impl AgentActor {
                     .replace("{{type}}", &xml_escape(&p.subagent_type))
                     .replace("{{status}}", pending_status_label(&p.status))
                     .replace("{{task}}", &xml_escape(&p.task_summary))
-                    .replace("{{output}}", &xml_escape(&truncate_for_notice(&p.final_text)))
-                    .replace("{{child_session}}", &xml_escape(p.child_session_id.as_ref())),
+                    .replace(
+                        "{{output}}",
+                        &xml_escape(&truncate_for_notice(&p.final_text)),
+                    )
+                    .replace(
+                        "{{child_session}}",
+                        &xml_escape(p.child_session_id.as_ref()),
+                    ),
             );
         }
         xml.push_str("</subagent_results>");
@@ -880,9 +884,7 @@ mod tests {
         assert_eq!(pending_status_label(&S::Completed), "completed");
         assert_eq!(pending_status_label(&S::Cancelled), "cancelled");
         assert_eq!(
-            pending_status_label(&S::Failed {
-                reason: "x".into()
-            }),
+            pending_status_label(&S::Failed { reason: "x".into() }),
             "failed"
         );
         assert_eq!(pending_status_label(&S::Timeout), "timeout");

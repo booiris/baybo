@@ -179,11 +179,8 @@ impl SubagentRegistry {
     /// full `system_prompt` body. Use `all_summaries_sorted` for the
     /// hot path that just lists names + descriptions.
     pub fn all_sorted(&self) -> Vec<SubagentProfile> {
-        let mut out: Vec<SubagentProfile> = self
-            .profiles
-            .iter()
-            .map(|e| e.value().clone())
-            .collect();
+        let mut out: Vec<SubagentProfile> =
+            self.profiles.iter().map(|e| e.value().clone()).collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
@@ -317,21 +314,13 @@ mod tests {
     fn reload_picks_up_disk_changes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("p.md");
-        std::fs::write(
-            &path,
-            "---\nname: p\ndescription: v1\n---\nbody\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "---\nname: p\ndescription: v1\n---\nbody\n").unwrap();
 
         let reg = SubagentRegistry::new();
         assert_eq!(reg.load_dir(dir.path()), 1);
         assert_eq!(reg.get("p").unwrap().description, "v1");
 
-        std::fs::write(
-            &path,
-            "---\nname: p\ndescription: v2\n---\nbody2\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "---\nname: p\ndescription: v2\n---\nbody2\n").unwrap();
         assert_eq!(reg.reload(), 1);
         assert_eq!(reg.get("p").unwrap().description, "v2");
 

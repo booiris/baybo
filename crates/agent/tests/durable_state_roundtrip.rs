@@ -177,9 +177,7 @@ async fn clearing_in_flight_unblocks_post_reap_compression() {
 /// responsible for upholding.
 #[tokio::test]
 async fn pending_subagent_results_survive_session_round_trip() {
-    use aura_model::{
-        ContentBlock, PendingSubagentResult, SessionId, SubagentExitStatus,
-    };
+    use aura_model::{ContentBlock, PendingSubagentResult, SessionId, SubagentExitStatus};
 
     let session_store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
     let summary_store = Arc::new(MemorySessionSummaryStore::new());
@@ -191,15 +189,18 @@ async fn pending_subagent_results_survive_session_round_trip() {
         .expect("create");
     let session_id = session.id.clone();
 
-    session.state.pending_subagent_results.push(PendingSubagentResult {
-        handle_id: "bg-1".into(),
-        subagent_type: "general-purpose".into(),
-        task_summary: "check the docs".into(),
-        child_session_id: SessionId::from("child-xyz"),
-        final_text: "found three matches".into(),
-        images: vec![],
-        status: SubagentExitStatus::Completed,
-    });
+    session
+        .state
+        .pending_subagent_results
+        .push(PendingSubagentResult {
+            handle_id: "bg-1".into(),
+            subagent_type: "general-purpose".into(),
+            task_summary: "check the docs".into(),
+            child_session_id: SessionId::from("child-xyz"),
+            final_text: "found three matches".into(),
+            images: vec![],
+            status: SubagentExitStatus::Completed,
+        });
     session_store.save(&session).await.expect("persist");
 
     drop(session);
@@ -220,21 +221,27 @@ async fn pending_subagent_results_survive_session_round_trip() {
     // Round-trip with an image attachment ensures the ContentBlock
     // serialization in the new field type works too.
     let mut with_image = reloaded;
-    with_image.state.pending_subagent_results.push(PendingSubagentResult {
-        handle_id: "bg-2".into(),
-        subagent_type: "explorer".into(),
-        task_summary: "screenshot".into(),
-        child_session_id: SessionId::from("child-img"),
-        final_text: "here is the screenshot".into(),
-        images: vec![ContentBlock::Image {
-            blob: aura_model::BlobRef {
-                blob_id: "blob-1".into(),
-            },
-            mime_type: "image/png".into(),
-        }],
-        status: SubagentExitStatus::Completed,
-    });
-    session_store.save(&with_image).await.expect("persist with image");
+    with_image
+        .state
+        .pending_subagent_results
+        .push(PendingSubagentResult {
+            handle_id: "bg-2".into(),
+            subagent_type: "explorer".into(),
+            task_summary: "screenshot".into(),
+            child_session_id: SessionId::from("child-img"),
+            final_text: "here is the screenshot".into(),
+            images: vec![ContentBlock::Image {
+                blob: aura_model::BlobRef {
+                    blob_id: "blob-1".into(),
+                },
+                mime_type: "image/png".into(),
+            }],
+            status: SubagentExitStatus::Completed,
+        });
+    session_store
+        .save(&with_image)
+        .await
+        .expect("persist with image");
     let reloaded = sessions
         .get(&session_id)
         .await

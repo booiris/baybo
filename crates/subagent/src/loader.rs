@@ -25,16 +25,14 @@ use std::path::Path;
 use aura_model::{ArtifactSource, ModelTier, TrustLevel};
 
 use crate::SubagentProfile;
-use crate::validation::{
-    normalize_line_endings, validate_profile_name, validate_profile_version,
-};
+use crate::validation::{normalize_line_endings, validate_profile_name, validate_profile_version};
 
 /// Read `<name>.md` and build a [`SubagentProfile`] from it. The file
 /// path is recorded on the definition so the upcoming risk assessor
 /// can hash the prompt body alongside the manifest.
 pub fn load_profile_from_file(path: &Path) -> Result<SubagentProfile, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let default_name = path
         .file_stem()
         .and_then(|s| s.to_str())
