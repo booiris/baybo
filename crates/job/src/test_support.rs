@@ -61,6 +61,19 @@ impl JobStore for MemoryJobStore {
             .collect())
     }
 
+    async fn list_active_by_session(&self, session_id: &SessionId) -> Result<Vec<JobRow>> {
+        Ok(self
+            .jobs
+            .lock()
+            .values()
+            .filter(|j| {
+                &j.session_id == session_id
+                    && matches!(j.status_kind.as_str(), "pending" | "in_progress" | "stuck")
+            })
+            .cloned()
+            .collect())
+    }
+
     async fn list_by_status_kind(&self, status_kind: &str) -> Result<Vec<JobRow>> {
         Ok(self
             .jobs

@@ -40,6 +40,12 @@ pub enum CancelReason {
     /// Distinct from hook / system-driven cancels so cost-attribution
     /// and replay UIs can split user-initiated work.
     OperatorCancel,
+    /// The user ran `/stop` on the session, cancelling the in-flight turn
+    /// and every in-flight subagent it spawned. Distinct from
+    /// `ParentCancelled` so the subagent wait task can suppress the
+    /// terminal `SubagentFinished` delivery (a stopped result must not
+    /// repopulate `pending_subagent_results`).
+    UserStopped,
 }
 
 impl CancelReason {
@@ -52,6 +58,7 @@ impl CancelReason {
             CancelReason::ParentCancelled => "parent_cancelled",
             CancelReason::ParentDeleted => "parent_deleted",
             CancelReason::OperatorCancel => "operator_cancel",
+            CancelReason::UserStopped => "user_stopped",
         }
     }
 }

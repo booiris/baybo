@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aura_channels::AgentOutput;
@@ -19,6 +19,21 @@ pub struct ActorHandle {
     pub sender: MailboxSender<AgentMessage>,
 }
 
+/// Per-parent record of one in-flight background subagent — enough for
+/// `/stop` to enumerate it (cancel it, report what it was doing) and for the
+/// idle reaper to know the parent has outstanding work, without a job-store
+/// lineage walk. Keyed by the child session id in the registry.
+#[derive(Clone)]
+pub struct InFlightSubagent {
+    pub subagent_type: String,
+    pub task_summary: String,
+    /// The child actor's cancellation token (created at dispatch, before the
+    /// child's job row exists). `/stop` cancels this directly so a background
+    /// subagent dispatched-but-not-yet-running is still stopped — a job-store
+    /// lookup would miss it in that window and let it run to completion.
+    pub cancel_token: CancellationToken,
+}
+
 /// Manages AgentActor instances, one per active session.
 ///
 /// Cheap to clone: the actor registry is a [`DashMap`] behind an `Arc`,
@@ -29,18 +44,20 @@ pub struct ActorHandle {
 /// entries when actors die for any reason (Shutdown / panic / mailbox
 /// close).
 ///
-/// `in_flight_background_subagents` counts background subagents still
-/// running per parent session. The idle reaper consults it before
-/// shutting an actor down: a parent with outstanding background work
-/// is protected so its mailbox stays alive to receive the eventual
-/// `AgentMessage::SubagentFinished` when each child terminates. The
-/// counter is process-local (background dispatches don't survive
-/// restart anyway).
+/// `in_flight_background_subagents` tracks background subagents still
+/// running per parent session — `parent_session → (child_session →
+/// [`InFlightSubagent`])`. The idle reaper consults it before shutting an
+/// actor down: a parent with outstanding background work is protected so
+/// its mailbox stays alive to receive the eventual
+/// `AgentMessage::SubagentFinished` when each child terminates. `/stop`
+/// drains it to enumerate what to cancel + report, and the removal doubles
+/// as the suppress signal (a wait task whose entry is gone delivers
+/// nothing). Process-local (background dispatches don't survive restart).
 #[derive(Clone)]
 pub struct AgentSupervisor {
     actors: Arc<DashMap<SessionId, ActorHandle>>,
     response_tx: mpsc::Sender<AgentOutput>,
-    in_flight_background_subagents: Arc<DashMap<SessionId, u32>>,
+    in_flight_background_subagents: Arc<DashMap<SessionId, HashMap<SessionId, InFlightSubagent>>>,
 }
 
 impl AgentSupervisor {
@@ -52,43 +69,69 @@ impl AgentSupervisor {
         }
     }
 
-    /// Mark that a `background: true` subagent has been dispatched
-    /// from `parent_session_id`. Increments the per-session counter
-    /// consulted by [`Self::has_in_flight_background_subagents`].
-    /// Idempotency is the caller's responsibility — pair each
+    /// Mark that a `background: true` subagent (running on `child_session_id`)
+    /// has been dispatched from `parent_session_id`. Pair each
     /// `note_background_subagent_started` with exactly one
-    /// [`Self::note_background_subagent_finished`] from the wait
-    /// task that observes the child's terminal event.
-    pub fn note_background_subagent_started(&self, parent_session_id: &SessionId) {
-        let mut entry = self
-            .in_flight_background_subagents
+    /// [`Self::note_background_subagent_finished`] from the wait task that
+    /// observes the child's terminal event.
+    pub fn note_background_subagent_started(
+        &self,
+        parent_session_id: &SessionId,
+        child_session_id: &SessionId,
+        subagent_type: &str,
+        task_summary: &str,
+        cancel_token: CancellationToken,
+    ) {
+        self.in_flight_background_subagents
             .entry(parent_session_id.clone())
-            .or_insert(0);
-        *entry = entry.saturating_add(1);
+            .or_default()
+            .insert(
+                child_session_id.clone(),
+                InFlightSubagent {
+                    subagent_type: subagent_type.to_string(),
+                    task_summary: task_summary.to_string(),
+                    cancel_token,
+                },
+            );
     }
 
-    /// Counterpart to [`Self::note_background_subagent_started`].
-    /// Decrements the per-session counter and removes the entry when
-    /// it falls to zero so the map doesn't accumulate stale keys.
-    pub fn note_background_subagent_finished(&self, parent_session_id: &SessionId) {
+    /// Counterpart to [`Self::note_background_subagent_started`]. Removes the
+    /// child's record, dropping the parent's entry when its last child
+    /// clears so the map doesn't accumulate stale keys. A no-op if `/stop`
+    /// already drained it (see [`Self::take_in_flight_background_subagents`]).
+    pub fn note_background_subagent_finished(
+        &self,
+        parent_session_id: &SessionId,
+        child_session_id: &SessionId,
+    ) {
         use dashmap::mapref::entry::Entry;
-        // Decrement-or-remove must stay atomic within the shard: holding
-        // the `Entry` guard across the branch stops a concurrent
-        // `note_background_subagent_started` from re-incrementing a zero
-        // entry that we then delete — which would drop the in-flight
-        // marker and let the idle reaper reap a parent whose new
-        // background child is still running.
+        // Hold the parent `Entry` guard across the child remove + emptiness
+        // check so a concurrent `started` can't re-insert into a map we then
+        // delete (which would drop the in-flight marker and let the idle
+        // reaper reap a parent whose new background child is still running).
         if let Entry::Occupied(mut entry) = self
             .in_flight_background_subagents
             .entry(parent_session_id.clone())
         {
-            let new = entry.get().saturating_sub(1);
-            if new == 0 {
+            entry.get_mut().remove(child_session_id);
+            if entry.get().is_empty() {
                 entry.remove();
-            } else {
-                *entry.get_mut() = new;
             }
         }
+    }
+
+    /// Peek whether a specific background subagent is still tracked. The wait
+    /// task calls this BEFORE delivering its terminal result: a `false` means
+    /// `/stop` already drained the entry, so the delivery must be suppressed
+    /// (a user-stopped result must not repopulate `pending_subagent_results`).
+    pub fn is_background_subagent_in_flight(
+        &self,
+        parent_session_id: &SessionId,
+        child_session_id: &SessionId,
+    ) -> bool {
+        self.in_flight_background_subagents
+            .get(parent_session_id)
+            .is_some_and(|m| m.contains_key(child_session_id))
     }
 
     /// True iff at least one background subagent dispatched from
@@ -96,7 +139,22 @@ impl AgentSupervisor {
     pub fn has_in_flight_background_subagents(&self, parent_session_id: &SessionId) -> bool {
         self.in_flight_background_subagents
             .get(parent_session_id)
-            .is_some_and(|v| *v > 0)
+            .is_some_and(|m| !m.is_empty())
+    }
+
+    /// Remove and return every in-flight background subagent for
+    /// `parent_session_id`. Used by `/stop`: the returned `(child_session_id,
+    /// info)` pairs are the cancellation targets + ack summaries, and the
+    /// removal is the suppress signal — each child's wait task will see its
+    /// entry gone and drop the terminal delivery instead of re-buffering it.
+    pub fn take_in_flight_background_subagents(
+        &self,
+        parent_session_id: &SessionId,
+    ) -> Vec<(SessionId, InFlightSubagent)> {
+        self.in_flight_background_subagents
+            .remove(parent_session_id)
+            .map(|(_, children)| children.into_iter().collect())
+            .unwrap_or_default()
     }
 
     /// Send a message to the actor for a given session.
@@ -632,33 +690,87 @@ mod tests {
     }
 
     #[test]
-    fn background_subagent_counter_increments_decrements_and_clears() {
+    fn background_subagent_tracking_adds_and_clears() {
         let sup = make_supervisor();
         let id = SessionId::from("parent");
+        let c1 = SessionId::from("child-1");
+        let c2 = SessionId::from("child-2");
         assert!(!sup.has_in_flight_background_subagents(&id));
-        sup.note_background_subagent_started(&id);
-        sup.note_background_subagent_started(&id);
+        sup.note_background_subagent_started(
+            &id,
+            &c1,
+            "explorer",
+            "find X",
+            CancellationToken::new(),
+        );
+        sup.note_background_subagent_started(
+            &id,
+            &c2,
+            "planner",
+            "draft Y",
+            CancellationToken::new(),
+        );
         assert!(sup.has_in_flight_background_subagents(&id));
-        sup.note_background_subagent_finished(&id);
+        assert!(sup.is_background_subagent_in_flight(&id, &c1));
+        sup.note_background_subagent_finished(&id, &c1);
         assert!(
             sup.has_in_flight_background_subagents(&id),
             "still one in-flight after one finished"
         );
-        sup.note_background_subagent_finished(&id);
+        assert!(!sup.is_background_subagent_in_flight(&id, &c1));
+        sup.note_background_subagent_finished(&id, &c2);
         assert!(
             !sup.has_in_flight_background_subagents(&id),
-            "counter must clear once every dispatch finishes"
+            "map must clear once every dispatch finishes"
         );
+    }
+
+    #[test]
+    fn take_in_flight_drains_and_suppresses() {
+        // `/stop` drains the registry; afterwards each child reads as
+        // not-in-flight, so its wait task suppresses the terminal delivery. The
+        // drained entries carry the child's cancel token so `/stop` can stop a
+        // subagent that hasn't created its job row yet (the pre-job window).
+        let sup = make_supervisor();
+        let id = SessionId::from("parent");
+        let c1 = SessionId::from("child-1");
+        let c2 = SessionId::from("child-2");
+        let tok1 = CancellationToken::new();
+        sup.note_background_subagent_started(&id, &c1, "explorer", "find X", tok1.clone());
+        sup.note_background_subagent_started(
+            &id,
+            &c2,
+            "planner",
+            "draft Y",
+            CancellationToken::new(),
+        );
+        let mut taken = sup.take_in_flight_background_subagents(&id);
+        taken.sort_by(|a, b| a.1.task_summary.cmp(&b.1.task_summary));
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[0].1.task_summary, "draft Y");
+        assert_eq!(taken[1].1.task_summary, "find X");
+        // The drained entry's token is the live child handle: cancelling it
+        // (what `/stop` does) trips the original token.
+        assert!(!tok1.is_cancelled());
+        taken[1].1.cancel_token.cancel();
+        assert!(
+            tok1.is_cancelled(),
+            "/stop stops the child via its stored token"
+        );
+        assert!(!sup.has_in_flight_background_subagents(&id));
+        assert!(!sup.is_background_subagent_in_flight(&id, &c1));
+        // A second drain is empty (idempotent), and `finished` is a no-op.
+        assert!(sup.take_in_flight_background_subagents(&id).is_empty());
+        sup.note_background_subagent_finished(&id, &c1);
     }
 
     #[test]
     fn background_subagent_finished_on_unknown_parent_is_a_noop() {
         let sup = make_supervisor();
-        // Decrement without a prior increment must not panic or
-        // wrap-around — the wait task's decrement is unconditional in
-        // the router, so this edge case is reachable if the spawn
-        // path bailed before incrementing.
-        sup.note_background_subagent_finished(&SessionId::from("ghost"));
+        // Removing without a prior start must not panic — the wait task's
+        // `finished` is unconditional, so this edge case is reachable if the
+        // spawn path bailed before registering (or `/stop` already drained).
+        sup.note_background_subagent_finished(&SessionId::from("ghost"), &SessionId::from("child"));
         assert!(!sup.has_in_flight_background_subagents(&SessionId::from("ghost")));
     }
 
@@ -689,7 +801,14 @@ mod tests {
             .expect("first insert");
 
         // Dispatch a background subagent.
-        supervisor.note_background_subagent_started(&parent.id);
+        let child = SessionId::from("child");
+        supervisor.note_background_subagent_started(
+            &parent.id,
+            &child,
+            "explorer",
+            "task",
+            CancellationToken::new(),
+        );
 
         // Reaper should skip the parent.
         let reaped = supervisor.reap_idle(&sessions, Duration::seconds(60)).await;
@@ -697,7 +816,7 @@ mod tests {
         assert!(mailbox_rx.try_recv().is_err(), "no Shutdown queued");
 
         // Once the subagent finishes, the reaper proceeds on the next tick.
-        supervisor.note_background_subagent_finished(&parent.id);
+        supervisor.note_background_subagent_finished(&parent.id, &child);
         let reaped = supervisor.reap_idle(&sessions, Duration::seconds(60)).await;
         assert_eq!(reaped, 1, "parent must be reaped after subagent clears");
         assert!(matches!(mailbox_rx.try_recv(), Ok(AgentMessage::ActorStop)));

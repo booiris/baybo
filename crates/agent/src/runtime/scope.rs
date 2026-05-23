@@ -190,8 +190,17 @@ where
         }
         Err(e) => {
             if cancel_token.is_cancelled() {
-                // Row already Cancelled. Don't call fail() — it would
-                // return InvalidTransition.
+                // The token may have been cancelled BEFORE this job's row
+                // existed (e.g. `/stop` tripping a child's pre-dispatch token),
+                // so the row can still be InProgress here, not Cancelled.
+                // `cancel` is idempotent on a terminal row (it preserves the
+                // canceller's original reason) and flips an InProgress row to
+                // Cancelled — so it both avoids `fail()`'s InvalidTransition and
+                // stops a pre-job-window row leaking as forever-InProgress.
+                lifecycle
+                    .cancel(&job_id, CancelReason::ParentCancelled, Vec::new())
+                    .await
+                    .ok();
                 return Err(e);
             }
             if let Err(fe) = lifecycle.fail(&job_id, e.to_string()).await {

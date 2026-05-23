@@ -14,7 +14,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;
 use crate::actor::router::Router;
@@ -188,7 +188,14 @@ impl Router {
 
         if background {
             let handle_id = self
-                .ack_background_dispatch(&parent.id, &child_session_id, &subagent_type, result_tx)
+                .ack_background_dispatch(
+                    &parent.id,
+                    &child_session_id,
+                    &subagent_type,
+                    &task_summary,
+                    actor_token.clone(),
+                    result_tx,
+                )
                 .await;
             let job_lifecycle = Arc::clone(&self.job_lifecycle);
             let supervisor = self.supervisor.clone();
@@ -329,6 +336,8 @@ impl Router {
                     &parent.id,
                     &child_session_id,
                     &request.subagent_type,
+                    &request.task_summary,
+                    external_request.cancel.clone(),
                     result_tx,
                 )
                 .await;
@@ -392,6 +401,8 @@ impl Router {
         parent_id: &SessionId,
         child_session_id: &SessionId,
         subagent_type: &str,
+        task_summary: &str,
+        cancel_token: CancellationToken,
         result_tx: oneshot::Sender<SubagentResult>,
     ) -> String {
         let handle_id = format!(
@@ -407,7 +418,13 @@ impl Router {
             final_content: Some(vec![ContentBlock::Text(ack_text)]),
             status: SubagentExitStatus::Completed,
         });
-        self.supervisor.note_background_subagent_started(parent_id);
+        self.supervisor.note_background_subagent_started(
+            parent_id,
+            child_session_id,
+            subagent_type,
+            task_summary,
+            cancel_token,
+        );
         if let Err(e) = self.session_manager.touch(parent_id).await {
             warn!(
                 parent_session_id = %parent_id,
@@ -523,16 +540,30 @@ async fn escort_background_terminal(
     limiter: &Arc<dyn aura_subagent::SubagentDispatchLimiter>,
     fan_out_root: &Option<SessionId>,
 ) {
-    deliver_background_result(
-        supervisor,
-        parent_id,
-        handle_id,
-        subagent_type,
-        task_summary,
-        result,
-    )
-    .await;
-    supervisor.note_background_subagent_finished(parent_id);
+    let child_session_id = result.child_session_id.clone();
+    // Peek (don't clear) so the in-flight marker is still set across the
+    // delivery — the reaper must not tear the parent down mid-escort. An
+    // absent marker means `/stop` already drained this subagent, so suppress
+    // the terminal delivery: a user-stopped result must not repopulate
+    // `pending_subagent_results`.
+    if supervisor.is_background_subagent_in_flight(parent_id, &child_session_id) {
+        deliver_background_result(
+            supervisor,
+            parent_id,
+            handle_id,
+            subagent_type,
+            task_summary,
+            result,
+        )
+        .await;
+    } else {
+        debug!(
+            parent_session_id = %parent_id,
+            child_session_id = %child_session_id,
+            "background subagent was /stop-cancelled; suppressing terminal delivery"
+        );
+    }
+    supervisor.note_background_subagent_finished(parent_id, &child_session_id);
     release_reserved_slot(limiter.as_ref(), fan_out_root);
 }
 

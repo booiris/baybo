@@ -2,8 +2,9 @@
 
 > Status: **TODO, not started.** A **generic refactor** of `aura_model::ChatMessage` — it
 > should land on `master` on its own, not bundled into a feature branch. Surfaced 2026-05-23
-> by an adversarial review of the subagent-notification work (see
-> [`subagent-notification-and-message-priority.md`](subagent-notification-and-message-priority.md)).
+> by an adversarial review of the subagent-notification work (now shipped; see the
+> "Background subagent results / scheduling invariants" notes in
+> [`docs/modules/agent.md`](../modules/agent.md)).
 
 ## Problem
 

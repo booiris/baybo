@@ -122,6 +122,18 @@ impl JobStore for LibsqlJobStore {
         .await
     }
 
+    async fn list_active_by_session(&self, session_id: &SessionId) -> Result<Vec<JobRow>> {
+        self.collect(
+            &format!(
+                "SELECT {SELECT_COLS} FROM jobs \
+                 WHERE session_id = ?1 AND status_kind IN ('pending', 'in_progress', 'stuck') \
+                 ORDER BY created_at"
+            ),
+            libsql::params![session_id.as_str().to_string()],
+        )
+        .await
+    }
+
     async fn list_by_status_kind(&self, status_kind: &str) -> Result<Vec<JobRow>> {
         self.collect(
             &format!("SELECT {SELECT_COLS} FROM jobs WHERE status_kind = ?1 ORDER BY created_at"),
@@ -307,6 +319,49 @@ mod tests {
         assert_eq!(recoverable.len(), 3);
         for r in &recoverable {
             assert_ne!(r.status_kind, "completed");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_active_by_session_scopes_and_filters_status() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlJobStore::new(pool);
+        let sess_a = SessionId::from("sess-a");
+        let sess_b = SessionId::from("sess-b");
+        let mk = |s: &SessionId| {
+            Job::new(
+                s.clone(),
+                JobInput::UserChat {
+                    content: vec![ContentBlock::Text("hi".into())],
+                },
+                "soul-v1",
+                None,
+            )
+        };
+
+        // sess-a: pending + in_progress (both active) + completed (terminal).
+        create(&store, &mk(&sess_a)).await;
+        let mut a_running = mk(&sess_a);
+        a_running.start().unwrap();
+        create(&store, &a_running).await;
+        let mut a_done = mk(&sess_a);
+        a_done.start().unwrap();
+        a_done
+            .complete(aura_job::JobOutput::Message {
+                content: vec![ContentBlock::Text("ok".into())],
+            })
+            .unwrap();
+        create(&store, &a_done).await;
+        // sess-b's in-flight job must NOT leak into sess-a's results.
+        let mut b_running = mk(&sess_b);
+        b_running.start().unwrap();
+        create(&store, &b_running).await;
+
+        let active = store.list_active_by_session(&sess_a).await.unwrap();
+        assert_eq!(active.len(), 2, "only sess-a's non-terminal jobs");
+        for j in &active {
+            assert_eq!(j.session_id, sess_a);
+            assert_ne!(j.status_kind, "completed");
         }
     }
 
