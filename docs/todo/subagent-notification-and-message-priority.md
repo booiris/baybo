@@ -142,6 +142,7 @@ then stop"). This is deliberate:
     <result handle="bg-7f3a" type="planner" status="completed">
       <task>…task_summary…</task>
       <output>…final_text (truncated)…</output>
+      <child_session>…child_session_id…</child_session>
     </result>
     …
   </subagent_results>
@@ -150,8 +151,10 @@ then stop"). This is deliberate:
 - **Proactive, empty-suppressed**: the reply is sent to the session's channel as a proactive
   message (cron-style framing — "report to the user"; channels handle out-of-turn sends). There
   is **no `<no_output/>` sentinel and no explicit "stay silent" instruction**, but if the final
-  assistant message is **empty / whitespace-only it is not sent** — we never push an empty
-  message to the user (this is the model's only, implicit, way to stay quiet).
+  assistant message is **empty / whitespace-only it is not sent** — the model's only implicit way
+  to stay quiet. Empty-reply policy is asymmetric: **non-user turns** (this notification turn,
+  cron) silently suppress a blank reply; a **user turn** instead surfaces a fallback `Notice`
+  (`send_user_reply`), since the user is waiting and a blank bubble would leave them hanging.
 - **Persistence**: the synthetic XML turn + the assistant reply persist into the transcript
   normally — same as any main-path turn (the XML turn at `from_user = false`, hidden from chat).
 - **Failure-safe drain (crash- and error-safe)**: the drained (empty) buffer is persisted to the
@@ -160,9 +163,12 @@ then stop"). This is deliberate:
   cost rejection, cancellation) the results are **restored** to `pending_subagent_results` and
   re-persisted so the next drain retries them. So: a transient failure never loses a completion; a
   crash mid-turn drops it from the parent row but it survives in the child session's trace. (The
-  actor is single-threaded, so nothing is buffered while the turn runs.) NOTE: proactive delivery
-  after a *failure* still waits for the session's next inbound message (or hydration) to re-drain
-  — bounded retry-after-failure for a quiet fire-and-forget session is a follow-up (see below).
+  actor is single-threaded, so nothing is buffered while the turn runs.) After a failure the actor
+  **retries on a capped backoff** (`NOTIFY_RETRY_*` — 60s, ×2, cap 5 min, ≤5 attempts), via a
+  biased `select!` over `mailbox.recv()` vs a sleep in the run loop, so a quiet fire-and-forget
+  session is still notified during the idle window. A real inbound message wins the race and resets
+  the schedule; after the attempt cap the actor falls back to delivering on the next message /
+  hydration (so the `last_active` bumped by each retry can no longer keep it from being reaped).
 
 ### 5. Buffer (unchanged shape)
 

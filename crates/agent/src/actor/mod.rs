@@ -23,6 +23,23 @@ use tracing::{debug, error, info, warn};
 /// dropped (its content still lives in the child session's trace).
 const MAX_PENDING_SUBAGENT_RESULTS: usize = 64;
 
+/// Bounded retry schedule for a FAILED `SubagentNotification` turn. When the
+/// turn errors (provider / cost / cancel) and the session then goes idle, the
+/// actor retries on this backoff so a fire-and-forget completion is still
+/// reported during the idle window — not only when the user next writes.
+/// After `NOTIFY_RETRY_MAX_ATTEMPTS` consecutive failures the actor stops
+/// retrying (the bumped `last_active` would otherwise keep it un-reapable)
+/// and falls back to delivering on the next inbound message or hydration.
+const NOTIFY_RETRY_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+const NOTIFY_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+const NOTIFY_RETRY_MAX_ATTEMPTS: u32 = 5;
+
+/// Surfaced (as a `Notice`) when a *user* turn yields a blank reply — the
+/// user is waiting, so acknowledge rather than push an empty bubble. Non-user
+/// turns (cron, subagent notification) silently suppress a blank reply.
+const EMPTY_USER_REPLY_NOTICE: &str =
+    "The assistant did not produce a response to your message. Please try again or rephrase.";
+
 /// Opening framing for a `SubagentNotification` turn's content. Lives in
 /// per-turn content (never the system prompt) so the prompt-cache prefix
 /// is identical to a normal main-path turn. Cron-style: report proactively.
@@ -34,6 +51,7 @@ const SUBAGENT_NOTIFICATION_FRAMING: &str = "[background subagent task(s) finish
 const SUBAGENT_RESULT_TEMPLATE: &str = r#"  <result handle="{{handle}}" type="{{type}}" status="{{status}}">
     <task>{{task}}</task>
     <output>{{output}}</output>
+    <child_session>{{child_session}}</child_session>
   </result>
 "#;
 
@@ -211,7 +229,53 @@ impl AgentActor {
             .restore_transcript_from_store()
             .await;
 
-        while let Some(msg) = mailbox.recv().await {
+        // A failed `SubagentNotification` turn leaves the buffer non-empty;
+        // rather than wait for the next inbound message, retry on a capped
+        // backoff so a fire-and-forget completion is still reported during
+        // the idle window. A real message wins the race (biased) and resets
+        // the schedule; after `NOTIFY_RETRY_MAX_ATTEMPTS` consecutive failures
+        // we give up and deliver on the next message/hydration.
+        let mut notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
+        let mut notify_retries: u32 = 0;
+        loop {
+            let next = if notify_retries < NOTIFY_RETRY_MAX_ATTEMPTS
+                && !self
+                    .durable
+                    .session
+                    .state
+                    .pending_subagent_results
+                    .is_empty()
+            {
+                tokio::select! {
+                    biased;
+                    m = mailbox.recv() => m,
+                    _ = tokio::time::sleep(notify_backoff) => {
+                        self.run_subagent_notification().await;
+                        if self
+                            .durable
+                            .session
+                            .state
+                            .pending_subagent_results
+                            .is_empty()
+                        {
+                            notify_retries = 0;
+                            notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
+                        } else {
+                            notify_retries += 1;
+                            notify_backoff = (notify_backoff * 2).min(NOTIFY_RETRY_MAX_BACKOFF);
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                mailbox.recv().await
+            };
+            let Some(msg) = next else {
+                break;
+            };
+            // Real activity resets the notification retry schedule.
+            notify_retries = 0;
+            notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
             let deferred = match msg {
                 AgentMessage::ActorStop => {
                     debug!(session_id = %session_id, "actor stopping");
@@ -374,8 +438,15 @@ impl AgentActor {
         let response = self
             .run_agent_loop(job_input, content, None, None)
             .await?;
-        self.send_response(AgentOutput::Message(response), "cron")
-            .await;
+        if is_blank_reply(&response.content) {
+            debug!(
+                session_id = %self.durable.session.id,
+                "cron turn produced no output; suppressing send"
+            );
+        } else {
+            self.send_response(AgentOutput::Message(response), "cron")
+                .await;
+        }
         Ok(())
     }
 
@@ -403,8 +474,7 @@ impl AgentActor {
                 Some(response_tx),
             )
             .await?;
-        self.send_response(AgentOutput::Message(response), "user")
-            .await;
+        self.send_user_reply(response).await;
         Ok(())
     }
 
@@ -447,8 +517,7 @@ impl AgentActor {
                 Some(response_tx),
             )
             .await?;
-        self.send_response(AgentOutput::Message(response), "user")
-            .await;
+        self.send_user_reply(response).await;
         Ok(())
     }
 
@@ -534,7 +603,8 @@ impl AgentActor {
                     .replace("{{type}}", &xml_escape(&p.subagent_type))
                     .replace("{{status}}", pending_status_label(&p.status))
                     .replace("{{task}}", &xml_escape(&p.task_summary))
-                    .replace("{{output}}", &xml_escape(&truncate_for_notice(&p.final_text))),
+                    .replace("{{output}}", &xml_escape(&truncate_for_notice(&p.final_text)))
+                    .replace("{{child_session}}", &xml_escape(p.child_session_id.as_ref())),
             );
         }
         xml.push_str("</subagent_results>");
@@ -630,6 +700,30 @@ impl AgentActor {
                     .await;
             }
         }
+    }
+
+    /// Send a user-turn reply. A blank reply (no non-whitespace text) is
+    /// anomalous for a user turn — the user is waiting — so surface a
+    /// fallback `Notice` rather than push an empty bubble. (Non-user turns —
+    /// cron, subagent notification — silently suppress a blank reply.)
+    async fn send_user_reply(&self, response: OutgoingMessage) {
+        if is_blank_reply(&response.content) {
+            warn!(
+                session_id = %self.durable.session.id,
+                "user turn produced an empty reply; surfacing fallback notice"
+            );
+            let notice = AgentOutput::Notice {
+                session_id: self.durable.session.id.clone(),
+                user_id: self.durable.session.user.id.clone(),
+                channel: self.durable.session.channel.clone(),
+                level: NoticeLevel::Warn,
+                text: EMPTY_USER_REPLY_NOTICE.to_string(),
+            };
+            self.send_response(notice, "user_empty_fallback").await;
+            return;
+        }
+        self.send_response(AgentOutput::Message(response), "user")
+            .await;
     }
 
     /// `/compact` is a control command, not an assistant turn, so the

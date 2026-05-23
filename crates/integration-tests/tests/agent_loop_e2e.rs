@@ -453,6 +453,10 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
     assert!(text.contains("bg-42"));
     assert!(text.contains("explorer"));
     assert!(text.contains("found FOO at lib/foo.rs:7"));
+    assert!(
+        text.contains("child-A"),
+        "notice must carry the child_session id for resume/citation: {text}"
+    );
     // The synthetic notice is `from_user = false`, so chat surfaces hide
     // it — it must not render as a fake user-authored bubble.
     assert!(
@@ -765,6 +769,35 @@ async fn slash_command_is_a_coalescing_boundary() {
         })
         .collect();
     assert!(middle.contains("/x"), "slash turn ran alone: {middle}");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn user_turn_empty_reply_surfaces_fallback_notice() {
+    // A user turn whose reply is blank must NOT be sent as an empty
+    // assistant bubble — the user is waiting, so a fallback Notice is
+    // surfaced instead. (Non-user turns silently suppress a blank reply.)
+    let mut harness = AgentTestHarness::builder().build();
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("   ".into())]);
+
+    harness.send_text("hi").await.expect("send");
+    let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert!(
+        !outputs
+            .iter()
+            .any(|o| matches!(o, AgentOutput::Message(_))),
+        "blank user reply must not be sent as an empty assistant message"
+    );
+    assert!(
+        outputs
+            .iter()
+            .any(|o| matches!(o, AgentOutput::Notice { .. })),
+        "blank user reply must surface a fallback notice"
+    );
 
     harness.shutdown().await;
 }
