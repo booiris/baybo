@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::actor::AgentMessage;
+use crate::actor::mailbox::MailboxSender;
 
 /// Wait for a freshly-spawned subagent to terminate. The caller (router)
 /// owns the synchronous prelude (build child session, spawn actor, send
@@ -29,7 +30,7 @@ pub async fn await_subagent_terminal(
     child_session_id: SessionId,
     mut output_rx: mpsc::Receiver<AgentOutput>,
     mut terminal_rx: broadcast::Receiver<JobTerminalEvent>,
-    mailbox: mpsc::Sender<AgentMessage>,
+    mailbox: MailboxSender<AgentMessage>,
     actor_token: CancellationToken,
     job_lifecycle: Arc<JobLifecycle>,
 ) -> SubagentResult {
@@ -95,7 +96,7 @@ pub async fn await_subagent_terminal(
     }
     .await;
 
-    let _ = mailbox.send(AgentMessage::Shutdown).await;
+    let _ = mailbox.send(AgentMessage::ActorStop).await;
 
     match wait_result {
         Ok(content) => SubagentResult {
@@ -171,6 +172,7 @@ async fn drain_for_final_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::mailbox::{self, MailboxReceiver};
     use aura_channels::OutgoingMessage;
     use aura_job::test_support::MemoryJobStore;
     use aura_job::{JobInput, JobOutput};
@@ -186,8 +188,8 @@ mod tests {
         terminal_rx: tokio::sync::broadcast::Receiver<JobTerminalEvent>,
         output_tx: mpsc::Sender<AgentOutput>,
         output_rx: mpsc::Receiver<AgentOutput>,
-        mailbox_tx: mpsc::Sender<AgentMessage>,
-        _mailbox_rx: mpsc::Receiver<AgentMessage>,
+        mailbox_tx: MailboxSender<AgentMessage>,
+        _mailbox_rx: MailboxReceiver<AgentMessage>,
         actor_token: CancellationToken,
     }
 
@@ -196,7 +198,7 @@ mod tests {
             let job_lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
             let terminal_rx = job_lifecycle.subscribe_terminal_events();
             let (output_tx, output_rx) = mpsc::channel(1);
-            let (mailbox_tx, _mailbox_rx) = mpsc::channel(1);
+            let (mailbox_tx, _mailbox_rx) = mailbox::channel(1);
             Self {
                 job_lifecycle,
                 terminal_rx,
@@ -275,7 +277,7 @@ mod tests {
         actor_token: CancellationToken,
         handle: JoinHandle<SubagentResult>,
         output_tx: mpsc::Sender<AgentOutput>,
-        _mailbox_rx: mpsc::Receiver<AgentMessage>,
+        _mailbox_rx: MailboxReceiver<AgentMessage>,
     }
 
     impl Waiter {

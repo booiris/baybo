@@ -34,7 +34,6 @@ pub use session::{
     SystemReason, TriggerKind, TriggerSource, User,
 };
 pub use spawn_protocol::{
-    BACKGROUND_NOTIFICATIONS_POSTAMBLE, BACKGROUND_NOTIFICATIONS_PREAMBLE,
     BACKGROUND_SUBAGENT_HANDLE_PREFIX, PendingSubagentResult, SPAWN_SUBAGENT_TOOL_NAME,
     SUBAGENT_CHANNEL_TAG, SubagentExitStatus, SubagentParentContext, SubagentResult,
     SubagentReturn, SubagentSpawnRequest, SystemSpawnRequest,

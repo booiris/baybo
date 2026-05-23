@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use aura_agent::{
     AgentLoop, SecurityGateway,
-    actor::{AgentActor, AgentMessage},
+    actor::{AgentActor, AgentMessage, mailbox::MailboxSender},
     soul::Soul,
     tool_executor::ToolExecutor,
 };
@@ -67,7 +67,7 @@ pub struct AgentTestHarness {
     /// tests can pre-seed session messages or summary metadata before
     /// driving the agent loop (e.g. compressor fast-path e2e coverage).
     pub session_manager: Arc<aura_agent::SessionManager>,
-    pub mailbox: mpsc::Sender<AgentMessage>,
+    pub mailbox: MailboxSender<AgentMessage>,
     outputs: mpsc::Receiver<AgentOutput>,
     actor_handle: Option<JoinHandle<()>>,
 }
@@ -145,7 +145,7 @@ impl AgentTestHarness {
     /// Send `Shutdown` and await actor termination. Idempotent — calling
     /// twice on the same harness is safe.
     pub async fn shutdown(mut self) {
-        let _ = self.mailbox.send(AgentMessage::Shutdown).await;
+        let _ = self.mailbox.send(AgentMessage::ActorStop).await;
         if let Some(handle) = self.actor_handle.take() {
             let _ = handle.await;
         }
@@ -424,7 +424,7 @@ impl AgentTestHarnessBuilder {
             workspace_paths: None,
             sessions: None,
         });
-        let (mailbox_tx, mailbox_rx) = mpsc::channel(self.mailbox_capacity);
+        let (mailbox_tx, mailbox_rx) = aura_agent::mailbox::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
         let actor = AgentActor::from_parts(

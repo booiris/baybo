@@ -68,7 +68,7 @@ impl Router {
             warn!(session_id = %session_id, error = %e, "failed to deliver cron trigger");
             return Ok(());
         }
-        if let Err(e) = sender.send(AgentMessage::Shutdown).await {
+        if let Err(e) = sender.send(AgentMessage::ActorStop).await {
             warn!(
                 session_id = %session_id,
                 error = %e,

@@ -9,6 +9,7 @@
 //! | `Cron`          | `JobKind::Cron`             |
 //! | `System`        | `JobKind::System`           |
 //! | (any)           | `JobKind::Spawned` is also valid in any session — spawned jobs inherit their parent context regardless of root trigger |
+//! | (any)           | `JobKind::SubagentNotification` is also valid in any session — the parent's autonomous turn reacting to a finished background subagent |
 
 use aura_model::{BackgroundCompressionPayload, ContentBlock, TriggerKind};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,7 @@ pub enum JobKind {
     Cron,
     System,
     Spawned,
+    SubagentNotification,
 }
 
 impl JobKind {
@@ -35,6 +37,7 @@ impl JobKind {
                 | (JobKind::Cron, TriggerKind::Cron)
                 | (JobKind::System, TriggerKind::System)
                 | (JobKind::Spawned, _)
+                | (JobKind::SubagentNotification, _)
         )
     }
 }
@@ -63,6 +66,12 @@ pub enum JobInput {
     Spawned {
         initial_prompt: Vec<ContentBlock>,
     },
+    /// The parent session's autonomous turn reacting to one or more
+    /// finished background subagents. Allowed under any root trigger
+    /// (like `Spawned`); `content` is the synthesized XML notification.
+    SubagentNotification {
+        content: Vec<ContentBlock>,
+    },
 }
 
 impl JobInput {
@@ -72,6 +81,7 @@ impl JobInput {
             JobInput::Cron { .. } => JobKind::Cron,
             JobInput::System { .. } => JobKind::System,
             JobInput::Spawned { .. } => JobKind::Spawned,
+            JobInput::SubagentNotification { .. } => JobKind::SubagentNotification,
         }
     }
 }
@@ -104,6 +114,8 @@ mod tests {
         assert!(JobKind::Spawned.allowed_for(TriggerKind::User));
         assert!(JobKind::Spawned.allowed_for(TriggerKind::Cron));
         assert!(JobKind::Spawned.allowed_for(TriggerKind::System));
+        assert!(JobKind::SubagentNotification.allowed_for(TriggerKind::User));
+        assert!(JobKind::SubagentNotification.allowed_for(TriggerKind::Cron));
         // Mismatches are rejected
         assert!(!JobKind::UserChat.allowed_for(TriggerKind::Cron));
         assert!(!JobKind::Cron.allowed_for(TriggerKind::User));
@@ -133,6 +145,9 @@ mod tests {
             initial_prompt: vec![],
         };
         assert_eq!(i.kind(), JobKind::Spawned);
+
+        let i = JobInput::SubagentNotification { content: vec![] };
+        assert_eq!(i.kind(), JobKind::SubagentNotification);
     }
 
     #[test]

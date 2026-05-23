@@ -100,6 +100,8 @@ Cron jobs flow through the Actor model and observability chain: `CronScheduler` 
 
 `AgentMessage::CronTrigger { job_id, prompt }` carries the cron job id and the prompt string directly. `AgentActor` dispatches `prompt` through `dispatch_cron_prompt` with `JobInput::Cron`, which wraps `prompt` via `cron_prompt::frame_cron_prompt` (so the fire reads as a task, not a user message) and runs the normal `AgentLoop` path; the LLM decides what tools (if any) to invoke.
 
+Background subagent results arrive as `AgentMessage::SubagentFinished`, are buffered on `session.state.pending_subagent_results`, and — once no higher-priority message is queued — drained into their own autonomous `SubagentNotification` agent-loop turn (same main path / system prompt + toolset, so the prompt cache holds; the model proactively reports to the user, and an empty reply is suppressed). The per-session mailbox is a **priority queue** (`mailbox::channel`): `UserInput`/trigger > `SubagentFinished` > `ActorStop` (lowest — drains all real work before stopping). A rapid burst of `UserInput`s coalesces into one turn; a leading `/command` is a hard boundary. Full design + rationale: [`docs/todo/subagent-notification-and-message-priority.md`](../todo/subagent-notification-and-message-priority.md).
+
 ### LLM-invocable cron tools
 
 `aura_cron::tools::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule/cancel/inspect cron jobs mid-conversation. They live in `aura-cron::tools` (not `aura-tools`) because they each hold `Arc<CronScheduler>`, and `aura-tools` cannot depend on `aura-cron` without creating a cycle. `src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.

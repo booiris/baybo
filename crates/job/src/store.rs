@@ -14,6 +14,7 @@ fn job_kind_str(kind: JobKind) -> &'static str {
         JobKind::Cron => "cron",
         JobKind::System => "system",
         JobKind::Spawned => "spawned",
+        JobKind::SubagentNotification => "subagent_notification",
     }
 }
 

@@ -2482,7 +2482,7 @@
           },
           "prompt": {
             "type": "string",
-            "description": "The user-facing prompt for this fire. Truncated to\n[`PREVIEW_MAX_CHARS`]. The persisted user row carries a\n`[cron:<job>] <prompt>` prefix; this strips the prefix so the\npanel doesn't redundantly re-show what the cron job already\nhas."
+            "description": "The user-facing prompt for this fire. Truncated to\n[`PREVIEW_MAX_CHARS`]. The persisted user row carries the cron\ndispatcher's fire-time framing; `aura_agent::cron_prompt::original_cron_prompt`\nrecovers the instruction as configured so the panel shows that,\nnot the framing boilerplate."
           },
           "response": {
             "type": [
@@ -2896,7 +2896,8 @@
           "user_chat",
           "cron",
           "system",
-          "spawned"
+          "spawned",
+          "subagent_notification"
         ]
       },
       "JobStatus": {
