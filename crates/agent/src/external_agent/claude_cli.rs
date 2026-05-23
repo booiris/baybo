@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aura_llm::TokenUsage;
-use aura_model::{ChatMessage, ContentBlock, ExternalAgentKind, Role, ThinkingContent};
+use aura_model::{ChatMessage, ContentBlock, ExternalAgentKind, ThinkingContent};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -231,11 +231,9 @@ fn spawn_stream_parser(
                                 }
                             }
                             if !blocks.is_empty() {
-                                yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
-                                    role: Role::Assistant,
-                                    content: blocks,
-                                    from_user: false,
-                                }));
+                                yield Ok(ExternalAgentEvent::Intermediate(
+                                    ChatMessage::assistant(blocks),
+                                ));
                             }
                         }
                         StreamJsonEvent::User { message } => {
@@ -245,11 +243,9 @@ fn spawn_stream_parser(
                                 .filter_map(UserBlock::into_content_block)
                                 .collect();
                             if !blocks.is_empty() {
-                                yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
-                                    role: Role::Tool,
-                                    content: blocks,
-                                    from_user: false,
-                                }));
+                                yield Ok(ExternalAgentEvent::Intermediate(ChatMessage::tool(
+                                    blocks,
+                                )));
                             }
                         }
                         StreamJsonEvent::Result {

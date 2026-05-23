@@ -1138,20 +1138,12 @@ pub(crate) fn insert_skill_trailer(
     let reminder = render_skill_reminder(&registry.all_summaries_sorted());
     messages.insert(
         insert_at,
-        ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text(reminder)],
-            from_user: false,
-        },
+        ChatMessage::agent_context(vec![ContentBlock::Text(reminder)]),
     );
     if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
         messages.insert(
             insert_at + 1,
-            ChatMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text(detail)],
-                from_user: false,
-            },
+            ChatMessage::agent_context(vec![ContentBlock::Text(detail)]),
         );
     }
 }
@@ -1169,17 +1161,13 @@ pub(crate) fn estimate_skill_trailer_tokens(
     called_skills: &[String],
 ) -> usize {
     let reminder = render_skill_reminder(&registry.all_summaries_sorted());
-    let mut total = tokenizer.count_message(&ChatMessage {
-        role: Role::User,
-        content: vec![ContentBlock::Text(reminder)],
-        from_user: false,
-    });
+    let mut total = tokenizer.count_message(&ChatMessage::agent_context(vec![ContentBlock::Text(
+        reminder,
+    )]));
     if let Some(detail) = build_skill_detail_payload(registry, tokenizer, called_skills) {
-        total += tokenizer.count_message(&ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text(detail)],
-            from_user: false,
-        });
+        total += tokenizer.count_message(&ChatMessage::agent_context(vec![ContentBlock::Text(
+            detail,
+        )]));
     }
     total
 }
@@ -1212,10 +1200,12 @@ mod tests {
     }
 
     fn make_msg(role: Role, text: &str) -> ChatMessage {
-        ChatMessage {
-            role,
-            content: vec![ContentBlock::Text(text.to_string())],
-            from_user: false,
+        let content = vec![ContentBlock::Text(text.to_string())];
+        match role {
+            Role::User => ChatMessage::agent_context(content),
+            Role::Assistant => ChatMessage::assistant(content),
+            Role::System => ChatMessage::system(content),
+            Role::Tool => ChatMessage::tool(content),
         }
     }
 
@@ -1586,16 +1576,12 @@ mod tests {
     }
 
     fn skill_call(skill_name: &str) -> ChatMessage {
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: format!("call-{skill_name}"),
-                name: SKILL_TOOL_NAME.into(),
-                input: serde_json::json!({ SKILL_INPUT_NAME_FIELD: skill_name }),
-                signature: None,
-            }],
-            from_user: false,
-        }
+        ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: format!("call-{skill_name}"),
+            name: SKILL_TOOL_NAME.into(),
+            input: serde_json::json!({ SKILL_INPUT_NAME_FIELD: skill_name }),
+            signature: None,
+        }])
     }
 
     /// `append` records every fresh `Skill` ToolUse it sees, in
@@ -1619,16 +1605,12 @@ mod tests {
     #[tokio::test]
     async fn append_ignores_non_skill_tool_uses() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
-        let bash_call = ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "1".into(),
-                name: "Bash".into(),
-                input: serde_json::json!({ "command": "ls" }),
-                signature: None,
-            }],
-            from_user: false,
-        };
+        let bash_call = ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": "ls" }),
+            signature: None,
+        }]);
         ctx.append(&bash_call).await;
         assert!(ctx.called_skills.is_empty());
     }
@@ -1874,16 +1856,12 @@ mod tests {
     // ---------- last_summary_anchor / trigger-gate tests ----------
 
     fn tool_use_msg(id: &str) -> ChatMessage {
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: id.into(),
-                name: "bash".into(),
-                input: serde_json::Value::Null,
-                signature: None,
-            }],
-            from_user: false,
-        }
+        ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: id.into(),
+            name: "bash".into(),
+            input: serde_json::Value::Null,
+            signature: None,
+        }])
     }
 
     /// Default anchor is `None`; both `tokens_since_anchor` and

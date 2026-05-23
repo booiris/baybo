@@ -756,8 +756,14 @@ async fn cron_message_from_session(
     // reverse for the response so we land on the last assistant turn
     // even when the agent emitted multiple.
     for (_ord, _at, msg) in &tail {
-        if matches!(msg.role, Role::User) && msg.from_user {
-            let text = extract_text(&msg.content);
+        if !matches!(msg.role, Role::User) {
+            continue;
+        }
+        // The cron prompt is an agent-context row (`from_user = false`), so
+        // locate it by its `[cron:<id>]` framing rather than provenance — the
+        // skill reminder is also a `Role::User` agent-context row.
+        let text = extract_text(&msg.content);
+        if aura_agent::cron_prompt::is_framed_cron_prompt(&text) {
             prompt = Some(aura_agent::cron_prompt::original_cron_prompt(&text).to_owned());
             break;
         }
@@ -806,7 +812,7 @@ async fn last_user_preview(
     // the freshest user row first and stop scanning the moment we
     // find it.
     for (_ord, created_at, msg) in tail.into_iter().rev() {
-        if !matches!(msg.role, Role::User) || !msg.from_user {
+        if !matches!(msg.role, Role::User) || !msg.from_user() {
             continue;
         }
         let item = chat_to_transcript_item(0, created_at, msg)?;
@@ -841,7 +847,7 @@ fn chat_to_transcript_item(
     // see that fn for why each excluded variant doesn't belong on the
     // chat surface.
     let role = match msg.role {
-        Role::User if msg.from_user => "user",
+        Role::User if msg.from_user() => "user",
         Role::Assistant => "assistant",
         _ => return None,
     };

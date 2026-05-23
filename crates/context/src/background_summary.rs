@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_llm::{ChatRequest, LlmResponse, ToolCallInfo, ToolDefinitionForLlm};
-use aura_model::{ChannelType, ChatMessage, ContentBlock, Role, SessionId, User};
+use aura_model::{ChannelType, ChatMessage, ContentBlock, SessionId, User};
 use aura_session::SessionManager;
 use aura_tools::builtin::{EditTool, ReadTool};
 use aura_tools::{Tool, ToolContext, ToolError, ToolOutput};
@@ -529,15 +529,9 @@ pub async fn run_background_summary(
 
     let notes_path = workspace.session_summary_file(parent_session_id.as_str());
     let mut messages: Vec<ChatMessage> = parent_messages;
-    messages.push(ChatMessage {
-        role: Role::User,
-        content: vec![ContentBlock::Text(build_summary_prompt(
-            &notes_path,
-            &current_notes,
-            tokenizer.as_ref(),
-        ))],
-        from_user: false,
-    });
+    messages.push(ChatMessage::agent_context(vec![ContentBlock::Text(
+        build_summary_prompt(&notes_path, &current_notes, tokenizer.as_ref()),
+    )]));
     let tool_defs = vec![
         tool_def_from(&ReadTool),
         tool_def_from(&EditTool::new(workspace.as_ref().clone())),
@@ -590,11 +584,7 @@ iterations without terminating"
         } else {
             response.content_blocks.clone()
         };
-        messages.push(ChatMessage {
-            role: Role::Assistant,
-            content: assistant_blocks,
-            from_user: false,
-        });
+        messages.push(ChatMessage::assistant(assistant_blocks));
 
         if response.tool_calls.is_empty() {
             break;
@@ -607,11 +597,7 @@ iterations without terminating"
             }
             tool_results.push(execute_tool_call(&notes_path, call, &tool_ctx).await);
         }
-        messages.push(ChatMessage {
-            role: Role::User,
-            content: tool_results,
-            from_user: false,
-        });
+        messages.push(ChatMessage::agent_context(tool_results));
     }
 
     if !applied_any_edit {

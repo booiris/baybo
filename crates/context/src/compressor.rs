@@ -24,7 +24,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use aura_llm::{ChatRequest, LlmResponse};
-use aura_model::{ChatMessage, ContentBlock, Role};
+use aura_model::{ChatMessage, ContentBlock};
 use tracing::{debug, warn};
 
 use crate::error::ContextError;
@@ -581,11 +581,9 @@ impl ContextManager {
         let (system_msgs, non_system) = partition_system(&self.messages);
 
         let mut request_messages: Vec<ChatMessage> = self.messages.to_vec();
-        request_messages.push(ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text(SUMMARIZE_INSTRUCTION.to_string())],
-            from_user: false,
-        });
+        request_messages.push(ChatMessage::agent_context(vec![ContentBlock::Text(
+            SUMMARIZE_INSTRUCTION.to_string(),
+        )]));
         let request = ChatRequest {
             messages: request_messages,
             temperature: None,
@@ -654,46 +652,37 @@ fn build_summary_message(
         transcript = transcript_path.display(),
         footer = CONTINUATION_FOOTER,
     );
-    ChatMessage {
-        role: Role::User,
-        content: vec![ContentBlock::Text(text)],
-        from_user: false,
-    }
+    ChatMessage::agent_context(vec![ContentBlock::Text(text)])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aura_model::Role;
 
     fn tool_use(id: &str) -> ChatMessage {
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: id.into(),
-                name: "bash".into(),
-                input: serde_json::Value::Null,
-                signature: None,
-            }],
-            from_user: false,
-        }
+        ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: id.into(),
+            name: "bash".into(),
+            input: serde_json::Value::Null,
+            signature: None,
+        }])
     }
 
     fn tool_result(id: &str) -> ChatMessage {
-        ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: id.into(),
-                content: "ok".into(),
-            }],
-            from_user: false,
-        }
+        ChatMessage::agent_context(vec![ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: "ok".into(),
+        }])
     }
 
     fn text(role: Role, t: &str) -> ChatMessage {
-        ChatMessage {
-            role,
-            content: vec![ContentBlock::Text(t.into())],
-            from_user: false,
+        let content = vec![ContentBlock::Text(t.into())];
+        match role {
+            Role::User => ChatMessage::agent_context(content),
+            Role::Assistant => ChatMessage::assistant(content),
+            Role::System => ChatMessage::system(content),
+            Role::Tool => ChatMessage::tool(content),
         }
     }
 

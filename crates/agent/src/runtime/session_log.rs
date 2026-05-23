@@ -204,16 +204,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use aura_llm::{TokenUsage, ToolDefinitionForLlm};
-    use aura_model::{ChatMessage, ContentBlock, Role};
+    use aura_model::{ChatMessage, ContentBlock};
     use tempfile::tempdir;
 
     fn sample_request() -> ChatRequest {
         ChatRequest {
-            messages: vec![ChatMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text("hello".into())],
-                from_user: false,
-            }],
+            messages: vec![ChatMessage::agent_context(vec![ContentBlock::Text(
+                "hello".into(),
+            )])],
             temperature: Some(0.7),
             tools: vec![ToolDefinitionForLlm {
                 name: "noop".into(),
@@ -289,16 +287,8 @@ mod tests {
     async fn appends_message_records_to_same_session_file() {
         let tmp = tempdir().unwrap();
         let logger = SessionLlmLogger::new(tmp.path().to_path_buf());
-        let first = ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text("hello".into())],
-            from_user: false,
-        };
-        let second = ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text("hi".into())],
-            from_user: false,
-        };
+        let first = ChatMessage::agent_context(vec![ContentBlock::Text("hello".into())]);
+        let second = ChatMessage::assistant(vec![ContentBlock::Text("hi".into())]);
 
         let sid = SessionId::from("sess-1");
         let first_id = logger.log_message(&sid, &first).await.unwrap();

@@ -15,7 +15,7 @@ use aura_config::ChannelsConfig;
 use aura_gateway::auth::WEB_CLIENT_LABEL_PREFIX;
 use aura_gateway::channel::boot;
 use aura_gateway::test_support::build_test_deps;
-use aura_model::{ChatMessage, ContentBlock, Role, SessionId};
+use aura_model::{ChatMessage, ContentBlock, SessionId};
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
@@ -315,26 +315,12 @@ async fn list_sessions_exposes_last_user_text_preview() {
     // any trailing assistant row that landed on top of it.
     let sid = SessionId::from(with_text_id.as_str());
     let rows: &[ChatMessage] = &[
-        ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text("first ask".into())],
-            from_user: true,
-        },
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text("first reply".into())],
-            from_user: false,
-        },
-        ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text("second\nask\nwith   newlines".into())],
-            from_user: true,
-        },
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text("second reply".into())],
-            from_user: false,
-        },
+        ChatMessage::user(vec![ContentBlock::Text("first ask".into())]),
+        ChatMessage::assistant(vec![ContentBlock::Text("first reply".into())]),
+        ChatMessage::user(vec![ContentBlock::Text(
+            "second\nask\nwith   newlines".into(),
+        )]),
+        ChatMessage::assistant(vec![ContentBlock::Text("second reply".into())]),
     ];
     for msg in rows {
         tg.deps
@@ -406,16 +392,12 @@ async fn cron_sessions_split_into_dedicated_endpoint() {
     let cron_id = cron_session.id.to_string();
 
     let cron_rows: &[ChatMessage] = &[
-        ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text("[cron:cj-test] morning brief".into())],
-            from_user: true,
-        },
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text("daily summary\nready".into())],
-            from_user: false,
-        },
+        // The cron prompt persists as an agent-context row; the inbox locates
+        // it by its `[cron:<id>]` framing, not by `from_user`.
+        ChatMessage::agent_context(vec![ContentBlock::Text(
+            "[cron:cj-test] morning brief".into(),
+        )]),
+        ChatMessage::assistant(vec![ContentBlock::Text("daily summary\nready".into())]),
     ];
     for msg in cron_rows {
         tg.deps

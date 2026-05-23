@@ -156,7 +156,7 @@ mod tests {
     use aura_llm::LlmCompletion;
     use aura_llm::test_support::StubLlm;
     use aura_llm::{GuardedLlm, LlmResponse, TokenUsage};
-    use aura_model::{ChatMessage, ContentBlock, JobId, Role, SessionId, SpanId};
+    use aura_model::{ChatMessage, ContentBlock, JobId, SessionId, SpanId};
     use aura_security::leak_detector::{LeakAction, LeakDetectionRule, LeakDetector};
     use aura_security::test_support::MemorySecretStore;
     use aura_security::{EncryptionKey, SecretVault};
@@ -237,11 +237,9 @@ mod tests {
         });
 
         let request = ChatRequest {
-            messages: vec![ChatMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text("summarise this page".to_string())],
-                from_user: false,
-            }],
+            messages: vec![ChatMessage::agent_context(vec![ContentBlock::Text(
+                "summarise this page".to_string(),
+            )])],
             temperature: Some(0.0),
             tools: vec![],
         };

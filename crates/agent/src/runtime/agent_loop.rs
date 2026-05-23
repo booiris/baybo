@@ -366,11 +366,13 @@ impl AgentLoop {
         // `Cron` / `System` where the input is a synthesized prompt
         // rather than the raw trigger payload.
         //
-        // Synthetic-input turns (the autonomous `SubagentNotification`) are
-        // appended as `from_user = false` so chat surfaces treat them as
-        // agent-injected context, not a real user-authored message.
+        // Only a genuine channel input is user-authored. Cron fires, spawned
+        // / subagent task prompts, and the autonomous `SubagentNotification`
+        // are all synthesized `Role::User` content — appended as
+        // `from_user = false` so chat surfaces treat them as agent-injected
+        // context, not a real user-authored message.
         let is_subagent_notification = matches!(job_input, JobInput::SubagentNotification { .. });
-        let from_user = !is_subagent_notification;
+        let from_user = matches!(job_input, JobInput::UserChat { .. });
         // The notification prompt is rebuilt from the durable
         // `pending_subagent_results` buffer on every retry, so persisting it
         // per-attempt would duplicate the hidden row on each failed retry
@@ -449,10 +451,13 @@ impl AgentLoop {
         };
 
         // Append user message (auto-compresses if over token budget).
-        let user_msg = ChatMessage {
-            role: Role::User,
-            content: user_content.clone(),
-            from_user,
+        // `from_user` is true only for a genuine `UserChat` turn; cron /
+        // spawned / subagent-notification inputs build an agent-context row
+        // so they never surface as a user bubble.
+        let user_msg = if from_user {
+            ChatMessage::user(user_content.clone())
+        } else {
+            ChatMessage::agent_context(user_content.clone())
         };
         if persist_user_row {
             self.append_context_message(session, &user_msg).await?;
@@ -474,11 +479,7 @@ impl AgentLoop {
                 input: input.clone(),
                 signature: None,
             };
-            let assistant_msg = ChatMessage {
-                role: Role::Assistant,
-                content: vec![tool_use_block],
-                from_user: false,
-            };
+            let assistant_msg = ChatMessage::assistant(vec![tool_use_block]);
             self.append_context_message(session, &assistant_msg).await?;
 
             let approved = std::sync::Arc::new(parking_lot::Mutex::new(
@@ -535,14 +536,7 @@ impl AgentLoop {
 
             session.state.approved_resources = approved.lock().clone();
 
-            let tool_msg = ChatMessage {
-                role: Role::Tool,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: synthesized_id,
-                    content: result_text,
-                }],
-                from_user: false,
-            };
+            let tool_msg = ChatMessage::tool_result(synthesized_id, result_text);
             self.append_context_message(session, &tool_msg).await?;
         }
 
@@ -717,11 +711,7 @@ impl AgentLoop {
             // prior iterations. Capture the persisted ordinal so the
             // channel adapter can stamp it onto the live `Frame::Message`
             // and reconnecting clients advance their cursor past it.
-            let assistant_msg = ChatMessage {
-                role: Role::Assistant,
-                content: response_blocks,
-                from_user: false,
-            };
+            let assistant_msg = ChatMessage::assistant(response_blocks);
             let ordinal = self.append_context_message(session, &assistant_msg).await?;
 
             return Ok(IterationOutcome::Final(OutgoingMessage {
@@ -758,11 +748,7 @@ impl AgentLoop {
             assistant_blocks.push(block.clone());
             accumulated_tool_uses.push(block);
         }
-        let assistant_msg = ChatMessage {
-            role: Role::Assistant,
-            content: assistant_blocks,
-            from_user: false,
-        };
+        let assistant_msg = ChatMessage::assistant(assistant_blocks);
         self.append_context_message(session, &assistant_msg).await?;
 
         // Execute tool calls concurrently. Approved resources are shared
@@ -880,14 +866,7 @@ impl AgentLoop {
 
             // Append tool result to context with the tool_use_id so the
             // LLM can correlate results with their originating calls.
-            let tool_msg = ChatMessage {
-                role: Role::Tool,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: tool_call.id.clone(),
-                    content: wrapped,
-                }],
-                from_user: false,
-            };
+            let tool_msg = ChatMessage::tool_result(tool_call.id.clone(), wrapped);
             self.append_context_message(session, &tool_msg).await?;
 
             // ToolResult.content is text-only; provider adapters
@@ -905,11 +884,7 @@ impl AgentLoop {
                     tool_call.name, tool_call.id
                 )));
                 content.extend(llm_visible_images);
-                let image_msg = ChatMessage {
-                    role: Role::User,
-                    content,
-                    from_user: false,
-                };
+                let image_msg = ChatMessage::agent_context(content);
                 self.append_context_message(session, &image_msg).await?;
             }
         }
@@ -1189,11 +1164,7 @@ impl AgentLoop {
         // user content. `initial_seed_messages` keys off `messages[0]`, so a
         // leading user row would also make every later turn re-seed.
         self.ensure_system_prompt(session).await?;
-        let msg = ChatMessage {
-            role: Role::User,
-            content,
-            from_user: true,
-        };
+        let msg = ChatMessage::user(content);
         self.append_context_message(session, &msg).await?;
         Ok(())
     }
@@ -1726,11 +1697,10 @@ impl AgentLoop {
             m.role == Role::System && matches!(m.content.first(), Some(ContentBlock::Text(_)))
         });
         if first_is_system_text {
-            self.context_manager.replace_first_message(ChatMessage {
-                role: Role::System,
-                content: vec![ContentBlock::Text(new_soul.system_prompt().to_string())],
-                from_user: false,
-            });
+            self.context_manager
+                .replace_first_message(ChatMessage::system(vec![ContentBlock::Text(
+                    new_soul.system_prompt().to_string(),
+                )]));
         }
         self.soul = new_soul;
         Ok(())
@@ -1767,19 +1737,13 @@ fn initial_seed_messages(
         return Vec::new();
     }
     let mut out = Vec::with_capacity(if skills.is_empty() { 1 } else { 2 });
-    out.push(ChatMessage {
-        role: Role::System,
-        content: vec![ContentBlock::Text(soul_prompt.to_string())],
-        from_user: false,
-    });
+    out.push(ChatMessage::system(vec![ContentBlock::Text(
+        soul_prompt.to_string(),
+    )]));
     if !skills.is_empty() {
-        out.push(ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text(
-                aura_skills::render::render_skill_reminder(skills),
-            )],
-            from_user: false,
-        });
+        out.push(ChatMessage::agent_context(vec![ContentBlock::Text(
+            aura_skills::render::render_skill_reminder(skills),
+        )]));
     }
     out
 }
@@ -2191,10 +2155,12 @@ mod merge_for_llm_tests {
     use aura_model::{BlobRef, ChatMessage, ContentBlock, Role};
 
     fn text(role: Role, body: &str) -> ChatMessage {
-        ChatMessage {
-            role,
-            content: vec![ContentBlock::Text(body.into())],
-            from_user: false,
+        let content = vec![ContentBlock::Text(body.into())];
+        match role {
+            Role::User => ChatMessage::agent_context(content),
+            Role::Assistant => ChatMessage::assistant(content),
+            Role::System => ChatMessage::system(content),
+            Role::Tool => ChatMessage::tool(content),
         }
     }
 
@@ -2247,16 +2213,8 @@ mod merge_for_llm_tests {
     #[test]
     fn keeps_non_text_blocks_separate() {
         let msgs = vec![
-            ChatMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text("hi".into()), img()],
-                from_user: false,
-            },
-            ChatMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text("more".into())],
-                from_user: false,
-            },
+            ChatMessage::agent_context(vec![ContentBlock::Text("hi".into()), img()]),
+            ChatMessage::agent_context(vec![ContentBlock::Text("more".into())]),
         ];
         let out = merge_for_llm(&msgs);
         assert_eq!(out.len(), 1);
@@ -2278,22 +2236,8 @@ mod merge_for_llm_tests {
         let msgs = vec![
             text(Role::System, "s1"),
             text(Role::System, "s2"),
-            ChatMessage {
-                role: Role::Tool,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "1".into(),
-                    content: "r1".into(),
-                }],
-                from_user: false,
-            },
-            ChatMessage {
-                role: Role::Tool,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: "2".into(),
-                    content: "r2".into(),
-                }],
-                from_user: false,
-            },
+            ChatMessage::tool_result("1".into(), "r1".into()),
+            ChatMessage::tool_result("2".into(), "r2".into()),
         ];
         let out = merge_for_llm(&msgs);
         assert_eq!(out.len(), 4);
@@ -2301,24 +2245,13 @@ mod merge_for_llm_tests {
 
     #[test]
     fn preserves_assistant_tool_use_then_tool_result() {
-        let assistant = ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "t1".into(),
-                name: "Foo".into(),
-                input: serde_json::json!({}),
-                signature: None,
-            }],
-            from_user: false,
-        };
-        let tool = ChatMessage {
-            role: Role::Tool,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: "t1".into(),
-                content: "ok".into(),
-            }],
-            from_user: false,
-        };
+        let assistant = ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "Foo".into(),
+            input: serde_json::json!({}),
+            signature: None,
+        }]);
+        let tool = ChatMessage::tool_result("t1".into(), "ok".into());
         let msgs = vec![text(Role::User, "hi"), assistant.clone(), tool.clone()];
         let out = merge_for_llm(&msgs);
         assert_eq!(out.len(), 3);
@@ -2347,19 +2280,11 @@ mod initial_seed_tests {
     }
 
     fn system_row() -> ChatMessage {
-        ChatMessage {
-            role: Role::System,
-            content: vec![ContentBlock::Text(SOUL.into())],
-            from_user: false,
-        }
+        ChatMessage::system(vec![ContentBlock::Text(SOUL.into())])
     }
 
     fn user_row() -> ChatMessage {
-        ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text("hi".into())],
-            from_user: true,
-        }
+        ChatMessage::user(vec![ContentBlock::Text("hi".into())])
     }
 
     #[test]
@@ -2381,7 +2306,7 @@ mod initial_seed_tests {
             Role::User,
             "reminder rides as Role::User because some providers reject mid-stream system rows",
         );
-        assert!(!out[1].from_user, "synthetic rows are never from_user");
+        assert!(!out[1].from_user(), "synthetic rows are never from_user");
         let reminder_text = match &out[1].content[0] {
             ContentBlock::Text(t) => t,
             _ => panic!("reminder should be a text block"),

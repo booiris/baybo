@@ -40,11 +40,9 @@ pub(crate) fn build_messages(
     scope: Scope,
     files: &[(String, Vec<u8>)],
 ) -> Vec<aura_model::ChatMessage> {
-    let system = aura_model::ChatMessage {
-        role: aura_model::Role::System,
-        content: vec![aura_model::ContentBlock::Text(SYSTEM_PROMPT.to_string())],
-        from_user: false,
-    };
+    let system = aura_model::ChatMessage::system(vec![aura_model::ContentBlock::Text(
+        SYSTEM_PROMPT.to_string(),
+    )]);
 
     let mut user_body = String::with_capacity(4 * 1024);
     match scope {
@@ -109,11 +107,8 @@ pub(crate) fn build_messages(
 
     user_body.push_str("\nRespond with a single JSON object only — no commentary.");
 
-    let user = aura_model::ChatMessage {
-        role: aura_model::Role::User,
-        content: vec![aura_model::ContentBlock::Text(user_body)],
-        from_user: false,
-    };
+    let user =
+        aura_model::ChatMessage::agent_context(vec![aura_model::ContentBlock::Text(user_body)]);
 
     vec![system, user]
 }

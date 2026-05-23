@@ -125,7 +125,6 @@ fn uses_o200k(model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::Role;
 
     #[test]
     fn count_text_empty_is_zero() {
@@ -144,11 +143,7 @@ mod tests {
     #[test]
     fn count_message_includes_structural_overhead() {
         let tok = TiktokenTokenizer::for_model("gpt-4");
-        let msg = ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text("hi".to_string())],
-            from_user: false,
-        };
+        let msg = ChatMessage::agent_context(vec![ContentBlock::Text("hi".to_string())]);
         let text_only = tok.count_text("hi");
         assert_eq!(tok.count_message(&msg), text_only + MESSAGE_OVERHEAD);
     }

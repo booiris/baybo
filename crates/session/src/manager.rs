@@ -909,16 +909,8 @@ mod tests {
             .await
             .unwrap();
 
-        let user = ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text("hi".into())],
-            from_user: false,
-        };
-        let assistant = ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text("hello".into())],
-            from_user: false,
-        };
+        let user = ChatMessage::agent_context(vec![ContentBlock::Text("hi".into())]);
+        let assistant = ChatMessage::assistant(vec![ContentBlock::Text("hello".into())]);
         mgr.append_session_message(&session.id, &user)
             .await
             .unwrap();
@@ -933,11 +925,8 @@ mod tests {
 
         // Compaction supersedes the two prior rows and installs a
         // single summary as the new active set.
-        let summary = ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text("<summary>S</summary>".into())],
-            from_user: false,
-        };
+        let summary =
+            ChatMessage::agent_context(vec![ContentBlock::Text("<summary>S</summary>".into())]);
         mgr.apply_session_compaction(&session.id, std::slice::from_ref(&summary))
             .await
             .unwrap();

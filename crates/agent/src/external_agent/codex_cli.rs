@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_llm::TokenUsage;
-use aura_model::{ChatMessage, ContentBlock, ExternalAgentKind, Role, ThinkingContent};
+use aura_model::{ChatMessage, ContentBlock, ExternalAgentKind, ThinkingContent};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -216,25 +216,21 @@ fn spawn_stream_parser(
                             if !text.is_empty() {
                                 final_text.clone_from(&text);
                                 yield Ok(ExternalAgentEvent::TextDelta(text.clone()));
-                                yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
-                                    role: Role::Assistant,
-                                    content: vec![ContentBlock::Text(text)],
-                                    from_user: false,
-                                }));
+                                yield Ok(ExternalAgentEvent::Intermediate(ChatMessage::assistant(
+                                    vec![ContentBlock::Text(text)],
+                                )));
                             }
                         }
                         ThreadEvent::ItemCompleted {
                             item: ThreadItem::Reasoning { summary },
                         } => {
                             if !summary.is_empty() {
-                                yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
-                                    role: Role::Assistant,
-                                    content: vec![ContentBlock::Thinking {
+                                yield Ok(ExternalAgentEvent::Intermediate(ChatMessage::assistant(
+                                    vec![ContentBlock::Thinking {
                                         id: None,
                                         content: vec![ThinkingContent::Summary { text: summary }],
                                     }],
-                                    from_user: false,
-                                }));
+                                )));
                             }
                         }
                         ThreadEvent::ItemCompleted {
@@ -253,51 +249,37 @@ fn spawn_stream_parser(
                             // confuse it with an aura-audited tool
                             // invocation.
                             let tool_use_id = format!("codex-{id}");
-                            yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
-                                role: Role::Assistant,
-                                content: vec![ContentBlock::ToolUse {
+                            yield Ok(ExternalAgentEvent::Intermediate(ChatMessage::assistant(
+                                vec![ContentBlock::ToolUse {
                                     id: tool_use_id.clone(),
                                     name: CODEX_TOOL_SHELL.to_string(),
                                     input: json!({ "command": command }),
                                     signature: None,
                                 }],
-                                from_user: false,
-                            }));
+                            )));
                             let result = match exit_code {
                                 Some(code) => format!("exit_code={code}\n{aggregated_output}"),
                                 None => aggregated_output,
                             };
-                            yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
-                                role: Role::Tool,
-                                content: vec![ContentBlock::ToolResult {
-                                    tool_use_id,
-                                    content: result,
-                                }],
-                                from_user: false,
-                            }));
+                            yield Ok(ExternalAgentEvent::Intermediate(
+                                ChatMessage::tool_result(tool_use_id, result),
+                            ));
                         }
                         ThreadEvent::ItemCompleted {
                             item: ThreadItem::FileChange { id, changes },
                         } => {
                             let tool_use_id = format!("codex-{id}");
-                            yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
-                                role: Role::Assistant,
-                                content: vec![ContentBlock::ToolUse {
+                            yield Ok(ExternalAgentEvent::Intermediate(ChatMessage::assistant(
+                                vec![ContentBlock::ToolUse {
                                     id: tool_use_id.clone(),
                                     name: CODEX_TOOL_FILE_CHANGE.to_string(),
                                     input: json!({ "changes": changes }),
                                     signature: None,
                                 }],
-                                from_user: false,
-                            }));
-                            yield Ok(ExternalAgentEvent::Intermediate(ChatMessage {
-                                role: Role::Tool,
-                                content: vec![ContentBlock::ToolResult {
-                                    tool_use_id,
-                                    content: "applied".to_string(),
-                                }],
-                                from_user: false,
-                            }));
+                            )));
+                            yield Ok(ExternalAgentEvent::Intermediate(
+                                ChatMessage::tool_result(tool_use_id, "applied".to_string()),
+                            ));
                         }
                         ThreadEvent::TurnCompleted { usage } => {
                             buffered_usage = usage.map(CodexUsage::into_token_usage);

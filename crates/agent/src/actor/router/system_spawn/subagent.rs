@@ -6,9 +6,9 @@ use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
 use aura_llm::TokenUsage;
 use aura_model::{
     BACKGROUND_SUBAGENT_HANDLE_PREFIX, ChannelType, ChatMessage, ContentBlock, ExternalAgentKind,
-    JobId, Lineage, LineageKind, MessageMetadata, PendingSubagentResult, Role,
-    SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend, SubagentExitStatus,
-    SubagentResult, SubagentSpawnRequest, TriggerKind, User,
+    JobId, Lineage, LineageKind, MessageMetadata, PendingSubagentResult, SUBAGENT_CHANNEL_TAG,
+    Session, SessionId, SpanId, SubagentBackend, SubagentExitStatus, SubagentResult,
+    SubagentSpawnRequest, TriggerKind, User,
 };
 use chrono::Utc;
 use futures::StreamExt;
@@ -776,11 +776,10 @@ async fn run_external_agent(
     append_subagent_message(
         &session_manager,
         &child_session_id,
-        ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text(request.task.clone())],
-            from_user: true,
-        },
+        // The task is the parent agent's instruction to the subagent, not a
+        // human channel input — agent-context, so it never renders as a user
+        // bubble in the child session's transcript.
+        ChatMessage::agent_context(vec![ContentBlock::Text(request.task.clone())]),
     )
     .await;
 

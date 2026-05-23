@@ -383,11 +383,9 @@ mod tests {
     /// `Persisted` is an object.
     #[test]
     fn llm_call_inputs_serializes_inline_as_bare_array() {
-        let inline = LlmCallInputs::Inline(vec![aura_model::ChatMessage {
-            role: aura_model::Role::User,
-            content: vec![aura_model::ContentBlock::Text("hi".into())],
-            from_user: false,
-        }]);
+        let inline = LlmCallInputs::Inline(vec![aura_model::ChatMessage::agent_context(vec![
+            aura_model::ContentBlock::Text("hi".into()),
+        ])]);
         let json = serde_json::to_value(&inline).unwrap();
         assert!(json.is_array(), "Inline must serialize as a bare array");
         assert_eq!(json.as_array().unwrap().len(), 1);

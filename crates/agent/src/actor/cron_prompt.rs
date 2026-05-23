@@ -26,11 +26,25 @@ const FRAMING_BODY: &str = r#"The text below was scheduled earlier and is firing
 /// configured.
 const INSTRUCTION_LABEL: &str = "Scheduled instruction to perform now:";
 
+/// Leading routing tag every framed cron prompt carries: `[cron:<id>] …`.
+/// One source of truth for both [`frame_cron_prompt`] (writes it) and
+/// [`is_framed_cron_prompt`] (detects it).
+const CRON_TAG_PREFIX: &str = "[cron:";
+
 /// Build the fire-time content for a cron job. The routing tag
 /// (`[cron:job_id]`) stays first so trace tooling and legacy-row recovery
 /// can still locate it; the framing and the original `prompt` follow.
 pub fn frame_cron_prompt(job_id: &str, prompt: &str) -> String {
-    format!("[cron:{job_id}] {FRAMING_BODY}\n\n{INSTRUCTION_LABEL}\n{prompt}")
+    format!("{CRON_TAG_PREFIX}{job_id}] {FRAMING_BODY}\n\n{INSTRUCTION_LABEL}\n{prompt}")
+}
+
+/// Whether `content` is a fire-time cron prompt produced by
+/// [`frame_cron_prompt`] — i.e. it leads with the `[cron:<id>]` routing tag.
+/// Operator surfaces use this to locate the cron prompt row in a transcript
+/// without leaning on `from_user`: the framed prompt is an agent-context
+/// `Role::User` row, indistinguishable by provenance from a skill reminder.
+pub fn is_framed_cron_prompt(content: &str) -> bool {
+    content.starts_with(CRON_TAG_PREFIX)
 }
 
 /// Recover the original instruction from synthesized cron content, for

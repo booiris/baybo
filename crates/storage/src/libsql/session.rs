@@ -32,6 +32,27 @@ fn lineage_kind_str(s: &Session) -> Option<&'static str> {
     })
 }
 
+/// Rebuild a typed [`ChatMessage`] from a persisted `session_messages` row,
+/// honoring the stored `from_user` flag — only a genuine `Role::User` row
+/// carries it. The sole rehydration seam for the sealed `from_user` field:
+/// every read path funnels its `(role, content, from_user)` triple here so the
+/// `(role, from_user) -> intent constructor` mapping lives in one place.
+fn rehydrate_message(
+    role: &str,
+    content: Vec<aura_model::ContentBlock>,
+    from_user: bool,
+) -> Result<ChatMessage> {
+    use aura_model::Role;
+    let role = role.parse::<Role>().map_err(StorageError::Storage)?;
+    Ok(match (role, from_user) {
+        (Role::User, true) => ChatMessage::user(content),
+        (Role::User, false) => ChatMessage::agent_context(content),
+        (Role::Assistant, _) => ChatMessage::assistant(content),
+        (Role::System, _) => ChatMessage::system(content),
+        (Role::Tool, _) => ChatMessage::tool(content),
+    })
+}
+
 /// `is_normal_session` column value: `0` for maintenance sessions
 /// (`LineageKind::SystemMaintenance`), `1` otherwise. Default queries
 /// filter `is_normal_session = 1` so maintenance sessions stay
@@ -548,7 +569,7 @@ impl SessionStore for LibsqlSessionStore {
                     role.to_string(),
                     content,
                     now_us,
-                    i64::from(message.from_user),
+                    i64::from(message.from_user()),
                 ],
             )
             .await
@@ -651,7 +672,7 @@ impl SessionStore for LibsqlSessionStore {
                 params.push(libsql::Value::Text(msg.role.as_str().to_string()));
                 params.push(libsql::Value::Text(content));
                 params.push(libsql::Value::Integer(now_us));
-                params.push(libsql::Value::Integer(i64::from(msg.from_user)));
+                params.push(libsql::Value::Integer(i64::from(msg.from_user())));
             }
             tx.execute(&sql, params).await.map_err(|e| {
                 StorageError::Internal(anyhow::anyhow!("libsql compaction insert: {e}"))
@@ -698,13 +719,7 @@ impl SessionStore for LibsqlSessionStore {
             })?;
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
-            out.push(aura_model::ChatMessage {
-                role: role
-                    .parse::<aura_model::Role>()
-                    .map_err(StorageError::Storage)?,
-                content,
-                from_user: from_user_flag != 0,
-            });
+            out.push(rehydrate_message(&role, content, from_user_flag != 0)?);
         }
         Ok(out)
     }
@@ -831,13 +846,7 @@ impl SessionStore for LibsqlSessionStore {
             })?;
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
-            out.push(aura_model::ChatMessage {
-                role: role
-                    .parse::<aura_model::Role>()
-                    .map_err(StorageError::Storage)?,
-                content,
-                from_user: from_user_flag != 0,
-            });
+            out.push(rehydrate_message(&role, content, from_user_flag != 0)?);
         }
         Ok(out)
     }
@@ -905,13 +914,7 @@ impl SessionStore for LibsqlSessionStore {
             out.push((
                 ordinal,
                 created_at,
-                aura_model::ChatMessage {
-                    role: role
-                        .parse::<aura_model::Role>()
-                        .map_err(StorageError::Storage)?,
-                    content,
-                    from_user: from_user_flag != 0,
-                },
+                rehydrate_message(&role, content, from_user_flag != 0)?,
             ));
         }
         // Caller expects ascending ordinal order — the SQL pulled the
@@ -973,13 +976,7 @@ impl SessionStore for LibsqlSessionStore {
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
             out.push((
                 ordinal,
-                aura_model::ChatMessage {
-                    role: role
-                        .parse::<aura_model::Role>()
-                        .map_err(StorageError::Storage)?,
-                    content,
-                    from_user: from_user_flag != 0,
-                },
+                rehydrate_message(&role, content, from_user_flag != 0)?,
             ));
         }
         Ok(out)
@@ -1037,13 +1034,7 @@ impl SessionStore for LibsqlSessionStore {
                 ordinal,
                 superseded_by,
                 created_at,
-                message: aura_model::ChatMessage {
-                    role: role
-                        .parse::<aura_model::Role>()
-                        .map_err(StorageError::Storage)?,
-                    content,
-                    from_user: from_user_flag != 0,
-                },
+                message: rehydrate_message(&role, content, from_user_flag != 0)?,
             });
         }
         Ok(out)
@@ -1268,11 +1259,9 @@ mod tests {
         let session = make_root_session("paginate-me");
         store.save(&session).await.unwrap();
         for i in 0..7 {
-            let msg = aura_model::ChatMessage {
-                role: aura_model::Role::User,
-                content: vec![aura_model::ContentBlock::Text(format!("msg-{i}"))],
-                from_user: true,
-            };
+            let msg = aura_model::ChatMessage::user(vec![aura_model::ContentBlock::Text(format!(
+                "msg-{i}"
+            ))]);
             store
                 .append_session_message(&session.id, &msg)
                 .await
@@ -1323,11 +1312,9 @@ mod tests {
         let session = make_root_session("catch-up-me");
         store.save(&session).await.unwrap();
         for i in 0..7 {
-            let msg = aura_model::ChatMessage {
-                role: aura_model::Role::User,
-                content: vec![aura_model::ContentBlock::Text(format!("msg-{i}"))],
-                from_user: true,
-            };
+            let msg = aura_model::ChatMessage::user(vec![aura_model::ContentBlock::Text(format!(
+                "msg-{i}"
+            ))]);
             store
                 .append_session_message(&session.id, &msg)
                 .await

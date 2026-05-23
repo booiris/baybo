@@ -650,7 +650,7 @@ async fn chat_to_visible_wire_message(
     blob_store: &dyn aura_store::BlobStore,
 ) -> Option<WireMessage> {
     let role = match msg.role {
-        Role::User if msg.from_user => MessageRole::User,
+        Role::User if msg.from_user() => MessageRole::User,
         Role::Assistant => MessageRole::Assistant,
         // Role::System rows are the leading prompt — never user-facing.
         // Role::User with from_user=false is an agent-injected reminder.

@@ -460,7 +460,7 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
     // The synthetic notice is `from_user = false`, so chat surfaces hide
     // it — it must not render as a fake user-authored bubble.
     assert!(
-        !user_msg.from_user,
+        !user_msg.from_user(),
         "subagent notice must be persisted as from_user=false"
     );
 

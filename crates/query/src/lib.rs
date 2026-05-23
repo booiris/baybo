@@ -1817,24 +1817,16 @@ mod tests {
     /// the LLM saw.
     #[tokio::test]
     async fn replay_hydrates_persisted_inputs_across_compaction() {
-        use aura_model::{ChatMessage, ContentBlock, Role, SpanId, StepId};
+        use aura_model::{ChatMessage, ContentBlock, SpanId, StepId};
         use aura_trace::{
             LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind, TraceStore,
         };
 
         fn user_msg(text: &str) -> ChatMessage {
-            ChatMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text(text.into())],
-                from_user: false,
-            }
+            ChatMessage::agent_context(vec![ContentBlock::Text(text.into())])
         }
         fn system_msg(text: &str) -> ChatMessage {
-            ChatMessage {
-                role: Role::System,
-                content: vec![ContentBlock::Text(text.into())],
-                from_user: false,
-            }
+            ChatMessage::system(vec![ContentBlock::Text(text.into())])
         }
 
         let session_store = Arc::new(MemSessionStore::default());
@@ -2079,14 +2071,10 @@ mod tests {
     /// No step/span data — that's the cheap-on-purpose contract.
     #[tokio::test]
     async fn load_trace_overview_returns_message_log_and_summaries() {
-        use aura_model::{ChatMessage, ContentBlock, Role};
+        use aura_model::{ChatMessage, ContentBlock};
 
         fn user_msg(text: &str) -> ChatMessage {
-            ChatMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text(text.into())],
-                from_user: false,
-            }
+            ChatMessage::agent_context(vec![ContentBlock::Text(text.into())])
         }
 
         let session_store = Arc::new(MemSessionStore::default());
@@ -2158,17 +2146,13 @@ mod tests {
     /// served by `load_trace_overview`.
     #[tokio::test]
     async fn load_job_trace_preserves_persisted_inputs() {
-        use aura_model::{ChatMessage, ContentBlock, Role, SpanId, StepId};
+        use aura_model::{ChatMessage, ContentBlock, SpanId, StepId};
         use aura_trace::{
             LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind, TraceStore,
         };
 
         fn user_msg(text: &str) -> ChatMessage {
-            ChatMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text(text.into())],
-                from_user: false,
-            }
+            ChatMessage::agent_context(vec![ContentBlock::Text(text.into())])
         }
 
         let session_store = Arc::new(MemSessionStore::default());

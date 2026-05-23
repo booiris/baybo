@@ -940,11 +940,9 @@ impl LlmClient {
     /// tiny (one-token prompt, no tools) so it is cheap to run repeatedly.
     pub async fn probe(&self) -> crate::Result<ProbeReport> {
         let req = ChatRequest {
-            messages: vec![aura_model::ChatMessage {
-                role: aura_model::Role::User,
-                content: vec![aura_model::ContentBlock::Text("ping".to_string())],
-                from_user: false,
-            }],
+            messages: vec![aura_model::ChatMessage::agent_context(vec![
+                aura_model::ContentBlock::Text("ping".to_string()),
+            ])],
             temperature: Some(0.0),
             tools: vec![],
         };

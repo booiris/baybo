@@ -18,7 +18,7 @@ use aura_gateway::auth::{
 use aura_gateway::channel::{StashedTokenHandle, boot};
 use aura_gateway::channel_listener::ChannelServer;
 use aura_gateway::test_support::build_test_deps;
-use aura_model::{ChannelType, ChatMessage, ContentBlock, MessageMetadata, Role, User};
+use aura_model::{ChannelType, ChatMessage, ContentBlock, MessageMetadata, User};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::client_async;
@@ -738,41 +738,14 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
     // Mix of rows: visible bubbles + agent-internal rows that the
     // catch-up replay must skip.
     let rows: &[ChatMessage] = &[
-        ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text("hi".into())],
-            from_user: true,
-        },
+        ChatMessage::user(vec![ContentBlock::Text("hi".into())]),
         // Agent-injected user-role reminder — must NOT replay.
-        ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text("[skill reminder]".into())],
-            from_user: false,
-        },
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text("hello there".into())],
-            from_user: false,
-        },
-        ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text("how are you".into())],
-            from_user: true,
-        },
+        ChatMessage::agent_context(vec![ContentBlock::Text("[skill reminder]".into())]),
+        ChatMessage::assistant(vec![ContentBlock::Text("hello there".into())]),
+        ChatMessage::user(vec![ContentBlock::Text("how are you".into())]),
         // Tool-result row — must NOT replay.
-        ChatMessage {
-            role: Role::Tool,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: "t1".into(),
-                content: "ok".into(),
-            }],
-            from_user: false,
-        },
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text("doing well".into())],
-            from_user: false,
-        },
+        ChatMessage::tool_result("t1".into(), "ok".into()),
+        ChatMessage::assistant(vec![ContentBlock::Text("doing well".into())]),
     ];
     for msg in rows {
         session_manager

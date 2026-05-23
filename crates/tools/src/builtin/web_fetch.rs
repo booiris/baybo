@@ -66,7 +66,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_llm::{BilledChat, ChatRequest};
-use aura_model::{ChatMessage, ContentBlock, Role};
+use aura_model::{ChatMessage, ContentBlock};
 use aura_store::BlobStore;
 use dom_smoothie::Readability;
 use htmd::HtmlToMarkdown;
@@ -576,16 +576,8 @@ async fn run_summary(
 ) -> Result<String, String> {
     let request = ChatRequest {
         messages: vec![
-            ChatMessage {
-                role: Role::System,
-                content: vec![ContentBlock::Text(SUMMARY_SYSTEM_PROMPT.to_string())],
-                from_user: false,
-            },
-            ChatMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text(user_text.to_string())],
-                from_user: false,
-            },
+            ChatMessage::system(vec![ContentBlock::Text(SUMMARY_SYSTEM_PROMPT.to_string())]),
+            ChatMessage::agent_context(vec![ContentBlock::Text(user_text.to_string())]),
         ],
         temperature: Some(0.0),
         tools: vec![],

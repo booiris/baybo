@@ -27,7 +27,7 @@ use aura_agent::SecurityGateway;
 use aura_integration_tests::gateway_with_memory_vault;
 use aura_llm::test_support::StubLlm;
 use aura_llm::{ChatRequest, LlmCompletion, StreamEvent};
-use aura_model::{ChatMessage, ContentBlock, Role};
+use aura_model::{ChatMessage, ContentBlock};
 use futures::StreamExt;
 
 const AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
@@ -53,11 +53,9 @@ fn safe_flush_boundary(pending: &str) -> usize {
 
 fn req() -> ChatRequest {
     ChatRequest {
-        messages: vec![ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text("hi".into())],
-            from_user: false,
-        }],
+        messages: vec![ChatMessage::agent_context(vec![ContentBlock::Text(
+            "hi".into(),
+        )])],
         temperature: None,
         tools: vec![],
     }

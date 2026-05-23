@@ -160,16 +160,14 @@ impl LlmCompletion for StubLlm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChatMessage, ContentBlock, Role};
+    use aura_model::{ChatMessage, ContentBlock};
     use futures::StreamExt;
 
     fn req() -> ChatRequest {
         ChatRequest {
-            messages: vec![ChatMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text("hi".into())],
-                from_user: false,
-            }],
+            messages: vec![ChatMessage::agent_context(vec![ContentBlock::Text(
+                "hi".into(),
+            )])],
             temperature: None,
             tools: vec![],
         }

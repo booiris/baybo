@@ -1,10 +1,28 @@
 # `ChatMessage` authorship encoding (`from_user: bool` → safer design)
 
-> Status: **TODO, not started.** A **generic refactor** of `aura_model::ChatMessage` — it
-> should land on `master` on its own, not bundled into a feature branch. Surfaced 2026-05-23
-> by an adversarial review of the subagent-notification work (now shipped; see the
-> "Background subagent results / scheduling invariants" notes in
-> [`docs/modules/agent.md`](../modules/agent.md)).
+> Status: **Done — options (1) + (2) landed 2026-05-23.** A **generic refactor** of
+> `aura_model::ChatMessage`. Surfaced 2026-05-23 by an adversarial review of the
+> subagent-notification work (shipped; see the "Background subagent results / scheduling
+> invariants" notes in [`docs/modules/agent.md`](../modules/agent.md)).
+>
+> **What landed:** `from_user` is sealed (non-`pub`) behind intent constructors —
+> `ChatMessage::user` (the sole producer of `from_user = true`), `::agent_context`,
+> `::assistant`, `::system`, `::tool` / `::tool_result` — read via `ChatMessage::from_user()`.
+> Provenance is now declared by the caller, and the wrong combo (`Assistant` + `from_user`) is
+> unconstructable. `AgentLoop::run` derives genuineness by **whitelist** —
+> `from_user = matches!(job_input, JobInput::UserChat { .. })` — so cron fires, spawned /
+> subagent task prompts, and the subagent notification are all `agent_context`. The external
+> subagent task (`run_external_agent`) flipped from `from_user: true` → `agent_context`.
+>
+> **Decision (cron / spawned visibility):** those reclassified prompts no longer satisfy the
+> chat-surface `from_user` filters, so they stop rendering as user bubbles in the transcript,
+> WS catch-up, and sidebar preview — intentional, since they aren't user-authored. The cron
+> **inbox** still surfaces the prompt: `build_cron_message` now locates the cron row by its
+> `[cron:<id>]` framing (`cron_prompt::is_framed_cron_prompt`) instead of `from_user`, because
+> the framed prompt is an `agent_context` `Role::User` row indistinguishable by provenance from
+> a skill reminder. The persistence boundary rehydrates through one seam
+> (`storage::libsql::session::rehydrate_message`, the only place the stored `from_user` flag is
+> honored). Option (3) deferred.
 
 ## Problem
 
@@ -52,13 +70,21 @@ safely, but it patches the symptom rather than the encoding.
    `session_messages` column, llm role conversion, ts-bindings, and ~85 sites all move. Worth
    doing only with dedicated budget.
 
-Recommendation: **(1) + (2)**. Defer (3) unless the type is being reworked for other reasons.
+Recommendation: **(1) + (2)** — **implemented**. (3) deferred unless the type is reworked for
+other reasons; it stays the right end-state if visible-but-synthetic prompts (cron / spawned)
+ever need to render as a distinct non-user bubble rather than be hidden.
 
 ## Related
 
-- `crates/model/src/message.rs` — `ChatMessage` / `Role`; the `from_user` field + its doc comment
-- `crates/agent/src/runtime/agent_loop.rs` — `run` derives `from_user` from the job kind;
-  `run_inner` builds the user turn; `append_context_message` / `append_user_message`
+- `crates/model/src/message.rs` — `ChatMessage` / `Role`; sealed `from_user` field, the intent
+  constructors (`user` / `agent_context` / `assistant` / `system` / `tool` / `tool_result`), and
+  the `from_user()` getter
+- `crates/agent/src/runtime/agent_loop.rs` — `run` whitelists `JobInput::UserChat` for
+  `from_user`; `run_inner` builds the user vs agent-context turn; `append_user_message`
+- `crates/agent/src/actor/cron_prompt.rs` — `is_framed_cron_prompt` / `frame_cron_prompt` share
+  the `[cron:` tag prefix the inbox now keys off instead of `from_user`
 - `crates/gateway/src/api/admin/chat.rs`, `crates/gateway/src/channel/route.rs` — the
-  `Role::User && from_user` visibility filter the encoding feeds
-- `crates/storage/src/libsql/session.rs` — the persisted `from_user` column (matters for option 3)
+  `Role::User && from_user()` visibility filter; `build_cron_message` locates the cron prompt by
+  framing
+- `crates/storage/src/libsql/session.rs` — `rehydrate_message`, the one seam that maps a stored
+  `(role, from_user)` row back to the right constructor
