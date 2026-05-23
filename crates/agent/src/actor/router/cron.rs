@@ -20,9 +20,10 @@ impl Router {
     /// supervisor: each cron session is one-shot and has no follow-up
     /// traffic, so registering would just accumulate dangling actor
     /// handles in the supervisor's map. We send `CronTrigger` followed
-    /// by `Shutdown`; the actor processes the trigger (FIFO), exits on
-    /// Shutdown, and its mailbox closes when this function returns and
-    /// drops the sender.
+    /// by `ActorStop`; the priority mailbox serves the trigger first
+    /// (`CronTrigger` outranks the lowest-priority `ActorStop`), so the
+    /// actor processes the fire then exits on `ActorStop`, and its mailbox
+    /// closes when this function returns and drops the sender.
     pub(super) async fn handle_cron_trigger(
         &mut self,
         event: CronTriggerEvent,
