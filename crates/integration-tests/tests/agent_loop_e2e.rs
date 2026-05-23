@@ -596,18 +596,21 @@ async fn subagent_notification_failure_keeps_pending_for_retry() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn failed_subagent_notification_retries_on_backoff() {
-    // A FAILED notification turn must retry on the backoff rather than wait
-    // for the session's next inbound message. Paused time lets tokio
-    // auto-advance through the (real, 60s) retry sleep when every task is
-    // idle, so this exercises the production backoff yet runs instantly.
+async fn failed_subagent_notification_retries_until_success() {
+    // The notification turn retries indefinitely on exponential backoff —
+    // there is NO attempt cap — so a completion is delivered once the
+    // provider recovers, even after MORE failures than the old cap would
+    // have allowed. Paused time auto-advances through the real backoffs, so
+    // this runs instantly.
     let mut harness = AgentTestHarness::builder().build();
     let session_id = harness.session.id.clone();
 
-    // First attempt fails; the retry succeeds.
-    harness
-        .stub_llm
-        .push_response_err(LlmError::Internal(anyhow::anyhow!("provider blip")));
+    // Six consecutive failures (past the former 5-attempt cap), then success.
+    for _ in 0..6 {
+        harness
+            .stub_llm
+            .push_response_err(LlmError::Internal(anyhow::anyhow!("provider blip")));
+    }
     harness.stub_llm.push_response(LlmResponse {
         content: "research done".into(),
         content_blocks: vec![],
@@ -634,12 +637,13 @@ async fn failed_subagent_notification_retries_on_backoff() {
 
     // Long enough that auto-advance steps past the first retry backoff (60s)
     // and the retry's reply reaches the channel.
-    let outputs = harness.drain_outputs(Duration::from_secs(120)).await;
+    let outputs = harness.drain_outputs(Duration::from_secs(2000)).await;
 
-    // The turn was attempted at least twice (initial failure + retry) …
+    // Attempted at least 7 times (initial + 6 retries) — past the former
+    // cap, proving there is no give-up …
     assert!(
-        harness.stub_llm.captured_requests().len() >= 2,
-        "a failed notification must be retried"
+        harness.stub_llm.captured_requests().len() >= 7,
+        "a failed notification must retry past the old attempt cap"
     );
     // … the retry drained the buffer …
     let stored = harness

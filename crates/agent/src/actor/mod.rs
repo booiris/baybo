@@ -23,16 +23,18 @@ use tracing::{debug, error, info, warn};
 /// dropped (its content still lives in the child session's trace).
 const MAX_PENDING_SUBAGENT_RESULTS: usize = 64;
 
-/// Bounded retry schedule for a FAILED `SubagentNotification` turn. When the
-/// turn errors (provider / cost / cancel) and the session then goes idle, the
-/// actor retries on this backoff so a fire-and-forget completion is still
-/// reported during the idle window — not only when the user next writes.
-/// After `NOTIFY_RETRY_MAX_ATTEMPTS` consecutive failures the actor stops
-/// retrying (the bumped `last_active` would otherwise keep it un-reapable)
-/// and falls back to delivering on the next inbound message or hydration.
+/// Exponential-backoff retry schedule for a FAILED `SubagentNotification`
+/// turn. When the turn errors (provider / cost / cancel) and the session is
+/// idle, the actor retries on this backoff so a fire-and-forget completion is
+/// still reported during the idle window. There is **no attempt cap** — a
+/// delivered completion is never dropped, so the actor retries indefinitely
+/// (each step doubling, capped at `NOTIFY_RETRY_MAX_BACKOFF`) until it
+/// succeeds; an inbound message resets the schedule. Trade-off: a session
+/// whose notification turn keeps failing stays resident (each retry bumps
+/// `last_active`, so the idle reaper won't reclaim it) rather than dropping
+/// the completion — the result is also buffered + persisted throughout.
 const NOTIFY_RETRY_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 const NOTIFY_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
-const NOTIFY_RETRY_MAX_ATTEMPTS: u32 = 5;
 
 /// Surfaced (as a `Notice`) when a *user* turn yields a blank reply — the
 /// user is waiting, so acknowledge rather than push an empty bubble. Non-user
@@ -230,21 +232,20 @@ impl AgentActor {
             .await;
 
         // A failed `SubagentNotification` turn leaves the buffer non-empty;
-        // rather than wait for the next inbound message, retry on a capped
-        // backoff so a fire-and-forget completion is still reported during
-        // the idle window. A real message wins the race (biased) and resets
-        // the schedule; after `NOTIFY_RETRY_MAX_ATTEMPTS` consecutive failures
-        // we give up and deliver on the next message/hydration.
+        // rather than wait for the next inbound message, retry on an
+        // exponential backoff (capped at `NOTIFY_RETRY_MAX_BACKOFF`) so a
+        // fire-and-forget completion is still reported during the idle
+        // window. No attempt cap — a delivered completion is never dropped,
+        // so the actor keeps retrying until it succeeds. A real inbound
+        // message wins the race (biased) and resets the backoff.
         let mut notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
-        let mut notify_retries: u32 = 0;
         loop {
-            let next = if notify_retries < NOTIFY_RETRY_MAX_ATTEMPTS
-                && !self
-                    .durable
-                    .session
-                    .state
-                    .pending_subagent_results
-                    .is_empty()
+            let next = if !self
+                .durable
+                .session
+                .state
+                .pending_subagent_results
+                .is_empty()
             {
                 tokio::select! {
                     biased;
@@ -258,10 +259,8 @@ impl AgentActor {
                             .pending_subagent_results
                             .is_empty()
                         {
-                            notify_retries = 0;
                             notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
                         } else {
-                            notify_retries += 1;
                             notify_backoff = (notify_backoff * 2).min(NOTIFY_RETRY_MAX_BACKOFF);
                         }
                         continue;
@@ -273,8 +272,7 @@ impl AgentActor {
             let Some(msg) = next else {
                 break;
             };
-            // Real activity resets the notification retry schedule.
-            notify_retries = 0;
+            // A real message resets the notification backoff (fresh schedule).
             notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
             let deferred = match msg {
                 AgentMessage::ActorStop => {

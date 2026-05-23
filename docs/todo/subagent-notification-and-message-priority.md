@@ -76,7 +76,7 @@ Tier 3 (lowest):            ActorStop
 The custom mailbox must re-implement three things `mpsc` gave for free:
 
 1. **FIFO-within-tier** via a monotonic insertion sequence number as the heap tiebreaker.
-2. **Bounded capacity + backpressure** (match the current configured mailbox capacity).
+2. **Bounded capacity + backpressure** — production uses `mailbox::DEFAULT_CAPACITY` (4096); `send` awaits a free slot rather than dropping.
 3. **Close-on-all-senders-dropped** → `recv` resolves to `None`. The cron one-shot relies on
    sender-drop to exit (`cron.rs`), so this must be correct or that actor hangs.
 
@@ -164,11 +164,13 @@ then stop"). This is deliberate:
   re-persisted so the next drain retries them. So: a transient failure never loses a completion; a
   crash mid-turn drops it from the parent row but it survives in the child session's trace. (The
   actor is single-threaded, so nothing is buffered while the turn runs.) After a failure the actor
-  **retries on a capped backoff** (`NOTIFY_RETRY_*` — 60s, ×2, cap 5 min, ≤5 attempts), via a
-  biased `select!` over `mailbox.recv()` vs a sleep in the run loop, so a quiet fire-and-forget
-  session is still notified during the idle window. A real inbound message wins the race and resets
-  the schedule; after the attempt cap the actor falls back to delivering on the next message /
-  hydration (so the `last_active` bumped by each retry can no longer keep it from being reaped).
+  **retries on an exponential backoff with NO attempt cap** (`NOTIFY_RETRY_*` — 60s, ×2, capped at
+  5 min), via a biased `select!` over `mailbox.recv()` vs a sleep in the run loop, so a quiet
+  fire-and-forget completion is **never dropped** — the actor keeps retrying until it succeeds; a
+  real inbound message wins the race and resets the backoff. Trade-off: a session whose
+  notification turn keeps failing stays resident (each retry bumps `last_active`, so the idle
+  reaper won't reclaim it) rather than dropping the completion — the result stays buffered +
+  persisted throughout.
 
 ### 5. Buffer (unchanged shape)
 

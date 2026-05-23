@@ -23,6 +23,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
+/// Default mailbox capacity the assembly layer uses for production
+/// per-session actors. Generous so a burst of background-subagent terminals
+/// or user messages backpressures the sender rather than stalling the actor;
+/// the mailbox is bounded (it never drops — `send` awaits a slot), so this
+/// only bounds queue depth.
+pub const DEFAULT_CAPACITY: usize = 4096;
+
 /// Priority class of a mailbox message; higher is served first. The
 /// derived `Ord` follows declaration order, so `Trigger > SubagentFinished
 /// > Stop`.
