@@ -24,7 +24,9 @@ pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLeve
 pub use ids::{CostRecordId, JobId, ParallelGroup, SessionId, SpanId, StepId};
 pub use llm_entry_name::LlmEntryName;
 pub use memory::{MemoryCategory, MemoryEntry};
-pub use message::{BlobRef, ChatMessage, ContentBlock, MessageMetadata, Role, ThinkingContent};
+pub use message::{
+    BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role, ThinkingContent,
+};
 pub use model_tier::ModelTier;
 pub use money::{MicroUsd, usd_decimal_option};
 pub use pricing::LlmPricingOverride;

@@ -1,28 +1,37 @@
 # `ChatMessage` authorship encoding (`from_user: bool` → safer design)
 
-> Status: **Done — options (1) + (2) landed 2026-05-23.** A **generic refactor** of
-> `aura_model::ChatMessage`. Surfaced 2026-05-23 by an adversarial review of the
-> subagent-notification work (shipped; see the "Background subagent results / scheduling
-> invariants" notes in [`docs/modules/agent.md`](../modules/agent.md)).
+> Status: **Done — (1) + (2) landed 2026-05-23; the typed-provenance step (a focused form of
+> (3)) landed 2026-05-24.** A **generic refactor** of `aura_model::ChatMessage`. Surfaced
+> 2026-05-23 by an adversarial review of the subagent-notification work (shipped; see the
+> "Background subagent results / scheduling invariants" notes in
+> [`docs/modules/agent.md`](../modules/agent.md)).
 >
-> **What landed:** `from_user` is sealed (non-`pub`) behind intent constructors —
-> `ChatMessage::user` (the sole producer of `from_user = true`), `::agent_context`,
-> `::assistant`, `::system`, `::tool` / `::tool_result` — read via `ChatMessage::from_user()`.
-> Provenance is now declared by the caller, and the wrong combo (`Assistant` + `from_user`) is
-> unconstructable. `AgentLoop::run` derives genuineness by **whitelist** —
-> `from_user = matches!(job_input, JobInput::UserChat { .. })` — so cron fires, spawned /
-> subagent task prompts, and the subagent notification are all `agent_context`. The external
-> subagent task (`run_external_agent`) flipped from `from_user: true` → `agent_context`.
+> **What landed (1 + 2):** the provenance field is sealed (non-`pub`) behind intent constructors —
+> `ChatMessage::user` (the sole user-authored producer), `::agent_context`, `::assistant`,
+> `::system`, `::tool` / `::tool_result`. Provenance is declared by the caller, and the wrong combo
+> (`Assistant` + user-authored) is unconstructable. `AgentLoop::run` derives provenance from the
+> `JobInput` kind, so cron fires, spawned / subagent task prompts, and the subagent notification
+> are never marked user-authored. The external subagent task (`run_external_agent`) flipped to
+> agent context.
 >
-> **Decision (cron / spawned visibility):** those reclassified prompts no longer satisfy the
-> chat-surface `from_user` filters, so they stop rendering as user bubbles in the transcript,
-> WS catch-up, and sidebar preview — intentional, since they aren't user-authored. The cron
-> **inbox** still surfaces the prompt: `build_cron_message` now locates the cron row by its
-> `[cron:<id>]` framing (`cron_prompt::is_framed_cron_prompt`) instead of `from_user`, because
-> the framed prompt is an `agent_context` `Role::User` row indistinguishable by provenance from
-> a skill reminder. The persistence boundary rehydrates through one seam
-> (`storage::libsql::session::rehydrate_message`, the only place the stored `from_user` flag is
-> honored). Option (3) deferred.
+> **What landed (typed provenance, 2026-05-24):** the `from_user: bool` field was replaced by a
+> sealed `source: MessageSource { User, Cron, Agent }` enum, plus a `ChatMessage::cron_fire`
+> constructor (the sole `Cron` producer) and a `source()` getter; `from_user()` stays as a
+> convenience (`source == User`). `AgentLoop::run` maps `JobInput` → source (`UserChat` → `User`,
+> `Cron` → `Cron`, else `Agent`). The **cron inbox now identifies the cron row by
+> `MessageSource::Cron`** instead of sniffing the `[cron:<id>]` framing out of the content —
+> `cron_prompt::is_framed_cron_prompt` was removed. `frame_cron_prompt` still prepends the
+> `[cron:]` tag (LLM diagnostics + trace tooling) and `original_cron_prompt` still strips the
+> framing for display. The persisted column became `source TEXT` (was `from_user INTEGER`), and
+> rehydration maps `(role, source)` back to the constructor through one seam
+> (`storage::libsql::session::rehydrate_message`). **No history backfill** — greenfield decision.
+>
+> **Decision (cron / spawned visibility):** synthetic prompts still don't satisfy the chat-surface
+> `from_user()` filter, so they don't render as user bubbles in the transcript, WS catch-up, or
+> sidebar preview — intentional, since they aren't user-authored. The cron **inbox** still surfaces
+> the prompt, now via the typed `source` rather than the framing tag. With a typed `Cron` source in
+> hand, a future surface *could* choose to render cron fires as a distinct (non-user) bubble; that
+> is now a one-line filter change rather than a content sniff.
 
 ## Problem
 
@@ -70,21 +79,29 @@ safely, but it patches the symptom rather than the encoding.
    `session_messages` column, llm role conversion, ts-bindings, and ~85 sites all move. Worth
    doing only with dedicated budget.
 
-Recommendation: **(1) + (2)** — **implemented**. (3) deferred unless the type is reworked for
-other reasons; it stays the right end-state if visible-but-synthetic prompts (cron / spawned)
-ever need to render as a distinct non-user bubble rather than be hidden.
+Recommendation: **(1) + (2)** — **implemented**, then a **focused form of (3)**: rather than fold
+`role` into a single origin enum (which would move llm-role conversion and the persisted role
+column), a separate sealed `source: MessageSource { User, Cron, Agent }` was added alongside
+`role`. This keeps `role` as the LLM-facing field while giving operator surfaces a typed
+provenance — enough to retire the cron `[cron:]` content-sniff. The full single-enum merge stays
+deferred (it would also subsume `role`); the current split is the better cost/value point.
 
 ## Related
 
-- `crates/model/src/message.rs` — `ChatMessage` / `Role`; sealed `from_user` field, the intent
-  constructors (`user` / `agent_context` / `assistant` / `system` / `tool` / `tool_result`), and
-  the `from_user()` getter
-- `crates/agent/src/runtime/agent_loop.rs` — `run` whitelists `JobInput::UserChat` for
-  `from_user`; `run_inner` builds the user vs agent-context turn; `append_user_message`
-- `crates/agent/src/actor/cron_prompt.rs` — `is_framed_cron_prompt` / `frame_cron_prompt` share
-  the `[cron:` tag prefix the inbox now keys off instead of `from_user`
+- `crates/model/src/message.rs` — `ChatMessage` / `Role`; the sealed `source: MessageSource`
+  field, the `MessageSource { User, Cron, Agent }` enum, the intent constructors (`user` /
+  `cron_fire` / `agent_context` / `assistant` / `system` / `tool` / `tool_result`), the `source()`
+  getter, and the `from_user()` convenience
+- `crates/agent/src/runtime/agent_loop.rs` — `run` maps `JobInput` → `MessageSource`; `run_inner`
+  builds the user / cron-fire / agent-context turn; `append_user_message`
+- `crates/agent/src/actor/cron_prompt.rs` — `frame_cron_prompt` / `original_cron_prompt` (the
+  `[cron:]` tag is for LLM diagnostics + display stripping; row identification is by
+  `MessageSource::Cron`, not the tag)
 - `crates/gateway/src/api/admin/chat.rs`, `crates/gateway/src/channel/route.rs` — the
-  `Role::User && from_user()` visibility filter; `build_cron_message` locates the cron prompt by
-  framing
+  `Role::User && from_user()` visibility filter; `cron_message_from_session` locates the cron
+  prompt by `source() == MessageSource::Cron`
 - `crates/storage/src/libsql/session.rs` — `rehydrate_message`, the one seam that maps a stored
-  `(role, from_user)` row back to the right constructor
+  `(role, source)` row back to the right constructor; the `source TEXT` column lives in
+  `crates/storage/src/libsql/mod.rs`
+- `web/src/types/trace.ts` — the hand-maintained `ChatMessage` mirror now carries
+  `source: MessageSource` ('user' | 'cron' | 'agent')

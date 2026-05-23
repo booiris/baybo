@@ -61,6 +61,13 @@ export interface Step {
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 
+// Provenance of a ChatMessage row (mirrors `aura_model::MessageSource`).
+// Several origins ride as a `user` role, so role alone can't tell a genuine
+// prompt from a cron fire or an agent-injected reminder — this distinguishes
+// them. 'user' = human channel input; 'cron' = a cron fire's framed prompt;
+// 'agent' = everything else the agent injects/produces.
+export type MessageSource = 'user' | 'cron' | 'agent';
+
 export interface BlobRef {
   blob_id: string;
 }
@@ -90,11 +97,11 @@ export interface ChatMessage {
   role: Role;
   content: ContentBlock[];
   /**
-   * `true` only when the message originated from a user channel input.
-   * Distinguishes the genuine prompt from `Role::User` messages the
-   * agent injects (skill reminders, system-reminders).
+   * Provenance of the row. Distinguishes a genuine user prompt ('user') from
+   * a cron fire ('cron') and from the `user`-role messages the agent injects
+   * ('agent': skill reminders, subagent tasks, the system prompt, etc.).
    */
-  from_user: boolean;
+  source: MessageSource;
 }
 
 // ── Span ──────────────────────────────────────────────────────────────

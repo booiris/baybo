@@ -64,45 +64,106 @@ pub struct BlobRef {
     pub blob_id: String,
 }
 
+/// Where a [`ChatMessage`] row came from — its provenance, independent of the
+/// LLM-facing [`Role`]. Several distinct origins all ride as a `Role::User`
+/// turn (a human's input, a cron fire's framed prompt, an agent-injected skill
+/// reminder), so role alone can't tell them apart; operator surfaces key off
+/// this instead of guessing by content. Sealed behind the [`ChatMessage`]
+/// constructors — set once, never flipped by a raw literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageSource {
+    /// A genuine message a human sent through a channel input. The only source
+    /// that renders as a user bubble on chat surfaces.
+    User,
+    /// A cron job's fire-time framed prompt: synthesized by the agent, so
+    /// hidden from the chat transcript, but surfaced on its own in the
+    /// operator cron inbox (which finds it by this variant rather than by
+    /// sniffing the framing tag out of the content).
+    Cron,
+    /// Any other agent-originated row: skill reminders, a spawned/subagent task
+    /// prompt, the subagent-finished notification, summary instructions, the
+    /// system prompt, assistant output, tool results. Hidden from chat surfaces.
+    Agent,
+}
+
+impl MessageSource {
+    /// Canonical lowercase wire/db spelling, matching the
+    /// `#[serde(rename_all = "snake_case")]` form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MessageSource::User => "user",
+            MessageSource::Cron => "cron",
+            MessageSource::Agent => "agent",
+        }
+    }
+}
+
+impl std::str::FromStr for MessageSource {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "user" => Ok(MessageSource::User),
+            "cron" => Ok(MessageSource::Cron),
+            "agent" => Ok(MessageSource::Agent),
+            other => Err(format!("unknown message source: {other}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: Vec<ContentBlock>,
-    /// `true` only when this row originated directly from a human channel
-    /// input. Sealed (non-`pub`) so provenance is set once, at the typed
-    /// constructor, never flipped by a raw literal: [`ChatMessage::user`]
-    /// is the sole producer of `true`; every synthetic `Role::User` row
-    /// goes through [`ChatMessage::agent_context`] (`false`). Read via
-    /// [`ChatMessage::from_user`].
-    from_user: bool,
+    /// Where this row came from. Sealed (non-`pub`) so provenance is set once,
+    /// at the typed constructor, never flipped by a raw literal:
+    /// [`ChatMessage::user`] is the sole producer of [`MessageSource::User`],
+    /// [`ChatMessage::cron_fire`] the sole producer of [`MessageSource::Cron`],
+    /// and every other constructor stamps [`MessageSource::Agent`]. Read via
+    /// [`ChatMessage::source`] (or the [`ChatMessage::from_user`] convenience).
+    source: MessageSource,
 }
 
 impl ChatMessage {
     /// A genuine message a human sent through a channel input — the **only**
-    /// constructor that marks a row user-authored (`from_user = true`).
+    /// constructor that marks a row [`MessageSource::User`].
     ///
-    /// Every synthetic `Role::User` row the agent injects — a cron fire's
-    /// framed prompt, a spawned/subagent task prompt, a skill reminder, the
-    /// subagent-finished notification — must use [`ChatMessage::agent_context`]
-    /// instead, so chat surfaces never present synthesized content as
-    /// something the user typed.
+    /// Every synthetic `Role::User` row the agent injects — a skill reminder, a
+    /// spawned/subagent task prompt, the subagent-finished notification — must
+    /// use [`ChatMessage::agent_context`] instead (and a cron fire uses
+    /// [`ChatMessage::cron_fire`]), so chat surfaces never present synthesized
+    /// content as something the user typed.
     pub fn user(content: Vec<ContentBlock>) -> Self {
         Self {
             role: Role::User,
             content,
-            from_user: true,
+            source: MessageSource::User,
+        }
+    }
+
+    /// A cron job's fire-time framed prompt — a `Role::User` turn the agent
+    /// synthesized at fire time (see the agent crate's
+    /// `cron_prompt::frame_cron_prompt`). Carries [`MessageSource::Cron`] so
+    /// the operator cron inbox can locate it by provenance instead of sniffing
+    /// the `[cron:<id>]` framing tag, while the chat transcript still hides it.
+    pub fn cron_fire(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content,
+            source: MessageSource::Cron,
         }
     }
 
     /// An agent-injected `Role::User` row: content the model should read as a
-    /// user turn (cron-fire framing, a spawned subagent's task, a skill
-    /// reminder, the subagent-finished notification) but that no human sent.
-    /// Carries `from_user = false`, so it never surfaces as a user bubble.
+    /// user turn (a skill reminder, a spawned subagent's task, the
+    /// subagent-finished notification) but that no human sent. Carries
+    /// [`MessageSource::Agent`], so it never surfaces as a user bubble.
     pub fn agent_context(content: Vec<ContentBlock>) -> Self {
         Self {
             role: Role::User,
             content,
-            from_user: false,
+            source: MessageSource::Agent,
         }
     }
 
@@ -111,7 +172,7 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content,
-            from_user: false,
+            source: MessageSource::Agent,
         }
     }
 
@@ -120,7 +181,7 @@ impl ChatMessage {
         Self {
             role: Role::System,
             content,
-            from_user: false,
+            source: MessageSource::Agent,
         }
     }
 
@@ -129,7 +190,7 @@ impl ChatMessage {
         Self {
             role: Role::Tool,
             content,
-            from_user: false,
+            source: MessageSource::Agent,
         }
     }
 
@@ -141,11 +202,19 @@ impl ChatMessage {
         }])
     }
 
+    /// This row's provenance — see [`MessageSource`]. Operator surfaces use it
+    /// to tell a genuine prompt, a cron fire, and agent-injected context apart
+    /// even though all three are `Role::User`.
+    pub fn source(&self) -> MessageSource {
+        self.source
+    }
+
     /// `true` only when this row came directly from a human channel input
-    /// (see [`ChatMessage::user`]). Chat surfaces use it to surface the
-    /// genuine prompt and hide agent-injected `Role::User` rows.
+    /// (i.e. [`MessageSource::User`]; see [`ChatMessage::user`]). Chat surfaces
+    /// use it to surface the genuine prompt and hide agent-injected
+    /// `Role::User` rows.
     pub fn from_user(&self) -> bool {
-        self.from_user
+        matches!(self.source, MessageSource::User)
     }
 }
 

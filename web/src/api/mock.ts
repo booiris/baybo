@@ -271,11 +271,11 @@ function toolSpan(
 }
 
 function userMsg(text: string): ChatMessage {
-  return { role: 'user', content: [{ Text: text }], from_user: true };
+  return { role: 'user', content: [{ Text: text }], source: 'user' };
 }
 
 function systemMsg(text: string): ChatMessage {
-  return { role: 'system', content: [{ Text: text }], from_user: false };
+  return { role: 'system', content: [{ Text: text }], source: 'agent' };
 }
 
 // Shared mock fixture: builds one job's worth of steps/spans + the
@@ -388,7 +388,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
             ToolUse: { id: 'tu_1', name: 'list_directory', input: { path: '.' } },
           },
         ],
-        from_user: false,
+        source: 'agent',
       },
       {
         role: 'tool',
@@ -396,7 +396,7 @@ function buildMockSession(sessionId: string): MockSessionFixture {
           { ToolResult: { tool_use_id: 'tu_1', content: '{"files":["README.md","src","package.json"]}' } },
           { ToolResult: { tool_use_id: 'tu_2', content: '{"content":"..."}' } },
         ],
-        from_user: false,
+        source: 'agent',
       },
     ],
     'There are 3 entries: README.md, src/, package.json. README documents Aura.',

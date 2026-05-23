@@ -6,7 +6,9 @@ use aura_job::{JobInput, JobLifecycle, JobOutput};
 use aura_llm::{
     ChatRequest, GuardedLlm, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
 };
-use aura_model::{ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SystemSpawnRequest};
+use aura_model::{
+    ChatMessage, ContentBlock, JobId, LlmEntryName, MessageSource, Role, SystemSpawnRequest,
+};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -366,20 +368,25 @@ impl AgentLoop {
         // `Cron` / `System` where the input is a synthesized prompt
         // rather than the raw trigger payload.
         //
-        // Only a genuine channel input is user-authored. Cron fires, spawned
-        // / subagent task prompts, and the autonomous `SubagentNotification`
-        // are all synthesized `Role::User` content — appended as
-        // `from_user = false` so chat surfaces treat them as agent-injected
-        // context, not a real user-authored message.
+        // Provenance of the synthesized first turn. Only a genuine channel
+        // input is user-authored; a cron fire carries its own source so the
+        // operator cron inbox can find it; spawned / subagent task prompts and
+        // the autonomous `SubagentNotification` are generic agent context.
+        // Everything but `UserChat` is synthesized `Role::User` content that
+        // chat surfaces hide.
         let is_subagent_notification = matches!(job_input, JobInput::SubagentNotification { .. });
-        let from_user = matches!(job_input, JobInput::UserChat { .. });
+        let source = match job_input {
+            JobInput::UserChat { .. } => MessageSource::User,
+            JobInput::Cron { .. } => MessageSource::Cron,
+            _ => MessageSource::Agent,
+        };
         // The notification prompt is rebuilt from the durable
         // `pending_subagent_results` buffer on every retry, so persisting it
         // per-attempt would duplicate the hidden row on each failed retry
         // (provider outage → infinite backoff). Append it in-memory only; the
         // buffer is the source of truth and only the proactive reply (if any)
-        // is persisted. Kept separate from `from_user` so a future
-        // agent-injected row can still choose to persist.
+        // is persisted. Kept separate from `source` so a future agent-injected
+        // row can still choose to persist.
         let persist_user_row = !is_subagent_notification;
         let spec = JobSpec {
             session_id: session.id.clone(),
@@ -401,7 +408,7 @@ impl AgentLoop {
                         span_recorder,
                         job_id,
                         delta_tx,
-                        from_user,
+                        source,
                         persist_user_row,
                         cancel_token,
                     )
@@ -424,7 +431,7 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
-        from_user: bool,
+        source: MessageSource,
         persist_user_row: bool,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
@@ -450,14 +457,14 @@ impl AgentLoop {
             self.invocable_skills()
         };
 
-        // Append user message (auto-compresses if over token budget).
-        // `from_user` is true only for a genuine `UserChat` turn; cron /
-        // spawned / subagent-notification inputs build an agent-context row
-        // so they never surface as a user bubble.
-        let user_msg = if from_user {
-            ChatMessage::user(user_content.clone())
-        } else {
-            ChatMessage::agent_context(user_content.clone())
+        // Append user message (auto-compresses if over token budget). Only a
+        // genuine `UserChat` turn is user-authored; a cron fire is stamped
+        // `Cron` so the operator inbox finds it; everything else is agent
+        // context. None but the user row surface as a user bubble.
+        let user_msg = match source {
+            MessageSource::User => ChatMessage::user(user_content.clone()),
+            MessageSource::Cron => ChatMessage::cron_fire(user_content.clone()),
+            MessageSource::Agent => ChatMessage::agent_context(user_content.clone()),
         };
         if persist_user_row {
             self.append_context_message(session, &user_msg).await?;
@@ -1149,7 +1156,7 @@ impl AgentLoop {
         Ok(ordinal)
     }
 
-    /// Append a `from_user` message to this session's transcript — both the
+    /// Append a user-authored message to this session's transcript — both the
     /// in-memory context and the persisted `session_messages` log — ahead
     /// of the turn that runs next. Lets the actor coalesce a burst of user
     /// messages into one turn while keeping each as its own transcript row;

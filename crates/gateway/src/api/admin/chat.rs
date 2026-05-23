@@ -29,7 +29,8 @@
 
 use aura_channels::wire::{SessionPatch, SlashCommandSpec};
 use aura_model::{
-    ChannelType, ChatMessage, ContentBlock, Role, Session, SessionId, TriggerSource, User,
+    ChannelType, ChatMessage, ContentBlock, MessageSource, Role, Session, SessionId, TriggerSource,
+    User,
 };
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -756,14 +757,11 @@ async fn cron_message_from_session(
     // reverse for the response so we land on the last assistant turn
     // even when the agent emitted multiple.
     for (_ord, _at, msg) in &tail {
-        if !matches!(msg.role, Role::User) {
-            continue;
-        }
-        // The cron prompt is an agent-context row (`from_user = false`), so
-        // locate it by its `[cron:<id>]` framing rather than provenance — the
-        // skill reminder is also a `Role::User` agent-context row.
-        let text = extract_text(&msg.content);
-        if aura_agent::cron_prompt::is_framed_cron_prompt(&text) {
+        // The cron prompt persists as a `MessageSource::Cron` row; locate it by
+        // provenance, then strip the framing for display. It rides as a
+        // `Role::User` turn, indistinguishable by role from a skill reminder.
+        if matches!(msg.source(), MessageSource::Cron) {
+            let text = extract_text(&msg.content);
             prompt = Some(aura_agent::cron_prompt::original_cron_prompt(&text).to_owned());
             break;
         }

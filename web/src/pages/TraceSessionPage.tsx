@@ -947,11 +947,11 @@ function traceTokens(trace: JobTrace): JobTokenTotals {
 }
 
 // Derive the user-facing input that kicked off the job: the last
-// message in the *first* LLM call's input_messages flagged with
-// `from_user`. The agent injects several `Role::User` messages of its
-// own (skill reminders, system-reminders) so role alone isn't enough
-// to identify the genuine prompt. Requires the message log because
-// the LLM call may reference it via `LlmCallInputs::Persisted`.
+// message in the *first* LLM call's input_messages whose `source` is
+// 'user'. The agent injects several `Role::User` messages of its own
+// (skill reminders, system-reminders) so role alone isn't enough to
+// identify the genuine prompt. Requires the message log because the
+// LLM call may reference it via `LlmCallInputs::Persisted`.
 function jobInputText(trace: JobTrace, messageLog: SessionMessageRow[]): string | null {
   for (const rs of trace.steps) {
     for (const span of rs.spans) {
@@ -962,7 +962,7 @@ function jobInputText(trace: JobTrace, messageLog: SessionMessageRow[]): string 
           span.started_at,
         );
         for (let i = messages.length - 1; i >= 0; i--) {
-          if (messages[i].from_user) {
+          if (messages[i].source === 'user') {
             const parts: string[] = [];
             for (const block of messages[i].content) {
               if ('Text' in block) parts.push(block.Text);

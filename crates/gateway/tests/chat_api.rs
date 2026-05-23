@@ -392,9 +392,10 @@ async fn cron_sessions_split_into_dedicated_endpoint() {
     let cron_id = cron_session.id.to_string();
 
     let cron_rows: &[ChatMessage] = &[
-        // The cron prompt persists as an agent-context row; the inbox locates
-        // it by its `[cron:<id>]` framing, not by `from_user`.
-        ChatMessage::agent_context(vec![ContentBlock::Text(
+        // The cron prompt persists as a `MessageSource::Cron` row; the inbox
+        // locates it by that provenance, then strips the `[cron:<id>]` framing
+        // for display.
+        ChatMessage::cron_fire(vec![ContentBlock::Text(
             "[cron:cj-test] morning brief".into(),
         )]),
         ChatMessage::assistant(vec![ContentBlock::Text("daily summary\nready".into())]),

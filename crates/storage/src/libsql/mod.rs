@@ -184,13 +184,14 @@ impl LibsqlPool {
                     content       TEXT NOT NULL,
                     created_at    INTEGER NOT NULL,
                     superseded_by INTEGER,
-                    -- 1 only when this row originated from a direct user
-                    -- channel input. The agent itself appends several
-                    -- `role = 'user'` rows (skill reminders, system-
-                    -- reminders); this column distinguishes the genuine
-                    -- prompt so trace replay can surface it as the job's
-                    -- user input rather than guessing by content.
-                    from_user     INTEGER NOT NULL DEFAULT 0,
+                    -- Provenance of the row (`aura_model::MessageSource`):
+                    -- 'user' (a genuine channel input), 'cron' (a cron fire's
+                    -- framed prompt), or 'agent' (everything else the agent
+                    -- injects/produces). The agent appends several
+                    -- `role = 'user'` rows (skill reminders, the cron fire,
+                    -- subagent tasks); this column tells the genuine prompt and
+                    -- the cron fire apart from them without guessing by content.
+                    source        TEXT NOT NULL DEFAULT 'agent',
                     PRIMARY KEY (session_id, ordinal)
                 );
                 CREATE INDEX IF NOT EXISTS idx_session_messages_active

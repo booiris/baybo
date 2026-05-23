@@ -33,23 +33,29 @@ fn lineage_kind_str(s: &Session) -> Option<&'static str> {
 }
 
 /// Rebuild a typed [`ChatMessage`] from a persisted `session_messages` row,
-/// honoring the stored `from_user` flag — only a genuine `Role::User` row
-/// carries it. The sole rehydration seam for the sealed `from_user` field:
-/// every read path funnels its `(role, content, from_user)` triple here so the
-/// `(role, from_user) -> intent constructor` mapping lives in one place.
+/// honoring the stored `source` provenance. The sole rehydration seam for the
+/// sealed `source` field: every read path funnels its `(role, content, source)`
+/// triple here so the `(role, source) -> intent constructor` mapping lives in
+/// one place. `User`/`Cron` sources are always `Role::User` (their constructor
+/// sets the role), so for those the stored role is redundant and the source
+/// wins; an `Agent` source dispatches on the role.
 fn rehydrate_message(
     role: &str,
     content: Vec<aura_model::ContentBlock>,
-    from_user: bool,
+    source: &str,
 ) -> Result<ChatMessage> {
-    use aura_model::Role;
+    use aura_model::{MessageSource, Role};
     let role = role.parse::<Role>().map_err(StorageError::Storage)?;
-    Ok(match (role, from_user) {
-        (Role::User, true) => ChatMessage::user(content),
-        (Role::User, false) => ChatMessage::agent_context(content),
-        (Role::Assistant, _) => ChatMessage::assistant(content),
-        (Role::System, _) => ChatMessage::system(content),
-        (Role::Tool, _) => ChatMessage::tool(content),
+    let source = source.parse::<MessageSource>().map_err(StorageError::Storage)?;
+    Ok(match source {
+        MessageSource::User => ChatMessage::user(content),
+        MessageSource::Cron => ChatMessage::cron_fire(content),
+        MessageSource::Agent => match role {
+            Role::User => ChatMessage::agent_context(content),
+            Role::Assistant => ChatMessage::assistant(content),
+            Role::System => ChatMessage::system(content),
+            Role::Tool => ChatMessage::tool(content),
+        },
     })
 }
 
@@ -560,7 +566,7 @@ impl SessionStore for LibsqlSessionStore {
         let mut rows = conn
             .query(
                 "INSERT INTO session_messages \
-             (session_id, ordinal, role, content, created_at, from_user) \
+             (session_id, ordinal, role, content, created_at, source) \
              SELECT ?1, COALESCE(MAX(ordinal), -1) + 1, ?2, ?3, ?4, ?5 \
              FROM session_messages WHERE session_id = ?1 \
              RETURNING ordinal",
@@ -569,7 +575,7 @@ impl SessionStore for LibsqlSessionStore {
                     role.to_string(),
                     content,
                     now_us,
-                    i64::from(message.from_user()),
+                    message.source().as_str().to_string(),
                 ],
             )
             .await
@@ -646,7 +652,7 @@ impl SessionStore for LibsqlSessionStore {
         for (chunk_idx, chunk) in new_active.chunks(ROWS_PER_BATCH).enumerate() {
             let mut sql = String::from(
                 "INSERT INTO session_messages \
-                 (session_id, ordinal, role, content, created_at, from_user) VALUES ",
+                 (session_id, ordinal, role, content, created_at, source) VALUES ",
             );
             let mut params: Vec<libsql::Value> = Vec::with_capacity(chunk.len() * COLS_PER_ROW);
             for (i, msg) in chunk.iter().enumerate() {
@@ -672,7 +678,7 @@ impl SessionStore for LibsqlSessionStore {
                 params.push(libsql::Value::Text(msg.role.as_str().to_string()));
                 params.push(libsql::Value::Text(content));
                 params.push(libsql::Value::Integer(now_us));
-                params.push(libsql::Value::Integer(i64::from(msg.from_user())));
+                params.push(libsql::Value::Text(msg.source().as_str().to_string()));
             }
             tx.execute(&sql, params).await.map_err(|e| {
                 StorageError::Internal(anyhow::anyhow!("libsql compaction insert: {e}"))
@@ -692,7 +698,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT role, content, from_user FROM session_messages \
+                "SELECT role, content, source FROM session_messages \
                  WHERE session_id = ?1 AND superseded_by IS NULL \
                  ORDER BY ordinal",
                 libsql::params![session_id.as_str().to_string()],
@@ -714,12 +720,12 @@ impl SessionStore for LibsqlSessionStore {
             let content_json: String = row
                 .get(1)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-            let from_user_flag: i64 = row.get(2).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get from_user: {e}"))
+            let source_str: String = row.get(2).map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql get source: {e}"))
             })?;
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
-            out.push(rehydrate_message(&role, content, from_user_flag != 0)?);
+            out.push(rehydrate_message(&role, content, &source_str)?);
         }
         Ok(out)
     }
@@ -819,7 +825,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT role, content, from_user FROM session_messages \
+                "SELECT role, content, source FROM session_messages \
                  WHERE session_id = ?1 AND superseded_by IS NULL AND ordinal <= ?2 \
                  ORDER BY ordinal",
                 libsql::params![session_id.as_str().to_string(), up_to_ordinal],
@@ -841,12 +847,12 @@ impl SessionStore for LibsqlSessionStore {
             let content_json: String = row
                 .get(1)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-            let from_user_flag: i64 = row.get(2).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get from_user: {e}"))
+            let source_str: String = row.get(2).map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql get source: {e}"))
             })?;
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
-            out.push(rehydrate_message(&role, content, from_user_flag != 0)?);
+            out.push(rehydrate_message(&role, content, &source_str)?);
         }
         Ok(out)
     }
@@ -871,7 +877,7 @@ impl SessionStore for LibsqlSessionStore {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut rows = conn
             .query(
-                "SELECT ordinal, role, content, from_user, created_at FROM session_messages \
+                "SELECT ordinal, role, content, source, created_at FROM session_messages \
                  WHERE session_id = ?1 AND superseded_by IS NULL \
                    AND (?2 IS NULL OR ordinal < ?2) \
                  ORDER BY ordinal DESC \
@@ -898,8 +904,8 @@ impl SessionStore for LibsqlSessionStore {
             let content_json: String = row
                 .get(2)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-            let from_user_flag: i64 = row.get(3).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get from_user: {e}"))
+            let source_str: String = row.get(3).map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql get source: {e}"))
             })?;
             let created_us: i64 = row.get(4).map_err(|e| {
                 StorageError::Internal(anyhow::anyhow!("libsql get created_at: {e}"))
@@ -914,7 +920,7 @@ impl SessionStore for LibsqlSessionStore {
             out.push((
                 ordinal,
                 created_at,
-                rehydrate_message(&role, content, from_user_flag != 0)?,
+                rehydrate_message(&role, content, &source_str)?,
             ));
         }
         // Caller expects ascending ordinal order — the SQL pulled the
@@ -942,7 +948,7 @@ impl SessionStore for LibsqlSessionStore {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut rows = conn
             .query(
-                "SELECT ordinal, role, content, from_user FROM session_messages \
+                "SELECT ordinal, role, content, source FROM session_messages \
                  WHERE session_id = ?1 AND superseded_by IS NULL \
                    AND ordinal > ?2 \
                  ORDER BY ordinal ASC \
@@ -969,14 +975,14 @@ impl SessionStore for LibsqlSessionStore {
             let content_json: String = row
                 .get(2)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-            let from_user_flag: i64 = row.get(3).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get from_user: {e}"))
+            let source_str: String = row.get(3).map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql get source: {e}"))
             })?;
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
             out.push((
                 ordinal,
-                rehydrate_message(&role, content, from_user_flag != 0)?,
+                rehydrate_message(&role, content, &source_str)?,
             ));
         }
         Ok(out)
@@ -989,7 +995,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT ordinal, superseded_by, role, content, created_at, from_user \
+                "SELECT ordinal, superseded_by, role, content, created_at, source \
                  FROM session_messages \
                  WHERE session_id = ?1 ORDER BY ordinal",
                 libsql::params![session_id.as_str().to_string()],
@@ -1020,8 +1026,8 @@ impl SessionStore for LibsqlSessionStore {
             let created_us: i64 = row
                 .get(4)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get created: {e}")))?;
-            let from_user_flag: i64 = row.get(5).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get from_user: {e}"))
+            let source_str: String = row.get(5).map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql get source: {e}"))
             })?;
             let created_at = super::time::from_us(created_us).ok_or_else(|| {
                 StorageError::Internal(anyhow::anyhow!(
@@ -1034,7 +1040,7 @@ impl SessionStore for LibsqlSessionStore {
                 ordinal,
                 superseded_by,
                 created_at,
-                message: rehydrate_message(&role, content, from_user_flag != 0)?,
+                message: rehydrate_message(&role, content, &source_str)?,
             });
         }
         Ok(out)
