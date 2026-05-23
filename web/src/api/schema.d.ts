@@ -583,10 +583,10 @@ export interface components {
             last_active: string;
             /**
              * @description The user-facing prompt for this fire. Truncated to
-             *     [`PREVIEW_MAX_CHARS`]. The persisted user row carries a
-             *     `[cron:<job>] <prompt>` prefix; this strips the prefix so the
-             *     panel doesn't redundantly re-show what the cron job already
-             *     has.
+             *     [`PREVIEW_MAX_CHARS`]. The persisted user row carries the cron
+             *     dispatcher's fire-time framing; `aura_agent::cron_prompt::original_cron_prompt`
+             *     recovers the instruction as configured so the panel shows that,
+             *     not the framing boilerplate.
              */
             prompt: string;
             /**
@@ -804,7 +804,7 @@ export interface components {
          * @description Wire mirror of [`aura_job::JobKind`].
          * @enum {string}
          */
-        JobKind: "user_chat" | "cron" | "system" | "spawned";
+        JobKind: "user_chat" | "cron" | "system" | "spawned" | "subagent_notification";
         /**
          * @description Wire mirror of [`aura_job::JobStatus`]. Carries the same payload
          *     the domain enum carries (cancel reason, partial-artifact span IDs);

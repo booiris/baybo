@@ -4,6 +4,7 @@
 //! checkpointed via [`DurableActorState`](crate::actor::state::DurableActorState).
 
 pub mod cron_prompt;
+pub mod mailbox;
 pub mod router;
 pub mod state;
 pub mod subagent;
@@ -11,10 +12,7 @@ pub mod supervisor;
 
 use aura_channels::{AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage};
 use aura_job::JobInput;
-use aura_model::{
-    BACKGROUND_NOTIFICATIONS_POSTAMBLE, BACKGROUND_NOTIFICATIONS_PREAMBLE,
-    BackgroundCompressionPayload, ContentBlock, PendingSubagentResult,
-};
+use aura_model::{BackgroundCompressionPayload, ContentBlock, PendingSubagentResult};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -24,6 +22,40 @@ use tracing::{debug, error, info, warn};
 /// the persisted row. Once the cap is reached the oldest entry is
 /// dropped (its content still lives in the child session's trace).
 const MAX_PENDING_SUBAGENT_RESULTS: usize = 64;
+
+/// Exponential-backoff retry schedule for a FAILED `SubagentNotification`
+/// turn. When the turn errors (provider / cost / cancel) and the session is
+/// idle, the actor retries on this backoff so a fire-and-forget completion is
+/// still reported during the idle window. There is **no attempt cap** — a
+/// delivered completion is never dropped, so the actor retries indefinitely
+/// (each step doubling, capped at `NOTIFY_RETRY_MAX_BACKOFF`) until it
+/// succeeds; an inbound message resets the schedule. Trade-off: a session
+/// whose notification turn keeps failing stays resident (each retry bumps
+/// `last_active`, so the idle reaper won't reclaim it) rather than dropping
+/// the completion — the result is also buffered + persisted throughout.
+const NOTIFY_RETRY_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+const NOTIFY_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Surfaced (as a `Notice`) when a *user* turn yields a blank reply — the
+/// user is waiting, so acknowledge rather than push an empty bubble. Non-user
+/// turns (cron, subagent notification) silently suppress a blank reply.
+const EMPTY_USER_REPLY_NOTICE: &str =
+    "The assistant did not produce a response to your message. Please try again or rephrase.";
+
+/// Opening framing for a `SubagentNotification` turn's content. Lives in
+/// per-turn content (never the system prompt) so the prompt-cache prefix
+/// is identical to a normal main-path turn. Cron-style: report proactively.
+const SUBAGENT_NOTIFICATION_FRAMING: &str = "[background subagent task(s) finished since your last turn — report the outcome to the user as a fresh, proactive message.]";
+
+/// Per-result element of the nested `<subagent_results>` block. Metadata
+/// rides as attributes; `task` / `output` are child elements so multi-line
+/// free text with quotes needs no attribute escaping.
+const SUBAGENT_RESULT_TEMPLATE: &str = r#"  <result handle="{{handle}}" type="{{type}}" status="{{status}}">
+    <task>{{task}}</task>
+    <output>{{output}}</output>
+    <child_session>{{child_session}}</child_session>
+  </result>
+"#;
 
 use crate::actor::state::{DurableActorState, VolatileResources};
 use crate::actor::supervisor::ActorRegistryGuard;
@@ -51,14 +83,31 @@ pub enum AgentMessage {
     /// dispatches the carried payload to a dedicated handler.
     BackgroundCompression(BackgroundCompressionPayload),
     /// A `background: true` subagent dispatched from this session
-    /// reached a terminal state. The wait task posts this to the
-    /// parent actor's mailbox so the result is buffered on
-    /// `session.state.pending_subagent_results`; the next
-    /// `UserInput` drains the buffer and prepends a reminder before
-    /// the parent LLM's next turn.
+    /// reached a terminal state. The wait task posts this to the parent
+    /// actor's mailbox; it is buffered on
+    /// `session.state.pending_subagent_results` and, once no
+    /// higher-priority work is queued, drained into one autonomous
+    /// `SubagentNotification` turn.
     SubagentFinished(Box<PendingSubagentResult>),
-    /// Gracefully shut down this actor.
-    Shutdown,
+    /// Stop this actor. Lowest mailbox priority — every queued
+    /// `UserInput` / `SubagentFinished` drains first, then the actor
+    /// trips its `actor_token` and exits. (The session row lives on; only
+    /// the in-memory actor stops.)
+    ActorStop,
+}
+
+impl mailbox::Prioritized for AgentMessage {
+    fn priority(&self) -> mailbox::MessagePriority {
+        use mailbox::MessagePriority;
+        match self {
+            AgentMessage::UserInput(_)
+            | AgentMessage::CronTrigger { .. }
+            | AgentMessage::SubagentSpawned { .. }
+            | AgentMessage::BackgroundCompression(_) => MessagePriority::Trigger,
+            AgentMessage::SubagentFinished(_) => MessagePriority::SubagentFinished,
+            AgentMessage::ActorStop => MessagePriority::Stop,
+        }
+    }
 }
 
 /// Render a short status label for the background-notification
@@ -85,6 +134,26 @@ fn truncate_for_notice(text: &str) -> String {
     format!("{truncated}… [truncated; full text in child session transcript]")
 }
 
+/// Escape the XML metacharacters relevant to attribute values and element
+/// bodies so a subagent's free text can't break the `<subagent_results>`
+/// structure the parent LLM reads.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// A `SubagentNotification` reply is suppressed (not sent to the channel)
+/// when it carries no non-whitespace text — the model's only, implicit,
+/// way to stay quiet (there is no `<no_output/>` sentinel).
+fn is_blank_reply(content: &[ContentBlock]) -> bool {
+    content.iter().all(|b| match b {
+        ContentBlock::Text(t) => t.trim().is_empty(),
+        _ => false,
+    })
+}
+
 /// Mirrors the gateway slash dispatcher's tolerance for casing and
 /// trailing arguments so a user typing `/Compact extra` from any
 /// channel hits the same control path.
@@ -97,6 +166,22 @@ fn is_compact_command(content: &[ContentBlock]) -> bool {
     };
     let token = rest.split_whitespace().next().unwrap_or("");
     token.eq_ignore_ascii_case(COMPACT_COMMAND.trim_start_matches('/'))
+}
+
+/// Whether `content` leads with any slash command (`/compact`, `/<skill>`,
+/// or any `/<token>`). Such a message is a hard boundary for `UserInput`
+/// coalescing: it runs on its own so the leading `/` stays at content
+/// position 0, where compact detection and the agent loop's skill
+/// detection (`detect_slash_invocation`) look. Purely syntactic — it does
+/// not resolve the token against any registry.
+fn is_slash_command(content: &[ContentBlock]) -> bool {
+    let Some(ContentBlock::Text(text)) = content.first() else {
+        return false;
+    };
+    text.trim_start()
+        .strip_prefix('/')
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|c| !c.is_whitespace())
 }
 
 /// One actor per session. Receives messages sequentially through its mailbox.
@@ -123,7 +208,7 @@ impl AgentActor {
     }
 
     /// Run the actor's message processing loop.
-    pub async fn run(mut self, mut mailbox: mpsc::Receiver<AgentMessage>) {
+    pub async fn run(mut self, mut mailbox: mailbox::MailboxReceiver<AgentMessage>) {
         let session_id = self.durable.session.id.clone();
         info!(session_id = %session_id, "agent actor started");
 
@@ -146,69 +231,158 @@ impl AgentActor {
             .restore_transcript_from_store()
             .await;
 
-        while let Some(msg) = mailbox.recv().await {
-            match msg {
-                AgentMessage::UserInput(incoming) => {
-                    if let Err(e) = self.handle_user_input(*incoming).await {
+        // A failed `SubagentNotification` turn leaves the buffer non-empty;
+        // rather than wait for the next inbound message, retry on an
+        // exponential backoff (capped at `NOTIFY_RETRY_MAX_BACKOFF`) so a
+        // fire-and-forget completion is still reported during the idle
+        // window. No attempt cap — a delivered completion is never dropped,
+        // so the actor keeps retrying until it succeeds. A real inbound
+        // message wins the race (biased) and resets the backoff.
+        let mut notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
+        loop {
+            let next = if !self
+                .durable
+                .session
+                .state
+                .pending_subagent_results
+                .is_empty()
+            {
+                tokio::select! {
+                    biased;
+                    m = mailbox.recv() => m,
+                    _ = tokio::time::sleep(notify_backoff) => {
+                        self.run_subagent_notification().await;
+                        if self
+                            .durable
+                            .session
+                            .state
+                            .pending_subagent_results
+                            .is_empty()
+                        {
+                            notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
+                        } else {
+                            notify_backoff = (notify_backoff * 2).min(NOTIFY_RETRY_MAX_BACKOFF);
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                mailbox.recv().await
+            };
+            let Some(msg) = next else {
+                break;
+            };
+            // A real message resets the notification backoff (fresh schedule).
+            notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
+            let deferred = match msg {
+                AgentMessage::ActorStop => {
+                    debug!(session_id = %session_id, "actor stopping");
+                    // Cancelling our `actor_token` cascades into every
+                    // child we spawned — including maintenance actors,
+                    // whose `actor_token` is a grandchild of ours via
+                    // the `parent_actor_token` carried in their
+                    // `SystemSpawnRequest`. No explicit dispatch needed.
+                    self.volatile.actor_token.cancel();
+                    break;
+                }
+                // Coalesce a leading run of NON-slash `UserInput`s already
+                // queued behind this one into a single turn (rapid bursts
+                // the actor was too busy to take one at a time). A slash
+                // message is a hard boundary — it falls through to
+                // `dispatch_one` so its leading `/` stays at content
+                // position 0 for compact / skill detection.
+                AgentMessage::UserInput(incoming)
+                    if !is_slash_command(&incoming.message.content) =>
+                {
+                    let mut batch = vec![*incoming];
+                    let mut deferred = None;
+                    while matches!(
+                        mailbox.peek_priority(),
+                        Some(mailbox::MessagePriority::Trigger)
+                    ) {
+                        match mailbox.try_recv() {
+                            Ok(AgentMessage::UserInput(inc))
+                                if !is_slash_command(&inc.message.content) =>
+                            {
+                                batch.push(*inc);
+                            }
+                            // A queued slash `UserInput` (or, on non-user
+                            // sessions, another trigger kind) ends the run;
+                            // handle it on its own after the batch.
+                            Ok(other) => {
+                                deferred = Some(other);
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if let Err(e) = self.handle_merged_user_turn(batch).await {
                         error!(
                             session_id = %session_id,
                             error = %e,
                             "failed to handle user input"
                         );
                     }
+                    deferred
                 }
-                AgentMessage::CronTrigger { job_id, prompt } => {
-                    debug!(session_id = %session_id, job_id = %job_id, "received cron trigger");
-                    if let Err(e) = self.dispatch_cron_prompt(&prompt, &job_id).await {
-                        error!(
-                            session_id = %session_id,
-                            job_id = %job_id,
-                            error = %e,
-                            "failed to handle cron trigger"
-                        );
-                    }
+                other => {
+                    self.dispatch_one(other).await;
+                    None
                 }
-                AgentMessage::SubagentSpawned {
-                    initial_message,
-                    parent_job_id,
-                } => {
-                    if let Err(e) = self
-                        .handle_subagent_spawned(*initial_message, parent_job_id)
-                        .await
-                    {
-                        error!(
-                            session_id = %session_id,
-                            error = %e,
-                            "failed to handle subagent spawn"
-                        );
-                    }
-                }
-                AgentMessage::BackgroundCompression(payload) => {
-                    if let Err(e) = self.handle_background_compression(payload).await {
-                        error!(
-                            session_id = %session_id,
-                            error = %e,
-                            "failed to handle background compression"
-                        );
-                    }
-                }
-                AgentMessage::SubagentFinished(pending) => {
-                    self.handle_subagent_finished(*pending).await;
-                }
-                AgentMessage::Shutdown => {
-                    debug!(session_id = %session_id, "actor shutting down");
-                    // Cancelling our `actor_token` cascades into every
-                    // child we spawned — including maintenance actors,
-                    // whose `actor_token` is a grandchild of ours via
-                    // the `parent_actor_token` carried in their
-                    // `SystemSpawnRequest`. No explicit Shutdown
-                    // mailbox dispatch is required.
-                    self.volatile.actor_token.cancel();
-                    break;
-                }
+            };
+            if let Some(msg) = deferred {
+                self.dispatch_one(msg).await;
             }
+            // Surface any buffered background-subagent results as their
+            // own turn once nothing higher-priority remains queued.
+            self.maybe_run_subagent_notification(&mailbox).await;
         }
         info!(session_id = %session_id, "agent actor stopped");
+    }
+
+    /// Handle one mailbox message — every kind except `ActorStop`, which
+    /// the run loop owns because it must break the loop. Shared by the
+    /// non-coalesced path and the deferred follow-up of a `UserInput`
+    /// coalescing run.
+    async fn dispatch_one(&mut self, msg: AgentMessage) {
+        let session_id = self.durable.session.id.clone();
+        match msg {
+            AgentMessage::UserInput(incoming) => {
+                if let Err(e) = self.handle_user_input(*incoming).await {
+                    error!(session_id = %session_id, error = %e, "failed to handle user input");
+                }
+            }
+            AgentMessage::CronTrigger { job_id, prompt } => {
+                debug!(session_id = %session_id, job_id = %job_id, "received cron trigger");
+                if let Err(e) = self.dispatch_cron_prompt(&prompt, &job_id).await {
+                    error!(session_id = %session_id, job_id = %job_id, error = %e, "failed to handle cron trigger");
+                }
+            }
+            AgentMessage::SubagentSpawned {
+                initial_message,
+                parent_job_id,
+            } => {
+                if let Err(e) = self
+                    .handle_subagent_spawned(*initial_message, parent_job_id)
+                    .await
+                {
+                    error!(session_id = %session_id, error = %e, "failed to handle subagent spawn");
+                }
+            }
+            AgentMessage::BackgroundCompression(payload) => {
+                if let Err(e) = self.handle_background_compression(payload).await {
+                    error!(session_id = %session_id, error = %e, "failed to handle background compression");
+                }
+            }
+            AgentMessage::SubagentFinished(pending) => {
+                self.handle_subagent_finished(*pending).await;
+            }
+            AgentMessage::ActorStop => {
+                // The run loop owns `ActorStop` (it must break); reaching
+                // here would be a routing bug. Defensive no-op.
+                warn!(session_id = %session_id, "ActorStop reached dispatch_one; ignoring");
+            }
+        }
     }
 
     /// Run the agent loop. Terminal-state notification is published by
@@ -225,7 +399,6 @@ impl AgentActor {
         content: Vec<ContentBlock>,
         parent_job_id: Option<aura_model::JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
-        background_notice: Option<String>,
     ) -> anyhow::Result<OutgoingMessage> {
         self.volatile
             .agent_loop
@@ -237,7 +410,6 @@ impl AgentActor {
                 &self.volatile.span_recorder,
                 parent_job_id,
                 delta_tx,
-                background_notice,
                 self.volatile.actor_token.child_token(),
             )
             .await
@@ -262,10 +434,17 @@ impl AgentActor {
             job_id, prompt,
         ))];
         let response = self
-            .run_agent_loop(job_input, content, None, None, None)
+            .run_agent_loop(job_input, content, None, None)
             .await?;
-        self.send_response(AgentOutput::Message(response), "cron")
-            .await;
+        if is_blank_reply(&response.content) {
+            debug!(
+                session_id = %self.durable.session.id,
+                "cron turn produced no output; suppressing send"
+            );
+        } else {
+            self.send_response(AgentOutput::Message(response), "cron")
+                .await;
+        }
         Ok(())
     }
 
@@ -274,17 +453,11 @@ impl AgentActor {
         if is_compact_command(&content) {
             return self.handle_compact().await;
         }
-        // Drain any background `spawn_subagent` results that landed
-        // between this turn and the previous one. They're injected as a
-        // separate context message ahead of the user's turn (NOT merged
-        // into the user's content — that would mask a leading `/command`
-        // from slash detection). We persist immediately after draining so
-        // a crash mid-turn can't replay the same notifications.
-        let background_notice = self.drain_pending_subagent_notice();
-        if background_notice.is_some() {
-            self.persist_session_state_after_pending_change("user_input_drain")
-                .await;
-        }
+        // Background `spawn_subagent` results are NOT folded into the
+        // user's turn — they run as their own `SubagentNotification` turn
+        // (scheduled by `maybe_run_subagent_notification`) so the user's
+        // turn keeps a clean leading `/command` for slash detection.
+        //
         // Pass a clone of the response channel so the loop can stream
         // text deltas as `AgentOutput::Delta` while the final assembled
         // message still flows through the normal path.
@@ -297,17 +470,58 @@ impl AgentActor {
                 content,
                 None,
                 Some(response_tx),
-                background_notice,
             )
             .await?;
-        self.send_response(AgentOutput::Message(response), "user")
-            .await;
+        self.send_user_reply(response).await;
+        Ok(())
+    }
+
+    /// Run one `UserChat` turn over a coalesced batch of `UserInput`s (a
+    /// rapid burst the actor was too busy to take one at a time). Each
+    /// message is kept as its **own** `Role::User` transcript row — the
+    /// leading ones are appended ahead of the turn, the last becomes the
+    /// turn's user content — so the stored transcript stays faithful to
+    /// what the user actually sent; `merge_for_llm` collapses the
+    /// consecutive rows into one message for the provider call. The job
+    /// record carries the combined content for provenance. One reply
+    /// answers the batch. Slash messages never reach here — they are split
+    /// out as their own turns by the caller.
+    async fn handle_merged_user_turn(
+        &mut self,
+        mut batch: Vec<IncomingMessage>,
+    ) -> anyhow::Result<()> {
+        // Batch always holds at least the message that triggered the turn.
+        let Some(last) = batch.pop() else {
+            return Ok(());
+        };
+        let mut combined: Vec<ContentBlock> = Vec::new();
+        for incoming in &batch {
+            combined.extend(incoming.message.content.iter().cloned());
+        }
+        combined.extend(last.message.content.iter().cloned());
+        // Append the leading messages as their own rows ahead of the turn.
+        for incoming in batch {
+            self.volatile
+                .agent_loop
+                .append_user_message(&mut self.durable.session, incoming.message.content)
+                .await?;
+        }
+        let response_tx = self.volatile.response_tx.clone();
+        let response = self
+            .run_agent_loop(
+                JobInput::UserChat { content: combined },
+                last.message.content,
+                None,
+                Some(response_tx),
+            )
+            .await?;
+        self.send_user_reply(response).await;
         Ok(())
     }
 
     /// Idempotent on `handle_id` — the wait task can in principle
     /// publish twice (mailbox retry, manual recovery) and we don't
-    /// want the parent's preamble to show two copies. Capped at
+    /// want the notification to list it twice. Capped at
     /// `MAX_PENDING_SUBAGENT_RESULTS` with drop-oldest semantics so a
     /// parent that stays idle while many backgrounds finish can't
     /// grow the persisted row without bound.
@@ -325,7 +539,7 @@ impl AgentActor {
             session_id = %self.durable.session.id,
             handle_id = %pending.handle_id,
             subagent_type = %pending.subagent_type,
-            "buffered background subagent result for next turn"
+            "buffered background subagent result for its notification turn"
         );
         if buffer.len() >= MAX_PENDING_SUBAGENT_RESULTS {
             let dropped = buffer.remove(0);
@@ -368,33 +582,174 @@ impl AgentActor {
         }
     }
 
-    /// Drain pending background results into a system-reminder text
-    /// block prepended to `content`. Returns `content` unchanged when
-    /// the buffer is empty so callers don't pay the allocation.
-    /// Drain any background `spawn_subagent` results into a formatted
-    /// notice body, or `None` when there are none. Returned as a
-    /// standalone string — NOT merged into the user's content — so the
-    /// agent loop can inject it as its own context message; merging it
-    /// would push a leading `/command` out of slash-detection range.
-    fn drain_pending_subagent_notice(&mut self) -> Option<String> {
+    /// Render the pending background-subagent results into nested-XML
+    /// content for one `SubagentNotification` turn. Pure (does not drain) —
+    /// the caller owns the buffer so it can restore the results if the turn
+    /// fails. The framing rides in this per-turn content (never the system
+    /// prompt) so the prompt-cache prefix stays identical to a normal
+    /// main-path turn.
+    fn build_subagent_notification_content(
+        &self,
+        pending: &[PendingSubagentResult],
+    ) -> Vec<ContentBlock> {
+        let mut xml = String::from(SUBAGENT_NOTIFICATION_FRAMING);
+        xml.push_str("\n\n<subagent_results>\n");
+        for p in pending {
+            xml.push_str(
+                &SUBAGENT_RESULT_TEMPLATE
+                    .replace("{{handle}}", &xml_escape(&p.handle_id))
+                    .replace("{{type}}", &xml_escape(&p.subagent_type))
+                    .replace("{{status}}", pending_status_label(&p.status))
+                    .replace("{{task}}", &xml_escape(&p.task_summary))
+                    .replace("{{output}}", &xml_escape(&truncate_for_notice(&p.final_text)))
+                    .replace("{{child_session}}", &xml_escape(p.child_session_id.as_ref())),
+            );
+        }
+        xml.push_str("</subagent_results>");
+        vec![ContentBlock::Text(xml)]
+    }
+
+    /// Surface buffered background-subagent results as their own turn —
+    /// but only when no higher-priority work is queued: a `Trigger`
+    /// (UserInput) must run first, and another queued `SubagentFinished`
+    /// is folded in first (merge). An empty queue or a lowest-priority
+    /// `ActorStop` means "drain now".
+    async fn maybe_run_subagent_notification(
+        &mut self,
+        mailbox: &mailbox::MailboxReceiver<AgentMessage>,
+    ) {
+        if self
+            .durable
+            .session
+            .state
+            .pending_subagent_results
+            .is_empty()
+        {
+            return;
+        }
+        if matches!(
+            mailbox.peek_priority(),
+            Some(p) if p >= mailbox::MessagePriority::SubagentFinished
+        ) {
+            return;
+        }
+        self.run_subagent_notification().await;
+    }
+
+    /// Run the merged background-subagent notification as its own
+    /// main-path turn (same system prompt + toolset → prompt cache
+    /// unchanged). The reply is sent proactively; an empty/whitespace
+    /// reply is suppressed.
+    async fn run_subagent_notification(&mut self) {
+        // Establish the system prompt before the snapshot below. It is
+        // persisted by `ensure_system_prompt`, so if the snapshot were taken
+        // before it (on a fresh session the prior context is empty), a
+        // rollback would drop the just-persisted system row in-memory and the
+        // next retry would re-seed and re-persist it. Idempotent mid-session.
+        if let Err(e) = self
+            .volatile
+            .agent_loop
+            .ensure_system_prompt_seeded(&mut self.durable.session)
+            .await
+        {
+            error!(
+                session_id = %self.durable.session.id,
+                error = %e,
+                "failed to seed system prompt for subagent notification; deferring to next retry"
+            );
+            return;
+        }
+        // Take the results but keep them in hand: the turn below is
+        // fallible (provider error, cost rejection, cancellation), and a
+        // delivered completion must not be lost if it fails. The actor is
+        // single-threaded, so nothing else mutates the buffer while the
+        // turn runs.
         let pending = std::mem::take(&mut self.durable.session.state.pending_subagent_results);
         if pending.is_empty() {
-            return None;
+            return;
         }
-        let mut body = String::from(BACKGROUND_NOTIFICATIONS_PREAMBLE);
-        for p in &pending {
-            body.push_str(&format!(
-                "- handle={} type={} status={} child_session={} summary={:?}\n  text: {}\n",
-                p.handle_id,
-                p.subagent_type,
-                pending_status_label(&p.status),
-                p.child_session_id,
-                p.task_summary,
-                truncate_for_notice(&p.final_text),
-            ));
+        let content = self.build_subagent_notification_content(&pending);
+        // Commit the drained (now-empty) buffer to the row BEFORE the
+        // fallible turn: a crash mid-turn must not leave the results in the
+        // row to be replayed as a DUPLICATE notification on restart. On an
+        // in-process turn failure we re-buffer below, so a transient error
+        // still retries (the actor is single-threaded — nothing else
+        // mutates the buffer while the turn runs).
+        self.persist_session_state_after_pending_change("subagent_notification_drained")
+            .await;
+        // No delta streaming: the empty-output decision is made on the
+        // assembled reply, so nothing may have been streamed already.
+        //
+        // Snapshot the transcript first: the notification's synthetic prompt
+        // is appended in-memory only (not persisted), so a failed turn must
+        // roll back to here before the retry rebuilds it — otherwise the live
+        // context stacks a copy per attempt under the infinite-backoff retry.
+        let context_snapshot = self.volatile.agent_loop.context_snapshot();
+        let result = self
+            .run_agent_loop(
+                JobInput::SubagentNotification {
+                    content: content.clone(),
+                },
+                content,
+                None,
+                None,
+            )
+            .await;
+        match result {
+            Ok(response) => {
+                if is_blank_reply(&response.content) {
+                    debug!(
+                        session_id = %self.durable.session.id,
+                        "subagent-notification produced no output; suppressing send"
+                    );
+                    return;
+                }
+                self.send_response(AgentOutput::Message(response), "subagent_notification")
+                    .await;
+            }
+            Err(e) => {
+                error!(
+                    session_id = %self.durable.session.id,
+                    error = %e,
+                    "subagent-notification turn failed; restoring pending results for retry"
+                );
+                // Drop the in-memory synthetic row (and any partial turn
+                // state) this attempt appended, so the retry doesn't stack a
+                // second copy in the live context.
+                self.volatile.agent_loop.restore_context(context_snapshot);
+                // Restore the drained results so the next drain retries them —
+                // the child trace alone would never resurface.
+                let mut restored = pending;
+                restored.append(&mut self.durable.session.state.pending_subagent_results);
+                self.durable.session.state.pending_subagent_results = restored;
+                self.persist_session_state_after_pending_change("subagent_notification_restore")
+                    .await;
+            }
         }
-        body.push_str(BACKGROUND_NOTIFICATIONS_POSTAMBLE);
-        Some(body)
+    }
+
+    /// Send a user-turn reply. A blank reply (no non-whitespace text) is
+    /// anomalous for a user turn — the user is waiting — so surface a
+    /// fallback `Notice` rather than push an empty bubble. (Non-user turns —
+    /// cron, subagent notification — silently suppress a blank reply.)
+    async fn send_user_reply(&self, response: OutgoingMessage) {
+        if is_blank_reply(&response.content) {
+            warn!(
+                session_id = %self.durable.session.id,
+                "user turn produced an empty reply; surfacing fallback notice"
+            );
+            let notice = AgentOutput::Notice {
+                session_id: self.durable.session.id.clone(),
+                user_id: self.durable.session.user.id.clone(),
+                channel: self.durable.session.channel.clone(),
+                level: NoticeLevel::Warn,
+                text: EMPTY_USER_REPLY_NOTICE.to_string(),
+            };
+            self.send_response(notice, "user_empty_fallback").await;
+            return;
+        }
+        self.send_response(AgentOutput::Message(response), "user")
+            .await;
     }
 
     /// `/compact` is a control command, not an assistant turn, so the
@@ -442,7 +797,6 @@ impl AgentActor {
                 content,
                 Some(parent_job_id),
                 Some(response_tx),
-                None,
             )
             .await?;
         self.send_response(AgentOutput::Message(response), "subagent")

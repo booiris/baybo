@@ -11,11 +11,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::actor::AgentMessage;
+use crate::actor::mailbox::{MailboxSender, TrySendError};
 use aura_session::SessionManager;
 
 /// Handle to communicate with a running AgentActor.
 pub struct ActorHandle {
-    pub sender: mpsc::Sender<AgentMessage>,
+    pub sender: MailboxSender<AgentMessage>,
 }
 
 /// Manages AgentActor instances, one per active session.
@@ -138,7 +139,7 @@ impl AgentSupervisor {
         spawn: F,
     ) -> bool
     where
-        F: FnOnce() -> mpsc::Sender<AgentMessage>,
+        F: FnOnce() -> MailboxSender<AgentMessage>,
     {
         use dashmap::Entry;
         let sender = match self.actors.entry(session_id.clone()) {
@@ -174,8 +175,8 @@ impl AgentSupervisor {
     pub fn register_if_absent(
         &self,
         session_id: SessionId,
-        sender: mpsc::Sender<AgentMessage>,
-    ) -> Result<(), mpsc::Sender<AgentMessage>> {
+        sender: MailboxSender<AgentMessage>,
+    ) -> Result<(), MailboxSender<AgentMessage>> {
         use dashmap::Entry;
         match self.actors.entry(session_id.clone()) {
             Entry::Vacant(slot) => {
@@ -232,13 +233,13 @@ impl AgentSupervisor {
     ///    session permanently blocked from future background compression
     ///    passes. The clear is unconditional (not owner-scoped) because
     ///    the maintenance child is about to die regardless.
-    /// 2. Send `AgentMessage::Shutdown` to the actor's mailbox. The
-    ///    actor's `run` loop matches `Shutdown`, trips its `actor_token`
+    /// 2. Send `AgentMessage::ActorStop` to the actor's mailbox. The
+    ///    actor's `run` loop matches `ActorStop`, trips its `actor_token`
     ///    (cascade-killing every maintenance grandchild), and exits.
     ///    The `ActorRegistryGuard` then removes the entry from
     ///    `self.actors` on drop.
     ///
-    /// Returns the number of `Shutdown` sends attempted. Idle sessions
+    /// Returns the number of `ActorStop` sends attempted. Idle sessions
     /// that were not registered (cron / maintenance / subagent
     /// one-shots) are skipped — those manage their own lifetime.
     pub async fn reap_idle(&self, sessions: &SessionManager, idle_threshold: Duration) -> usize {
@@ -283,18 +284,18 @@ impl AgentSupervisor {
             let Some(sender) = self.actors.get(&session_id).map(|e| e.sender.clone()) else {
                 continue;
             };
-            match sender.try_send(AgentMessage::Shutdown) {
+            match sender.try_send(AgentMessage::ActorStop) {
                 Ok(()) => {
                     debug!(%session_id, "idle reaper: sent Shutdown");
                     reaped += 1;
                 }
-                Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(TrySendError::Full(_)) => {
                     debug!(
                         %session_id,
                         "idle reaper: mailbox full, skipping (will retry next tick)"
                     );
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(TrySendError::Closed(_)) => {
                     debug!(
                         %session_id,
                         "idle reaper: mailbox already closed; entry will be removed by registry guard"
@@ -312,14 +313,14 @@ impl AgentSupervisor {
     pub async fn shutdown_all(&self) {
         // Snapshot out of the shards before awaiting so each shard
         // lock is released before any `.send().await`.
-        let handles: Vec<(SessionId, mpsc::Sender<AgentMessage>)> = self
+        let handles: Vec<(SessionId, MailboxSender<AgentMessage>)> = self
             .actors
             .iter()
             .map(|e| (e.key().clone(), e.sender.clone()))
             .collect();
         info!(count = handles.len(), "shutting down all actors");
         for (session_id, sender) in handles {
-            if let Err(e) = sender.send(AgentMessage::Shutdown).await {
+            if let Err(e) = sender.send(AgentMessage::ActorStop).await {
                 tracing::warn!(
                     %session_id,
                     error = %e,
@@ -408,12 +409,13 @@ impl Drop for ActorRegistryGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::mailbox;
     use aura_model::{ChannelType, SessionId, User};
     use aura_session::test_support::{MemorySessionStore, MemorySessionSummaryStore};
     use aura_session::{SessionStore, SessionSummaryStore};
 
     fn make_supervisor() -> AgentSupervisor {
-        let (tx, _rx) = mpsc::channel(8);
+        let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
         AgentSupervisor::new(tx)
     }
 
@@ -421,7 +423,7 @@ mod tests {
     fn register_and_remove_round_trip() {
         let supervisor = make_supervisor();
         let session_id = SessionId::from("s-1");
-        let (tx, _rx) = mpsc::channel(8);
+        let (tx, _rx) = mailbox::channel(8);
         supervisor
             .register_if_absent(session_id.clone(), tx)
             .expect("first insert always succeeds");
@@ -434,7 +436,7 @@ mod tests {
     fn registry_guard_removes_on_drop() {
         let supervisor = make_supervisor();
         let session_id = SessionId::from("s-2");
-        let (tx, _rx) = mpsc::channel(8);
+        let (tx, _rx) = mailbox::channel(8);
         supervisor
             .register_if_absent(session_id.clone(), tx)
             .expect("first insert always succeeds");
@@ -457,8 +459,8 @@ mod tests {
     fn register_if_absent_rejects_duplicate() {
         let supervisor = make_supervisor();
         let session_id = SessionId::from("s-dup");
-        let (first, _rx) = mpsc::channel(8);
-        let (second, _rx2) = mpsc::channel(8);
+        let (first, _rx) = mailbox::channel(8);
+        let (second, _rx2) = mailbox::channel(8);
         supervisor
             .register_if_absent(session_id.clone(), first)
             .expect("first insert");
@@ -466,8 +468,8 @@ mod tests {
             .register_if_absent(session_id.clone(), second)
             .expect_err("second insert is rejected");
         // The rejected sender is returned to the caller intact —
-        // still usable for dispatching `Shutdown` to its actor.
-        assert_eq!(rejected.capacity(), 8);
+        // still usable for dispatching `ActorStop` to its actor.
+        assert!(rejected.try_send(AgentMessage::ActorStop).is_ok());
         assert_eq!(supervisor.len(), 1);
     }
 
@@ -476,12 +478,12 @@ mod tests {
         let supervisor = make_supervisor();
         let session_id = SessionId::from("s-spawn");
 
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = mailbox::channel(8);
         let spawn_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawn_calls_for_closure = Arc::clone(&spawn_calls);
 
         let routed = supervisor
-            .route_or_spawn(&session_id, AgentMessage::Shutdown, move || {
+            .route_or_spawn(&session_id, AgentMessage::ActorStop, move || {
                 spawn_calls_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tx
             })
@@ -490,7 +492,7 @@ mod tests {
         assert!(routed);
         assert_eq!(spawn_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(supervisor.len(), 1, "spawned actor must be registered");
-        assert!(matches!(rx.try_recv(), Ok(AgentMessage::Shutdown)));
+        assert!(matches!(rx.try_recv(), Ok(AgentMessage::ActorStop)));
     }
 
     #[tokio::test]
@@ -498,7 +500,7 @@ mod tests {
         let supervisor = make_supervisor();
         let session_id = SessionId::from("s-reuse");
 
-        let (first, mut first_rx) = mpsc::channel(8);
+        let (first, mut first_rx) = mailbox::channel(8);
         supervisor
             .register_if_absent(session_id.clone(), first)
             .expect("seed an existing actor");
@@ -507,9 +509,9 @@ mod tests {
         let spawn_calls_for_closure = Arc::clone(&spawn_calls);
 
         let routed = supervisor
-            .route_or_spawn(&session_id, AgentMessage::Shutdown, move || {
+            .route_or_spawn(&session_id, AgentMessage::ActorStop, move || {
                 spawn_calls_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let (rogue, _) = mpsc::channel(1);
+                let (rogue, _) = mailbox::channel(1);
                 rogue
             })
             .await;
@@ -523,7 +525,7 @@ mod tests {
         assert_eq!(supervisor.len(), 1);
         // Message reaches the *pre-registered* mailbox, not a freshly
         // built one.
-        assert!(matches!(first_rx.try_recv(), Ok(AgentMessage::Shutdown)));
+        assert!(matches!(first_rx.try_recv(), Ok(AgentMessage::ActorStop)));
     }
 
     #[tokio::test]
@@ -532,10 +534,10 @@ mod tests {
         let session_id = SessionId::from("s-closed");
 
         let routed = supervisor
-            .route_or_spawn(&session_id, AgentMessage::Shutdown, || {
+            .route_or_spawn(&session_id, AgentMessage::ActorStop, || {
                 // Drop the receiver immediately so the freshly built
                 // sender is closed before route_or_spawn sends on it.
-                let (tx, rx) = mpsc::channel(1);
+                let (tx, rx) = mailbox::channel(1);
                 drop(rx);
                 tx
             })
@@ -554,7 +556,7 @@ mod tests {
         let supervisor = make_supervisor();
         let clone = supervisor.clone();
         let session_id = SessionId::from("s-4");
-        let (tx, _rx) = mpsc::channel(8);
+        let (tx, _rx) = mailbox::channel(8);
         supervisor
             .register_if_absent(session_id.clone(), tx)
             .expect("first insert always succeeds");
@@ -607,8 +609,8 @@ mod tests {
             .unwrap();
 
         let supervisor = make_supervisor();
-        let (idle_tx, mut idle_rx) = mpsc::channel(8);
-        let (fresh_tx, mut fresh_rx) = mpsc::channel(8);
+        let (idle_tx, mut idle_rx) = mailbox::channel(8);
+        let (fresh_tx, mut fresh_rx) = mailbox::channel(8);
         supervisor
             .register_if_absent(idle.id.clone(), idle_tx)
             .expect("first insert");
@@ -620,7 +622,7 @@ mod tests {
         assert_eq!(reaped, 1, "only the registered idle actor is reaped");
 
         // The idle actor received a Shutdown message.
-        assert!(matches!(idle_rx.try_recv(), Ok(AgentMessage::Shutdown)));
+        assert!(matches!(idle_rx.try_recv(), Ok(AgentMessage::ActorStop)));
         // The fresh actor received nothing.
         assert!(fresh_rx.try_recv().is_err());
 
@@ -681,7 +683,7 @@ mod tests {
         session_store.save(&parent).await.unwrap();
 
         let supervisor = make_supervisor();
-        let (mailbox_tx, mut mailbox_rx) = mpsc::channel(8);
+        let (mailbox_tx, mut mailbox_rx) = mailbox::channel(8);
         supervisor
             .register_if_absent(parent.id.clone(), mailbox_tx)
             .expect("first insert");
@@ -698,6 +700,6 @@ mod tests {
         supervisor.note_background_subagent_finished(&parent.id);
         let reaped = supervisor.reap_idle(&sessions, Duration::seconds(60)).await;
         assert_eq!(reaped, 1, "parent must be reaped after subagent clears");
-        assert!(matches!(mailbox_rx.try_recv(), Ok(AgentMessage::Shutdown)));
+        assert!(matches!(mailbox_rx.try_recv(), Ok(AgentMessage::ActorStop)));
     }
 }

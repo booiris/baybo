@@ -38,16 +38,6 @@ pub const SUBAGENT_CHANNEL_TAG: &str = "subagent";
 /// in-flight handles.
 pub const BACKGROUND_SUBAGENT_HANDLE_PREFIX: &str = "bg-";
 
-/// Opening line of the system-reminder preamble the parent actor
-/// prepends to the next user turn after one or more background
-/// subagents land their results. Lifted so the actor that writes it
-/// and integration tests that grep for it share one source of truth.
-pub const BACKGROUND_NOTIFICATIONS_PREAMBLE: &str =
-    "[background subagent notifications — work that finished since your last turn]\n";
-
-/// Closing line of the same preamble.
-pub const BACKGROUND_NOTIFICATIONS_POSTAMBLE: &str = "[end of background notifications]\n\n";
-
 /// Request emitted by `AgentLoop`'s parent-side trigger gate and by
 /// the `spawn_subagent` tool, consumed by `Router`'s `system_trigger_rx`
 /// arm. Senders push onto an `mpsc::Sender<SystemSpawnRequest>`; the

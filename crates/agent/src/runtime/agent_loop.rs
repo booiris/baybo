@@ -307,6 +307,34 @@ impl AgentLoop {
         self.context_manager.restore_from_store().await;
     }
 
+    /// Snapshot the in-memory transcript so a fallible turn can be rolled
+    /// back. Used by the subagent-notification retry path: that turn's
+    /// synthetic prompt is appended in-memory only (not persisted), so on
+    /// failure the actor restores this snapshot to drop the row before the
+    /// next retry rebuilds it — otherwise the live context would stack a copy
+    /// per attempt.
+    pub fn context_snapshot(&self) -> Vec<ChatMessage> {
+        self.context_manager.messages().to_vec()
+    }
+
+    /// Restore a transcript snapshot taken by [`Self::context_snapshot`].
+    pub fn restore_context(&mut self, messages: Vec<ChatMessage>) {
+        self.context_manager.restore_messages(messages);
+    }
+
+    /// Seed the system prompt (+ skill reminder) if the transcript doesn't
+    /// already lead with it. Idempotent. Exposed so the subagent-notification
+    /// path can establish the (persisted) system row *before* snapshotting the
+    /// context for rollback — otherwise a rollback on a fresh session would
+    /// drop the just-persisted system row in-memory and the next retry would
+    /// re-seed and re-persist it.
+    pub async fn ensure_system_prompt_seeded(
+        &mut self,
+        session: &mut Session,
+    ) -> anyhow::Result<()> {
+        self.ensure_system_prompt(session).await
+    }
+
     /// Run the main conversation loop for a single user message.
     ///
     /// When `delta_tx` is `Some`, each text chunk emitted by the LLM is
@@ -329,7 +357,6 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         parent_job_id: Option<JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
-        background_notice: Option<String>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
         // `job_input` records why this job exists (provenance: which
@@ -338,6 +365,20 @@ impl AgentLoop {
         // message. They coincide for `UserChat` but differ for
         // `Cron` / `System` where the input is a synthesized prompt
         // rather than the raw trigger payload.
+        //
+        // Synthetic-input turns (the autonomous `SubagentNotification`) are
+        // appended as `from_user = false` so chat surfaces treat them as
+        // agent-injected context, not a real user-authored message.
+        let is_subagent_notification = matches!(job_input, JobInput::SubagentNotification { .. });
+        let from_user = !is_subagent_notification;
+        // The notification prompt is rebuilt from the durable
+        // `pending_subagent_results` buffer on every retry, so persisting it
+        // per-attempt would duplicate the hidden row on each failed retry
+        // (provider outage → infinite backoff). Append it in-memory only; the
+        // buffer is the source of truth and only the proactive reply (if any)
+        // is persisted. Kept separate from `from_user` so a future
+        // agent-injected row can still choose to persist.
+        let persist_user_row = !is_subagent_notification;
         let spec = JobSpec {
             session_id: session.id.clone(),
             session_trigger_kind: session.trigger.kind(),
@@ -358,7 +399,8 @@ impl AgentLoop {
                         span_recorder,
                         job_id,
                         delta_tx,
-                        background_notice,
+                        from_user,
+                        persist_user_row,
                         cancel_token,
                     )
                     .await?;
@@ -380,7 +422,8 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
-        background_notice: Option<String>,
+        from_user: bool,
+        persist_user_row: bool,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
         let _ = job_lifecycle;
@@ -398,19 +441,6 @@ impl AgentLoop {
             }) as Arc<dyn aura_tools::SessionNotifier>
         });
 
-        // Background-subagent notice (work that finished off-thread since
-        // the parent's last turn) is appended as its own context message
-        // ahead of the user's — never merged into `user_content`, which
-        // would push a leading `/command` past slash detection below.
-        if let Some(notice) = background_notice {
-            let notice_msg = ChatMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text(notice)],
-                from_user: false,
-            };
-            self.append_context_message(session, &notice_msg).await?;
-        }
-
         let user_text = aura_llm::multimodal::extract_text(&user_content);
         let skills_for_turn = if self.skill_registry.is_empty() {
             Vec::new()
@@ -422,9 +452,15 @@ impl AgentLoop {
         let user_msg = ChatMessage {
             role: Role::User,
             content: user_content.clone(),
-            from_user: true,
+            from_user,
         };
-        self.append_context_message(session, &user_msg).await?;
+        if persist_user_row {
+            self.append_context_message(session, &user_msg).await?;
+        } else {
+            // SubagentNotification: rebuilt from the durable buffer on retry,
+            // so the row is in-memory only and rolled back if the turn fails.
+            self.context_manager.append_in_memory(&user_msg);
+        }
 
         if let Some((skill_name, args)) = detect_slash_invocation(&user_text, &skills_for_turn) {
             let synthesized_id = format!("synthskill-{}", uuid::Uuid::new_v4());
@@ -1136,6 +1172,30 @@ impl AgentLoop {
         let ordinal = self.context_manager.append(message).await;
         self.write_session_message_log(session, message).await;
         Ok(ordinal)
+    }
+
+    /// Append a `from_user` message to this session's transcript — both the
+    /// in-memory context and the persisted `session_messages` log — ahead
+    /// of the turn that runs next. Lets the actor coalesce a burst of user
+    /// messages into one turn while keeping each as its own transcript row;
+    /// `merge_for_llm` collapses the consecutive rows for the provider call.
+    pub async fn append_user_message(
+        &mut self,
+        session: &mut Session,
+        content: Vec<ContentBlock>,
+    ) -> anyhow::Result<()> {
+        // A coalesced burst can be the first thing a fresh session ever
+        // appends; seed the system prompt first so it never lands *after*
+        // user content. `initial_seed_messages` keys off `messages[0]`, so a
+        // leading user row would also make every later turn re-seed.
+        self.ensure_system_prompt(session).await?;
+        let msg = ChatMessage {
+            role: Role::User,
+            content,
+            from_user: true,
+        };
+        self.append_context_message(session, &msg).await?;
+        Ok(())
     }
 
     async fn write_session_message_log(&self, session: &Session, message: &ChatMessage) {

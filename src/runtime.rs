@@ -806,7 +806,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         session_manager: Arc::clone(&sessions),
                     },
                 );
-                let (sender, mailbox) = mpsc::channel(buffer);
+                let (sender, mailbox) =
+                    aura_agent::mailbox::channel(aura_agent::mailbox::DEFAULT_CAPACITY);
                 tokio::spawn(async move {
                     actor.run(mailbox).await;
                 });

@@ -597,6 +597,7 @@ pub enum JobKind {
     Cron,
     System,
     Spawned,
+    SubagentNotification,
 }
 
 impl From<aura_job::JobKind> for JobKind {
@@ -606,6 +607,7 @@ impl From<aura_job::JobKind> for JobKind {
             aura_job::JobKind::Cron => Self::Cron,
             aura_job::JobKind::System => Self::System,
             aura_job::JobKind::Spawned => Self::Spawned,
+            aura_job::JobKind::SubagentNotification => Self::SubagentNotification,
         }
     }
 }

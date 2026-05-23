@@ -24,15 +24,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::actor::AgentMessage;
-use aura_channels::AgentOutput;
+use aura_channels::{AgentOutput, IncomingMessage, Message};
 use aura_cost::SpendingLimits;
 use aura_integration_tests::{AgentTestHarness, SessionBuilder, capture_tracing};
 use aura_llm::test_support::StubLlm;
 use aura_llm::{LlmError, LlmResponse, ModelPricing, StreamEvent, TokenUsage, ToolCallInfo};
 use aura_model::{
-    ContentBlock, MicroUsd, PendingSubagentResult, Role, SessionId, SubagentExitStatus,
-    TriggerSource,
+    ContentBlock, MessageMetadata, MicroUsd, PendingSubagentResult, Role, SessionId,
+    SubagentExitStatus, TriggerSource,
 };
+use chrono::Utc;
 use aura_tools::test_support::RecordingTool;
 use aura_tools::{Tool, ToolOutput};
 use serde_json::json;
@@ -396,20 +397,18 @@ async fn multiple_tool_calls_run_concurrently() {
 }
 
 #[tokio::test]
-async fn background_subagent_finished_is_persisted_and_drained_on_next_turn() {
-    // End-to-end of the background path's terminal side: the wait
-    // task's `AgentMessage::SubagentFinished` push, the actor's
-    // append + persist, and the next `UserInput`'s drain into the
-    // system-reminder preamble. The router-side dispatch is covered
-    // by unit tests on the supervisor / fan_out counter; this
-    // exercises the *delivery* half.
+async fn background_subagent_finished_runs_autonomous_notification_turn() {
+    // The new background-delivery contract: a finished background
+    // subagent is buffered, then — once nothing higher-priority is
+    // queued — drained into its OWN `SubagentNotification` turn the actor
+    // runs autonomously (no user turn required). The nested-XML notice
+    // rides as the turn's user-role content; the model's reply is sent
+    // proactively to the channel.
     let mut harness = AgentTestHarness::builder().build();
     let session_id = harness.session.id.clone();
 
-    // Final response for the upcoming user turn (no tool calls so
-    // the loop exits after one iteration).
     harness.stub_llm.push_response(LlmResponse {
-        content: "got it".into(),
+        content: "FOO lives at lib/foo.rs:7".into(),
         content_blocks: vec![],
         tool_calls: vec![],
         usage: TokenUsage::default(),
@@ -431,13 +430,155 @@ async fn background_subagent_finished_is_persisted_and_drained_on_next_turn() {
         .await
         .expect("inject SubagentFinished");
 
-    // Give the actor a tick to process. The actor's run loop is
-    // single-threaded over the mailbox so by the time the next
-    // mailbox push lands, the prior message has been fully handled.
-    // We still need to wait briefly for the async persist to settle.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // No user turn: the actor fires the notification turn on its own.
+    let outputs = harness.drain_outputs(Duration::from_millis(500)).await;
 
-    // Persistence: storage row carries the pending entry.
+    // The turn ran with the nested-XML notice as its user-role content.
+    let captured = harness.stub_llm.captured_requests();
+    assert!(!captured.is_empty(), "notification turn must call the LLM");
+    let user_msg = captured[0]
+        .messages
+        .iter()
+        .find(|m| m.role == Role::User)
+        .expect("user-role notice present");
+    let text = user_msg
+        .content
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .expect("text block on notice");
+    assert!(text.contains("<subagent_results>"), "XML notice missing: {text}");
+    assert!(text.contains("bg-42"));
+    assert!(text.contains("explorer"));
+    assert!(text.contains("found FOO at lib/foo.rs:7"));
+    assert!(
+        text.contains("child-A"),
+        "notice must carry the child_session id for resume/citation: {text}"
+    );
+    // The synthetic notice is `from_user = false`, so chat surfaces hide
+    // it — it must not render as a fake user-authored bubble.
+    assert!(
+        !user_msg.from_user,
+        "subagent notice must be persisted as from_user=false"
+    );
+
+    // The turn drained the buffer.
+    let stored = harness
+        .session_manager
+        .get(&session_id)
+        .await
+        .expect("load session")
+        .expect("row present");
+    assert!(
+        stored.state.pending_subagent_results.is_empty(),
+        "notification turn must clear the persisted buffer"
+    );
+
+    // The non-empty reply was sent proactively to the channel.
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            aura_channels::AgentOutput::Message(m)
+                if m.content.iter().any(|b| matches!(
+                    b,
+                    ContentBlock::Text(t) if t.contains("FOO lives at lib/foo.rs:7")
+                ))
+        )),
+        "proactive reply must reach the channel"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn subagent_notification_suppresses_empty_reply() {
+    // The notification turn always runs, but a blank/whitespace model
+    // reply is suppressed (never pushed to the channel) — the model's
+    // only implicit way to stay quiet (there is no `<no_output/>`
+    // sentinel).
+    let mut harness = AgentTestHarness::builder().build();
+
+    harness.stub_llm.push_response(LlmResponse {
+        content: "   ".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage::default(),
+        thinking: None,
+    });
+
+    harness
+        .mailbox
+        .send(AgentMessage::SubagentFinished(Box::new(
+            PendingSubagentResult {
+                handle_id: "bg-quiet".into(),
+                subagent_type: "explorer".into(),
+                task_summary: "nothing notable".into(),
+                child_session_id: SessionId::from("child-Q"),
+                final_text: "no-op".into(),
+                images: vec![],
+                status: SubagentExitStatus::Completed,
+            },
+        )))
+        .await
+        .expect("inject SubagentFinished");
+
+    let outputs = harness.drain_outputs(Duration::from_millis(500)).await;
+
+    // The turn ran (LLM was called) …
+    assert_eq!(
+        harness.stub_llm.captured_requests().len(),
+        1,
+        "the notification turn must still run"
+    );
+    // … but the blank reply was suppressed.
+    assert!(
+        !outputs
+            .iter()
+            .any(|o| matches!(o, aura_channels::AgentOutput::Message(_))),
+        "blank notification reply must not be sent to the channel"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn subagent_notification_failure_keeps_pending_for_retry() {
+    // If the autonomous notification turn fails (provider error, cost
+    // rejection, cancellation), the delivered result must NOT be lost — it
+    // stays buffered so a later drain retries it. (Regression: an earlier
+    // version drained + persisted the empty buffer *before* the fallible
+    // turn, dropping the result on any failure.)
+    let mut harness = AgentTestHarness::builder().build();
+    let session_id = harness.session.id.clone();
+
+    // The notification turn's LLM call fails.
+    harness
+        .stub_llm
+        .push_response_err(LlmError::Internal(anyhow::anyhow!("provider down")));
+
+    harness
+        .mailbox
+        .send(AgentMessage::SubagentFinished(Box::new(
+            PendingSubagentResult {
+                handle_id: "bg-keep".into(),
+                subagent_type: "explorer".into(),
+                task_summary: "find X".into(),
+                child_session_id: SessionId::from("child-K"),
+                final_text: "found X".into(),
+                images: vec![],
+                status: SubagentExitStatus::Completed,
+            },
+        )))
+        .await
+        .expect("inject SubagentFinished");
+
+    let _ = harness.drain_outputs(Duration::from_millis(500)).await;
+
+    // The turn was attempted (LLM called) …
+    assert_eq!(harness.stub_llm.captured_requests().len(), 1);
+    // … but the result is preserved for retry, not dropped.
     let stored = harness
         .session_manager
         .get(&session_id)
@@ -447,55 +588,130 @@ async fn background_subagent_finished_is_persisted_and_drained_on_next_turn() {
     assert_eq!(
         stored.state.pending_subagent_results.len(),
         1,
-        "SubagentFinished must write to the session row"
+        "failed notification turn must keep the pending result"
     );
-    let row_entry = &stored.state.pending_subagent_results[0];
-    assert_eq!(row_entry.handle_id, "bg-42");
-    assert_eq!(row_entry.subagent_type, "explorer");
+    assert_eq!(stored.state.pending_subagent_results[0].handle_id, "bg-keep");
 
-    // Trigger a user turn; the actor drains pending before run.
-    harness.send_text("anything").await.unwrap();
-    let _ = harness.drain_outputs(Duration::from_millis(500)).await;
+    harness.shutdown().await;
+}
 
-    // The drained notice is injected as its own user-role context
-    // message ahead of the user's turn (no longer merged into the
-    // user's content), so it's the first user message the LLM sees.
-    let captured = harness.stub_llm.captured_requests();
+#[tokio::test(start_paused = true)]
+async fn failed_subagent_notification_retries_until_success() {
+    // The notification turn retries indefinitely on exponential backoff —
+    // there is NO attempt cap — so a completion is delivered once the
+    // provider recovers, even after MORE failures than the old cap would
+    // have allowed. Paused time auto-advances through the real backoffs, so
+    // this runs instantly.
+    let mut harness = AgentTestHarness::builder().build();
+    let session_id = harness.session.id.clone();
+
+    // Six consecutive failures (past the former 5-attempt cap), then success.
+    for _ in 0..6 {
+        harness
+            .stub_llm
+            .push_response_err(LlmError::Internal(anyhow::anyhow!("provider blip")));
+    }
+    harness.stub_llm.push_response(LlmResponse {
+        content: "research done".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage::default(),
+        thinking: None,
+    });
+
+    harness
+        .mailbox
+        .send(AgentMessage::SubagentFinished(Box::new(
+            PendingSubagentResult {
+                handle_id: "bg-retry".into(),
+                subagent_type: "explorer".into(),
+                task_summary: "find X".into(),
+                child_session_id: SessionId::from("child-R"),
+                final_text: "found X".into(),
+                images: vec![],
+                status: SubagentExitStatus::Completed,
+            },
+        )))
+        .await
+        .expect("inject SubagentFinished");
+
+    // Long enough that auto-advance steps past the first retry backoff (60s)
+    // and the retry's reply reaches the channel.
+    let outputs = harness.drain_outputs(Duration::from_secs(2000)).await;
+
+    // Attempted at least 7 times (initial + 6 retries) — past the former
+    // cap, proving there is no give-up …
     assert!(
-        !captured.is_empty(),
-        "expected at least one captured LLM call"
+        harness.stub_llm.captured_requests().len() >= 7,
+        "a failed notification must retry past the old attempt cap"
     );
-    let user_msg = captured[0]
-        .messages
-        .iter()
-        .find(|m| m.role == Role::User)
-        .expect("user message present");
-    let first_text = user_msg
-        .content
-        .iter()
-        .find_map(|b| match b {
-            ContentBlock::Text(t) => Some(t.as_str()),
-            _ => None,
-        })
-        .expect("first text block on user message");
-    assert!(
-        first_text.contains("background subagent notifications"),
-        "preamble missing: {first_text}"
-    );
-    assert!(first_text.contains("bg-42"));
-    assert!(first_text.contains("explorer"));
-    assert!(first_text.contains("found FOO at lib/foo.rs:7"));
-
-    // Storage was cleared on drain — the next turn must not double-replay.
+    // … the retry drained the buffer …
     let stored = harness
         .session_manager
         .get(&session_id)
         .await
-        .expect("load session post-drain")
-        .expect("row present post-drain");
+        .expect("load session")
+        .expect("row present");
     assert!(
         stored.state.pending_subagent_results.is_empty(),
-        "drain must clear the persisted buffer"
+        "a successful retry must drain the buffer"
+    );
+    // … and the retry's reply reached the channel.
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            AgentOutput::Message(m)
+                if m.content.iter().any(|b| matches!(
+                    b,
+                    ContentBlock::Text(t) if t.contains("research done")
+                ))
+        )),
+        "the retry's reply must reach the channel"
+    );
+
+    // P2 regression: the synthetic notification prompt is appended in-memory
+    // only and rolled back on each failed attempt, so it never accumulates —
+    // not in the successful request, and not in the persisted transcript.
+    let captured = harness.stub_llm.captured_requests();
+    let last_user_text: String = captured
+        .last()
+        .expect("at least one request")
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        last_user_text.matches("bg-retry").count(),
+        1,
+        "the successful turn must see the result once, not one copy per failed retry: {last_user_text}"
+    );
+
+    let persisted = harness
+        .session_manager
+        .load_active_session_messages(&session_id)
+        .await
+        .expect("load persisted transcript");
+    let persisted_notification_rows = persisted
+        .iter()
+        .filter(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("bg-retry")))
+        })
+        .count();
+    assert_eq!(
+        persisted_notification_rows, 0,
+        "the in-memory-only notification row must never be persisted, even across failed retries"
+    );
+    let persisted_system_rows = persisted.iter().filter(|m| m.role == Role::System).count();
+    assert_eq!(
+        persisted_system_rows, 1,
+        "the system prompt must be seeded once, not re-seeded on each retry"
     );
 
     harness.shutdown().await;
@@ -503,32 +719,58 @@ async fn background_subagent_finished_is_persisted_and_drained_on_next_turn() {
 
 #[tokio::test]
 async fn subagent_finished_dedupes_on_handle_id() {
-    // A wait task that retried delivery (or any future
-    // storage-backed recovery path) could re-publish the same
-    // pending result. The actor handler dedupes by `handle_id` so
-    // the parent LLM's reminder doesn't show two copies of the
-    // same finish.
-    let harness = AgentTestHarness::builder().build();
+    // Duplicate deliveries of the same `handle_id` that land in one batch
+    // (before the notification turn drains the buffer) collapse to a
+    // single entry, so the notice lists the result once. `#[tokio::test]`
+    // is current-thread, so the three sends enqueue before the actor task
+    // is polled — they batch deterministically into one turn.
+    let mut harness = AgentTestHarness::builder().build();
     let session_id = harness.session.id.clone();
 
-    let make = || PendingSubagentResult {
-        handle_id: "bg-dupe".into(),
-        subagent_type: "explorer".into(),
-        task_summary: "dupe".into(),
-        child_session_id: SessionId::from("child-D"),
-        final_text: "only once".into(),
-        images: vec![],
-        status: SubagentExitStatus::Completed,
-    };
+    harness.stub_llm.push_response(LlmResponse {
+        content: "noted".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage::default(),
+        thinking: None,
+    });
 
+    let make = || {
+        AgentMessage::SubagentFinished(Box::new(PendingSubagentResult {
+            handle_id: "bg-dupe".into(),
+            subagent_type: "explorer".into(),
+            task_summary: "dupe".into(),
+            child_session_id: SessionId::from("child-D"),
+            final_text: "only once".into(),
+            images: vec![],
+            status: SubagentExitStatus::Completed,
+        }))
+    };
     for _ in 0..3 {
-        harness
-            .mailbox
-            .send(AgentMessage::SubagentFinished(Box::new(make())))
-            .await
-            .expect("inject");
+        harness.mailbox.send(make()).await.expect("inject");
     }
-    tokio::time::sleep(Duration::from_millis(75)).await;
+
+    let _ = harness.drain_outputs(Duration::from_millis(500)).await;
+
+    // Exactly one notification turn; its notice lists the handle once.
+    let captured = harness.stub_llm.captured_requests();
+    assert_eq!(captured.len(), 1, "duplicates must not spawn extra turns");
+    let text = captured[0]
+        .messages
+        .iter()
+        .find(|m| m.role == Role::User)
+        .and_then(|m| {
+            m.content.iter().find_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+        })
+        .expect("notice text");
+    assert_eq!(
+        text.matches("bg-dupe").count(),
+        1,
+        "duplicate handle must be listed once: {text}"
+    );
 
     let stored = harness
         .session_manager
@@ -536,10 +778,203 @@ async fn subagent_finished_dedupes_on_handle_id() {
         .await
         .expect("load session")
         .expect("row present");
+    assert!(stored.state.pending_subagent_results.is_empty());
+
+    harness.shutdown().await;
+}
+
+/// Build a raw `AgentMessage::UserInput` for direct mailbox injection,
+/// bypassing the gateway sanitize step (whose `.await` could yield and let
+/// the actor drain mid-burst). Sending these in a tight loop on the
+/// current-thread test runtime enqueues them before the actor is polled,
+/// so coalescing is deterministic.
+fn user_input(harness: &AgentTestHarness, text: &str) -> AgentMessage {
+    AgentMessage::UserInput(Box::new(IncomingMessage {
+        message: Message {
+            id: format!("m-{text}"),
+            session_id: harness.session.id.clone(),
+            channel: harness.session.channel.clone(),
+            sender: harness.session.user.clone(),
+            content: vec![ContentBlock::Text(text.to_string())],
+            timestamp: Utc::now(),
+            reply_to: None,
+            metadata: MessageMetadata::default(),
+        },
+        platform_msg_id: String::new(),
+    }))
+}
+
+#[tokio::test]
+async fn rapid_user_inputs_coalesce_into_one_turn() {
+    // A burst of plain user messages that pile up before the actor takes
+    // them runs as ONE turn (one LLM call, one reply) with their content
+    // concatenated.
+    let mut harness = AgentTestHarness::builder().build();
+    harness.stub_llm.push_response(LlmResponse {
+        content: "answered all three".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage::default(),
+        thinking: None,
+    });
+
+    for t in ["one", "two", "three"] {
+        harness
+            .mailbox
+            .send(user_input(&harness, t))
+            .await
+            .expect("send");
+    }
+
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let captured = harness.stub_llm.captured_requests();
+    assert_eq!(captured.len(), 1, "burst must coalesce into one turn");
+    let user_text: String = captured[0]
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(user_text.contains("one"), "coalesced text: {user_text}");
+    assert!(user_text.contains("two"));
+    assert!(user_text.contains("three"));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn coalesced_first_turn_seeds_system_prompt_before_user_rows() {
+    // Regression (P1): when a fresh session's FIRST turn is a coalesced burst,
+    // the leading rows must not be appended ahead of the system prompt. If they
+    // were, the transcript would start with a user row, and since the seed
+    // check keys off `messages[0]`, `ensure_system_prompt` would re-seed on
+    // every later turn — sending duplicate preambles + consecutive user rows.
+    let mut harness = AgentTestHarness::builder().build();
+    for _ in 0..2 {
+        harness.stub_llm.push_response(LlmResponse {
+            content: "ok".into(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: TokenUsage::default(),
+            thinking: None,
+        });
+    }
+
+    // Turn 1: a two-message burst on the fresh session (enqueued before the
+    // actor polls, so they coalesce into one turn).
+    for t in ["alpha", "beta"] {
+        harness
+            .mailbox
+            .send(user_input(&harness, t))
+            .await
+            .expect("send burst");
+    }
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    // Turn 2: a follow-up — this is where the per-turn re-seed bug surfaces.
+    harness.send_text("gamma").await.expect("send follow-up");
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let captured = harness.stub_llm.captured_requests();
+    assert_eq!(captured.len(), 2, "burst then follow-up = two turns");
+    // The first turn's request must lead with the system prompt, not a user row.
     assert_eq!(
-        stored.state.pending_subagent_results.len(),
-        1,
-        "duplicate handle_id must collapse"
+        captured[0].messages.first().map(|m| m.role),
+        Some(Role::System),
+        "coalesced first turn must seed the system prompt ahead of the user rows"
+    );
+    // The follow-up turn still carries exactly one system prompt — proof the
+    // first row stayed `System` and nothing re-seeded.
+    let system_rows = captured[1]
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::System)
+        .count();
+    assert_eq!(
+        system_rows, 1,
+        "system prompt must be seeded once, not re-appended every turn"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn slash_command_is_a_coalescing_boundary() {
+    // A slash message splits a burst: "a" / "/x" / "b" run as three
+    // separate turns, so the slash never merges with its neighbours and
+    // stays at content position 0 for compact / skill detection.
+    let mut harness = AgentTestHarness::builder().build();
+    for _ in 0..3 {
+        harness.stub_llm.push_response(LlmResponse {
+            content: "ok".into(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: TokenUsage::default(),
+            thinking: None,
+        });
+    }
+
+    for t in ["a", "/x", "b"] {
+        harness
+            .mailbox
+            .send(user_input(&harness, t))
+            .await
+            .expect("send");
+    }
+
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let captured = harness.stub_llm.captured_requests();
+    assert_eq!(
+        captured.len(),
+        3,
+        "slash boundary must split the burst into three turns"
+    );
+    // The middle turn carries the slash message alone.
+    let middle: String = captured[1]
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(middle.contains("/x"), "slash turn ran alone: {middle}");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn user_turn_empty_reply_surfaces_fallback_notice() {
+    // A user turn whose reply is blank must NOT be sent as an empty
+    // assistant bubble — the user is waiting, so a fallback Notice is
+    // surfaced instead. (Non-user turns silently suppress a blank reply.)
+    let mut harness = AgentTestHarness::builder().build();
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("   ".into())]);
+
+    harness.send_text("hi").await.expect("send");
+    let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert!(
+        !outputs
+            .iter()
+            .any(|o| matches!(o, AgentOutput::Message(_))),
+        "blank user reply must not be sent as an empty assistant message"
+    );
+    assert!(
+        outputs
+            .iter()
+            .any(|o| matches!(o, AgentOutput::Notice { .. })),
+        "blank user reply must surface a fallback notice"
     );
 
     harness.shutdown().await;

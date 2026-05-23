@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::actor::AgentMessage;
+use crate::actor::mailbox::MailboxSender;
 use crate::actor::supervisor::AgentSupervisor;
 use crate::security::SecurityGateway;
 use aura_cost::CostManager;
@@ -97,7 +98,7 @@ pub type ActorSpawner = Box<
             mpsc::Sender<AgentOutput>,
             /* actor_token */ CancellationToken,
             /* system_prompt_override */ Option<String>,
-        ) -> mpsc::Sender<AgentMessage>
+        ) -> MailboxSender<AgentMessage>
         + Send
         + Sync,
 >;
@@ -280,7 +281,7 @@ impl Router {
         response_tx: mpsc::Sender<AgentOutput>,
         parent_token: &CancellationToken,
         system_prompt_override: Option<String>,
-    ) -> (mpsc::Sender<AgentMessage>, CancellationToken) {
+    ) -> (MailboxSender<AgentMessage>, CancellationToken) {
         let actor_token = parent_token.child_token();
         let mailbox = (self.actor_spawner)(
             session,
