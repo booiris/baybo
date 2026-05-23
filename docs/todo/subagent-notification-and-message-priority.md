@@ -154,12 +154,15 @@ then stop"). This is deliberate:
   message to the user (this is the model's only, implicit, way to stay quiet).
 - **Persistence**: the synthetic XML turn + the assistant reply persist into the transcript
   normally — same as any main-path turn (the XML turn at `from_user = false`, hidden from chat).
-- **Failure-safe drain**: the pending buffer is taken in hand and the XML built, but the cleared
-  buffer is **persisted only after the turn succeeds**. If the turn fails (provider error, cost
-  rejection, cancellation), the drained results are **restored** to `pending_subagent_results`
-  and re-persisted so the next drain retries them — a delivered completion is never lost to a
-  transient notification failure. (The actor is single-threaded, so nothing is buffered while
-  the turn runs.)
+- **Failure-safe drain (crash- and error-safe)**: the drained (empty) buffer is persisted to the
+  row **before** the fallible turn, so a crash mid-turn can't leave the results in the row to be
+  replayed as a duplicate notification on restart. On an in-process turn failure (provider error,
+  cost rejection, cancellation) the results are **restored** to `pending_subagent_results` and
+  re-persisted so the next drain retries them. So: a transient failure never loses a completion; a
+  crash mid-turn drops it from the parent row but it survives in the child session's trace. (The
+  actor is single-threaded, so nothing is buffered while the turn runs.) NOTE: proactive delivery
+  after a *failure* still waits for the session's next inbound message (or hydration) to re-drain
+  — bounded retry-after-failure for a quiet fire-and-forget session is a follow-up (see below).
 
 ### 5. Buffer (unchanged shape)
 

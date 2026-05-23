@@ -583,6 +583,14 @@ impl AgentActor {
             return;
         }
         let content = self.build_subagent_notification_content(&pending);
+        // Commit the drained (now-empty) buffer to the row BEFORE the
+        // fallible turn: a crash mid-turn must not leave the results in the
+        // row to be replayed as a DUPLICATE notification on restart. On an
+        // in-process turn failure we re-buffer below, so a transient error
+        // still retries (the actor is single-threaded — nothing else
+        // mutates the buffer while the turn runs).
+        self.persist_session_state_after_pending_change("subagent_notification_drained")
+            .await;
         // No delta streaming: the empty-output decision is made on the
         // assembled reply, so nothing may have been streamed already.
         let result = self
@@ -597,10 +605,6 @@ impl AgentActor {
             .await;
         match result {
             Ok(response) => {
-                // Consumed: persist the cleared buffer so a crash can't
-                // replay the same notification.
-                self.persist_session_state_after_pending_change("subagent_notification_drained")
-                    .await;
                 if is_blank_reply(&response.content) {
                     debug!(
                         session_id = %self.durable.session.id,
