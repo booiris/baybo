@@ -595,6 +595,79 @@ async fn subagent_notification_failure_keeps_pending_for_retry() {
     harness.shutdown().await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn failed_subagent_notification_retries_on_backoff() {
+    // A FAILED notification turn must retry on the backoff rather than wait
+    // for the session's next inbound message. Paused time lets tokio
+    // auto-advance through the (real, 60s) retry sleep when every task is
+    // idle, so this exercises the production backoff yet runs instantly.
+    let mut harness = AgentTestHarness::builder().build();
+    let session_id = harness.session.id.clone();
+
+    // First attempt fails; the retry succeeds.
+    harness
+        .stub_llm
+        .push_response_err(LlmError::Internal(anyhow::anyhow!("provider blip")));
+    harness.stub_llm.push_response(LlmResponse {
+        content: "research done".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage::default(),
+        thinking: None,
+    });
+
+    harness
+        .mailbox
+        .send(AgentMessage::SubagentFinished(Box::new(
+            PendingSubagentResult {
+                handle_id: "bg-retry".into(),
+                subagent_type: "explorer".into(),
+                task_summary: "find X".into(),
+                child_session_id: SessionId::from("child-R"),
+                final_text: "found X".into(),
+                images: vec![],
+                status: SubagentExitStatus::Completed,
+            },
+        )))
+        .await
+        .expect("inject SubagentFinished");
+
+    // Long enough that auto-advance steps past the first retry backoff (60s)
+    // and the retry's reply reaches the channel.
+    let outputs = harness.drain_outputs(Duration::from_secs(120)).await;
+
+    // The turn was attempted at least twice (initial failure + retry) …
+    assert!(
+        harness.stub_llm.captured_requests().len() >= 2,
+        "a failed notification must be retried"
+    );
+    // … the retry drained the buffer …
+    let stored = harness
+        .session_manager
+        .get(&session_id)
+        .await
+        .expect("load session")
+        .expect("row present");
+    assert!(
+        stored.state.pending_subagent_results.is_empty(),
+        "a successful retry must drain the buffer"
+    );
+    // … and the retry's reply reached the channel.
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            AgentOutput::Message(m)
+                if m.content.iter().any(|b| matches!(
+                    b,
+                    ContentBlock::Text(t) if t.contains("research done")
+                ))
+        )),
+        "the retry's reply must reach the channel"
+    );
+
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn subagent_finished_dedupes_on_handle_id() {
     // Duplicate deliveries of the same `handle_id` that land in one batch
