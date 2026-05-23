@@ -418,6 +418,22 @@ impl ContextManager {
         self.persist_appended(msg).await
     }
 
+    /// Append a message to the in-memory transcript + token budget
+    /// **without** persisting it to `session_messages`. The
+    /// subagent-notification turn rebuilds its synthetic prompt from the
+    /// durable `pending_subagent_results` buffer on every retry, so a
+    /// persisted row would be duplicated on each failed attempt under the
+    /// infinite-backoff retry. The buffer is the source of truth; only the
+    /// model's proactive reply (if any) is persisted. The caller rolls this
+    /// row back via [`Self::restore_messages`] if the turn fails.
+    pub fn append_in_memory(&mut self, msg: &ChatMessage) {
+        let count = self.tokenizer.count_message(msg);
+        record_skill_calls(&mut self.called_skills, msg);
+        self.messages.push(msg.clone());
+        self.per_message_tokens.push(count);
+        self.budget.update(self.count_tokens());
+    }
+
     async fn persist_appended(&self, msg: &ChatMessage) -> Option<i64> {
         match self
             .sessions

@@ -669,6 +669,51 @@ async fn failed_subagent_notification_retries_until_success() {
         "the retry's reply must reach the channel"
     );
 
+    // P2 regression: the synthetic notification prompt is appended in-memory
+    // only and rolled back on each failed attempt, so it never accumulates —
+    // not in the successful request, and not in the persisted transcript.
+    let captured = harness.stub_llm.captured_requests();
+    let last_user_text: String = captured
+        .last()
+        .expect("at least one request")
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        last_user_text.matches("bg-retry").count(),
+        1,
+        "the successful turn must see the result once, not one copy per failed retry: {last_user_text}"
+    );
+
+    let persisted = harness
+        .session_manager
+        .load_active_session_messages(&session_id)
+        .await
+        .expect("load persisted transcript");
+    let persisted_notification_rows = persisted
+        .iter()
+        .filter(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("bg-retry")))
+        })
+        .count();
+    assert_eq!(
+        persisted_notification_rows, 0,
+        "the in-memory-only notification row must never be persisted, even across failed retries"
+    );
+    let persisted_system_rows = persisted.iter().filter(|m| m.role == Role::System).count();
+    assert_eq!(
+        persisted_system_rows, 1,
+        "the system prompt must be seeded once, not re-seeded on each retry"
+    );
+
     harness.shutdown().await;
 }
 
@@ -798,6 +843,62 @@ async fn rapid_user_inputs_coalesce_into_one_turn() {
     assert!(user_text.contains("one"), "coalesced text: {user_text}");
     assert!(user_text.contains("two"));
     assert!(user_text.contains("three"));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn coalesced_first_turn_seeds_system_prompt_before_user_rows() {
+    // Regression (P1): when a fresh session's FIRST turn is a coalesced burst,
+    // the leading rows must not be appended ahead of the system prompt. If they
+    // were, the transcript would start with a user row, and since the seed
+    // check keys off `messages[0]`, `ensure_system_prompt` would re-seed on
+    // every later turn — sending duplicate preambles + consecutive user rows.
+    let mut harness = AgentTestHarness::builder().build();
+    for _ in 0..2 {
+        harness.stub_llm.push_response(LlmResponse {
+            content: "ok".into(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: TokenUsage::default(),
+            thinking: None,
+        });
+    }
+
+    // Turn 1: a two-message burst on the fresh session (enqueued before the
+    // actor polls, so they coalesce into one turn).
+    for t in ["alpha", "beta"] {
+        harness
+            .mailbox
+            .send(user_input(&harness, t))
+            .await
+            .expect("send burst");
+    }
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    // Turn 2: a follow-up — this is where the per-turn re-seed bug surfaces.
+    harness.send_text("gamma").await.expect("send follow-up");
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let captured = harness.stub_llm.captured_requests();
+    assert_eq!(captured.len(), 2, "burst then follow-up = two turns");
+    // The first turn's request must lead with the system prompt, not a user row.
+    assert_eq!(
+        captured[0].messages.first().map(|m| m.role),
+        Some(Role::System),
+        "coalesced first turn must seed the system prompt ahead of the user rows"
+    );
+    // The follow-up turn still carries exactly one system prompt — proof the
+    // first row stayed `System` and nothing re-seeded.
+    let system_rows = captured[1]
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::System)
+        .count();
+    assert_eq!(
+        system_rows, 1,
+        "system prompt must be seeded once, not re-appended every turn"
+    );
 
     harness.shutdown().await;
 }

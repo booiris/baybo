@@ -503,7 +503,7 @@ impl AgentActor {
         for incoming in batch {
             self.volatile
                 .agent_loop
-                .append_user_message(&self.durable.session, incoming.message.content)
+                .append_user_message(&mut self.durable.session, incoming.message.content)
                 .await?;
         }
         let response_tx = self.volatile.response_tx.clone();
@@ -641,6 +641,24 @@ impl AgentActor {
     /// unchanged). The reply is sent proactively; an empty/whitespace
     /// reply is suppressed.
     async fn run_subagent_notification(&mut self) {
+        // Establish the system prompt before the snapshot below. It is
+        // persisted by `ensure_system_prompt`, so if the snapshot were taken
+        // before it (on a fresh session the prior context is empty), a
+        // rollback would drop the just-persisted system row in-memory and the
+        // next retry would re-seed and re-persist it. Idempotent mid-session.
+        if let Err(e) = self
+            .volatile
+            .agent_loop
+            .ensure_system_prompt_seeded(&mut self.durable.session)
+            .await
+        {
+            error!(
+                session_id = %self.durable.session.id,
+                error = %e,
+                "failed to seed system prompt for subagent notification; deferring to next retry"
+            );
+            return;
+        }
         // Take the results but keep them in hand: the turn below is
         // fallible (provider error, cost rejection, cancellation), and a
         // delivered completion must not be lost if it fails. The actor is
@@ -661,6 +679,12 @@ impl AgentActor {
             .await;
         // No delta streaming: the empty-output decision is made on the
         // assembled reply, so nothing may have been streamed already.
+        //
+        // Snapshot the transcript first: the notification's synthetic prompt
+        // is appended in-memory only (not persisted), so a failed turn must
+        // roll back to here before the retry rebuilds it — otherwise the live
+        // context stacks a copy per attempt under the infinite-backoff retry.
+        let context_snapshot = self.volatile.agent_loop.context_snapshot();
         let result = self
             .run_agent_loop(
                 JobInput::SubagentNotification {
@@ -684,13 +708,17 @@ impl AgentActor {
                     .await;
             }
             Err(e) => {
-                // Restore the drained results so the next drain retries
-                // them — the child trace alone would never resurface.
                 error!(
                     session_id = %self.durable.session.id,
                     error = %e,
                     "subagent-notification turn failed; restoring pending results for retry"
                 );
+                // Drop the in-memory synthetic row (and any partial turn
+                // state) this attempt appended, so the retry doesn't stack a
+                // second copy in the live context.
+                self.volatile.agent_loop.restore_context(context_snapshot);
+                // Restore the drained results so the next drain retries them —
+                // the child trace alone would never resurface.
                 let mut restored = pending;
                 restored.append(&mut self.durable.session.state.pending_subagent_results);
                 self.durable.session.state.pending_subagent_results = restored;

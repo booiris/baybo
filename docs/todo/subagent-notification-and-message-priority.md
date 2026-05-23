@@ -155,13 +155,24 @@ then stop"). This is deliberate:
   to stay quiet. Empty-reply policy is asymmetric: **non-user turns** (this notification turn,
   cron) silently suppress a blank reply; a **user turn** instead surfaces a fallback `Notice`
   (`send_user_reply`), since the user is waiting and a blank bubble would leave them hanging.
-- **Persistence**: the synthetic XML turn + the assistant reply persist into the transcript
-  normally — same as any main-path turn (the XML turn at `from_user = false`, hidden from chat).
+- **Persistence (in-memory-only synthetic row)**: the synthetic XML turn is appended to the
+  in-memory `ContextManager` but **not** persisted to `session_messages` (`append_in_memory`);
+  only the assistant reply (if any) persists. Because the XML is rebuilt from the durable
+  `pending_subagent_results` buffer on every retry, persisting it per-attempt would stack a
+  duplicate hidden row on each failed retry under the infinite-backoff loop. Prompt-cache parity
+  is unaffected — the in-memory row is still sent to the provider with the same system prompt +
+  toolset. Trade-off: after a clean restart the transcript carries the proactive reply without the
+  XML that prompted it (acceptable — the XML is `from_user = false` internal plumbing, hidden from
+  chat).
 - **Failure-safe drain (crash- and error-safe)**: the drained (empty) buffer is persisted to the
   row **before** the fallible turn, so a crash mid-turn can't leave the results in the row to be
   replayed as a duplicate notification on restart. On an in-process turn failure (provider error,
   cost rejection, cancellation) the results are **restored** to `pending_subagent_results` and
-  re-persisted so the next drain retries them. So: a transient failure never loses a completion; a
+  re-persisted so the next drain retries them, AND the in-memory context is **rolled back** to a
+  pre-turn snapshot (`context_snapshot` / `restore_context`) so the retry doesn't stack a second
+  copy of the synthetic row. The system prompt is seeded (`ensure_system_prompt_seeded`) **before**
+  the snapshot — it persists, so snapshotting after it stops the rollback from dropping it (and the
+  next retry from re-seeding + re-persisting it). So: a transient failure never loses a completion; a
   crash mid-turn drops it from the parent row but it survives in the child session's trace. (The
   actor is single-threaded, so nothing is buffered while the turn runs.) After a failure the actor
   **retries on an exponential backoff with NO attempt cap** (`NOTIFY_RETRY_*` — 60s, ×2, capped at
@@ -188,7 +199,10 @@ not rapid sends to an idle actor; accepted).
   new `AgentLoop::append_user_message` (which writes both the in-memory `ContextManager` and the
   persisted `session_messages` log, same as the normal user-turn append), then runs the turn
   with the last message as `user_content`; the job record's `JobInput::UserChat` carries the
-  combined content for provenance. The existing `merge_for_llm`
+  combined content for provenance. `append_user_message` **seeds the system prompt first**
+  (`ensure_system_prompt`, idempotent): a coalesced burst can be a fresh session's very first
+  append, and since the seed check keys off `messages[0]`, a leading user row would land the
+  system prompt *after* user content and make every later turn re-seed. The existing `merge_for_llm`
   (`crates/agent/src/runtime/agent_loop.rs`) collapses the consecutive rows into one message for
   the provider call. One reply answers the batch.
 - **Slash is a hard boundary** (not just `/compact`). Generalize `is_compact_command` →
