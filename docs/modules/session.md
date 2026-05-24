@@ -58,7 +58,6 @@ When a session with an in-flight subagent is deleted, the subagent's cancellatio
 
 ### `SessionState` fields
 
-- `active_skills`: skill names invoked this turn (slash-command or `/mention`, score ≥ 0.9). Repopulated each turn by `AgentLoop` from the active band; pure provenance for trace/CLI display. Tool governance is computed separately as the union of those skills' `allowed_tools` lists. See [`agent.md`](agent.md).
 - `compression_count`: incremented after each successful context compression. Used by monitoring / strategy switching to detect runaway growth.
 - `approved_resources`: tool resources the user has granted permanent approval for in this session, populated on each `ApproveAlways` decision. See [`tools.md`](tools.md).
 - `extra`: reserved extension fields for experimental features or plugin state.

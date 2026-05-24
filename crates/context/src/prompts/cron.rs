@@ -10,9 +10,9 @@
 //! (3) the `cron:<id>` tag is diagnostic-only and must never surface in
 //! the reply.
 //!
-//! [`frame_cron_prompt`] is the single synthesis seam (used by
-//! `AgentActor::dispatch_cron_prompt`); [`original_cron_prompt`] reverses
-//! it so operator surfaces (the admin chat panel) can render the
+//! [`frame_cron_prompt`] is the single synthesis seam (the agent actor's
+//! cron dispatch appends it via `ContextManager`); [`original_cron_prompt`]
+//! reverses it so operator surfaces (the admin chat panel) can render the
 //! instruction as configured rather than the framing boilerplate.
 
 /// Framing paragraph inserted between the routing tag and the original
@@ -65,10 +65,7 @@ mod tests {
     #[test]
     fn framing_announces_scheduled_fire_and_hides_tag() {
         let framed = frame_cron_prompt("cj-1", "hi");
-        // Tag stays first for diagnostics / trace tooling.
         assert!(framed.starts_with("[cron:cj-1] "), "{framed}");
-        // Model is told this is not a live user message and to keep the
-        // id out of its reply.
         assert!(framed.contains("NOT a new message the user just sent"));
         assert!(framed.contains("never repeat that id"));
         assert!(framed.contains("hi"));
@@ -89,8 +86,6 @@ mod tests {
 
     #[test]
     fn recovers_prompt_that_contains_the_label() {
-        // The framing's label is the *first* occurrence, so a prompt that
-        // happens to repeat it is returned whole.
         let prompt = "Scheduled instruction to perform now: greet the user";
         let framed = frame_cron_prompt("cj-3", prompt);
         assert_eq!(original_cron_prompt(&framed), prompt);

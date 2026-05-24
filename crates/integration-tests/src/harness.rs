@@ -15,7 +15,6 @@ use std::time::Duration;
 use aura_agent::{
     AgentLoop, SecurityGateway,
     actor::{AgentActor, AgentMessage, mailbox::MailboxSender},
-    soul::Soul,
     tool_executor::ToolExecutor,
 };
 use aura_channels::{AgentOutput, IncomingMessage, Message};
@@ -290,12 +289,7 @@ impl AgentTestHarnessBuilder {
             master_key_for_tests(),
             secret_store.clone() as Arc<dyn aura_store::SecretStore>,
         ));
-        let spill_dir = std::env::temp_dir().join(format!(
-            "aura-it-tool-spills-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        ));
-        let gateway =
-            Arc::new(SecurityGateway::new(detector, vault.clone()).with_spill_dir(spill_dir));
+        let gateway = Arc::new(SecurityGateway::new(detector, vault.clone()));
 
         // Observability stores.
         let job_store = Arc::new(MemoryJobStore::new());
@@ -372,6 +366,24 @@ impl AgentTestHarnessBuilder {
             session_store,
             summary_store,
         ));
+        let soul_text = self
+            .soul_prompt
+            .unwrap_or_else(|| "You are Aura, a test assistant.".into());
+        // Inject the fixed test prompt as a one-profile subagent registry: the
+        // new design resolves a session's system prompt from either the
+        // workspace soul or a subagent profile, and the harness workspace is a
+        // stub (so the workspace path would just hit the fallback).
+        let subagent_registry = Arc::new(aura_subagent::SubagentRegistry::new());
+        subagent_registry.register(aura_subagent::SubagentProfile {
+            name: "harness".into(),
+            version: "1".into(),
+            description: "harness test prompt".into(),
+            system_prompt: soul_text,
+            default_tier: None,
+            source: aura_model::ArtifactSource::Inline,
+            trust_level: aura_model::TrustLevel::Trusted,
+            source_path: None,
+        });
         let context_manager = ContextManager::from_config(ContextManagerConfig {
             tokenizer,
             workspace,
@@ -381,12 +393,9 @@ impl AgentTestHarnessBuilder {
             skill_registry: Arc::clone(&skill_registry),
             session_id: session.id.clone(),
             sessions: Arc::clone(&session_manager),
+            subagent_profile: Some((subagent_registry, "harness".to_string())),
+            session_log: None,
         });
-
-        let soul_text = self
-            .soul_prompt
-            .unwrap_or_else(|| "You are Aura, a test assistant.".into());
-        let soul = Soul::custom(soul_text);
 
         let guarded_llm = aura_llm::GuardedLlm::new(
             stub_llm.clone() as Arc<dyn aura_llm::LlmCompletion>,
@@ -411,15 +420,12 @@ impl AgentTestHarnessBuilder {
             llm_pool,
             initial_llm: None,
             tool_registry: tool_registry.clone(),
-            skill_registry: skill_registry.clone(),
             tool_executor: tool_executor.clone(),
             context_manager,
             max_iterations: 20,
-            soul,
             security_gateway: gateway.clone(),
             cost_manager: Arc::clone(&cost_manager),
             actor_token: actor_token.clone(),
-            session_log: None,
             system_spawn_tx: None,
             workspace_paths: None,
             sessions: None,

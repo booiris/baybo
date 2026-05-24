@@ -16,6 +16,7 @@ path = "tests/all.rs"
 [dependencies]
 aura-model = { workspace = true }
 aura-agent = { workspace = true }
+aura-context = { workspace = true }
 aura-channels = { workspace = true }
 aura-config = { workspace = true }
 aura-gateway = { workspace = true }

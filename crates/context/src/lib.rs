@@ -3,6 +3,8 @@ pub mod budget;
 pub mod calibration;
 pub mod compressor;
 pub mod error;
+pub mod prompts;
+pub mod session_log;
 pub mod tokenizer;
 
 pub use background_summary::{
@@ -11,8 +13,12 @@ pub use background_summary::{
 };
 pub use budget::TokenBudget;
 pub use calibration::TokenCalibration;
-pub use compressor::{CompressOutput, SUMMARIZE_INSTRUCTION, parse_summary_response};
+pub use compressor::{CompressOutput, parse_summary_response};
 pub use error::ContextError;
+pub use prompts::compression::SUMMARIZE_INSTRUCTION;
+pub use session_log::{
+    LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
+};
 pub use tokenizer::{TiktokenTokenizer, Tokenizer};
 
 // ---------------------------------------------------------------------------
@@ -86,7 +92,10 @@ use aura_llm::{ChatRequest, LlmResponse};
 use aura_model::{BackgroundCompressionPayload, ChatMessage, ContentBlock, Role, SessionId};
 use aura_session::SessionManager;
 use aura_skills::render::{render_skill_block, render_skill_reminder};
-use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry};
+use aura_skills::{
+    SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry, SkillSummary,
+    render_skill_for_slash,
+};
 use aura_trace::LlmCallInputs;
 use parking_lot::RwLock;
 use tracing::{debug, warn};
@@ -198,6 +207,17 @@ pub struct ContextManager {
     /// Cross-session manager for transcript persistence + summary
     /// metadata reads.
     pub(crate) sessions: Arc<SessionManager>,
+    /// For a subagent session: `(profile registry, profile name)` — context
+    /// resolves the child's system prompt from the registry by name. `None`
+    /// for a workspace session (assemble the workspace soul). Resolved by
+    /// [`Self::resolve_system_prompt`] for the seed and re-resolved by
+    /// `reseed_system_row` after each compaction, so a source edit (workspace
+    /// soul *or* subagent profile) lands on the next compaction.
+    subagent_profile: Option<(Arc<aura_subagent::SubagentRegistry>, String)>,
+    /// Per-session JSONL logger. [`Self::append`] mirrors each persisted message
+    /// here; the owning `AgentLoop` reaches it via [`Self::session_log`] to log
+    /// LLM calls. `None` in tests / single-shot harnesses that don't wire one.
+    session_log: Option<Arc<SessionLlmLogger>>,
     /// Boundary the trigger gate measures from. Set to `messages.len()`
     /// after every compression apply and reconstructed from
     /// `session_summaries.cursor` on cold start.
@@ -236,6 +256,17 @@ pub struct ContextManagerConfig {
     pub skill_registry: Arc<SkillRegistry>,
     pub session_id: SessionId,
     pub sessions: Arc<SessionManager>,
+    /// For a subagent session: `(profile registry, profile name)` — context
+    /// resolves the child's system prompt from the registry by name (and
+    /// re-resolves on compaction). `None` for a workspace session (assemble the
+    /// workspace soul). The profile *name* is the parent's spawn-time choice;
+    /// resolving it to a prompt is context's job, so an edited profile is
+    /// picked up like an edited workspace soul.
+    pub subagent_profile: Option<(Arc<aura_subagent::SubagentRegistry>, String)>,
+    /// Per-session JSONL event logger (messages + LLM calls). `None` in tests /
+    /// single-shot harnesses. [`ContextManager::append`] logs messages to it;
+    /// `AgentLoop` logs LLM calls via [`ContextManager::session_log`].
+    pub session_log: Option<Arc<SessionLlmLogger>>,
 }
 
 impl ContextManager {
@@ -258,6 +289,8 @@ impl ContextManager {
             current_model: RwLock::new(None),
             session_id: config.session_id,
             sessions: config.sessions,
+            subagent_profile: config.subagent_profile,
+            session_log: config.session_log,
             last_summary_anchor: None,
             last_synced_cursor: None,
         }
@@ -273,6 +306,200 @@ impl ContextManager {
     /// Read-only access to the owned transcript.
     pub fn messages(&self) -> &[ChatMessage] {
         &self.messages
+    }
+
+    /// The transcript shaped for an LLM request: adjacent same-role
+    /// user/assistant rows coalesced (see [`merge_for_llm`]) so providers that
+    /// require strict alternation accept it. An owned snapshot — the stored
+    /// transcript keeps each row separate.
+    pub fn messages_for_llm(&self) -> Vec<ChatMessage> {
+        merge_for_llm(&self.messages)
+    }
+
+    /// Resolve the system prompt to seed the leading `Role::System` row. The
+    /// agent loop awaits this on a fresh session. Falls back to a minimal
+    /// prompt only if resolution fails outright (a missing subagent profile or
+    /// a workspace I/O error — identity files normally auto-seed) rather than
+    /// seeding an empty system row.
+    pub async fn resolve_system_prompt(&self) -> String {
+        self.try_resolve_system_prompt()
+            .await
+            .unwrap_or_else(|| crate::prompts::soul::FALLBACK_SYSTEM_PROMPT.to_string())
+    }
+
+    /// Resolve the session's system prompt from its source: a subagent profile
+    /// (looked up by name in the spawn registry) or the workspace soul. `None`
+    /// on a resolution failure (profile not found, or workspace I/O error) so
+    /// the caller decides whether to fall back (seed) or keep the prior row
+    /// (reseed).
+    async fn try_resolve_system_prompt(&self) -> Option<String> {
+        match &self.subagent_profile {
+            Some((registry, profile_name)) => {
+                let resolved = registry.get(profile_name).map(|p| p.system_prompt);
+                if resolved.is_none() {
+                    tracing::warn!(subagent_type = %profile_name, "subagent profile not found in registry");
+                }
+                resolved
+            }
+            None => match crate::prompts::soul::assemble_from_workspace(&self.workspace).await {
+                Ok(prompt) => Some(prompt),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to assemble workspace soul");
+                    None
+                }
+            },
+        }
+    }
+
+    /// Refresh the leading system row after a *committed* compaction so a
+    /// source edit (the user's workspace soul, or a subagent profile) lands on
+    /// the next compaction rather than carrying the pre-compaction prompt
+    /// forward forever. Runs after the savings gate + commit (operating on
+    /// `self.messages`, not the candidate) so a grown prompt can't skew the
+    /// shrink decision, and a declined apply does no resolution work. Re-reads
+    /// the session's source via [`Self::replace_first_message`] (which
+    /// re-totals the budget); on a resolution failure the prior row is kept.
+    async fn reseed_system_row(&mut self) {
+        let first_is_system_text = self.messages.first().is_some_and(|m| {
+            m.role == Role::System && matches!(m.content.first(), Some(ContentBlock::Text(_)))
+        });
+        if !first_is_system_text {
+            return;
+        }
+        match self.try_resolve_system_prompt().await {
+            Some(prompt) => {
+                self.replace_first_message(ChatMessage::system(vec![ContentBlock::Text(prompt)]));
+            }
+            None => {
+                tracing::warn!(
+                    "failed to re-resolve system prompt after compaction; keeping prior row"
+                );
+            }
+        }
+    }
+
+    /// Seed the leading `Role::System` row — and a skill reminder when any
+    /// skills are invocable — if the transcript doesn't already lead with one.
+    /// Each seeded row is persisted and mirrored to the session JSONL log by
+    /// [`Self::append`].
+    ///
+    /// Idempotent and cheap on the hot path — the leading-system check
+    /// short-circuits before the (file-reading) prompt resolution, so only a
+    /// fresh session pays for the resolve.
+    ///
+    /// The skill reminder rides as a `Role::User` `agent_context` row, not a
+    /// `system` row — some providers reject `system` outside the leading slot;
+    /// `merge_for_llm` folds it into the first real user message.
+    pub async fn ensure_seeded(&mut self) {
+        if self
+            .messages
+            .first()
+            .is_some_and(|m| m.role == Role::System)
+        {
+            return;
+        }
+        let prompt = self.resolve_system_prompt().await;
+        let skills = self.invocable_skill_summaries();
+        self.append(&ChatMessage::system(vec![ContentBlock::Text(prompt)]))
+            .await;
+        if !skills.is_empty() {
+            self.append(&ChatMessage::agent_context(vec![ContentBlock::Text(
+                render_skill_reminder(&skills),
+            )]))
+            .await;
+        }
+    }
+
+    /// Skills the agent may invoke: the registry's summaries filtered to
+    /// agent-invocable, non-untrusted entries (registry order). Empty when the
+    /// registry is empty. The seed reminder advertises exactly this set; the
+    /// agent loop reuses it for the per-turn slash-command candidate list, so
+    /// the advertised set and the slash-invocable set can't drift.
+    pub fn invocable_skill_summaries(&self) -> Vec<SkillSummary> {
+        if self.skill_registry.is_empty() {
+            return Vec::new();
+        }
+        self.skill_registry
+            .all_summaries_sorted()
+            .into_iter()
+            .filter(|s| {
+                s.agent_invocable && !matches!(s.trust_level, aura_model::TrustLevel::Untrusted)
+            })
+            .collect()
+    }
+
+    /// If the trailing message is a user `/command` whose command matches an
+    /// invocable skill, expand it: append that skill's body (via
+    /// `aura_skills::render_skill_for_slash`, `{{session_id}}` substituted) as a
+    /// hidden agent-context row (`MessageSource::Agent` — the next LLM turn sees
+    /// it, but it isn't shown as a user bubble). No-op when the tail isn't a
+    /// matching user `/command`. The appended row is persisted + JSONL-logged
+    /// by [`Self::append`].
+    ///
+    /// Unlike an LLM-issued `Skill` tool call this deliberately skips the risk
+    /// assessor: an explicit user slash command is treated as authorized, so the
+    /// body is injected directly rather than gated. When the skill ships linked
+    /// files the injected text still carries their inventory + a hint, so the
+    /// model can pull a sub-file with a follow-up `Skill` tool call — that fetch
+    /// goes through the normal gate. The original `/command` message stays in
+    /// the transcript, so any args remain visible.
+    pub async fn expand_slash_command(&mut self) {
+        if let Some((skill_name, msg)) = self.slash_expansion_message() {
+            // Record eagerly so a compaction *this turn* (before any rebuild)
+            // re-broadcasts the definition via the skill trailer — the body
+            // row carries no `ToolUse` for `scan_skill_calls` to find, and a
+            // live-LLM-summary pass (a first compaction's only option — no
+            // `summary.md` yet, no recent slice kept) folds it into the
+            // summary. Later compactions + cold-start restore re-derive it
+            // durably from the persisted `/command` row (`called_skills_in`).
+            push_called_skill(&mut self.called_skills, &skill_name);
+            self.append(&msg).await;
+        }
+    }
+
+    /// Build the matched skill's name + agent-context body row for a trailing
+    /// `/command`, or `None`. Pure (no append) so
+    /// [`Self::expand_slash_command`] keeps the `?`-chain while owning the
+    /// `&mut` append and the `called_skills` record.
+    fn slash_expansion_message(&self) -> Option<(String, ChatMessage)> {
+        let user_text = self
+            .messages
+            .last()
+            .filter(|m| m.source() == aura_model::MessageSource::User)
+            .map(|m| aura_llm::multimodal::extract_text(&m.content))?;
+        let (skill_name, _args) =
+            detect_slash_invocation(&user_text, &self.invocable_skill_summaries())?;
+        let skill = self.skill_registry.get(&skill_name)?;
+        let body = render_skill_for_slash(&skill, self.session_id.as_str());
+        Some((
+            skill_name,
+            ChatMessage::agent_context(vec![ContentBlock::Text(body)]),
+        ))
+    }
+
+    /// Rebuild the called-skills list from a transcript slice: `ToolUse`
+    /// skill calls (via [`scan_skill_calls`]) plus slash invocations
+    /// re-derived from any surviving `/command` user rows. The latter keeps a
+    /// slash-invoked skill tracked as durably as an LLM-issued one — its
+    /// agent-context body carries no `ToolUse` for `scan_skill_calls` to find,
+    /// but the user's literal `/command` row is persisted, so the skill trailer
+    /// can still re-broadcast the definition right up until that row is folded
+    /// into a summary. Used by both transcript-replacing paths
+    /// ([`Self::restore_messages`], the compaction apply); the in-turn
+    /// `expand_slash_command` still records eagerly for a same-turn compaction.
+    fn called_skills_in(&self, messages: &[ChatMessage]) -> Vec<String> {
+        let mut called = scan_skill_calls(messages);
+        let summaries = self.invocable_skill_summaries();
+        for msg in messages {
+            if msg.source() != aura_model::MessageSource::User {
+                continue;
+            }
+            let text = aura_llm::multimodal::extract_text(&msg.content);
+            if let Some((name, _)) = detect_slash_invocation(&text, &summaries) {
+                push_called_skill(&mut called, &name);
+            }
+        }
+        called
     }
 
     /// Number of messages currently in the transcript.
@@ -294,15 +521,18 @@ impl ContextManager {
     /// row's content + per-message token cache are touched, and the
     /// budget is re-totalled.
     ///
-    /// Used by the agent loop to refresh the soul system prompt when
-    /// the underlying identity files change on disk. Persistence is
-    /// in-memory only — `session_messages` keeps the originally
-    /// persisted content; the next actor cold start rebuilds the
-    /// prompt from disk anyway, so the staleness is invisible
-    /// downstream.
+    /// Used by [`Self::reseed_system_row`] to refresh the soul system prompt
+    /// after a committed compaction when the identity files changed on disk.
+    /// The refresh is in-memory only: `persist_compaction` already wrote the
+    /// pre-reseed row, and on a cold start `ensure_system_prompt` short-circuits
+    /// on the restored leading `System` row without re-reading disk — so a
+    /// reaped-then-rehydrated actor carries the persisted prompt until the next
+    /// compaction reseeds again. Correct for the live actor's lifetime and
+    /// self-healing across compactions; a source edit just isn't durable until
+    /// then.
     ///
     /// No-op if the transcript is empty.
-    pub fn replace_first_message(&mut self, msg: ChatMessage) {
+    fn replace_first_message(&mut self, msg: ChatMessage) {
         if self.messages.is_empty() {
             return;
         }
@@ -328,7 +558,7 @@ impl ContextManager {
             .iter()
             .map(|m| self.tokenizer.count_message(m))
             .collect();
-        self.called_skills = scan_skill_calls(&messages);
+        self.called_skills = self.called_skills_in(&messages);
         self.messages = messages;
         self.invalidate_baseline();
         self.budget.update(self.calibrate(self.raw_estimate()));
@@ -415,7 +645,66 @@ impl ContextManager {
         self.messages.push(msg.clone());
         self.per_message_tokens.push(count);
         self.budget.update(self.count_tokens());
-        self.persist_appended(msg).await
+        let ordinal = self.persist_appended(msg).await;
+        self.log_message_to_session_log(msg).await;
+        ordinal
+    }
+
+    /// Read-only access to the session JSONL logger so the owning `AgentLoop`
+    /// can record LLM calls against the same per-session file. `None` when no
+    /// logger is wired (tests / single-shot harnesses).
+    pub fn session_log(&self) -> Option<&Arc<SessionLlmLogger>> {
+        self.session_log.as_ref()
+    }
+
+    /// Mirror a persisted message to the session JSONL log, if one is wired.
+    /// Best-effort: the durable transcript lives in `session_messages`, so a
+    /// log-write error is warned and swallowed.
+    async fn log_message_to_session_log(&self, msg: &ChatMessage) {
+        if let Some(logger) = &self.session_log
+            && let Err(e) = logger.log_message(&self.session_id, msg).await
+        {
+            warn!(
+                session_id = %self.session_id,
+                error = %e,
+                "failed to append session message log"
+            );
+        }
+    }
+
+    /// Assemble + append an LLM-call record to the session JSONL log. No-op
+    /// without a logger. The owning `AgentLoop` calls this on its LLM-call path
+    /// with the call's request/outcome + the model info from its `GuardedLlm`
+    /// (which context doesn't hold) — so the record format + the write live
+    /// here, while the model identity stays the agent's to supply.
+    pub async fn log_llm_call(
+        &self,
+        request: &ChatRequest,
+        outcome: LlmCallOutcome,
+        provider: &str,
+        model: &str,
+    ) {
+        let Some(logger) = &self.session_log else {
+            return;
+        };
+        let request = match LlmRequestMeta::from_request(request) {
+            Ok(meta) => meta,
+            Err(e) => {
+                warn!(error = %e, "failed to summarize llm request for session log");
+                return;
+            }
+        };
+        let record = LlmCallRecord {
+            timestamp: chrono::Utc::now(),
+            session_id: self.session_id.clone(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            request,
+            outcome,
+        };
+        if let Err(e) = logger.log_llm_call(&record).await {
+            warn!(error = %e, "failed to append session llm log");
+        }
     }
 
     /// Append a message to the in-memory transcript + token budget
@@ -432,6 +721,25 @@ impl ContextManager {
         self.messages.push(msg.clone());
         self.per_message_tokens.push(count);
         self.budget.update(self.count_tokens());
+    }
+
+    /// Cap untrusted tool output to the per-result byte budget, spilling the
+    /// full payload under the workspace's tool-spills dir so the truncation
+    /// notice can point the model back at it. The framing primitives live in
+    /// [`crate::prompts::tool_output`]; this method resolves the spill
+    /// location from the manager's own workspace handle. Injection scanning
+    /// and the `<tool_output>` wrap stay separate — the caller runs the
+    /// `aura-security` scan and calls
+    /// [`crate::prompts::tool_output::wrap_tool_output`] with the capped text.
+    pub async fn cap_tool_output(&self, content: String) -> String {
+        use crate::prompts::tool_output;
+        if content.len() <= tool_output::MAX_TOOL_OUTPUT_BYTES {
+            return content;
+        }
+        let spill =
+            tool_output::spill_tool_output(&self.workspace.tool_spills_dir(), content.as_bytes())
+                .await;
+        tool_output::cap_tool_output(content, spill.as_deref())
     }
 
     async fn persist_appended(&self, msg: &ChatMessage) -> Option<i64> {
@@ -568,11 +876,12 @@ impl ContextManager {
 
         self.messages = new_messages;
         self.per_message_tokens = new_per_message;
-        // Rebuild called_skills from the freshly-applied slice: a
-        // successful summary leaves it empty (the trailer carries
-        // plain text, no `ToolUse`), and a Truncate apply scopes it
-        // to whatever's still in the kept tail.
-        self.called_skills = scan_skill_calls(&self.messages);
+        // Rebuild called_skills from the freshly-applied slice: a summary
+        // that folds away every `Skill` ToolUse and `/command` row leaves it
+        // empty (the trailer carries plain text), and a Truncate apply scopes
+        // it to whatever calls — ToolUse or slash — survived in the kept tail.
+        let rebuilt = self.called_skills_in(&self.messages);
+        self.called_skills = rebuilt;
         self.budget.update(after_tokens);
         // Post-compression transcript counts as fully covered;
         // anchoring at len() avoids a degenerate retrigger from the
@@ -595,6 +904,11 @@ impl ContextManager {
         );
 
         self.persist_compaction().await;
+        // Refresh the system row from the workspace soul now that the shrink
+        // decision is committed + persisted — kept out of the savings gate
+        // above so a grown soul can't veto a real compaction, and after
+        // `persist_compaction` so it stays an in-memory-only refresh.
+        self.reseed_system_row().await;
         Ok(CompressionOutcome::Compressed)
     }
 
@@ -1000,21 +1314,198 @@ pub(crate) fn record_skill_calls(acc: &mut Vec<String>, msg: &ChatMessage) {
         let Some(skill_name) = input.get(SKILL_INPUT_NAME_FIELD).and_then(|v| v.as_str()) else {
             continue;
         };
-        if !acc.iter().any(|n| n == skill_name) {
-            acc.push(skill_name.to_string());
-        }
+        push_called_skill(acc, skill_name);
+    }
+}
+
+/// Append `name` to `acc` unless already present (insertion-order dedup),
+/// keeping the post-summary skill trailer deterministic.
+pub(crate) fn push_called_skill(acc: &mut Vec<String>, name: &str) {
+    if !acc.iter().any(|n| n == name) {
+        acc.push(name.to_string());
     }
 }
 
 /// Rebuild the called-skills vector from a full message slice.
 /// Used after a compression apply to scope the vector to whatever
 /// `ToolUse` blocks survived in the new transcript.
-pub(crate) fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
+pub fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
     let mut out = Vec::new();
     for msg in messages {
         record_skill_calls(&mut out, msg);
     }
     out
+}
+
+/// Coalesce adjacent same-role user/assistant messages into a single
+/// message so providers that require strict user/assistant alternation
+/// (e.g. some Gemini / Mistral configurations) accept the request.
+///
+/// `Role::System` and `Role::Tool` are passed through untouched — system
+/// messages are typically extracted to a dedicated field by the provider
+/// adapter, and tool-result messages must remain individually addressable
+/// by their `tool_use_id`.
+///
+/// When two adjacent user/assistant messages are merged, the merge also
+/// flattens trailing/leading `ContentBlock::Text` blocks across the
+/// boundary into a single text block (joined with `\n\n`). Non-text
+/// blocks (images, tool_use, tool_result, thinking) are appended as-is so
+/// signatures, IDs, and modality data are preserved verbatim.
+fn merge_for_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let mergeable = matches!(msg.role, Role::User | Role::Assistant);
+        match out.last_mut() {
+            Some(last) if mergeable && last.role == msg.role => {
+                for block in &msg.content {
+                    let folded = matches!(block, ContentBlock::Text(_))
+                        && matches!(last.content.last(), Some(ContentBlock::Text(_)));
+                    if folded {
+                        if let (Some(ContentBlock::Text(prev_t)), ContentBlock::Text(cur_t)) =
+                            (last.content.last_mut(), block)
+                        {
+                            if !prev_t.is_empty() && !cur_t.is_empty() {
+                                prev_t.push_str("\n\n");
+                            }
+                            prev_t.push_str(cur_t);
+                        }
+                    } else {
+                        last.content.push(block.clone());
+                    }
+                }
+            }
+            _ => out.push(msg.clone()),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod merge_for_llm_tests {
+    use super::merge_for_llm;
+    use aura_model::{BlobRef, ChatMessage, ContentBlock, Role};
+
+    fn text(role: Role, body: &str) -> ChatMessage {
+        let content = vec![ContentBlock::Text(body.into())];
+        match role {
+            Role::User => ChatMessage::agent_context(content),
+            Role::Assistant => ChatMessage::assistant(content),
+            Role::System => ChatMessage::system(content),
+            Role::Tool => ChatMessage::tool(content),
+        }
+    }
+
+    fn img() -> ContentBlock {
+        ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: "sha256:abc".into(),
+            },
+            mime_type: "image/png".into(),
+        }
+    }
+
+    #[test]
+    fn passthrough_when_alternating() {
+        let msgs = vec![
+            text(Role::System, "sys"),
+            text(Role::User, "u1"),
+            text(Role::Assistant, "a1"),
+            text(Role::User, "u2"),
+        ];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out, msgs);
+    }
+
+    #[test]
+    fn merges_consecutive_user_text() {
+        let msgs = vec![text(Role::User, "reminder"), text(Role::User, "hello")];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, Role::User);
+        assert_eq!(out[0].content.len(), 1);
+        match &out[0].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "reminder\n\nhello"),
+            other => panic!("expected merged text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merges_consecutive_assistant_text() {
+        let msgs = vec![text(Role::Assistant, "a"), text(Role::Assistant, "b")];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 1);
+        match &out[0].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "a\n\nb"),
+            other => panic!("expected merged text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keeps_non_text_blocks_separate() {
+        let msgs = vec![
+            ChatMessage::agent_context(vec![ContentBlock::Text("hi".into()), img()]),
+            ChatMessage::agent_context(vec![ContentBlock::Text("more".into())]),
+        ];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 1);
+        // hi, image, more — image keeps the text blocks from folding across it.
+        assert_eq!(out[0].content.len(), 3);
+        match &out[0].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "hi"),
+            other => panic!("unexpected first block {other:?}"),
+        }
+        assert!(matches!(out[0].content[1], ContentBlock::Image { .. }));
+        match &out[0].content[2] {
+            ContentBlock::Text(t) => assert_eq!(t, "more"),
+            other => panic!("unexpected third block {other:?}"),
+        }
+    }
+
+    #[test]
+    fn does_not_merge_system_or_tool() {
+        let msgs = vec![
+            text(Role::System, "s1"),
+            text(Role::System, "s2"),
+            ChatMessage::tool_result("1".into(), "r1".into()),
+            ChatMessage::tool_result("2".into(), "r2".into()),
+        ];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn preserves_assistant_tool_use_then_tool_result() {
+        let assistant = ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "Foo".into(),
+            input: serde_json::json!({}),
+            signature: None,
+        }]);
+        let tool = ChatMessage::tool_result("t1".into(), "ok".into());
+        let msgs = vec![text(Role::User, "hi"), assistant.clone(), tool.clone()];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1], assistant);
+        assert_eq!(out[2], tool);
+    }
+}
+
+/// Parse a leading `/command` against the invocable skill set, returning the
+/// matched skill's name + the trailing args (empty when none). Pure; the
+/// `command` field is the `/cmd` trigger configured on a skill. Used by
+/// [`ContextManager::expand_slash_command`].
+fn detect_slash_invocation(user_text: &str, skills: &[SkillSummary]) -> Option<(String, String)> {
+    let rest = user_text.trim_start().strip_prefix('/')?;
+    let (cmd, args) = match rest.find(char::is_whitespace) {
+        Some(idx) => (&rest[..idx], rest[idx..].trim().to_string()),
+        None => (rest, String::new()),
+    };
+    if cmd.is_empty() {
+        return None;
+    }
+    let skill = skills.iter().find(|s| s.command.as_deref() == Some(cmd))?;
+    Some((skill.name.clone(), args))
 }
 
 /// Render `skill` as a `<skill>` block, truncating the body in place
@@ -1260,6 +1751,8 @@ mod tests {
             skill_registry: Arc::new(SkillRegistry::new()),
             session_id: test_session_id(),
             sessions: test_sessions(),
+            subagent_profile: None,
+            session_log: None,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -1358,6 +1851,129 @@ mod tests {
         // system + reminder + keep_recent=2 most recent non-system.
         assert_eq!(ctx.messages().len(), 4);
         assert_eq!(ctx.messages()[0].role, Role::System);
+    }
+
+    #[tokio::test]
+    async fn reseed_rereads_grown_workspace_soul_without_vetoing_compaction() {
+        // Regression (#1): the soul re-read happens AFTER the savings gate, on
+        // committed state — never on the candidate before the shrink decision.
+        // A large workspace soul must NOT inflate `after_tokens` and turn a
+        // real truncate compaction into a spurious NoSavings.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = Arc::new(aura_workspace::WorkspacePaths::new(
+            dir.path().to_path_buf(),
+        ));
+        // Distinctive + large: swapping it in before the savings gate (the old
+        // bug) would exceed the one-message truncate savings and veto the apply.
+        let soul_path = workspace.identity_file(aura_workspace::IdentityKind::Soul);
+        std::fs::create_dir_all(soul_path.parent().expect("profile parent")).expect("profile dir");
+        std::fs::write(
+            &soul_path,
+            format!("DISTINCTIVE_SOUL {}", "soul ".repeat(400)),
+        )
+        .expect("write soul");
+
+        let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            tokenizer: Arc::new(SimpleTokenizer),
+            workspace: Arc::clone(&workspace),
+            keep_recent: 2,
+            compression_threshold: 0.75,
+            calibration: Arc::new(TokenCalibration::new()),
+            skill_registry: Arc::new(SkillRegistry::new()),
+            session_id: test_session_id(),
+            sessions: test_sessions(),
+            subagent_profile: None,
+            session_log: None,
+        });
+        ctx.set_active_model_context_window(100_000);
+        ctx.append(&make_msg(Role::System, "small seed")).await;
+        ctx.append(&make_msg(Role::User, &padded("first"))).await;
+        ctx.append(&make_msg(Role::Assistant, &padded("second")))
+            .await;
+        ctx.append(&make_msg(Role::User, &padded("third"))).await;
+
+        // err_chat → truncate fallback (drops 1 of 3 non-system messages).
+        let outcome = ctx.force_compress("test-model", err_chat).await.unwrap();
+        // Savings gate compared the old (small) soul on both sides, so the real
+        // shrink is honoured rather than vetoed by the large workspace soul.
+        assert!(
+            matches!(outcome, CompressionOutcome::Compressed),
+            "{outcome:?}"
+        );
+        // And the system row was refreshed from the workspace after the commit.
+        match &ctx.messages()[0].content[0] {
+            ContentBlock::Text(t) => assert!(
+                t.contains("DISTINCTIVE_SOUL"),
+                "system row should be re-read from workspace after compaction"
+            ),
+            other => panic!("expected system text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reseed_resolves_subagent_profile_from_registry() {
+        // A subagent session resolves its system prompt from the profile
+        // registry by name — at seed and re-resolved on every compaction —
+        // NOT from the workspace soul.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = Arc::new(aura_workspace::WorkspacePaths::new(
+            dir.path().to_path_buf(),
+        ));
+        // A workspace soul that must NOT leak into a subagent session.
+        let soul_path = workspace.identity_file(aura_workspace::IdentityKind::Soul);
+        std::fs::create_dir_all(soul_path.parent().expect("profile parent")).expect("profile dir");
+        std::fs::write(&soul_path, "WORKSPACE_SOUL_SHOULD_NOT_APPEAR").expect("write soul");
+
+        let registry = Arc::new(aura_subagent::SubagentRegistry::new());
+        registry.register(aura_subagent::SubagentProfile {
+            name: "test-agent".into(),
+            version: "1".into(),
+            description: "test".into(),
+            system_prompt: "SUBAGENT_PROFILE".into(),
+            default_tier: None,
+            source: aura_model::ArtifactSource::Inline,
+            trust_level: aura_model::TrustLevel::Trusted,
+            source_path: None,
+        });
+
+        let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            tokenizer: Arc::new(SimpleTokenizer),
+            workspace: Arc::clone(&workspace),
+            keep_recent: 2,
+            compression_threshold: 0.75,
+            calibration: Arc::new(TokenCalibration::new()),
+            skill_registry: Arc::new(SkillRegistry::new()),
+            session_id: test_session_id(),
+            sessions: test_sessions(),
+            subagent_profile: Some((Arc::clone(&registry), "test-agent".to_string())),
+            session_log: None,
+        });
+        ctx.set_active_model_context_window(100_000);
+        ctx.append(&make_msg(Role::System, "SUBAGENT_PROFILE"))
+            .await;
+        ctx.append(&make_msg(Role::User, &padded("first"))).await;
+        ctx.append(&make_msg(Role::Assistant, &padded("second")))
+            .await;
+        ctx.append(&make_msg(Role::User, &padded("third"))).await;
+
+        let outcome = ctx.force_compress("test-model", err_chat).await.unwrap();
+        assert!(
+            matches!(outcome, CompressionOutcome::Compressed),
+            "{outcome:?}"
+        );
+        match &ctx.messages()[0].content[0] {
+            ContentBlock::Text(t) => {
+                assert_eq!(
+                    t, "SUBAGENT_PROFILE",
+                    "subagent prompt must resolve from the registry"
+                );
+                assert!(
+                    !t.contains("WORKSPACE_SOUL"),
+                    "must not use the workspace soul"
+                );
+            }
+            other => panic!("expected system text, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1599,6 +2215,46 @@ mod tests {
         assert_eq!(ctx.called_skills, vec!["foo", "bar", "baz"]);
     }
 
+    fn registry_with_slash_skill() -> Arc<SkillRegistry> {
+        let registry = Arc::new(SkillRegistry::new());
+        let mut skill = mk_skill("weather", "WEATHER_BODY");
+        skill.command = Some("wx".into());
+        registry.register(skill);
+        registry
+    }
+
+    /// On cold-start restore a slash skill must be re-derived from its
+    /// persisted `/command` row: the injected body carries no `ToolUse`, so
+    /// without re-derivation a rehydrated actor drops it from `called_skills`
+    /// and a later compaction can't re-broadcast the definition.
+    #[tokio::test]
+    async fn restore_messages_rederives_slash_skill_from_command_row() {
+        let mut ctx = make_ctx_with_registry(registry_with_slash_skill(), 5, 100_000, 0.75);
+        ctx.restore_messages(vec![
+            make_msg(Role::System, "sys"),
+            ChatMessage::user(vec![ContentBlock::Text("/wx today".into())]),
+            ChatMessage::agent_context(vec![ContentBlock::Text("WEATHER_BODY".into())]),
+        ]);
+        assert_eq!(
+            ctx.called_skills,
+            vec!["weather"],
+            "slash skill re-derived from the persisted /command row"
+        );
+    }
+
+    /// `called_skills_in` unions `ToolUse` skill calls with slash invocations
+    /// re-derived from `/command` rows (deduped), so the compaction rebuild
+    /// tracks both kinds as long as their call survives in the transcript.
+    #[tokio::test]
+    async fn called_skills_in_unions_tooluse_and_slash() {
+        let ctx = make_ctx_with_registry(registry_with_slash_skill(), 5, 100_000, 0.75);
+        let msgs = vec![
+            skill_call("foo"),
+            ChatMessage::user(vec![ContentBlock::Text("/wx now".into())]),
+        ];
+        assert_eq!(ctx.called_skills_in(&msgs), vec!["foo", "weather"]);
+    }
+
     /// `record_skill_calls` must ignore `ToolUse` blocks for non-Skill
     /// tools so we don't accidentally render Bash / WebFetch / etc.
     /// detail blocks at compression time.
@@ -1632,9 +2288,87 @@ mod tests {
             skill_registry: registry,
             session_id: test_session_id(),
             sessions: test_sessions(),
+            subagent_profile: None,
+            session_log: None,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
+    }
+
+    #[tokio::test]
+    async fn ensure_seeded_seeds_leading_system_row_on_fresh_session() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.ensure_seeded().await;
+        assert_eq!(ctx.message_count(), 1, "no skills → one system row");
+        assert_eq!(ctx.messages()[0].role, Role::System);
+    }
+
+    #[tokio::test]
+    async fn ensure_seeded_is_idempotent() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.ensure_seeded().await;
+        assert_eq!(ctx.message_count(), 1);
+        ctx.ensure_seeded().await;
+        assert_eq!(ctx.message_count(), 1, "re-seeding is a no-op");
+    }
+
+    #[tokio::test]
+    async fn ensure_seeded_appends_skill_reminder_when_skills_invocable() {
+        let mut ctx = make_ctx_with_registry(registry_with(&[("alpha", "body")]), 5, 100_000, 0.75);
+        ctx.ensure_seeded().await;
+        assert_eq!(ctx.message_count(), 2, "system row + skill reminder");
+        assert_eq!(ctx.messages()[0].role, Role::System);
+        let ContentBlock::Text(reminder) = &ctx.messages()[1].content[0] else {
+            panic!("reminder should be a text block");
+        };
+        assert!(
+            reminder.contains("alpha"),
+            "reminder advertises the invocable skill"
+        );
+    }
+
+    #[tokio::test]
+    async fn expand_slash_command_injects_skill_body_as_agent_context() {
+        let registry = Arc::new(SkillRegistry::new());
+        let mut skill = mk_skill("weather", "WEATHER INSTRUCTIONS");
+        skill.command = Some("wx".into());
+        registry.register(skill);
+        let mut ctx = make_ctx_with_registry(registry, 5, 100_000, 0.75);
+        ctx.append(&ChatMessage::user(vec![ContentBlock::Text(
+            "/wx Beijing".into(),
+        )]))
+        .await;
+
+        ctx.expand_slash_command().await;
+        // appended the skill body as a hidden agent-context row after `/wx`
+        assert_eq!(ctx.message_count(), 2);
+        let appended = ctx.messages().last().expect("appended row");
+        assert_eq!(appended.source(), aura_model::MessageSource::Agent);
+        let ContentBlock::Text(body) = &appended.content[0] else {
+            panic!("expected a text block");
+        };
+        assert!(body.contains("WEATHER INSTRUCTIONS"));
+    }
+
+    #[tokio::test]
+    async fn expand_slash_command_noop_for_plain_text_or_unknown_command() {
+        let registry = Arc::new(SkillRegistry::new());
+        let mut skill = mk_skill("weather", "BODY");
+        skill.command = Some("wx".into());
+        registry.register(skill);
+        let mut ctx = make_ctx_with_registry(registry, 5, 100_000, 0.75);
+
+        ctx.append(&ChatMessage::user(vec![ContentBlock::Text("hello".into())]))
+            .await;
+        ctx.expand_slash_command().await;
+        assert_eq!(ctx.message_count(), 1, "plain text is not a slash command");
+
+        ctx.append(&ChatMessage::user(vec![ContentBlock::Text(
+            "/unknown".into(),
+        )]))
+        .await;
+        ctx.expand_slash_command().await;
+        assert_eq!(ctx.message_count(), 2, "unknown command appends nothing");
     }
 
     /// Chat closure returning a well-formed `<summary>S</summary>` so the
@@ -1716,6 +2450,53 @@ mod tests {
             .await
             .unwrap();
         assert!(ctx.called_skills.is_empty());
+    }
+
+    /// A slash-invoked skill must survive a live-LLM-summary compression.
+    /// `expand_slash_command` records the match in `called_skills`, so when
+    /// the summary stage drops the body row (it keeps no recent slice) the
+    /// skill trailer still re-broadcasts the full definition. Without the
+    /// record the model would act on the `/command` with only the generic
+    /// one-line reminder.
+    #[tokio::test]
+    async fn slash_invoked_skill_survives_summarize_via_trailer() {
+        let registry = Arc::new(SkillRegistry::new());
+        let mut skill = mk_skill("weather", "WEATHER_BODY");
+        skill.command = Some("wx".into());
+        registry.register(skill);
+        let mut ctx = make_ctx_with_registry(registry, 2, 50, 0.5);
+
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, &"u1 ".repeat(800))).await;
+        ctx.append(&make_msg(Role::Assistant, &"a1 ".repeat(800)))
+            .await;
+        ctx.append(&ChatMessage::user(vec![ContentBlock::Text(
+            "/wx today".into(),
+        )]))
+        .await;
+
+        ctx.expand_slash_command().await;
+        assert_eq!(
+            ctx.called_skills,
+            vec!["weather"],
+            "slash invocation is recorded so the trailer can re-broadcast it"
+        );
+
+        let outcome = ctx
+            .maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
+
+        // The agent-context body row was folded into the summary; the full
+        // definition is back only because the trailer detail block carries it.
+        let has_body = ctx.messages().iter().any(|m| {
+            matches!(m.content.first(), Some(ContentBlock::Text(t)) if t.contains("WEATHER_BODY"))
+        });
+        assert!(
+            has_body,
+            "skill body survives compression via the trailer detail block"
+        );
     }
 
     // ---------- render_skill_block_capped / build_skill_detail_payload ----------

@@ -12,8 +12,8 @@ impl Router {
     ///
     /// Each fire creates an isolated session so the trigger sees a
     /// clean transcript and a fresh `SessionState` (no leaked
-    /// `approved_resources`, `active_skills`, or compression state
-    /// from prior fires). Continuity across fires belongs to memory +
+    /// `approved_resources` or compression state from prior fires).
+    /// Continuity across fires belongs to memory +
     /// skill loading, not to a shared mutable transcript.
     ///
     /// The spawned actor is intentionally NOT registered with the
@@ -54,7 +54,7 @@ impl Router {
 
         let response_tx = self.supervisor.response_tx().clone();
         let (sender, _actor_token) =
-            self.spawn_oneshot_actor(session, None, response_tx, &self.actor_parent_token, None);
+            self.spawn_oneshot_actor(session, None, response_tx, &self.actor_parent_token);
 
         let trigger_msg = AgentMessage::CronTrigger {
             job_id: event.job_id.clone(),

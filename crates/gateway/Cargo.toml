@@ -31,6 +31,8 @@ test-support = ["aura-llm/test-support"]
 [dependencies]
 aura-agent = { workspace = true }
 aura-channels = { workspace = true }
+# Cron-fire prompt reverse-parser for the admin chat panel.
+aura-context = { workspace = true }
 aura-config = { workspace = true }
 aura-cron = { workspace = true }
 aura-cost = { workspace = true }

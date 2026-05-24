@@ -11,9 +11,14 @@ aura-model = { workspace = true }
 aura-llm = { workspace = true }
 aura-skills = { workspace = true }
 aura-session = { workspace = true }
+# Subagent profile registry: context resolves a subagent session's system
+# prompt from its profile name (see `ContextManager::subagent_profile`).
+aura-subagent = { workspace = true }
 aura-tools = { workspace = true }
 aura-trace = { workspace = true }
-aura-workspace = { workspace = true }
+# `io` exposes `identity::load_identity_files`, used by prompts::soul to
+# assemble the system prompt from the workspace identity files.
+aura-workspace = { workspace = true, features = ["io"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
@@ -34,6 +39,9 @@ tokio-util = { workspace = true }
 # trigger gate so a stale Pass A finishing after Pass B remarked the
 # parent cannot CAS-clear Pass B's mark.
 uuid = { workspace = true }
+# Content-addressed tool-output spill files (`prompts::tool_output`).
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 aura-storage = { workspace = true, features = ["test-support"] }

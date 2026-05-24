@@ -6,27 +6,22 @@ use aura_job::{JobInput, JobLifecycle, JobOutput};
 use aura_llm::{
     ChatRequest, GuardedLlm, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
 };
-use aura_model::{
-    ChatMessage, ContentBlock, JobId, LlmEntryName, MessageSource, Role, SystemSpawnRequest,
-};
+use aura_model::{ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SystemSpawnRequest};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use aura_model::Session;
-use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillRegistry, SkillSummary};
 use aura_tools::{ToolOutput, ToolRegistry};
 use aura_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::runtime::compression::CompressionRunner;
 use crate::runtime::error_recovery::ErrorHandler;
 use crate::runtime::scope::JobSpec;
-use crate::runtime::session_log::{
-    LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
-};
-use crate::runtime::soul::Soul;
+use aura_context::{LlmCallOutcome, LlmResponseMeta};
+
 use crate::runtime::tool_executor::ToolExecutor;
 use crate::security::SecurityGateway;
 use tokio_util::sync::CancellationToken;
@@ -175,11 +170,9 @@ pub struct AgentLoop {
     /// actor is using.
     billed_chat_factory: Arc<crate::runtime::billed_chat::BilledChatFactory>,
     tool_registry: Arc<ToolRegistry>,
-    skill_registry: Arc<SkillRegistry>,
     tool_executor: Arc<ToolExecutor>,
     context_manager: ContextManager,
     max_iterations: usize,
-    soul: Soul,
     security_gateway: Arc<SecurityGateway>,
     error_handler: ErrorHandler,
     /// Cost gate + ledger; `record_call` feeds spend back so the
@@ -192,11 +185,6 @@ pub struct AgentLoop {
     /// from the parent actor into its maintenance children
     /// automatically.
     actor_token: CancellationToken,
-    /// Optional per-session JSONL logger for LLM calls. When set, every
-    /// `call_llm` invocation appends a record (request, response or
-    /// error, latency, model metadata) to
-    /// `<workspace>/logs/sessions/<session_id>.jsonl`.
-    session_log: Option<Arc<SessionLlmLogger>>,
     /// Sender half of the generic system-spawn channel. The router
     /// consumes the receiving half. Today only the summary-refresh
     /// trigger gate emits on it; future system tasks (history review,
@@ -228,11 +216,9 @@ pub struct AgentLoopConfig {
     /// Initial pick for the active LLM. `None` ⇒ pool default.
     pub initial_llm: Option<LlmEntryName>,
     pub tool_registry: Arc<ToolRegistry>,
-    pub skill_registry: Arc<SkillRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
     pub context_manager: ContextManager,
     pub max_iterations: usize,
-    pub soul: Soul,
     pub security_gateway: Arc<SecurityGateway>,
     /// Cost gate + ledger.
     pub cost_manager: Arc<aura_cost::CostManager>,
@@ -240,8 +226,6 @@ pub struct AgentLoopConfig {
     /// factory derives the actor token once and threads the same
     /// handle into both this loop and the actor.
     pub actor_token: CancellationToken,
-    /// Optional per-session JSONL logger for LLM calls.
-    pub session_log: Option<Arc<SessionLlmLogger>>,
     /// Generic system-spawn channel sender (any
     /// `SystemSpawnRequest` variant — today background summary).
     pub system_spawn_tx: Option<mpsc::Sender<SystemSpawnRequest>>,
@@ -259,15 +243,12 @@ impl AgentLoop {
             llm_pool,
             initial_llm,
             tool_registry,
-            skill_registry,
             tool_executor,
             context_manager,
             max_iterations,
-            soul,
             security_gateway,
             cost_manager,
             actor_token,
-            session_log,
             system_spawn_tx,
             workspace_paths,
             sessions,
@@ -285,16 +266,13 @@ impl AgentLoop {
             llm_client,
             billed_chat_factory,
             tool_registry,
-            skill_registry,
             tool_executor,
             context_manager,
             max_iterations,
-            soul,
             security_gateway,
             error_handler: ErrorHandler::default(),
             cost_manager,
             actor_token,
-            session_log,
             system_spawn_tx,
             workspace_paths,
             sessions,
@@ -330,11 +308,8 @@ impl AgentLoop {
     /// context for rollback — otherwise a rollback on a fresh session would
     /// drop the just-persisted system row in-memory and the next retry would
     /// re-seed and re-persist it.
-    pub async fn ensure_system_prompt_seeded(
-        &mut self,
-        session: &mut Session,
-    ) -> anyhow::Result<()> {
-        self.ensure_system_prompt(session).await
+    pub async fn ensure_system_prompt_seeded(&mut self) {
+        self.context_manager.ensure_seeded().await;
     }
 
     /// Run the main conversation loop for a single user message.
@@ -345,49 +320,23 @@ impl AgentLoop {
     /// `OutgoingMessage` returned here should still be dispatched by the
     /// caller as `AgentOutput::Message` so non-streaming adapters receive
     /// the canonical response.
-    // Each parameter is genuinely independent (provenance, LLM input,
-    // facade handles, lineage hint, streaming sink). Grouping them
-    // into a struct would obscure the call site without saving
-    // anything.
+    // `job_input` records why this job exists (provenance: which trigger
+    // kicked it off — User / Cron / System / Spawned), used for the JobSpec.
+    // The turn's triggering message is appended to the transcript by the
+    // actor *before* this runs (via `append_user_message` / `append_cron_fire`
+    // / `append_subagent_notification`), so the loop iterates the current
+    // context rather than appending here.
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &mut self,
         session: &mut Session,
         job_input: JobInput,
-        user_content: Vec<ContentBlock>,
         job_lifecycle: &Arc<JobLifecycle>,
         span_recorder: &Arc<SpanRecorder>,
         parent_job_id: Option<JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
-        // `job_input` records why this job exists (provenance: which
-        // trigger kicked it off — User / Cron / System / Spawned).
-        // `user_content` is what we feed the LLM as the first user
-        // message. They coincide for `UserChat` but differ for
-        // `Cron` / `System` where the input is a synthesized prompt
-        // rather than the raw trigger payload.
-        //
-        // Provenance of the synthesized first turn. Only a genuine channel
-        // input is user-authored; a cron fire carries its own source so the
-        // operator cron inbox can find it; spawned / subagent task prompts and
-        // the autonomous `SubagentNotification` are generic agent context.
-        // Everything but `UserChat` is synthesized `Role::User` content that
-        // chat surfaces hide.
-        let is_subagent_notification = matches!(job_input, JobInput::SubagentNotification { .. });
-        let source = match job_input {
-            JobInput::UserChat { .. } => MessageSource::User,
-            JobInput::Cron { .. } => MessageSource::Cron,
-            _ => MessageSource::Agent,
-        };
-        // The notification prompt is rebuilt from the durable
-        // `pending_subagent_results` buffer on every retry, so persisting it
-        // per-attempt would duplicate the hidden row on each failed retry
-        // (provider outage → infinite backoff). Append it in-memory only; the
-        // buffer is the source of truth and only the proactive reply (if any)
-        // is persisted. Kept separate from `source` so a future agent-injected
-        // row can still choose to persist.
-        let persist_user_row = !is_subagent_notification;
         let spec = JobSpec {
             session_id: session.id.clone(),
             session_trigger_kind: session.trigger.kind(),
@@ -403,13 +352,10 @@ impl AgentLoop {
                 let outgoing = self
                     .run_inner(
                         session,
-                        user_content,
                         job_lifecycle,
                         span_recorder,
                         job_id,
                         delta_tx,
-                        source,
-                        persist_user_row,
                         cancel_token,
                     )
                     .await?;
@@ -426,17 +372,14 @@ impl AgentLoop {
     async fn run_inner(
         &mut self,
         session: &mut Session,
-        user_content: Vec<ContentBlock>,
         job_lifecycle: &Arc<JobLifecycle>,
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
-        source: MessageSource,
-        persist_user_row: bool,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
         let _ = job_lifecycle;
-        self.ensure_system_prompt(session).await?;
+        self.context_manager.ensure_seeded().await;
 
         // Bound to the *outer* delta_tx, not iter_delta_tx — notices
         // need to reach the channel on iter-2+ where streaming is
@@ -450,102 +393,10 @@ impl AgentLoop {
             }) as Arc<dyn aura_tools::SessionNotifier>
         });
 
-        let user_text = aura_llm::multimodal::extract_text(&user_content);
-        let skills_for_turn = if self.skill_registry.is_empty() {
-            Vec::new()
-        } else {
-            self.invocable_skills()
-        };
-
-        // Append user message (auto-compresses if over token budget). Only a
-        // genuine `UserChat` turn is user-authored; a cron fire is stamped
-        // `Cron` so the operator inbox finds it; everything else is agent
-        // context. None but the user row surface as a user bubble.
-        let user_msg = match source {
-            MessageSource::User => ChatMessage::user(user_content.clone()),
-            MessageSource::Cron => ChatMessage::cron_fire(user_content.clone()),
-            MessageSource::Agent => ChatMessage::agent_context(user_content.clone()),
-        };
-        if persist_user_row {
-            self.append_context_message(session, &user_msg).await?;
-        } else {
-            // SubagentNotification: rebuilt from the durable buffer on retry,
-            // so the row is in-memory only and rolled back if the turn fails.
-            self.context_manager.append_in_memory(&user_msg);
-        }
-
-        if let Some((skill_name, args)) = detect_slash_invocation(&user_text, &skills_for_turn) {
-            let synthesized_id = format!("synthskill-{}", uuid::Uuid::new_v4());
-            let mut input = serde_json::json!({ SKILL_INPUT_NAME_FIELD: skill_name });
-            if !args.is_empty() {
-                input["args"] = serde_json::Value::String(args);
-            }
-            let tool_use_block = ContentBlock::ToolUse {
-                id: synthesized_id.clone(),
-                name: SKILL_TOOL_NAME.to_string(),
-                input: input.clone(),
-                signature: None,
-            };
-            let assistant_msg = ChatMessage::assistant(vec![tool_use_block]);
-            self.append_context_message(session, &assistant_msg).await?;
-
-            let approved = std::sync::Arc::new(parking_lot::Mutex::new(
-                session.state.approved_resources.clone(),
-            ));
-
-            let executor_clone = Arc::clone(&self.tool_executor);
-            let span_recorder_clone = Arc::clone(span_recorder);
-            let session_id_clone = session.id.clone();
-            let user_clone = session.user.clone();
-            let approved_clone = Arc::clone(&approved);
-            let synth_id_clone = synthesized_id.clone();
-            let input_clone = input.clone();
-            let cancel_token_clone = cancel_token.clone();
-            let notifier_clone = notifier.clone();
-            let factory_clone = Arc::clone(&self.billed_chat_factory);
-
-            let result_text = crate::runtime::scope::with_step(
-                span_recorder.as_ref(),
-                job_id,
-                StepKind::LlmIteration,
-                Some((&cancel_token, aura_job::CancelReason::ParentCancelled)),
-                move |step| async move {
-                    let res = executor_clone
-                        .execute(
-                            SKILL_TOOL_NAME,
-                            input_clone,
-                            &session_id_clone,
-                            &user_clone,
-                            &approved_clone,
-                            &span_recorder_clone,
-                            &step,
-                            None,
-                            synth_id_clone,
-                            None,
-                            Some(job_id),
-                            cancel_token_clone.child_token(),
-                            notifier_clone,
-                            Some(&factory_clone),
-                        )
-                        .await;
-                    let text = match res {
-                        Ok(ToolOutput::Text(s)) => s,
-                        Ok(ToolOutput::Json(v)) => v.to_string(),
-                        Ok(ToolOutput::WithAttachments { text, .. })
-                        | Ok(ToolOutput::MultiModalText { text, .. }) => text,
-                        Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
-                        Err(e) => format!("Error: {e}"),
-                    };
-                    Ok((LifecycleOutcome::Ok, text))
-                },
-            )
-            .await?;
-
-            session.state.approved_resources = approved.lock().clone();
-
-            let tool_msg = ChatMessage::tool_result(synthesized_id, result_text);
-            self.append_context_message(session, &tool_msg).await?;
-        }
+        // Expand an explicit `/command` skill invocation before the loop:
+        // context reads the matching skill's body and appends it (persisted +
+        // JSONL-logged) as a hidden agent-context row for the loop to act on.
+        self.context_manager.expand_slash_command().await;
 
         // Iterative LLM loop
         let mut iterations = 0;
@@ -719,7 +570,7 @@ impl AgentLoop {
             // channel adapter can stamp it onto the live `Frame::Message`
             // and reconnecting clients advance their cursor past it.
             let assistant_msg = ChatMessage::assistant(response_blocks);
-            let ordinal = self.append_context_message(session, &assistant_msg).await?;
+            let ordinal = self.context_manager.append(&assistant_msg).await;
 
             return Ok(IterationOutcome::Final(OutgoingMessage {
                 session_id: session.id.clone(),
@@ -756,7 +607,7 @@ impl AgentLoop {
             accumulated_tool_uses.push(block);
         }
         let assistant_msg = ChatMessage::assistant(assistant_blocks);
-        self.append_context_message(session, &assistant_msg).await?;
+        self.context_manager.append(&assistant_msg).await;
 
         // Execute tool calls concurrently. Approved resources are shared
         // via a Mutex so concurrent calls see each other's grants
@@ -863,18 +714,24 @@ impl AgentLoop {
                 }
             };
 
-            // Cap size before wrapping so the truncation notice lands
-            // inside the `<tool_output>` envelope, then wrap so the LLM
-            // sees a clear boundary around untrusted tool output.
-            let capped = self.security_gateway.cap_tool_output(raw_result_text).await;
-            let wrapped = self
-                .security_gateway
-                .wrap_tool_output_for_llm(&tool_call.name, &capped);
+            // Cap size before wrapping so the truncation notice lands inside
+            // the `<tool_output>` envelope. The scan/format split keeps the
+            // injection detector in `aura-security` while the cap + spill +
+            // envelope framing live in `aura-context`; the loop bridges the
+            // two by feeding the scan's rule names into the wrapper.
+            let capped = self.context_manager.cap_tool_output(raw_result_text).await;
+            let warnings = self.security_gateway.detect_injection(&capped);
+            let warning_rules: Vec<&str> = warnings.iter().map(|w| w.rule_name.as_str()).collect();
+            let wrapped = aura_context::prompts::tool_output::wrap_tool_output(
+                &tool_call.name,
+                &capped,
+                &warning_rules,
+            );
 
             // Append tool result to context with the tool_use_id so the
             // LLM can correlate results with their originating calls.
             let tool_msg = ChatMessage::tool_result(tool_call.id.clone(), wrapped);
-            self.append_context_message(session, &tool_msg).await?;
+            self.context_manager.append(&tool_msg).await;
 
             // ToolResult.content is text-only; provider adapters
             // serialize it as plain text. To get images back into the
@@ -892,7 +749,7 @@ impl AgentLoop {
                 )));
                 content.extend(llm_visible_images);
                 let image_msg = ChatMessage::agent_context(content);
-                self.append_context_message(session, &image_msg).await?;
+                self.context_manager.append(&image_msg).await;
             }
         }
 
@@ -971,7 +828,7 @@ impl AgentLoop {
         // user prompt, assistant turn — stays separately inspectable.
         // Merging is a transport concern, not a storage one.
         let request = ChatRequest {
-            messages: merge_for_llm(self.context_manager.messages()),
+            messages: self.context_manager.messages_for_llm(),
             temperature: None,
             tools: tool_defs,
         };
@@ -1021,7 +878,6 @@ impl AgentLoop {
                         // code blocks, and lists are unaffected.
                         trim_response_text_edges(&mut response);
                         self.write_session_log(
-                            session,
                             &request,
                             LlmCallOutcome::Ok {
                                 response: LlmResponseMeta::from_response(&response),
@@ -1061,7 +917,6 @@ impl AgentLoop {
                             .await
                             .unwrap_or(raw);
                         self.write_session_log(
-                            session,
                             &request,
                             LlmCallOutcome::Err {
                                 error: log_msg,
@@ -1113,76 +968,95 @@ impl AgentLoop {
         .await
     }
 
-    /// Append a single LLM call record to the per-session JSONL log.
-    /// No-op when no logger is configured. Failures are logged at warn
-    /// and swallowed — log persistence must never block a turn.
-    async fn write_session_log(
-        &self,
-        session: &Session,
-        request: &ChatRequest,
-        outcome: LlmCallOutcome,
-    ) {
-        let Some(logger) = self.session_log.as_ref() else {
-            return;
-        };
+    /// Log a single LLM call to the per-session JSONL log. Context owns the
+    /// logger + record format and assembles + writes it; the agent only
+    /// supplies the model identity (from its `GuardedLlm`, which context
+    /// doesn't hold) plus the call's request + outcome.
+    async fn write_session_log(&self, request: &ChatRequest, outcome: LlmCallOutcome) {
         let info = self.llm_client.model_info();
-        let request = match LlmRequestMeta::from_request(request) {
-            Ok(meta) => meta,
-            Err(e) => {
-                warn!(error = %e, "failed to summarize llm request for session log");
-                return;
-            }
-        };
-        let record = LlmCallRecord {
-            timestamp: chrono::Utc::now(),
-            session_id: session.id.clone(),
-            provider: info.provider.clone(),
-            model: info.id.clone(),
-            request,
-            outcome,
-        };
-        if let Err(e) = logger.log_llm_call(&record).await {
-            warn!(error = %e, "failed to append session llm log");
-        }
-    }
-
-    async fn append_context_message(
-        &mut self,
-        session: &Session,
-        message: &ChatMessage,
-    ) -> anyhow::Result<Option<i64>> {
-        let ordinal = self.context_manager.append(message).await;
-        self.write_session_message_log(session, message).await;
-        Ok(ordinal)
+        self.context_manager
+            .log_llm_call(request, outcome, &info.provider, &info.id)
+            .await;
     }
 
     /// Append a user-authored message to this session's transcript — both the
     /// in-memory context and the persisted `session_messages` log — ahead
     /// of the turn that runs next. Lets the actor coalesce a burst of user
     /// messages into one turn while keeping each as its own transcript row;
-    /// `merge_for_llm` collapses the consecutive rows for the provider call.
-    pub async fn append_user_message(
-        &mut self,
-        session: &mut Session,
-        content: Vec<ContentBlock>,
-    ) -> anyhow::Result<()> {
+    /// context's `messages_for_llm` collapses the consecutive rows for the
+    /// provider call.
+    pub async fn append_user_message(&mut self, content: Vec<ContentBlock>) -> anyhow::Result<()> {
         // A coalesced burst can be the first thing a fresh session ever
         // appends; seed the system prompt first so it never lands *after*
-        // user content. `initial_seed_messages` keys off `messages[0]`, so a
-        // leading user row would also make every later turn re-seed.
-        self.ensure_system_prompt(session).await?;
+        // user content. `ensure_seeded` keys off `messages[0]`, so a leading
+        // user row would otherwise make every later turn re-seed.
+        self.context_manager.ensure_seeded().await;
         let msg = ChatMessage::user(content);
-        self.append_context_message(session, &msg).await?;
+        self.context_manager.append(&msg).await;
         Ok(())
     }
 
-    async fn write_session_message_log(&self, session: &Session, message: &ChatMessage) {
-        let Some(logger) = self.session_log.as_ref() else {
+    /// Append a cron fire's framed prompt as a persisted `Cron`-source row
+    /// ahead of the turn. The framing ([`aura_context::prompts::cron`]) makes
+    /// the model treat the fire as a task to perform now rather than a live
+    /// user message; `MessageSource::Cron` lets the operator inbox find the
+    /// row. Seeds the system prompt first so a fresh cron session never lands
+    /// the fire ahead of `messages[0]`.
+    pub async fn append_cron_fire(&mut self, job_id: &str, prompt: &str) -> anyhow::Result<()> {
+        self.context_manager.ensure_seeded().await;
+        let framed = aura_context::prompts::cron::frame_cron_prompt(job_id, prompt);
+        let msg = ChatMessage::cron_fire(vec![ContentBlock::Text(framed)]);
+        self.context_manager.append(&msg).await;
+        Ok(())
+    }
+
+    /// Append a subagent-spawned session's initial prompt as a persisted
+    /// agent-context row ahead of the turn (hidden from chat surfaces).
+    pub async fn append_spawned_prompt(
+        &mut self,
+        content: Vec<ContentBlock>,
+    ) -> anyhow::Result<()> {
+        self.context_manager.ensure_seeded().await;
+        let msg = ChatMessage::agent_context(content);
+        self.context_manager.append(&msg).await;
+        Ok(())
+    }
+
+    /// Append the synthetic `SubagentNotification` prompt **in-memory only**.
+    /// It is rebuilt from the durable `pending_subagent_results` buffer on
+    /// every retry, so persisting per-attempt would stack duplicate hidden
+    /// rows under the infinite-backoff retry. The caller seeds the system
+    /// prompt and snapshots the transcript *before* this so a failed turn can
+    /// roll the row back; `content` is built via
+    /// [`aura_context::prompts::subagent::build_notification_content`].
+    pub fn append_subagent_notification(&mut self, content: Vec<ContentBlock>) {
+        // Unlike the other append_* helpers this does NOT seed the system
+        // prompt: the caller must have seeded (and snapshotted) *before* this,
+        // so a failed turn's rollback can't drop the system row. Self-seeding
+        // here would append the system row to the tail, after the notification.
+        let seeded = self
+            .context_manager
+            .messages()
+            .first()
+            .is_some_and(|m| m.role == Role::System);
+        debug_assert!(
+            seeded,
+            "append_subagent_notification requires the system prompt already seeded \
+             (call ensure_system_prompt_seeded before snapshotting)"
+        );
+        if !seeded {
+            // Unreachable given the sole caller, but in release (debug_assert
+            // compiled out) don't push the notification ahead of a not-yet-seeded
+            // system row: that would leave messages[0] off the system prompt and
+            // break the prompt-cache prefix. Drop the row and log loudly instead.
+            error!(
+                "append_subagent_notification called before the system prompt was seeded; \
+                 dropping the in-memory notification to keep the transcript prefix intact"
+            );
             return;
-        };
-        if let Err(e) = logger.log_message(&session.id, message).await {
-            warn!(error = %e, "failed to append session message log");
         }
+        let msg = ChatMessage::agent_context(content);
+        self.context_manager.append_in_memory(&msg);
     }
 
     /// Run a streaming chat request, forwarding each text chunk through
@@ -1344,15 +1218,11 @@ impl AgentLoop {
     ) -> anyhow::Result<()> {
         let runner = self.build_compression_runner(session, span_recorder, job_id, cancel_token);
         let model_id = runner.model_info.id.clone();
-        let outcome = self
-            .context_manager
+        self.context_manager
             .maybe_compress(&model_id, |req| async move {
                 runner.run(req).await.map(|run| run.response)
             })
             .await?;
-        if matches!(outcome, aura_context::CompressionOutcome::Compressed) {
-            self.reload_soul_after_compaction().await?;
-        }
         Ok(())
     }
 
@@ -1429,9 +1299,6 @@ impl AgentLoop {
                         runner.run(req).await.map(|run| run.response)
                     })
                     .await?;
-                if matches!(outcome, aura_context::CompressionOutcome::Compressed) {
-                    self.reload_soul_after_compaction().await?;
-                }
                 let text = match outcome {
                     aura_context::CompressionOutcome::Compressed => {
                         "Context compressed.".to_string()
@@ -1637,122 +1504,6 @@ impl AgentLoop {
 
         result
     }
-
-    /// Seed the transcript with the soul system prompt and — once,
-    /// adjacent to it — the authoritative skill reminder. Both are
-    /// idempotent on the leading-system check: if `messages[0]` is
-    /// already a system row, this is a no-op (restored sessions keep
-    /// whatever they persisted; compression re-attaches the reminder
-    /// via [`aura_context::insert_skill_trailer`] when the kept slice
-    /// drops it).
-    ///
-    /// The reminder rides as `Role::User` because some providers reject
-    /// `system` outside the leading slot; `merge_for_llm` folds it into
-    /// the first real user message before dispatch. Placing it here
-    /// (rather than per-turn after each user message) keeps the model's
-    /// "what skills are available" context adjacent to its instructions
-    /// and avoids appending a fresh reminder row every turn.
-    async fn ensure_system_prompt(&mut self, session: &mut Session) -> anyhow::Result<()> {
-        let skills = if self.skill_registry.is_empty() {
-            Vec::new()
-        } else {
-            self.invocable_skills()
-        };
-        let soul_prompt = self.soul.system_prompt();
-        let to_seed = initial_seed_messages(
-            self.context_manager.messages().first(),
-            soul_prompt,
-            &skills,
-        );
-        for msg in &to_seed {
-            self.append_context_message(session, msg).await?;
-        }
-        // active_skills mirrors the reminder we actually seeded; on the
-        // re-entry path (leading system already present) `to_seed` is
-        // empty and we leave the field unchanged so the prior value
-        // carries forward.
-        if !to_seed.is_empty() {
-            session.state.active_skills = skills.iter().map(|s| s.name.clone()).collect();
-        }
-        Ok(())
-    }
-
-    /// Rebuild [`Soul`] from disk and swap the result into
-    /// `messages[0]`. Called only after a successful compaction —
-    /// the compressor preserves the leading system row from the
-    /// pre-compaction transcript, so a profile edit made earlier in
-    /// the conversation would otherwise carry the stale content
-    /// forward forever. New sessions don't need this path because
-    /// `ensure_system_prompt` already seeds them from a fresh
-    /// [`Soul::from_workspace`] read.
-    async fn reload_soul_after_compaction(&mut self) -> anyhow::Result<()> {
-        let Some(paths) = self.workspace_paths.as_ref() else {
-            return Ok(());
-        };
-        let workspace = aura_workspace::WorkspaceManager::new(paths.root().to_path_buf());
-        let new_soul = match Soul::from_workspace(&workspace).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, "failed to reload soul from workspace; keeping cached prompt");
-                return Ok(());
-            }
-        };
-        // Only swap `messages[0]` when it's already a system text
-        // block — defensive against an empty transcript or a non-
-        // system first row.
-        let first_is_system_text = self.context_manager.messages().first().is_some_and(|m| {
-            m.role == Role::System && matches!(m.content.first(), Some(ContentBlock::Text(_)))
-        });
-        if first_is_system_text {
-            self.context_manager
-                .replace_first_message(ChatMessage::system(vec![ContentBlock::Text(
-                    new_soul.system_prompt().to_string(),
-                )]));
-        }
-        self.soul = new_soul;
-        Ok(())
-    }
-
-    fn invocable_skills(&self) -> Vec<SkillSummary> {
-        self.skill_registry
-            .all_summaries_sorted()
-            .into_iter()
-            .filter(|s| {
-                s.agent_invocable && !matches!(s.trust_level, aura_model::TrustLevel::Untrusted)
-            })
-            .collect()
-    }
-}
-
-/// Pure decision logic for [`AgentLoop::ensure_system_prompt`]: given the
-/// current leading message (if any), the resolved soul prompt, and the
-/// invocable skill set, return the messages that should be appended.
-///
-/// Invariants:
-/// - A leading `Role::System` message inhibits all seeding — empty vec.
-/// - No leading system → exactly one system row is seeded.
-/// - The skill reminder is appended **only** alongside a freshly-seeded
-///   system row, never on the early-return path. This is what makes the
-///   reminder fire exactly once per session: any subsequent call observes
-///   the system row and short-circuits.
-fn initial_seed_messages(
-    leading: Option<&ChatMessage>,
-    soul_prompt: &str,
-    skills: &[SkillSummary],
-) -> Vec<ChatMessage> {
-    if leading.is_some_and(|m| m.role == Role::System) {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(if skills.is_empty() { 1 } else { 2 });
-    out.push(ChatMessage::system(vec![ContentBlock::Text(
-        soul_prompt.to_string(),
-    )]));
-    if !skills.is_empty() {
-        out.push(ChatMessage::agent_context(vec![ContentBlock::Text(
-            aura_skills::render::render_skill_reminder(skills),
-        )]));
-    }
-    out
 }
 
 /// Strip leading/trailing whitespace from the LLM response's text fields.
@@ -1780,62 +1531,6 @@ fn trim_response_text_edges(response: &mut LlmResponse) {
             }
         }
     }
-}
-
-/// Coalesce adjacent same-role user/assistant messages into a single
-/// message so providers that require strict user/assistant alternation
-/// (e.g. some Gemini / Mistral configurations) accept the request.
-///
-/// `Role::System` and `Role::Tool` are passed through untouched — system
-/// messages are typically extracted to a dedicated field by the provider
-/// adapter, and tool-result messages must remain individually addressable
-/// by their `tool_use_id`.
-///
-/// When two adjacent user/assistant messages are merged, the merge also
-/// flattens trailing/leading `ContentBlock::Text` blocks across the
-/// boundary into a single text block (joined with `\n\n`). Non-text
-/// blocks (images, tool_use, tool_result, thinking) are appended as-is so
-/// signatures, IDs, and modality data are preserved verbatim.
-fn merge_for_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
-    for msg in messages {
-        let mergeable = matches!(msg.role, Role::User | Role::Assistant);
-        match out.last_mut() {
-            Some(last) if mergeable && last.role == msg.role => {
-                for block in &msg.content {
-                    let folded = matches!(block, ContentBlock::Text(_))
-                        && matches!(last.content.last(), Some(ContentBlock::Text(_)));
-                    if folded {
-                        if let (Some(ContentBlock::Text(prev_t)), ContentBlock::Text(cur_t)) =
-                            (last.content.last_mut(), block)
-                        {
-                            if !prev_t.is_empty() && !cur_t.is_empty() {
-                                prev_t.push_str("\n\n");
-                            }
-                            prev_t.push_str(cur_t);
-                        }
-                    } else {
-                        last.content.push(block.clone());
-                    }
-                }
-            }
-            _ => out.push(msg.clone()),
-        }
-    }
-    out
-}
-
-fn detect_slash_invocation(user_text: &str, skills: &[SkillSummary]) -> Option<(String, String)> {
-    let rest = user_text.trim_start().strip_prefix('/')?;
-    let (cmd, args) = match rest.find(char::is_whitespace) {
-        Some(idx) => (&rest[..idx], rest[idx..].trim().to_string()),
-        None => (rest, String::new()),
-    };
-    if cmd.is_empty() {
-        return None;
-    }
-    let skill = skills.iter().find(|s| s.command.as_deref() == Some(cmd))?;
-    Some((skill.name.clone(), args))
 }
 
 #[cfg(test)]
@@ -2153,209 +1848,5 @@ mod trim_response_text_edges_tests {
             ContentBlock::Text(t) => assert_eq!(t, body),
             other => panic!("expected text, got {other:?}"),
         }
-    }
-}
-
-#[cfg(test)]
-mod merge_for_llm_tests {
-    use super::merge_for_llm;
-    use aura_model::{BlobRef, ChatMessage, ContentBlock, Role};
-
-    fn text(role: Role, body: &str) -> ChatMessage {
-        let content = vec![ContentBlock::Text(body.into())];
-        match role {
-            Role::User => ChatMessage::agent_context(content),
-            Role::Assistant => ChatMessage::assistant(content),
-            Role::System => ChatMessage::system(content),
-            Role::Tool => ChatMessage::tool(content),
-        }
-    }
-
-    fn img() -> ContentBlock {
-        ContentBlock::Image {
-            blob: BlobRef {
-                blob_id: "sha256:abc".into(),
-            },
-            mime_type: "image/png".into(),
-        }
-    }
-
-    #[test]
-    fn passthrough_when_alternating() {
-        let msgs = vec![
-            text(Role::System, "sys"),
-            text(Role::User, "u1"),
-            text(Role::Assistant, "a1"),
-            text(Role::User, "u2"),
-        ];
-        let out = merge_for_llm(&msgs);
-        assert_eq!(out.len(), 4);
-        assert_eq!(out, msgs);
-    }
-
-    #[test]
-    fn merges_consecutive_user_text() {
-        let msgs = vec![text(Role::User, "reminder"), text(Role::User, "hello")];
-        let out = merge_for_llm(&msgs);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].role, Role::User);
-        assert_eq!(out[0].content.len(), 1);
-        match &out[0].content[0] {
-            ContentBlock::Text(t) => assert_eq!(t, "reminder\n\nhello"),
-            other => panic!("expected merged text, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn merges_consecutive_assistant_text() {
-        let msgs = vec![text(Role::Assistant, "a"), text(Role::Assistant, "b")];
-        let out = merge_for_llm(&msgs);
-        assert_eq!(out.len(), 1);
-        match &out[0].content[0] {
-            ContentBlock::Text(t) => assert_eq!(t, "a\n\nb"),
-            other => panic!("expected merged text, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn keeps_non_text_blocks_separate() {
-        let msgs = vec![
-            ChatMessage::agent_context(vec![ContentBlock::Text("hi".into()), img()]),
-            ChatMessage::agent_context(vec![ContentBlock::Text("more".into())]),
-        ];
-        let out = merge_for_llm(&msgs);
-        assert_eq!(out.len(), 1);
-        // hi, image, more — image keeps the text blocks from folding across it.
-        assert_eq!(out[0].content.len(), 3);
-        match &out[0].content[0] {
-            ContentBlock::Text(t) => assert_eq!(t, "hi"),
-            other => panic!("unexpected first block {other:?}"),
-        }
-        assert!(matches!(out[0].content[1], ContentBlock::Image { .. }));
-        match &out[0].content[2] {
-            ContentBlock::Text(t) => assert_eq!(t, "more"),
-            other => panic!("unexpected third block {other:?}"),
-        }
-    }
-
-    #[test]
-    fn does_not_merge_system_or_tool() {
-        let msgs = vec![
-            text(Role::System, "s1"),
-            text(Role::System, "s2"),
-            ChatMessage::tool_result("1".into(), "r1".into()),
-            ChatMessage::tool_result("2".into(), "r2".into()),
-        ];
-        let out = merge_for_llm(&msgs);
-        assert_eq!(out.len(), 4);
-    }
-
-    #[test]
-    fn preserves_assistant_tool_use_then_tool_result() {
-        let assistant = ChatMessage::assistant(vec![ContentBlock::ToolUse {
-            id: "t1".into(),
-            name: "Foo".into(),
-            input: serde_json::json!({}),
-            signature: None,
-        }]);
-        let tool = ChatMessage::tool_result("t1".into(), "ok".into());
-        let msgs = vec![text(Role::User, "hi"), assistant.clone(), tool.clone()];
-        let out = merge_for_llm(&msgs);
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[1], assistant);
-        assert_eq!(out[2], tool);
-    }
-}
-
-#[cfg(test)]
-mod initial_seed_tests {
-    use super::initial_seed_messages;
-    use aura_model::{ChatMessage, ContentBlock, Role};
-    use aura_skills::SkillSummary;
-
-    const SOUL: &str = "You are Aura.";
-
-    fn skill(name: &str) -> SkillSummary {
-        SkillSummary {
-            name: name.into(),
-            command: None,
-            description: format!("{name} description"),
-            argument_hint: None,
-            agent_invocable: true,
-            trust_level: aura_model::TrustLevel::Trusted,
-        }
-    }
-
-    fn system_row() -> ChatMessage {
-        ChatMessage::system(vec![ContentBlock::Text(SOUL.into())])
-    }
-
-    fn user_row() -> ChatMessage {
-        ChatMessage::user(vec![ContentBlock::Text("hi".into())])
-    }
-
-    #[test]
-    fn fresh_start_no_skills_seeds_system_only() {
-        let out = initial_seed_messages(None, SOUL, &[]);
-        assert_eq!(out.len(), 1, "expected one system row, got {out:?}");
-        assert_eq!(out[0].role, Role::System);
-        assert!(matches!(out[0].content[0], ContentBlock::Text(ref t) if t == SOUL));
-    }
-
-    #[test]
-    fn fresh_start_with_skills_seeds_system_then_reminder() {
-        let skills = vec![skill("alpha"), skill("beta")];
-        let out = initial_seed_messages(None, SOUL, &skills);
-        assert_eq!(out.len(), 2, "expected system + reminder, got {out:?}");
-        assert_eq!(out[0].role, Role::System);
-        assert_eq!(
-            out[1].role,
-            Role::User,
-            "reminder rides as Role::User because some providers reject mid-stream system rows",
-        );
-        assert!(!out[1].from_user(), "synthetic rows are never from_user");
-        let reminder_text = match &out[1].content[0] {
-            ContentBlock::Text(t) => t,
-            _ => panic!("reminder should be a text block"),
-        };
-        assert!(reminder_text.contains("alpha"));
-        assert!(reminder_text.contains("beta"));
-    }
-
-    #[test]
-    fn leading_system_short_circuits_even_with_skills() {
-        let leading = system_row();
-        let skills = vec![skill("alpha")];
-        let out = initial_seed_messages(Some(&leading), SOUL, &skills);
-        assert!(
-            out.is_empty(),
-            "re-entry must not append anything; got {out:?}",
-        );
-    }
-
-    #[test]
-    fn leading_non_system_does_not_short_circuit() {
-        // Defensive — a transcript whose first row is a user message
-        // (test fixture, restored partial state) still gets seeded so
-        // the LLM sees a leading system row.
-        let leading = user_row();
-        let out = initial_seed_messages(Some(&leading), SOUL, &[]);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].role, Role::System);
-    }
-
-    #[test]
-    fn second_call_after_first_seeds_nothing() {
-        // The exactly-once invariant: simulate two consecutive calls by
-        // feeding the previously-seeded system row as the leading
-        // message on the second call.
-        let first = initial_seed_messages(None, SOUL, &[skill("alpha")]);
-        let leading = first[0].clone();
-        let second = initial_seed_messages(Some(&leading), SOUL, &[skill("alpha")]);
-        assert_eq!(first.len(), 2);
-        assert!(
-            second.is_empty(),
-            "second call must short-circuit on the leading system row",
-        );
     }
 }

@@ -25,14 +25,14 @@ use aura_agent::actor::AgentActor;
 use aura_agent::agent_loop::{AgentLoop, AgentLoopConfig};
 use aura_agent::router::Router;
 use aura_agent::service::{ShutdownSignal, TaskTracker};
-use aura_agent::session_log::SessionLlmLogger;
-use aura_agent::soul::Soul;
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager};
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::{AuraConfig, LlmEntryName};
-use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, Tokenizer};
+use aura_context::{
+    ContextManager, ContextManagerConfig, SessionLlmLogger, TiktokenTokenizer, Tokenizer,
+};
 use aura_cost::{CostManager, SpendingLimits, cost_call_guard};
 use aura_job::JobLifecycle;
 use aura_llm::GuardedLlm;
@@ -132,6 +132,10 @@ pub struct ManagerGraph {
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
+    /// Subagent profile registry — `wire_router` hands it to a spawned
+    /// subagent's `ContextManager`, which resolves the child's system prompt
+    /// from it by profile name.
+    pub subagent_registry: Arc<aura_subagent::SubagentRegistry>,
     /// Always already wrapped via `GuardedLlm` — every
     /// consumer (main loop, side-LLM in tools, skill_assessor)
     /// shares the same budget gate. Constructed in
@@ -234,7 +238,7 @@ pub async fn build_managers(
         }
         reg
     };
-    let subagent_profile_registry = {
+    let subagent_registry = {
         let reg = Arc::new(aura_subagent::SubagentRegistry::new());
         let builtins = reg.register_builtins();
         if builtins > 0 {
@@ -478,7 +482,7 @@ pub async fn build_managers(
         let (tool, manifest) =
             aura_subagent::tool::make(aura_subagent::tool::SpawnSubagentToolConfig {
                 system_spawn_tx: system_spawn_tx.clone(),
-                registry: Arc::clone(&subagent_profile_registry),
+                registry: Arc::clone(&subagent_registry),
                 sessions: Arc::clone(&session_manager),
                 dispatch_limiter: Arc::clone(&subagent_dispatch_limiter),
                 max_depth: config.agent.max_subagent_depth,
@@ -514,12 +518,12 @@ pub async fn build_managers(
     }
 
     // --- security gateway + tool executor
-    let tool_spill_dir =
-        aura_workspace::WorkspacePaths::new(workspace_root.clone()).tool_spills_dir();
-    let security_gateway = Arc::new(
-        SecurityGateway::new(Arc::clone(&leak_detector), Arc::clone(&secret_vault))
-            .with_spill_dir(tool_spill_dir),
-    );
+    // Tool-output spill now lives in `aura-context` (resolved from the
+    // session's workspace handle); the gateway only does scan + sanitize.
+    let security_gateway = Arc::new(SecurityGateway::new(
+        Arc::clone(&leak_detector),
+        Arc::clone(&secret_vault),
+    ));
     let gate_map = channels_registry.approval_gates();
     let sandbox_runner = match aura_sandbox::current_platform_runner() {
         Ok(r) => match r.warm().await {
@@ -637,6 +641,7 @@ pub async fn build_managers(
         skill_registry,
         tool_registry,
         tool_executor,
+        subagent_registry,
         llm_client,
         llm_pool,
         cost_manager,
@@ -685,11 +690,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
     let token_calibration = Arc::new(aura_context::TokenCalibration::new());
 
-    let soul = Soul::from_workspace(&graph.workspace)
-        .await
-        .unwrap_or_else(|_| Soul::custom("You are Aura, an intelligent assistant.".to_string()));
-    let system_prompt = soul.system_prompt().to_string();
-
     let max_iterations = graph.config.agent.max_iterations;
     let compression_threshold = graph.config.agent.context.compression_threshold;
     let keep_recent = graph.config.agent.context.keep_recent;
@@ -727,11 +727,11 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let session_logger = Arc::clone(&session_logger);
         let tokenizer = Arc::clone(&tokenizer);
         let trace_event_stream = trace_event_stream.clone();
-        let system_prompt = system_prompt.clone();
         let cost_manager = Arc::clone(&cost_manager);
         let token_calibration = Arc::clone(&token_calibration);
 
         let sessions = Arc::clone(&graph.session_manager);
+        let subagent_registry = Arc::clone(&graph.subagent_registry);
         let workspace_paths_arc = Arc::new(aura_workspace::WorkspacePaths::new(
             graph.workspace.root.clone(),
         ));
@@ -741,19 +741,12 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
             move |session: aura_model::Session,
                   initial_llm: Option<LlmEntryName>,
                   response_tx: mpsc::Sender<AgentOutput>,
-                  actor_token: CancellationToken,
-                  system_prompt_override: Option<String>| {
+                  actor_token: CancellationToken| {
                 // LLM pinning is exclusively a subagent-spawn affair —
                 // user-channel actors always run on `default-llm`.
                 // `initial_llm` is `Some` only when the router's subagent
                 // handler resolved a model for the child (from the spawn
                 // request's `model_tier`) and forwarded it here.
-
-                // Subagent profiles replace Soul wholesale; user / cron /
-                // background-compression spawns pass `None` and inherit
-                // the workspace's resolved Soul.
-                let effective_system_prompt =
-                    system_prompt_override.unwrap_or_else(|| system_prompt.clone());
 
                 // `summary_state_dir` connects the compressor's
                 // fast-path to the background refresh runner's output.
@@ -764,7 +757,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     llm_pool: Arc::clone(&llm_pool),
                     initial_llm,
                     tool_registry: Arc::clone(&tool_registry),
-                    skill_registry: Arc::clone(&skill_registry),
                     tool_executor: Arc::clone(&tool_executor),
                     context_manager: ContextManager::from_config(ContextManagerConfig {
                         tokenizer: Arc::clone(&tokenizer),
@@ -775,13 +767,17 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         skill_registry: Arc::clone(&skill_registry),
                         session_id: session.id.clone(),
                         sessions: Arc::clone(&sessions),
+                        subagent_profile: session
+                            .state
+                            .subagent_type
+                            .clone()
+                            .map(|name| (Arc::clone(&subagent_registry), name)),
+                        session_log: Some(Arc::clone(&session_logger)),
                     }),
                     max_iterations,
-                    soul: Soul::custom(effective_system_prompt),
                     security_gateway: Arc::clone(&security_gateway),
                     cost_manager: Arc::clone(&cost_manager),
                     actor_token: actor_token.clone(),
-                    session_log: Some(Arc::clone(&session_logger)),
                     system_spawn_tx: Some(system_spawn_tx.clone()),
                     workspace_paths: Some(Arc::clone(&workspace_paths_arc)),
                     sessions: Some(Arc::clone(&sessions)),

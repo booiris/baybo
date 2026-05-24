@@ -25,7 +25,8 @@ pub use ids::{CostRecordId, JobId, ParallelGroup, SessionId, SpanId, StepId};
 pub use llm_entry_name::LlmEntryName;
 pub use memory::{MemoryCategory, MemoryEntry};
 pub use message::{
-    BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role, ThinkingContent,
+    BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role,
+    TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX, ThinkingContent,
 };
 pub use model_tier::ModelTier;
 pub use money::{MicroUsd, usd_decimal_option};

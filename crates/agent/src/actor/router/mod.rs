@@ -83,12 +83,10 @@ impl RateLimiter {
 /// the spawned actor (e.g. the subagent waiter on timeout) must
 /// keep their own clone before calling.
 ///
-/// `system_prompt_override` lets a caller swap the inherited workspace
-/// Soul for a profile-specific prompt. Today only the typed
-/// `spawn_subagent` path passes `Some(...)`; user, cron, and
-/// background-compression spawns all keep `None` and inherit the
-/// session-default Soul. When `None` the spawner falls back to the
-/// workspace's resolved Soul.
+/// The child's system prompt is resolved by its `ContextManager` from
+/// `session.state.subagent_type` (the profile name, set at spawn) via the
+/// subagent profile registry; a `None` subagent_type yields the workspace
+/// soul. So the spawner needs no prompt argument — the `Session` carries it.
 ///
 /// [`AgentActor`]: crate::actor::AgentActor
 pub type ActorSpawner = Box<
@@ -97,7 +95,6 @@ pub type ActorSpawner = Box<
             /* initial_llm */ Option<LlmEntryName>,
             mpsc::Sender<AgentOutput>,
             /* actor_token */ CancellationToken,
-            /* system_prompt_override */ Option<String>,
         ) -> MailboxSender<AgentMessage>
         + Send
         + Sync,
@@ -280,16 +277,9 @@ impl Router {
         initial_llm: Option<LlmEntryName>,
         response_tx: mpsc::Sender<AgentOutput>,
         parent_token: &CancellationToken,
-        system_prompt_override: Option<String>,
     ) -> (MailboxSender<AgentMessage>, CancellationToken) {
         let actor_token = parent_token.child_token();
-        let mailbox = (self.actor_spawner)(
-            session,
-            initial_llm,
-            response_tx,
-            actor_token.clone(),
-            system_prompt_override,
-        );
+        let mailbox = (self.actor_spawner)(session, initial_llm, response_tx, actor_token.clone());
         (mailbox, actor_token)
     }
 }

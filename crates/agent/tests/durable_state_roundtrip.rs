@@ -42,7 +42,6 @@ fn durable_actor_state_json_roundtrip_preserves_all_fields() {
         created_at: chrono::Utc::now(),
         last_active: chrono::Utc::now(),
         state: aura_model::SessionState {
-            active_skills: vec!["skill-a".into(), "skill-b".into()],
             compression_count: 7,
             ..Default::default()
         },
@@ -59,10 +58,6 @@ fn durable_actor_state_json_roundtrip_preserves_all_fields() {
         serde_json::from_str(&json).expect("durable state must deserialize");
 
     assert_eq!(restored.session.id, original.session.id);
-    assert_eq!(
-        restored.session.state.active_skills,
-        original.session.state.active_skills,
-    );
     assert_eq!(restored.session.state.compression_count, 7);
     assert_eq!(
         restored.session.bound_soul_version,
@@ -89,7 +84,6 @@ async fn rehydrate_after_idle_eviction_preserves_session_state() {
         .await
         .expect("create session");
     let session_id = session.id.clone();
-    session.state.active_skills.push("active-pre-evict".into());
     session.state.compression_count = 3;
     session_store
         .save(&session)
@@ -113,11 +107,6 @@ async fn rehydrate_after_idle_eviction_preserves_session_state() {
     let durable_post = DurableActorState::new(reloaded);
 
     assert_eq!(durable_post.session.id, session_id);
-    assert_eq!(
-        durable_post.session.state.active_skills,
-        vec!["active-pre-evict".to_string()],
-        "active_skills must survive idle eviction → rehydrate",
-    );
     assert_eq!(
         durable_post.session.state.compression_count, 3,
         "compression_count must survive idle eviction → rehydrate",

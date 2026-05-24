@@ -13,6 +13,4 @@ pub mod error_recovery;
 pub mod llm_pool;
 pub mod sandbox;
 pub mod scope;
-pub mod session_log;
-pub mod soul;
 pub mod tool_executor;

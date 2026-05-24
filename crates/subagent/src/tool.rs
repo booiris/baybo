@@ -4,8 +4,9 @@
 //!
 //! 1. Resolves `subagent_type` against
 //!    [`crate::SubagentRegistry`].
-//! 2. Packs the resolved profile's `system_prompt` (and the parent's
-//!    `prompt` brief) into a [`SubagentSpawnRequest`].
+//! 2. Packs the resolved profile name (`subagent_type`) and the parent's
+//!    `prompt` brief into a [`SubagentSpawnRequest`]; the child's
+//!    `ContextManager` resolves the name back to a system prompt.
 //! 3. Ships a [`SystemSpawnRequest::Subagent`] envelope onto the agent
 //!    runtime's system-spawn channel and awaits the child's terminal
 //!    [`SubagentResult`].
@@ -237,7 +238,6 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
     Ok(ParsedSpawn {
         request: SubagentSpawnRequest {
             subagent_type: profile.name.clone(),
-            system_prompt: profile.system_prompt.clone(),
             task_summary: p.description,
             prompt: p.prompt,
             model_tier,
@@ -793,8 +793,6 @@ mod tests {
         assert_eq!(req.task_summary, "look up X");
         assert_eq!(req.prompt, "Investigate X and report what you find.");
         assert_eq!(req.model_tier, Some(ModelTier::Fast));
-        assert!(!req.system_prompt.is_empty());
-        assert!(req.system_prompt.contains("subagent"));
         assert!(!req.background);
         assert!(
             matches!(&req.backend, SubagentBackend::Aura),

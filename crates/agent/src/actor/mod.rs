@@ -3,7 +3,6 @@
 //! routed to by [`Router`](crate::actor::router::Router), and
 //! checkpointed via [`DurableActorState`](crate::actor::state::DurableActorState).
 
-pub mod cron_prompt;
 pub mod mailbox;
 pub mod router;
 pub mod state;
@@ -41,21 +40,6 @@ const NOTIFY_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_
 /// turns (cron, subagent notification) silently suppress a blank reply.
 const EMPTY_USER_REPLY_NOTICE: &str =
     "The assistant did not produce a response to your message. Please try again or rephrase.";
-
-/// Opening framing for a `SubagentNotification` turn's content. Lives in
-/// per-turn content (never the system prompt) so the prompt-cache prefix
-/// is identical to a normal main-path turn. Cron-style: report proactively.
-const SUBAGENT_NOTIFICATION_FRAMING: &str = "[background subagent task(s) finished since your last turn — report the outcome to the user as a fresh, proactive message.]";
-
-/// Per-result element of the nested `<subagent_results>` block. Metadata
-/// rides as attributes; `task` / `output` are child elements so multi-line
-/// free text with quotes needs no attribute escaping.
-const SUBAGENT_RESULT_TEMPLATE: &str = r#"  <result handle="{{handle}}" type="{{type}}" status="{{status}}">
-    <task>{{task}}</task>
-    <output>{{output}}</output>
-    <child_session>{{child_session}}</child_session>
-  </result>
-"#;
 
 use crate::actor::state::{DurableActorState, VolatileResources};
 use crate::actor::supervisor::ActorRegistryGuard;
@@ -108,40 +92,6 @@ impl mailbox::Prioritized for AgentMessage {
             AgentMessage::ActorStop => MessagePriority::Stop,
         }
     }
-}
-
-/// Render a short status label for the background-notification
-/// preamble — keeps the LLM's reading short and stable.
-fn pending_status_label(status: &aura_model::SubagentExitStatus) -> &'static str {
-    match status {
-        aura_model::SubagentExitStatus::Completed => "completed",
-        aura_model::SubagentExitStatus::Cancelled => "cancelled",
-        aura_model::SubagentExitStatus::Failed { .. } => "failed",
-        aura_model::SubagentExitStatus::Timeout => "timeout",
-    }
-}
-
-/// Cap a subagent's final text when rendered into the parent's
-/// next-turn reminder. The full content is still in the trace and
-/// the persisted child session; this cap exists only so a giant
-/// final message can't dominate the parent's context budget.
-fn truncate_for_notice(text: &str) -> String {
-    const MAX: usize = 1024;
-    if text.chars().count() <= MAX {
-        return text.to_string();
-    }
-    let truncated: String = text.chars().take(MAX).collect();
-    format!("{truncated}… [truncated; full text in child session transcript]")
-}
-
-/// Escape the XML metacharacters relevant to attribute values and element
-/// bodies so a subagent's free text can't break the `<subagent_results>`
-/// structure the parent LLM reads.
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 /// A `SubagentNotification` reply is suppressed (not sent to the channel)
@@ -393,10 +343,14 @@ impl AgentActor {
     /// (UserInput, SubagentSpawned, cron prompt dispatch). Returns
     /// the loop's response on `Ok`; caller is responsible for sending
     /// it to the response channel.
+    /// Run the loop on the session's *current* context. The triggering
+    /// message must already be appended (the callers do this via
+    /// `AgentLoop::append_user_message` / `append_cron_fire` /
+    /// `append_subagent_notification`) so framing lives in `aura-context`
+    /// and the loop just iterates.
     async fn run_agent_loop(
         &mut self,
         job_input: JobInput,
-        content: Vec<ContentBlock>,
         parent_job_id: Option<aura_model::JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<OutgoingMessage> {
@@ -405,7 +359,6 @@ impl AgentActor {
             .run(
                 &mut self.durable.session,
                 job_input,
-                content,
                 &self.volatile.job_lifecycle,
                 &self.volatile.span_recorder,
                 parent_job_id,
@@ -421,8 +374,9 @@ impl AgentActor {
     /// The `JobInput::Cron` provenance must match the session's root
     /// trigger or `JobLifecycle::start_job` will reject it; the cron fire
     /// mints a Cron-rooted session, so it does. The content the LLM sees
-    /// is framed by [`cron_prompt::frame_cron_prompt`] so the model treats
-    /// the fire as a task to perform now rather than a live user message.
+    /// The fire is framed + appended by `AgentLoop::append_cron_fire` (which
+    /// uses `aura_context::prompts::cron`) so the model treats it as a task to
+    /// perform now rather than a live user message.
     async fn dispatch_cron_prompt(&mut self, prompt: &str, job_id: &str) -> anyhow::Result<()> {
         let job_input = JobInput::Cron {
             action_payload: serde_json::json!({
@@ -430,10 +384,11 @@ impl AgentActor {
                 "prompt": prompt,
             }),
         };
-        let content = vec![ContentBlock::Text(cron_prompt::frame_cron_prompt(
-            job_id, prompt,
-        ))];
-        let response = self.run_agent_loop(job_input, content, None, None).await?;
+        self.volatile
+            .agent_loop
+            .append_cron_fire(job_id, prompt)
+            .await?;
+        let response = self.run_agent_loop(job_input, None, None).await?;
         if is_blank_reply(&response.content) {
             debug!(
                 session_id = %self.durable.session.id,
@@ -460,15 +415,12 @@ impl AgentActor {
         // text deltas as `AgentOutput::Delta` while the final assembled
         // message still flows through the normal path.
         let response_tx = self.volatile.response_tx.clone();
+        self.volatile
+            .agent_loop
+            .append_user_message(content.clone())
+            .await?;
         let response = self
-            .run_agent_loop(
-                JobInput::UserChat {
-                    content: content.clone(),
-                },
-                content,
-                None,
-                Some(response_tx),
-            )
+            .run_agent_loop(JobInput::UserChat { content }, None, Some(response_tx))
             .await?;
         self.send_user_reply(response).await;
         Ok(())
@@ -497,18 +449,23 @@ impl AgentActor {
             combined.extend(incoming.message.content.iter().cloned());
         }
         combined.extend(last.message.content.iter().cloned());
-        // Append the leading messages as their own rows ahead of the turn.
+        // Append every message as its own row ahead of the turn (the last
+        // included) so the loop iterates the current context; the combined
+        // content rides in `JobInput` for the job record only.
         for incoming in batch {
             self.volatile
                 .agent_loop
-                .append_user_message(&mut self.durable.session, incoming.message.content)
+                .append_user_message(incoming.message.content)
                 .await?;
         }
+        self.volatile
+            .agent_loop
+            .append_user_message(last.message.content)
+            .await?;
         let response_tx = self.volatile.response_tx.clone();
         let response = self
             .run_agent_loop(
                 JobInput::UserChat { content: combined },
-                last.message.content,
                 None,
                 Some(response_tx),
             )
@@ -580,39 +537,6 @@ impl AgentActor {
         }
     }
 
-    /// Render the pending background-subagent results into nested-XML
-    /// content for one `SubagentNotification` turn. Pure (does not drain) —
-    /// the caller owns the buffer so it can restore the results if the turn
-    /// fails. The framing rides in this per-turn content (never the system
-    /// prompt) so the prompt-cache prefix stays identical to a normal
-    /// main-path turn.
-    fn build_subagent_notification_content(
-        &self,
-        pending: &[PendingSubagentResult],
-    ) -> Vec<ContentBlock> {
-        let mut xml = String::from(SUBAGENT_NOTIFICATION_FRAMING);
-        xml.push_str("\n\n<subagent_results>\n");
-        for p in pending {
-            xml.push_str(
-                &SUBAGENT_RESULT_TEMPLATE
-                    .replace("{{handle}}", &xml_escape(&p.handle_id))
-                    .replace("{{type}}", &xml_escape(&p.subagent_type))
-                    .replace("{{status}}", pending_status_label(&p.status))
-                    .replace("{{task}}", &xml_escape(&p.task_summary))
-                    .replace(
-                        "{{output}}",
-                        &xml_escape(&truncate_for_notice(&p.final_text)),
-                    )
-                    .replace(
-                        "{{child_session}}",
-                        &xml_escape(p.child_session_id.as_ref()),
-                    ),
-            );
-        }
-        xml.push_str("</subagent_results>");
-        vec![ContentBlock::Text(xml)]
-    }
-
     /// Surface buffered background-subagent results as their own turn —
     /// but only when no higher-priority work is queued: a `Trigger`
     /// (UserInput) must run first, and another queued `SubagentFinished`
@@ -646,23 +570,11 @@ impl AgentActor {
     /// reply is suppressed.
     async fn run_subagent_notification(&mut self) {
         // Establish the system prompt before the snapshot below. It is
-        // persisted by `ensure_system_prompt`, so if the snapshot were taken
-        // before it (on a fresh session the prior context is empty), a
-        // rollback would drop the just-persisted system row in-memory and the
-        // next retry would re-seed and re-persist it. Idempotent mid-session.
-        if let Err(e) = self
-            .volatile
-            .agent_loop
-            .ensure_system_prompt_seeded(&mut self.durable.session)
-            .await
-        {
-            error!(
-                session_id = %self.durable.session.id,
-                error = %e,
-                "failed to seed system prompt for subagent notification; deferring to next retry"
-            );
-            return;
-        }
+        // persisted by `ensure_seeded`, so if the snapshot were taken before it
+        // (on a fresh session the prior context is empty), a rollback would drop
+        // the just-persisted system row in-memory and the next retry would
+        // re-seed and re-persist it. Idempotent mid-session, and infallible.
+        self.volatile.agent_loop.ensure_system_prompt_seeded().await;
         // Take the results but keep them in hand: the turn below is
         // fallible (provider error, cost rejection, cancellation), and a
         // delivered completion must not be lost if it fails. The actor is
@@ -672,7 +584,7 @@ impl AgentActor {
         if pending.is_empty() {
             return;
         }
-        let content = self.build_subagent_notification_content(&pending);
+        let content = aura_context::prompts::subagent::build_notification_content(&pending);
         // Commit the drained (now-empty) buffer to the row BEFORE the
         // fallible turn: a crash mid-turn must not leave the results in the
         // row to be replayed as a DUPLICATE notification on restart. On an
@@ -689,15 +601,13 @@ impl AgentActor {
         // roll back to here before the retry rebuilds it — otherwise the live
         // context stacks a copy per attempt under the infinite-backoff retry.
         let context_snapshot = self.volatile.agent_loop.context_snapshot();
+        // Append the synthetic prompt in-memory *after* the snapshot so a
+        // failed turn rolls it back; the durable buffer is the source of truth.
+        self.volatile
+            .agent_loop
+            .append_subagent_notification(content.clone());
         let result = self
-            .run_agent_loop(
-                JobInput::SubagentNotification {
-                    content: content.clone(),
-                },
-                content,
-                None,
-                None,
-            )
+            .run_agent_loop(JobInput::SubagentNotification { content }, None, None)
             .await;
         match result {
             Ok(response) => {
@@ -793,12 +703,15 @@ impl AgentActor {
     ) -> anyhow::Result<()> {
         let content = incoming.message.content;
         let response_tx = self.volatile.response_tx.clone();
+        self.volatile
+            .agent_loop
+            .append_spawned_prompt(content.clone())
+            .await?;
         let response = self
             .run_agent_loop(
                 JobInput::Spawned {
-                    initial_prompt: content.clone(),
+                    initial_prompt: content,
                 },
-                content,
                 Some(parent_job_id),
                 Some(response_tx),
             )
@@ -876,30 +789,5 @@ mod tests {
             tool_use_id: "x".into(),
             content: "/compact".into(),
         }]));
-    }
-
-    #[test]
-    fn pending_status_label_covers_every_exit_status() {
-        use aura_model::SubagentExitStatus as S;
-        assert_eq!(pending_status_label(&S::Completed), "completed");
-        assert_eq!(pending_status_label(&S::Cancelled), "cancelled");
-        assert_eq!(
-            pending_status_label(&S::Failed { reason: "x".into() }),
-            "failed"
-        );
-        assert_eq!(pending_status_label(&S::Timeout), "timeout");
-    }
-
-    #[test]
-    fn truncate_for_notice_appends_marker_when_over_cap() {
-        let long = "a".repeat(2000);
-        let out = truncate_for_notice(&long);
-        assert!(
-            out.len() > 1024,
-            "marker must be appended on overflow: {out:?}"
-        );
-        assert!(out.contains("truncated"));
-        let short = "hello";
-        assert_eq!(truncate_for_notice(short), "hello");
     }
 }

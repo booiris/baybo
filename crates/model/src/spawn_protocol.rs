@@ -77,24 +77,24 @@ pub enum SystemSpawnRequest {
 
 /// What the parent LLM asks for when it calls `spawn_subagent`.
 ///
-/// The tool resolves the `subagent_type` name into a concrete
-/// `SubagentProfile` BEFORE producing this envelope and stamps the
-/// profile's `system_prompt` here. The router consumes the prompt
-/// verbatim — no further registry lookup happens agent-side.
+/// The tool validates `subagent_type` against the registry BEFORE
+/// producing this envelope (rejecting unknown types and canonicalizing
+/// the name), but the resolved system prompt does NOT ride along: the
+/// child's `ContextManager` resolves the name back to a prompt via the
+/// subagent profile registry at seed time, and re-resolves it on
+/// compaction (see the `subagent_type` field).
 ///
 /// Field naming follows Claude Code's Agent tool: `task_summary` is
 /// the short 3-5 word title surfaced in traces, while `prompt` is the
 /// self-contained brief that becomes the child's first user message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentSpawnRequest {
-    /// Profile name the parent LLM emitted as `subagent_type`. Surfaced
-    /// in trace/audit only — the resolved [`Self::system_prompt`]
-    /// already encodes behaviour. Stored as a plain `String` so this
-    /// crate stays a leaf (no dependency on `aura-subagent`).
+    /// Profile name the parent LLM emitted. The child's `ContextManager`
+    /// resolves it back to a system prompt via the subagent profile registry
+    /// (re-resolved on compaction), so the profile owns the child's identity
+    /// for the session's life. Stored as a plain `String` so this crate stays
+    /// a leaf (no dependency on `aura-subagent`).
     pub subagent_type: String,
-    /// Child actor's full system prompt. REPLACES the parent's Soul —
-    /// the profile author owns identity / security / output contracts.
-    pub system_prompt: String,
     /// 3-5 word summary the parent LLM authored. Trace display only;
     /// not part of the child's initial prompt.
     pub task_summary: String,
