@@ -386,7 +386,7 @@ impl AgentActor {
         };
         self.volatile
             .agent_loop
-            .append_cron_fire(&mut self.durable.session, job_id, prompt)
+            .append_cron_fire(job_id, prompt)
             .await?;
         let response = self.run_agent_loop(job_input, None, None).await?;
         if is_blank_reply(&response.content) {
@@ -417,7 +417,7 @@ impl AgentActor {
         let response_tx = self.volatile.response_tx.clone();
         self.volatile
             .agent_loop
-            .append_user_message(&mut self.durable.session, content.clone())
+            .append_user_message(content.clone())
             .await?;
         let response = self
             .run_agent_loop(JobInput::UserChat { content }, None, Some(response_tx))
@@ -455,12 +455,12 @@ impl AgentActor {
         for incoming in batch {
             self.volatile
                 .agent_loop
-                .append_user_message(&mut self.durable.session, incoming.message.content)
+                .append_user_message(incoming.message.content)
                 .await?;
         }
         self.volatile
             .agent_loop
-            .append_user_message(&mut self.durable.session, last.message.content)
+            .append_user_message(last.message.content)
             .await?;
         let response_tx = self.volatile.response_tx.clone();
         let response = self
@@ -574,12 +574,7 @@ impl AgentActor {
         // before it (on a fresh session the prior context is empty), a
         // rollback would drop the just-persisted system row in-memory and the
         // next retry would re-seed and re-persist it. Idempotent mid-session.
-        if let Err(e) = self
-            .volatile
-            .agent_loop
-            .ensure_system_prompt_seeded(&self.durable.session)
-            .await
-        {
+        if let Err(e) = self.volatile.agent_loop.ensure_system_prompt_seeded().await {
             error!(
                 session_id = %self.durable.session.id,
                 error = %e,
@@ -717,7 +712,7 @@ impl AgentActor {
         let response_tx = self.volatile.response_tx.clone();
         self.volatile
             .agent_loop
-            .append_spawned_prompt(&mut self.durable.session, content.clone())
+            .append_spawned_prompt(content.clone())
             .await?;
         let response = self
             .run_agent_loop(

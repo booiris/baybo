@@ -33,7 +33,6 @@ pub use runtime::compression;
 pub use runtime::error_recovery;
 pub use runtime::llm_pool;
 pub use runtime::sandbox;
-pub use runtime::session_log;
 pub use runtime::tool_executor;
 
 pub use agent_loop::AgentLoop;
@@ -45,9 +44,5 @@ pub use llm_pool::LlmClientPool;
 pub use router::{ActorSpawner, Router};
 pub use security::{LeakRuleSummary, SecretVaultSummary, SecurityAuditReport, SecurityGateway};
 pub use service::{ShutdownSignal, TaskTracker};
-pub use session_log::{
-    LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
-    SessionMessageRecord,
-};
 pub use supervisor::AgentSupervisor;
 pub use tool_executor::ToolExecutor;

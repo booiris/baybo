@@ -25,13 +25,14 @@ use aura_agent::actor::AgentActor;
 use aura_agent::agent_loop::{AgentLoop, AgentLoopConfig};
 use aura_agent::router::Router;
 use aura_agent::service::{ShutdownSignal, TaskTracker};
-use aura_agent::session_log::SessionLlmLogger;
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager};
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::{AuraConfig, LlmEntryName};
-use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, Tokenizer};
+use aura_context::{
+    ContextManager, ContextManagerConfig, SessionLlmLogger, TiktokenTokenizer, Tokenizer,
+};
 use aura_cost::{CostManager, SpendingLimits, cost_call_guard};
 use aura_job::JobLifecycle;
 use aura_llm::GuardedLlm;
@@ -771,12 +772,12 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                             .subagent_type
                             .clone()
                             .map(|name| (Arc::clone(&subagent_registry), name)),
+                        session_log: Some(Arc::clone(&session_logger)),
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),
                     cost_manager: Arc::clone(&cost_manager),
                     actor_token: actor_token.clone(),
-                    session_log: Some(Arc::clone(&session_logger)),
                     system_spawn_tx: Some(system_spawn_tx.clone()),
                     workspace_paths: Some(Arc::clone(&workspace_paths_arc)),
                     sessions: Some(Arc::clone(&sessions)),

@@ -4,6 +4,7 @@ pub mod calibration;
 pub mod compressor;
 pub mod error;
 pub mod prompts;
+pub mod session_log;
 pub mod tokenizer;
 
 pub use background_summary::{
@@ -15,6 +16,9 @@ pub use calibration::TokenCalibration;
 pub use compressor::{CompressOutput, parse_summary_response};
 pub use error::ContextError;
 pub use prompts::compression::SUMMARIZE_INSTRUCTION;
+pub use session_log::{
+    LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
+};
 pub use tokenizer::{TiktokenTokenizer, Tokenizer};
 
 // ---------------------------------------------------------------------------
@@ -210,6 +214,10 @@ pub struct ContextManager {
     /// `reseed_system_row` after each compaction, so a source edit (workspace
     /// soul *or* subagent profile) lands on the next compaction.
     subagent_profile: Option<(Arc<aura_subagent::SubagentRegistry>, String)>,
+    /// Per-session JSONL logger. [`Self::append`] mirrors each persisted message
+    /// here; the owning `AgentLoop` reaches it via [`Self::session_log`] to log
+    /// LLM calls. `None` in tests / single-shot harnesses that don't wire one.
+    session_log: Option<Arc<SessionLlmLogger>>,
     /// Boundary the trigger gate measures from. Set to `messages.len()`
     /// after every compression apply and reconstructed from
     /// `session_summaries.cursor` on cold start.
@@ -255,6 +263,10 @@ pub struct ContextManagerConfig {
     /// resolving it to a prompt is context's job, so an edited profile is
     /// picked up like an edited workspace soul.
     pub subagent_profile: Option<(Arc<aura_subagent::SubagentRegistry>, String)>,
+    /// Per-session JSONL event logger (messages + LLM calls). `None` in tests /
+    /// single-shot harnesses. [`ContextManager::append`] logs messages to it;
+    /// `AgentLoop` logs LLM calls via [`ContextManager::session_log`].
+    pub session_log: Option<Arc<SessionLlmLogger>>,
 }
 
 impl ContextManager {
@@ -278,6 +290,7 @@ impl ContextManager {
             session_id: config.session_id,
             sessions: config.sessions,
             subagent_profile: config.subagent_profile,
+            session_log: config.session_log,
             last_summary_anchor: None,
             last_synced_cursor: None,
         }
@@ -359,34 +372,30 @@ impl ContextManager {
 
     /// Seed the leading `Role::System` row — and a skill reminder when any
     /// skills are invocable — if the transcript doesn't already lead with one.
-    /// Returns the rows that were appended (empty when already seeded) so the
-    /// agent layer can mirror them to its JSONL session log: context owns the
-    /// transcript + persistence but deliberately has no session logger.
+    /// Each seeded row is persisted and mirrored to the session JSONL log by
+    /// [`Self::append`].
     ///
     /// Idempotent and cheap on the hot path — the leading-system check
     /// short-circuits before the (file-reading) prompt resolution, so only a
     /// fresh session pays for the resolve.
-    pub async fn ensure_seeded(&mut self) -> Vec<ChatMessage> {
+    pub async fn ensure_seeded(&mut self) {
         if self
             .messages
             .first()
             .is_some_and(|m| m.role == Role::System)
         {
-            return Vec::new();
+            return;
         }
         let prompt = self.resolve_system_prompt().await;
         let skills = self.invocable_skill_summaries();
-        let mut seeded = Vec::with_capacity(if skills.is_empty() { 1 } else { 2 });
-        seeded.push(ChatMessage::system(vec![ContentBlock::Text(prompt)]));
+        self.append(&ChatMessage::system(vec![ContentBlock::Text(prompt)]))
+            .await;
         if !skills.is_empty() {
-            seeded.push(ChatMessage::agent_context(vec![ContentBlock::Text(
+            self.append(&ChatMessage::agent_context(vec![ContentBlock::Text(
                 render_skill_reminder(&skills),
-            )]));
+            )]))
+            .await;
         }
-        for msg in &seeded {
-            self.append(msg).await;
-        }
-        seeded
     }
 
     /// Skills the agent may invoke: the registry's summaries filtered to
@@ -408,17 +417,28 @@ impl ContextManager {
     }
 
     /// If the trailing message is a user `/command` whose command matches an
-    /// invocable skill, expand it: append that skill's `prompt_template`
-    /// (`{{session_id}}` substituted) as a hidden agent-context row
-    /// (`MessageSource::Agent` — the next LLM turn sees it, but it isn't shown
-    /// as a user bubble) and return the appended row so the agent can mirror it
-    /// to the JSONL log. `None` when the tail isn't a matching user `/command`.
+    /// invocable skill, expand it: append that skill's body (via
+    /// `aura_skills::render_skill_body`, `{{session_id}}` substituted) as a
+    /// hidden agent-context row (`MessageSource::Agent` — the next LLM turn sees
+    /// it, but it isn't shown as a user bubble). No-op when the tail isn't a
+    /// matching user `/command`. The appended row is persisted + JSONL-logged
+    /// by [`Self::append`].
     ///
     /// Unlike an LLM-issued `Skill` tool call this deliberately skips the risk
     /// assessor and linked-sub-file loading: an explicit user slash command is
     /// treated as authorized and the body is injected directly. The original
     /// `/command` message stays in the transcript, so any args remain visible.
-    pub async fn expand_slash_command(&mut self) -> Option<ChatMessage> {
+    pub async fn expand_slash_command(&mut self) {
+        if let Some(msg) = self.slash_expansion_message() {
+            self.append(&msg).await;
+        }
+    }
+
+    /// Build the agent-context row for a trailing `/command` that matches an
+    /// invocable skill, or `None`. Pure (no append) so
+    /// [`Self::expand_slash_command`] keeps the `?`-chain while owning the
+    /// `&mut` append.
+    fn slash_expansion_message(&self) -> Option<ChatMessage> {
         let user_text = self
             .messages
             .last()
@@ -428,9 +448,7 @@ impl ContextManager {
             detect_slash_invocation(&user_text, &self.invocable_skill_summaries())?;
         let skill = self.skill_registry.get(&skill_name)?;
         let body = render_skill_body(&skill, self.session_id.as_str());
-        let msg = ChatMessage::agent_context(vec![ContentBlock::Text(body)]);
-        self.append(&msg).await;
-        Some(msg)
+        Some(ChatMessage::agent_context(vec![ContentBlock::Text(body)]))
     }
 
     /// Number of messages currently in the transcript.
@@ -576,7 +594,31 @@ impl ContextManager {
         self.messages.push(msg.clone());
         self.per_message_tokens.push(count);
         self.budget.update(self.count_tokens());
-        self.persist_appended(msg).await
+        let ordinal = self.persist_appended(msg).await;
+        self.log_message_to_session_log(msg).await;
+        ordinal
+    }
+
+    /// Read-only access to the session JSONL logger so the owning `AgentLoop`
+    /// can record LLM calls against the same per-session file. `None` when no
+    /// logger is wired (tests / single-shot harnesses).
+    pub fn session_log(&self) -> Option<&Arc<SessionLlmLogger>> {
+        self.session_log.as_ref()
+    }
+
+    /// Mirror a persisted message to the session JSONL log, if one is wired.
+    /// Best-effort: the durable transcript lives in `session_messages`, so a
+    /// log-write error is warned and swallowed.
+    async fn log_message_to_session_log(&self, msg: &ChatMessage) {
+        if let Some(logger) = &self.session_log
+            && let Err(e) = logger.log_message(&self.session_id, msg).await
+        {
+            warn!(
+                session_id = %self.session_id,
+                error = %e,
+                "failed to append session message log"
+            );
+        }
     }
 
     /// Append a message to the in-memory transcript + token budget
@@ -1463,6 +1505,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
+            session_log: None,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -1593,6 +1636,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
+            session_log: None,
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed")).await;
@@ -1655,6 +1699,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: Some((Arc::clone(&registry), "test-agent".to_string())),
+            session_log: None,
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "SUBAGENT_PROFILE"))
@@ -1957,6 +2002,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
+            session_log: None,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -1965,37 +2011,25 @@ mod tests {
     #[tokio::test]
     async fn ensure_seeded_seeds_leading_system_row_on_fresh_session() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
-        let seeded = ctx.ensure_seeded().await;
-        assert_eq!(
-            seeded.len(),
-            1,
-            "no skills → one system row, got {seeded:?}"
-        );
-        assert_eq!(ctx.message_count(), 1);
+        ctx.ensure_seeded().await;
+        assert_eq!(ctx.message_count(), 1, "no skills → one system row");
         assert_eq!(ctx.messages()[0].role, Role::System);
     }
 
     #[tokio::test]
     async fn ensure_seeded_is_idempotent() {
         let mut ctx = make_ctx(5, 100_000, 0.75);
-        assert_eq!(ctx.ensure_seeded().await.len(), 1);
-        let second = ctx.ensure_seeded().await;
-        assert!(
-            second.is_empty(),
-            "re-seeding an already-seeded session is a no-op"
-        );
-        assert_eq!(ctx.message_count(), 1, "no extra rows on the second call");
+        ctx.ensure_seeded().await;
+        assert_eq!(ctx.message_count(), 1);
+        ctx.ensure_seeded().await;
+        assert_eq!(ctx.message_count(), 1, "re-seeding is a no-op");
     }
 
     #[tokio::test]
     async fn ensure_seeded_appends_skill_reminder_when_skills_invocable() {
         let mut ctx = make_ctx_with_registry(registry_with(&[("alpha", "body")]), 5, 100_000, 0.75);
-        let seeded = ctx.ensure_seeded().await;
-        assert_eq!(
-            seeded.len(),
-            2,
-            "system row + skill reminder, got {seeded:?}"
-        );
+        ctx.ensure_seeded().await;
+        assert_eq!(ctx.message_count(), 2, "system row + skill reminder");
         assert_eq!(ctx.messages()[0].role, Role::System);
         let ContentBlock::Text(reminder) = &ctx.messages()[1].content[0] else {
             panic!("reminder should be a text block");
@@ -2018,21 +2052,19 @@ mod tests {
         )]))
         .await;
 
-        let appended = ctx
-            .expand_slash_command()
-            .await
-            .expect("matching /wx expands");
+        ctx.expand_slash_command().await;
+        // appended the skill body as a hidden agent-context row after `/wx`
+        assert_eq!(ctx.message_count(), 2);
+        let appended = ctx.messages().last().expect("appended row");
         assert_eq!(appended.source(), aura_model::MessageSource::Agent);
         let ContentBlock::Text(body) = &appended.content[0] else {
             panic!("expected a text block");
         };
         assert!(body.contains("WEATHER INSTRUCTIONS"));
-        // the row was appended to the live transcript (after the `/wx` message)
-        assert_eq!(ctx.message_count(), 2);
     }
 
     #[tokio::test]
-    async fn expand_slash_command_none_for_plain_text_or_unknown_command() {
+    async fn expand_slash_command_noop_for_plain_text_or_unknown_command() {
         let registry = Arc::new(SkillRegistry::new());
         let mut skill = mk_skill("weather", "BODY");
         skill.command = Some("wx".into());
@@ -2041,19 +2073,15 @@ mod tests {
 
         ctx.append(&ChatMessage::user(vec![ContentBlock::Text("hello".into())]))
             .await;
-        assert!(
-            ctx.expand_slash_command().await.is_none(),
-            "plain text is not a slash command"
-        );
+        ctx.expand_slash_command().await;
+        assert_eq!(ctx.message_count(), 1, "plain text is not a slash command");
 
         ctx.append(&ChatMessage::user(vec![ContentBlock::Text(
             "/unknown".into(),
         )]))
         .await;
-        assert!(
-            ctx.expand_slash_command().await.is_none(),
-            "an unknown command matches no skill"
-        );
+        ctx.expand_slash_command().await;
+        assert_eq!(ctx.message_count(), 2, "unknown command appends nothing");
     }
 
     /// Chat closure returning a well-formed `<summary>S</summary>` so the

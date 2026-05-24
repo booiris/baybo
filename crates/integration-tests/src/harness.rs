@@ -394,6 +394,7 @@ impl AgentTestHarnessBuilder {
             session_id: session.id.clone(),
             sessions: Arc::clone(&session_manager),
             subagent_profile: Some((subagent_registry, "harness".to_string())),
+            session_log: None,
         });
 
         let guarded_llm = aura_llm::GuardedLlm::new(
@@ -425,7 +426,6 @@ impl AgentTestHarnessBuilder {
             security_gateway: gateway.clone(),
             cost_manager: Arc::clone(&cost_manager),
             actor_token: actor_token.clone(),
-            session_log: None,
             system_spawn_tx: None,
             workspace_paths: None,
             sessions: None,

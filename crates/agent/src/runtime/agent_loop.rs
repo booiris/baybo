@@ -20,9 +20,8 @@ use tracing::{debug, error, info, warn};
 use crate::runtime::compression::CompressionRunner;
 use crate::runtime::error_recovery::ErrorHandler;
 use crate::runtime::scope::JobSpec;
-use crate::runtime::session_log::{
-    LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
-};
+use aura_context::{LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta};
+
 use crate::runtime::tool_executor::ToolExecutor;
 use crate::security::SecurityGateway;
 use tokio_util::sync::CancellationToken;
@@ -186,11 +185,6 @@ pub struct AgentLoop {
     /// from the parent actor into its maintenance children
     /// automatically.
     actor_token: CancellationToken,
-    /// Optional per-session JSONL logger for LLM calls. When set, every
-    /// `call_llm` invocation appends a record (request, response or
-    /// error, latency, model metadata) to
-    /// `<workspace>/logs/sessions/<session_id>.jsonl`.
-    session_log: Option<Arc<SessionLlmLogger>>,
     /// Sender half of the generic system-spawn channel. The router
     /// consumes the receiving half. Today only the summary-refresh
     /// trigger gate emits on it; future system tasks (history review,
@@ -232,8 +226,6 @@ pub struct AgentLoopConfig {
     /// factory derives the actor token once and threads the same
     /// handle into both this loop and the actor.
     pub actor_token: CancellationToken,
-    /// Optional per-session JSONL logger for LLM calls.
-    pub session_log: Option<Arc<SessionLlmLogger>>,
     /// Generic system-spawn channel sender (any
     /// `SystemSpawnRequest` variant — today background summary).
     pub system_spawn_tx: Option<mpsc::Sender<SystemSpawnRequest>>,
@@ -257,7 +249,6 @@ impl AgentLoop {
             security_gateway,
             cost_manager,
             actor_token,
-            session_log,
             system_spawn_tx,
             workspace_paths,
             sessions,
@@ -282,7 +273,6 @@ impl AgentLoop {
             error_handler: ErrorHandler::default(),
             cost_manager,
             actor_token,
-            session_log,
             system_spawn_tx,
             workspace_paths,
             sessions,
@@ -318,8 +308,8 @@ impl AgentLoop {
     /// context for rollback — otherwise a rollback on a fresh session would
     /// drop the just-persisted system row in-memory and the next retry would
     /// re-seed and re-persist it.
-    pub async fn ensure_system_prompt_seeded(&mut self, session: &Session) -> anyhow::Result<()> {
-        self.ensure_system_prompt(session).await
+    pub async fn ensure_system_prompt_seeded(&mut self) -> anyhow::Result<()> {
+        self.ensure_system_prompt().await
     }
 
     /// Run the main conversation loop for a single user message.
@@ -389,7 +379,7 @@ impl AgentLoop {
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
         let _ = job_lifecycle;
-        self.ensure_system_prompt(session).await?;
+        self.ensure_system_prompt().await?;
 
         // Bound to the *outer* delta_tx, not iter_delta_tx — notices
         // need to reach the channel on iter-2+ where streaming is
@@ -404,12 +394,9 @@ impl AgentLoop {
         });
 
         // Expand an explicit `/command` skill invocation before the loop:
-        // context reads the matching skill's body and appends it as a hidden
-        // agent-context row for the loop to act on; mirror that row to the JSONL
-        // session log (the `/command` message itself stays in the transcript).
-        if let Some(msg) = self.context_manager.expand_slash_command().await {
-            self.write_session_message_log(session, &msg).await;
-        }
+        // context reads the matching skill's body and appends it (persisted +
+        // JSONL-logged) as a hidden agent-context row for the loop to act on.
+        self.context_manager.expand_slash_command().await;
 
         // Iterative LLM loop
         let mut iterations = 0;
@@ -583,7 +570,7 @@ impl AgentLoop {
             // channel adapter can stamp it onto the live `Frame::Message`
             // and reconnecting clients advance their cursor past it.
             let assistant_msg = ChatMessage::assistant(response_blocks);
-            let ordinal = self.append_context_message(session, &assistant_msg).await?;
+            let ordinal = self.append_context_message(&assistant_msg).await?;
 
             return Ok(IterationOutcome::Final(OutgoingMessage {
                 session_id: session.id.clone(),
@@ -620,7 +607,7 @@ impl AgentLoop {
             accumulated_tool_uses.push(block);
         }
         let assistant_msg = ChatMessage::assistant(assistant_blocks);
-        self.append_context_message(session, &assistant_msg).await?;
+        self.append_context_message(&assistant_msg).await?;
 
         // Execute tool calls concurrently. Approved resources are shared
         // via a Mutex so concurrent calls see each other's grants
@@ -744,7 +731,7 @@ impl AgentLoop {
             // Append tool result to context with the tool_use_id so the
             // LLM can correlate results with their originating calls.
             let tool_msg = ChatMessage::tool_result(tool_call.id.clone(), wrapped);
-            self.append_context_message(session, &tool_msg).await?;
+            self.append_context_message(&tool_msg).await?;
 
             // ToolResult.content is text-only; provider adapters
             // serialize it as plain text. To get images back into the
@@ -762,7 +749,7 @@ impl AgentLoop {
                 )));
                 content.extend(llm_visible_images);
                 let image_msg = ChatMessage::agent_context(content);
-                self.append_context_message(session, &image_msg).await?;
+                self.append_context_message(&image_msg).await?;
             }
         }
 
@@ -992,7 +979,7 @@ impl AgentLoop {
         request: &ChatRequest,
         outcome: LlmCallOutcome,
     ) {
-        let Some(logger) = self.session_log.as_ref() else {
+        let Some(logger) = self.context_manager.session_log() else {
             return;
         };
         let info = self.llm_client.model_info();
@@ -1018,12 +1005,9 @@ impl AgentLoop {
 
     async fn append_context_message(
         &mut self,
-        session: &Session,
         message: &ChatMessage,
     ) -> anyhow::Result<Option<i64>> {
-        let ordinal = self.context_manager.append(message).await;
-        self.write_session_message_log(session, message).await;
-        Ok(ordinal)
+        Ok(self.context_manager.append(message).await)
     }
 
     /// Append a user-authored message to this session's transcript — both the
@@ -1031,18 +1015,14 @@ impl AgentLoop {
     /// of the turn that runs next. Lets the actor coalesce a burst of user
     /// messages into one turn while keeping each as its own transcript row;
     /// `merge_for_llm` collapses the consecutive rows for the provider call.
-    pub async fn append_user_message(
-        &mut self,
-        session: &mut Session,
-        content: Vec<ContentBlock>,
-    ) -> anyhow::Result<()> {
+    pub async fn append_user_message(&mut self, content: Vec<ContentBlock>) -> anyhow::Result<()> {
         // A coalesced burst can be the first thing a fresh session ever
         // appends; seed the system prompt first so it never lands *after*
         // user content. `ensure_seeded` keys off `messages[0]`, so a leading
         // user row would otherwise make every later turn re-seed.
-        self.ensure_system_prompt(session).await?;
+        self.ensure_system_prompt().await?;
         let msg = ChatMessage::user(content);
-        self.append_context_message(session, &msg).await?;
+        self.append_context_message(&msg).await?;
         Ok(())
     }
 
@@ -1052,16 +1032,11 @@ impl AgentLoop {
     /// user message; `MessageSource::Cron` lets the operator inbox find the
     /// row. Seeds the system prompt first so a fresh cron session never lands
     /// the fire ahead of `messages[0]`.
-    pub async fn append_cron_fire(
-        &mut self,
-        session: &mut Session,
-        job_id: &str,
-        prompt: &str,
-    ) -> anyhow::Result<()> {
-        self.ensure_system_prompt(session).await?;
+    pub async fn append_cron_fire(&mut self, job_id: &str, prompt: &str) -> anyhow::Result<()> {
+        self.ensure_system_prompt().await?;
         let framed = aura_context::prompts::cron::frame_cron_prompt(job_id, prompt);
         let msg = ChatMessage::cron_fire(vec![ContentBlock::Text(framed)]);
-        self.append_context_message(session, &msg).await?;
+        self.append_context_message(&msg).await?;
         Ok(())
     }
 
@@ -1069,12 +1044,11 @@ impl AgentLoop {
     /// agent-context row ahead of the turn (hidden from chat surfaces).
     pub async fn append_spawned_prompt(
         &mut self,
-        session: &mut Session,
         content: Vec<ContentBlock>,
     ) -> anyhow::Result<()> {
-        self.ensure_system_prompt(session).await?;
+        self.ensure_system_prompt().await?;
         let msg = ChatMessage::agent_context(content);
-        self.append_context_message(session, &msg).await?;
+        self.append_context_message(&msg).await?;
         Ok(())
     }
 
@@ -1113,15 +1087,6 @@ impl AgentLoop {
         }
         let msg = ChatMessage::agent_context(content);
         self.context_manager.append_in_memory(&msg);
-    }
-
-    async fn write_session_message_log(&self, session: &Session, message: &ChatMessage) {
-        let Some(logger) = self.session_log.as_ref() else {
-            return;
-        };
-        if let Err(e) = logger.log_message(&session.id, message).await {
-            warn!(error = %e, "failed to append session message log");
-        }
     }
 
     /// Run a streaming chat request, forwarding each text chunk through
@@ -1584,15 +1549,10 @@ impl AgentLoop {
     /// (rather than per-turn after each user message) keeps the model's
     /// "what skills are available" context adjacent to its instructions
     /// and avoids appending a fresh reminder row every turn.
-    async fn ensure_system_prompt(&mut self, session: &Session) -> anyhow::Result<()> {
-        // Context owns the seed (resolve the prompt, render the skill reminder,
-        // persist the transcript rows) and returns the rows it appended so we
-        // can mirror them to the agent-owned JSONL session log. Idempotent — an
-        // already-seeded session yields an empty vec.
-        let seeded = self.context_manager.ensure_seeded().await;
-        for msg in &seeded {
-            self.write_session_message_log(session, msg).await;
-        }
+    async fn ensure_system_prompt(&mut self) -> anyhow::Result<()> {
+        // Context owns the seed: resolve the prompt, render the skill reminder,
+        // persist + JSONL-log the rows. Idempotent — a seeded session is a no-op.
+        self.context_manager.ensure_seeded().await;
         Ok(())
     }
 }
