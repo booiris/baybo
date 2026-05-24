@@ -1,4 +1,3 @@
-pub mod agent;
 pub mod channel;
 pub mod completion;
 pub mod config;

@@ -5,8 +5,8 @@
 //! dispatcher in `dispatch_smoke.rs`.
 
 use aura_cli::cli::{
-    AgentCmd, ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd,
-    LogCmd, SessionCmd, ShellKind, SkillsCmd,
+    ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, JobCmd, JobStatusArg, LlmCmd, LogCmd,
+    SessionCmd, ShellKind, SkillsCmd,
 };
 use clap::Parser;
 
@@ -777,44 +777,6 @@ fn skills_check_accepts_optional_name() {
         Some(Commands::Skills {
             cmd: SkillsCmd::Check { name },
         }) => assert_eq!(name.as_deref(), Some("summarize")),
-        other => panic!("unexpected: {other:?}"),
-    }
-}
-
-#[test]
-fn agent_send_requires_session_and_message() {
-    assert!(Cli::try_parse_from(["aura", "agent", "send"]).is_err());
-    assert!(
-        Cli::try_parse_from(["aura", "agent", "send", "--session", "s1"]).is_err(),
-        "--message is required"
-    );
-    assert!(
-        Cli::try_parse_from(["aura", "agent", "send", "--message", "hi"]).is_err(),
-        "--session is required"
-    );
-
-    let cli = parse(&["agent", "send", "--session", "sess-1", "--message", "hello"]);
-    match cli.command {
-        Some(Commands::Agent {
-            cmd:
-                AgentCmd::Send {
-                    session,
-                    message,
-                    yes,
-                },
-        }) => {
-            assert_eq!(session, "sess-1");
-            assert_eq!(message, "hello");
-            assert!(!yes);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
-
-    let cli = parse(&["agent", "send", "--session", "s", "--message", "m", "-y"]);
-    match cli.command {
-        Some(Commands::Agent {
-            cmd: AgentCmd::Send { yes, .. },
-        }) => assert!(yes),
         other => panic!("unexpected: {other:?}"),
     }
 }

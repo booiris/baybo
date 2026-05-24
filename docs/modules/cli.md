@@ -120,7 +120,7 @@ before the subshell runs. The agent gets:
 The substring match is loose; non-aura processes inherit the
 variables and ignore them, so a false-positive injection is a no-op.
 
-"Status" shows what actually ships today. Rows marked **deferred** are kept here so future contributors can see the target surface; the missing backing APIs are tracked in the per-subsystem follow-up todos (`docs/todo/cli-agent-send-argv.md`) — the original mass-tracker was completed and archived at `docs/todo/archives/cli-write-commands.md`. Handlers for deferred subcommands do not exist — the clap tree in `crates/cli/src/cli.rs` only exposes the shipped rows.
+"Status" shows what actually ships today. Rows marked **deferred** are kept here so future contributors can see the target surface; the missing backing APIs land with their subsystems — the original mass-tracker was completed and archived at `docs/todo/archives/cli-write-commands.md`. Handlers for deferred subcommands do not exist — the clap tree in `crates/cli/src/cli.rs` only exposes the shipped rows.
 
 | Family       | Subcommands                                                                                               | Backing module                                                               | Mutation                                                                                           | Status                                            |
 | ------------ | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
@@ -140,7 +140,6 @@ variables and ignore them, so a false-positive injection is a no-op.
 | `cron`       | `list` · `show <id>`                                                                                      | `CronScheduler::list_all_jobs` / `get_job`                                   | read-only operator view. `show` returns the full job row (prompt body + `origin_session_id` + timestamps); cron jobs are bound to `user_id + channel`, not to a session, so a session's audit trail of cron creations is better viewed via `session export` than a cron-side filter. All cron mutations (create/delete/enable/disable/run) are driven through the LLM tools (`CronCreate`, `CronDelete`, `CronList`) registered by `aura-cron::tools::agent_tools`. | shipped                                           |
 | `log`        | `main [--date <YYYY-MM-DD>] [-n <limit>] [-f/--follow]` · `channel <channel> [--date] [-n] [-f]` | Workspace `logs/` files (`logs/aura.log.<date>`, `logs/channel/<ch>.log.<date>`) written by the tracing appender | read-only. Tails the last `--limit` lines (default 200) by seeking backwards from EOF; `--follow` polls for appended bytes until Ctrl-C (incompatible with `--json`). | shipped                                           |
 | `security`   | `audit` · `leaks check <file>`                                                                            | `SecurityGateway::audit` / `LeakDetector::check_file`                        | read-only; `audit` would return rule count by action + vault master-key flag (never secret material); `leaks check` would report blocked/hits via the shared detector | deferred — no `Security` variant in the clap tree yet |
-| `agent`      | `send --session <id> --message <text>`                                                                    | `Router` / `AgentLoop`                                                       | mutates; **disabled in slash mode** (returns `AgentSendForbiddenInSlash`)                          | partial — grammar + slash guard shipped; argv returns a deferred `Manager` error pending a `Router` one-shot entry |
 | `cost`       | `show [--user <u> \| --session <id> \| --job <id>] [--since <YYYY-MM-DD>] [--until <YYYY-MM-DD>]`        | `QueryApi::cost_summary` (`CostScope::{User, Session, Job, TimeRange}`)      | read-only. Scopes are mutually exclusive: `--user` is bounded by `--since`/`--until` (default = current UTC day); `--session`/`--job` ignore the time range. Output reports total micro-USD + token aggregates (input / output / cached input / cache writes). | shipped (requires the full domain graph; returns a `Manager` error in argv-light boots that lack `QueryApi`) |
 | `status`     | `[--live]`                                                                                                | Static: registries + `LlmClient`. Live: `JobLifecycle::list` + `QueryApi::cost_summary` | `--live` adds in-flight job count, failed-jobs-last-24h, and today's spend (USD + token counts). Each live counter degrades to `(unavailable)` when its manager isn't wired in the current invocation. | shipped (live block populated where managers are wired)  |
 | `gateway`    | `start` · `install [--system] [--exec-start <p>]` · `enable` · `disable` · `uninstall` · `status` · `token {show, rotate}` | `aura-gateway` installer + `AdminToken`                                      | `start` runs the long-lived server; `install`/`enable`/`disable`/`uninstall` and `token rotate` mutate; `status`/`token show` are read-only | shipped (intercepted in `src/main.rs` before dispatch, runs in `src/gateway_cmd.rs`) |
@@ -195,7 +194,6 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 - The `SecretVault` value of any secret is never rendered; `security` and `config` commands redact to `********`.
 - No `unwrap` / `expect` in command handlers. Parser-level `expect` on derive macros is acceptable.
 - Every **shipped** command family has at least one parser test and one dispatch test. Deferred families do not appear in the clap tree at all until their subsystem lands, so there is nothing to test yet.
-- `agent send` is rejected in slash mode with a clear error — firing a new agent turn from within an agent turn would either deadlock or corrupt the ongoing conversation.
 
 ## Collaboration
 
@@ -203,7 +201,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `bootstrap` (`src/main.rs`, `src/boot.rs`, `src/runtime.rs`)                                                        | Promotes `--config` into `AURA_CONFIG_PATH`, then routes to a per-subcommand entry: `gateway_cmd::run` for `gateway`, `setup_cmd::run` for `setup`, `tui_cmd::run` for `tui`, and the lightweight argv path (`aura_cli::dispatch::run` against a `CommandContext`) for everything else. The TUI side (`tui_cmd`) wires `aura-tui`'s WS-backed `TuiSlashHandler` / `TuiDashboardProvider`, not the in-crate `CliSlashHandler`. |
 | `config`                                                                                                            | `config` family directly reads/writes `AuraConfig`; `doctor` calls `validate`.                                                                                   |
-| `agent`                                                                                                             | Supplies all manager `Arc`s; `agent send` reuses the `Router` path.                                                                                              |
+| `agent`                                                                                                             | Supplies all manager `Arc`s.                                                                                              |
 | `channels`                                                                                                          | Owns `SlashHandler`, `SlashOutcome`, `DashboardProvider`, `ViewKind`; `TuiAdapter` is the first consumer of all four.                                            |
 | `job` / `cron` / `skills` / `tools` / `session` / `security` / `llm` | Each exposes the read/write APIs that a command family calls. CLI contains no business logic — it is a parameter adapter only.                                   |
 
@@ -213,7 +211,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 
 1. `docs/modules/cli.md` exists with the seven sections above.
 2. `docs/modules/README.md` lists `cli` in its module groups and Reading Order.
-3. Every command family in the table maps to a manager already present in `src/main.rs`; the remaining "deferred" rows (`agent send` argv) are tracked in their own follow-up todos under `docs/todo/`.
+3. Every command family in the table maps to a manager already present in `src/main.rs`; the remaining "deferred" rows are added as their subsystems land.
 
 **Phase 2a — read-only commands** — complete.
 
@@ -223,9 +221,8 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 - `aura completion zsh > /tmp/_aura && zsh -c 'source /tmp/_aura'` loads without error.
 - `aura doctor` reports an error when `security.encryption_key_file` is missing or unreadable, and when no LLM client is configured.
 
-**Phase 2b — write-mutating commands** — complete. Tracked in `docs/todo/archives/cli-write-commands.md` (archived; one subsystem-level follow-up — `cli-agent-send-argv.md` — carries the remaining deferred work). Each shipped family landed with the following:
+**Phase 2b — write-mutating commands** — complete. Tracked in `docs/todo/archives/cli-write-commands.md` (archived). Each shipped family landed with the following:
 
 - Parser snapshot test in `crates/cli/tests/parser.rs` (aggregated via `crates/cli/tests/all.rs`).
-- Dispatch smoke tests in `crates/cli/tests/agent_send.rs` and `crates/cli/tests/mcp_e2e.rs` (also reached via `all.rs`).
+- Dispatch smoke tests in `crates/cli/tests/mcp_e2e.rs` (also reached via `all.rs`).
 - Slash-mode confirmation test (missing `--yes` returns `CliError::ConfirmationRequired`).
-- For `agent send`: `printf '/agent send --session x --message hi\n/quit\n' | cargo run` returns `AgentSendForbiddenInSlash`.
