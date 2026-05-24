@@ -989,7 +989,7 @@ async fn user_turn_empty_reply_surfaces_fallback_notice() {
 /// "say 你好 in a minute" stored the bare prompt `你好`; before framing,
 /// the model read `你好` as the user greeting it and greeted back. Drives
 /// the real actor path (`AgentMessage::CronTrigger` →
-/// `AgentActor::dispatch_cron_prompt` → `cron_prompt::frame_cron_prompt`)
+/// `AgentActor::dispatch_cron_prompt` → `AgentLoop::append_cron_fire`)
 /// and asserts on the content the `StubLlm` actually received.
 #[tokio::test]
 async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
@@ -1056,7 +1056,7 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
     // The operator panel recovers the original instruction, not the
     // framing boilerplate.
     assert_eq!(
-        aura_agent::cron_prompt::original_cron_prompt(framed),
+        aura_context::prompts::cron::original_cron_prompt(framed),
         "你好"
     );
 

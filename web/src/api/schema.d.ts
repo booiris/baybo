@@ -584,7 +584,7 @@ export interface components {
             /**
              * @description The user-facing prompt for this fire. Truncated to
              *     [`PREVIEW_MAX_CHARS`]. The persisted user row carries the cron
-             *     dispatcher's fire-time framing; `aura_agent::cron_prompt::original_cron_prompt`
+             *     dispatcher's fire-time framing; `aura_context::prompts::cron::original_cron_prompt`
              *     recovers the instruction as configured so the panel shows that,
              *     not the framing boilerplate.
              */

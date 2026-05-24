@@ -3,7 +3,6 @@
 //! routed to by [`Router`](crate::actor::router::Router), and
 //! checkpointed via [`DurableActorState`](crate::actor::state::DurableActorState).
 
-pub mod cron_prompt;
 pub mod mailbox;
 pub mod router;
 pub mod state;

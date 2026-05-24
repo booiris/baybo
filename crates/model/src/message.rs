@@ -156,7 +156,7 @@ impl ChatMessage {
 
     /// A cron job's fire-time framed prompt — a `Role::User` turn the agent
     /// synthesized at fire time (see the agent crate's
-    /// `cron_prompt::frame_cron_prompt`). Carries [`MessageSource::Cron`] so
+    /// `aura_context::prompts::cron::frame_cron_prompt`). Carries [`MessageSource::Cron`] so
     /// the operator cron inbox can locate it by provenance instead of sniffing
     /// the `[cron:<id>]` framing tag, while the chat transcript still hides it.
     pub fn cron_fire(content: Vec<ContentBlock>) -> Self {

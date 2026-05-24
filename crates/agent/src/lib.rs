@@ -22,7 +22,6 @@ pub mod service;
 // Stable external paths — consumers import `aura_agent::agent_loop::*`,
 // `aura_agent::supervisor::*`, etc. The submodules live under `runtime`
 // and `actor` after the PR6 reorg; these re-exports keep the wire shape.
-pub use actor::cron_prompt;
 pub use actor::mailbox;
 pub use actor::router;
 pub use actor::state;
