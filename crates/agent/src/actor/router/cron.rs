@@ -54,7 +54,7 @@ impl Router {
 
         let response_tx = self.supervisor.response_tx().clone();
         let (sender, _actor_token) =
-            self.spawn_oneshot_actor(session, None, response_tx, &self.actor_parent_token, None);
+            self.spawn_oneshot_actor(session, None, response_tx, &self.actor_parent_token);
 
         let trigger_msg = AgentMessage::CronTrigger {
             job_id: event.job_id.clone(),

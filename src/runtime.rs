@@ -131,6 +131,10 @@ pub struct ManagerGraph {
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
+    /// Subagent profile registry — `wire_router` hands it to a spawned
+    /// subagent's `ContextManager`, which resolves the child's system prompt
+    /// from it by profile name.
+    pub subagent_profile_registry: Arc<aura_subagent::SubagentRegistry>,
     /// Always already wrapped via `GuardedLlm` — every
     /// consumer (main loop, side-LLM in tools, skill_assessor)
     /// shares the same budget gate. Constructed in
@@ -636,6 +640,7 @@ pub async fn build_managers(
         skill_registry,
         tool_registry,
         tool_executor,
+        subagent_profile_registry,
         llm_client,
         llm_pool,
         cost_manager,
@@ -725,6 +730,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let token_calibration = Arc::clone(&token_calibration);
 
         let sessions = Arc::clone(&graph.session_manager);
+        let subagent_profile_registry = Arc::clone(&graph.subagent_profile_registry);
         let workspace_paths_arc = Arc::new(aura_workspace::WorkspacePaths::new(
             graph.workspace.root.clone(),
         ));
@@ -734,19 +740,18 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
             move |session: aura_model::Session,
                   initial_llm: Option<LlmEntryName>,
                   response_tx: mpsc::Sender<AgentOutput>,
-                  actor_token: CancellationToken,
-                  system_prompt_override: Option<String>| {
+                  actor_token: CancellationToken| {
                 // LLM pinning is exclusively a subagent-spawn affair —
                 // user-channel actors always run on `default-llm`.
                 // `initial_llm` is `Some` only when the router's subagent
                 // handler resolved a model for the child (from the spawn
                 // request's `model_tier`) and forwarded it here.
 
-                // Subagent profiles replace Soul wholesale; user / cron /
-                // background-compression spawns pass `None`, and context
-                // assembles the workspace soul itself (and re-reads it on
-                // compaction). `system_prompt_override` is the only
-                // system-prompt input the wiring layer provides.
+                // The child's system prompt is resolved by its ContextManager
+                // from `session.state.subagent_type` (the profile name, set +
+                // persisted at spawn) via the profile registry; `None` → the
+                // workspace soul. The spawner takes no prompt argument — the
+                // session already carries the choice.
 
                 // `summary_state_dir` connects the compressor's
                 // fast-path to the background refresh runner's output.
@@ -768,7 +773,11 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         skill_registry: Arc::clone(&skill_registry),
                         session_id: session.id.clone(),
                         sessions: Arc::clone(&sessions),
-                        system_prompt_override,
+                        subagent_profile: session
+                            .state
+                            .subagent_type
+                            .clone()
+                            .map(|name| (Arc::clone(&subagent_profile_registry), name)),
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),

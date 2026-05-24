@@ -369,6 +369,21 @@ impl AgentTestHarnessBuilder {
         let soul_text = self
             .soul_prompt
             .unwrap_or_else(|| "You are Aura, a test assistant.".into());
+        // Inject the fixed test prompt as a one-profile subagent registry: the
+        // new design resolves a session's system prompt from either the
+        // workspace soul or a subagent profile, and the harness workspace is a
+        // stub (so the workspace path would just hit the fallback).
+        let subagent_registry = Arc::new(aura_subagent::SubagentRegistry::new());
+        subagent_registry.register(aura_subagent::SubagentProfile {
+            name: "harness".into(),
+            version: "1".into(),
+            description: "harness test prompt".into(),
+            system_prompt: soul_text,
+            default_tier: None,
+            source: aura_model::ArtifactSource::Inline,
+            trust_level: aura_model::TrustLevel::Trusted,
+            source_path: None,
+        });
         let context_manager = ContextManager::from_config(ContextManagerConfig {
             tokenizer,
             workspace,
@@ -378,9 +393,7 @@ impl AgentTestHarnessBuilder {
             skill_registry: Arc::clone(&skill_registry),
             session_id: session.id.clone(),
             sessions: Arc::clone(&session_manager),
-            // Fixed test prompt — an override so compaction-reseed doesn't
-            // depend on the tempdir workspace's identity files.
-            system_prompt_override: Some(soul_text),
+            subagent_profile: Some((subagent_registry, "harness".to_string())),
         });
 
         let guarded_llm = aura_llm::GuardedLlm::new(

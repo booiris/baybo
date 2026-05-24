@@ -87,14 +87,12 @@ pub enum SystemSpawnRequest {
 /// self-contained brief that becomes the child's first user message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentSpawnRequest {
-    /// Profile name the parent LLM emitted as `subagent_type`. Surfaced
-    /// in trace/audit only — the resolved [`Self::system_prompt`]
-    /// already encodes behaviour. Stored as a plain `String` so this
-    /// crate stays a leaf (no dependency on `aura-subagent`).
+    /// Profile name the parent LLM emitted. The child's `ContextManager`
+    /// resolves it back to a system prompt via the subagent profile registry
+    /// (re-resolved on compaction), so the profile owns the child's identity
+    /// for the session's life. Stored as a plain `String` so this crate stays
+    /// a leaf (no dependency on `aura-subagent`).
     pub subagent_type: String,
-    /// Child actor's full system prompt. REPLACES the parent's Soul —
-    /// the profile author owns identity / security / output contracts.
-    pub system_prompt: String,
     /// 3-5 word summary the parent LLM authored. Trace display only;
     /// not part of the child's initial prompt.
     pub task_summary: String,

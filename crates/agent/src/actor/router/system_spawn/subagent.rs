@@ -147,7 +147,6 @@ impl Router {
         let llm = request
             .model_tier
             .and_then(|t| self.llm_pool.resolve_tier(t));
-        let system_prompt_override = Some(request.system_prompt.clone());
         let background = request.background;
         let subagent_type = request.subagent_type.clone();
         let task_summary = request.task_summary.clone();
@@ -166,13 +165,8 @@ impl Router {
         };
 
         let (output_tx, output_rx) = mpsc::channel::<AgentOutput>(SUBAGENT_OUTPUT_BUFFER);
-        let (mailbox, actor_token) = self.spawn_oneshot_actor(
-            child_session,
-            llm,
-            output_tx,
-            &effective_parent_token,
-            system_prompt_override,
-        );
+        let (mailbox, actor_token) =
+            self.spawn_oneshot_actor(child_session, llm, output_tx, &effective_parent_token);
 
         if let Err(e) = mailbox
             .send(AgentMessage::SubagentSpawned {

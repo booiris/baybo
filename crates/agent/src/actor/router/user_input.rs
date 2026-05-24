@@ -106,7 +106,7 @@ impl Router {
                 AgentMessage::UserInput(Box::new(incoming)),
                 || {
                     let actor_token = parent_token.child_token();
-                    actor_spawner(session, None, response_tx, actor_token, None)
+                    actor_spawner(session, None, response_tx, actor_token)
                 },
             )
             .await;

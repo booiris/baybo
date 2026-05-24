@@ -11,6 +11,9 @@ aura-model = { workspace = true }
 aura-llm = { workspace = true }
 aura-skills = { workspace = true }
 aura-session = { workspace = true }
+# Subagent profile registry: context resolves a subagent session's system
+# prompt from its profile name (see `ContextManager::subagent_profile`).
+aura-subagent = { workspace = true }
 aura-tools = { workspace = true }
 aura-trace = { workspace = true }
 # `io` exposes `identity::load_identity_files`, used by prompts::soul to

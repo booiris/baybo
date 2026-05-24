@@ -200,14 +200,13 @@ pub struct ContextManager {
     /// Cross-session manager for transcript persistence + summary
     /// metadata reads.
     pub(crate) sessions: Arc<SessionManager>,
-    /// Resolved system prompt for the initial seed — the workspace soul or a
-    /// subagent profile override. Reseed-after-compaction re-reads the
-    /// workspace rather than this field, so a profile edit lands on compaction.
-    /// Subagent profile override (preserved across compaction) or `None` to
-    /// assemble + re-read the workspace soul. Resolved lazily by
-    /// [`Self::resolve_system_prompt`]; `reseed_system_row` re-reads only when
-    /// `None`.
-    system_prompt_override: Option<String>,
+    /// For a subagent session: `(profile registry, profile name)` — context
+    /// resolves the child's system prompt from the registry by name. `None`
+    /// for a workspace session (assemble the workspace soul). Resolved by
+    /// [`Self::resolve_system_prompt`] for the seed and re-resolved by
+    /// `reseed_system_row` after each compaction, so a source edit (workspace
+    /// soul *or* subagent profile) lands on the next compaction.
+    subagent_profile: Option<(Arc<aura_subagent::SubagentRegistry>, String)>,
     /// Boundary the trigger gate measures from. Set to `messages.len()`
     /// after every compression apply and reconstructed from
     /// `session_summaries.cursor` on cold start.
@@ -246,14 +245,13 @@ pub struct ContextManagerConfig {
     pub skill_registry: Arc<SkillRegistry>,
     pub session_id: SessionId,
     pub sessions: Arc<SessionManager>,
-    /// Resolved system prompt for the initial seed: the workspace soul
-    /// (assembled via [`crate::prompts::soul::assemble_from_workspace`]) or a
-    /// subagent profile override.
-    /// Subagent profile override (preserved across compaction) or `None` to
-    /// assemble the workspace soul (and re-read it on compaction). The override
-    /// is the only system-prompt input the wiring layer provides — context
-    /// owns the workspace-soul assembly + fallback.
-    pub system_prompt_override: Option<String>,
+    /// For a subagent session: `(profile registry, profile name)` — context
+    /// resolves the child's system prompt from the registry by name (and
+    /// re-resolves on compaction). `None` for a workspace session (assemble the
+    /// workspace soul). The profile *name* is the parent's spawn-time choice;
+    /// resolving it to a prompt is context's job, so an edited profile is
+    /// picked up like an edited workspace soul.
+    pub subagent_profile: Option<(Arc<aura_subagent::SubagentRegistry>, String)>,
 }
 
 impl ContextManager {
@@ -276,7 +274,7 @@ impl ContextManager {
             current_model: RwLock::new(None),
             session_id: config.session_id,
             sessions: config.sessions,
-            system_prompt_override: config.system_prompt_override,
+            subagent_profile: config.subagent_profile,
             last_summary_anchor: None,
             last_synced_cursor: None,
         }
@@ -294,56 +292,63 @@ impl ContextManager {
         &self.messages
     }
 
-    /// Resolve the system prompt to seed the leading `Role::System` row: a
-    /// fixed override (subagent profile) as-is, or the workspace soul
-    /// assembled fresh from disk. On an assemble failure (workspace I/O —
-    /// identity files normally auto-seed, so this is a last resort) falls back
-    /// to a minimal prompt rather than seeding an empty system row. The agent
-    /// loop awaits this when seeding a fresh session.
+    /// Resolve the system prompt to seed the leading `Role::System` row. The
+    /// agent loop awaits this on a fresh session. Falls back to a minimal
+    /// prompt only if resolution fails outright (a missing subagent profile or
+    /// a workspace I/O error — identity files normally auto-seed) rather than
+    /// seeding an empty system row.
     pub async fn resolve_system_prompt(&self) -> String {
-        if let Some(override_prompt) = &self.system_prompt_override {
-            return override_prompt.clone();
-        }
-        crate::prompts::soul::assemble_from_workspace(&self.workspace)
+        self.try_resolve_system_prompt()
             .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "failed to assemble system prompt from workspace; using fallback"
-                );
-                crate::prompts::soul::FALLBACK_SYSTEM_PROMPT.to_string()
-            })
+            .unwrap_or_else(|| crate::prompts::soul::FALLBACK_SYSTEM_PROMPT.to_string())
+    }
+
+    /// Resolve the session's system prompt from its source: a subagent profile
+    /// (looked up by name in the spawn registry) or the workspace soul. `None`
+    /// on a resolution failure (profile not found, or workspace I/O error) so
+    /// the caller decides whether to fall back (seed) or keep the prior row
+    /// (reseed).
+    async fn try_resolve_system_prompt(&self) -> Option<String> {
+        match &self.subagent_profile {
+            Some((registry, profile_name)) => {
+                let resolved = registry.get(profile_name).map(|p| p.system_prompt);
+                if resolved.is_none() {
+                    tracing::warn!(subagent_type = %profile_name, "subagent profile not found in registry");
+                }
+                resolved
+            }
+            None => match crate::prompts::soul::assemble_from_workspace(&self.workspace).await {
+                Ok(prompt) => Some(prompt),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to assemble workspace soul");
+                    None
+                }
+            },
+        }
     }
 
     /// Refresh the leading system row after a *committed* compaction so a
-    /// profile edit made earlier in the conversation lands on the next
-    /// compaction rather than carrying the pre-compaction prompt forward
-    /// forever. Runs after the savings gate + commit (operating on
-    /// `self.messages`, not the candidate) so a grown soul can't skew the
-    /// shrink decision, and a declined apply does no workspace I/O.
-    ///
-    /// A subagent profile override is fixed for the session's life — compaction
-    /// preserved `messages[0]`, so it's left as-is. Only the workspace soul is
-    /// re-read, via [`Self::replace_first_message`] (which re-totals the
-    /// budget for the new prompt size). On a read failure the prior row is kept.
+    /// source edit (the user's workspace soul, or a subagent profile) lands on
+    /// the next compaction rather than carrying the pre-compaction prompt
+    /// forward forever. Runs after the savings gate + commit (operating on
+    /// `self.messages`, not the candidate) so a grown prompt can't skew the
+    /// shrink decision, and a declined apply does no resolution work. Re-reads
+    /// the session's source via [`Self::replace_first_message`] (which
+    /// re-totals the budget); on a resolution failure the prior row is kept.
     async fn reseed_system_row(&mut self) {
-        if self.system_prompt_override.is_some() {
-            return;
-        }
         let first_is_system_text = self.messages.first().is_some_and(|m| {
             m.role == Role::System && matches!(m.content.first(), Some(ContentBlock::Text(_)))
         });
         if !first_is_system_text {
             return;
         }
-        match crate::prompts::soul::assemble_from_workspace(&self.workspace).await {
-            Ok(prompt) => {
+        match self.try_resolve_system_prompt().await {
+            Some(prompt) => {
                 self.replace_first_message(ChatMessage::system(vec![ContentBlock::Text(prompt)]));
             }
-            Err(e) => {
+            None => {
                 tracing::warn!(
-                    error = %e,
-                    "failed to reload soul from workspace after compaction; keeping prior system prompt"
+                    "failed to re-resolve system prompt after compaction; keeping prior row"
                 );
             }
         }
@@ -1357,7 +1362,7 @@ mod tests {
             skill_registry: Arc::new(SkillRegistry::new()),
             session_id: test_session_id(),
             sessions: test_sessions(),
-            system_prompt_override: Some("test system prompt".to_string()),
+            subagent_profile: None,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -1487,7 +1492,7 @@ mod tests {
             skill_registry: Arc::new(SkillRegistry::new()),
             session_id: test_session_id(),
             sessions: test_sessions(),
-            system_prompt_override: None,
+            subagent_profile: None,
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed")).await;
@@ -1515,16 +1520,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reseed_preserves_subagent_override_across_compaction() {
-        // Regression (#2): a subagent profile override (is_override=true) must
-        // survive compaction — reseed must NOT swap in the workspace soul.
+    async fn reseed_resolves_subagent_profile_from_registry() {
+        // A subagent session resolves its system prompt from the profile
+        // registry by name — at seed and re-resolved on every compaction —
+        // NOT from the workspace soul.
         let dir = tempfile::tempdir().expect("tempdir");
         let workspace = Arc::new(aura_workspace::WorkspacePaths::new(
             dir.path().to_path_buf(),
         ));
+        // A workspace soul that must NOT leak into a subagent session.
         let soul_path = workspace.identity_file(aura_workspace::IdentityKind::Soul);
         std::fs::create_dir_all(soul_path.parent().expect("profile parent")).expect("profile dir");
         std::fs::write(&soul_path, "WORKSPACE_SOUL_SHOULD_NOT_APPEAR").expect("write soul");
+
+        let registry = Arc::new(aura_subagent::SubagentRegistry::new());
+        registry.register(aura_subagent::SubagentProfile {
+            name: "test-agent".into(),
+            version: "1".into(),
+            description: "test".into(),
+            system_prompt: "SUBAGENT_PROFILE".into(),
+            default_tier: None,
+            source: aura_model::ArtifactSource::Inline,
+            trust_level: aura_model::TrustLevel::Trusted,
+            source_path: None,
+        });
 
         let mut ctx = ContextManager::from_config(ContextManagerConfig {
             tokenizer: Arc::new(SimpleTokenizer),
@@ -1535,7 +1554,7 @@ mod tests {
             skill_registry: Arc::new(SkillRegistry::new()),
             session_id: test_session_id(),
             sessions: test_sessions(),
-            system_prompt_override: Some("SUBAGENT_PROFILE".to_string()),
+            subagent_profile: Some((Arc::clone(&registry), "test-agent".to_string())),
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "SUBAGENT_PROFILE"))
@@ -1552,7 +1571,14 @@ mod tests {
         );
         match &ctx.messages()[0].content[0] {
             ContentBlock::Text(t) => {
-                assert_eq!(t, "SUBAGENT_PROFILE", "override must survive compaction")
+                assert_eq!(
+                    t, "SUBAGENT_PROFILE",
+                    "subagent prompt must resolve from the registry"
+                );
+                assert!(
+                    !t.contains("WORKSPACE_SOUL"),
+                    "must not use the workspace soul"
+                );
             }
             other => panic!("expected system text, got {other:?}"),
         }
@@ -1830,7 +1856,7 @@ mod tests {
             skill_registry: registry,
             session_id: test_session_id(),
             sessions: test_sessions(),
-            system_prompt_override: Some("test system prompt".to_string()),
+            subagent_profile: None,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
