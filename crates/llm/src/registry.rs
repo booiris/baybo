@@ -75,27 +75,6 @@ pub trait LlmProviderFactory: Send + Sync {
     /// Creates an `LlmClient` from the given configuration.
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient>;
 
-    /// Model ids this provider can accept as `config.model`.
-    ///
-    /// Advisory only — used by operator tooling (`aura llm models`) to show
-    /// the choice set. Providers that cannot enumerate their catalog return
-    /// an empty slice.
-    fn known_models(&self) -> &'static [&'static str] {
-        &[]
-    }
-
-    /// Static pricing table for this provider's known models. Used by
-    /// `CostManager` to attribute spend to non-active models (e.g. a
-    /// session that started under one model and got config-flipped
-    /// mid-flight). Default impl pairs each `known_models()` entry
-    /// with [`Self::pricing_for_model`].
-    fn known_pricings(&self) -> HashMap<String, crate::ModelPricing> {
-        self.known_models()
-            .iter()
-            .map(|m| ((*m).to_string(), self.pricing_for_model(m)))
-            .collect()
-    }
-
     /// Per-model rate this factory advertises. Default impl resolves
     /// against the bundled OpenRouter snapshot via [`Self::provider_name`]
     /// + `crate::openrouter::pricing_for`, falling back to
@@ -118,36 +97,30 @@ pub trait LlmProviderFactory: Send + Sync {
     /// Live discovery: ask the provider's catalog endpoint what models the
     /// caller actually has access to **right now**.
     ///
-    /// Default implementation maps [`Self::known_models`] to bare
-    /// [`LiveModelInfo`] entries (id only) — a no-network fallback for
-    /// providers that don't expose a discovery endpoint or aren't worth
-    /// implementing one for. Providers with real catalog endpoints
+    /// Default implementation maps the bundled OpenRouter snapshot's
+    /// catalog for this provider ([`crate::openrouter::snapshot_model_ids_for`])
+    /// to bare [`LiveModelInfo`] entries (id only) — a no-network fallback
+    /// for providers that don't expose a discovery endpoint or aren't
+    /// worth implementing one for. Returns empty for providers that don't
+    /// route through OpenRouter. Providers with real catalog endpoints
     /// (currently `openai-subscription` against `<base>/codex/models`)
     /// override this to return rich metadata.
     async fn live_models(&self, _config: &LlmProviderConfig) -> crate::Result<Vec<LiveModelInfo>> {
-        Ok(self
-            .known_models()
-            .iter()
-            .map(|id| LiveModelInfo {
-                id: (*id).to_string(),
-                ..Default::default()
-            })
-            .collect())
+        Ok(
+            crate::openrouter::snapshot_model_ids_for(self.provider_name())
+                .into_iter()
+                .map(|id| LiveModelInfo {
+                    id,
+                    ..Default::default()
+                })
+                .collect(),
+        )
     }
 }
 
-/// One entry in the static `list_models()` aggregate (advertised models).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderModels {
-    pub provider: String,
-    pub models: Vec<String>,
-}
-
-/// One entry in the live `list_live_models()` aggregate. Richer than
-/// [`ProviderModels`] — providers with real catalog endpoints fill in
-/// the optional fields. The default `live_models()` impl emits only
-/// `id`, which gives the same data as the static `known_models()` path
-/// but in the same shape so callers can render both uniformly.
+/// One entry in the live `list_live_models()` aggregate. Providers with
+/// real catalog endpoints fill in the optional fields; the default
+/// `live_models()` impl (the OpenRouter snapshot) emits only `id`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LiveModelInfo {
     /// Model slug (the value users put in `LlmConfig.model`).
@@ -209,44 +182,9 @@ impl LlmProviderRegistry {
             .insert(factory.provider_name().to_string(), Box::new(factory));
     }
 
-    /// Aggregate every registered factory's `known_pricings()` into a
-    /// single `model_id -> ModelPricing` map. Used by the runtime to
-    /// seed `CostManager` so spans from non-active models still
-    /// resolve to real USD instead of 0.0. Conflicting model-id entries
-    /// across providers are last-wins; in practice the model-id space
-    /// is provider-disjoint so this doesn't matter.
-    ///
-    /// See `LlmProviderFactory::known_pricings` for the per-model
-    /// pricing accuracy caveat.
-    pub fn all_known_pricings(&self) -> HashMap<String, crate::ModelPricing> {
-        let mut all = HashMap::new();
-        for factory in self.factories.values() {
-            for (id, pricing) in factory.known_pricings() {
-                all.insert(id, pricing);
-            }
-        }
-        all
-    }
-
-    /// Return the catalog advertised by each registered factory.
-    ///
-    /// Output is sorted by provider name for stable display.
-    pub fn list_models(&self) -> Vec<ProviderModels> {
-        let mut out: Vec<ProviderModels> = self
-            .factories
-            .values()
-            .map(|f| ProviderModels {
-                provider: f.provider_name().to_string(),
-                models: f.known_models().iter().map(|s| (*s).to_string()).collect(),
-            })
-            .collect();
-        out.sort_by(|a, b| a.provider.cmp(&b.provider));
-        out
-    }
-
-    /// Live-discovery counterpart to [`Self::list_models`]: ask one named
-    /// provider's factory for its current catalog. Network-bound for
-    /// providers that override [`LlmProviderFactory::live_models`];
+    /// Ask one named provider's factory for its current catalog.
+    /// Network-bound for providers that override
+    /// [`LlmProviderFactory::live_models`];
     /// instant for providers that fall through to the default impl.
     ///
     /// Single-provider (not "all providers") because each one needs its
@@ -352,103 +290,53 @@ impl Default for LlmProviderRegistry {
 mod tests {
     use super::*;
 
-    /// Stub factory whose `known_models()` returns a fixed slice but
-    /// which doesn't override `live_models` — exercises the default
-    /// trait impl that maps known_models into bare LiveModelInfo entries.
-    struct StubFactory;
+    /// Stub factory that doesn't override `live_models` — exercises the
+    /// default trait impl that maps the OpenRouter snapshot catalog into
+    /// bare LiveModelInfo entries. `provider` selects which catalog.
+    struct StubFactory {
+        provider: &'static str,
+    }
 
     #[async_trait::async_trait]
     impl LlmProviderFactory for StubFactory {
         fn provider_name(&self) -> &str {
-            "stub"
+            self.provider
         }
         fn create(&self, _cfg: &LlmProviderConfig) -> crate::Result<LlmClient> {
             unreachable!("not exercised in this test")
-        }
-        fn known_models(&self) -> &'static [&'static str] {
-            &["alpha", "beta"]
         }
         // Deliberately do NOT override live_models — that's the point of
         // the test.
     }
 
-    #[test]
-    fn all_known_pricings_aggregates_default_providers() {
-        // Pin: every default provider that publishes known_pricings()
-        // shows up in the aggregate. Used by `runtime::wire_router` to
-        // seed `CostManager` so non-active models still attribute
-        // spend instead of falling to $0.
-        let registry = LlmProviderRegistry::with_default_providers();
-        let pricings = registry.all_known_pricings();
-        // openai, anthropic, gemini, minimax all publish known_pricings;
-        // openai_subscription's known_models is empty (account-tier
-        // dependent), so it contributes nothing — that's expected.
-        assert!(pricings.contains_key("gpt-4o"));
-        assert!(pricings.contains_key("claude-sonnet-4-6"));
-        assert!(pricings.contains_key("gemini-2.5-flash"));
-        assert!(pricings.contains_key("MiniMax-M2"));
-        // No model id should map to (0.0, 0.0) — that would mean a
-        // provider regressed its pricing publication.
-        for (id, p) in &pricings {
-            assert!(
-                p.input_per_1m_tokens > aura_model::MicroUsd::ZERO
-                    || p.output_per_1m_tokens > aura_model::MicroUsd::ZERO,
-                "model {id} has zero pricing in known_pricings",
-            );
-        }
-    }
-
-    #[test]
-    fn known_pricings_differentiates_within_provider() {
-        // Pin the snapshot wiring: a regression that puts every
-        // openai model back at the same flat rate would have
-        // `gpt-5-mini` and `gpt-5` matching, defeating the whole
-        // point of `LlmProviderFactory::openrouter_slug`.
-        let registry = LlmProviderRegistry::with_default_providers();
-        let pricings = registry.all_known_pricings();
-        let flagship = pricings.get("gpt-5").expect("gpt-5 published");
-        let mini = pricings.get("gpt-5-mini").expect("gpt-5-mini published");
-        assert!(
-            mini.input_per_1m_tokens < flagship.input_per_1m_tokens,
-            "gpt-5-mini input must be cheaper than gpt-5: mini={:?} flagship={:?}",
-            mini.input_per_1m_tokens,
-            flagship.input_per_1m_tokens,
-        );
-
-        let opus = pricings
-            .get("claude-opus-4-6")
-            .expect("claude-opus-4-6 published");
-        let haiku = pricings
-            .get("claude-haiku-4-5-20251001")
-            .expect("claude-haiku-4-5-20251001 published");
-        assert!(
-            haiku.input_per_1m_tokens < opus.input_per_1m_tokens,
-            "haiku must be cheaper than opus: haiku={:?} opus={:?}",
-            haiku.input_per_1m_tokens,
-            opus.input_per_1m_tokens,
-        );
-    }
-
-    #[tokio::test]
-    async fn live_models_default_impl_maps_known_models_to_bare_entries() {
-        let factory = StubFactory;
-        let cfg = LlmProviderConfig {
-            provider: "stub".into(),
+    fn bare_config(provider: &str) -> LlmProviderConfig {
+        LlmProviderConfig {
+            provider: provider.into(),
             api_key: None,
             base_url: None,
-            model: "alpha".into(),
+            model: "unused".into(),
             supports_vision: None,
             context_window: None,
             pricing: None,
             reasoning_effort: None,
             vault: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_models_default_impl_maps_snapshot_to_bare_entries() {
+        // Snapshot-routable provider: the default impl surfaces its
+        // OpenRouter catalog as id-only entries.
+        let factory = StubFactory {
+            provider: "deepseek",
         };
-        let entries = factory.live_models(&cfg).await.unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].id, "alpha");
-        assert_eq!(entries[1].id, "beta");
-        // All optional fields default to None — the default impl can't
-        // know richer metadata, only ids.
+        let entries = factory.live_models(&bare_config("deepseek")).await.unwrap();
+        assert!(
+            entries.iter().any(|e| e.id == "deepseek-chat"),
+            "expected snapshot-derived deepseek ids, got {:?}",
+            entries.iter().map(|e| &e.id).collect::<Vec<_>>(),
+        );
+        // id-only: the default impl can't know richer metadata.
         for e in &entries {
             assert!(e.display_name.is_none());
             assert!(e.context_window.is_none());
@@ -456,6 +344,12 @@ mod tests {
             assert!(e.supports_tools.is_none());
             assert!(e.extras.is_null());
         }
+        // A provider that doesn't route through OpenRouter yields nothing.
+        let empty = StubFactory { provider: "stub" }
+            .live_models(&bare_config("stub"))
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
     }
 
     /// Empty-live factory registered under a snapshot-routable provider
@@ -472,9 +366,6 @@ mod tests {
         }
         fn create(&self, _cfg: &LlmProviderConfig) -> crate::Result<LlmClient> {
             unreachable!("not exercised in this test")
-        }
-        fn known_models(&self) -> &'static [&'static str] {
-            &[]
         }
         async fn live_models(
             &self,
@@ -532,9 +423,6 @@ mod tests {
             }
             fn create(&self, _cfg: &LlmProviderConfig) -> crate::Result<LlmClient> {
                 unreachable!()
-            }
-            fn known_models(&self) -> &'static [&'static str] {
-                &[]
             }
             async fn live_models(
                 &self,

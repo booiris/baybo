@@ -4,7 +4,6 @@ use serde::Deserialize;
 
 use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
-use aura_model::MicroUsd;
 
 pub(crate) const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
 /// Origin host MiniMax exposes for OpenAI-compatible model listing.
@@ -26,25 +25,11 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
         "minimax"
     }
 
-    fn known_models(&self) -> &'static [&'static str] {
-        &[
-            "MiniMax-M2",
-            "MiniMax-M1",
-            "MiniMax-Text-01",
-            "abab6.5s-chat",
-            "abab6.5-chat",
-        ]
-    }
-
-    /// Roughly M1's list price for unmapped ids (`abab*-chat`,
-    /// custom checkpoints): M2 is cheaper, abab is unpriced on
-    /// OpenRouter — M1's rate is the conservative midline.
+    /// Priciest OpenRouter `minimax/*` model by input+output, the
+    /// conservative unknown-id fallback. Generated from the snapshot —
+    /// see `build.rs`.
     fn flat_default_pricing(&self) -> ModelPricing {
-        ModelPricing {
-            input_per_1m_tokens: MicroUsd::from_usd_decimal(0.40),
-            output_per_1m_tokens: MicroUsd::from_usd_decimal(2.20),
-            ..Default::default()
-        }
+        crate::providers::catalog::MINIMAX_FLAT_DEFAULT_PRICING
     }
 
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
@@ -274,12 +259,6 @@ mod tests {
         let client = factory.create(&config).expect("client builds with api key");
         assert_eq!(client.model_info().provider, "minimax");
         assert_eq!(client.model_info().id, "MiniMax-M2");
-    }
-
-    #[test]
-    fn test_known_models_lists_flagship() {
-        let factory = MiniMaxProviderFactory;
-        assert!(factory.known_models().contains(&"MiniMax-M2"));
     }
 
     #[test]

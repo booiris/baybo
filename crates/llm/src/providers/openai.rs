@@ -4,7 +4,6 @@ use serde::Deserialize;
 
 use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
-use aura_model::MicroUsd;
 
 pub(crate) const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -17,25 +16,11 @@ impl LlmProviderFactory for OpenAIProviderFactory {
         "openai"
     }
 
-    fn known_models(&self) -> &'static [&'static str] {
-        &[
-            "gpt-5",
-            "gpt-5-mini",
-            "gpt-4.1",
-            "gpt-4.1-mini",
-            "gpt-4o",
-            "gpt-4o-mini",
-        ]
-    }
-
-    /// Flagship list price; under-attribution is worse than
-    /// over-attribution since the budget gate is the safety surface.
+    /// Priciest OpenRouter `openai/*` model by input+output; over-attribution
+    /// is the safe direction since the budget gate is the safety surface.
+    /// Generated from the snapshot — see `build.rs`.
     fn flat_default_pricing(&self) -> ModelPricing {
-        ModelPricing {
-            input_per_1m_tokens: MicroUsd::from_usd_decimal(2.50),
-            output_per_1m_tokens: MicroUsd::from_usd_decimal(10.0),
-            ..Default::default()
-        }
+        crate::providers::catalog::OPENAI_FLAT_DEFAULT_PRICING
     }
 
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {

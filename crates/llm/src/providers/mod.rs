@@ -13,6 +13,19 @@ pub(crate) mod openai;
 // `aura_llm::providers::openai_subscription`.
 pub mod openai_subscription;
 
+// Aura provider name -> OpenRouter prefix, shared with `build.rs`.
+pub(crate) mod openrouter_prefix;
+
+/// Per-provider flat-default pricing, generated at build time from the
+/// bundled OpenRouter snapshot (see `build.rs`): the priciest snapshot
+/// model under the provider's prefix by `input + output`.
+pub(crate) mod catalog {
+    use crate::ModelPricing;
+    use aura_model::MicroUsd;
+
+    include!(concat!(env!("OUT_DIR"), "/provider_catalog.rs"));
+}
+
 /// Per-provider built-in fallbacks for `(context_window, supports_vision)`.
 /// The single source of truth: each factory layers `OpenRouter snapshot
 /// → operator override → these defaults`, and the gateway dashboard

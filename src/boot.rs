@@ -74,12 +74,10 @@ pub fn resolve_config_path() -> Option<PathBuf> {
 /// returned handle is sealed: every `chat`/`chat_stream` runs through
 /// `guard` first.
 ///
-/// `registry` is borrowed by the caller so the same instance can be
-/// reused for harvesting `all_known_pricings()` and constructing the
-/// client — `LlmProviderRegistry::with_default_providers()` is cheap
-/// but the runtime needs both anyway, and threading a single registry
-/// makes the "one source of truth for providers" relationship
-/// explicit at the call site.
+/// `registry` is borrowed by the caller so a single instance is the one
+/// source of truth for providers — `LlmProviderRegistry::with_default_providers()`
+/// is cheap, but threading one registry through every `create()` makes
+/// that relationship explicit at the call site.
 ///
 /// `blob_store` is optional. When `Some`, the inner client is wired
 /// with a `BlobFetcher` so vision-capable models actually receive

@@ -73,13 +73,6 @@ impl LlmProviderFactory for OpenAiSubscriptionProviderFactory {
         PROVIDER_NAME
     }
 
-    fn known_models(&self) -> &'static [&'static str] {
-        // The Codex catalog is account-tier-dependent; static listing
-        // would lie. Use `aura llm models --live --provider openai-subscription`
-        // to see what the signed-in account actually has.
-        &[]
-    }
-
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let model = build_model(config, BackgroundRefresh::Enabled)?;
         let defaults = crate::providers::factory_defaults_for(PROVIDER_NAME);

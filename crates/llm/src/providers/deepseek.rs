@@ -3,13 +3,12 @@ use rig::providers::openai;
 
 use crate::registry::{LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
-use aura_model::MicroUsd;
 
 /// DeepSeek's OpenAI-compatible base. The platform speaks the OpenAI
 /// Chat Completions wire format (function calling + streaming
 /// included), so we route through rig's OpenAI client with this base
 /// URL pinned. Operators can override via `LlmConfig.base_url`.
-pub(crate) const DEEPSEEK_DEFAULT_BASE_URL: &str = "https://api.deepseek.com/v1";
+pub(crate) const DEEPSEEK_DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 
 /// Factory that creates `LlmClient` instances configured for DeepSeek models.
 ///
@@ -24,22 +23,12 @@ impl LlmProviderFactory for DeepSeekProviderFactory {
         "deepseek"
     }
 
-    fn known_models(&self) -> &'static [&'static str] {
-        &["deepseek-chat", "deepseek-reasoner"]
-    }
-
-    /// `deepseek-reasoner`'s list price — the pricier of the two
-    /// catalog models. Used only as the unknown-id fallback; the
-    /// OpenRouter snapshot/live overlay supplies precise per-slug
-    /// rates for `deepseek-chat` / `deepseek-reasoner`. Erring toward
-    /// the higher rate keeps the budget gate conservative
-    /// (under-attribution is the unsafe direction).
+    /// Priciest OpenRouter `deepseek/*` model by input+output, the
+    /// unknown-id fallback. Erring toward the higher rate keeps the
+    /// budget gate conservative (under-attribution is the unsafe
+    /// direction). Generated from the snapshot — see `build.rs`.
     fn flat_default_pricing(&self) -> ModelPricing {
-        ModelPricing {
-            input_per_1m_tokens: MicroUsd::from_usd_decimal(0.56),
-            output_per_1m_tokens: MicroUsd::from_usd_decimal(1.68),
-            ..Default::default()
-        }
+        crate::providers::catalog::DEEPSEEK_FLAT_DEFAULT_PRICING
     }
 
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
@@ -89,6 +78,7 @@ impl LlmProviderFactory for DeepSeekProviderFactory {
 mod tests {
     use super::*;
     use crate::registry::LlmProviderConfig;
+    use aura_model::MicroUsd;
 
     fn config(model: &str, api_key: Option<&str>) -> LlmProviderConfig {
         LlmProviderConfig {
@@ -128,17 +118,10 @@ mod tests {
     }
 
     #[test]
-    fn known_models_list_both_flagships() {
-        let models = DeepSeekProviderFactory.known_models();
-        assert!(models.contains(&"deepseek-chat"));
-        assert!(models.contains(&"deepseek-reasoner"));
-    }
-
-    #[test]
     fn unknown_model_falls_back_to_nonzero_flat_pricing() {
-        // The registry's all_known_pricings test asserts no model maps
-        // to zero pricing — pin the flat default stays non-zero so a
-        // snapshot miss never silently disables the budget gate.
+        // The flat default must stay non-zero so a snapshot miss never
+        // silently disables the budget gate — it's what seeds the cost
+        // lookup for a configured id the snapshot doesn't price.
         let p = DeepSeekProviderFactory.pricing_for_model("deepseek-custom-checkpoint");
         assert!(p.input_per_1m_tokens > MicroUsd::ZERO);
         assert!(p.output_per_1m_tokens > MicroUsd::ZERO);

@@ -4,7 +4,6 @@ use serde::Deserialize;
 
 use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
-use aura_model::MicroUsd;
 
 // Host root only — rig's gemini client appends the versioned path
 // (`/v1beta/models/{model}:generateContent`) on every request, so the
@@ -20,24 +19,10 @@ impl LlmProviderFactory for GeminiProviderFactory {
         "gemini"
     }
 
-    fn known_models(&self) -> &'static [&'static str] {
-        &[
-            "gemini-3.1-pro-preview",
-            "gemini-3-flash-preview",
-            "gemini-3.1-flash-lite-preview",
-            "gemini-2.5-flash",
-            "gemini-2.5-pro",
-        ]
-    }
-
-    /// Gemini 2.5 Flash list price; over-attribution is the safe
-    /// direction since the budget gate is the safety surface.
+    /// Priciest OpenRouter `google/*` model by input+output; over-attribution
+    /// is the safe direction since the budget gate is the safety surface.
     fn flat_default_pricing(&self) -> ModelPricing {
-        ModelPricing {
-            input_per_1m_tokens: MicroUsd::from_usd_decimal(0.075),
-            output_per_1m_tokens: MicroUsd::from_usd_decimal(0.30),
-            ..Default::default()
-        }
+        crate::providers::catalog::GEMINI_FLAT_DEFAULT_PRICING
     }
 
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {

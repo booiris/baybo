@@ -290,12 +290,17 @@ pub async fn build_managers(
     // The provider registry is shared between pricing harvest and
     // `build_llm_client` — single source of truth for factories.
     let provider_registry = aura_llm::LlmProviderRegistry::with_default_providers();
-    let pricings = provider_registry.all_known_pricings();
     let spending_limits = SpendingLimits {
         daily_usd: config.cost.spending_limits.daily_usd,
         monthly_usd: config.cost.spending_limits.monthly_usd,
     };
-    let cost_manager = CostManager::new(stores.cost.clone(), pricings, spending_limits);
+    // Seeded empty: the budget gate is primed from the built clients' own
+    // (snapshot-derived) pricing once the pool is up — see below.
+    let cost_manager = CostManager::new(
+        stores.cost.clone(),
+        std::collections::HashMap::new(),
+        spending_limits,
+    );
     cost_manager.hydrate().await;
 
     // Refresh pricing for every configured entry (not just default —
@@ -370,6 +375,19 @@ pub async fn build_managers(
             }
         }
     }
+    // Prime the budget gate offline from each built client's own pricing
+    // (set in the factory's `create()` from the snapshot via
+    // `pricing_for_model`), keyed by `model_info.id` == `config.model` to
+    // match the cost lookup. The async refresh below overlays live prices.
+    cost_manager.merge_pricings(
+        pool_clients
+            .values()
+            .map(|c| {
+                let info = c.model_info();
+                (info.id.clone(), info.pricing)
+            })
+            .collect(),
+    );
     let llm_pool = Arc::new(
         aura_agent::LlmClientPool::with_tier_map(
             pool_clients,

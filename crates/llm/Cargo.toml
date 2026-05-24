@@ -6,6 +6,11 @@ edition.workspace = true
 [lib]
 doctest = false
 
+# Parses the bundled OpenRouter snapshot at build time to generate each
+# provider's `known_models` list + flat-default pricing (see `build.rs`).
+[build-dependencies]
+serde_json = { workspace = true }
+
 [features]
 # Exposes `StubLlm` and the `LlmStream::from_events` constructor for
 # downstream crates' tests. Pull in via:

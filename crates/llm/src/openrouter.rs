@@ -1,11 +1,12 @@
 //! Bundled OpenRouter pricing + capability snapshot, plus a one-shot
 //! live-fetch path.
 //!
-//! `CostManager` seeds itself from `LlmProviderRegistry::all_known_pricings()`
-//! at boot. Per-factory `known_pricings()` consults the snapshot below,
-//! so every advertised model attributes spend at the rate OpenRouter
-//! had cached the last time someone ran `scripts/regen-openrouter-pricings.sh`,
-//! not at a flat per-provider guess.
+//! `CostManager` is seeded at boot from each built client's
+//! `ModelInfo.pricing`, which the provider factories resolve through
+//! [`pricing_for`] (snapshot below, then a flat per-provider default).
+//! So every configured model attributes spend at the rate OpenRouter had
+//! cached the last time someone ran `scripts/regen-openrouter-pricings.sh`,
+//! not at a flat per-provider guess — offline, before the live overlay lands.
 //!
 //! Each snapshot entry also carries the model's `top_provider`
 //! capability profile (max context window, max completion tokens) and
@@ -37,6 +38,7 @@ use aura_model::MicroUsd;
 use serde::Deserialize;
 
 use crate::ModelPricing;
+use crate::providers::openrouter_prefix::openrouter_provider_prefix;
 
 const SNAPSHOT_JSON: &str = include_str!("providers/openrouter_pricings.json");
 const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
@@ -229,17 +231,6 @@ pub fn snapshot_model_ids_for(provider: &str) -> Vec<String> {
         .keys()
         .filter_map(|slug| slug.strip_prefix(&prefix).map(str::to_string))
         .collect()
-}
-
-fn openrouter_provider_prefix(provider: &str) -> Option<&'static str> {
-    match provider {
-        "openai" => Some("openai"),
-        "anthropic" => Some("anthropic"),
-        "minimax" => Some("minimax"),
-        "deepseek" => Some("deepseek"),
-        "gemini" => Some("google"),
-        _ => None,
-    }
 }
 
 /// Map an Aura `(provider, model_id)` pair to its OpenRouter catalog

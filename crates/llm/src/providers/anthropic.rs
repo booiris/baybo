@@ -4,7 +4,6 @@ use serde::Deserialize;
 
 use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
-use aura_model::MicroUsd;
 
 pub(crate) const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -18,24 +17,11 @@ impl LlmProviderFactory for AnthropicProviderFactory {
         "anthropic"
     }
 
-    fn known_models(&self) -> &'static [&'static str] {
-        &[
-            "claude-opus-4-6",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5-20251001",
-            "claude-opus-4",
-            "claude-sonnet-4",
-        ]
-    }
-
-    /// Sonnet flagship list price; over-attribution is the safe
-    /// direction since the budget gate is the safety surface.
+    /// Priciest OpenRouter `anthropic/*` model by input+output; over-attribution
+    /// is the safe direction since the budget gate is the safety surface.
+    /// Generated from the snapshot — see `build.rs`.
     fn flat_default_pricing(&self) -> ModelPricing {
-        ModelPricing {
-            input_per_1m_tokens: MicroUsd::from_usd_decimal(3.0),
-            output_per_1m_tokens: MicroUsd::from_usd_decimal(15.0),
-            ..Default::default()
-        }
+        crate::providers::catalog::ANTHROPIC_FLAT_DEFAULT_PRICING
     }
 
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
