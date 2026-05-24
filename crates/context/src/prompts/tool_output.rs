@@ -131,9 +131,12 @@ fn escape_xml_attr(s: &str) -> String {
 /// Neutralize any literal close delimiter inside tool output so untrusted
 /// content can't forge a boundary the LLM parses as a handoff back to
 /// instructions. A zero-width space after the leading `<` breaks the literal
-/// match while staying visually transparent.
+/// match while staying visually transparent. The replacement is derived from
+/// the shared `TOOL_OUTPUT_CLOSE_PREFIX` (not a second hardcoded copy) so it
+/// can never drift from the matcher or the detector's forged-delimiter rule.
 fn escape_close_tool_output(s: &str) -> String {
-    s.replace(TOOL_OUTPUT_CLOSE_PREFIX, "<\u{200B}/tool_output")
+    let neutralized = TOOL_OUTPUT_CLOSE_PREFIX.replacen('<', "<\u{200B}", 1);
+    s.replace(TOOL_OUTPUT_CLOSE_PREFIX, &neutralized)
 }
 
 #[cfg(test)]

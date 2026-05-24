@@ -375,9 +375,13 @@ impl ContextManager {
     ///
     /// Used by [`Self::reseed_system_row`] to refresh the soul system prompt
     /// after a committed compaction when the identity files changed on disk.
-    /// Persistence is in-memory only — `session_messages` keeps the originally
-    /// persisted content; the next actor cold start re-seeds the prompt from
-    /// disk anyway, so the staleness is invisible downstream.
+    /// The refresh is in-memory only: `persist_compaction` already wrote the
+    /// pre-reseed row, and on a cold start `ensure_system_prompt` short-circuits
+    /// on the restored leading `System` row without re-reading disk — so a
+    /// reaped-then-rehydrated actor carries the persisted prompt until the next
+    /// compaction reseeds again. Correct for the live actor's lifetime and
+    /// self-healing across compactions; a source edit just isn't durable until
+    /// then.
     ///
     /// No-op if the transcript is empty.
     pub fn replace_first_message(&mut self, msg: ChatMessage) {

@@ -77,10 +77,12 @@ pub enum SystemSpawnRequest {
 
 /// What the parent LLM asks for when it calls `spawn_subagent`.
 ///
-/// The tool resolves the `subagent_type` name into a concrete
-/// `SubagentProfile` BEFORE producing this envelope and stamps the
-/// profile's `system_prompt` here. The router consumes the prompt
-/// verbatim — no further registry lookup happens agent-side.
+/// The tool validates `subagent_type` against the registry BEFORE
+/// producing this envelope (rejecting unknown types and canonicalizing
+/// the name), but the resolved system prompt does NOT ride along: the
+/// child's `ContextManager` resolves the name back to a prompt via the
+/// subagent profile registry at seed time, and re-resolves it on
+/// compaction (see the `subagent_type` field).
 ///
 /// Field naming follows Claude Code's Agent tool: `task_summary` is
 /// the short 3-5 word title surfaced in traces, while `prompt` is the

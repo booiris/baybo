@@ -16,7 +16,7 @@ use aura_tools::{ToolOutput, ToolRegistry};
 use aura_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::runtime::compression::CompressionRunner;
 use crate::runtime::error_recovery::ErrorHandler;
@@ -1183,14 +1183,27 @@ impl AgentLoop {
         // prompt: the caller must have seeded (and snapshotted) *before* this,
         // so a failed turn's rollback can't drop the system row. Self-seeding
         // here would append the system row to the tail, after the notification.
+        let seeded = self
+            .context_manager
+            .messages()
+            .first()
+            .is_some_and(|m| m.role == Role::System);
         debug_assert!(
-            self.context_manager
-                .messages()
-                .first()
-                .is_some_and(|m| m.role == Role::System),
+            seeded,
             "append_subagent_notification requires the system prompt already seeded \
              (call ensure_system_prompt_seeded before snapshotting)"
         );
+        if !seeded {
+            // Unreachable given the sole caller, but in release (debug_assert
+            // compiled out) don't push the notification ahead of a not-yet-seeded
+            // system row: that would leave messages[0] off the system prompt and
+            // break the prompt-cache prefix. Drop the row and log loudly instead.
+            error!(
+                "append_subagent_notification called before the system prompt was seeded; \
+                 dropping the in-memory notification to keep the transcript prefix intact"
+            );
+            return;
+        }
         let msg = ChatMessage::agent_context(content);
         self.context_manager.append_in_memory(&msg);
     }
