@@ -85,7 +85,7 @@ Sections mirror Aura's real runtime concerns, not a 1:1 copy of any external ref
 
 ### Channel enablement model
 
-Each optional channel (`telegram`, `discord`, `http`) is wrapped in `Option<_>`: **absent ⇒ disabled, present ⇒ enabled**. The inner `enabled: bool` is redundant with the `Option` wrapper and is retained only for migration; `validate()` must reject `Some { enabled: false, ... }` and guide the operator to omit the section instead. The `cli` channel is always present because it has no required configuration and ships as the default adapter.
+Each optional channel (`telegram`, `discord`, `weixin`) is wrapped in `Option<_>`: **absent ⇒ disabled, present ⇒ enabled**. The inner `enabled: bool` is redundant with the `Option` wrapper and is retained only for migration; `validate()` must reject `Some { enabled: false, ... }` and guide the operator to omit the section instead. The `cli` channel is always present because it has no required configuration and ships as the default adapter. The `http` channel is likewise always installed — it powers the embedded web dashboard / chat page, has no operator-facing knobs, and so carries no `channels` section of its own.
 
 ## Out-of-scope modules
 

@@ -109,9 +109,9 @@ Fresh checkouts get a usable key from `aura setup`, which mints `<workspace>/.ke
 ## What boot does NOT do
 
 - **No bootstrap-time MCP wiring beyond launching the reconciler.** MCP servers themselves are configured in `<workspace>/config/.mcp.json`, owned by `aura-tools::mcp` (not `aura-config`). `runtime::build_managers` only spawns the `McpReconciler`; the reconciler reads `.mcp.json` itself on each tick and connects/disconnects servers + registers their tools dynamically.
-- **No compiled-in channel adapters.** `ChannelRegistry` starts empty. Every channel — the bundled TUI and any sidecar plugin — arrives at runtime as a `/v1/channel-ws` client and registers itself from the gateway's route task. The legacy `channels.{http, telegram, discord}` sections in `aura.json` are validated but no longer drive in-process adapter wiring; channel bots are managed via `aura channel add/remove` and a `ChannelBotReconciler` running inside the gateway.
+- **No in-`boot` channel installation.** The `boot` module maps config to types but never touches `ChannelRegistry`. Installation happens one layer out: `runtime::build_managers` calls `aura_gateway::channel::boot::install_channels`, which walks `config.channels` and pre-installs one pinned `Channel` (a registry slot with its own approval gate) per enabled section — `cli`→TUI, `telegram`, `discord`, `weixin` — plus the always-on `http` dashboard channel. So the registry is populated from config at boot, but only with *slots*: each live connection attaches later — TUI/browser/sidecar processes arrive as `/v1/channel-ws` clients, and the `telegram`/`discord`/`weixin` bots are launched and reconciled by the `ChannelBotReconciler` (`aura channel add/remove`).
 
-These are spec'd in `config.md` and are future wiring work; `validate()` already rejects inconsistent configurations for them so later wiring can trust the shapes.
+Neither is future work — both the `McpReconciler` and `install_channels` run at boot today, just from `runtime`/the gateway rather than `boot` itself. `boot`'s job ends at validated config plus mapped primitives; `validate()` having already rejected inconsistent `channels.*` / `cost.*` shapes is what lets that downstream wiring trust them.
 
 ## Constraints
 
