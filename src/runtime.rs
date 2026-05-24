@@ -134,7 +134,7 @@ pub struct ManagerGraph {
     /// Subagent profile registry — `wire_router` hands it to a spawned
     /// subagent's `ContextManager`, which resolves the child's system prompt
     /// from it by profile name.
-    pub subagent_profile_registry: Arc<aura_subagent::SubagentRegistry>,
+    pub subagent_registry: Arc<aura_subagent::SubagentRegistry>,
     /// Always already wrapped via `GuardedLlm` — every
     /// consumer (main loop, side-LLM in tools, skill_assessor)
     /// shares the same budget gate. Constructed in
@@ -237,7 +237,7 @@ pub async fn build_managers(
         }
         reg
     };
-    let subagent_profile_registry = {
+    let subagent_registry = {
         let reg = Arc::new(aura_subagent::SubagentRegistry::new());
         let builtins = reg.register_builtins();
         if builtins > 0 {
@@ -481,7 +481,7 @@ pub async fn build_managers(
         let (tool, manifest) =
             aura_subagent::tool::make(aura_subagent::tool::SpawnSubagentToolConfig {
                 system_spawn_tx: system_spawn_tx.clone(),
-                registry: Arc::clone(&subagent_profile_registry),
+                registry: Arc::clone(&subagent_registry),
                 sessions: Arc::clone(&session_manager),
                 dispatch_limiter: Arc::clone(&subagent_dispatch_limiter),
                 max_depth: config.agent.max_subagent_depth,
@@ -640,7 +640,7 @@ pub async fn build_managers(
         skill_registry,
         tool_registry,
         tool_executor,
-        subagent_profile_registry,
+        subagent_registry,
         llm_client,
         llm_pool,
         cost_manager,
@@ -730,7 +730,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let token_calibration = Arc::clone(&token_calibration);
 
         let sessions = Arc::clone(&graph.session_manager);
-        let subagent_profile_registry = Arc::clone(&graph.subagent_profile_registry);
+        let subagent_registry = Arc::clone(&graph.subagent_registry);
         let workspace_paths_arc = Arc::new(aura_workspace::WorkspacePaths::new(
             graph.workspace.root.clone(),
         ));
@@ -777,7 +777,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                             .state
                             .subagent_type
                             .clone()
-                            .map(|name| (Arc::clone(&subagent_profile_registry), name)),
+                            .map(|name| (Arc::clone(&subagent_registry), name)),
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),
