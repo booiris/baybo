@@ -58,10 +58,10 @@ ContextManager (struct)
 ```
 
 `prompts/` is the single home for every piece of text the runtime injects into
-the LLM transcript. The pure builders are unit-testable on their own; the
-`ContextManager` `append_*`-adjacent helpers (`cap_tool_output`,
-`reseed_system_row`) and the agent-loop seam (`append_cron_fire`,
-`append_subagent_notification`, `system_prompt()`) call into them. The
+the LLM transcript. The pure builders are unit-testable on their own; both
+`ContextManager` (`resolve_system_prompt` via `ensure_seeded`,
+`cap_tool_output`, `reseed_system_row`) and the agent-loop seam
+(`append_cron_fire`, `append_subagent_notification`) call into them. The
 injection *detection* for tool output stays in `aura-security`; only the
 `<tool_output>` envelope formatting lives here (the shared delimiter is
 `aura_model::TOOL_OUTPUT_{OPEN,CLOSE}_PREFIX`).
