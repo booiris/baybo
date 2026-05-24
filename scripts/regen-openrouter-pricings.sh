@@ -13,8 +13,13 @@
 # Output: crates/llm/src/providers/openrouter_pricings.json
 #
 # Filtering rules:
-#   * Keep ids under `^(openai|anthropic|google|minimax)/` only —
-#     these are the four factories Aura ships with default config.
+#   * Store the FULL OpenRouter catalog (every provider), not just the
+#     ones Aura ships factories for. Pricing lookups are gated by
+#     `openrouter::openrouter_provider_prefix` — an unmapped provider's
+#     rows are simply never queried — so bundling them is harmless and
+#     means adding a new provider factory needs no edit here. (The
+#     bundled JSON is only the offline fallback anyway: at boot the
+#     runtime live-fetches accurate pricing for the configured models.)
 #   * Drop `:free` route variants (their prompt/completion are 0 and
 #     we never want to attribute spend at $0 just because someone
 #     happens to be configured against the free tier).
@@ -53,13 +58,16 @@ fi
 
 fetched_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-jq --arg t "$fetched_at" --arg src "$SOURCE_URL" '
+# `-S` sorts keys so the bundled JSON has a deterministic model order:
+# OpenRouter returns `.data[]` in a churn-prone recency order, which
+# would otherwise make every regen a giant reshuffle diff instead of
+# just the rows whose price/caps actually changed.
+jq -S --arg t "$fetched_at" --arg src "$SOURCE_URL" '
   {
     fetched_at: $t,
     source: $src,
     models: (
       [.data[]
-        | select(.id | test("^(openai|anthropic|google|minimax)/"))
         | select(.id | test(":free$") | not)
         | select((.pricing.prompt | tonumber) > 0 or (.pricing.completion | tonumber) > 0)
         | { (.id): {
