@@ -34,6 +34,9 @@ tokio-util = { workspace = true }
 # trigger gate so a stale Pass A finishing after Pass B remarked the
 # parent cannot CAS-clear Pass B's mark.
 uuid = { workspace = true }
+# Content-addressed tool-output spill files (`prompts::tool_output`).
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 aura-storage = { workspace = true, features = ["test-support"] }

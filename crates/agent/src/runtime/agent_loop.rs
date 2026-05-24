@@ -863,13 +863,19 @@ impl AgentLoop {
                 }
             };
 
-            // Cap size before wrapping so the truncation notice lands
-            // inside the `<tool_output>` envelope, then wrap so the LLM
-            // sees a clear boundary around untrusted tool output.
-            let capped = self.security_gateway.cap_tool_output(raw_result_text).await;
-            let wrapped = self
-                .security_gateway
-                .wrap_tool_output_for_llm(&tool_call.name, &capped);
+            // Cap size before wrapping so the truncation notice lands inside
+            // the `<tool_output>` envelope. The scan/format split keeps the
+            // injection detector in `aura-security` while the cap + spill +
+            // envelope framing live in `aura-context`; the loop bridges the
+            // two by feeding the scan's rule names into the wrapper.
+            let capped = self.context_manager.cap_tool_output(raw_result_text).await;
+            let warnings = self.security_gateway.detect_injection(&capped);
+            let warning_rules: Vec<&str> = warnings.iter().map(|w| w.rule_name.as_str()).collect();
+            let wrapped = aura_context::prompts::tool_output::wrap_tool_output(
+                &tool_call.name,
+                &capped,
+                &warning_rules,
+            );
 
             // Append tool result to context with the tool_use_id so the
             // LLM can correlate results with their originating calls.

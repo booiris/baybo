@@ -174,13 +174,13 @@ impl InjectionDetector {
             ),
             // Fake tool/output markers
             lit(
-                "<tool_output",
+                aura_model::TOOL_OUTPUT_OPEN_PREFIX,
                 "forged_tool_output",
                 InjectionSeverity::High,
                 "Attempt to forge a tool-output delimiter",
             ),
             lit(
-                "</tool_output",
+                aura_model::TOOL_OUTPUT_CLOSE_PREFIX,
                 "forged_tool_output_close",
                 InjectionSeverity::High,
                 "Attempt to forge a tool-output close tag",

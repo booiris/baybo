@@ -514,12 +514,12 @@ pub async fn build_managers(
     }
 
     // --- security gateway + tool executor
-    let tool_spill_dir =
-        aura_workspace::WorkspacePaths::new(workspace_root.clone()).tool_spills_dir();
-    let security_gateway = Arc::new(
-        SecurityGateway::new(Arc::clone(&leak_detector), Arc::clone(&secret_vault))
-            .with_spill_dir(tool_spill_dir),
-    );
+    // Tool-output spill now lives in `aura-context` (resolved from the
+    // session's workspace handle); the gateway only does scan + sanitize.
+    let security_gateway = Arc::new(SecurityGateway::new(
+        Arc::clone(&leak_detector),
+        Arc::clone(&secret_vault),
+    ));
     let gate_map = channels_registry.approval_gates();
     let sandbox_runner = match aura_sandbox::current_platform_runner() {
         Ok(r) => match r.warm().await {

@@ -3,6 +3,7 @@ pub mod budget;
 pub mod calibration;
 pub mod compressor;
 pub mod error;
+pub mod prompts;
 pub mod tokenizer;
 
 pub use background_summary::{
@@ -432,6 +433,25 @@ impl ContextManager {
         self.messages.push(msg.clone());
         self.per_message_tokens.push(count);
         self.budget.update(self.count_tokens());
+    }
+
+    /// Cap untrusted tool output to the per-result byte budget, spilling the
+    /// full payload under the workspace's tool-spills dir so the truncation
+    /// notice can point the model back at it. The framing primitives live in
+    /// [`crate::prompts::tool_output`]; this method resolves the spill
+    /// location from the manager's own workspace handle. Injection scanning
+    /// and the `<tool_output>` wrap stay separate — the caller runs the
+    /// `aura-security` scan and calls
+    /// [`crate::prompts::tool_output::wrap_tool_output`] with the capped text.
+    pub async fn cap_tool_output(&self, content: String) -> String {
+        use crate::prompts::tool_output;
+        if content.len() <= tool_output::MAX_TOOL_OUTPUT_BYTES {
+            return content;
+        }
+        let spill =
+            tool_output::spill_tool_output(&self.workspace.tool_spills_dir(), content.as_bytes())
+                .await;
+        tool_output::cap_tool_output(content, spill.as_deref())
     }
 
     async fn persist_appended(&self, msg: &ChatMessage) -> Option<i64> {

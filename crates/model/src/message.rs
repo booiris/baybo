@@ -43,6 +43,18 @@ pub enum ContentBlock {
     },
 }
 
+/// Open-tag prefix of the `<tool_output name="...">` envelope the agent wraps
+/// untrusted tool results in before they enter the LLM transcript. Shared so
+/// the wrapper (`aura-context`) and the injection detector's forged-delimiter
+/// rule (`aura-security`) can never disagree on the literal they key off.
+pub const TOOL_OUTPUT_OPEN_PREFIX: &str = "<tool_output";
+
+/// Close-tag prefix (`</tool_output`, without the trailing `>`): the wrapper
+/// neutralises any literal occurrence inside the body so untrusted content
+/// can't forge a boundary back to instructions, and the injection detector
+/// flags forged ones in untrusted input.
+pub const TOOL_OUTPUT_CLOSE_PREFIX: &str = "</tool_output";
+
 /// A single thinking/reasoning content item from the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
