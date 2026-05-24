@@ -752,6 +752,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // Subagent profiles replace Soul wholesale; user / cron /
                 // background-compression spawns pass `None` and inherit
                 // the workspace's resolved Soul.
+                let system_prompt_is_override = system_prompt_override.is_some();
                 let effective_system_prompt =
                     system_prompt_override.unwrap_or_else(|| system_prompt.clone());
 
@@ -776,6 +777,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         session_id: session.id.clone(),
                         sessions: Arc::clone(&sessions),
                         system_prompt: effective_system_prompt,
+                        system_prompt_is_override,
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),

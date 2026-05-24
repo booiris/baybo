@@ -414,12 +414,15 @@ impl AgentLoop {
         // The triggering message was appended by the actor *before* `run`
         // (via `append_user_message` / `append_cron_fire` /
         // `append_subagent_notification`), so the slash check reads it off the
-        // context tail rather than a passed copy. Only a genuine user turn ever
-        // carries a leading `/command`; cron / subagent framing never matches.
+        // context tail. Gate on the message *source*, not just the tail
+        // content: slash invocation only applies to a genuine user turn, so a
+        // future caller whose tail is an agent/cron/tool row can't have a
+        // leading `/` misread as a skill command.
         let user_text = self
             .context_manager
             .messages()
             .last()
+            .filter(|m| m.source() == aura_model::MessageSource::User)
             .map(|m| aura_llm::multimodal::extract_text(&m.content))
             .unwrap_or_default();
         let skills_for_turn = if self.skill_registry.is_empty() {
@@ -1176,6 +1179,18 @@ impl AgentLoop {
     /// roll the row back; `content` is built via
     /// [`aura_context::prompts::subagent::build_notification_content`].
     pub fn append_subagent_notification(&mut self, content: Vec<ContentBlock>) {
+        // Unlike the other append_* helpers this does NOT seed the system
+        // prompt: the caller must have seeded (and snapshotted) *before* this,
+        // so a failed turn's rollback can't drop the system row. Self-seeding
+        // here would append the system row to the tail, after the notification.
+        debug_assert!(
+            self.context_manager
+                .messages()
+                .first()
+                .is_some_and(|m| m.role == Role::System),
+            "append_subagent_notification requires the system prompt already seeded \
+             (call ensure_system_prompt_seeded before snapshotting)"
+        );
         let msg = ChatMessage::agent_context(content);
         self.context_manager.append_in_memory(&msg);
     }

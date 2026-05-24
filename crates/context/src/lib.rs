@@ -204,6 +204,10 @@ pub struct ContextManager {
     /// subagent profile override. Reseed-after-compaction re-reads the
     /// workspace rather than this field, so a profile edit lands on compaction.
     system_prompt: String,
+    /// Whether `system_prompt` is a fixed override (e.g. a subagent profile)
+    /// rather than the workspace soul. Overrides survive compaction; the
+    /// workspace soul is re-read by `reseed_system_row` to pick up edits.
+    system_prompt_is_override: bool,
     /// Boundary the trigger gate measures from. Set to `messages.len()`
     /// after every compression apply and reconstructed from
     /// `session_summaries.cursor` on cold start.
@@ -246,6 +250,10 @@ pub struct ContextManagerConfig {
     /// (assembled via [`crate::prompts::soul::assemble_from_workspace`]) or a
     /// subagent profile override.
     pub system_prompt: String,
+    /// `true` when `system_prompt` is a fixed override (subagent profile) that
+    /// must survive compaction; `false` for the workspace soul (re-read on
+    /// compaction to pick up profile edits).
+    pub system_prompt_is_override: bool,
 }
 
 impl ContextManager {
@@ -269,6 +277,7 @@ impl ContextManager {
             session_id: config.session_id,
             sessions: config.sessions,
             system_prompt: config.system_prompt,
+            system_prompt_is_override: config.system_prompt_is_override,
             last_summary_anchor: None,
             last_synced_cursor: None,
         }
@@ -292,16 +301,22 @@ impl ContextManager {
         &self.system_prompt
     }
 
-    /// Re-read the workspace soul and swap the leading system row in
-    /// `messages` (only when it's already a `Role::System` text block).
-    /// Called from the compaction apply so a profile edit made earlier in the
-    /// conversation lands on the next compaction rather than carrying the
-    /// pre-compaction prompt forward forever. On a read failure the prior row
-    /// is kept. Subagent profile overrides are intentionally *not* preserved
-    /// here — like the prior caller-driven reload, compaction re-reads the
-    /// workspace soul.
-    async fn reseed_system_row(&self, messages: &mut [ChatMessage]) {
-        let first_is_system_text = messages.first().is_some_and(|m| {
+    /// Refresh the leading system row after a *committed* compaction so a
+    /// profile edit made earlier in the conversation lands on the next
+    /// compaction rather than carrying the pre-compaction prompt forward
+    /// forever. Runs after the savings gate + commit (operating on
+    /// `self.messages`, not the candidate) so a grown soul can't skew the
+    /// shrink decision, and a declined apply does no workspace I/O.
+    ///
+    /// A subagent profile override is fixed for the session's life — compaction
+    /// preserved `messages[0]`, so it's left as-is. Only the workspace soul is
+    /// re-read, via [`Self::replace_first_message`] (which re-totals the
+    /// budget for the new prompt size). On a read failure the prior row is kept.
+    async fn reseed_system_row(&mut self) {
+        if self.system_prompt_is_override {
+            return;
+        }
+        let first_is_system_text = self.messages.first().is_some_and(|m| {
             m.role == Role::System && matches!(m.content.first(), Some(ContentBlock::Text(_)))
         });
         if !first_is_system_text {
@@ -309,7 +324,7 @@ impl ContextManager {
         }
         match crate::prompts::soul::assemble_from_workspace(&self.workspace).await {
             Ok(prompt) => {
-                messages[0] = ChatMessage::system(vec![ContentBlock::Text(prompt)]);
+                self.replace_first_message(ChatMessage::system(vec![ContentBlock::Text(prompt)]));
             }
             Err(e) => {
                 tracing::warn!(
@@ -339,12 +354,11 @@ impl ContextManager {
     /// row's content + per-message token cache are touched, and the
     /// budget is re-totalled.
     ///
-    /// Used by the agent loop to refresh the soul system prompt when
-    /// the underlying identity files change on disk. Persistence is
-    /// in-memory only — `session_messages` keeps the originally
-    /// persisted content; the next actor cold start rebuilds the
-    /// prompt from disk anyway, so the staleness is invisible
-    /// downstream.
+    /// Used by [`Self::reseed_system_row`] to refresh the soul system prompt
+    /// after a committed compaction when the identity files changed on disk.
+    /// Persistence is in-memory only — `session_messages` keeps the originally
+    /// persisted content; the next actor cold start re-seeds the prompt from
+    /// disk anyway, so the staleness is invisible downstream.
     ///
     /// No-op if the transcript is empty.
     pub fn replace_first_message(&mut self, msg: ChatMessage) {
@@ -597,11 +611,6 @@ impl ContextManager {
             return Ok(CompressionOutcome::StrategyDeclined);
         }
 
-        // Pick up profile edits: re-read the workspace soul and swap the
-        // preserved system row before re-attaching the skill reminder. This
-        // internalises the old caller-driven reload_soul_after_compaction.
-        self.reseed_system_row(&mut new_messages).await;
-
         // Re-broadcast the authoritative skill list right after the
         // system block. The summary stages discard the historical
         // `<system-reminder>` by construction; the truncate fallback
@@ -664,6 +673,11 @@ impl ContextManager {
         );
 
         self.persist_compaction().await;
+        // Refresh the system row from the workspace soul now that the shrink
+        // decision is committed + persisted — kept out of the savings gate
+        // above so a grown soul can't veto a real compaction, and after
+        // `persist_compaction` so it stays an in-memory-only refresh.
+        self.reseed_system_row().await;
         Ok(CompressionOutcome::Compressed)
     }
 
@@ -1330,6 +1344,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             system_prompt: "test system prompt".to_string(),
+            system_prompt_is_override: true,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -1428,6 +1443,108 @@ mod tests {
         // system + reminder + keep_recent=2 most recent non-system.
         assert_eq!(ctx.messages().len(), 4);
         assert_eq!(ctx.messages()[0].role, Role::System);
+    }
+
+    #[tokio::test]
+    async fn reseed_rereads_grown_workspace_soul_without_vetoing_compaction() {
+        // Regression (#1): the soul re-read happens AFTER the savings gate, on
+        // committed state — never on the candidate before the shrink decision.
+        // A large workspace soul must NOT inflate `after_tokens` and turn a
+        // real truncate compaction into a spurious NoSavings.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = Arc::new(aura_workspace::WorkspacePaths::new(
+            dir.path().to_path_buf(),
+        ));
+        // Distinctive + large: swapping it in before the savings gate (the old
+        // bug) would exceed the one-message truncate savings and veto the apply.
+        let soul_path = workspace.identity_file(aura_workspace::IdentityKind::Soul);
+        std::fs::create_dir_all(soul_path.parent().expect("profile parent")).expect("profile dir");
+        std::fs::write(
+            &soul_path,
+            format!("DISTINCTIVE_SOUL {}", "soul ".repeat(400)),
+        )
+        .expect("write soul");
+
+        let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            tokenizer: Arc::new(SimpleTokenizer),
+            workspace: Arc::clone(&workspace),
+            keep_recent: 2,
+            compression_threshold: 0.75,
+            calibration: Arc::new(TokenCalibration::new()),
+            skill_registry: Arc::new(SkillRegistry::new()),
+            session_id: test_session_id(),
+            sessions: test_sessions(),
+            system_prompt: "small seed".to_string(),
+            system_prompt_is_override: false,
+        });
+        ctx.set_active_model_context_window(100_000);
+        ctx.append(&make_msg(Role::System, "small seed")).await;
+        ctx.append(&make_msg(Role::User, &padded("first"))).await;
+        ctx.append(&make_msg(Role::Assistant, &padded("second")))
+            .await;
+        ctx.append(&make_msg(Role::User, &padded("third"))).await;
+
+        // err_chat → truncate fallback (drops 1 of 3 non-system messages).
+        let outcome = ctx.force_compress("test-model", err_chat).await.unwrap();
+        // Savings gate compared the old (small) soul on both sides, so the real
+        // shrink is honoured rather than vetoed by the large workspace soul.
+        assert!(
+            matches!(outcome, CompressionOutcome::Compressed),
+            "{outcome:?}"
+        );
+        // And the system row was refreshed from the workspace after the commit.
+        match &ctx.messages()[0].content[0] {
+            ContentBlock::Text(t) => assert!(
+                t.contains("DISTINCTIVE_SOUL"),
+                "system row should be re-read from workspace after compaction"
+            ),
+            other => panic!("expected system text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reseed_preserves_subagent_override_across_compaction() {
+        // Regression (#2): a subagent profile override (is_override=true) must
+        // survive compaction — reseed must NOT swap in the workspace soul.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = Arc::new(aura_workspace::WorkspacePaths::new(
+            dir.path().to_path_buf(),
+        ));
+        let soul_path = workspace.identity_file(aura_workspace::IdentityKind::Soul);
+        std::fs::create_dir_all(soul_path.parent().expect("profile parent")).expect("profile dir");
+        std::fs::write(&soul_path, "WORKSPACE_SOUL_SHOULD_NOT_APPEAR").expect("write soul");
+
+        let mut ctx = ContextManager::from_config(ContextManagerConfig {
+            tokenizer: Arc::new(SimpleTokenizer),
+            workspace: Arc::clone(&workspace),
+            keep_recent: 2,
+            compression_threshold: 0.75,
+            calibration: Arc::new(TokenCalibration::new()),
+            skill_registry: Arc::new(SkillRegistry::new()),
+            session_id: test_session_id(),
+            sessions: test_sessions(),
+            system_prompt: "SUBAGENT_PROFILE".to_string(),
+            system_prompt_is_override: true,
+        });
+        ctx.set_active_model_context_window(100_000);
+        ctx.append(&make_msg(Role::System, "SUBAGENT_PROFILE"))
+            .await;
+        ctx.append(&make_msg(Role::User, &padded("first"))).await;
+        ctx.append(&make_msg(Role::Assistant, &padded("second")))
+            .await;
+        ctx.append(&make_msg(Role::User, &padded("third"))).await;
+
+        let outcome = ctx.force_compress("test-model", err_chat).await.unwrap();
+        assert!(
+            matches!(outcome, CompressionOutcome::Compressed),
+            "{outcome:?}"
+        );
+        match &ctx.messages()[0].content[0] {
+            ContentBlock::Text(t) => {
+                assert_eq!(t, "SUBAGENT_PROFILE", "override must survive compaction")
+            }
+            other => panic!("expected system text, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1703,6 +1820,7 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             system_prompt: "test system prompt".to_string(),
+            system_prompt_is_override: true,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
