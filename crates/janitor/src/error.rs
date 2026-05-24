@@ -1,4 +1,3 @@
-use aura_store::StorageError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -9,9 +8,6 @@ pub enum JanitorError {
         #[source]
         source: std::io::Error,
     },
-
-    #[error("blob store: {0}")]
-    Blob(#[from] StorageError),
 }
 
 impl JanitorError {

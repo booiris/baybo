@@ -1,4 +1,3 @@
-mod blob_sweep;
 mod error;
 mod fs_sweep;
 mod sidecar_sweep;
@@ -11,17 +10,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aura_store::{BlobStore, ChannelPairingStore};
+use aura_store::ChannelPairingStore;
 use aura_workspace::WorkspacePaths;
 
 use fs_sweep::{DirSweep, is_log_file, is_session_log, sweep_directory};
 
-const SESSION_LOG_TTL: Duration = Duration::from_secs(3 * 86_400);
-const LOG_FILE_TTL: Duration = Duration::from_secs(14 * 86_400);
-// LRU window for blobs — touched on every successful stat/get/open. A
-// blob whose `last_accessed_at` falls behind this window is reaped on
-// the next sweep.
-const BLOB_TTL: Duration = Duration::from_secs(7 * 86_400);
+const SESSION_LOG_TTL: Duration = Duration::from_secs(15 * 86_400);
+const LOG_FILE_TTL: Duration = Duration::from_secs(30 * 86_400);
 // Pairing approvals — short-lived auth-flow ephemera, kept long enough
 // for the next channel reload to confirm them, then dropped.
 const PAIRING_APPROVAL_TTL: Duration = Duration::from_secs(7 * 86_400);
@@ -50,7 +45,6 @@ const SIDECAR_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct JanitorReport {
     pub session_logs_removed: usize,
     pub log_files_removed: usize,
-    pub blobs_purged: u64,
     pub sidecar_dirs_removed: usize,
     pub pairings_purged: u64,
 }
@@ -68,16 +62,14 @@ pub struct SidecarCache {
 
 pub struct Janitor {
     paths: WorkspacePaths,
-    blobs: Arc<dyn BlobStore>,
     sidecar_cache: Option<SidecarCache>,
     pairings: Option<Arc<dyn ChannelPairingStore>>,
 }
 
 impl Janitor {
-    pub fn new(paths: WorkspacePaths, blobs: Arc<dyn BlobStore>) -> Self {
+    pub fn new(paths: WorkspacePaths) -> Self {
         Self {
             paths,
-            blobs,
             sidecar_cache: None,
             pairings: None,
         }
@@ -133,11 +125,6 @@ impl Janitor {
         }
         report.log_files_removed = logs_total;
 
-        match blob_sweep::purge_old_blobs(&self.blobs, BLOB_TTL).await {
-            Ok(n) => report.blobs_purged = n,
-            Err(e) => tracing::warn!(error = %e, "blob sweep failed"),
-        }
-
         // Pairings get a daily sweep here too so a long-running process
         // that never trips the hourly tick (e.g. heavy load deferring
         // every interval fire) still eventually reaps stale rows.
@@ -148,7 +135,6 @@ impl Janitor {
         tracing::info!(
             session_logs_removed = report.session_logs_removed,
             log_files_removed = report.log_files_removed,
-            blobs_purged = report.blobs_purged,
             pairings_purged = report.pairings_purged,
             "janitor sweep complete",
         );
@@ -247,8 +233,6 @@ mod tests {
     use std::path::Path;
     use std::time::SystemTime;
 
-    use aura_storage::test_support::MemoryBlobStore;
-    use aura_store::BlobStore;
     use tempfile::TempDir;
 
     use super::*;
@@ -296,7 +280,7 @@ mod tests {
         std::fs::write(&other, b"keep").unwrap();
         back_date(&stale, Duration::from_secs(SESSION_LOG_TTL.as_secs() + 60));
 
-        let report = Janitor::new(paths, Arc::new(MemoryBlobStore::new()))
+        let report = Janitor::new(paths)
             .sweep_once()
             .await;
 
@@ -329,7 +313,7 @@ mod tests {
             Duration::from_secs(LOG_FILE_TTL.as_secs() + 60),
         );
 
-        let report = Janitor::new(paths, Arc::new(MemoryBlobStore::new()))
+        let report = Janitor::new(paths)
             .sweep_once()
             .await;
 
@@ -337,34 +321,6 @@ mod tests {
         assert!(!stale_main.exists());
         assert!(fresh_main.exists());
         assert!(!stale_chan.exists());
-    }
-
-    #[tokio::test]
-    async fn blob_sweep_purges_old_blob_rows_via_store_trait() {
-        // Reaches the BlobStore trait through `Arc<dyn BlobStore>` —
-        // same dispatch the gateway uses. The libsql path's
-        // on-disk-unlink behaviour is covered separately in
-        // `crates/storage/src/libsql/blob.rs` tests.
-        let tmp = TempDir::new().unwrap();
-        let paths = workspace_paths(tmp.path());
-
-        let memory = Arc::new(MemoryBlobStore::new());
-        let store: Arc<dyn BlobStore> = Arc::clone(&memory) as _;
-        let _ = store.put(b"fresh", "text/plain", None).await.unwrap();
-
-        // The MemoryBlobStore stamps `created_at = now` on every put and
-        // exposes no clock seam; pass a cutoff well into the future so
-        // the live row is unconditionally older than it.
-        let future_cutoff = chrono::Utc::now().timestamp_micros() + 86_400_000_000;
-        let report = Janitor::new(paths.clone(), Arc::clone(&store))
-            .sweep_once_with_blob_cutoff(future_cutoff)
-            .await;
-        assert_eq!(report.blobs_purged, 1);
-        assert_eq!(memory.len(), 0, "row should be deleted");
-
-        // A second run is idempotent.
-        let report2 = Janitor::new(paths, Arc::clone(&store)).sweep_once().await;
-        assert_eq!(report2.blobs_purged, 0);
     }
 
     #[tokio::test]
@@ -396,7 +352,7 @@ mod tests {
 
         let paths = workspace_paths(tmp.path());
         let live_dirs: HashSet<String> = ["browser-livehash".to_string()].into_iter().collect();
-        let janitor = Janitor::new(paths, Arc::new(MemoryBlobStore::new())).with_sidecar_cache(
+        let janitor = Janitor::new(paths).with_sidecar_cache(
             SidecarCache {
                 cache_root: cache.clone(),
                 live_dirs,
@@ -418,7 +374,7 @@ mod tests {
     async fn sidecar_cache_sweep_is_noop_when_disabled() {
         let tmp = TempDir::new().unwrap();
         let paths = workspace_paths(tmp.path());
-        let n = Janitor::new(paths, Arc::new(MemoryBlobStore::new()))
+        let n = Janitor::new(paths)
             .sweep_sidecar_cache()
             .await;
         assert_eq!(n, 0);
@@ -429,7 +385,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = tmp.path().join("does-not-exist");
         let paths = workspace_paths(tmp.path());
-        let janitor = Janitor::new(paths, Arc::new(MemoryBlobStore::new())).with_sidecar_cache(
+        let janitor = Janitor::new(paths).with_sidecar_cache(
             SidecarCache {
                 cache_root: cache,
                 live_dirs: HashSet::new(),
@@ -442,19 +398,18 @@ mod tests {
     async fn sweep_short_circuits_when_target_dirs_do_not_exist() {
         let tmp = TempDir::new().unwrap();
         let paths = workspace_paths(tmp.path());
-        let report = Janitor::new(paths, Arc::new(MemoryBlobStore::new()))
+        let report = Janitor::new(paths)
             .sweep_once()
             .await;
         assert_eq!(report.session_logs_removed, 0);
         assert_eq!(report.log_files_removed, 0);
-        assert_eq!(report.blobs_purged, 0);
     }
 
     #[tokio::test]
     async fn run_loop_exits_promptly_on_shutdown() {
         let tmp = TempDir::new().unwrap();
         let paths = workspace_paths(tmp.path());
-        let janitor = Janitor::new(paths, Arc::new(MemoryBlobStore::new()));
+        let janitor = Janitor::new(paths);
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
             janitor
@@ -467,16 +422,5 @@ mod tests {
         let _ = tx.send(());
         let outcome = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(outcome.is_ok(), "janitor.run did not honour shutdown");
-    }
-
-    impl Janitor {
-        async fn sweep_once_with_blob_cutoff(&self, cutoff: i64) -> JanitorReport {
-            let mut report = JanitorReport::default();
-            match self.blobs.purge_older_than(cutoff).await {
-                Ok(n) => report.blobs_purged = n,
-                Err(e) => tracing::warn!(error = %e, "test blob sweep failed"),
-            }
-            report
-        }
     }
 }
