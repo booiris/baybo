@@ -445,13 +445,13 @@ impl ContextManager {
     /// the transcript, so any args remain visible.
     pub async fn expand_slash_command(&mut self) {
         if let Some((skill_name, msg)) = self.slash_expansion_message() {
-            // Track it like an LLM-issued `Skill` call. If this turn trips a
-            // live-LLM-summary compression (the stage a first compaction always
-            // takes — no `summary.md` yet — and which keeps no recent slice),
-            // the body row is folded into the paraphrased summary; the skill
-            // trailer then re-broadcasts the full definition only for names in
-            // `called_skills`. Without this the model would act on the
-            // `/command` having lost the skill's instructions.
+            // Record eagerly so a compaction *this turn* (before any rebuild)
+            // re-broadcasts the definition via the skill trailer — the body
+            // row carries no `ToolUse` for `scan_skill_calls` to find, and a
+            // live-LLM-summary pass (a first compaction's only option — no
+            // `summary.md` yet, no recent slice kept) folds it into the
+            // summary. Later compactions + cold-start restore re-derive it
+            // durably from the persisted `/command` row (`called_skills_in`).
             push_called_skill(&mut self.called_skills, &skill_name);
             self.append(&msg).await;
         }
@@ -475,6 +475,31 @@ impl ContextManager {
             skill_name,
             ChatMessage::agent_context(vec![ContentBlock::Text(body)]),
         ))
+    }
+
+    /// Rebuild the called-skills list from a transcript slice: `ToolUse`
+    /// skill calls (via [`scan_skill_calls`]) plus slash invocations
+    /// re-derived from any surviving `/command` user rows. The latter keeps a
+    /// slash-invoked skill tracked as durably as an LLM-issued one — its
+    /// agent-context body carries no `ToolUse` for `scan_skill_calls` to find,
+    /// but the user's literal `/command` row is persisted, so the skill trailer
+    /// can still re-broadcast the definition right up until that row is folded
+    /// into a summary. Used by both transcript-replacing paths
+    /// ([`Self::restore_messages`], the compaction apply); the in-turn
+    /// `expand_slash_command` still records eagerly for a same-turn compaction.
+    fn called_skills_in(&self, messages: &[ChatMessage]) -> Vec<String> {
+        let mut called = scan_skill_calls(messages);
+        let summaries = self.invocable_skill_summaries();
+        for msg in messages {
+            if msg.source() != aura_model::MessageSource::User {
+                continue;
+            }
+            let text = aura_llm::multimodal::extract_text(&msg.content);
+            if let Some((name, _)) = detect_slash_invocation(&text, &summaries) {
+                push_called_skill(&mut called, &name);
+            }
+        }
+        called
     }
 
     /// Number of messages currently in the transcript.
@@ -533,7 +558,7 @@ impl ContextManager {
             .iter()
             .map(|m| self.tokenizer.count_message(m))
             .collect();
-        self.called_skills = scan_skill_calls(&messages);
+        self.called_skills = self.called_skills_in(&messages);
         self.messages = messages;
         self.invalidate_baseline();
         self.budget.update(self.calibrate(self.raw_estimate()));
@@ -851,11 +876,12 @@ impl ContextManager {
 
         self.messages = new_messages;
         self.per_message_tokens = new_per_message;
-        // Rebuild called_skills from the freshly-applied slice: a
-        // successful summary leaves it empty (the trailer carries
-        // plain text, no `ToolUse`), and a Truncate apply scopes it
-        // to whatever's still in the kept tail.
-        self.called_skills = scan_skill_calls(&self.messages);
+        // Rebuild called_skills from the freshly-applied slice: a summary
+        // that folds away every `Skill` ToolUse and `/command` row leaves it
+        // empty (the trailer carries plain text), and a Truncate apply scopes
+        // it to whatever calls — ToolUse or slash — survived in the kept tail.
+        let rebuilt = self.called_skills_in(&self.messages);
+        self.called_skills = rebuilt;
         self.budget.update(after_tokens);
         // Post-compression transcript counts as fully covered;
         // anchoring at len() avoids a degenerate retrigger from the
@@ -2187,6 +2213,46 @@ mod tests {
         ctx.append(&skill_call("baz")).await;
 
         assert_eq!(ctx.called_skills, vec!["foo", "bar", "baz"]);
+    }
+
+    fn registry_with_slash_skill() -> Arc<SkillRegistry> {
+        let registry = Arc::new(SkillRegistry::new());
+        let mut skill = mk_skill("weather", "WEATHER_BODY");
+        skill.command = Some("wx".into());
+        registry.register(skill);
+        registry
+    }
+
+    /// On cold-start restore a slash skill must be re-derived from its
+    /// persisted `/command` row: the injected body carries no `ToolUse`, so
+    /// without re-derivation a rehydrated actor drops it from `called_skills`
+    /// and a later compaction can't re-broadcast the definition.
+    #[tokio::test]
+    async fn restore_messages_rederives_slash_skill_from_command_row() {
+        let mut ctx = make_ctx_with_registry(registry_with_slash_skill(), 5, 100_000, 0.75);
+        ctx.restore_messages(vec![
+            make_msg(Role::System, "sys"),
+            ChatMessage::user(vec![ContentBlock::Text("/wx today".into())]),
+            ChatMessage::agent_context(vec![ContentBlock::Text("WEATHER_BODY".into())]),
+        ]);
+        assert_eq!(
+            ctx.called_skills,
+            vec!["weather"],
+            "slash skill re-derived from the persisted /command row"
+        );
+    }
+
+    /// `called_skills_in` unions `ToolUse` skill calls with slash invocations
+    /// re-derived from `/command` rows (deduped), so the compaction rebuild
+    /// tracks both kinds as long as their call survives in the transcript.
+    #[tokio::test]
+    async fn called_skills_in_unions_tooluse_and_slash() {
+        let ctx = make_ctx_with_registry(registry_with_slash_skill(), 5, 100_000, 0.75);
+        let msgs = vec![
+            skill_call("foo"),
+            ChatMessage::user(vec![ContentBlock::Text("/wx now".into())]),
+        ];
+        assert_eq!(ctx.called_skills_in(&msgs), vec!["foo", "weather"]);
     }
 
     /// `record_skill_calls` must ignore `ToolUse` blocks for non-Skill
