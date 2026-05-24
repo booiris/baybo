@@ -308,6 +308,14 @@ impl ContextManager {
         &self.messages
     }
 
+    /// The transcript shaped for an LLM request: adjacent same-role
+    /// user/assistant rows coalesced (see [`merge_for_llm`]) so providers that
+    /// require strict alternation accept it. An owned snapshot — the stored
+    /// transcript keeps each row separate.
+    pub fn messages_for_llm(&self) -> Vec<ChatMessage> {
+        merge_for_llm(&self.messages)
+    }
+
     /// Resolve the system prompt to seed the leading `Role::System` row. The
     /// agent loop awaits this on a fresh session. Falls back to a minimal
     /// prompt only if resolution fails outright (a missing subagent profile or
@@ -378,6 +386,10 @@ impl ContextManager {
     /// Idempotent and cheap on the hot path — the leading-system check
     /// short-circuits before the (file-reading) prompt resolution, so only a
     /// fresh session pays for the resolve.
+    ///
+    /// The skill reminder rides as a `Role::User` `agent_context` row, not a
+    /// `system` row — some providers reject `system` outside the leading slot;
+    /// `merge_for_llm` folds it into the first real user message.
     pub async fn ensure_seeded(&mut self) {
         if self
             .messages
@@ -618,6 +630,41 @@ impl ContextManager {
                 error = %e,
                 "failed to append session message log"
             );
+        }
+    }
+
+    /// Assemble + append an LLM-call record to the session JSONL log. No-op
+    /// without a logger. The owning `AgentLoop` calls this on its LLM-call path
+    /// with the call's request/outcome + the model info from its `GuardedLlm`
+    /// (which context doesn't hold) — so the record format + the write live
+    /// here, while the model identity stays the agent's to supply.
+    pub async fn log_llm_call(
+        &self,
+        request: &ChatRequest,
+        outcome: LlmCallOutcome,
+        provider: &str,
+        model: &str,
+    ) {
+        let Some(logger) = &self.session_log else {
+            return;
+        };
+        let request = match LlmRequestMeta::from_request(request) {
+            Ok(meta) => meta,
+            Err(e) => {
+                warn!(error = %e, "failed to summarize llm request for session log");
+                return;
+            }
+        };
+        let record = LlmCallRecord {
+            timestamp: chrono::Utc::now(),
+            session_id: self.session_id.clone(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            request,
+            outcome,
+        };
+        if let Err(e) = logger.log_llm_call(&record).await {
+            warn!(error = %e, "failed to append session llm log");
         }
     }
 
@@ -1242,6 +1289,160 @@ pub fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
         record_skill_calls(&mut out, msg);
     }
     out
+}
+
+/// Coalesce adjacent same-role user/assistant messages into a single
+/// message so providers that require strict user/assistant alternation
+/// (e.g. some Gemini / Mistral configurations) accept the request.
+///
+/// `Role::System` and `Role::Tool` are passed through untouched — system
+/// messages are typically extracted to a dedicated field by the provider
+/// adapter, and tool-result messages must remain individually addressable
+/// by their `tool_use_id`.
+///
+/// When two adjacent user/assistant messages are merged, the merge also
+/// flattens trailing/leading `ContentBlock::Text` blocks across the
+/// boundary into a single text block (joined with `\n\n`). Non-text
+/// blocks (images, tool_use, tool_result, thinking) are appended as-is so
+/// signatures, IDs, and modality data are preserved verbatim.
+fn merge_for_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let mergeable = matches!(msg.role, Role::User | Role::Assistant);
+        match out.last_mut() {
+            Some(last) if mergeable && last.role == msg.role => {
+                for block in &msg.content {
+                    let folded = matches!(block, ContentBlock::Text(_))
+                        && matches!(last.content.last(), Some(ContentBlock::Text(_)));
+                    if folded {
+                        if let (Some(ContentBlock::Text(prev_t)), ContentBlock::Text(cur_t)) =
+                            (last.content.last_mut(), block)
+                        {
+                            if !prev_t.is_empty() && !cur_t.is_empty() {
+                                prev_t.push_str("\n\n");
+                            }
+                            prev_t.push_str(cur_t);
+                        }
+                    } else {
+                        last.content.push(block.clone());
+                    }
+                }
+            }
+            _ => out.push(msg.clone()),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod merge_for_llm_tests {
+    use super::merge_for_llm;
+    use aura_model::{BlobRef, ChatMessage, ContentBlock, Role};
+
+    fn text(role: Role, body: &str) -> ChatMessage {
+        let content = vec![ContentBlock::Text(body.into())];
+        match role {
+            Role::User => ChatMessage::agent_context(content),
+            Role::Assistant => ChatMessage::assistant(content),
+            Role::System => ChatMessage::system(content),
+            Role::Tool => ChatMessage::tool(content),
+        }
+    }
+
+    fn img() -> ContentBlock {
+        ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: "sha256:abc".into(),
+            },
+            mime_type: "image/png".into(),
+        }
+    }
+
+    #[test]
+    fn passthrough_when_alternating() {
+        let msgs = vec![
+            text(Role::System, "sys"),
+            text(Role::User, "u1"),
+            text(Role::Assistant, "a1"),
+            text(Role::User, "u2"),
+        ];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out, msgs);
+    }
+
+    #[test]
+    fn merges_consecutive_user_text() {
+        let msgs = vec![text(Role::User, "reminder"), text(Role::User, "hello")];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, Role::User);
+        assert_eq!(out[0].content.len(), 1);
+        match &out[0].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "reminder\n\nhello"),
+            other => panic!("expected merged text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merges_consecutive_assistant_text() {
+        let msgs = vec![text(Role::Assistant, "a"), text(Role::Assistant, "b")];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 1);
+        match &out[0].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "a\n\nb"),
+            other => panic!("expected merged text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keeps_non_text_blocks_separate() {
+        let msgs = vec![
+            ChatMessage::agent_context(vec![ContentBlock::Text("hi".into()), img()]),
+            ChatMessage::agent_context(vec![ContentBlock::Text("more".into())]),
+        ];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 1);
+        // hi, image, more — image keeps the text blocks from folding across it.
+        assert_eq!(out[0].content.len(), 3);
+        match &out[0].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "hi"),
+            other => panic!("unexpected first block {other:?}"),
+        }
+        assert!(matches!(out[0].content[1], ContentBlock::Image { .. }));
+        match &out[0].content[2] {
+            ContentBlock::Text(t) => assert_eq!(t, "more"),
+            other => panic!("unexpected third block {other:?}"),
+        }
+    }
+
+    #[test]
+    fn does_not_merge_system_or_tool() {
+        let msgs = vec![
+            text(Role::System, "s1"),
+            text(Role::System, "s2"),
+            ChatMessage::tool_result("1".into(), "r1".into()),
+            ChatMessage::tool_result("2".into(), "r2".into()),
+        ];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn preserves_assistant_tool_use_then_tool_result() {
+        let assistant = ChatMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "Foo".into(),
+            input: serde_json::json!({}),
+            signature: None,
+        }]);
+        let tool = ChatMessage::tool_result("t1".into(), "ok".into());
+        let msgs = vec![text(Role::User, "hi"), assistant.clone(), tool.clone()];
+        let out = merge_for_llm(&msgs);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1], assistant);
+        assert_eq!(out[2], tool);
+    }
 }
 
 /// Parse a leading `/command` against the invocable skill set, returning the

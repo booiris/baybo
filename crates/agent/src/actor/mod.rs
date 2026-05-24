@@ -570,18 +570,11 @@ impl AgentActor {
     /// reply is suppressed.
     async fn run_subagent_notification(&mut self) {
         // Establish the system prompt before the snapshot below. It is
-        // persisted by `ensure_system_prompt`, so if the snapshot were taken
-        // before it (on a fresh session the prior context is empty), a
-        // rollback would drop the just-persisted system row in-memory and the
-        // next retry would re-seed and re-persist it. Idempotent mid-session.
-        if let Err(e) = self.volatile.agent_loop.ensure_system_prompt_seeded().await {
-            error!(
-                session_id = %self.durable.session.id,
-                error = %e,
-                "failed to seed system prompt for subagent notification; deferring to next retry"
-            );
-            return;
-        }
+        // persisted by `ensure_seeded`, so if the snapshot were taken before it
+        // (on a fresh session the prior context is empty), a rollback would drop
+        // the just-persisted system row in-memory and the next retry would
+        // re-seed and re-persist it. Idempotent mid-session, and infallible.
+        self.volatile.agent_loop.ensure_system_prompt_seeded().await;
         // Take the results but keep them in hand: the turn below is
         // fallible (provider error, cost rejection, cancellation), and a
         // delivered completion must not be lost if it fails. The actor is

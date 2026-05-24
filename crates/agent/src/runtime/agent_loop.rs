@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 use crate::runtime::compression::CompressionRunner;
 use crate::runtime::error_recovery::ErrorHandler;
 use crate::runtime::scope::JobSpec;
-use aura_context::{LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta};
+use aura_context::{LlmCallOutcome, LlmResponseMeta};
 
 use crate::runtime::tool_executor::ToolExecutor;
 use crate::security::SecurityGateway;
@@ -308,8 +308,8 @@ impl AgentLoop {
     /// context for rollback — otherwise a rollback on a fresh session would
     /// drop the just-persisted system row in-memory and the next retry would
     /// re-seed and re-persist it.
-    pub async fn ensure_system_prompt_seeded(&mut self) -> anyhow::Result<()> {
-        self.ensure_system_prompt().await
+    pub async fn ensure_system_prompt_seeded(&mut self) {
+        self.context_manager.ensure_seeded().await;
     }
 
     /// Run the main conversation loop for a single user message.
@@ -379,7 +379,7 @@ impl AgentLoop {
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
         let _ = job_lifecycle;
-        self.ensure_system_prompt().await?;
+        self.context_manager.ensure_seeded().await;
 
         // Bound to the *outer* delta_tx, not iter_delta_tx — notices
         // need to reach the channel on iter-2+ where streaming is
@@ -570,7 +570,7 @@ impl AgentLoop {
             // channel adapter can stamp it onto the live `Frame::Message`
             // and reconnecting clients advance their cursor past it.
             let assistant_msg = ChatMessage::assistant(response_blocks);
-            let ordinal = self.append_context_message(&assistant_msg).await?;
+            let ordinal = self.context_manager.append(&assistant_msg).await;
 
             return Ok(IterationOutcome::Final(OutgoingMessage {
                 session_id: session.id.clone(),
@@ -607,7 +607,7 @@ impl AgentLoop {
             accumulated_tool_uses.push(block);
         }
         let assistant_msg = ChatMessage::assistant(assistant_blocks);
-        self.append_context_message(&assistant_msg).await?;
+        self.context_manager.append(&assistant_msg).await;
 
         // Execute tool calls concurrently. Approved resources are shared
         // via a Mutex so concurrent calls see each other's grants
@@ -731,7 +731,7 @@ impl AgentLoop {
             // Append tool result to context with the tool_use_id so the
             // LLM can correlate results with their originating calls.
             let tool_msg = ChatMessage::tool_result(tool_call.id.clone(), wrapped);
-            self.append_context_message(&tool_msg).await?;
+            self.context_manager.append(&tool_msg).await;
 
             // ToolResult.content is text-only; provider adapters
             // serialize it as plain text. To get images back into the
@@ -749,7 +749,7 @@ impl AgentLoop {
                 )));
                 content.extend(llm_visible_images);
                 let image_msg = ChatMessage::agent_context(content);
-                self.append_context_message(&image_msg).await?;
+                self.context_manager.append(&image_msg).await;
             }
         }
 
@@ -828,7 +828,7 @@ impl AgentLoop {
         // user prompt, assistant turn — stays separately inspectable.
         // Merging is a transport concern, not a storage one.
         let request = ChatRequest {
-            messages: merge_for_llm(self.context_manager.messages()),
+            messages: self.context_manager.messages_for_llm(),
             temperature: None,
             tools: tool_defs,
         };
@@ -878,7 +878,6 @@ impl AgentLoop {
                         // code blocks, and lists are unaffected.
                         trim_response_text_edges(&mut response);
                         self.write_session_log(
-                            session,
                             &request,
                             LlmCallOutcome::Ok {
                                 response: LlmResponseMeta::from_response(&response),
@@ -918,7 +917,6 @@ impl AgentLoop {
                             .await
                             .unwrap_or(raw);
                         self.write_session_log(
-                            session,
                             &request,
                             LlmCallOutcome::Err {
                                 error: log_msg,
@@ -970,59 +968,31 @@ impl AgentLoop {
         .await
     }
 
-    /// Append a single LLM call record to the per-session JSONL log.
-    /// No-op when no logger is configured. Failures are logged at warn
-    /// and swallowed — log persistence must never block a turn.
-    async fn write_session_log(
-        &self,
-        session: &Session,
-        request: &ChatRequest,
-        outcome: LlmCallOutcome,
-    ) {
-        let Some(logger) = self.context_manager.session_log() else {
-            return;
-        };
+    /// Log a single LLM call to the per-session JSONL log. Context owns the
+    /// logger + record format and assembles + writes it; the agent only
+    /// supplies the model identity (from its `GuardedLlm`, which context
+    /// doesn't hold) plus the call's request + outcome.
+    async fn write_session_log(&self, request: &ChatRequest, outcome: LlmCallOutcome) {
         let info = self.llm_client.model_info();
-        let request = match LlmRequestMeta::from_request(request) {
-            Ok(meta) => meta,
-            Err(e) => {
-                warn!(error = %e, "failed to summarize llm request for session log");
-                return;
-            }
-        };
-        let record = LlmCallRecord {
-            timestamp: chrono::Utc::now(),
-            session_id: session.id.clone(),
-            provider: info.provider.clone(),
-            model: info.id.clone(),
-            request,
-            outcome,
-        };
-        if let Err(e) = logger.log_llm_call(&record).await {
-            warn!(error = %e, "failed to append session llm log");
-        }
-    }
-
-    async fn append_context_message(
-        &mut self,
-        message: &ChatMessage,
-    ) -> anyhow::Result<Option<i64>> {
-        Ok(self.context_manager.append(message).await)
+        self.context_manager
+            .log_llm_call(request, outcome, &info.provider, &info.id)
+            .await;
     }
 
     /// Append a user-authored message to this session's transcript — both the
     /// in-memory context and the persisted `session_messages` log — ahead
     /// of the turn that runs next. Lets the actor coalesce a burst of user
     /// messages into one turn while keeping each as its own transcript row;
-    /// `merge_for_llm` collapses the consecutive rows for the provider call.
+    /// context's `messages_for_llm` collapses the consecutive rows for the
+    /// provider call.
     pub async fn append_user_message(&mut self, content: Vec<ContentBlock>) -> anyhow::Result<()> {
         // A coalesced burst can be the first thing a fresh session ever
         // appends; seed the system prompt first so it never lands *after*
         // user content. `ensure_seeded` keys off `messages[0]`, so a leading
         // user row would otherwise make every later turn re-seed.
-        self.ensure_system_prompt().await?;
+        self.context_manager.ensure_seeded().await;
         let msg = ChatMessage::user(content);
-        self.append_context_message(&msg).await?;
+        self.context_manager.append(&msg).await;
         Ok(())
     }
 
@@ -1033,10 +1003,10 @@ impl AgentLoop {
     /// row. Seeds the system prompt first so a fresh cron session never lands
     /// the fire ahead of `messages[0]`.
     pub async fn append_cron_fire(&mut self, job_id: &str, prompt: &str) -> anyhow::Result<()> {
-        self.ensure_system_prompt().await?;
+        self.context_manager.ensure_seeded().await;
         let framed = aura_context::prompts::cron::frame_cron_prompt(job_id, prompt);
         let msg = ChatMessage::cron_fire(vec![ContentBlock::Text(framed)]);
-        self.append_context_message(&msg).await?;
+        self.context_manager.append(&msg).await;
         Ok(())
     }
 
@@ -1046,9 +1016,9 @@ impl AgentLoop {
         &mut self,
         content: Vec<ContentBlock>,
     ) -> anyhow::Result<()> {
-        self.ensure_system_prompt().await?;
+        self.context_manager.ensure_seeded().await;
         let msg = ChatMessage::agent_context(content);
-        self.append_context_message(&msg).await?;
+        self.context_manager.append(&msg).await;
         Ok(())
     }
 
@@ -1534,27 +1504,6 @@ impl AgentLoop {
 
         result
     }
-
-    /// Seed the transcript with the soul system prompt and — once,
-    /// adjacent to it — the authoritative skill reminder. Both are
-    /// idempotent on the leading-system check: if `messages[0]` is
-    /// already a system row, this is a no-op (restored sessions keep
-    /// whatever they persisted; compression re-attaches the reminder
-    /// via [`aura_context::insert_skill_trailer`] when the kept slice
-    /// drops it).
-    ///
-    /// The reminder rides as `Role::User` because some providers reject
-    /// `system` outside the leading slot; `merge_for_llm` folds it into
-    /// the first real user message before dispatch. Placing it here
-    /// (rather than per-turn after each user message) keeps the model's
-    /// "what skills are available" context adjacent to its instructions
-    /// and avoids appending a fresh reminder row every turn.
-    async fn ensure_system_prompt(&mut self) -> anyhow::Result<()> {
-        // Context owns the seed: resolve the prompt, render the skill reminder,
-        // persist + JSONL-log the rows. Idempotent — a seeded session is a no-op.
-        self.context_manager.ensure_seeded().await;
-        Ok(())
-    }
 }
 
 /// Strip leading/trailing whitespace from the LLM response's text fields.
@@ -1582,49 +1531,6 @@ fn trim_response_text_edges(response: &mut LlmResponse) {
             }
         }
     }
-}
-
-/// Coalesce adjacent same-role user/assistant messages into a single
-/// message so providers that require strict user/assistant alternation
-/// (e.g. some Gemini / Mistral configurations) accept the request.
-///
-/// `Role::System` and `Role::Tool` are passed through untouched — system
-/// messages are typically extracted to a dedicated field by the provider
-/// adapter, and tool-result messages must remain individually addressable
-/// by their `tool_use_id`.
-///
-/// When two adjacent user/assistant messages are merged, the merge also
-/// flattens trailing/leading `ContentBlock::Text` blocks across the
-/// boundary into a single text block (joined with `\n\n`). Non-text
-/// blocks (images, tool_use, tool_result, thinking) are appended as-is so
-/// signatures, IDs, and modality data are preserved verbatim.
-fn merge_for_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
-    for msg in messages {
-        let mergeable = matches!(msg.role, Role::User | Role::Assistant);
-        match out.last_mut() {
-            Some(last) if mergeable && last.role == msg.role => {
-                for block in &msg.content {
-                    let folded = matches!(block, ContentBlock::Text(_))
-                        && matches!(last.content.last(), Some(ContentBlock::Text(_)));
-                    if folded {
-                        if let (Some(ContentBlock::Text(prev_t)), ContentBlock::Text(cur_t)) =
-                            (last.content.last_mut(), block)
-                        {
-                            if !prev_t.is_empty() && !cur_t.is_empty() {
-                                prev_t.push_str("\n\n");
-                            }
-                            prev_t.push_str(cur_t);
-                        }
-                    } else {
-                        last.content.push(block.clone());
-                    }
-                }
-            }
-            _ => out.push(msg.clone()),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1942,116 +1848,5 @@ mod trim_response_text_edges_tests {
             ContentBlock::Text(t) => assert_eq!(t, body),
             other => panic!("expected text, got {other:?}"),
         }
-    }
-}
-
-#[cfg(test)]
-mod merge_for_llm_tests {
-    use super::merge_for_llm;
-    use aura_model::{BlobRef, ChatMessage, ContentBlock, Role};
-
-    fn text(role: Role, body: &str) -> ChatMessage {
-        let content = vec![ContentBlock::Text(body.into())];
-        match role {
-            Role::User => ChatMessage::agent_context(content),
-            Role::Assistant => ChatMessage::assistant(content),
-            Role::System => ChatMessage::system(content),
-            Role::Tool => ChatMessage::tool(content),
-        }
-    }
-
-    fn img() -> ContentBlock {
-        ContentBlock::Image {
-            blob: BlobRef {
-                blob_id: "sha256:abc".into(),
-            },
-            mime_type: "image/png".into(),
-        }
-    }
-
-    #[test]
-    fn passthrough_when_alternating() {
-        let msgs = vec![
-            text(Role::System, "sys"),
-            text(Role::User, "u1"),
-            text(Role::Assistant, "a1"),
-            text(Role::User, "u2"),
-        ];
-        let out = merge_for_llm(&msgs);
-        assert_eq!(out.len(), 4);
-        assert_eq!(out, msgs);
-    }
-
-    #[test]
-    fn merges_consecutive_user_text() {
-        let msgs = vec![text(Role::User, "reminder"), text(Role::User, "hello")];
-        let out = merge_for_llm(&msgs);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].role, Role::User);
-        assert_eq!(out[0].content.len(), 1);
-        match &out[0].content[0] {
-            ContentBlock::Text(t) => assert_eq!(t, "reminder\n\nhello"),
-            other => panic!("expected merged text, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn merges_consecutive_assistant_text() {
-        let msgs = vec![text(Role::Assistant, "a"), text(Role::Assistant, "b")];
-        let out = merge_for_llm(&msgs);
-        assert_eq!(out.len(), 1);
-        match &out[0].content[0] {
-            ContentBlock::Text(t) => assert_eq!(t, "a\n\nb"),
-            other => panic!("expected merged text, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn keeps_non_text_blocks_separate() {
-        let msgs = vec![
-            ChatMessage::agent_context(vec![ContentBlock::Text("hi".into()), img()]),
-            ChatMessage::agent_context(vec![ContentBlock::Text("more".into())]),
-        ];
-        let out = merge_for_llm(&msgs);
-        assert_eq!(out.len(), 1);
-        // hi, image, more — image keeps the text blocks from folding across it.
-        assert_eq!(out[0].content.len(), 3);
-        match &out[0].content[0] {
-            ContentBlock::Text(t) => assert_eq!(t, "hi"),
-            other => panic!("unexpected first block {other:?}"),
-        }
-        assert!(matches!(out[0].content[1], ContentBlock::Image { .. }));
-        match &out[0].content[2] {
-            ContentBlock::Text(t) => assert_eq!(t, "more"),
-            other => panic!("unexpected third block {other:?}"),
-        }
-    }
-
-    #[test]
-    fn does_not_merge_system_or_tool() {
-        let msgs = vec![
-            text(Role::System, "s1"),
-            text(Role::System, "s2"),
-            ChatMessage::tool_result("1".into(), "r1".into()),
-            ChatMessage::tool_result("2".into(), "r2".into()),
-        ];
-        let out = merge_for_llm(&msgs);
-        assert_eq!(out.len(), 4);
-    }
-
-    #[test]
-    fn preserves_assistant_tool_use_then_tool_result() {
-        let assistant = ChatMessage::assistant(vec![ContentBlock::ToolUse {
-            id: "t1".into(),
-            name: "Foo".into(),
-            input: serde_json::json!({}),
-            signature: None,
-        }]);
-        let tool = ChatMessage::tool_result("t1".into(), "ok".into());
-        let msgs = vec![text(Role::User, "hi"), assistant.clone(), tool.clone()];
-        let out = merge_for_llm(&msgs);
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[1], assistant);
-        assert_eq!(out[2], tool);
     }
 }
