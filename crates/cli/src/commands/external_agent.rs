@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use aura_agent::external_agent::{
     ExternalAgentError, claude_cli::ClaudeCliAgent, codex_cli::CodexCliAgent,
+    gemini_cli::GeminiCliAgent,
 };
 use aura_config::AuraConfig;
 use aura_model::ExternalAgentKind;
@@ -110,6 +111,10 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
             new_config.external_agents.codex.enabled = true;
             new_config.external_agents.codex.binary_path = binary_path.clone();
         }
+        ExternalAgentKind::Gemini => {
+            new_config.external_agents.gemini.enabled = true;
+            new_config.external_agents.gemini.binary_path = binary_path.clone();
+        }
     }
 
     // If multiple kinds are enabled after this write and no default
@@ -181,6 +186,10 @@ fn describe_kind(ctx: &CommandContext, kind: ExternalAgentKind) -> StatusRow {
             ctx.config.external_agents.codex.enabled,
             ctx.config.external_agents.codex.binary_path.clone(),
         ),
+        ExternalAgentKind::Gemini => (
+            ctx.config.external_agents.gemini.enabled,
+            ctx.config.external_agents.gemini.binary_path.clone(),
+        ),
     };
     let probe = match probe(kind, configured_path.as_deref()) {
         Ok(resolved_path) => ProbeOutcome::Ok { resolved_path },
@@ -209,6 +218,10 @@ fn probe(
         }
         ExternalAgentKind::Codex => {
             let agent = CodexCliAgent::probe_and_build(binary_path)?;
+            Ok(agent.binary_path().display().to_string())
+        }
+        ExternalAgentKind::Gemini => {
+            let agent = GeminiCliAgent::probe_and_build(binary_path)?;
             Ok(agent.binary_path().display().to_string())
         }
     }

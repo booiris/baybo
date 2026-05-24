@@ -17,15 +17,17 @@ use serde::{Deserialize, Serialize};
 pub enum ExternalAgentKind {
     Claude,
     Codex,
+    Gemini,
 }
 
 impl ExternalAgentKind {
-    pub const ALL: &'static [ExternalAgentKind] = &[Self::Claude, Self::Codex];
+    pub const ALL: &'static [ExternalAgentKind] = &[Self::Claude, Self::Codex, Self::Gemini];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -34,6 +36,7 @@ impl ExternalAgentKind {
         match self {
             Self::Claude => "Claude Code (claude)",
             Self::Codex => "Codex (codex)",
+            Self::Gemini => "Gemini CLI (gemini)",
         }
     }
 
@@ -42,6 +45,7 @@ impl ExternalAgentKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Gemini => "gemini",
         }
     }
 

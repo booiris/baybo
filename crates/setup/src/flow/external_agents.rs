@@ -1,11 +1,12 @@
-//! External-agent quick-setup. Probes `claude` + `codex` on PATH, then
-//! shows the detected ones in a single multi-select so the operator
-//! enables the set they want in one pass; if more than one ends up
-//! enabled, prompts for the default. Records each enabled agent's
-//! discovered binary path.
+//! External-agent quick-setup. Probes `claude` + `codex` + `gemini` on
+//! PATH, then shows the detected ones in a single multi-select so the
+//! operator enables the set they want in one pass; if more than one
+//! ends up enabled, prompts for the default. Records each enabled
+//! agent's discovered binary path.
 
 use aura_agent::external_agent::claude_cli::ClaudeCliAgent;
 use aura_agent::external_agent::codex_cli::CodexCliAgent;
+use aura_agent::external_agent::gemini_cli::GeminiCliAgent;
 use aura_config::AuraConfig;
 use aura_model::ExternalAgentKind;
 
@@ -34,7 +35,7 @@ fn select_and_apply<P: Prompter>(
     detected: Vec<Detected>,
 ) -> Result<ExternalAgentsStepOutcome> {
     if detected.is_empty() {
-        eprintln!("No external agents (`claude`, `codex`) found on PATH; skipping.");
+        eprintln!("No external agents (`claude`, `codex`, `gemini`) found on PATH; skipping.");
         return Ok(ExternalAgentsStepOutcome::default());
     }
 
@@ -123,6 +124,9 @@ fn probe(kind: ExternalAgentKind) -> Option<String> {
         ExternalAgentKind::Codex => CodexCliAgent::probe_and_build(None)
             .ok()
             .map(|a| a.binary_path().display().to_string()),
+        ExternalAgentKind::Gemini => GeminiCliAgent::probe_and_build(None)
+            .ok()
+            .map(|a| a.binary_path().display().to_string()),
     }
 }
 
@@ -130,6 +134,7 @@ fn is_enabled(config: &AuraConfig, kind: ExternalAgentKind) -> bool {
     match kind {
         ExternalAgentKind::Claude => config.external_agents.claude.enabled,
         ExternalAgentKind::Codex => config.external_agents.codex.enabled,
+        ExternalAgentKind::Gemini => config.external_agents.gemini.enabled,
     }
 }
 
@@ -142,6 +147,10 @@ fn apply_enable(config: &mut AuraConfig, d: &Detected, on: bool) {
         ExternalAgentKind::Codex => (
             &mut config.external_agents.codex.enabled,
             &mut config.external_agents.codex.binary_path,
+        ),
+        ExternalAgentKind::Gemini => (
+            &mut config.external_agents.gemini.enabled,
+            &mut config.external_agents.gemini.binary_path,
         ),
     };
     *enabled = on;

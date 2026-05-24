@@ -38,7 +38,7 @@ pub use crate::channels::{
 };
 pub use crate::cost::{CostConfig, RateLimitConfig, SpendingLimitsConfig};
 pub use crate::error::{ConfigError, Result, ValidationError};
-pub use crate::external_agents::{ClaudeConfig, CodexConfig, ExternalAgentsConfig};
+pub use crate::external_agents::{ClaudeConfig, CodexConfig, ExternalAgentsConfig, GeminiConfig};
 pub use crate::gateway::GatewayConfig;
 pub use crate::llm::{LlmEntry, LlmPricingOverride};
 pub use crate::security::SecurityConfig;

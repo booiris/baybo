@@ -1,6 +1,6 @@
 use aura_config::{
     AuraConfig, ClaudeConfig, CodexConfig, ConfigError, DiscordChannelConfig, ExternalAgentsConfig,
-    LlmEntry, LlmEntryName, TelegramChannelConfig,
+    GeminiConfig, LlmEntry, LlmEntryName, TelegramChannelConfig,
 };
 use aura_model::{ExternalAgentKind, ModelTier};
 
@@ -450,6 +450,7 @@ fn external_agents_multiple_enabled_require_default() {
                 enabled: true,
                 binary_path: Some("/usr/bin/codex".into()),
             },
+            gemini: GeminiConfig::default(),
             default_external_agent: None,
         },
         ..AuraConfig::default()
@@ -470,6 +471,7 @@ fn external_agents_default_among_enabled_is_ok() {
                 enabled: true,
                 binary_path: Some("/usr/bin/codex".into()),
             },
+            gemini: GeminiConfig::default(),
             default_external_agent: Some(ExternalAgentKind::Claude),
         },
         ..AuraConfig::default()
@@ -493,6 +495,7 @@ fn external_agents_binary_path_without_enabled_does_not_count() {
                 enabled: false,
                 binary_path: Some("/usr/bin/codex".into()),
             },
+            gemini: GeminiConfig::default(),
             default_external_agent: None,
         },
         ..AuraConfig::default()

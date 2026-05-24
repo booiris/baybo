@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct ExternalAgentsConfig {
     pub claude: ClaudeConfig,
     pub codex: CodexConfig,
+    pub gemini: GeminiConfig,
     /// Which kind to treat as the operator's primary when multiple
     /// external agents are configured. Only meaningful (and only
     /// validated) when more than one kind has a non-default config;
@@ -45,6 +46,18 @@ pub struct CodexConfig {
     pub binary_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GeminiConfig {
+    /// Whether boot should probe + register this agent. See the
+    /// `ClaudeConfig::enabled` docstring for rationale.
+    pub enabled: bool,
+    /// Path to the `gemini` binary. `None` falls back to `PATH`
+    /// lookup. Only consulted when `enabled = true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+}
+
 impl ExternalAgentsConfig {
     /// Which kinds the operator has explicitly opted into. Boot
     /// probes / registers only these. Validation also keys on this
@@ -57,6 +70,9 @@ impl ExternalAgentsConfig {
         }
         if self.codex.enabled {
             out.push(ExternalAgentKind::Codex);
+        }
+        if self.gemini.enabled {
+            out.push(ExternalAgentKind::Gemini);
         }
         out
     }
@@ -77,6 +93,11 @@ impl ExternalAgentsConfig {
                 ExternalAgentKind::Codex,
                 self.codex.enabled,
                 self.codex.binary_path.as_deref(),
+            ),
+            (
+                ExternalAgentKind::Gemini,
+                self.gemini.enabled,
+                self.gemini.binary_path.as_deref(),
             ),
         ]
     }

@@ -109,8 +109,8 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: LlmCmd,
     },
-    /// Manage external-agent backends (Claude Code, Codex) used by
-    /// `spawn_subagent(backend: ...)`. `setup` is an interactive
+    /// Manage external-agent backends (Claude Code, Codex, Gemini CLI)
+    /// used by `spawn_subagent(backend: ...)`. `setup` is an interactive
     /// wizard that picks a kind, prompts for a binary path (empty
     /// = $PATH lookup), runs an existence + version probe, then
     /// persists the resulting `external_agents.<kind>.binary_path`

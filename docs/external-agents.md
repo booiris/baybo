@@ -4,15 +4,18 @@
 
 An **external agent** is a subagent backend whose work is delegated to a
 subprocess (or other out-of-process driver) instead of running on an
-in-process aura `AgentActor`. Two are registered today:
+in-process aura `AgentActor`. Three are registered today:
 
 - **`claude`** drives `claude` (Anthropic Claude Code) — billed
   against the operator's Claude Code Max/Pro subscription.
 - **`codex`** drives `codex` (OpenAI Codex CLI) — billed against the
   operator's ChatGPT subscription.
+- **`gemini`** drives `gemini` (Google Gemini CLI) — billed against
+  the operator's Google account / Gemini API key.
 
-Both let an aura subagent's task be handled by the external agent's
-own autonomous loop without spending per-token API credit.
+All three let an aura subagent's task be handled by the external
+agent's own autonomous loop without spending aura's own per-token API
+credit.
 
 Where the LLM crate handles "send messages, get back text" for HTTP
 providers, external agents handle "delegate a task, get back a final
@@ -37,8 +40,8 @@ different flavor of LLM:
   External { kind: ExternalAgentKind }`. Carried on
   `SubagentSpawnRequest.backend`.
 - `aura_model::ExternalAgentKind` — discriminator enum: `Claude`,
-  `Codex`. Carried on `SubagentBackendTag::External { external_kind,
-  workspace_dir, resume_key }`.
+  `Codex`, `Gemini`. Carried on `SubagentBackendTag::External {
+  external_kind, workspace_dir, resume_key }`.
 - `aura_model::SubagentBackendKind` — discriminator-only view of
   `SubagentBackendTag` for runtime decisions that don't care about
   per-instance state (resume validation, error labels, dispatch).
@@ -155,6 +158,10 @@ the child session's transcript looks like a normal agent loop:
   are codex-prefixed (`codex_shell`, `codex_file_change`) so a reader
   cannot mistake them for aura-routed tool invocations — these
   bypass aura's sandbox + approval gate by design.
+- gemini: assistant `message` deltas → accumulated into one
+  `Assistant Text` per run; `tool_use` / `tool_result` events emit a
+  paired `Assistant ToolUse` + `Tool ToolResult` linked by `tool_id`,
+  with tool names `gemini_`-prefixed for the same reason as codex's.
 
 `FinalContent` duplicates the last assistant text, so the consumer
 treats it as a result signal only and does not double-write.
@@ -321,6 +328,81 @@ as equivalent to running `codex exec ...` in a shell on the host.
 Same opt-in model as claude — `enabled: false` (the default)
 means boot skips this kind entirely.
 
+## gemini — invocation
+
+Same shape as claude/codex, a third wire protocol. Built on
+`gemini --output-format stream-json` (the Google Gemini CLI's
+non-interactive line-delimited-JSON mode).
+
+```
+gemini --output-format stream-json
+       --yolo
+       --skip-trust
+       [--model <name>]
+       [--resume <session_id>]
+       -p "<prompt>"
+```
+
+Event mapping (vs claude's `stream-json` / codex's JSONL):
+- `{"type":"init","session_id":…}` → emit `ResumeKey(session_id)` on a
+  fresh session (gemini calls its session uuid a `session_id`, like
+  claude).
+- `{"type":"message","role":"assistant","content":…,"delta":true}` →
+  assistant text arrives as incremental deltas, so they're
+  **accumulated** (claude/codex send whole turns). Consecutive deltas
+  are grouped into one `Intermediate(Assistant text)` row, flushed when
+  a tool event interrupts or at stream end, so a token-streamed answer
+  doesn't fragment the transcript.
+- `{"type":"message","role":"user",…}` → the prompt echo; skipped (the
+  spawn router already persisted the task).
+- `{"type":"tool_use","tool_name":…,"tool_id":…,"parameters":…}` →
+  `Intermediate(Assistant ToolUse)`, name prefixed `gemini_` so a
+  transcript reader can't confuse it with an aura-audited tool call.
+- `{"type":"tool_result","tool_id":…,"status":…,"output":…}` →
+  `Intermediate(Tool ToolResult)`, linked by `tool_id`. Output may be
+  absent; the status string stands in.
+- `{"type":"result","status":"success","stats":{…}}` → emit `Usage` +
+  `FinalContent`. The result event carries **no** final answer text —
+  `FinalContent` is the accumulated assistant deltas.
+- `{"type":"result","status":"error","error":{message}}` → terminal
+  error.
+- Unknown event kinds are ignored.
+
+Differences from claude/codex that matter:
+- **Prompt is the `-p <prompt>` flag**, a single argv value (not stdin
+  like claude, not a positional after `--` like codex).
+- **`--skip-trust` is required alongside `--yolo`.** In an untrusted
+  folder gemini silently downgrades `--yolo` to interactive approval —
+  which a non-TTY subprocess can never satisfy, so the run hangs.
+  `--skip-trust` trusts the workspace cwd so YOLO actually takes.
+- **`stats.input_tokens` is the TOTAL prompt; `stats.cached` is a
+  subset** (OpenAI/Gemini convention) — passed through, not folded
+  like claude's disjoint cache buckets.
+- **Resume takes the session uuid directly** (`--resume <session_id>`),
+  same as claude's `--resume`.
+
+Security: `--yolo --skip-trust` is hardcoded for the same reason
+claude's `bypassPermissions` / codex's
+`--dangerously-bypass-approvals-and-sandbox` are — a non-TTY
+subprocess can't show the interactive approval UI. The workspace cwd
+pins gemini's default working area but does not constrain its
+absolute-path reach. Treat `spawn_subagent(backend: "gemini", ...)` as
+equivalent to running `gemini --yolo ...` in a shell on the host.
+
+## gemini — config
+
+```jsonc
+"external_agents": {
+  "gemini": {
+    "enabled": false,        // operator must opt in explicitly
+    "binary_path": null      // null falls back to PATH lookup
+  }
+}
+```
+
+Same opt-in model as claude/codex — `enabled: false` (the default)
+means boot skips this kind entirely.
+
 ## Picking a default
 
 When multiple external agents are **enabled**,
@@ -340,7 +422,7 @@ may resolve it.
   probe, persist on success. If the write would leave multiple
   kinds configured without a default, the wizard also prompts for
   `default_external_agent`. Restarts the gateway to take effect.
-- `aura setup` (quick mode) probes both kinds on PATH after the
+- `aura setup` (quick mode) probes every kind on PATH after the
   other setup steps. Each detected binary triggers a y/n confirm;
   the operator picks which to enable. If multiple end up enabled,
   prompts for `default_external_agent` automatically.

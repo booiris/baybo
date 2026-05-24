@@ -108,7 +108,7 @@ calls concurrently. Sequential spawns serialise needlessly.
 parent continue talking. The subagent's result is delivered as an
 out-of-band notification (a system reminder) prepended to your next
 user turn. Works for any backend — especially handy for long external
-(claude/codex) runs you don't want to block on.
+(claude/codex/gemini) runs you don't want to block on.
 
 # Trust but verify
 
@@ -141,7 +141,7 @@ struct SpawnParams {
     description: String,
     /// Self-contained brief the child sees as its first user message.
     prompt: String,
-    /// `"aura"` (default), `"claude"`, or `"codex"`.
+    /// `"aura"` (default), `"claude"`, `"codex"`, or `"gemini"`.
     #[serde(default)]
     backend: Option<String>,
     #[serde(default)]
@@ -447,12 +447,12 @@ fn parameters_schema() -> Value {
             },
             "backend": {
                 "type": "string",
-                "enum": ["aura", "claude", "codex"],
-                "description": "Backend that runs the subagent. 'aura' (default) spawns a full in-process aura agent that uses the configured LLMs/tools/skills. 'claude' delegates to a local Claude Code subprocess; 'codex' delegates to OpenAI's codex CLI — both are one-shot, run their own internal tool loops with bypassed permissions, and are best for heavy autonomous tasks where you want claude/codex (not aura) to drive."
+                "enum": ["aura", "claude", "codex", "gemini"],
+                "description": "Backend that runs the subagent. 'aura' (default) spawns a full in-process aura agent that uses the configured LLMs/tools/skills. 'claude' delegates to a local Claude Code subprocess; 'codex' delegates to OpenAI's codex CLI; 'gemini' delegates to Google's gemini CLI — these three are one-shot, run their own internal tool loops with bypassed permissions, and are best for heavy autonomous tasks where you want that external agent (not aura) to drive."
             },
             "background": {
                 "type": "boolean",
-                "description": "When true, returns a handle immediately and surfaces the subagent's final result as an out-of-band notification prepended to your next user turn, letting the parent keep working. Works for any backend; especially useful for long external (claude/codex) runs."
+                "description": "When true, returns a handle immediately and surfaces the subagent's final result as an out-of-band notification prepended to your next user turn, letting the parent keep working. Works for any backend; especially useful for long external (claude/codex/gemini) runs."
             },
             "resume_session_id": {
                 "type": "string",

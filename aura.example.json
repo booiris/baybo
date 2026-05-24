@@ -57,6 +57,10 @@
       "enabled": false,
       "binary_path": null
     },
+    "gemini": {
+      "enabled": false,
+      "binary_path": null
+    },
     "default_external_agent": null
   }
 }

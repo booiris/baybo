@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 pub mod claude_cli;
 pub mod codex_cli;
+pub mod gemini_cli;
 mod probe;
 
 pub type Result<T> = std::result::Result<T, ExternalAgentError>;
@@ -153,6 +154,8 @@ where
             ExternalAgentKind::Claude => claude_cli::ClaudeCliAgent::probe_and_build(binary_path)
                 .map(|a| a as Arc<dyn ExternalAgent>),
             ExternalAgentKind::Codex => codex_cli::CodexCliAgent::probe_and_build(binary_path)
+                .map(|a| a as Arc<dyn ExternalAgent>),
+            ExternalAgentKind::Gemini => gemini_cli::GeminiCliAgent::probe_and_build(binary_path)
                 .map(|a| a as Arc<dyn ExternalAgent>),
         };
         match result {
