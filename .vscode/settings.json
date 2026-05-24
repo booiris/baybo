@@ -326,7 +326,8 @@
         "**/.claude/commands": true,
         "**/.claude/settings.json": true,
         "./.mcp.json": true,
-        "**/.gitmodules": true
+        "**/.gitmodules": true,
+        "**/relative-soul-test": true,
     },
     "rust-analyzer.cargo.features": []
 }
