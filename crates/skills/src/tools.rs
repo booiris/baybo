@@ -281,6 +281,51 @@ pub fn render_skill_body(skill: &SkillDefinition, session_id: &str) -> String {
     skill.prompt_template.replace(SESSION_ID_TOKEN, session_id)
 }
 
+/// Appended to a slash-injected skill body when the skill ships linked
+/// files, so a `/command` invocation can discover and pull sub-files just
+/// like an LLM-issued `Skill` call. [`render_main`] advertises the same
+/// affordance as JSON (`linked_files` + `usage_hint`); the slash path
+/// injects plain text, so the equivalent rendering lives here. The
+/// `{{skill_name}}` / `{{tool_name}}` / `{{file_list}}` markers are
+/// substituted at render time.
+const SLASH_LINKED_FILES_HINT: &str = r#"<system-reminder>
+The "{{skill_name}}" skill ships linked files. To read one, call the {{tool_name}} tool with `skill` set to "{{skill_name}}" and `file_path` set to one of:
+{{file_list}}
+</system-reminder>"#;
+
+/// Render a skill's body for slash injection (`{{session_id}}` substituted),
+/// plus — when the skill ships linked sub-files — a text inventory + usage
+/// hint matching what [`render_main`] exposes to the LLM `Skill` tool, so the
+/// two invocation routes don't diverge. The sub-file fetch itself still goes
+/// through the gated `Skill` tool. Shared with `aura-context`'s slash
+/// expansion.
+pub fn render_skill_for_slash(skill: &SkillDefinition, session_id: &str) -> String {
+    let mut out = render_skill_body(skill, session_id);
+    if let Some(hint) = render_linked_files_hint(skill) {
+        out.push_str("\n\n");
+        out.push_str(&hint);
+    }
+    out
+}
+
+fn render_linked_files_hint(skill: &SkillDefinition) -> Option<String> {
+    if skill.linked_files.is_empty() {
+        return None;
+    }
+    let file_list = skill
+        .linked_files
+        .iter_paths()
+        .map(|p| format!("- {p}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(
+        SLASH_LINKED_FILES_HINT
+            .replace("{{skill_name}}", &skill.name)
+            .replace("{{tool_name}}", SKILL_TOOL_NAME)
+            .replace("{{file_list}}", &file_list),
+    )
+}
+
 fn render_main(
     skill: &SkillDefinition,
     args: Option<&str>,
@@ -833,6 +878,43 @@ mod tests {
         assert_eq!(lf["templates"], json!(["templates/cfg.yaml"]));
         assert_eq!(lf["scripts"], json!(["scripts/s.sh"]));
         assert_eq!(lf["other"], json!(["misc.txt"]));
+    }
+
+    /// The slash route must surface the same sub-file affordance the LLM
+    /// `Skill` tool advertises: body first, then an inventory naming the
+    /// tool, the skill, and every linked path the model can fetch.
+    #[test]
+    fn render_skill_for_slash_appends_linked_file_inventory() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("SKILL.md"), "# Body\n").unwrap();
+        fs::create_dir(root.join("references")).unwrap();
+        fs::write(root.join("references/a.md"), "ref a").unwrap();
+        fs::create_dir(root.join("scripts")).unwrap();
+        fs::write(root.join("scripts/s.sh"), "#!/bin/sh\n").unwrap();
+
+        let out = render_skill_for_slash(&mk_skill(root, "demo"), "sess-1");
+
+        assert!(out.starts_with("# Body\n"), "body comes first: {out}");
+        assert!(out.contains(SKILL_TOOL_NAME), "names the tool to call");
+        assert!(
+            out.contains("\"demo\""),
+            "names the skill for the fetch call"
+        );
+        assert!(out.contains("- references/a.md"));
+        assert!(out.contains("- scripts/s.sh"));
+    }
+
+    /// A single-file skill gets no inventory — just the body, byte-for-byte.
+    #[test]
+    fn render_skill_for_slash_body_only_when_no_linked_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("SKILL.md"), "# Body\n").unwrap();
+
+        let mut skill = mk_skill(root, "demo");
+        skill.prompt_template = "BODY ONLY".into();
+        assert_eq!(render_skill_for_slash(&skill, "sess-1"), "BODY ONLY");
     }
 
     #[tokio::test]

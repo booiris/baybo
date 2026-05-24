@@ -32,6 +32,25 @@ impl LinkedFiles {
             "other": self.other,
         })
     }
+
+    /// True when no helper files sit alongside `SKILL.md`.
+    pub fn is_empty(&self) -> bool {
+        self.references.is_empty()
+            && self.templates.is_empty()
+            && self.scripts.is_empty()
+            && self.other.is_empty()
+    }
+
+    /// Every linked path across all buckets, in
+    /// `references → templates → scripts → other` order.
+    pub fn iter_paths(&self) -> impl Iterator<Item = &str> {
+        self.references
+            .iter()
+            .chain(&self.templates)
+            .chain(&self.scripts)
+            .chain(&self.other)
+            .map(String::as_str)
+    }
 }
 
 /// Walk `skill_dir` and bucket every file (other than `SKILL.md`

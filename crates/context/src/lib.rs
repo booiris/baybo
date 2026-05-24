@@ -94,7 +94,7 @@ use aura_session::SessionManager;
 use aura_skills::render::{render_skill_block, render_skill_reminder};
 use aura_skills::{
     SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry, SkillSummary,
-    render_skill_body,
+    render_skill_for_slash,
 };
 use aura_trace::LlmCallInputs;
 use parking_lot::RwLock;
@@ -430,16 +430,19 @@ impl ContextManager {
 
     /// If the trailing message is a user `/command` whose command matches an
     /// invocable skill, expand it: append that skill's body (via
-    /// `aura_skills::render_skill_body`, `{{session_id}}` substituted) as a
+    /// `aura_skills::render_skill_for_slash`, `{{session_id}}` substituted) as a
     /// hidden agent-context row (`MessageSource::Agent` — the next LLM turn sees
     /// it, but it isn't shown as a user bubble). No-op when the tail isn't a
     /// matching user `/command`. The appended row is persisted + JSONL-logged
     /// by [`Self::append`].
     ///
     /// Unlike an LLM-issued `Skill` tool call this deliberately skips the risk
-    /// assessor and linked-sub-file loading: an explicit user slash command is
-    /// treated as authorized and the body is injected directly. The original
-    /// `/command` message stays in the transcript, so any args remain visible.
+    /// assessor: an explicit user slash command is treated as authorized, so the
+    /// body is injected directly rather than gated. When the skill ships linked
+    /// files the injected text still carries their inventory + a hint, so the
+    /// model can pull a sub-file with a follow-up `Skill` tool call — that fetch
+    /// goes through the normal gate. The original `/command` message stays in
+    /// the transcript, so any args remain visible.
     pub async fn expand_slash_command(&mut self) {
         if let Some((skill_name, msg)) = self.slash_expansion_message() {
             // Track it like an LLM-issued `Skill` call. If this turn trips a
@@ -467,7 +470,7 @@ impl ContextManager {
         let (skill_name, _args) =
             detect_slash_invocation(&user_text, &self.invocable_skill_summaries())?;
         let skill = self.skill_registry.get(&skill_name)?;
-        let body = render_skill_body(&skill, self.session_id.as_str());
+        let body = render_skill_for_slash(&skill, self.session_id.as_str());
         Some((
             skill_name,
             ChatMessage::agent_context(vec![ContentBlock::Text(body)]),

@@ -14,6 +14,7 @@ pub use registry::{
 };
 pub use tools::{
     SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, build as build_skill_tool, render_skill_body,
+    render_skill_for_slash,
 };
 
 /// Directory-level hard-reject thresholds shared between the
