@@ -3,4 +3,6 @@
 //! scattered across the agent loop. See
 //! `docs/todo/prompt-framing-to-context.md` for the migration plan.
 
+pub mod cron;
+pub mod subagent;
 pub mod tool_output;
