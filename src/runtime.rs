@@ -747,12 +747,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // handler resolved a model for the child (from the spawn
                 // request's `model_tier`) and forwarded it here.
 
-                // The child's system prompt is resolved by its ContextManager
-                // from `session.state.subagent_type` (the profile name, set +
-                // persisted at spawn) via the profile registry; `None` → the
-                // workspace soul. The spawner takes no prompt argument — the
-                // session already carries the choice.
-
                 // `summary_state_dir` connects the compressor's
                 // fast-path to the background refresh runner's output.
                 // Without it the background passes still run and bill
