@@ -199,6 +199,10 @@ pub struct ContextManager {
     /// Cross-session manager for transcript persistence + summary
     /// metadata reads.
     pub(crate) sessions: Arc<SessionManager>,
+    /// Resolved system prompt for the initial seed — the workspace soul or a
+    /// subagent profile override. Reseed-after-compaction re-reads the
+    /// workspace rather than this field, so a profile edit lands on compaction.
+    system_prompt: String,
     /// Boundary the trigger gate measures from. Set to `messages.len()`
     /// after every compression apply and reconstructed from
     /// `session_summaries.cursor` on cold start.
@@ -237,6 +241,10 @@ pub struct ContextManagerConfig {
     pub skill_registry: Arc<SkillRegistry>,
     pub session_id: SessionId,
     pub sessions: Arc<SessionManager>,
+    /// Resolved system prompt for the initial seed: the workspace soul
+    /// (assembled via [`crate::prompts::soul::assemble_from_workspace`]) or a
+    /// subagent profile override.
+    pub system_prompt: String,
 }
 
 impl ContextManager {
@@ -259,6 +267,7 @@ impl ContextManager {
             current_model: RwLock::new(None),
             session_id: config.session_id,
             sessions: config.sessions,
+            system_prompt: config.system_prompt,
             last_summary_anchor: None,
             last_synced_cursor: None,
         }
@@ -274,6 +283,40 @@ impl ContextManager {
     /// Read-only access to the owned transcript.
     pub fn messages(&self) -> &[ChatMessage] {
         &self.messages
+    }
+
+    /// The resolved system prompt used to seed the leading `Role::System`
+    /// row. The agent loop reads this when seeding a fresh session.
+    pub fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
+    /// Re-read the workspace soul and swap the leading system row in
+    /// `messages` (only when it's already a `Role::System` text block).
+    /// Called from the compaction apply so a profile edit made earlier in the
+    /// conversation lands on the next compaction rather than carrying the
+    /// pre-compaction prompt forward forever. On a read failure the prior row
+    /// is kept. Subagent profile overrides are intentionally *not* preserved
+    /// here — like the prior caller-driven reload, compaction re-reads the
+    /// workspace soul.
+    async fn reseed_system_row(&self, messages: &mut [ChatMessage]) {
+        let first_is_system_text = messages.first().is_some_and(|m| {
+            m.role == Role::System && matches!(m.content.first(), Some(ContentBlock::Text(_)))
+        });
+        if !first_is_system_text {
+            return;
+        }
+        match crate::prompts::soul::assemble_from_workspace(&self.workspace).await {
+            Ok(prompt) => {
+                messages[0] = ChatMessage::system(vec![ContentBlock::Text(prompt)]);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to reload soul from workspace after compaction; keeping prior system prompt"
+                );
+            }
+        }
     }
 
     /// Number of messages currently in the transcript.
@@ -552,6 +595,11 @@ impl ContextManager {
             warn!("compression produced an empty replacement; refusing to apply");
             return Ok(CompressionOutcome::StrategyDeclined);
         }
+
+        // Pick up profile edits: re-read the workspace soul and swap the
+        // preserved system row before re-attaching the skill reminder. This
+        // internalises the old caller-driven reload_soul_after_compaction.
+        self.reseed_system_row(&mut new_messages).await;
 
         // Re-broadcast the authoritative skill list right after the
         // system block. The summary stages discard the historical
@@ -1280,6 +1328,7 @@ mod tests {
             skill_registry: Arc::new(SkillRegistry::new()),
             session_id: test_session_id(),
             sessions: test_sessions(),
+            system_prompt: "test system prompt".to_string(),
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -1652,6 +1701,7 @@ mod tests {
             skill_registry: registry,
             session_id: test_session_id(),
             sessions: test_sessions(),
+            system_prompt: "test system prompt".to_string(),
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx

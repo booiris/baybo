@@ -35,7 +35,6 @@ pub use runtime::error_recovery;
 pub use runtime::llm_pool;
 pub use runtime::sandbox;
 pub use runtime::session_log;
-pub use runtime::soul;
 pub use runtime::tool_executor;
 
 pub use agent_loop::AgentLoop;

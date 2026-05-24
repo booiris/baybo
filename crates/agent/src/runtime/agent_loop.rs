@@ -24,7 +24,6 @@ use crate::runtime::scope::JobSpec;
 use crate::runtime::session_log::{
     LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
 };
-use crate::runtime::soul::Soul;
 use crate::runtime::tool_executor::ToolExecutor;
 use crate::security::SecurityGateway;
 use tokio_util::sync::CancellationToken;
@@ -177,7 +176,6 @@ pub struct AgentLoop {
     tool_executor: Arc<ToolExecutor>,
     context_manager: ContextManager,
     max_iterations: usize,
-    soul: Soul,
     security_gateway: Arc<SecurityGateway>,
     error_handler: ErrorHandler,
     /// Cost gate + ledger; `record_call` feeds spend back so the
@@ -230,7 +228,6 @@ pub struct AgentLoopConfig {
     pub tool_executor: Arc<ToolExecutor>,
     pub context_manager: ContextManager,
     pub max_iterations: usize,
-    pub soul: Soul,
     pub security_gateway: Arc<SecurityGateway>,
     /// Cost gate + ledger.
     pub cost_manager: Arc<aura_cost::CostManager>,
@@ -261,7 +258,6 @@ impl AgentLoop {
             tool_executor,
             context_manager,
             max_iterations,
-            soul,
             security_gateway,
             cost_manager,
             actor_token,
@@ -287,7 +283,6 @@ impl AgentLoop {
             tool_executor,
             context_manager,
             max_iterations,
-            soul,
             security_gateway,
             error_handler: ErrorHandler::default(),
             cost_manager,
@@ -1353,15 +1348,11 @@ impl AgentLoop {
     ) -> anyhow::Result<()> {
         let runner = self.build_compression_runner(session, span_recorder, job_id, cancel_token);
         let model_id = runner.model_info.id.clone();
-        let outcome = self
-            .context_manager
+        self.context_manager
             .maybe_compress(&model_id, |req| async move {
                 runner.run(req).await.map(|run| run.response)
             })
             .await?;
-        if matches!(outcome, aura_context::CompressionOutcome::Compressed) {
-            self.reload_soul_after_compaction().await?;
-        }
         Ok(())
     }
 
@@ -1438,9 +1429,6 @@ impl AgentLoop {
                         runner.run(req).await.map(|run| run.response)
                     })
                     .await?;
-                if matches!(outcome, aura_context::CompressionOutcome::Compressed) {
-                    self.reload_soul_after_compaction().await?;
-                }
                 let text = match outcome {
                     aura_context::CompressionOutcome::Compressed => {
                         "Context compressed.".to_string()
@@ -1667,10 +1655,10 @@ impl AgentLoop {
         } else {
             self.invocable_skills()
         };
-        let soul_prompt = self.soul.system_prompt();
+        let soul_prompt = self.context_manager.system_prompt().to_string();
         let to_seed = initial_seed_messages(
             self.context_manager.messages().first(),
-            soul_prompt,
+            &soul_prompt,
             &skills,
         );
         for msg in &to_seed {
@@ -1683,42 +1671,6 @@ impl AgentLoop {
         if !to_seed.is_empty() {
             session.state.active_skills = skills.iter().map(|s| s.name.clone()).collect();
         }
-        Ok(())
-    }
-
-    /// Rebuild [`Soul`] from disk and swap the result into
-    /// `messages[0]`. Called only after a successful compaction —
-    /// the compressor preserves the leading system row from the
-    /// pre-compaction transcript, so a profile edit made earlier in
-    /// the conversation would otherwise carry the stale content
-    /// forward forever. New sessions don't need this path because
-    /// `ensure_system_prompt` already seeds them from a fresh
-    /// [`Soul::from_workspace`] read.
-    async fn reload_soul_after_compaction(&mut self) -> anyhow::Result<()> {
-        let Some(paths) = self.workspace_paths.as_ref() else {
-            return Ok(());
-        };
-        let workspace = aura_workspace::WorkspaceManager::new(paths.root().to_path_buf());
-        let new_soul = match Soul::from_workspace(&workspace).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, "failed to reload soul from workspace; keeping cached prompt");
-                return Ok(());
-            }
-        };
-        // Only swap `messages[0]` when it's already a system text
-        // block — defensive against an empty transcript or a non-
-        // system first row.
-        let first_is_system_text = self.context_manager.messages().first().is_some_and(|m| {
-            m.role == Role::System && matches!(m.content.first(), Some(ContentBlock::Text(_)))
-        });
-        if first_is_system_text {
-            self.context_manager
-                .replace_first_message(ChatMessage::system(vec![ContentBlock::Text(
-                    new_soul.system_prompt().to_string(),
-                )]));
-        }
-        self.soul = new_soul;
         Ok(())
     }
 

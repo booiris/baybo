@@ -15,7 +15,6 @@ use std::time::Duration;
 use aura_agent::{
     AgentLoop, SecurityGateway,
     actor::{AgentActor, AgentMessage, mailbox::MailboxSender},
-    soul::Soul,
     tool_executor::ToolExecutor,
 };
 use aura_channels::{AgentOutput, IncomingMessage, Message};
@@ -367,6 +366,9 @@ impl AgentTestHarnessBuilder {
             session_store,
             summary_store,
         ));
+        let soul_text = self
+            .soul_prompt
+            .unwrap_or_else(|| "You are Aura, a test assistant.".into());
         let context_manager = ContextManager::from_config(ContextManagerConfig {
             tokenizer,
             workspace,
@@ -376,12 +378,8 @@ impl AgentTestHarnessBuilder {
             skill_registry: Arc::clone(&skill_registry),
             session_id: session.id.clone(),
             sessions: Arc::clone(&session_manager),
+            system_prompt: soul_text,
         });
-
-        let soul_text = self
-            .soul_prompt
-            .unwrap_or_else(|| "You are Aura, a test assistant.".into());
-        let soul = Soul::custom(soul_text);
 
         let guarded_llm = aura_llm::GuardedLlm::new(
             stub_llm.clone() as Arc<dyn aura_llm::LlmCompletion>,
@@ -410,7 +408,6 @@ impl AgentTestHarnessBuilder {
             tool_executor: tool_executor.clone(),
             context_manager,
             max_iterations: 20,
-            soul,
             security_gateway: gateway.clone(),
             cost_manager: Arc::clone(&cost_manager),
             actor_token: actor_token.clone(),

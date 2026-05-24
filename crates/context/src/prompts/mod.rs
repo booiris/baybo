@@ -4,5 +4,6 @@
 //! `docs/todo/prompt-framing-to-context.md` for the migration plan.
 
 pub mod cron;
+pub mod soul;
 pub mod subagent;
 pub mod tool_output;

@@ -26,7 +26,6 @@ use aura_agent::agent_loop::{AgentLoop, AgentLoopConfig};
 use aura_agent::router::Router;
 use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_agent::session_log::SessionLlmLogger;
-use aura_agent::soul::Soul;
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager};
@@ -685,10 +684,11 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
     let token_calibration = Arc::new(aura_context::TokenCalibration::new());
 
-    let soul = Soul::from_workspace(&graph.workspace)
-        .await
-        .unwrap_or_else(|_| Soul::custom("You are Aura, an intelligent assistant.".to_string()));
-    let system_prompt = soul.system_prompt().to_string();
+    let system_prompt = aura_context::prompts::soul::assemble_from_workspace(
+        &aura_workspace::WorkspacePaths::new(graph.workspace.root.clone()),
+    )
+    .await
+    .unwrap_or_else(|_| "You are Aura, an intelligent assistant.".to_string());
 
     let max_iterations = graph.config.agent.max_iterations;
     let compression_threshold = graph.config.agent.context.compression_threshold;
@@ -775,9 +775,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         skill_registry: Arc::clone(&skill_registry),
                         session_id: session.id.clone(),
                         sessions: Arc::clone(&sessions),
+                        system_prompt: effective_system_prompt,
                     }),
                     max_iterations,
-                    soul: Soul::custom(effective_system_prompt),
                     security_gateway: Arc::clone(&security_gateway),
                     cost_manager: Arc::clone(&cost_manager),
                     actor_token: actor_token.clone(),
