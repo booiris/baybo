@@ -577,7 +577,7 @@ impl AgentActor {
         if let Err(e) = self
             .volatile
             .agent_loop
-            .ensure_system_prompt_seeded(&mut self.durable.session)
+            .ensure_system_prompt_seeded(&self.durable.session)
             .await
         {
             error!(

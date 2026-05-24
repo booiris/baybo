@@ -113,7 +113,7 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         "created_at": session.created_at.to_rfc3339(),
         "last_active": session.last_active.to_rfc3339(),
         "messages": messages.len(),
-        "active_skills": session.state.active_skills,
+        "called_skills": aura_context::scan_skill_calls(&messages),
         "compression_count": session.state.compression_count,
     });
     if let Some((jobs, steps, spans)) = trace_counts
@@ -125,10 +125,11 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         );
     }
 
-    let active_skills_human = if session.state.active_skills.is_empty() {
+    let called_skills = aura_context::scan_skill_calls(&messages);
+    let called_skills_human = if called_skills.is_empty() {
         "(none)".to_string()
     } else {
-        session.state.active_skills.join(", ")
+        called_skills.join(", ")
     };
     let trace_human = match trace_counts {
         Some((j, s, p)) => format!("\ntrace:          {j} jobs · {s} steps · {p} spans"),
@@ -136,14 +137,14 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
     };
 
     let human = format!(
-        "id:             {}\nuser:           {}\nchannel:        {}\ncreated:        {}\nlast_active:    {}\nmessages:       {}\nactive_skills:  {}\ncompressions:   {}{}",
+        "id:             {}\nuser:           {}\nchannel:        {}\ncreated:        {}\nlast_active:    {}\nmessages:       {}\ncalled_skills:  {}\ncompressions:   {}{}",
         session.id,
         session.user.id,
         session.channel,
         session.created_at.to_rfc3339(),
         session.last_active.to_rfc3339(),
         messages.len(),
-        active_skills_human,
+        called_skills_human,
         session.state.compression_count,
         trace_human,
     );

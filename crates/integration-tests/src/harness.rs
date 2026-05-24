@@ -419,7 +419,6 @@ impl AgentTestHarnessBuilder {
             llm_pool,
             initial_llm: None,
             tool_registry: tool_registry.clone(),
-            skill_registry: skill_registry.clone(),
             tool_executor: tool_executor.clone(),
             context_manager,
             max_iterations: 20,

@@ -297,6 +297,7 @@ dependencies = [
  "aura-agent",
  "aura-channels",
  "aura-config",
+ "aura-context",
  "aura-cost",
  "aura-cron",
  "aura-gateway",

@@ -88,7 +88,9 @@ use aura_llm::{ChatRequest, LlmResponse};
 use aura_model::{BackgroundCompressionPayload, ChatMessage, ContentBlock, Role, SessionId};
 use aura_session::SessionManager;
 use aura_skills::render::{render_skill_block, render_skill_reminder};
-use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry};
+use aura_skills::{
+    SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry, SkillSummary,
+};
 use aura_trace::LlmCallInputs;
 use parking_lot::RwLock;
 use tracing::{debug, warn};
@@ -352,6 +354,56 @@ impl ContextManager {
                 );
             }
         }
+    }
+
+    /// Seed the leading `Role::System` row — and a skill reminder when any
+    /// skills are invocable — if the transcript doesn't already lead with one.
+    /// Returns the rows that were appended (empty when already seeded) so the
+    /// agent layer can mirror them to its JSONL session log: context owns the
+    /// transcript + persistence but deliberately has no session logger.
+    ///
+    /// Idempotent and cheap on the hot path — the leading-system check
+    /// short-circuits before the (file-reading) prompt resolution, so only a
+    /// fresh session pays for the resolve.
+    pub async fn ensure_seeded(&mut self) -> Vec<ChatMessage> {
+        if self
+            .messages
+            .first()
+            .is_some_and(|m| m.role == Role::System)
+        {
+            return Vec::new();
+        }
+        let prompt = self.resolve_system_prompt().await;
+        let skills = self.invocable_skill_summaries();
+        let mut seeded = Vec::with_capacity(if skills.is_empty() { 1 } else { 2 });
+        seeded.push(ChatMessage::system(vec![ContentBlock::Text(prompt)]));
+        if !skills.is_empty() {
+            seeded.push(ChatMessage::agent_context(vec![ContentBlock::Text(
+                render_skill_reminder(&skills),
+            )]));
+        }
+        for msg in &seeded {
+            self.append(msg).await;
+        }
+        seeded
+    }
+
+    /// Skills the agent may invoke: the registry's summaries filtered to
+    /// agent-invocable, non-untrusted entries (registry order). Empty when the
+    /// registry is empty. The seed reminder advertises exactly this set; the
+    /// agent loop reuses it for the per-turn slash-command candidate list, so
+    /// the advertised set and the slash-invocable set can't drift.
+    pub fn invocable_skill_summaries(&self) -> Vec<SkillSummary> {
+        if self.skill_registry.is_empty() {
+            return Vec::new();
+        }
+        self.skill_registry
+            .all_summaries_sorted()
+            .into_iter()
+            .filter(|s| {
+                s.agent_invocable && !matches!(s.trust_level, aura_model::TrustLevel::Untrusted)
+            })
+            .collect()
     }
 
     /// Number of messages currently in the transcript.
@@ -1115,7 +1167,7 @@ pub(crate) fn record_skill_calls(acc: &mut Vec<String>, msg: &ChatMessage) {
 /// Rebuild the called-skills vector from a full message slice.
 /// Used after a compression apply to scope the vector to whatever
 /// `ToolUse` blocks survived in the new transcript.
-pub(crate) fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
+pub fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
     let mut out = Vec::new();
     for msg in messages {
         record_skill_calls(&mut out, msg);
@@ -1864,6 +1916,50 @@ mod tests {
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
+    }
+
+    #[tokio::test]
+    async fn ensure_seeded_seeds_leading_system_row_on_fresh_session() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        let seeded = ctx.ensure_seeded().await;
+        assert_eq!(
+            seeded.len(),
+            1,
+            "no skills → one system row, got {seeded:?}"
+        );
+        assert_eq!(ctx.message_count(), 1);
+        assert_eq!(ctx.messages()[0].role, Role::System);
+    }
+
+    #[tokio::test]
+    async fn ensure_seeded_is_idempotent() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        assert_eq!(ctx.ensure_seeded().await.len(), 1);
+        let second = ctx.ensure_seeded().await;
+        assert!(
+            second.is_empty(),
+            "re-seeding an already-seeded session is a no-op"
+        );
+        assert_eq!(ctx.message_count(), 1, "no extra rows on the second call");
+    }
+
+    #[tokio::test]
+    async fn ensure_seeded_appends_skill_reminder_when_skills_invocable() {
+        let mut ctx = make_ctx_with_registry(registry_with(&[("alpha", "body")]), 5, 100_000, 0.75);
+        let seeded = ctx.ensure_seeded().await;
+        assert_eq!(
+            seeded.len(),
+            2,
+            "system row + skill reminder, got {seeded:?}"
+        );
+        assert_eq!(ctx.messages()[0].role, Role::System);
+        let ContentBlock::Text(reminder) = &ctx.messages()[1].content[0] else {
+            panic!("reminder should be a text block");
+        };
+        assert!(
+            reminder.contains("alpha"),
+            "reminder advertises the invocable skill"
+        );
     }
 
     /// Chat closure returning a well-formed `<summary>S</summary>` so the

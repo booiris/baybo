@@ -256,15 +256,6 @@ pub struct Session {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionState {
-    /// Skills currently active on this turn.
-    ///
-    /// Populated every turn by `AgentLoop` from the explicit-trigger band
-    /// (slash command or inline `/mention`, score ≥ 0.9). Multiple may be
-    /// active simultaneously; the list is pure provenance for trace and
-    /// CLI display — tool governance is computed separately.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub active_skills: Vec<String>,
-
     /// Number of context compressions performed in this session.
     /// Incremented after each compression pass; useful for monitoring
     /// or switching compression strategies.

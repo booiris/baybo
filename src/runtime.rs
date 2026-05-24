@@ -756,7 +756,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     llm_pool: Arc::clone(&llm_pool),
                     initial_llm,
                     tool_registry: Arc::clone(&tool_registry),
-                    skill_registry: Arc::clone(&skill_registry),
                     tool_executor: Arc::clone(&tool_executor),
                     context_manager: ContextManager::from_config(ContextManagerConfig {
                         tokenizer: Arc::clone(&tokenizer),
