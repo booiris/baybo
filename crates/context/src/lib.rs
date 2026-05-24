@@ -12,8 +12,9 @@ pub use background_summary::{
 };
 pub use budget::TokenBudget;
 pub use calibration::TokenCalibration;
-pub use compressor::{CompressOutput, SUMMARIZE_INSTRUCTION, parse_summary_response};
+pub use compressor::{CompressOutput, parse_summary_response};
 pub use error::ContextError;
+pub use prompts::compression::SUMMARIZE_INSTRUCTION;
 pub use tokenizer::{TiktokenTokenizer, Tokenizer};
 
 // ---------------------------------------------------------------------------
