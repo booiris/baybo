@@ -355,7 +355,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
 
     {
         let mut janitor =
-            aura_janitor::Janitor::new(workspace_paths.clone(), graph.stores.blob.clone())
+            aura_janitor::Janitor::new(workspace_paths.clone())
                 .with_pairing_store(graph.stores.channel_pairing.clone());
         if let Some(runtime) = sidecar_runtime.as_ref()
             && let Some(cache_root) = runtime.sidecars_cache_root()

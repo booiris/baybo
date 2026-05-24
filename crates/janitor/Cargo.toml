@@ -7,7 +7,6 @@ edition.workspace = true
 doctest = false
 
 [dependencies]
-aura-storage = { workspace = true }
 aura-store = { workspace = true }
 aura-workspace = { workspace = true }
 thiserror = { workspace = true }
@@ -18,6 +17,5 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 aura-model = { workspace = true }
-aura-storage = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "fs"] }
