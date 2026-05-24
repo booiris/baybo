@@ -34,18 +34,37 @@ ContextManager (struct)
 ├── current_model     — Option<String>; written by maybe_compress, used as
 │                       calibration key + baseline-invalidation trigger
 ├── workspace         — Arc<aura_workspace::WorkspacePaths>; resolves
-│                       <state>/<session_id>/summary.md for the fast-path
-│                       and <logs>/sessions/<session_id>.jsonl for the
-│                       transcript pointer in the continuation message
-└── compressor.rs     — impl ContextManager block: 3-stage hardcoded flow
-    ├── Stage 1: try_summary_fast_path  — read summary.md, assemble
-    │                                     [system + summary + recent slice]
-    ├── pre-flight gate                 — NoOp if non_system.len() ≤ keep_recent
-    ├── Stage 2: LLM summary            — invoke ChatCallback with
-    │                                     SUMMARIZE_INSTRUCTION
-    └── Stage 3: truncate fallback      — keep system + last keep_recent
-                                          (only on Stage 2 failure)
+│                       summary.md (fast-path), the JSONL transcript pointer,
+│                       the identity files (soul assembly), and the
+│                       tool-spills dir (oversize tool output)
+├── system_prompt     — resolved system prompt for the initial seed (workspace
+│                       soul or a subagent profile override); reseed-after-
+│                       compaction re-reads the workspace instead
+├── compressor.rs     — impl ContextManager block: 3-stage hardcoded flow
+│   ├── Stage 1: try_summary_fast_path  — read summary.md, assemble
+│   │                                     [system + summary + recent slice]
+│   ├── pre-flight gate                 — NoOp if non_system.len() ≤ keep_recent
+│   ├── Stage 2: LLM summary            — invoke ChatCallback with
+│   │                                     SUMMARIZE_INSTRUCTION
+│   ├── Stage 3: truncate fallback      — keep system + last keep_recent
+│   │                                     (only on Stage 2 failure)
+│   └── reseed_system_row               — re-read workspace soul on every apply
+└── prompts/          — all model-facing framing text + pure builders
+    ├── soul.rs        — assemble_from_workspace (TOP/TAIL hints + identity)
+    ├── cron.rs        — frame_cron_prompt / original_cron_prompt
+    ├── subagent.rs    — build_notification_content (SubagentNotification XML)
+    ├── tool_output.rs — wrap_tool_output / cap_tool_output / spill (+ MAX cap)
+    └── compression.rs — SUMMARIZE_INSTRUCTION + CONTINUATION_INTRO/FOOTER
 ```
+
+`prompts/` is the single home for every piece of text the runtime injects into
+the LLM transcript. The pure builders are unit-testable on their own; the
+`ContextManager` `append_*`-adjacent helpers (`cap_tool_output`,
+`reseed_system_row`) and the agent-loop seam (`append_cron_fire`,
+`append_subagent_notification`, `system_prompt()`) call into them. The
+injection *detection* for tool output stays in `aura-security`; only the
+`<tool_output>` envelope formatting lives here (the shared delimiter is
+`aura_model::TOOL_OUTPUT_{OPEN,CLOSE}_PREFIX`).
 
 **Key design choice**: `ContextManager` is a **concrete struct** with a **concrete compression flow**. Both the management logic (append, budget check) and the compression algorithm are invariant — no swappable strategy, no extension trait. Per-session paths flow through one shared `WorkspacePaths` handle.
 
