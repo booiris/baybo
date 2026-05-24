@@ -90,6 +90,7 @@ use aura_session::SessionManager;
 use aura_skills::render::{render_skill_block, render_skill_reminder};
 use aura_skills::{
     SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry, SkillSummary,
+    render_skill_body,
 };
 use aura_trace::LlmCallInputs;
 use parking_lot::RwLock;
@@ -406,6 +407,32 @@ impl ContextManager {
             .collect()
     }
 
+    /// If the trailing message is a user `/command` whose command matches an
+    /// invocable skill, expand it: append that skill's `prompt_template`
+    /// (`{{session_id}}` substituted) as a hidden agent-context row
+    /// (`MessageSource::Agent` — the next LLM turn sees it, but it isn't shown
+    /// as a user bubble) and return the appended row so the agent can mirror it
+    /// to the JSONL log. `None` when the tail isn't a matching user `/command`.
+    ///
+    /// Unlike an LLM-issued `Skill` tool call this deliberately skips the risk
+    /// assessor and linked-sub-file loading: an explicit user slash command is
+    /// treated as authorized and the body is injected directly. The original
+    /// `/command` message stays in the transcript, so any args remain visible.
+    pub async fn expand_slash_command(&mut self) -> Option<ChatMessage> {
+        let user_text = self
+            .messages
+            .last()
+            .filter(|m| m.source() == aura_model::MessageSource::User)
+            .map(|m| aura_llm::multimodal::extract_text(&m.content))?;
+        let (skill_name, _args) =
+            detect_slash_invocation(&user_text, &self.invocable_skill_summaries())?;
+        let skill = self.skill_registry.get(&skill_name)?;
+        let body = render_skill_body(&skill, self.session_id.as_str());
+        let msg = ChatMessage::agent_context(vec![ContentBlock::Text(body)]);
+        self.append(&msg).await;
+        Some(msg)
+    }
+
     /// Number of messages currently in the transcript.
     pub fn message_count(&self) -> usize {
         self.messages.len()
@@ -436,7 +463,7 @@ impl ContextManager {
     /// then.
     ///
     /// No-op if the transcript is empty.
-    pub fn replace_first_message(&mut self, msg: ChatMessage) {
+    fn replace_first_message(&mut self, msg: ChatMessage) {
         if self.messages.is_empty() {
             return;
         }
@@ -1173,6 +1200,23 @@ pub fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
         record_skill_calls(&mut out, msg);
     }
     out
+}
+
+/// Parse a leading `/command` against the invocable skill set, returning the
+/// matched skill's name + the trailing args (empty when none). Pure; the
+/// `command` field is the `/cmd` trigger configured on a skill. Used by
+/// [`ContextManager::expand_slash_command`].
+fn detect_slash_invocation(user_text: &str, skills: &[SkillSummary]) -> Option<(String, String)> {
+    let rest = user_text.trim_start().strip_prefix('/')?;
+    let (cmd, args) = match rest.find(char::is_whitespace) {
+        Some(idx) => (&rest[..idx], rest[idx..].trim().to_string()),
+        None => (rest, String::new()),
+    };
+    if cmd.is_empty() {
+        return None;
+    }
+    let skill = skills.iter().find(|s| s.command.as_deref() == Some(cmd))?;
+    Some((skill.name.clone(), args))
 }
 
 /// Render `skill` as a `<skill>` block, truncating the body in place
@@ -1959,6 +2003,56 @@ mod tests {
         assert!(
             reminder.contains("alpha"),
             "reminder advertises the invocable skill"
+        );
+    }
+
+    #[tokio::test]
+    async fn expand_slash_command_injects_skill_body_as_agent_context() {
+        let registry = Arc::new(SkillRegistry::new());
+        let mut skill = mk_skill("weather", "WEATHER INSTRUCTIONS");
+        skill.command = Some("wx".into());
+        registry.register(skill);
+        let mut ctx = make_ctx_with_registry(registry, 5, 100_000, 0.75);
+        ctx.append(&ChatMessage::user(vec![ContentBlock::Text(
+            "/wx Beijing".into(),
+        )]))
+        .await;
+
+        let appended = ctx
+            .expand_slash_command()
+            .await
+            .expect("matching /wx expands");
+        assert_eq!(appended.source(), aura_model::MessageSource::Agent);
+        let ContentBlock::Text(body) = &appended.content[0] else {
+            panic!("expected a text block");
+        };
+        assert!(body.contains("WEATHER INSTRUCTIONS"));
+        // the row was appended to the live transcript (after the `/wx` message)
+        assert_eq!(ctx.message_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn expand_slash_command_none_for_plain_text_or_unknown_command() {
+        let registry = Arc::new(SkillRegistry::new());
+        let mut skill = mk_skill("weather", "BODY");
+        skill.command = Some("wx".into());
+        registry.register(skill);
+        let mut ctx = make_ctx_with_registry(registry, 5, 100_000, 0.75);
+
+        ctx.append(&ChatMessage::user(vec![ContentBlock::Text("hello".into())]))
+            .await;
+        assert!(
+            ctx.expand_slash_command().await.is_none(),
+            "plain text is not a slash command"
+        );
+
+        ctx.append(&ChatMessage::user(vec![ContentBlock::Text(
+            "/unknown".into(),
+        )]))
+        .await;
+        assert!(
+            ctx.expand_slash_command().await.is_none(),
+            "an unknown command matches no skill"
         );
     }
 

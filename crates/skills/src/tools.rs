@@ -273,6 +273,14 @@ async fn check_env_or_prompt(
 /// contain the token, so every skill goes through the same path.
 const SESSION_ID_TOKEN: &str = "{{session_id}}";
 
+/// Render a skill's prompt body for injection: substitute the running
+/// session's id into [`SESSION_ID_TOKEN`]. Shared by [`render_main`] (the
+/// `Skill` tool's output) and `aura-context`'s slash-command expansion, so the
+/// substitution rule lives in one place rather than being copied per caller.
+pub fn render_skill_body(skill: &SkillDefinition, session_id: &str) -> String {
+    skill.prompt_template.replace(SESSION_ID_TOKEN, session_id)
+}
+
 fn render_main(
     skill: &SkillDefinition,
     args: Option<&str>,
@@ -281,7 +289,7 @@ fn render_main(
     let dir = skill.source_path.as_deref();
     let path = dir.map(|d| d.join("SKILL.md"));
 
-    let content = skill.prompt_template.replace(SESSION_ID_TOKEN, session_id);
+    let content = render_skill_body(skill, session_id);
 
     let mut out = json!({
         "name": skill.name,

@@ -12,7 +12,9 @@ pub use linked_files::LinkedFiles;
 pub use registry::{
     SkillCandidate, SkillIssue, SkillIssueKind, SkillRegistry, SkillSummary, SkillValidation,
 };
-pub use tools::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, build as build_skill_tool};
+pub use tools::{
+    SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, build as build_skill_tool, render_skill_body,
+};
 
 /// Directory-level hard-reject thresholds shared between the
 /// risk-assessor (which hashes the tree before judging) and the

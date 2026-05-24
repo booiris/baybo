@@ -11,7 +11,6 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use aura_model::Session;
-use aura_skills::{SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillSummary};
 use aura_tools::{ToolOutput, ToolRegistry};
 use aura_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
@@ -404,93 +403,12 @@ impl AgentLoop {
             }) as Arc<dyn aura_tools::SessionNotifier>
         });
 
-        // The triggering message was appended by the actor *before* `run`
-        // (via `append_user_message` / `append_cron_fire` /
-        // `append_subagent_notification`), so the slash check reads it off the
-        // context tail. Gate on the message *source*, not just the tail
-        // content: slash invocation only applies to a genuine user turn, so a
-        // future caller whose tail is an agent/cron/tool row can't have a
-        // leading `/` misread as a skill command.
-        let user_text = self
-            .context_manager
-            .messages()
-            .last()
-            .filter(|m| m.source() == aura_model::MessageSource::User)
-            .map(|m| aura_llm::multimodal::extract_text(&m.content))
-            .unwrap_or_default();
-        let skills_for_turn = self.context_manager.invocable_skill_summaries();
-
-        if let Some((skill_name, args)) = detect_slash_invocation(&user_text, &skills_for_turn) {
-            let synthesized_id = format!("synthskill-{}", uuid::Uuid::new_v4());
-            let mut input = serde_json::json!({ SKILL_INPUT_NAME_FIELD: skill_name });
-            if !args.is_empty() {
-                input["args"] = serde_json::Value::String(args);
-            }
-            let tool_use_block = ContentBlock::ToolUse {
-                id: synthesized_id.clone(),
-                name: SKILL_TOOL_NAME.to_string(),
-                input: input.clone(),
-                signature: None,
-            };
-            let assistant_msg = ChatMessage::assistant(vec![tool_use_block]);
-            self.append_context_message(session, &assistant_msg).await?;
-
-            let approved = std::sync::Arc::new(parking_lot::Mutex::new(
-                session.state.approved_resources.clone(),
-            ));
-
-            let executor_clone = Arc::clone(&self.tool_executor);
-            let span_recorder_clone = Arc::clone(span_recorder);
-            let session_id_clone = session.id.clone();
-            let user_clone = session.user.clone();
-            let approved_clone = Arc::clone(&approved);
-            let synth_id_clone = synthesized_id.clone();
-            let input_clone = input.clone();
-            let cancel_token_clone = cancel_token.clone();
-            let notifier_clone = notifier.clone();
-            let factory_clone = Arc::clone(&self.billed_chat_factory);
-
-            let result_text = crate::runtime::scope::with_step(
-                span_recorder.as_ref(),
-                job_id,
-                StepKind::LlmIteration,
-                Some((&cancel_token, aura_job::CancelReason::ParentCancelled)),
-                move |step| async move {
-                    let res = executor_clone
-                        .execute(
-                            SKILL_TOOL_NAME,
-                            input_clone,
-                            &session_id_clone,
-                            &user_clone,
-                            &approved_clone,
-                            &span_recorder_clone,
-                            &step,
-                            None,
-                            synth_id_clone,
-                            None,
-                            Some(job_id),
-                            cancel_token_clone.child_token(),
-                            notifier_clone,
-                            Some(&factory_clone),
-                        )
-                        .await;
-                    let text = match res {
-                        Ok(ToolOutput::Text(s)) => s,
-                        Ok(ToolOutput::Json(v)) => v.to_string(),
-                        Ok(ToolOutput::WithAttachments { text, .. })
-                        | Ok(ToolOutput::MultiModalText { text, .. }) => text,
-                        Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
-                        Err(e) => format!("Error: {e}"),
-                    };
-                    Ok((LifecycleOutcome::Ok, text))
-                },
-            )
-            .await?;
-
-            session.state.approved_resources = approved.lock().clone();
-
-            let tool_msg = ChatMessage::tool_result(synthesized_id, result_text);
-            self.append_context_message(session, &tool_msg).await?;
+        // Expand an explicit `/command` skill invocation before the loop:
+        // context reads the matching skill's body and appends it as a hidden
+        // agent-context row for the loop to act on; mirror that row to the JSONL
+        // session log (the `/command` message itself stays in the transcript).
+        if let Some(msg) = self.context_manager.expand_slash_command().await {
+            self.write_session_message_log(session, &msg).await;
         }
 
         // Iterative LLM loop
@@ -1747,19 +1665,6 @@ fn merge_for_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         }
     }
     out
-}
-
-fn detect_slash_invocation(user_text: &str, skills: &[SkillSummary]) -> Option<(String, String)> {
-    let rest = user_text.trim_start().strip_prefix('/')?;
-    let (cmd, args) = match rest.find(char::is_whitespace) {
-        Some(idx) => (&rest[..idx], rest[idx..].trim().to_string()),
-        None => (rest, String::new()),
-    };
-    if cmd.is_empty() {
-        return None;
-    }
-    let skill = skills.iter().find(|s| s.command.as_deref() == Some(cmd))?;
-    Some((skill.name.clone(), args))
 }
 
 #[cfg(test)]
