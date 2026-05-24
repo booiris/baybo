@@ -1,6 +1,7 @@
 // Internal: rig-backed providers stay crate-private — they're consumed
 // only through `LlmProviderRegistry::with_default_providers()`.
 pub(crate) mod anthropic;
+pub(crate) mod deepseek;
 pub(crate) mod gemini;
 pub(crate) mod minimax;
 pub(crate) mod openai;
@@ -42,6 +43,11 @@ pub fn factory_defaults_for(provider: &str) -> FactoryDefaults {
         },
         "minimax" => FactoryDefaults {
             context_window: 200_000,
+            supports_vision: false,
+        },
+        // DeepSeek V3/R1 family: 128k context, text-only.
+        "deepseek" => FactoryDefaults {
+            context_window: 128_000,
             supports_vision: false,
         },
         // Subscription billing is account-level, vision-off is a

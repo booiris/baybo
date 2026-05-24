@@ -44,6 +44,7 @@ pub async fn resolve_api_key(
         "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
         "gemini" => std::env::var("GEMINI_API_KEY").ok(),
         "minimax" => std::env::var("MINIMAX_API_KEY").ok(),
+        "deepseek" => std::env::var("DEEPSEEK_API_KEY").ok(),
         _ => None,
     }
 }

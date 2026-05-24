@@ -22,6 +22,7 @@ const BUILTIN_PROVIDERS: &[&str] = &[
     "anthropic",
     "gemini",
     "minimax",
+    "deepseek",
     SUB_PROVIDER_NAME,
 ];
 

@@ -47,6 +47,7 @@ pub fn default_base_url_for_provider(provider: &str) -> Option<&'static str> {
         "anthropic" => Some(crate::providers::anthropic::ANTHROPIC_DEFAULT_BASE_URL),
         "gemini" => Some(crate::providers::gemini::GEMINI_DEFAULT_BASE_URL),
         "minimax" => Some(crate::providers::minimax::MINIMAX_DEFAULT_BASE_URL),
+        "deepseek" => Some(crate::providers::deepseek::DEEPSEEK_DEFAULT_BASE_URL),
         crate::providers::openai_subscription::PROVIDER_NAME => {
             Some(crate::providers::openai_subscription::DEFAULT_BASE_URL)
         }

@@ -16,7 +16,7 @@ Core responsibilities:
 
 ### rig-based completion with enum dispatch
 
-`LlmClient` wraps `AnyCompletionModel`, an enum with four variants: `OpenAI`, `Anthropic`, `Gemini`, and `OpenAiSubscription` (the ChatGPT/Codex OAuth path, documented in [`llm-openai-subscription.md`](llm-openai-subscription.md)). The MiniMax provider also routes through the `Anthropic` variant by reusing rig's Anthropic client against MiniMax's Anthropic-compatible endpoint. This uses compile-time enum dispatch instead of trait objects — rig's `CompletionModel` trait is not object-safe (`Clone` + `impl Future`), and the deprecated `CompletionModelDyn` has been removed. Adding a new provider means adding an enum variant and a match arm.
+`LlmClient` wraps `AnyCompletionModel`, an enum with four variants: `OpenAI`, `Anthropic`, `Gemini`, and `OpenAiSubscription` (the ChatGPT/Codex OAuth path, documented in [`llm-openai-subscription.md`](llm-openai-subscription.md)). The MiniMax provider also routes through the `Anthropic` variant by reusing rig's Anthropic client against MiniMax's Anthropic-compatible endpoint; symmetrically, the DeepSeek provider routes through the `OpenAI` variant against DeepSeek's OpenAI-compatible endpoint (`https://api.deepseek.com/v1`). This uses compile-time enum dispatch instead of trait objects — rig's `CompletionModel` trait is not object-safe (`Clone` + `impl Future`), and the deprecated `CompletionModelDyn` has been removed. Adding a new provider means adding an enum variant and a match arm.
 
 `OpenAiSubscription` bypasses the rig adapter: it speaks the Codex Responses API directly over HTTP with its own OAuth dance, intercepted by `LlmClient::chat` / `chat_stream` before the rig `CompletionRequest` is built.
 
@@ -28,7 +28,7 @@ Subprocess-driven agents (the `claude` binary) are **not** LLM providers and liv
 
 ### Provider registry pattern
 
-`LlmProviderRegistry` holds factory functions keyed by provider name. Built-in providers (OpenAI, Anthropic, Gemini) are registered by the crate itself. New providers are added by implementing `LlmProviderFactory` and registering it.
+`LlmProviderRegistry` holds factory functions keyed by provider name. Built-in providers (OpenAI, Anthropic, Gemini, MiniMax, DeepSeek, OpenAI-subscription) are registered by the crate itself. New providers are added by implementing `LlmProviderFactory` and registering it.
 
 ### Multimodal support
 

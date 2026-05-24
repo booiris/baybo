@@ -236,6 +236,7 @@ fn openrouter_provider_prefix(provider: &str) -> Option<&'static str> {
         "openai" => Some("openai"),
         "anthropic" => Some("anthropic"),
         "minimax" => Some("minimax"),
+        "deepseek" => Some("deepseek"),
         "gemini" => Some("google"),
         _ => None,
     }

@@ -5,8 +5,8 @@ use aura_security::SecretVault;
 use serde::{Deserialize, Serialize};
 
 use crate::providers::{
-    anthropic::AnthropicProviderFactory, gemini::GeminiProviderFactory,
-    minimax::MiniMaxProviderFactory, openai::OpenAIProviderFactory,
+    anthropic::AnthropicProviderFactory, deepseek::DeepSeekProviderFactory,
+    gemini::GeminiProviderFactory, minimax::MiniMaxProviderFactory, openai::OpenAIProviderFactory,
     openai_subscription::OpenAiSubscriptionProviderFactory,
 };
 use crate::{BlobFetcher, GuardedLlm, LlmCallGuard, LlmClient, LlmCompletion};
@@ -197,6 +197,7 @@ impl LlmProviderRegistry {
         registry.register(AnthropicProviderFactory);
         registry.register(GeminiProviderFactory);
         registry.register(MiniMaxProviderFactory);
+        registry.register(DeepSeekProviderFactory);
         registry.register(OpenAiSubscriptionProviderFactory);
         registry
     }
