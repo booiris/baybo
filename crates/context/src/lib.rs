@@ -203,11 +203,11 @@ pub struct ContextManager {
     /// Resolved system prompt for the initial seed — the workspace soul or a
     /// subagent profile override. Reseed-after-compaction re-reads the
     /// workspace rather than this field, so a profile edit lands on compaction.
-    system_prompt: String,
-    /// Whether `system_prompt` is a fixed override (e.g. a subagent profile)
-    /// rather than the workspace soul. Overrides survive compaction; the
-    /// workspace soul is re-read by `reseed_system_row` to pick up edits.
-    system_prompt_is_override: bool,
+    /// Subagent profile override (preserved across compaction) or `None` to
+    /// assemble + re-read the workspace soul. Resolved lazily by
+    /// [`Self::resolve_system_prompt`]; `reseed_system_row` re-reads only when
+    /// `None`.
+    system_prompt_override: Option<String>,
     /// Boundary the trigger gate measures from. Set to `messages.len()`
     /// after every compression apply and reconstructed from
     /// `session_summaries.cursor` on cold start.
@@ -249,11 +249,11 @@ pub struct ContextManagerConfig {
     /// Resolved system prompt for the initial seed: the workspace soul
     /// (assembled via [`crate::prompts::soul::assemble_from_workspace`]) or a
     /// subagent profile override.
-    pub system_prompt: String,
-    /// `true` when `system_prompt` is a fixed override (subagent profile) that
-    /// must survive compaction; `false` for the workspace soul (re-read on
-    /// compaction to pick up profile edits).
-    pub system_prompt_is_override: bool,
+    /// Subagent profile override (preserved across compaction) or `None` to
+    /// assemble the workspace soul (and re-read it on compaction). The override
+    /// is the only system-prompt input the wiring layer provides — context
+    /// owns the workspace-soul assembly + fallback.
+    pub system_prompt_override: Option<String>,
 }
 
 impl ContextManager {
@@ -276,8 +276,7 @@ impl ContextManager {
             current_model: RwLock::new(None),
             session_id: config.session_id,
             sessions: config.sessions,
-            system_prompt: config.system_prompt,
-            system_prompt_is_override: config.system_prompt_is_override,
+            system_prompt_override: config.system_prompt_override,
             last_summary_anchor: None,
             last_synced_cursor: None,
         }
@@ -295,10 +294,25 @@ impl ContextManager {
         &self.messages
     }
 
-    /// The resolved system prompt used to seed the leading `Role::System`
-    /// row. The agent loop reads this when seeding a fresh session.
-    pub fn system_prompt(&self) -> &str {
-        &self.system_prompt
+    /// Resolve the system prompt to seed the leading `Role::System` row: a
+    /// fixed override (subagent profile) as-is, or the workspace soul
+    /// assembled fresh from disk. On an assemble failure (workspace I/O —
+    /// identity files normally auto-seed, so this is a last resort) falls back
+    /// to a minimal prompt rather than seeding an empty system row. The agent
+    /// loop awaits this when seeding a fresh session.
+    pub async fn resolve_system_prompt(&self) -> String {
+        if let Some(override_prompt) = &self.system_prompt_override {
+            return override_prompt.clone();
+        }
+        crate::prompts::soul::assemble_from_workspace(&self.workspace)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "failed to assemble system prompt from workspace; using fallback"
+                );
+                crate::prompts::soul::FALLBACK_SYSTEM_PROMPT.to_string()
+            })
     }
 
     /// Refresh the leading system row after a *committed* compaction so a
@@ -313,7 +327,7 @@ impl ContextManager {
     /// re-read, via [`Self::replace_first_message`] (which re-totals the
     /// budget for the new prompt size). On a read failure the prior row is kept.
     async fn reseed_system_row(&mut self) {
-        if self.system_prompt_is_override {
+        if self.system_prompt_override.is_some() {
             return;
         }
         let first_is_system_text = self.messages.first().is_some_and(|m| {
@@ -1343,8 +1357,7 @@ mod tests {
             skill_registry: Arc::new(SkillRegistry::new()),
             session_id: test_session_id(),
             sessions: test_sessions(),
-            system_prompt: "test system prompt".to_string(),
-            system_prompt_is_override: true,
+            system_prompt_override: Some("test system prompt".to_string()),
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -1474,8 +1487,7 @@ mod tests {
             skill_registry: Arc::new(SkillRegistry::new()),
             session_id: test_session_id(),
             sessions: test_sessions(),
-            system_prompt: "small seed".to_string(),
-            system_prompt_is_override: false,
+            system_prompt_override: None,
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed")).await;
@@ -1523,8 +1535,7 @@ mod tests {
             skill_registry: Arc::new(SkillRegistry::new()),
             session_id: test_session_id(),
             sessions: test_sessions(),
-            system_prompt: "SUBAGENT_PROFILE".to_string(),
-            system_prompt_is_override: true,
+            system_prompt_override: Some("SUBAGENT_PROFILE".to_string()),
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "SUBAGENT_PROFILE"))
@@ -1819,8 +1830,7 @@ mod tests {
             skill_registry: registry,
             session_id: test_session_id(),
             sessions: test_sessions(),
-            system_prompt: "test system prompt".to_string(),
-            system_prompt_is_override: true,
+            system_prompt_override: Some("test system prompt".to_string()),
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx

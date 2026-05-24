@@ -1665,12 +1665,24 @@ impl AgentLoop {
     /// "what skills are available" context adjacent to its instructions
     /// and avoids appending a fresh reminder row every turn.
     async fn ensure_system_prompt(&mut self, session: &mut Session) -> anyhow::Result<()> {
+        // Idempotent: a leading `Role::System` row means this session is
+        // already seeded. Check before resolving the prompt so the
+        // (file-reading) `resolve_system_prompt` only runs on a fresh session,
+        // not on every turn's append.
+        if self
+            .context_manager
+            .messages()
+            .first()
+            .is_some_and(|m| m.role == Role::System)
+        {
+            return Ok(());
+        }
         let skills = if self.skill_registry.is_empty() {
             Vec::new()
         } else {
             self.invocable_skills()
         };
-        let soul_prompt = self.context_manager.system_prompt().to_string();
+        let soul_prompt = self.context_manager.resolve_system_prompt().await;
         let to_seed = initial_seed_messages(
             self.context_manager.messages().first(),
             &soul_prompt,
@@ -1679,10 +1691,7 @@ impl AgentLoop {
         for msg in &to_seed {
             self.append_context_message(session, msg).await?;
         }
-        // active_skills mirrors the reminder we actually seeded; on the
-        // re-entry path (leading system already present) `to_seed` is
-        // empty and we leave the field unchanged so the prior value
-        // carries forward.
+        // active_skills mirrors the reminder we just seeded.
         if !to_seed.is_empty() {
             session.state.active_skills = skills.iter().map(|s| s.name.clone()).collect();
         }

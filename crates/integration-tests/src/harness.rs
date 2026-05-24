@@ -378,10 +378,9 @@ impl AgentTestHarnessBuilder {
             skill_registry: Arc::clone(&skill_registry),
             session_id: session.id.clone(),
             sessions: Arc::clone(&session_manager),
-            system_prompt: soul_text,
-            // Fixed test prompt — treat as an override so compaction-reseed
-            // doesn't depend on the tempdir workspace's identity files.
-            system_prompt_is_override: true,
+            // Fixed test prompt — an override so compaction-reseed doesn't
+            // depend on the tempdir workspace's identity files.
+            system_prompt_override: Some(soul_text),
         });
 
         let guarded_llm = aura_llm::GuardedLlm::new(

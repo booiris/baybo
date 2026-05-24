@@ -10,6 +10,11 @@ use std::path::Path;
 
 use aura_workspace::{IdentityKind, WorkspacePaths, absolutise};
 
+/// Minimal fallback used when the workspace soul can't be assembled (an I/O
+/// error — identity files normally auto-seed, so this is a last resort). Lives
+/// here so the fallback travels with the assembly it backs.
+pub const FALLBACK_SYSTEM_PROMPT: &str = "You are Aura, an intelligent assistant.";
+
 /// Framing preamble prepended to every runtime system prompt. Sets the
 /// agent role and points at the per-attribute Edit affordance.
 const TOP_HINT: &str = r#"You are an intelligent AI assistant. The following are your core attributes. You should use Edit tool to update the corresponding attribute file according to the conversation content."#;

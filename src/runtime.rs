@@ -684,12 +684,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
     let token_calibration = Arc::new(aura_context::TokenCalibration::new());
 
-    let system_prompt = aura_context::prompts::soul::assemble_from_workspace(
-        &aura_workspace::WorkspacePaths::new(graph.workspace.root.clone()),
-    )
-    .await
-    .unwrap_or_else(|_| "You are Aura, an intelligent assistant.".to_string());
-
     let max_iterations = graph.config.agent.max_iterations;
     let compression_threshold = graph.config.agent.context.compression_threshold;
     let keep_recent = graph.config.agent.context.keep_recent;
@@ -727,7 +721,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let session_logger = Arc::clone(&session_logger);
         let tokenizer = Arc::clone(&tokenizer);
         let trace_event_stream = trace_event_stream.clone();
-        let system_prompt = system_prompt.clone();
         let cost_manager = Arc::clone(&cost_manager);
         let token_calibration = Arc::clone(&token_calibration);
 
@@ -750,11 +743,10 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 // request's `model_tier`) and forwarded it here.
 
                 // Subagent profiles replace Soul wholesale; user / cron /
-                // background-compression spawns pass `None` and inherit
-                // the workspace's resolved Soul.
-                let system_prompt_is_override = system_prompt_override.is_some();
-                let effective_system_prompt =
-                    system_prompt_override.unwrap_or_else(|| system_prompt.clone());
+                // background-compression spawns pass `None`, and context
+                // assembles the workspace soul itself (and re-reads it on
+                // compaction). `system_prompt_override` is the only
+                // system-prompt input the wiring layer provides.
 
                 // `summary_state_dir` connects the compressor's
                 // fast-path to the background refresh runner's output.
@@ -776,8 +768,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         skill_registry: Arc::clone(&skill_registry),
                         session_id: session.id.clone(),
                         sessions: Arc::clone(&sessions),
-                        system_prompt: effective_system_prompt,
-                        system_prompt_is_override,
+                        system_prompt_override,
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),
