@@ -441,16 +441,24 @@ impl ContextManager {
     /// treated as authorized and the body is injected directly. The original
     /// `/command` message stays in the transcript, so any args remain visible.
     pub async fn expand_slash_command(&mut self) {
-        if let Some(msg) = self.slash_expansion_message() {
+        if let Some((skill_name, msg)) = self.slash_expansion_message() {
+            // Track it like an LLM-issued `Skill` call. If this turn trips a
+            // live-LLM-summary compression (the stage a first compaction always
+            // takes — no `summary.md` yet — and which keeps no recent slice),
+            // the body row is folded into the paraphrased summary; the skill
+            // trailer then re-broadcasts the full definition only for names in
+            // `called_skills`. Without this the model would act on the
+            // `/command` having lost the skill's instructions.
+            push_called_skill(&mut self.called_skills, &skill_name);
             self.append(&msg).await;
         }
     }
 
-    /// Build the agent-context row for a trailing `/command` that matches an
-    /// invocable skill, or `None`. Pure (no append) so
+    /// Build the matched skill's name + agent-context body row for a trailing
+    /// `/command`, or `None`. Pure (no append) so
     /// [`Self::expand_slash_command`] keeps the `?`-chain while owning the
-    /// `&mut` append.
-    fn slash_expansion_message(&self) -> Option<ChatMessage> {
+    /// `&mut` append and the `called_skills` record.
+    fn slash_expansion_message(&self) -> Option<(String, ChatMessage)> {
         let user_text = self
             .messages
             .last()
@@ -460,7 +468,10 @@ impl ContextManager {
             detect_slash_invocation(&user_text, &self.invocable_skill_summaries())?;
         let skill = self.skill_registry.get(&skill_name)?;
         let body = render_skill_body(&skill, self.session_id.as_str());
-        Some(ChatMessage::agent_context(vec![ContentBlock::Text(body)]))
+        Some((
+            skill_name,
+            ChatMessage::agent_context(vec![ContentBlock::Text(body)]),
+        ))
     }
 
     /// Number of messages currently in the transcript.
@@ -1274,9 +1285,15 @@ pub(crate) fn record_skill_calls(acc: &mut Vec<String>, msg: &ChatMessage) {
         let Some(skill_name) = input.get(SKILL_INPUT_NAME_FIELD).and_then(|v| v.as_str()) else {
             continue;
         };
-        if !acc.iter().any(|n| n == skill_name) {
-            acc.push(skill_name.to_string());
-        }
+        push_called_skill(acc, skill_name);
+    }
+}
+
+/// Append `name` to `acc` unless already present (insertion-order dedup),
+/// keeping the post-summary skill trailer deterministic.
+pub(crate) fn push_called_skill(acc: &mut Vec<String>, name: &str) {
+    if !acc.iter().any(|n| n == name) {
+        acc.push(name.to_string());
     }
 }
 
@@ -2364,6 +2381,53 @@ mod tests {
             .await
             .unwrap();
         assert!(ctx.called_skills.is_empty());
+    }
+
+    /// A slash-invoked skill must survive a live-LLM-summary compression.
+    /// `expand_slash_command` records the match in `called_skills`, so when
+    /// the summary stage drops the body row (it keeps no recent slice) the
+    /// skill trailer still re-broadcasts the full definition. Without the
+    /// record the model would act on the `/command` with only the generic
+    /// one-line reminder.
+    #[tokio::test]
+    async fn slash_invoked_skill_survives_summarize_via_trailer() {
+        let registry = Arc::new(SkillRegistry::new());
+        let mut skill = mk_skill("weather", "WEATHER_BODY");
+        skill.command = Some("wx".into());
+        registry.register(skill);
+        let mut ctx = make_ctx_with_registry(registry, 2, 50, 0.5);
+
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, &"u1 ".repeat(800))).await;
+        ctx.append(&make_msg(Role::Assistant, &"a1 ".repeat(800)))
+            .await;
+        ctx.append(&ChatMessage::user(vec![ContentBlock::Text(
+            "/wx today".into(),
+        )]))
+        .await;
+
+        ctx.expand_slash_command().await;
+        assert_eq!(
+            ctx.called_skills,
+            vec!["weather"],
+            "slash invocation is recorded so the trailer can re-broadcast it"
+        );
+
+        let outcome = ctx
+            .maybe_compress("test-model", ok_summary_chat)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CompressionOutcome::Compressed));
+
+        // The agent-context body row was folded into the summary; the full
+        // definition is back only because the trailer detail block carries it.
+        let has_body = ctx.messages().iter().any(|m| {
+            matches!(m.content.first(), Some(ContentBlock::Text(t)) if t.contains("WEATHER_BODY"))
+        });
+        assert!(
+            has_body,
+            "skill body survives compression via the trailer detail block"
+        );
     }
 
     // ---------- render_skill_block_capped / build_skill_detail_payload ----------
