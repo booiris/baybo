@@ -162,14 +162,6 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: LogCmd,
     },
-    /// Send a one-shot message to an existing session's agent loop
-    /// (`send --session <id> --message <text>`). Disabled inside a
-    /// chat session — running it from slash mode would inject a turn
-    /// into the session that's running it.
-    Agent {
-        #[command(subcommand)]
-        cmd: AgentCmd,
-    },
     /// Inspect LLM spend (USD + token counts) recorded by the cost
     /// manager. `show` aggregates over a scope — `--user <id>`,
     /// `--session <id>`, `--job <id>`, or the default current-UTC-day
@@ -727,25 +719,6 @@ pub enum CostCmd {
         /// Defaults to start-of-tomorrow.
         #[arg(long)]
         until: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AgentCmd {
-    /// Send a one-shot message to a session's agent loop. Forbidden inside
-    /// a chat session (returns `AgentSendForbiddenInSlash`). In argv mode
-    /// this requires the agent runtime to expose a synchronous one-shot
-    /// entry point, which is still deferred pending daemon/RPC work.
-    Send {
-        /// Session id the message should be appended to.
-        #[arg(long)]
-        session: String,
-        /// Literal message content sent as a user turn.
-        #[arg(long)]
-        message: String,
-        /// Confirm the mutation. Slash mode rejects before this is read.
-        #[arg(long, short = 'y')]
-        yes: bool,
     },
 }
 

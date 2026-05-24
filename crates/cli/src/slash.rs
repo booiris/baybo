@@ -6,8 +6,8 @@ use aura_model::ContentBlock;
 use clap::{CommandFactory, Parser};
 
 use crate::cli::{
-    AgentCmd, ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, ExternalAgentCmd, JobCmd,
-    LlmCmd, LogCmd, McpCmd, PairCmd, SessionCmd, SkillsCmd,
+    ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, ExternalAgentCmd, JobCmd, LlmCmd,
+    LogCmd, McpCmd, PairCmd, SessionCmd, SkillsCmd,
 };
 use crate::context::{CommandContext, Invocation};
 use crate::dispatch;
@@ -106,10 +106,7 @@ impl SlashHandler for CliSlashHandler {
             // command the dispatcher will reject. The dispatch-time
             // whitelist (`slash_admissible`) is the canonical guard;
             // this is the cosmetic mirror so the menu stays coherent.
-            if matches!(
-                name,
-                "help" | "completion" | "setup" | "tui" | "gateway" | "agent"
-            ) {
+            if matches!(name, "help" | "completion" | "setup" | "tui" | "gateway") {
                 continue;
             }
             let slash = format!("/{name}");
@@ -240,9 +237,6 @@ enum DispatchError {
 ///   the tail-poll loop only exits on Ctrl-C; a slash invocation would
 ///   hold the dispatcher task open forever (DoS). See the adversarial
 ///   review on this surface.
-/// * **`agent send`**: a chat session running `/agent send` would
-///   recursively inject a turn into itself. Forbidden in slash since
-///   the original CLI ship.
 ///
 /// Read-only inspection (config show/get, skills, session, job, cron,
 /// cost, log non-follow, status, doctor, etc.) plus the mutating
@@ -259,11 +253,6 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
         Commands::Completion { .. } => {
             Err("`completion` emits a shell script; run it from a shell")
         }
-
-        // Recursive turn injection.
-        Commands::Agent {
-            cmd: AgentCmd::Send { .. },
-        } => Err("`agent send` would inject a turn into the active session; run it from a shell"),
 
         // TTY-only editors and OAuth flows.
         Commands::Channel {
@@ -501,12 +490,7 @@ mod tests {
     #[tokio::test]
     async fn slash_rejects_process_lifecycle_commands() {
         let handler = handler_with(SkillRegistry::new());
-        for raw in [
-            "/tui",
-            "/gateway status",
-            "/setup",
-            "/agent send --session s --message m",
-        ] {
+        for raw in ["/tui", "/gateway status", "/setup"] {
             match handler.handle(raw).await {
                 SlashOutcome::Handled(blocks) => {
                     let text = blocks
@@ -530,7 +514,7 @@ mod tests {
     fn slash_menu_drops_process_lifecycle_families() {
         let handler = handler_with(SkillRegistry::new());
         let names: Vec<String> = handler.commands().into_iter().map(|c| c.name).collect();
-        for forbidden in ["/tui", "/gateway", "/setup", "/agent", "/completion"] {
+        for forbidden in ["/tui", "/gateway", "/setup", "/completion"] {
             assert!(
                 !names.contains(&forbidden.to_string()),
                 "{forbidden} must not appear in the slash menu, got {names:?}"
