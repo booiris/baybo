@@ -85,12 +85,16 @@ impl GuardedLlm {
         (self.recorder)(attribution, model_id, usage)
     }
 
-    pub async fn chat(&self, request: &ChatRequest) -> crate::Result<LlmResponse> {
+    /// `pub(crate)` on purpose: the only way to reach a provider from
+    /// outside this crate is [`GuardedLlm::bind`] → [`BoundBilledChat`],
+    /// which runs the recorder after the call. Exposing a bare `chat`
+    /// again would reopen the unbilled-spend hole this design closes.
+    pub(crate) async fn chat(&self, request: &ChatRequest) -> crate::Result<LlmResponse> {
         (self.guard)()?;
         self.inner.chat(request).await
     }
 
-    pub async fn chat_stream(&self, request: &ChatRequest) -> crate::Result<LlmStream> {
+    pub(crate) async fn chat_stream(&self, request: &ChatRequest) -> crate::Result<LlmStream> {
         (self.guard)()?;
         self.inner.chat_stream(request).await
     }

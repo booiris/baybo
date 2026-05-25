@@ -391,8 +391,13 @@ pub async fn build_managers(
     );
 
     let assessment_mode = boot::to_assessment_mode(config.skills.risk_check);
+    // Bind once to the reserved system bucket: skill assessment is
+    // platform safety overhead, not user-attributable work, and its
+    // verdicts are cached by content hash, so it pins the boot-time
+    // default rather than following hot-reload swaps.
+    let assessor_llm = Arc::new(llm_client.bind(aura_llm::Attribution::system("skill-assessor")));
     let skill_assessor = Arc::new(SkillAssessor::with_background_worker(
-        llm_client.clone(),
+        assessor_llm,
         stores.risk.clone(),
         assessment_mode,
     ));

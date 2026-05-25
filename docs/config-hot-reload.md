@@ -14,7 +14,7 @@ The headline win is **LLM identity** (`provider`, `model`, `base_url`, `api_key`
 - Hot-reloading anything outside the whitelist (ports, bind address, workspace path, encryption key file, channels, session, the rest of `agent`). These **hard-reject** on reload.
 - HTTP add/remove model endpoints — the `aura llm` CLI already does full CRUD, and reload rebuilds the whole pool from `config.llm` regardless of which surface triggered it.
 - TUI inline reload (the TUI boot path has no admin HTTP server; SIGHUP only, if wired).
-- Migrating `skill_assessor` onto the billed path — tracked as a TODO below.
+- Making `skill_assessor` *follow* a hot-reload model swap — it's now on the billed path (a system-attributed `BoundBilledChat`) but stays pinned to the boot-time default; see the TODO below.
 
 ## Contract (non-negotiable)
 
@@ -132,7 +132,7 @@ Both are infallible to prepare.
 
 ## Out of scope / follow-up TODOs
 
-- **`skill_assessor` billing + swap:** it currently holds `Arc<GuardedLlm>` and calls `.chat()` directly (`crates/skills-assessor/src/{queue,assessor}.rs`), so its calls hit the budget *gate* but are never `record_call`'d — unbilled spend, invisible to `cost_records` and the accumulator. Migrating it onto a `BilledChatFactory` bound to the pool handle fixes the billing gap **and** makes it follow hot-reload swaps in one change. Pinned to the boot default until then.
+- **`skill_assessor` swap-follow:** billing is **fixed** — it now holds an `Arc<BoundBilledChat>` bound once to a `system:skill-assessor` `Attribution`, so its calls record to `cost_records` under the system bucket (`crates/skills-assessor/src/{queue,assessor}.rs`). What remains: it's bound to the boot-time default client, so it does **not** follow a hot-reload model swap. Re-binding on swap would need the runtime to re-inject the handle (the assessor would hold a swappable slot, or read the pool handle per call). Deferred because verdicts cache by content hash, not model, and pinning a safety classifier to a known model is arguably preferable — also an open question whether the assessor should have its own model config rather than tracking the chat default.
 - **Incremental pool rebuild (trim rebind churn):** `reload` rebuilds the **whole** pool every time, minting fresh client `Arc`s for every entry, so every live session rebinds on its next turn. `build_pool_clients` could instead diff per entry-name (config fields + a stored credential fingerprint) and reuse the unchanged entries' `Arc`s, so only sessions pinned to a genuinely-changed entry rebind — and a pricing-only edit, which doesn't alter the client, would reuse every `Arc`. The credential fingerprint is what keeps this correct (a vault rotation changes the fingerprint even with an identical config entry), so it doesn't reintroduce the gap that forced unconditional rebuild. The churn is cheap (client build is local, no network) and doesn't affect provider-side prompt cache, so this is an optimization, not a correctness fix.
 - HTTP add/remove model endpoints (CLI covers CRUD today).
 - TUI inline reload.
