@@ -405,9 +405,11 @@ impl AgentLoop {
         let _ = job_lifecycle;
         self.context_manager.ensure_seeded().await;
 
-        // Bound to the *outer* delta_tx, not iter_delta_tx — notices
-        // need to reach the channel on iter-2+ where streaming is
-        // suppressed.
+        // Tool-authored notices (`AgentOutput::Notice`) ride the job-wide
+        // delta_tx directly, not the per-iteration `iter_delta_tx`: they
+        // are a distinct output variant from the LLM's streamed `Delta`
+        // and must reach the channel on every iteration, independent of
+        // any per-iteration streaming decision.
         let notifier: Option<Arc<dyn aura_tools::SessionNotifier>> = delta_tx.as_ref().map(|tx| {
             Arc::new(DeltaTxNotifier {
                 tx: tx.clone(),
@@ -463,12 +465,15 @@ impl AgentLoop {
             self.compress_if_needed(session, span_recorder, job_id, &cancel_token)
                 .await?;
 
-            // Deltas are only streamed on the first iteration of the loop.
-            let iter_delta_tx = if iterations == 1 {
-                delta_tx.as_ref()
-            } else {
-                None
-            };
+            // Stream deltas on every iteration, not just the first. The
+            // final answer can land on any iteration (it follows however
+            // many tool-call rounds the model needs), and the TUI renders
+            // the final message body *only* from streamed deltas — its
+            // `finalize_stream` skips `Text` blocks via
+            // `render_non_text_blocks`. An unstreamed post-tool answer
+            // would persist and reach the client over the wire yet never
+            // render. Streaming each iteration keeps that answer visible.
+            let iter_delta_tx = delta_tx.as_ref();
 
             let outcome = crate::runtime::scope::with_step(
                 span_recorder.as_ref(),

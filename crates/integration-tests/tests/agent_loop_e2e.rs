@@ -142,15 +142,12 @@ async fn tool_call_round_trip_invokes_recording_tool() {
             arguments: json!({"q": "ping"}),
             signature: None,
         })]);
-    // Iter 2 (non-streaming chat): final response with no tool calls →
-    // loop exits and dispatches the Message.
-    harness.stub_llm.push_response(LlmResponse {
-        content: "all done".into(),
-        content_blocks: vec![],
-        tool_calls: vec![],
-        usage: Default::default(),
-        thinking: None,
-    });
+    // Iter 2 (streaming): final response with no tool calls → loop exits
+    // and dispatches the Message. Every iteration streams now, so the
+    // post-tool answer is primed as a stream, not a plain `chat` response.
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("all done".into())]);
 
     harness.send_text("call the tool please").await.unwrap();
     let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
@@ -161,6 +158,14 @@ async fn tool_call_round_trip_invokes_recording_tool() {
     assert!(
         outs.iter().any(|o| matches!(o, AgentOutput::Message(_))),
         "expected a final Message after the tool round-trip, got {outs:?}"
+    );
+    // Regression: the final answer lands on iteration 2 (after the tool
+    // call), so it must still stream as deltas. The old loop streamed
+    // only iteration 1, leaving the post-tool answer unstreamed — which
+    // the TUI then dropped at render (`finalize_stream` skips `Text`).
+    assert!(
+        AgentTestHarness::delta_text(&outs).contains("all done"),
+        "post-tool final answer must stream as deltas, got {outs:?}"
     );
 
     let _: Arc<StubLlm> = harness.stub_llm.clone();
@@ -365,14 +370,10 @@ async fn multiple_tool_calls_run_concurrently() {
             signature: None,
         }),
     ]);
-    // Iter 2: empty final response, loop exits.
-    harness.stub_llm.push_response(LlmResponse {
-        content: "ok".into(),
-        content_blocks: vec![],
-        tool_calls: vec![],
-        usage: Default::default(),
-        thinking: None,
-    });
+    // Iter 2 (streaming): final response with no tool calls, loop exits.
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("ok".into())]);
 
     harness.send_text("run both").await.unwrap();
     // The harness's `drain_outputs` has a tail-quiet-period wait so

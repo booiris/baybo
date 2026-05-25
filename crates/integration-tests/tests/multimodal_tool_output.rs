@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use aura_channels::AgentOutput;
 use aura_integration_tests::AgentTestHarness;
-use aura_llm::{LlmResponse, StreamEvent, ToolCallInfo};
+use aura_llm::{StreamEvent, ToolCallInfo};
 use aura_model::{BlobRef, ContentBlock, Role};
 use aura_tools::test_support::RecordingTool;
 use aura_tools::{Tool, ToolOutput};
@@ -53,14 +53,12 @@ async fn multi_modal_text_forwards_image_to_user_channel_and_next_llm_turn() {
             arguments: json!({}),
             signature: None,
         })]);
-    // Turn 2: final text, no further tool calls. The agent loop exits.
-    harness.stub_llm.push_response(LlmResponse {
-        content: "I see the page".into(),
-        content_blocks: vec![],
-        tool_calls: vec![],
-        usage: Default::default(),
-        thinking: None,
-    });
+    // Turn 2 (streaming): final text, no further tool calls. The agent
+    // loop exits. Every iteration streams now, so the post-tool answer is
+    // primed as a stream rather than a plain `chat` response.
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("I see the page".into())]);
 
     harness.send_text("take a screenshot").await.unwrap();
     let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
@@ -145,13 +143,10 @@ async fn with_attachments_does_not_round_trip_image_to_llm() {
             arguments: json!({}),
             signature: None,
         })]);
-    harness.stub_llm.push_response(LlmResponse {
-        content: "done".into(),
-        content_blocks: vec![],
-        tool_calls: vec![],
-        usage: Default::default(),
-        thinking: None,
-    });
+    // Turn 2 (streaming): final response, loop exits.
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("done".into())]);
 
     harness.send_text("send the file").await.unwrap();
     let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
