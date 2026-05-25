@@ -24,12 +24,12 @@
 //! crashes restarts immediately.
 //!
 //! Child stdout/stderr are (a) pushed into the shared [`LogBuffer`]
-//! for the live admin dashboard, (b) appended to a per-channel
+//! for the live admin dashboard and (b) appended to a per-channel
 //! daily-rolling file at `<channel_log_dir>/<channel_type>.log.<date>`
-//! through [`RedactingMakeWriter`], and (c) tee'd to the gateway's
-//! own stdout/stderr so running `aura gateway start` in a terminal
-//! still shows every sidecar line live. Sidecar output never enters
-//! `aura.log`.
+//! through [`RedactingMakeWriter`]. Sidecar output is deliberately
+//! **not** echoed to the gateway's own stdout/stderr — `aura gateway
+//! start` stays quiet on the terminal — and never enters `aura.log`;
+//! read it live from the dashboard or `tail` the per-channel file.
 //!
 //! The SDK's default logger emits one NDJSON record per call
 //! (`{"level": "...", "msg": "...", "target"?: "..."}`); [`drain_pipe`]
@@ -256,7 +256,6 @@ impl SidecarSupervisor {
                     writer.clone(),
                     channel_type.clone(),
                     format!("sidecar::{channel_type}::stdout"),
-                    Stream::Stdout,
                     LogLevel::Info,
                 ))
             });
@@ -267,7 +266,6 @@ impl SidecarSupervisor {
                     writer.clone(),
                     channel_type.clone(),
                     format!("sidecar::{channel_type}::stderr"),
-                    Stream::Stderr,
                     LogLevel::Warn,
                 ))
             });
@@ -339,19 +337,12 @@ async fn wait_or_shutdown(shutdown: &ShutdownSignal, dur: Duration) -> bool {
     }
 }
 
-#[derive(Copy, Clone)]
-enum Stream {
-    Stdout,
-    Stderr,
-}
-
 async fn drain_pipe<R>(
     reader: R,
     buffer: Arc<LogBuffer>,
     file_writer: Option<ChannelLogWriter>,
     channel_type: String,
     target: String,
-    stream: Stream,
     default_level: LogLevel,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
@@ -361,7 +352,7 @@ async fn drain_pipe<R>(
     // emits a multi-GB unbroken stream without a newline can no
     // longer OOM the supervisor. The display-side cap below
     // (SIDECAR_PIPE_LINE_MAX_BYTES = 1024) trims what we write to
-    // the LogBuffer / file / terminal. Cap-hits get a dedicated
+    // the LogBuffer and the per-channel file. Cap-hits get a dedicated
     // suffix so an operator sees the difference between a normal
     // long line and a runaway stream.
     let mut reader = BufReader::new(reader);
@@ -376,7 +367,6 @@ async fn drain_pipe<R>(
                 if let Some(mw) = file_writer.as_ref() {
                     write_line_to_file(mw, LogLevel::Warn, &msg);
                 }
-                tee_to_terminal(stream, &channel_type, &msg);
                 buffer.push_external(LogLevel::Warn, target.clone(), msg);
                 break;
             }
@@ -438,7 +428,6 @@ async fn drain_pipe<R>(
         if let Some(mw) = file_writer.as_ref() {
             write_line_to_file(mw, level, &trimmed);
         }
-        tee_to_terminal(stream, &channel_type, &trimmed);
         buffer.push_external(level, log_target, trimmed);
 
         // After a cap-hit flush, resync at the next newline so the
@@ -459,8 +448,9 @@ struct SidecarLogLine {
 }
 
 /// Replace ASCII control bytes (0x00-0x1F except `\t`, plus 0x7F) with
-/// `?`. Keeps the supervisor TTY + tail output safe from a sidecar that
-/// emits ANSI escapes (`\x1b[2J` would clear the operator's screen) or
+/// `?`. Keeps the per-channel log file (and anyone tailing it) safe from
+/// a sidecar that emits ANSI escapes (`\x1b[2J` would clear the operator's
+/// screen) or
 /// other terminal-state mutations inside its log strings. Tabs are
 /// preserved so structured log strings keep formatting; everything else
 /// in that range has no business in a one-line log payload.
@@ -478,19 +468,6 @@ fn write_line_to_file(mw: &ChannelLogWriter, level: LogLevel, line: &str) {
     let mut w = mw.make_writer();
     let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z");
     let _ = writeln!(w, "{ts} [{}] {line}", level.as_str());
-}
-
-fn tee_to_terminal(stream: Stream, channel_type: &str, line: &str) {
-    match stream {
-        Stream::Stdout => {
-            let mut out = std::io::stdout().lock();
-            let _ = writeln!(out, "[{channel_type}] {line}");
-        }
-        Stream::Stderr => {
-            let mut err = std::io::stderr().lock();
-            let _ = writeln!(err, "[{channel_type}] {line}");
-        }
-    }
 }
 
 async fn join_pipe_readers(
@@ -522,7 +499,6 @@ mod tests {
             None,
             "telegram".to_string(),
             target.clone(),
-            Stream::Stdout,
             LogLevel::Info,
         ));
         writer
@@ -555,7 +531,6 @@ mod tests {
             None,
             "telegram".to_string(),
             "sidecar::telegram::stdout".to_string(),
-            Stream::Stdout,
             LogLevel::Info,
         ));
         writer
@@ -579,9 +554,9 @@ mod tests {
     #[tokio::test]
     async fn pipe_strips_ansi_escapes_from_ndjson_payload() {
         // A sidecar that emits a CSI escape inside its NDJSON `msg`
-        // would otherwise see the raw escape land in the LogBuffer +
-        // tee'd terminal — the supervisor must replace it so the
-        // operator's TTY can't be hijacked by sidecar output.
+        // would otherwise see the raw escape land in the LogBuffer and
+        // the per-channel file — the supervisor must replace it so an
+        // operator tailing that file can't have their TTY hijacked.
         let buf = LogBuffer::new(8);
         let (reader, mut writer) = tokio::io::duplex(4096);
         let drain = tokio::spawn(drain_pipe(
@@ -590,7 +565,6 @@ mod tests {
             None,
             "telegram".to_string(),
             "sidecar::telegram::stdout".to_string(),
-            Stream::Stdout,
             LogLevel::Info,
         ));
         writer
@@ -623,7 +597,6 @@ mod tests {
             None,
             "telegram".to_string(),
             "sidecar::telegram::stderr".to_string(),
-            Stream::Stderr,
             LogLevel::Warn,
         ));
         writer
@@ -661,7 +634,6 @@ mod tests {
             Some(mw),
             "telegram".to_string(),
             "sidecar::telegram::stdout".to_string(),
-            Stream::Stdout,
             LogLevel::Info,
         ));
         writer
@@ -696,7 +668,6 @@ mod tests {
             Some(mw),
             "telegram".to_string(),
             "sidecar::telegram::stdout".to_string(),
-            Stream::Stdout,
             LogLevel::Info,
         ));
         let secret_line = b"bootstrapping with key AKIAIOSFODNN7EXAMPLE now\n";
@@ -713,7 +684,7 @@ mod tests {
         let name = entries[0].file_name().into_string().unwrap();
         assert!(name.starts_with("telegram.log."), "got {name}");
         let contents = std::fs::read_to_string(entries[0].path()).unwrap();
-        // Stream-default level is the file tag for plain-text input.
+        // The stream's default level is the file tag for plain-text input.
         assert!(contents.contains("[info]"));
         assert!(!contents.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(contents.contains("[{REDACTED_LOG_aws_access_key}]"));
@@ -729,7 +700,6 @@ mod tests {
             None,
             "t".to_string(),
             "sidecar::t::stdout".to_string(),
-            Stream::Stdout,
             LogLevel::Info,
         ));
         let big = "x".repeat(SIDECAR_PIPE_LINE_MAX_BYTES + 128);
@@ -765,7 +735,6 @@ mod tests {
             None,
             "t".to_string(),
             "sidecar::t::stdout".to_string(),
-            Stream::Stdout,
             LogLevel::Info,
         ));
         // Two cap-fulls + a final "tail\n" so the drain returns.
