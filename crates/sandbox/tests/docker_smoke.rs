@@ -5,15 +5,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_sandbox::docker::DockerRunner;
+use aura_sandbox::docker::{DEFAULT_IMAGE, DockerRunner};
 use aura_sandbox::{
     EnvPolicy, NetworkPolicy, ResourceLimits, SandboxRunner, SandboxSpec, StdinSource,
 };
 
-/// Returns whether the docker daemon looks reachable. CLI-on-PATH alone
-/// is not enough — most CI / dev hosts have the binary but not the
-/// daemon socket. We bail out cleanly in that case so the suite still
-/// passes on those machines.
+/// Returns whether docker is usable for these tests: the CLI is on PATH,
+/// the daemon answers, and [`DEFAULT_IMAGE`] is already pulled. CLI-on-PATH
+/// alone is not enough — most CI / dev hosts have the binary but not the
+/// daemon socket, and stock CI runners often have a live daemon yet have
+/// never pulled the base image (the tests don't `warm()`, so a missing
+/// image is a hard failure rather than a pull). We bail out cleanly in
+/// those cases so the suite still passes on those machines.
 fn docker_reachable() -> bool {
     let Some(path_var) = std::env::var_os("PATH") else {
         return false;
@@ -21,13 +24,16 @@ fn docker_reachable() -> bool {
     if !std::env::split_paths(&path_var).any(|d| d.join("docker").is_file()) {
         return false;
     }
-    std::process::Command::new("docker")
-        .arg("info")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let ok = |args: &[&str]| {
+        std::process::Command::new("docker")
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    ok(&["info"]) && ok(&["image", "inspect", DEFAULT_IMAGE])
 }
 
 #[tokio::test]

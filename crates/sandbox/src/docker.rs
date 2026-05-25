@@ -27,7 +27,7 @@ use crate::spec::{Backend, ResourceLimits, SandboxOutput, SandboxSpec, StdinSour
 /// subsequent `docker run` uses the digest with `--pull=never`, so
 /// upstream rotations of the floating tag cannot silently swap the
 /// trusted execution base.
-const DEFAULT_IMAGE: &str = "debian:stable-slim";
+pub const DEFAULT_IMAGE: &str = "debian:stable-slim";
 
 /// Cross-platform sandbox backend that delegates isolation to the
 /// docker daemon. Selected by `current_platform_runner()` when the
