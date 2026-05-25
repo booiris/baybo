@@ -124,6 +124,16 @@ no per-boundary cap beyond the mailbox's 4096 capacity; `reply_to` stays `None`.
   for a greppability marker. As built, the drain logs a structured
   `tracing::info!(interjections = N, …)`; the durable trace record is the persisted
   `UserInterjection` rows plus their capture in the next `LlmCall` span's input.
+- **Trace web UI marks interjections via the existing `source` field (no new variant).**
+  The dashboard surfaces interjections without any `SpanEventKind`/ts-rs change: the
+  persisted `source: "user_interjection"` (already on the `/v1/traces` wire) drives an
+  "Interjected" badge on the message card (`web/src/components/trace/MessageList.tsx`,
+  shown in both the session transcript and each LLM call's inputs), a per-job count chip
+  in the job sidebar, and a header badge + `Interjections` Activity row in the job summary
+  (`web/src/pages/TraceSessionPage.tsx`). A job is credited an interjection when a
+  `user_interjection` row's `created_at` falls inside its `[started_at, ended_at)` window
+  — jobs run sequentially and the row is only persisted mid-drain, so the mapping is exact.
+  Vindicates the observability bullet above: the `source` flag alone was enough.
 - **Only `handle_merged_user_turn` drains, not `handle_user_input`.** Every non-slash
   user message routes through `handle_merged_user_turn` (even a single message is a
   batch of one), so draining there covers the whole feature. `handle_user_input`

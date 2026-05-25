@@ -278,6 +278,10 @@ function systemMsg(text: string): ChatMessage {
   return { role: 'system', content: [{ Text: text }], source: 'agent' };
 }
 
+function interjectMsg(text: string): ChatMessage {
+  return { role: 'user', content: [{ Text: text }], source: 'user_interjection' };
+}
+
 // Shared mock fixture: builds one job's worth of steps/spans + the
 // session_messages log it would have produced. Kept module-private so
 // the overview and job-trace mocks stay in lock-step. Cached per
@@ -398,8 +402,9 @@ function buildMockSession(sessionId: string): MockSessionFixture {
         ],
         source: 'agent',
       },
+      interjectMsg('Actually, also tell me the package name.'),
     ],
-    'There are 3 entries: README.md, src/, package.json. README documents Aura.',
+    'There are 3 entries: README.md, src/, package.json. README documents Aura. The package is "aura".',
     [],
     220,
     52,
@@ -427,9 +432,18 @@ function buildMockSession(sessionId: string): MockSessionFixture {
 
   const overview: TraceOverview = {
     session_id: sessionId,
-    // Mock spans use `LlmCallInputs::Inline`, so the message log can
-    // stay empty — `resolveInputMessages` short-circuits on inline.
-    session_messages: [],
+    // Mock spans use `LlmCallInputs::Inline`, so the transcript log isn't
+    // needed for message rendering. We seed one mid-turn interjection row
+    // (created between iteration 1 and the final response, inside the job
+    // window) so the sidebar / job-summary interjection markers light up.
+    session_messages: [
+      {
+        ordinal: 1,
+        superseded_by: null,
+        created_at: new Date(t0 + 1650).toISOString(),
+        message: interjectMsg('Actually, also tell me the package name.'),
+      },
+    ],
     jobs: [
       {
         job_id: job1,
