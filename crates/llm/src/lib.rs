@@ -31,12 +31,12 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 pub use crate::billed::{
-    Attribution, BilledChat, BilledChatResponse, BoundBilledChat, LlmBilling, LlmCostRecorder,
+    Attribution, BilledChat, BilledChatResponse, BilledLlm, CostHooks, LlmCostRecorder,
     SYSTEM_USER_ID,
 };
 pub use crate::error::LlmError;
 pub(crate) use crate::error::{reqwest_to_error, rig_completion_to_error, status_to_error};
-pub use crate::guard::{GuardedLlm, LlmCallGuard};
+pub use crate::guard::{BillableLlm, LlmCallGuard};
 pub use crate::providers::{FactoryDefaults, factory_defaults_for};
 pub use crate::registry::{
     LiveModelInfo, LlmPricingOverride, LlmProviderConfig, LlmProviderRegistry,

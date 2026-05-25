@@ -42,7 +42,7 @@ Each has a unit test in `boot::tests` that pins the mapping. These act as drift 
 |----------|--------|-------|
 | `load_config` | `AURA_CONFIG_PATH` → `<default_workspace_root>/config/aura.json` → `Default` | Explicit path that doesn't exist is a hard error; implicit fallback is silent. `default_workspace_root()` is `~/.aura` in release / `<cwd>/.aura` in debug — always absolute, since `AuraConfig::validate` rejects relative `workspace.path`. |
 | `resolve_config_path` | Same precedence as `load_config`, returning the path that was used (or `None` for a pure-default boot). | Used by mutation endpoints that need to write `aura.json` back. |
-| `build_llm_client` | `default-llm` entry of `AuraConfig`, plus `LlmProviderRegistry`, optional `BlobStore`, optional `SecretVault`, and an `LlmCallGuard` | Delegates credential resolution to `aura_llm::credentials::resolve_api_key`. Returns an `Arc<GuardedLlm>` so every consumer shares the same budget gate. |
+| `build_llm_client` | `default-llm` entry of `AuraConfig`, plus `LlmProviderRegistry`, optional `BlobStore`, optional `SecretVault`, and an `LlmCallGuard` | Delegates credential resolution to `aura_llm::credentials::resolve_api_key`. Returns an `Arc<BillableLlm>` so every consumer shares the same budget gate. |
 | `build_llm_client_for_entry` | Same wiring pinned to a specific non-default `LlmEntry`. | Used by `aura llm probe` / live-model listing. |
 | `load_encryption_key` | `security.encryption_key_file` (hex, required) | Rejects non-hex input and any length ≠ 32 bytes. No dev-key fallback — a missing or unreadable file aborts startup rather than silently encrypting secrets with a publicly-known constant. |
 
@@ -78,7 +78,7 @@ init_tracing(File { log_dir, leak_detector })
 runtime::build_managers(config, shutdown, leak_detector, embedded_mcp_servers)
   │   ── Store::open at <workspace>/state/storage.db
   │   ── SessionManager / JobLifecycle / MemoryManager / CronScheduler / SecurityGateway
-  │   ── SkillRegistry / SkillAssessor / ToolRegistry / ToolExecutor / GuardedLlm / CostManager
+  │   ── SkillRegistry / SkillAssessor / ToolRegistry / ToolExecutor / BillableLlm / CostManager
   │   ── McpReconciler::spawn (re-reads <workspace>/config/.mcp.json on a tick)
   │
   ▼

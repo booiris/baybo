@@ -6,11 +6,10 @@
 //! the runtime loaded at startup). Edits land on disk and require a
 //! gateway restart to take effect — same contract as `PUT /v1/config`.
 
-
 use aura_config::{AuraConfig, LlmEntry};
 use aura_cost::TimeRange;
 use aura_llm::credentials::{resolve_api_key, vault_api_key_name};
-use aura_llm::{LlmBilling, LlmProviderConfig, LlmProviderRegistry};
+use aura_llm::{CostHooks, LlmProviderConfig, LlmProviderRegistry};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use chrono::{Duration, Utc};
@@ -243,7 +242,7 @@ async fn test_model(
         vault: Some(state.secret_vault.clone()),
     };
 
-    let client = match registry.create_client(&provider_cfg, None, LlmBilling::passthrough()) {
+    let client = match registry.create_client(&provider_cfg, None, CostHooks::passthrough()) {
         Ok(c) => c,
         Err(e) => {
             return Ok(Json(LlmModelTestResult {

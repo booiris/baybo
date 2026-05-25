@@ -190,7 +190,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
                 vault: None,
             },
             None,
-            aura_llm::LlmBilling::passthrough(),
+            aura_llm::CostHooks::passthrough(),
         )
         .expect("stub LLM client");
 

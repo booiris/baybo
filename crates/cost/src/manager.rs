@@ -431,7 +431,7 @@ impl CostManager {
     }
 
     /// Synchronous in-memory budget gate. Runs before every
-    /// dispatched LLM call (via `GuardedLlm`) and at `Router`
+    /// dispatched LLM call (via `BillableLlm`) and at `Router`
     /// ingress. A UTC rollover between the most recent `record_call`
     /// and `now` is honoured by treating the stale window as zero
     /// spend.
@@ -482,11 +482,11 @@ pub fn cost_call_guard(manager: &Arc<CostManager>) -> aura_llm::LlmCallGuard {
 }
 
 /// Bundle the admission guard and cost recorder for a `CostManager` into
-/// the [`LlmBilling`](aura_llm::LlmBilling) every `GuardedLlm` is built
+/// the [`CostHooks`](aura_llm::CostHooks) every `BillableLlm` is built
 /// with. This is the production wiring; argv one-shots and tests use
-/// [`LlmBilling::passthrough`](aura_llm::LlmBilling::passthrough).
-pub fn cost_billing(manager: &Arc<CostManager>) -> aura_llm::LlmBilling {
-    aura_llm::LlmBilling {
+/// [`CostHooks::passthrough`](aura_llm::CostHooks::passthrough).
+pub fn cost_hooks(manager: &Arc<CostManager>) -> aura_llm::CostHooks {
+    aura_llm::CostHooks {
         guard: cost_call_guard(manager),
         record: cost_record_closure(manager),
     }

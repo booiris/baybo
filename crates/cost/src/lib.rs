@@ -16,5 +16,5 @@ pub use aura_model::{CostRecord, CostSummary, TimeRange};
 pub use aura_store::CostStore;
 pub use error::{CostError, CostResult};
 pub use manager::{
-    CostGuardError, CostManager, CostMetrics, SpendingLimits, cost_billing, cost_call_guard,
+    CostGuardError, CostManager, CostMetrics, SpendingLimits, cost_call_guard, cost_hooks,
 };

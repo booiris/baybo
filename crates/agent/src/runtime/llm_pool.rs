@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aura_llm::GuardedLlm;
+use aura_llm::BillableLlm;
 use aura_model::{LlmEntryName, ModelTier};
 use tracing::warn;
 
@@ -28,15 +28,15 @@ use tracing::warn;
 pub type LlmPoolHandle = Arc<parking_lot::RwLock<Arc<LlmClientPool>>>;
 
 pub struct LlmClientPool {
-    clients: HashMap<LlmEntryName, Arc<GuardedLlm>>,
+    clients: HashMap<LlmEntryName, Arc<BillableLlm>>,
     default_name: LlmEntryName,
-    default_client: Arc<GuardedLlm>,
+    default_client: Arc<BillableLlm>,
     tier_map: HashMap<ModelTier, LlmEntryName>,
 }
 
 impl LlmClientPool {
     pub fn new(
-        clients: HashMap<LlmEntryName, Arc<GuardedLlm>>,
+        clients: HashMap<LlmEntryName, Arc<BillableLlm>>,
         default_name: LlmEntryName,
     ) -> Result<Self, String> {
         Self::with_tier_map(clients, default_name, HashMap::new())
@@ -47,7 +47,7 @@ impl LlmClientPool {
     /// reference would surface as a default-fallback every spawn,
     /// which is hard to diagnose at runtime, so we reject it at boot.
     pub fn with_tier_map(
-        clients: HashMap<LlmEntryName, Arc<GuardedLlm>>,
+        clients: HashMap<LlmEntryName, Arc<BillableLlm>>,
         default_name: LlmEntryName,
         tier_map: HashMap<ModelTier, LlmEntryName>,
     ) -> Result<Self, String> {
@@ -80,7 +80,7 @@ impl LlmClientPool {
         self.tier_map.get(&tier).cloned()
     }
 
-    pub fn default_client(&self) -> Arc<GuardedLlm> {
+    pub fn default_client(&self) -> Arc<BillableLlm> {
         self.default_client.clone()
     }
 
@@ -88,7 +88,7 @@ impl LlmClientPool {
         self.clients.keys().cloned().collect()
     }
 
-    pub(crate) fn resolve(&self, name: Option<&LlmEntryName>) -> (Arc<GuardedLlm>, LlmEntryName) {
+    pub(crate) fn resolve(&self, name: Option<&LlmEntryName>) -> (Arc<BillableLlm>, LlmEntryName) {
         match name {
             None => (self.default_client(), self.default_name.clone()),
             Some(requested) => match self.clients.get(requested) {
@@ -106,7 +106,7 @@ impl LlmClientPool {
     }
 }
 
-fn entry_names_csv(clients: &HashMap<LlmEntryName, Arc<GuardedLlm>>) -> String {
+fn entry_names_csv(clients: &HashMap<LlmEntryName, Arc<BillableLlm>>) -> String {
     clients
         .keys()
         .map(LlmEntryName::as_str)
@@ -121,7 +121,7 @@ mod tests {
     use aura_llm::{LlmCompletion, ModelInfo, ModelPricing};
     use std::sync::Arc;
 
-    fn stub_with_id(id: &str) -> Arc<GuardedLlm> {
+    fn stub_with_id(id: &str) -> Arc<BillableLlm> {
         let info = ModelInfo {
             id: id.to_string(),
             provider: "stub".into(),
@@ -131,7 +131,7 @@ mod tests {
             pricing: ModelPricing::default(),
         };
         let stub = Arc::new(StubLlm::new().with_model_info(info));
-        GuardedLlm::passthrough(stub as Arc<dyn LlmCompletion>)
+        BillableLlm::passthrough(stub as Arc<dyn LlmCompletion>)
     }
 
     fn fixture() -> LlmClientPool {

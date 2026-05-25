@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use aura_llm::{Attribution, BilledChat, GuardedLlm};
+use aura_llm::{Attribution, BillableLlm, BilledChat};
 use aura_model::{JobId, ParallelGroup, SessionId, SpanId, TrustLevel, User};
 
 use aura_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
@@ -308,7 +308,7 @@ impl ToolExecutor {
         cancel_token: CancellationToken,
         notifier: Option<Arc<dyn aura_tools::SessionNotifier>>,
         // `None` ⇒ tool's `ctx.llm` is unset (argv-mode / older tests).
-        bind_source: Option<&Arc<GuardedLlm>>,
+        bind_source: Option<&Arc<BillableLlm>>,
     ) -> anyhow::Result<ToolOutput> {
         debug!(tool = tool_name, "executing tool");
 

@@ -23,16 +23,16 @@ use crate::{
     ToolContext, ToolManifest, ToolOutput,
 };
 
-/// Binds a [`aura_llm::GuardedLlm`] to a throwaway system
+/// Binds a [`aura_llm::BillableLlm`] to a throwaway system
 /// [`Attribution`](aura_llm::Attribution) and exposes it as a
 /// [`BilledChat`] — bridges tests that drive `LlmCompletion` stubs into
 /// the per-call `ctx.llm` slot WebFetch (and any future tool) reads
-/// from. Pass a [`GuardedLlm::passthrough`](aura_llm::GuardedLlm::passthrough)
+/// from. Pass a [`BillableLlm::passthrough`](aura_llm::BillableLlm::passthrough)
 /// client so its no-op recorder reports `cost_micros: MicroUsd::ZERO`;
 /// budget assertions belong in agent-crate tests.
-pub fn unbilled_chat(inner: Arc<aura_llm::GuardedLlm>) -> Arc<dyn BilledChat> {
+pub fn unbilled_chat(inner: Arc<aura_llm::BillableLlm>) -> Arc<dyn BilledChat> {
     struct UnbilledChat {
-        inner: aura_llm::BoundBilledChat,
+        inner: aura_llm::BilledLlm,
     }
     #[async_trait]
     impl BilledChat for UnbilledChat {

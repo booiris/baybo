@@ -32,7 +32,7 @@ use std::sync::Arc;
 use aura_context::{
     BackgroundSummaryConfig, BackgroundSummaryOutcome, Tokenizer, run_background_summary,
 };
-use aura_llm::{Attribution, GuardedLlm, ModelInfo};
+use aura_llm::{Attribution, BillableLlm, ModelInfo};
 use aura_model::{BackgroundCompressionPayload, JobId, SessionId};
 use aura_session::SessionManager;
 use aura_trace::{LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepKind};
@@ -51,7 +51,7 @@ const ORPHAN_REAP_MODEL_TAG: &str = "orphan-reap";
 /// trace recorder, cost ledger, the LLM client, and the identity /
 /// cancel context that pin the call to a specific job + session.
 pub(crate) struct CompressionRunner {
-    pub(crate) llm_client: Arc<GuardedLlm>,
+    pub(crate) llm_client: Arc<BillableLlm>,
     pub(crate) recorder: Arc<SpanRecorder>,
     /// Same gateway as the main LLM path. Compression LLM output and
     /// errors are scrubbed through it before they land in the trace,
@@ -137,9 +137,8 @@ impl CompressionRunner {
                                 // Summary]. Placeholders are kept, not
                                 // revealed — the summarized brain operates
                                 // against the sanitized transcript.
-                                if let Err(e) = security_gateway
-                                    .sanitize_llm_response(&mut response)
-                                    .await
+                                if let Err(e) =
+                                    security_gateway.sanitize_llm_response(&mut response).await
                                 {
                                     warn!(error = %e, "compression: sanitize_llm_response failed");
                                 }
@@ -187,7 +186,7 @@ impl CompressionRunner {
 /// [`aura_context::run_background_summary`]; this struct is the
 /// agent-side adapter.
 pub(crate) struct BackgroundCompressionRunner {
-    pub llm_client: Arc<GuardedLlm>,
+    pub llm_client: Arc<BillableLlm>,
     pub security_gateway: Arc<SecurityGateway>,
     pub sessions: Arc<SessionManager>,
     pub workspace_paths: Arc<WorkspacePaths>,

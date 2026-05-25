@@ -1,6 +1,6 @@
 //! Billing primitives: the [`Attribution`] a call is billed to, the cost
-//! hooks ([`LlmBilling`]) every [`GuardedLlm`] runs, and
-//! [`BoundBilledChat`] — the bound handle that performs
+//! hooks ([`CostHooks`]) every [`BillableLlm`] runs, and
+//! [`BilledLlm`] — the bound handle that performs
 //! gate → call → record, so a successful return guarantees the spend was
 //! accounted (or explicitly waived via a no-op recorder).
 //!
@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use aura_model::{JobId, MicroUsd, SessionId, SpanId};
 use futures::stream::{Stream, StreamExt};
 
-use crate::guard::{GuardedLlm, LlmCallGuard};
+use crate::guard::{BillableLlm, LlmCallGuard};
 use crate::{ChatRequest, LlmResponse, LlmStream, ModelInfo, StreamEvent, TokenUsage};
 
 /// Reserved `user_id` for spend no end user triggered — background safety
@@ -28,7 +28,7 @@ use crate::{ChatRequest, LlmResponse, LlmStream, ModelInfo, StreamEvent, TokenUs
 /// single filter surfaces all system-initiated spend in `cost_records`.
 pub const SYSTEM_USER_ID: &str = "system";
 
-/// Who an LLM call is billed to. Threaded into [`GuardedLlm::bind`] and
+/// Who an LLM call is billed to. Threaded into [`BillableLlm::bind`] and
 /// handed to the cost recorder on every call.
 #[derive(Debug, Clone)]
 pub struct Attribution {
@@ -61,18 +61,18 @@ impl Attribution {
 /// layer injects a closure capturing its `CostManager`.
 pub type LlmCostRecorder = Arc<dyn Fn(&Attribution, &str, &TokenUsage) -> MicroUsd + Send + Sync>;
 
-/// The two cost hooks every [`GuardedLlm`] runs: an admission `guard`
+/// The two cost hooks every [`BillableLlm`] runs: an admission `guard`
 /// before the provider call and a `record` after it. Bundled because both
 /// derive from the same `CostManager` and must be wired together — a
 /// client that gates spend but never records it is exactly the bug this
 /// pairing makes unrepresentable.
 #[derive(Clone)]
-pub struct LlmBilling {
+pub struct CostHooks {
     pub guard: LlmCallGuard,
     pub record: LlmCostRecorder,
 }
 
-impl LlmBilling {
+impl CostHooks {
     /// Admit every call, record nothing. The deliberate escape hatch for
     /// argv one-shots and tests with no `CostManager` — the only place an
     /// unbilled provider call is intentional. Grep for it.
@@ -87,7 +87,7 @@ impl LlmBilling {
     /// without standing up a `CostManager`. Test-gated on purpose:
     /// "gate but don't record" has no production use, and leaving it
     /// callable in release builds would be a billing bypass — exactly
-    /// what routing every call through [`BoundBilledChat`] prevents.
+    /// what routing every call through [`BilledLlm`] prevents.
     #[cfg(test)]
     pub(crate) fn unrecorded(guard: LlmCallGuard) -> Self {
         Self {
@@ -118,17 +118,17 @@ pub trait BilledChat: Send + Sync {
     async fn chat(&self, request: &ChatRequest) -> Result<BilledChatResponse, String>;
 }
 
-/// A [`GuardedLlm`] bound to a fixed [`Attribution`]. The sole way to
+/// A [`BillableLlm`] bound to a fixed [`Attribution`]. The sole way to
 /// reach a provider with recording attached: every `chat` / `chat_stream`
 /// runs gate → call → record. Returns the *raw* provider response —
 /// response sanitization is a separate, caller-side concern.
-pub struct BoundBilledChat {
-    llm: Arc<GuardedLlm>,
+pub struct BilledLlm {
+    llm: Arc<BillableLlm>,
     attribution: Attribution,
 }
 
-impl BoundBilledChat {
-    pub(crate) fn new(llm: Arc<GuardedLlm>, attribution: Attribution) -> Self {
+impl BilledLlm {
+    pub(crate) fn new(llm: Arc<BillableLlm>, attribution: Attribution) -> Self {
         Self { llm, attribution }
     }
 
@@ -146,9 +146,11 @@ impl BoundBilledChat {
     /// produced no usage has nothing to bill.
     pub async fn chat(&self, request: &ChatRequest) -> crate::Result<BilledChatResponse> {
         let response = self.llm.chat(request).await?;
-        let cost_micros =
-            self.llm
-                .record(&self.attribution, &self.llm.model_info().id, &response.usage);
+        let cost_micros = self.llm.record(
+            &self.attribution,
+            &self.llm.model_info().id,
+            &response.usage,
+        );
         Ok(BilledChatResponse {
             response,
             cost_micros,
@@ -176,7 +178,7 @@ impl BoundBilledChat {
 /// if it bails early. Records the last `Usage` event observed.
 struct RecordingStream {
     inner: LlmStream,
-    llm: Arc<GuardedLlm>,
+    llm: Arc<BillableLlm>,
     attribution: Attribution,
     last_usage: TokenUsage,
     recorded: bool,
@@ -233,8 +235,8 @@ mod tests {
         calls: Mutex<Vec<(String, String, TokenUsage)>>,
     }
 
-    fn billing_with_probe(probe: Arc<RecorderProbe>) -> LlmBilling {
-        LlmBilling {
+    fn billing_with_probe(probe: Arc<RecorderProbe>) -> CostHooks {
+        CostHooks {
             guard: Arc::new(|| Ok(())),
             record: Arc::new(move |attr, model_id, usage| {
                 probe.calls.lock().push((
@@ -282,8 +284,10 @@ mod tests {
             usage: usage(12, 34),
             thinking: None,
         });
-        let guarded =
-            GuardedLlm::new(stub as Arc<dyn LlmCompletion>, billing_with_probe(probe.clone()));
+        let guarded = BillableLlm::new(
+            stub as Arc<dyn LlmCompletion>,
+            billing_with_probe(probe.clone()),
+        );
         let bound = guarded.bind(Attribution::system("unit-test"));
 
         bound.chat(&empty_request()).await.expect("chat ok");
@@ -303,11 +307,16 @@ mod tests {
             StreamEvent::Text("hi".into()),
             StreamEvent::Usage(usage(7, 9)),
         ]);
-        let guarded =
-            GuardedLlm::new(stub as Arc<dyn LlmCompletion>, billing_with_probe(probe.clone()));
+        let guarded = BillableLlm::new(
+            stub as Arc<dyn LlmCompletion>,
+            billing_with_probe(probe.clone()),
+        );
         let bound = guarded.bind(Attribution::system("stream-test"));
 
-        let mut stream = bound.chat_stream(&empty_request()).await.expect("stream ok");
+        let mut stream = bound
+            .chat_stream(&empty_request())
+            .await
+            .expect("stream ok");
         while stream.next().await.is_some() {}
         drop(stream);
 

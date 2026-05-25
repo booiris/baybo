@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_llm::{BoundBilledChat, ChatRequest};
+use aura_llm::{BilledLlm, ChatRequest};
 use aura_skills::SkillDefinition;
 use aura_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 use tokio::sync::mpsc;
@@ -56,7 +56,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(5);
 /// Returns an mpsc sender the assessor clones into every `check` call.
 /// Dropping all senders shuts the worker down after draining.
 pub(crate) fn spawn_worker(
-    llm: Arc<BoundBilledChat>,
+    llm: Arc<BilledLlm>,
     store: Arc<dyn SkillRiskStore>,
     capacity: usize,
 ) -> mpsc::Sender<BackgroundJob> {
@@ -71,7 +71,7 @@ pub(crate) fn spawn_worker(
     tx
 }
 
-async fn process_job(llm: &BoundBilledChat, store: &dyn SkillRiskStore, job: BackgroundJob) {
+async fn process_job(llm: &BilledLlm, store: &dyn SkillRiskStore, job: BackgroundJob) {
     let BackgroundJob {
         skill,
         source_path,
@@ -176,7 +176,7 @@ async fn process_job(llm: &BoundBilledChat, store: &dyn SkillRiskStore, job: Bac
 /// level on success; the verdict and job row are persisted before
 /// returning.
 async fn assess_full(
-    llm: &BoundBilledChat,
+    llm: &BilledLlm,
     store: &dyn SkillRiskStore,
     skill: &SkillDefinition,
     source_path: &std::path::Path,

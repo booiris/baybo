@@ -173,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
             &provider_registry,
             None,
             None,
-            aura_llm::LlmBilling::passthrough(),
+            aura_llm::CostHooks::passthrough(),
         )
         .await
         {

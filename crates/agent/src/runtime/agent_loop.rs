@@ -4,7 +4,7 @@ use aura_channels::{AgentOutput, COMPACT_COMMAND, OutgoingMessage};
 use aura_context::ContextManager;
 use aura_job::{JobInput, JobLifecycle, JobOutput};
 use aura_llm::{
-    Attribution, BoundBilledChat, ChatRequest, GuardedLlm, LlmResponse, StreamEvent, TokenUsage,
+    Attribution, BillableLlm, BilledLlm, ChatRequest, LlmResponse, StreamEvent, TokenUsage,
     ToolDefinitionForLlm,
 };
 use aura_model::{ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SystemSpawnRequest};
@@ -168,7 +168,7 @@ pub struct AgentLoop {
     /// Currently-active client, re-resolved from `llm_pool` at the
     /// start of each turn ([`Self::refresh_active_llm`]) so a config
     /// hot-reload takes effect on the next message.
-    llm_client: Arc<GuardedLlm>,
+    llm_client: Arc<BillableLlm>,
     /// Hot-swappable pool handle this loop re-resolves against per turn.
     llm_pool: crate::runtime::llm_pool::LlmPoolHandle,
     /// The pin this loop resolves: `None` ⇒ pool default (user / cron
@@ -332,7 +332,7 @@ impl AgentLoop {
         let pool = Arc::clone(&self.llm_pool.read());
         let (client, _name) = pool.resolve(self.initial_llm.as_ref());
         // Compare by pointer, not model id: a config reload swaps in a
-        // fresh `Arc<GuardedLlm>` even when the model id is unchanged
+        // fresh `Arc<BillableLlm>` even when the model id is unchanged
         // (a `base_url`, credential, `reasoning_effort`, or
         // `context_window` edit), and those must take effect too. An
         // unchanged pool returns a clone of the same `Arc`, so this stays
@@ -874,7 +874,7 @@ impl AgentLoop {
             |span| async move {
                 let started_at = std::time::Instant::now();
                 // Bind this call to its `LlmCall` span so the spend lands
-                // on the right span. `BoundBilledChat` does gate → call →
+                // on the right span. `BilledLlm` does gate → call →
                 // record internally — no manual `record_call` afterward.
                 let bound = self.llm_client.bind(Attribution {
                     user_id: session.user.id.clone(),
@@ -973,7 +973,7 @@ impl AgentLoop {
                 };
 
                 // Cost was already recorded inside the bound call
-                // (`BoundBilledChat`) — synchronously bumping the budget
+                // (`BilledLlm`) — synchronously bumping the budget
                 // accumulator before the next iteration's `check()`, with
                 // disk persistence fire-and-forget. Streaming bills the
                 // last-seen usage on stream end/drop; a non-streaming
@@ -994,7 +994,7 @@ impl AgentLoop {
 
     /// Log a single LLM call to the per-session JSONL log. Context owns the
     /// logger + record format and assembles + writes it; the agent only
-    /// supplies the model identity (from its `GuardedLlm`, which context
+    /// supplies the model identity (from its `BillableLlm`, which context
     /// doesn't hold) plus the call's request + outcome.
     async fn write_session_log(&self, request: &ChatRequest, outcome: LlmCallOutcome) {
         let info = self.llm_client.model_info();
@@ -1102,7 +1102,7 @@ impl AgentLoop {
     /// see the failed call instead of silent under-billing.
     async fn chat_streaming(
         &self,
-        bound: &BoundBilledChat,
+        bound: &BilledLlm,
         request: &ChatRequest,
         session: &Session,
         delta_tx: &mpsc::Sender<AgentOutput>,

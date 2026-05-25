@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use aura_config::{AuraConfig, LlmEntry, RiskCheckConfig, SecurityConfig, WorkspaceConfig};
 use aura_llm::credentials::resolve_api_key;
-use aura_llm::{GuardedLlm, LlmBilling, LlmProviderConfig, LlmProviderRegistry};
+use aura_llm::{BillableLlm, CostHooks, LlmProviderConfig, LlmProviderRegistry};
 use aura_security::{EncryptionKey, LeakDetector};
 use aura_skills_assessor::AssessmentMode;
 use aura_workspace::WorkspacePaths;
@@ -69,7 +69,7 @@ pub fn resolve_config_path() -> Option<PathBuf> {
     default.exists().then_some(default)
 }
 
-/// Build an [`Arc<GuardedLlm>`] from the `default-llm` entry of an
+/// Build an [`Arc<BillableLlm>`] from the `default-llm` entry of an
 /// `AuraConfig`, resolving the api key through env then vault. The
 /// returned handle is sealed: every `chat`/`chat_stream` runs through
 /// `guard` first.
@@ -88,16 +88,16 @@ pub fn resolve_config_path() -> Option<PathBuf> {
 ///
 /// `billing` carries the gate the resulting client runs before every
 /// LLM call and the recorder it runs after. Production wiring derives
-/// this from `CostManager` (`aura_cost::cost_billing`); CLI `aura llm
-/// probe` and similar one-shot tools pass [`LlmBilling::passthrough`] so
+/// this from `CostManager` (`aura_cost::cost_hooks`); CLI `aura llm
+/// probe` and similar one-shot tools pass [`CostHooks::passthrough`] so
 /// the probe isn't gated or billed against anyone.
 pub async fn build_llm_client(
     cfg: &AuraConfig,
     registry: &LlmProviderRegistry,
     blob_store: Option<std::sync::Arc<dyn aura_store::BlobStore>>,
     vault: Option<std::sync::Arc<aura_security::SecretVault>>,
-    billing: LlmBilling,
-) -> anyhow::Result<std::sync::Arc<GuardedLlm>> {
+    billing: CostHooks,
+) -> anyhow::Result<std::sync::Arc<BillableLlm>> {
     let entry = cfg.default_llm_entry().ok_or_else(|| {
         if cfg.llm.is_empty() {
             anyhow::anyhow!(
@@ -127,8 +127,8 @@ pub async fn build_llm_client_for_entry(
     registry: &LlmProviderRegistry,
     blob_store: Option<std::sync::Arc<dyn aura_store::BlobStore>>,
     vault: Option<std::sync::Arc<aura_security::SecretVault>>,
-    billing: LlmBilling,
-) -> anyhow::Result<std::sync::Arc<GuardedLlm>> {
+    billing: CostHooks,
+) -> anyhow::Result<std::sync::Arc<BillableLlm>> {
     let api_key = resolve_api_key(
         entry.name.as_str(),
         &entry.provider,

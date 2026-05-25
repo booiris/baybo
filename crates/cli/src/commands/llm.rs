@@ -121,7 +121,7 @@ async fn probe(ctx: &CommandContext, name: Option<String>) -> Result<CommandOutp
         reasoning_effort: entry.reasoning_effort.clone(),
         vault: ctx.secret_vault.clone(),
     };
-    match registry.create_client(&cfg, None, aura_llm::LlmBilling::passthrough()) {
+    match registry.create_client(&cfg, None, aura_llm::CostHooks::passthrough()) {
         Err(e) => Err(CliError::Manager(format!(
             "build provider client for {}: {e}",
             entry.name

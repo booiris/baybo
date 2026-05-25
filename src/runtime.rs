@@ -35,7 +35,7 @@ use aura_context::{
 };
 use aura_cost::{CostManager, SpendingLimits};
 use aura_job::JobLifecycle;
-use aura_llm::GuardedLlm;
+use aura_llm::BillableLlm;
 use aura_memory::MemoryManager;
 use aura_model::SystemSpawnRequest;
 use aura_security::{LeakDetectionRule, LeakDetector};
@@ -136,14 +136,14 @@ pub struct ManagerGraph {
     /// subagent's `ContextManager`, which resolves the child's system prompt
     /// from it by profile name.
     pub subagent_registry: Arc<aura_subagent::SubagentRegistry>,
-    /// Always already wrapped via `GuardedLlm` — every
+    /// Always already wrapped via `BillableLlm` — every
     /// consumer (main loop, side-LLM in tools, skill_assessor)
     /// shares the same budget gate. Constructed in
     /// [`build_managers`] so a new consumer added downstream can't
     /// accidentally pull a raw `Arc<LlmClient>` and bypass the gate;
     /// the type signature alone is enough to refuse a raw
     /// `Arc<dyn LlmCompletion>` at the call site.
-    pub llm_client: Arc<GuardedLlm>,
+    pub llm_client: Arc<BillableLlm>,
     /// `llm_client` is `pool.default_client()`. The pool exists so the
     /// actor spawner can resolve a per-session pick from
     /// `Session.state.last_llm`.
@@ -298,7 +298,7 @@ pub async fn build_managers(
     let secret_vault = Arc::new(SecretVault::new(master_key, stores.secret.clone()));
 
     // CostManager built before the LLM client so its gate closure is
-    // ready for `boot::build_llm_client` to seal into `GuardedLlm`.
+    // ready for `boot::build_llm_client` to seal into `BillableLlm`.
     // The provider registry is shared between pricing harvest and
     // `build_llm_client` — single source of truth for factories.
     let provider_registry = aura_llm::LlmProviderRegistry::with_default_providers();
@@ -571,7 +571,7 @@ pub async fn build_managers(
     });
     info!(path = %sandbox_root.display(), "sandbox FS scope rooted at workspace work/");
     // `ToolExecutor` doesn't store an LLM handle; the active
-    // `GuardedLlm` is passed in per `execute` call and bound to the
+    // `BillableLlm` is passed in per `execute` call and bound to the
     // tool span there, so a tool's side-LLM call bills against the
     // model the surrounding actor is currently using.
     let tool_executor = Arc::new(ToolExecutor::new(

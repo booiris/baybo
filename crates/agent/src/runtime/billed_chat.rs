@@ -1,6 +1,6 @@
 //! Tool-facing billed-chat adapter.
 //!
-//! [`BoundBilledChat`](aura_llm::BoundBilledChat) is the billing
+//! [`BilledLlm`](aura_llm::BilledLlm) is the billing
 //! chokepoint — it runs gate → call → record and returns the *raw*
 //! provider response. [`BilledChatRunner`] is the agent-side decorator a
 //! tool's `ctx.llm` resolves to: on top of a bound call it adds the
@@ -11,13 +11,13 @@
 //! at the sanitize-tool-output boundary.
 //!
 //! The main reasoning loop and compression don't use this adapter — they
-//! bind their own [`BoundBilledChat`] and sanitize inline, because their
+//! bind their own [`BilledLlm`] and sanitize inline, because their
 //! brain operates against the *placeholdered* transcript (no reveal).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_llm::{BilledChat, BilledChatResponse, BoundBilledChat, ChatRequest, ModelInfo};
+use aura_llm::{BilledChat, BilledChatResponse, BilledLlm, ChatRequest, ModelInfo};
 use tracing::warn;
 
 use crate::security::SecurityGateway;
@@ -25,12 +25,12 @@ use crate::security::SecurityGateway;
 /// Tool-facing [`BilledChat`]: a bound billed call plus the response
 /// sanitize + placeholder-reveal the tool path requires.
 pub struct BilledChatRunner {
-    bound: BoundBilledChat,
+    bound: BilledLlm,
     security_gateway: Arc<SecurityGateway>,
 }
 
 impl BilledChatRunner {
-    pub fn new(bound: BoundBilledChat, security_gateway: Arc<SecurityGateway>) -> Self {
+    pub fn new(bound: BilledLlm, security_gateway: Arc<SecurityGateway>) -> Self {
         Self {
             bound,
             security_gateway,
@@ -76,7 +76,7 @@ mod tests {
     use std::sync::Arc;
 
     use aura_llm::test_support::StubLlm;
-    use aura_llm::{Attribution, GuardedLlm, LlmCompletion, LlmResponse, TokenUsage};
+    use aura_llm::{Attribution, BillableLlm, LlmCompletion, LlmResponse, TokenUsage};
     use aura_model::{ChatMessage, ContentBlock};
     use aura_security::leak_detector::{LeakAction, LeakDetectionRule, LeakDetector};
     use aura_security::test_support::MemorySecretStore;
@@ -98,7 +98,7 @@ mod tests {
         let vault = Arc::new(SecretVault::new(vault_key, secret_store));
         let gateway = Arc::new(SecurityGateway::new(Arc::new(detector), vault));
 
-        let llm = GuardedLlm::passthrough(stub as Arc<dyn LlmCompletion>);
+        let llm = BillableLlm::passthrough(stub as Arc<dyn LlmCompletion>);
         let bound = llm.bind(Attribution::system("tool-test"));
         let runner =
             Arc::new(BilledChatRunner::new(bound, Arc::clone(&gateway))) as Arc<dyn BilledChat>;

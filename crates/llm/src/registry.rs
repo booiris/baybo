@@ -9,7 +9,7 @@ use crate::providers::{
     gemini::GeminiProviderFactory, minimax::MiniMaxProviderFactory, openai::OpenAIProviderFactory,
     openai_subscription::OpenAiSubscriptionProviderFactory,
 };
-use crate::{BlobFetcher, GuardedLlm, LlmBilling, LlmClient, LlmCompletion};
+use crate::{BillableLlm, BlobFetcher, CostHooks, LlmClient, LlmCompletion};
 
 /// Configuration for creating an LLM provider client.
 #[derive(Clone, Serialize, Deserialize)]
@@ -221,33 +221,33 @@ impl LlmProviderRegistry {
 
     /// **The** public production constructor. Builds the raw client
     /// internally, attaches an optional blob fetcher, and wraps the
-    /// whole thing in a [`GuardedLlm`] sealed by `guard`. Returns
-    /// `Arc<GuardedLlm>` so callers can fan it out to consumers
+    /// whole thing in a [`BillableLlm`] sealed by `guard`. Returns
+    /// `Arc<BillableLlm>` so callers can fan it out to consumers
     /// without ever holding a raw `LlmClient` / `Arc<dyn
     /// LlmCompletion>` at a public boundary.
     ///
     /// `blob_fetcher` is optional; passing `None` is correct for
     /// text-only deployments and one-shot probes. `billing` carries the
     /// pre-call guard and post-call cost recorder — production wires
-    /// `aura_cost::cost_billing`, while CLI / test fixtures pass
-    /// [`LlmBilling::passthrough`].
+    /// `aura_cost::cost_hooks`, while CLI / test fixtures pass
+    /// [`CostHooks::passthrough`].
     pub fn create_client(
         &self,
         config: &LlmProviderConfig,
         blob_fetcher: Option<Arc<dyn BlobFetcher>>,
-        billing: LlmBilling,
-    ) -> crate::Result<Arc<GuardedLlm>> {
+        billing: CostHooks,
+    ) -> crate::Result<Arc<BillableLlm>> {
         let mut client = self.build_client(config)?;
         if let Some(fetcher) = blob_fetcher {
             client = client.with_blob_fetcher(fetcher);
         }
         let inner: Arc<dyn LlmCompletion> = Arc::new(client);
-        Ok(GuardedLlm::new(inner, billing))
+        Ok(BillableLlm::new(inner, billing))
     }
 
     /// Internal raw-client construction. Kept `pub(crate)` because
     /// every external call should go through [`Self::create_client`]
-    /// (which seals the result in a `GuardedLlm`). The internal tests
+    /// (which seals the result in a `BillableLlm`). The internal tests
     /// in this crate still use this directly to exercise provider
     /// factories without dragging the guard layer in.
     pub(crate) fn build_client(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {

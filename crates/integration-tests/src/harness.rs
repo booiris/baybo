@@ -20,7 +20,7 @@ use aura_agent::{
 use aura_channels::{AgentOutput, IncomingMessage, Message};
 use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer};
 use aura_cost::test_support::MemoryCostStore;
-use aura_cost::{CostManager, SpendingLimits, cost_billing};
+use aura_cost::{CostManager, SpendingLimits, cost_hooks};
 use aura_job::JobLifecycle;
 use aura_job::test_support::MemoryJobStore;
 use aura_llm::test_support::StubLlm;
@@ -397,9 +397,9 @@ impl AgentTestHarnessBuilder {
             session_log: None,
         });
 
-        let guarded_llm = aura_llm::GuardedLlm::new(
+        let guarded_llm = aura_llm::BillableLlm::new(
             stub_llm.clone() as Arc<dyn aura_llm::LlmCompletion>,
-            cost_billing(&cost_manager),
+            cost_hooks(&cost_manager),
         );
 
         // Single-entry pool keyed by the stub model's id; tests that
