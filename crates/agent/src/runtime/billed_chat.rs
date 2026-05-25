@@ -1,6 +1,6 @@
 //! Tool-facing billed-chat adapter.
 //!
-//! [`BilledLlm`](aura_llm::BilledLlm) is the billing
+//! [`BoundBilledLlm`](aura_llm::BoundBilledLlm) is the billing
 //! chokepoint — it runs gate → call → record and returns the *raw*
 //! provider response. [`BilledChatRunner`] is the agent-side decorator a
 //! tool's `ctx.llm` resolves to: on top of a bound call it adds the
@@ -11,13 +11,13 @@
 //! at the sanitize-tool-output boundary.
 //!
 //! The main reasoning loop and compression don't use this adapter — they
-//! bind their own [`BilledLlm`] and sanitize inline, because their
+//! bind their own [`BoundBilledLlm`] and sanitize inline, because their
 //! brain operates against the *placeholdered* transcript (no reveal).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_llm::{BilledChat, BilledChatResponse, BilledLlm, ChatRequest, ModelInfo};
+use aura_llm::{BilledChat, BilledChatResponse, BoundBilledLlm, ChatRequest, ModelInfo};
 use tracing::warn;
 
 use crate::security::SecurityGateway;
@@ -25,12 +25,12 @@ use crate::security::SecurityGateway;
 /// Tool-facing [`BilledChat`]: a bound billed call plus the response
 /// sanitize + placeholder-reveal the tool path requires.
 pub struct BilledChatRunner {
-    bound: BilledLlm,
+    bound: BoundBilledLlm,
     security_gateway: Arc<SecurityGateway>,
 }
 
 impl BilledChatRunner {
-    pub fn new(bound: BilledLlm, security_gateway: Arc<SecurityGateway>) -> Self {
+    pub fn new(bound: BoundBilledLlm, security_gateway: Arc<SecurityGateway>) -> Self {
         Self {
             bound,
             security_gateway,

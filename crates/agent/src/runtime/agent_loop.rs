@@ -4,7 +4,7 @@ use aura_channels::{AgentOutput, COMPACT_COMMAND, OutgoingMessage};
 use aura_context::ContextManager;
 use aura_job::{JobInput, JobLifecycle, JobOutput};
 use aura_llm::{
-    Attribution, BillableLlm, BilledLlm, ChatRequest, LlmResponse, StreamEvent, TokenUsage,
+    Attribution, BillableLlm, BoundBilledLlm, ChatRequest, LlmResponse, StreamEvent, TokenUsage,
     ToolDefinitionForLlm,
 };
 use aura_model::{ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SystemSpawnRequest};
@@ -874,7 +874,7 @@ impl AgentLoop {
             |span| async move {
                 let started_at = std::time::Instant::now();
                 // Bind this call to its `LlmCall` span so the spend lands
-                // on the right span. `BilledLlm` does gate → call →
+                // on the right span. `BoundBilledLlm` does gate → call →
                 // record internally — no manual `record_call` afterward.
                 let bound = self.llm_client.bind(Attribution {
                     user_id: session.user.id.clone(),
@@ -973,7 +973,7 @@ impl AgentLoop {
                 };
 
                 // Cost was already recorded inside the bound call
-                // (`BilledLlm`) — synchronously bumping the budget
+                // (`BoundBilledLlm`) — synchronously bumping the budget
                 // accumulator before the next iteration's `check()`, with
                 // disk persistence fire-and-forget. Streaming bills the
                 // last-seen usage on stream end/drop; a non-streaming
@@ -1102,7 +1102,7 @@ impl AgentLoop {
     /// see the failed call instead of silent under-billing.
     async fn chat_streaming(
         &self,
-        bound: &BilledLlm,
+        bound: &BoundBilledLlm,
         request: &ChatRequest,
         session: &Session,
         delta_tx: &mpsc::Sender<AgentOutput>,

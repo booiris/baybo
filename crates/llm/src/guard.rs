@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use aura_model::MicroUsd;
 
-use crate::billed::{Attribution, BilledLlm, CostHooks, LlmCostRecorder};
+use crate::billed::{Attribution, BoundBilledLlm, CostHooks, LlmCostRecorder};
 use crate::{ChatRequest, LlmCompletion, LlmError, LlmResponse, LlmStream, ModelInfo, TokenUsage};
 
 /// Closure invoked before every guarded LLM call. Returns `Err` to
@@ -32,7 +32,7 @@ pub type LlmCallGuard = Arc<dyn Fn() -> Result<(), LlmError> + Send + Sync>;
 /// [`LlmCallGuard`] runs before every call and a cost recorder runs
 /// after it. The handle itself is attribution-free and shared across all
 /// sessions; [`BillableLlm::bind`] pins an [`Attribution`] to produce a
-/// [`BilledLlm`], which is the path that actually reaches a
+/// [`BoundBilledLlm`], which is the path that actually reaches a
 /// provider with recording attached.
 pub struct BillableLlm {
     inner: Arc<dyn LlmCompletion>,
@@ -66,15 +66,15 @@ impl BillableLlm {
     }
 
     /// Pin an [`Attribution`] to this client, yielding the
-    /// [`BilledLlm`] that performs gate → call → record. Cheap
+    /// [`BoundBilledLlm`] that performs gate → call → record. Cheap
     /// (an `Arc` clone); bind once per context (per turn, per tool call,
     /// or once at startup for a system component).
-    pub fn bind(self: &Arc<Self>, attribution: Attribution) -> BilledLlm {
-        BilledLlm::new(Arc::clone(self), attribution)
+    pub fn bind(self: &Arc<Self>, attribution: Attribution) -> BoundBilledLlm {
+        BoundBilledLlm::new(Arc::clone(self), attribution)
     }
 
     /// Run the injected cost recorder. `pub(crate)` so only
-    /// [`BilledLlm`] can invoke it — recording is never a
+    /// [`BoundBilledLlm`] can invoke it — recording is never a
     /// caller-visible step, it rides on the bound call.
     pub(crate) fn record(
         &self,
@@ -86,7 +86,7 @@ impl BillableLlm {
     }
 
     /// `pub(crate)` on purpose: the only way to reach a provider from
-    /// outside this crate is [`BillableLlm::bind`] → [`BilledLlm`],
+    /// outside this crate is [`BillableLlm::bind`] → [`BoundBilledLlm`],
     /// which runs the recorder after the call. Exposing a bare `chat`
     /// again would reopen the unbilled-spend hole this design closes.
     pub(crate) async fn chat(&self, request: &ChatRequest) -> crate::Result<LlmResponse> {

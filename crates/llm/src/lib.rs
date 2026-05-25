@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 pub use crate::billed::{
-    Attribution, BilledChat, BilledChatResponse, BilledLlm, CostHooks, LlmCostRecorder,
+    Attribution, BilledChat, BilledChatResponse, BoundBilledLlm, CostHooks, LlmCostRecorder,
     SYSTEM_USER_ID,
 };
 pub use crate::error::LlmError;

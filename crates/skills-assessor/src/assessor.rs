@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use aura_llm::{BilledLlm, ChatRequest};
+use aura_llm::{BoundBilledLlm, ChatRequest};
 use aura_skills::SkillDefinition;
 use aura_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 use thiserror::Error;
@@ -89,7 +89,7 @@ pub struct SkillAssessor {
     /// user-attributable work, and verdicts are cached by content hash
     /// (not model), so the boot-time client is pinned for the assessor's
     /// lifetime — it does not follow a config hot-reload's model swap.
-    llm: Arc<BilledLlm>,
+    llm: Arc<BoundBilledLlm>,
     store: Arc<dyn SkillRiskStore>,
     mode: AssessmentMode,
     /// Background worker handle. Under `Full` mode `check_full` tiers
@@ -105,7 +105,7 @@ impl SkillAssessor {
     /// spawned on the current Tokio runtime and lives as long as any
     /// sender is held.
     pub fn with_background_worker(
-        llm: Arc<BilledLlm>,
+        llm: Arc<BoundBilledLlm>,
         store: Arc<dyn SkillRiskStore>,
         mode: AssessmentMode,
     ) -> Self {

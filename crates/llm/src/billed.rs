@@ -1,6 +1,6 @@
 //! Billing primitives: the [`Attribution`] a call is billed to, the cost
 //! hooks ([`CostHooks`]) every [`BillableLlm`] runs, and
-//! [`BilledLlm`] — the bound handle that performs
+//! [`BoundBilledLlm`] — the bound handle that performs
 //! gate → call → record, so a successful return guarantees the spend was
 //! accounted (or explicitly waived via a no-op recorder).
 //!
@@ -87,7 +87,7 @@ impl CostHooks {
     /// without standing up a `CostManager`. Test-gated on purpose:
     /// "gate but don't record" has no production use, and leaving it
     /// callable in release builds would be a billing bypass — exactly
-    /// what routing every call through [`BilledLlm`] prevents.
+    /// what routing every call through [`BoundBilledLlm`] prevents.
     #[cfg(test)]
     pub(crate) fn unrecorded(guard: LlmCallGuard) -> Self {
         Self {
@@ -122,12 +122,12 @@ pub trait BilledChat: Send + Sync {
 /// reach a provider with recording attached: every `chat` / `chat_stream`
 /// runs gate → call → record. Returns the *raw* provider response —
 /// response sanitization is a separate, caller-side concern.
-pub struct BilledLlm {
+pub struct BoundBilledLlm {
     llm: Arc<BillableLlm>,
     attribution: Attribution,
 }
 
-impl BilledLlm {
+impl BoundBilledLlm {
     pub(crate) fn new(llm: Arc<BillableLlm>, attribution: Attribution) -> Self {
         Self { llm, attribution }
     }

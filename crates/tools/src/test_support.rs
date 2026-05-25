@@ -32,7 +32,7 @@ use crate::{
 /// budget assertions belong in agent-crate tests.
 pub fn unbilled_chat(inner: Arc<aura_llm::BillableLlm>) -> Arc<dyn BilledChat> {
     struct UnbilledChat {
-        inner: aura_llm::BilledLlm,
+        inner: aura_llm::BoundBilledLlm,
     }
     #[async_trait]
     impl BilledChat for UnbilledChat {
