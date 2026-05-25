@@ -222,7 +222,7 @@ impl JobLifecycle {
             Some(k) => self.store.list_by_status_kind(k.as_snake_case()).await?,
             None => self.store.list_all().await?,
         };
-        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        rows.sort_by_key(|b| std::cmp::Reverse(b.created_at));
         rows.into_iter().map(Job::from_row).collect()
     }
 
@@ -256,7 +256,7 @@ impl JobLifecycle {
         if let Some(k) = status {
             jobs.retain(|j| j.status.kind() == k);
         }
-        jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        jobs.sort_by_key(|b| std::cmp::Reverse(b.created_at));
         Ok(jobs)
     }
 
