@@ -745,12 +745,17 @@ fn resolve_target_path(ctx: &CommandContext) -> Result<PathBuf> {
 /// (`singleton::acquire`).
 ///
 /// The one false-positive is a sibling `aura` CLI that holds the lock for
-/// the microsecond of its own "acquired" branch below. To stop a
-/// concurrent CLI from observing that as `WouldBlock`, reading a *stale*
-/// pid left by an exited gateway, and SIGHUP-ing an unrelated (pid-reused)
-/// process — whose default SIGHUP action is to terminate — the acquired
-/// branch clears the stale pid before releasing. Returns the note to
-/// append to the command's human output.
+/// the microsecond of its own "acquired" branch below. To shrink that
+/// window, the acquired branch clears the stale pid (left by an exited
+/// gateway) before releasing, so a concurrent CLI is unlikely to observe
+/// `WouldBlock` *and* read a stale pid to SIGHUP an unrelated (pid-reused)
+/// process — whose default SIGHUP action is to terminate. This narrows but
+/// does not fully eliminate the race: between a sibling's `try_lock` (Ok)
+/// and its `set_len(0)` there's a 2-syscall window where the stale pid is
+/// still readable. Closing it entirely would need pidfd or a pid+liveness
+/// check; the residual risk (concurrent CLIs + an exited gateway + a reused
+/// pid, all at once) is deemed acceptable. Returns the note to append to
+/// the command's human output.
 fn notify_running_gateway(ctx: &CommandContext) -> String {
     use std::fs::{OpenOptions, TryLockError};
 

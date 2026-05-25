@@ -185,14 +185,17 @@ async fn update_model(
         .map_err(|e| GatewayError::Internal(e.to_string()))?;
 
     // Apply in-process. `reload` always rebuilds the LLM pool, so a vault
-    // key rotation (invisible in the config diff) takes effect too. A
-    // failed rebuild returns 400; the file keeps the edit for the operator.
-    state.config_reloader.reload().await?;
+    // key rotation (invisible in the config diff) takes effect too. If a
+    // non-hot field is already pending-restart on disk (a prior `PUT
+    // /v1/config` edit), the reload reports `NotHotReloadable` — the LLM
+    // edit is still persisted, so surface restart-pending rather than 400.
+    // A genuine rebuild failure (unbuildable default) still propagates.
+    let requires_restart = super::config::apply_after_write(&state).await?;
 
     Ok(Json(MutateResponse {
         path: format!("llm[{name}]"),
         written_to: target.display().to_string(),
-        requires_restart: false,
+        requires_restart,
     }))
 }
 
@@ -319,12 +322,14 @@ async fn set_default(
         .await
         .map_err(|e| GatewayError::Internal(e.to_string()))?;
 
-    state.config_reloader.reload().await?;
+    // Restart-pending (not 400) if a non-hot field is already pending on
+    // disk; the default-llm edit is persisted regardless. See `update_model`.
+    let requires_restart = super::config::apply_after_write(&state).await?;
 
     Ok(Json(MutateResponse {
         path: "default-llm".into(),
         written_to: target.display().to_string(),
-        requires_restart: false,
+        requires_restart,
     }))
 }
 

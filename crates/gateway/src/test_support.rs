@@ -86,6 +86,30 @@ impl crate::reload::ConfigReloader for RejectingDryRunReloader {
     }
 }
 
+/// Reloader whose `reload` reports a non-hot field is pending a restart (as
+/// when a prior `PUT /v1/config` edit awaits one); `dry_run` passes so the
+/// admin endpoint still writes. Lets a test assert a hot LLM edit then
+/// surfaces `requires_restart: true` rather than a confusing 400.
+pub struct NonHotPendingReloader;
+
+#[async_trait::async_trait]
+impl crate::reload::ConfigReloader for NonHotPendingReloader {
+    async fn reload(
+        &self,
+    ) -> std::result::Result<crate::reload::ReloadOutcome, crate::reload::ReloadError> {
+        Err(crate::reload::ReloadError::NotHotReloadable(
+            "gateway".into(),
+        ))
+    }
+
+    async fn dry_run(
+        &self,
+        _candidate: &aura_config::AuraConfig,
+    ) -> std::result::Result<(), crate::reload::ReloadError> {
+        Ok(())
+    }
+}
+
 /// Bearer token every test gateway is wired with. Exposed so callers
 /// that talk to the admin listener can authenticate without duplicating
 /// the constant.

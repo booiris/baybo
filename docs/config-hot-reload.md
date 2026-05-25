@@ -21,7 +21,7 @@ The headline win is **LLM identity** (`provider`, `model`, `base_url`, `api_key`
 Restated from `config.md` §"Reload semantics", made concrete for this work:
 
 - **Hot-updatable whitelist:** `llm`, `default_llm`, `agent.model_tiers`, `cost.rate_limit`, `cost.spending_limits`. Any diff touching a field outside this set rejects the **entire** reload (atomic — nothing swaps) with an error naming the offending section. An operator who edits a model *and* a port in one shot gets the model change rejected too and must restart; this is deliberate and predictable.
-- **Atomic swap:** a successful reload swaps a single `Arc<AuraConfig>` holding all whitelisted changes together. Partial application is forbidden.
+- **Atomic swap:** a successful reload swaps a single `Arc<AuraConfig>` holding all whitelisted changes together. Partial application is forbidden. *(Implementation note: commit publishes in three sub-swaps — pool, then cost limits + rate atomics, then the config handle — not one compare-and-swap. Each value is individually valid, so there's no torn read, but a turn starting in the ~ns gap can observe new-pool + old-limits. Practically fine; not a literal single publish.)*
 - **Validation rollback:** a reload that fails `validate()` leaves the running config untouched and returns `ConfigError`; no observable partial state.
 - **In-flight behavior:** an LLM turn already running finishes on the client it resolved at turn start; only the next turn sees the new pool.
 
@@ -118,11 +118,17 @@ Both are infallible to prepare.
 | Situation | Result |
 | --- | --- |
 | New config fails `validate()` | `ConfigError`; nothing swaps. |
-| Non-whitelisted field changed | Reject; nothing swaps; error names the section. |
-| **Default** LLM entry fails to build | Abort the whole reload; nothing swaps. |
+| Non-hot field changed | Live state untouched; the persisted edit needs a restart (`requires_restart: true`). The baseline **does** advance to the on-disk config so the divergence can't block future hot reloads — see "Baseline advances on a non-hot reload" below. |
+| Hot LLM edit while a non-hot field is pending-restart on disk | `update_model` / `set_default` report `requires_restart: true` (not 400) via the shared `apply_after_write`; the LLM edit is persisted and applies on restart. |
+| **Default** LLM entry fails to build | Abort the whole reload; nothing swaps. The admin endpoints `dry_run` before writing, so this is caught without dirtying the file. |
 | Non-default LLM entry fails to build | Drop it with `warn!`; reload proceeds (mirrors boot). |
-| Two reloads race | Serialized by the reload `Mutex`; second sees the first's result as the new `old`. |
-| Turn in flight during commit | Finishes on its turn-start client; next turn re-resolves. |
+| `update_model` rotates a key, then `dry_run` rejects | **Known partial application:** the new vault secret is already staged (providers need it at client construction) and is **not** rolled back — the vault exposes no per-key delete. The config file is untouched (dry-run runs before the write), but a later reload will resolve the staged key. Scoped to the credential only. |
+| Two reloads race | Serialized by the reload `Mutex`; the second sees the first's result as the new `old`. |
+| Turn in flight during commit | Finishes on its turn-start client; next turn re-resolves. Commit is three sub-swaps (pool, cost, handle), each individually valid, so a turn starting mid-commit may read new-pool + old-limits for a few ns — no torn state, but not a single atomic publish (see the Atomic-swap note above). |
+
+### Baseline advances on a non-hot reload
+
+`reload` diffs the on-disk config against `ConfigHandle` — *not* against a frozen boot snapshot. When a reload carries a non-hot change it returns `NotHotReloadable` (live state untouched) **but still stores the new config into the handle** before returning. This is essential: a `PUT /v1/config` on a non-hot field (e.g. `gateway.port`) persists to disk and returns `requires_restart: true`, so the disk now diverges from the running process on that field. If the baseline didn't advance, that divergence would re-trip on *every* subsequent reload — silently blocking all hot reloads until restart, and 400-ing later hot edits the operator never associated with the port change. Advancing the baseline makes each `hot_reload_diff` compare against the previously-processed disk state, i.e. *this edit's delta*, so a non-hot persist no longer poisons later hot reloads. It's safe because nothing reads the handle for live behaviour — it is purely the diff baseline (the boot-time non-hot value the process actually uses lives in the already-built server/managers, not the handle).
 
 ## Out of scope / follow-up TODOs
 

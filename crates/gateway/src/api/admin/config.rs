@@ -146,8 +146,11 @@ async fn unset_config(
 /// still required: a hot field is applied live (`false`); a non-hot field
 /// is persisted but needs a restart, which the reloader reports as
 /// `NotHotReloadable` (`true`, not an error). Any other reload failure
-/// (invalid config, unbuildable default) propagates.
-async fn apply_after_write(state: &AdminState) -> Result<bool> {
+/// (invalid config, unbuildable default) propagates. Shared with the LLM
+/// admin endpoints so a hot LLM edit that lands while a non-hot field is
+/// already pending-restart on disk reports `requires_restart: true` instead
+/// of a confusing 400.
+pub(crate) async fn apply_after_write(state: &AdminState) -> Result<bool> {
     match state.config_reloader.reload().await {
         Ok(_) => Ok(false),
         Err(ReloadError::NotHotReloadable(_)) => Ok(true),

@@ -515,3 +515,35 @@ async fn rejected_dry_run_leaves_config_file_untouched() {
         "a rejected dry-run must not write the config file"
     );
 }
+
+// A hot LLM edit that lands while a non-hot field is already pending a
+// restart on disk (the reload reports NotHotReloadable) must surface
+// requires_restart: true, not a 400 — the LLM edit is persisted regardless.
+#[tokio::test]
+async fn update_model_behind_pending_non_hot_field_reports_restart_not_400() {
+    let (router, _dir, _path) = router_with_reloader(
+        seed_two_entries(),
+        Some(Arc::new(aura_gateway::test_support::NonHotPendingReloader)),
+    )
+    .await;
+
+    let req = auth(
+        Request::builder()
+            .method("PUT")
+            .uri("/v1/llm/models/primary")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "model": "gpt-4o-mini" }).to_string()))
+            .unwrap(),
+    );
+    let (status, body) = read_json(router.oneshot(req).await.unwrap()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a hot edit behind a pending non-hot field must not 400"
+    );
+    assert_eq!(
+        body["requires_restart"],
+        json!(true),
+        "must report restart-pending, with the LLM edit still persisted"
+    );
+}

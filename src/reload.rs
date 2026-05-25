@@ -318,7 +318,23 @@ impl ConfigReloader for RuntimeConfigReloader {
         );
         let old = self.handle.current();
 
-        hot_reload_diff(&old, &new).map_err(|e| ReloadError::NotHotReloadable(e.to_string()))?;
+        if let Err(e) = hot_reload_diff(&old, &new) {
+            // A non-hot field on disk differs from the last config we
+            // processed. We can't apply it live (it needs a restart), but we
+            // must still advance the baseline to this validated on-disk
+            // config — otherwise the divergence re-trips on *every* future
+            // reload and silently blocks all hot reloads until restart (a
+            // persisted non-hot edit via `PUT /v1/config` is a supported
+            // path). Nothing reads the handle for live behaviour — it is
+            // purely the diff baseline — so storing the persisted (not-yet-
+            // applied) config is bookkeeping only; the live pool/cost state
+            // is untouched. The effect: `hot_reload_diff` compares each
+            // reload against the previous on-disk state, i.e. this edit's
+            // delta, not an ever-staler boot baseline. See
+            // `docs/config-hot-reload.md`.
+            self.handle.store(Arc::clone(&new));
+            return Err(ReloadError::NotHotReloadable(e.to_string()));
+        }
 
         // Always rebuild the LLM pool. A config `llm` change and a vault
         // credential rotation (which is invisible in the config diff) both
@@ -354,6 +370,12 @@ impl ConfigReloader for RuntimeConfigReloader {
         // Build the candidate's pool to confirm it's buildable, then discard
         // it (no swap, no pricing reseed, no refresh spawn). Serialized
         // against real reloads so a concurrent swap can't interleave.
+        //
+        // The admin endpoints call this and then `reload`, so a mutating
+        // request builds the pool twice. Client construction is local (no
+        // network), so the redundancy is cheap; folding it out would mean
+        // `prepare` returning a handle `reload` consumes — more plumbing
+        // than it's worth for an admin-rate operation.
         let _guard = self.reload_lock.lock().await;
         self.llm
             .prepare(candidate)

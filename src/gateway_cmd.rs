@@ -230,6 +230,24 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         .await?;
     let _workspace_lock = singleton::acquire(workspace_paths.root())?;
 
+    // Register SIGHUP **before** the long boot work below (manager build,
+    // sidecar install, router wiring). Until a signal stream exists SIGHUP
+    // sits at its default disposition — terminate — so a concurrent `aura
+    // llm` edit that signals our freshly-recorded pid (singleton wrote it
+    // just above) would kill the gateway mid-boot. Creating the stream now
+    // flips the disposition and buffers any boot-time signal; the reload
+    // loop drains it once the reloader exists.
+    let sighup = {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::hangup()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to register SIGHUP; config reload-on-signal disabled");
+                None
+            }
+        }
+    };
+
     // Read the admin token AND mint+publish a fresh TUI token BEFORE
     // building the manager graph: both are registered as
     // `LeakAction::Replace` rules on the LeakDetector, which happens
@@ -357,22 +375,16 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     let mut task_tracker = TaskTracker::new();
     runtime::install_signal_handler(&mut task_tracker, shutdown.clone());
 
-    // SIGHUP → config hot-reload. Covers hand-edits to aura.json and the
-    // `aura llm` CLI (which signals after writing config and/or rotating a
-    // vault credential). `reload` always rebuilds the LLM pool, so a vault
-    // key rotation — invisible in the config diff — still takes effect.
-    {
+    // SIGHUP → config hot-reload, draining the stream registered before
+    // boot. Covers hand-edits to aura.json and the `aura llm` CLI (which
+    // signals after writing config and/or rotating a vault credential).
+    // `reload` always rebuilds the LLM pool, so a vault key rotation —
+    // invisible in the config diff — still takes effect. A signal that
+    // arrived during boot was buffered by the stream and is processed here.
+    if let Some(mut hup) = sighup {
         let reloader = Arc::clone(&graph.config_reloader);
         let hup_shutdown = shutdown.clone();
         task_tracker.track(tokio::spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut hup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to register SIGHUP; reload-on-signal disabled");
-                    return;
-                }
-            };
             loop {
                 tokio::select! {
                     _ = hup.recv() => match reloader.reload().await {
