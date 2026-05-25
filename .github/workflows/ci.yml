@@ -46,6 +46,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+      # The grep builtin shells out to ripgrep, so its tests need `rg` on
+      # PATH. (Docker- and bwrap-backed tests self-skip when their backend
+      # is absent; nothing else here spawns a non-stock binary.)
+      - run: sudo apt-get update -qq && sudo apt-get install -y ripgrep
       - run: cargo test --workspace --locked
 
   ts-bindings:
