@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Newer pushes to a PR cancel the in-flight run; master pushes run to completion.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The repo's .cargo/config.toml pins sccache as the rustc wrapper and
+  # -fuse-ld=lld; stock GitHub runners have neither. Disable both for CI —
+  # the toolchain action handles caching and the default linker is fine here.
+  RUSTC_WRAPPER: ""
+  RUSTFLAGS: ""
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Channel + components come from rust-toolchain.toml; this action
+      # reads it and caches the cargo registry/target.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo clippy --all --benches --tests --examples --all-features --locked -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      # The grep builtin shells out to ripgrep, so its tests need `rg` on
+      # PATH. (Docker- and bwrap-backed tests self-skip when their backend
+      # is absent; nothing else here spawns a non-stock binary.)
+      - run: sudo apt-get update -qq && sudo apt-get install -y ripgrep
+      - run: cargo test --workspace --locked
+
+  ts-bindings:
+    name: ts-rs bindings sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: scripts/check-ts-bindings.sh
+
+  frontend:
+    name: frontend (typecheck + build + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Build first: the sidecars import @aura/channel-sdk, and the
+      # channel-src/* test suites import from the gitignored dist/, so the
+      # SDK's .d.ts and each package's dist/ must exist before typecheck and
+      # test. pnpm builds in dependency order; this also builds the web
+      # dashboard (gen:api + tsc -b + vite build).
+      - run: pnpm -r --if-present run build
+      # tsc --noEmit across the channel SDK + channel/tool sidecars
+      - run: pnpm -r --if-present run check
+      # node --test suites (channel SDK, channel + browser sidecars)
+      - run: pnpm -r --if-present run test

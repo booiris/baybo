@@ -1,0 +1,9 @@
+# Single source of truth for the workspace toolchain — local builds and
+# CI both read this file. Pinned because a floating `stable` drifted to
+# 1.95 and surfaced clippy lints that 1.94.1 does not flag; pinning keeps
+# the "zero warnings" gate deterministic. Bump deliberately, fixing any
+# newly-surfaced lints in the same change.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
