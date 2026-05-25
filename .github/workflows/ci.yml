@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Newer pushes to a PR cancel the in-flight run; master pushes run to completion.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The repo's .cargo/config.toml pins sccache as the rustc wrapper and
+  # -fuse-ld=lld; stock GitHub runners have neither. Disable both for CI —
+  # Swatinem/rust-cache handles caching and the default linker is fine here.
+  RUSTC_WRAPPER: ""
+  RUSTFLAGS: ""
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all --benches --tests --examples --all-features --locked -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  ts-bindings:
+    name: ts-rs bindings sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/check-ts-bindings.sh
+
+  frontend:
+    name: frontend (typecheck + build + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Build first: the sidecars import @aura/channel-sdk, and the
+      # channel-src/* test suites import from the gitignored dist/, so the
+      # SDK's .d.ts and each package's dist/ must exist before typecheck and
+      # test. pnpm builds in dependency order; this also builds the web
+      # dashboard (gen:api + tsc -b + vite build).
+      - run: pnpm -r --if-present run build
+      # tsc --noEmit across the channel SDK + channel/tool sidecars
+      - run: pnpm -r --if-present run check
+      # node --test suites (channel SDK, channel + browser sidecars)
+      - run: pnpm -r --if-present run test
