@@ -164,7 +164,15 @@ enum IterationOutcome {
 
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
 pub struct AgentLoop {
+    /// Currently-active client, re-resolved from `llm_pool` at the
+    /// start of each turn ([`Self::refresh_active_llm`]) so a config
+    /// hot-reload takes effect on the next message.
     llm_client: Arc<GuardedLlm>,
+    /// Hot-swappable pool handle this loop re-resolves against per turn.
+    llm_pool: crate::runtime::llm_pool::LlmPoolHandle,
+    /// The pin this loop resolves: `None` ⇒ pool default (user / cron
+    /// actors); `Some` ⇒ a subagent's pinned entry name.
+    initial_llm: Option<LlmEntryName>,
     /// Plumbed into [`crate::runtime::tool_executor::ToolExecutor::execute`] so
     /// in-tool LLM calls bill against the same model the surrounding
     /// actor is using.
@@ -212,7 +220,7 @@ pub struct AgentLoop {
 /// post-construction mutability.
 pub struct AgentLoopConfig {
     /// Process-wide pool of guarded LLM clients keyed by entry name.
-    pub llm_pool: Arc<crate::runtime::llm_pool::LlmClientPool>,
+    pub llm_pool: crate::runtime::llm_pool::LlmPoolHandle,
     /// Initial pick for the active LLM. `None` ⇒ pool default.
     pub initial_llm: Option<LlmEntryName>,
     pub tool_registry: Arc<ToolRegistry>,
@@ -253,7 +261,7 @@ impl AgentLoop {
             workspace_paths,
             sessions,
         } = config;
-        let (llm_client, _effective_name) = llm_pool.resolve(initial_llm.as_ref());
+        let (llm_client, _effective_name) = llm_pool.read().resolve(initial_llm.as_ref());
         let billed_chat_factory = crate::runtime::billed_chat::BilledChatFactory::new(
             llm_client.clone(),
             cost_manager.clone(),
@@ -264,6 +272,8 @@ impl AgentLoop {
 
         Self {
             llm_client,
+            llm_pool,
+            initial_llm,
             billed_chat_factory,
             tool_registry,
             tool_executor,
@@ -326,6 +336,40 @@ impl AgentLoop {
     // actor *before* this runs (via `append_user_message` / `append_cron_fire`
     // / `append_subagent_notification`), so the loop iterates the current
     // context rather than appending here.
+    /// Re-resolve the active client from the (possibly hot-swapped)
+    /// pool at the start of a turn. When the resolved model changed
+    /// since the last turn, swap the client, rebuild the billed-chat
+    /// factory so in-tool LLM calls bill the new model, and update the
+    /// context window so compression gates on the new model's limit.
+    /// The tokenizer is intentionally left as-is — tiktoken is an
+    /// estimate and `TokenCalibration` corrects the drift within a few
+    /// turns. See `docs/config-hot-reload.md`.
+    fn refresh_active_llm(&mut self) {
+        let pool = Arc::clone(&self.llm_pool.read());
+        let (client, _name) = pool.resolve(self.initial_llm.as_ref());
+        // Compare by pointer, not model id: a config reload swaps in a
+        // fresh `Arc<GuardedLlm>` even when the model id is unchanged
+        // (a `base_url`, credential, `reasoning_effort`, or
+        // `context_window` edit), and those must take effect too. An
+        // unchanged pool returns a clone of the same `Arc`, so this stays
+        // a no-op on the common path.
+        if Arc::ptr_eq(&client, &self.llm_client) {
+            return;
+        }
+        info!(
+            model = %client.model_info().id,
+            "rebinding agent loop to the reloaded LLM client for this turn",
+        );
+        let window = client.model_info().context_window;
+        self.billed_chat_factory = crate::runtime::billed_chat::BilledChatFactory::new(
+            client.clone(),
+            Arc::clone(&self.cost_manager),
+            Arc::clone(&self.security_gateway),
+        );
+        self.llm_client = client;
+        self.context_manager.set_active_model_context_window(window);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &mut self,
@@ -337,6 +381,7 @@ impl AgentLoop {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<OutgoingMessage> {
+        self.refresh_active_llm();
         let spec = JobSpec {
             session_id: session.id.clone(),
             session_trigger_kind: session.trigger.kind(),

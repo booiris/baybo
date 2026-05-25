@@ -148,6 +148,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/config/reload": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["reload_config"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/cron": {
         parameters: {
             query?: never;
@@ -1039,6 +1055,23 @@ export interface components {
             written_to: string;
         };
         /**
+         * @description Outcome of a successful reload, surfaced to the operator (HTTP
+         *     response + logs).
+         */
+        ReloadOutcome: {
+            /** @description Model id of the (possibly new) default entry now serving turns. */
+            active_model: string;
+            /** @description `default-llm` entry name after the reload. */
+            default_entry: string;
+            /**
+             * @description Non-default entries that failed to build and were dropped with a
+             *     warning (mirrors boot's failure policy).
+             */
+            dropped: string[];
+            /** @description All entry names present in the rebuilt pool. */
+            entries: string[];
+        };
+        /**
          * @description Wire mirror of [`aura_query::SessionKind`]. Coarse trigger/lineage
          *     label for the trace browser list view.
          * @enum {string}
@@ -1581,7 +1614,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Config updated on disk. Gateway restart required to pick up. */
+            /** @description Config written to disk and applied in-process; `requires_restart` is true only when a non-hot field changed. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1632,7 +1665,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Config entry removed on disk. Gateway restart required to pick up. */
+            /** @description Config entry removed on disk and applied in-process; `requires_restart` is true only when a non-hot field changed. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1661,6 +1694,44 @@ export interface operations {
             };
             /** @description Write failure */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    reload_config: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Config re-read; hot-updatable changes applied in-process */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReloadOutcome"];
+                };
+            };
+            /** @description Reload rejected — a non-hot field changed, the config is invalid, or the default model is unbuildable */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2082,7 +2153,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description `default-llm` updated on disk. Gateway restart required to pick up. */
+            /** @description `default-llm` updated and hot-reloaded in-process (no restart needed). */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -2165,7 +2236,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Entry updated on disk. Gateway restart required to pick up. */
+            /** @description Entry updated and hot-reloaded in-process (no restart needed). */
             200: {
                 headers: {
                     [name: string]: unknown;

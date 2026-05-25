@@ -53,7 +53,9 @@ pub struct CostManager {
     /// `RwLock` so the boot-time refresh can overlay rates without
     /// blocking the LLM-client wiring on the network fetch.
     pricing: Arc<RwLock<HashMap<String, ModelPricing>>>,
-    limits: SpendingLimits,
+    /// `RwLock` so config hot-reload can swap the caps live; the next
+    /// `check` reads the new values. Swapped via `set_limits`.
+    limits: RwLock<SpendingLimits>,
     state: Arc<RwLock<BudgetState>>,
     metrics: Arc<CostMetrics>,
 }
@@ -194,7 +196,7 @@ impl CostManager {
         Arc::new(Self {
             store,
             pricing: Arc::new(RwLock::new(pricing)),
-            limits,
+            limits: RwLock::new(limits),
             state: Arc::new(RwLock::new(BudgetState::default())),
             metrics,
         })
@@ -202,6 +204,13 @@ impl CostManager {
 
     pub fn metrics(&self) -> Arc<CostMetrics> {
         Arc::clone(&self.metrics)
+    }
+
+    /// Swap the spending caps live (config hot-reload). The next
+    /// [`Self::check`] sees the new caps; an in-flight check finishes
+    /// on whichever snapshot it already read.
+    pub fn set_limits(&self, limits: SpendingLimits) {
+        *self.limits.write() = limits;
     }
 
     /// Compute spend for the given token counts. Returns
@@ -430,9 +439,13 @@ impl CostManager {
         let now = Utc::now();
         let today = now.date_naive();
         let year_month = (now.year(), now.month());
+        let (daily_cap, monthly_cap) = {
+            let limits = self.limits.read();
+            (limits.daily_usd, limits.monthly_usd)
+        };
         let state = self.state.read();
 
-        if let Some(daily_limit) = self.limits.daily_usd {
+        if let Some(daily_limit) = daily_cap {
             let spent = state.daily_for(today);
             if spent >= daily_limit {
                 return Err(CostGuardError::DailyLimitExceeded {
@@ -441,7 +454,7 @@ impl CostManager {
                 });
             }
         }
-        if let Some(monthly_limit) = self.limits.monthly_usd {
+        if let Some(monthly_limit) = monthly_cap {
             let spent = state.monthly_for(year_month);
             if spent >= monthly_limit {
                 return Err(CostGuardError::MonthlyLimitExceeded {
@@ -692,6 +705,25 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test]
+    async fn set_limits_is_seen_by_next_check() {
+        // No caps configured → spend is unconstrained.
+        let cm = manager_with(SpendingLimits::default());
+        record_then_drain(&cm, "u", 1_000_000, 0).await;
+        assert!(cm.check().is_ok(), "uncapped check should pass");
+
+        // Hot-swap in a daily cap below the accrued spend; the very next
+        // check must observe it (the config hot-reload path).
+        cm.set_limits(SpendingLimits {
+            daily_usd: Some(usd(0.000_001)),
+            monthly_usd: None,
+        });
+        assert!(
+            matches!(cm.check(), Err(CostGuardError::DailyLimitExceeded { .. })),
+            "check must observe the swapped-in cap",
+        );
     }
 
     #[tokio::test]

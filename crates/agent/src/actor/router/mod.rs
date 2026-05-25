@@ -21,6 +21,7 @@ mod user_input;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
@@ -38,24 +39,56 @@ use aura_cost::CostManager;
 use aura_job::JobLifecycle;
 use aura_session::SessionManager;
 
+/// Live, atomically-updatable rate-limit knobs, shared between the
+/// `Router`'s [`RateLimiter`] (reader) and the config-reload
+/// `CostReloader` (writer). Only the two config values are shared; the
+/// per-user timestamp map stays owned by the `RateLimiter`. `Relaxed`
+/// ordering is fine — the two knobs are independent and a check that
+/// races a reload sees the old or the new value, never a torn one.
+pub struct LiveRateLimit {
+    max_requests: AtomicUsize,
+    window_secs: AtomicU64,
+}
+
+impl LiveRateLimit {
+    pub fn new(max_requests: usize, window: std::time::Duration) -> Arc<Self> {
+        Arc::new(Self {
+            max_requests: AtomicUsize::new(max_requests),
+            window_secs: AtomicU64::new(window.as_secs()),
+        })
+    }
+
+    /// Swap both knobs live (config hot-reload). The next `check` sees them.
+    pub fn set(&self, max_requests: usize, window: std::time::Duration) {
+        self.max_requests.store(max_requests, Ordering::Relaxed);
+        self.window_secs.store(window.as_secs(), Ordering::Relaxed);
+    }
+
+    fn max_requests(&self) -> usize {
+        self.max_requests.load(Ordering::Relaxed)
+    }
+
+    fn window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.window_secs.load(Ordering::Relaxed))
+    }
+}
+
 /// Per-user sliding-window rate limiter.
 ///
 /// Tracks timestamps of recent requests per user and rejects requests that
-/// exceed the configured limit within the window.
+/// exceed the limit within the window. Both limits are read live from a
+/// shared [`LiveRateLimit`] so a `cost.rate_limit` config reload takes
+/// effect on the next request without rebuilding the `Router`.
 pub(crate) struct RateLimiter {
-    /// Maximum requests allowed within the window.
-    max_requests: usize,
-    /// Sliding window duration.
-    window: std::time::Duration,
+    limits: Arc<LiveRateLimit>,
     /// Per-user request timestamps.
     requests: HashMap<String, Vec<Instant>>,
 }
 
 impl RateLimiter {
-    pub(crate) fn new(max_requests: usize, window: std::time::Duration) -> Self {
+    pub(crate) fn new(limits: Arc<LiveRateLimit>) -> Self {
         Self {
-            max_requests,
-            window,
+            limits,
             requests: HashMap::new(),
         }
     }
@@ -63,12 +96,14 @@ impl RateLimiter {
     /// Returns `true` if the request is allowed, `false` if rate-limited.
     pub(crate) fn check(&mut self, user_id: &str) -> bool {
         let now = Instant::now();
+        let window = self.limits.window();
+        let max_requests = self.limits.max_requests();
         let timestamps = self.requests.entry(user_id.to_string()).or_default();
 
         // Evict entries outside the window.
-        timestamps.retain(|&t| now.duration_since(t) < self.window);
+        timestamps.retain(|&t| now.duration_since(t) < window);
 
-        if timestamps.len() >= self.max_requests {
+        if timestamps.len() >= max_requests {
             return false;
         }
 
@@ -117,7 +152,7 @@ pub struct Router {
     /// `request.model_tier` to a concrete entry name before spawning
     /// the child actor. Other handlers ignore it (top-level / cron /
     /// maintenance spawns always run on `default-llm`).
-    pub(crate) llm_pool: Arc<crate::runtime::llm_pool::LlmClientPool>,
+    pub(crate) llm_pool: crate::runtime::llm_pool::LlmPoolHandle,
     /// Fan-out limiter shared with the `spawn_subagent` tool. The
     /// router doesn't reserve (the tool does that before sending the
     /// envelope) but it MUST release on every terminal path — the
@@ -153,18 +188,18 @@ pub struct RouterConfig {
     pub cost_manager: Arc<CostManager>,
     pub actor_spawner: ActorSpawner,
     pub job_lifecycle: Arc<JobLifecycle>,
-    pub llm_pool: Arc<crate::runtime::llm_pool::LlmClientPool>,
+    pub llm_pool: crate::runtime::llm_pool::LlmPoolHandle,
     pub dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
     pub cron_trigger_rx: mpsc::Receiver<CronTriggerEvent>,
     pub system_trigger_rx: mpsc::Receiver<SystemSpawnRequest>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream.
     pub actor_parent_token: CancellationToken,
-    /// Per-user sliding-window rate limit. Both fields are required
-    /// (no default) — production wiring sources them from the user
-    /// config; tests pass whatever they want.
-    pub rate_limit_max_requests: usize,
-    pub rate_limit_window: std::time::Duration,
+    /// Per-user sliding-window rate limit, shared live with the config
+    /// reloader so `cost.rate_limit` edits take effect without
+    /// rebuilding the router. Production wiring sources it from config;
+    /// tests build one from whatever values they want.
+    pub rate_limit: Arc<LiveRateLimit>,
     pub external_agents: Arc<crate::external_agent::ExternalAgentRegistry>,
     pub workspace_paths: Arc<aura_workspace::WorkspacePaths>,
 }
@@ -184,8 +219,7 @@ impl Router {
             cron_trigger_rx,
             system_trigger_rx,
             actor_parent_token,
-            rate_limit_max_requests,
-            rate_limit_window,
+            rate_limit,
             external_agents,
             workspace_paths,
         } = config;
@@ -195,7 +229,7 @@ impl Router {
             channels,
             security_gateway,
             cost_manager,
-            rate_limiter: RateLimiter::new(rate_limit_max_requests, rate_limit_window),
+            rate_limiter: RateLimiter::new(rate_limit),
             actor_spawner,
             job_lifecycle,
             llm_pool,
@@ -281,5 +315,24 @@ impl Router {
         let actor_token = parent_token.child_token();
         let mailbox = (self.actor_spawner)(session, initial_llm, response_tx, actor_token.clone());
         (mailbox, actor_token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_rate_limit_swap_changes_cap() {
+        let limit = LiveRateLimit::new(2, std::time::Duration::from_secs(60));
+        let mut limiter = RateLimiter::new(Arc::clone(&limit));
+        assert!(limiter.check("u"));
+        assert!(limiter.check("u"));
+        assert!(!limiter.check("u"), "third request exceeds the cap of 2");
+
+        // Raise the cap live (config hot-reload path); the next request
+        // is admitted without rebuilding the limiter.
+        limit.set(10, std::time::Duration::from_secs(60));
+        assert!(limiter.check("u"), "swapped-in cap must be seen by check");
     }
 }

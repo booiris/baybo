@@ -40,7 +40,7 @@ pub use aura_cron::{CronScheduler, CronTriggerEvent};
 pub use aura_security::SecretVault;
 pub use aura_session::SessionManager;
 pub use billed_chat::BilledChatFactory;
-pub use llm_pool::LlmClientPool;
+pub use llm_pool::{LlmClientPool, LlmPoolHandle};
 pub use router::{ActorSpawner, Router};
 pub use security::{LeakRuleSummary, SecretVaultSummary, SecurityAuditReport, SecurityGateway};
 pub use service::{ShutdownSignal, TaskTracker};

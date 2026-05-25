@@ -230,6 +230,24 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         .await?;
     let _workspace_lock = singleton::acquire(workspace_paths.root())?;
 
+    // Register SIGHUP **before** the long boot work below (manager build,
+    // sidecar install, router wiring). Until a signal stream exists SIGHUP
+    // sits at its default disposition — terminate — so a concurrent `aura
+    // llm` edit that signals our freshly-recorded pid (singleton wrote it
+    // just above) would kill the gateway mid-boot. Creating the stream now
+    // flips the disposition and buffers any boot-time signal; the reload
+    // loop drains it once the reloader exists.
+    let sighup = {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::hangup()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to register SIGHUP; config reload-on-signal disabled");
+                None
+            }
+        }
+    };
+
     // Read the admin token AND mint+publish a fresh TUI token BEFORE
     // building the manager graph: both are registered as
     // `LeakAction::Replace` rules on the LeakDetector, which happens
@@ -332,8 +350,18 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         .unwrap_or_default();
 
     let shutdown = ShutdownSignal::new();
+    // The resolved config path, or the default path when none existed at
+    // boot — so a first-run `aura llm add` that creates the file and
+    // SIGHUPs us still hot-reloads instead of silently returning
+    // `NoConfigPath`. This single value feeds both the reloader and the
+    // admin read/mutate surface (`GatewayDeps.config_path`) so the two
+    // never diverge — otherwise `GET /v1/config` would keep reporting the
+    // boot snapshot after a first-run reload had already applied the file.
+    let reload_config_path =
+        boot::resolve_config_path().or_else(|| Some(aura_workspace::paths::default_config_file()));
     let mut graph = runtime::build_managers(
         Arc::clone(&config),
+        reload_config_path.clone(),
         shutdown.clone(),
         Arc::clone(&leak_detector),
         embedded_mcp_servers,
@@ -347,6 +375,30 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     let mut task_tracker = TaskTracker::new();
     runtime::install_signal_handler(&mut task_tracker, shutdown.clone());
 
+    // SIGHUP → config hot-reload, draining the stream registered before
+    // boot. Covers hand-edits to aura.json and the `aura llm` CLI (which
+    // signals after writing config and/or rotating a vault credential).
+    // `reload` always rebuilds the LLM pool, so a vault key rotation —
+    // invisible in the config diff — still takes effect. A signal that
+    // arrived during boot was buffered by the stream and is processed here.
+    if let Some(mut hup) = sighup {
+        let reloader = Arc::clone(&graph.config_reloader);
+        let hup_shutdown = shutdown.clone();
+        task_tracker.track(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = hup.recv() => match reloader.reload().await {
+                        Ok(o) => {
+                            tracing::info!(active_model = %o.active_model, "SIGHUP: config reloaded")
+                        }
+                        Err(e) => tracing::warn!(error = %e, "SIGHUP: config reload failed"),
+                    },
+                    _ = hup_shutdown.wait() => break,
+                }
+            }
+        }));
+    }
+
     // Cron tick loop.
     let cron_handle = Arc::clone(&graph.cron_scheduler);
     task_tracker.track(tokio::spawn(async move {
@@ -354,9 +406,8 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     }));
 
     {
-        let mut janitor =
-            aura_janitor::Janitor::new(workspace_paths.clone())
-                .with_pairing_store(graph.stores.channel_pairing.clone());
+        let mut janitor = aura_janitor::Janitor::new(workspace_paths.clone())
+            .with_pairing_store(graph.stores.channel_pairing.clone());
         if let Some(runtime) = sidecar_runtime.as_ref()
             && let Some(cache_root) = runtime.sidecars_cache_root()
         {
@@ -414,7 +465,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // Build the axum server from the assembled graph.
     let deps = GatewayDeps {
         config: Arc::clone(&graph.config),
-        config_path: boot::resolve_config_path(),
+        config_path: reload_config_path,
         runtime_config: runtime_cfg.clone(),
         session_manager: Arc::clone(&graph.session_manager),
         job_lifecycle: Arc::clone(&graph.job_lifecycle),
@@ -423,7 +474,8 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         skill_registry: Arc::clone(&graph.skill_registry),
         tool_registry: Arc::clone(&graph.tool_registry),
         channel_registry: Arc::clone(&graph.channels_registry),
-        llm_client: Arc::clone(&graph.llm_client),
+        llm_pool: Arc::clone(&graph.llm_pool),
+        config_reloader: Arc::clone(&graph.config_reloader),
         admin_token: token.clone(),
         log_buffer: Arc::clone(&log_buffer),
         incoming_tx: run_handle.incoming_tx.clone(),

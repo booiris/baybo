@@ -18,6 +18,15 @@ use aura_llm::GuardedLlm;
 use aura_model::{LlmEntryName, ModelTier};
 use tracing::warn;
 
+/// Process-wide, hot-swappable handle to the [`LlmClientPool`]. A config
+/// reload swaps the inner `Arc<LlmClientPool>` under the write lock;
+/// readers (each `AgentLoop` at turn start, the router's tier
+/// resolution, the gateway's `GET /v1/llm`) clone the current `Arc` and
+/// use it for that turn/request. A plain `RwLock<Arc<_>>` rather than a
+/// lock-free `ArcSwap` because reads happen per-turn / per-request,
+/// never per-token. See `docs/config-hot-reload.md`.
+pub type LlmPoolHandle = Arc<parking_lot::RwLock<Arc<LlmClientPool>>>;
+
 pub struct LlmClientPool {
     clients: HashMap<LlmEntryName, Arc<GuardedLlm>>,
     default_name: LlmEntryName,
@@ -172,6 +181,22 @@ mod tests {
         let direct = pool.default_client();
         let (resolved, _) = pool.resolve(None);
         assert!(Arc::ptr_eq(&direct, &resolved));
+    }
+
+    #[test]
+    fn resolve_is_arc_stable_across_calls() {
+        // The per-turn reload check (`AgentLoop::refresh_active_llm`)
+        // relies on `resolve` returning the same `Arc` when the pool is
+        // unchanged, so an unchanged pool never triggers a needless
+        // rebind. A pool swap produces fresh `Arc`s, which is what makes
+        // the pointer-identity check fire.
+        let pool = fixture();
+        let (a, _) = pool.resolve(None);
+        let (b, _) = pool.resolve(None);
+        assert!(Arc::ptr_eq(&a, &b));
+        let (c, _) = pool.resolve(Some(&LlmEntryName::from("fast")));
+        let (d, _) = pool.resolve(Some(&LlmEntryName::from("fast")));
+        assert!(Arc::ptr_eq(&c, &d));
     }
 
     #[test]

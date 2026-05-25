@@ -1,10 +1,11 @@
 //! `/v1/config` — read and mutate the loaded `AuraConfig`.
 //!
-//! `GET` returns a snapshot of the in-memory config (with secret fields
+//! `GET` returns a snapshot of the on-disk config (with secret fields
 //! redacted by `aura_config`'s serde impls). `PUT` / `DELETE` write
 //! through to the same on-disk `aura.json` that `aura config set/unset`
-//! targets: we do not mutate the running process's `Arc<AuraConfig>` in
-//! place, so callers must restart the gateway to pick the change up.
+//! targets, then trigger an in-process reload: a hot-updatable field
+//! takes effect live; a non-hot field is persisted but needs a restart,
+//! reported back via `requires_restart`.
 
 use axum::Json;
 use axum::extract::State;
@@ -13,10 +14,13 @@ use utoipa_axum::routes;
 
 use crate::Result;
 use crate::api::dto::{ErrorBody, MutateResponse, SetConfigRequest, UnsetConfigRequest};
+use crate::reload::{ReloadError, ReloadOutcome};
 use crate::server::AdminState;
 
 pub fn routes() -> OpenApiRouter<AdminState> {
-    OpenApiRouter::new().routes(routes!(get_config, set_config, unset_config))
+    OpenApiRouter::new()
+        .routes(routes!(get_config, set_config, unset_config))
+        .routes(routes!(reload_config))
 }
 
 #[utoipa::path(
@@ -35,8 +39,11 @@ pub fn routes() -> OpenApiRouter<AdminState> {
     )
 )]
 async fn get_config(State(state): State<AdminState>) -> Result<Json<serde_json::Value>> {
-    let value = serde_json::to_value(&*state.config)
-        .map_err(|e| crate::GatewayError::Internal(e.to_string()))?;
+    // Read the current on-disk config (what a reload would apply), not
+    // the boot snapshot — otherwise this lies after a hot-reload.
+    let cfg = super::llm::read_config_for_dashboard(&state).await?;
+    let value =
+        serde_json::to_value(&cfg).map_err(|e| crate::GatewayError::Internal(e.to_string()))?;
     Ok(Json(value))
 }
 
@@ -46,7 +53,7 @@ async fn get_config(State(state): State<AdminState>) -> Result<Json<serde_json::
     tag = "config",
     request_body = SetConfigRequest,
     responses(
-        (status = 200, description = "Config updated on disk. Gateway restart required to pick up.", body = MutateResponse),
+        (status = 200, description = "Config written to disk and applied in-process; `requires_restart` is true only when a non-hot field changed.", body = MutateResponse),
         (status = 400, description = "Invalid path or value", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 500, description = "Write failure", body = ErrorBody),
@@ -64,10 +71,21 @@ async fn set_config(
         )
     })?;
 
-    let new_config = state
-        .config
+    // Build from the current on-disk config, not the boot snapshot, so
+    // we don't clobber edits a prior hot-reload already applied.
+    let current = super::llm::read_config_for_dashboard(&state).await?;
+    let new_config = current
         .set_at_path(&req.path, req.value.clone())
         .map_err(|e| crate::GatewayError::BadRequest(e.to_string()))?;
+    // Validate before persisting/applying: `apply_after_write` reloads
+    // the file in-process, so an invalid value would otherwise take
+    // effect live (e.g. a zero rate-limit bricking every request).
+    new_config
+        .validate()
+        .map_err(|e| crate::GatewayError::BadRequest(e.to_string()))?;
+    // Pre-flight the rebuild too, so a generic edit that breaks the
+    // default model is rejected without dirtying the file.
+    state.config_reloader.dry_run(&new_config).await?;
     new_config
         .write_to_file(target)
         .await
@@ -76,7 +94,7 @@ async fn set_config(
     Ok(Json(MutateResponse {
         path: req.path,
         written_to: target.display().to_string(),
-        requires_restart: true,
+        requires_restart: apply_after_write(&state).await?,
     }))
 }
 
@@ -86,7 +104,7 @@ async fn set_config(
     tag = "config",
     request_body = UnsetConfigRequest,
     responses(
-        (status = 200, description = "Config entry removed on disk. Gateway restart required to pick up.", body = MutateResponse),
+        (status = 200, description = "Config entry removed on disk and applied in-process; `requires_restart` is true only when a non-hot field changed.", body = MutateResponse),
         (status = 400, description = "Invalid path", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 500, description = "Write failure", body = ErrorBody),
@@ -104,10 +122,14 @@ async fn unset_config(
         )
     })?;
 
-    let new_config = state
-        .config
+    let current = super::llm::read_config_for_dashboard(&state).await?;
+    let new_config = current
         .unset_at_path(&req.path)
         .map_err(|e| crate::GatewayError::BadRequest(e.to_string()))?;
+    new_config
+        .validate()
+        .map_err(|e| crate::GatewayError::BadRequest(e.to_string()))?;
+    state.config_reloader.dry_run(&new_config).await?;
     new_config
         .write_to_file(target)
         .await
@@ -116,6 +138,37 @@ async fn unset_config(
     Ok(Json(MutateResponse {
         path: req.path,
         written_to: target.display().to_string(),
-        requires_restart: true,
+        requires_restart: apply_after_write(&state).await?,
     }))
+}
+
+/// Apply the just-written config in-process. Returns whether a restart is
+/// still required: a hot field is applied live (`false`); a non-hot field
+/// is persisted but needs a restart, which the reloader reports as
+/// `NotHotReloadable` (`true`, not an error). Any other reload failure
+/// (invalid config, unbuildable default) propagates. Shared with the LLM
+/// admin endpoints so a hot LLM edit that lands while a non-hot field is
+/// already pending-restart on disk reports `requires_restart: true` instead
+/// of a confusing 400.
+pub(crate) async fn apply_after_write(state: &AdminState) -> Result<bool> {
+    match state.config_reloader.reload().await {
+        Ok(_) => Ok(false),
+        Err(ReloadError::NotHotReloadable(_)) => Ok(true),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/config/reload",
+    tag = "config",
+    responses(
+        (status = 200, description = "Config re-read; hot-updatable changes applied in-process", body = ReloadOutcome),
+        (status = 400, description = "Reload rejected — a non-hot field changed, the config is invalid, or the default model is unbuildable", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
+async fn reload_config(State(state): State<AdminState>) -> Result<Json<ReloadOutcome>> {
+    let outcome = state.config_reloader.reload().await?;
+    Ok(Json(outcome))
 }

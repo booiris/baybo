@@ -146,7 +146,7 @@ impl Router {
         // into `model_tier`, so this is the final step.
         let llm = request
             .model_tier
-            .and_then(|t| self.llm_pool.resolve_tier(t));
+            .and_then(|t| self.llm_pool.read().resolve_tier(t));
         let background = request.background;
         let subagent_type = request.subagent_type.clone();
         let task_summary = request.task_summary.clone();

@@ -107,14 +107,13 @@ Principle: a module earns a config section when operators need to tune it in pro
 
 ## Reload semantics
 
-`aura-config` has **no reload API today**. Configuration is loaded once at startup; live changes require a process restart.
+`aura-config` has **no reload API today**. Configuration is loaded once at startup; live changes require a process restart. The approved design that lands this is [`docs/config-hot-reload.md`](../config-hot-reload.md) — read it before touching reload code; the contract below is the part `aura-config` itself must enforce.
 
-When hot reload is implemented, the following contract must be in place **before** reload code lands:
-
-- **Hot-updatable fields** — an explicit whitelist. Plausible candidates: `cost.rate_limit.*`, `cost.spending_limits.*`, `security.leak_detection_enabled`. Clearly not hot-updatable: `gateway.port`, `gateway.bind_address`, anything influencing `llm` client identity.
+- **Hot-updatable whitelist** — an explicit allowlist: `llm`, `default_llm`, `agent.model_tiers`, `cost.rate_limit`, `cost.spending_limits`. Any reload whose diff touches a field **outside** this set hard-rejects the entire reload (atomic — nothing swaps) with an error naming the offending section. Not hot-updatable: `gateway.*`, `workspace.path`, `security.*`, `channels.*`, `session.*`, and the rest of `agent`.
 - **Atomic swap** — a successful reload swaps a single `Arc<AuraConfig>` holding all whitelisted changes together. Partial application is forbidden.
-- **Validation rollback** — a reload that fails `validate()` leaves the running config untouched and returns `ConfigError::Validation` to the caller; no partial state is exposed.
-- **In-flight behavior** — requests already running against the old config continue with its values; only new requests pick up the new config.
+- **Validation rollback** — a reload that fails `validate()` leaves the running config untouched and returns `ConfigError` to the caller; no partial state is exposed.
+- **In-flight behavior** — requests already running against the old config continue with its values; only new requests pick up the new config. For LLM turns this is per-turn: a turn finishes on the client it resolved at turn start.
+- **Fallible derived rebuilds** — a consumer whose live state is fallible to rebuild (the LLM pool: the default entry can fail to build) gates the swap via a two-phase prepare→commit. A failed prepare aborts before anything swaps.
 
 ## Validation Rules
 

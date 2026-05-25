@@ -32,7 +32,7 @@ One row per subsystem. Signatures are indicative; the real shape is whatever kee
 | ~~`ToolExecutor`~~     | ~~`test_execute(name, args)` that runs a tool outside an agent turn and records the attempt in trace~~ — shipped                                                                                                                                     | ~~`tools test`~~ — shipped                                            |
 | ~~`SkillRegistry`~~    | ~~`search(query)`, `validate_all()`~~ — shipped (substring search over name/description/command trigger; validation checks required binaries on `$PATH`, required env vars, declarative shape)                                                       | ~~`skills search/check`~~ — shipped                                   |
 | `Router` / `AgentLoop` | `send_message(session_id, blocks)` for a one-shot agent turn (must remain disabled inside slash mode — see `cli.md` §"Explicit mutation confirmation in slash mode" and `AgentSendForbiddenInSlash`). Design + implementation tracked separately in `cli-agent-send-argv.md`. | `agent send` — grammar + slash guard shipped; argv path deferred, see `cli-agent-send-argv.md` |
-| ~~`AuraConfig`~~       | ~~`set_at_path(path, value)`, `unset_at_path(path)`, and an async `write_to_file`~~ — shipped. Hot-reload still tracked in `docs/todo/config-hot-reload.md`; today `config set/unset` persists on-disk and the running process requires restart to observe the change.                                                                                                    | ~~`config get/set/unset`~~ — shipped                                  |
+| ~~`AuraConfig`~~       | ~~`set_at_path(path, value)`, `unset_at_path(path)`, and an async `write_to_file`~~ — shipped. Hot-reload has since shipped too — see `docs/config-hot-reload.md`; `config set/unset` now apply whitelisted fields in-process (non-hot fields still need a restart).                                                                                                    | ~~`config get/set/unset`~~ — shipped                                  |
 
 ## Proposed Direction
 
@@ -45,7 +45,7 @@ Suggested order:
 3. ~~**`cron`** — the user-facing scheduling surface already exists (`list_jobs/create/enable/disable/delete`); the gaps are small. `list` needs to accept "all users" semantics for operator mode.~~ — shipped
 4. ~~**`memory`** — requires defining `MemoryEntry` identity (id vs session+hash) before list/search can return stable handles.~~ — shipped (identity resolved by reusing the existing UUID `MemoryEntry.id`)
 5. ~~**`trace`** — touches file I/O for `export`; snapshot is a write through an existing hook.~~ — shipped for list/show/export/snapshot. `snapshot` is the read-only ancestor lookup (walks `find_nearest_snapshot` over a trace loaded from `TraceStore::load_trace`; supports `--node` and `--full`). The *live* snapshot capture path — writing a new `context_snapshot` mid-session — still needs the per-session live context the CLI does not hold.
-6. ~~**`config set/unset`** — requires a JSON-pointer-style path setter on `AuraConfig`. Coordinate with `docs/todo/config-hot-reload.md` so the reload path can consume whatever shape `set` produces.~~ — shipped (dotted or JSON-pointer path, round-trips through `serde_json::Value`; `write_to_file` is a tmpfile-and-rename). Hot-reload still pending.
+6. ~~**`config set/unset`** — requires a JSON-pointer-style path setter on `AuraConfig`. Coordinate with `docs/config-hot-reload.md` so the reload path can consume whatever shape `set` produces.~~ — shipped (dotted or JSON-pointer path, round-trips through `serde_json::Value`; `write_to_file` is a tmpfile-and-rename). Hot-reload has since shipped too.
 7. ~~**`tools test`** — has to route through `ToolExecutor` so trace + cost records fire. Slash mode must require `--yes`.~~ — shipped (synthetic `cli-test-<uuid>` session id; routes through `ObservabilityRecorder` so the attempt shows up in trace/job/cost like a real call).
 8. ~~**`llm models/probe`** — needed by `doctor`; probe is a minimal chat request.~~ — shipped. Catalog comes from `LlmProviderFactory::known_models`; `probe()` runs one "ping" user-turn and reports `{provider, model, latency_ms, tokens}`. `doctor` can now wire `llm probe` in as the auth/connectivity check it was always supposed to have.
 9. ~~**`workspace set-identity`** — small; fits after `workspace show`.~~ — shipped (`--file` or `--content`, mutually exclusive; atomic write; change is picked up after restart).
@@ -66,6 +66,6 @@ Suggested order:
 - `docs/modules/cli.md` — command taxonomy and mutation rules; the spec this work fills in.
 - `docs/todo/cli-agent-send-argv.md` — design work for `agent send` argv mode.
 - `docs/todo/cli-sandbox-registry.md` — design work for `sandbox list/info`.
-- `docs/todo/config-hot-reload.md` — coordinates with `config set/unset`.
+- `docs/config-hot-reload.md` — the shipped hot-reload design `config set/unset` feeds into.
 - `crates/cli/src/commands/` — extension point; each new family adds one file here.
 - `crates/cli/tests/` — test extension points (`parser.rs`, `dispatch_smoke.rs`).

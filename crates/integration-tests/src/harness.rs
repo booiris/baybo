@@ -408,10 +408,10 @@ impl AgentTestHarnessBuilder {
         let stub_entry_name = LlmEntryName::from(stub_llm.model_info().id.clone());
         let mut pool_clients = std::collections::HashMap::new();
         pool_clients.insert(stub_entry_name.clone(), guarded_llm);
-        let llm_pool = Arc::new(
+        let llm_pool: aura_agent::LlmPoolHandle = Arc::new(parking_lot::RwLock::new(Arc::new(
             aura_agent::LlmClientPool::new(pool_clients, stub_entry_name.clone())
                 .expect("stub pool default present"),
-        );
+        )));
 
         let actor_parent_token = tokio_util::sync::CancellationToken::new();
         let actor_token = actor_parent_token.child_token();

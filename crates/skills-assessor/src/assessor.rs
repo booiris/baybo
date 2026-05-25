@@ -83,6 +83,13 @@ pub struct AssessedSkill {
 /// the classifier runs at all, and if so which scope it judges —
 /// `Primary` reads only `SKILL.md`, `Full` reads the whole tree.
 pub struct SkillAssessor {
+    // TODO(config-hot-reload): this is the boot-time default client,
+    // pinned for the assessor's lifetime — it does NOT follow a config
+    // hot-reload's model swap, and its `.chat()` calls hit the budget
+    // gate but are never `record_call`'d (unbilled spend, invisible to
+    // cost_records). Migrating to a `BilledChatFactory` bound to the
+    // shared `LlmPoolHandle` fixes both in one change. See
+    // docs/config-hot-reload.md "Out of scope / follow-up TODOs".
     llm: Arc<GuardedLlm>,
     store: Arc<dyn SkillRiskStore>,
     mode: AssessmentMode,
