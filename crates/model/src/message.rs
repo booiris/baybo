@@ -304,20 +304,75 @@ pub struct MessageMetadata {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
-    #[test]
-    fn message_source_string_round_trips() {
-        for src in [
+    /// Every `MessageSource` variant. The exhaustive `match` makes adding a
+    /// variant a compile error here until it's listed below — which forces both
+    /// the round-trip test and the TS-mirror test to account for the new variant.
+    fn all_message_sources() -> Vec<MessageSource> {
+        fn _exhaustive(s: MessageSource) {
+            match s {
+                MessageSource::User
+                | MessageSource::UserInterjection
+                | MessageSource::Cron
+                | MessageSource::Agent => {}
+            }
+        }
+        vec![
             MessageSource::User,
             MessageSource::UserInterjection,
             MessageSource::Cron,
             MessageSource::Agent,
-        ] {
+        ]
+    }
+
+    #[test]
+    fn message_source_string_round_trips() {
+        for src in all_message_sources() {
             assert_eq!(src.as_str().parse::<MessageSource>(), Ok(src));
         }
         assert_eq!(
             MessageSource::UserInterjection.as_str(),
             "user_interjection"
+        );
+    }
+
+    /// The hand-maintained TS mirror `web/src/types/trace.ts` is **not** covered
+    /// by `scripts/check-ts-bindings.sh` (that gate only spans the ts-rs
+    /// surfaces), so it has silently drifted before. This guards it directly: the
+    /// `MessageSource` union there must list exactly the serialized form of every
+    /// Rust variant — catching both a new Rust variant the mirror forgot and a
+    /// stale member the mirror kept.
+    #[test]
+    fn message_source_matches_ts_mirror() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/src/types/trace.ts");
+        let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+
+        // Slice the `export type MessageSource = ...;` declaration (robust to the
+        // union spanning multiple lines) and pull its single-quoted members.
+        let start = src
+            .find("export type MessageSource")
+            .unwrap_or_else(|| panic!("`export type MessageSource` not found in {path}"));
+        let decl = &src[start..];
+        let end = decl
+            .find(';')
+            .unwrap_or_else(|| panic!("MessageSource union not `;`-terminated in {path}"));
+        let ts_members: BTreeSet<String> = decl[..end]
+            .split('\'')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+
+        let rust_members: BTreeSet<String> = all_message_sources()
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+
+        assert_eq!(
+            rust_members, ts_members,
+            "MessageSource drift between aura_model and web/src/types/trace.ts — \
+             keep the TS union in sync with the Rust enum"
         );
     }
 
