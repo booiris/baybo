@@ -4,7 +4,8 @@ use aura_channels::{AgentOutput, COMPACT_COMMAND, OutgoingMessage};
 use aura_context::ContextManager;
 use aura_job::{JobInput, JobLifecycle, JobOutput};
 use aura_llm::{
-    ChatRequest, GuardedLlm, LlmResponse, StreamEvent, TokenUsage, ToolDefinitionForLlm,
+    Attribution, BoundBilledChat, ChatRequest, GuardedLlm, LlmResponse, StreamEvent, TokenUsage,
+    ToolDefinitionForLlm,
 };
 use aura_model::{ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SystemSpawnRequest};
 use futures::StreamExt;
@@ -173,19 +174,12 @@ pub struct AgentLoop {
     /// The pin this loop resolves: `None` ⇒ pool default (user / cron
     /// actors); `Some` ⇒ a subagent's pinned entry name.
     initial_llm: Option<LlmEntryName>,
-    /// Plumbed into [`crate::runtime::tool_executor::ToolExecutor::execute`] so
-    /// in-tool LLM calls bill against the same model the surrounding
-    /// actor is using.
-    billed_chat_factory: Arc<crate::runtime::billed_chat::BilledChatFactory>,
     tool_registry: Arc<ToolRegistry>,
     tool_executor: Arc<ToolExecutor>,
     context_manager: ContextManager,
     max_iterations: usize,
     security_gateway: Arc<SecurityGateway>,
     error_handler: ErrorHandler,
-    /// Cost gate + ledger; `record_call` feeds spend back so the
-    /// `GuardedLlm` wrapper's gate sees it before the next dispatch.
-    cost_manager: Arc<aura_cost::CostManager>,
     /// Lifetime token for the surrounding `AgentActor`. The spawner
     /// factory derives the token once and threads it into both this
     /// loop and the actor. The summary-refresh trigger gate clones it
@@ -228,8 +222,6 @@ pub struct AgentLoopConfig {
     pub context_manager: ContextManager,
     pub max_iterations: usize,
     pub security_gateway: Arc<SecurityGateway>,
-    /// Cost gate + ledger.
-    pub cost_manager: Arc<aura_cost::CostManager>,
     /// Lifetime token for the surrounding `AgentActor`. The spawner
     /// factory derives the actor token once and threads the same
     /// handle into both this loop and the actor.
@@ -255,18 +247,12 @@ impl AgentLoop {
             context_manager,
             max_iterations,
             security_gateway,
-            cost_manager,
             actor_token,
             system_spawn_tx,
             workspace_paths,
             sessions,
         } = config;
         let (llm_client, _effective_name) = llm_pool.read().resolve(initial_llm.as_ref());
-        let billed_chat_factory = crate::runtime::billed_chat::BilledChatFactory::new(
-            llm_client.clone(),
-            cost_manager.clone(),
-            Arc::clone(&security_gateway),
-        );
         let mut context_manager = context_manager;
         context_manager.set_active_model_context_window(llm_client.model_info().context_window);
 
@@ -274,14 +260,12 @@ impl AgentLoop {
             llm_client,
             llm_pool,
             initial_llm,
-            billed_chat_factory,
             tool_registry,
             tool_executor,
             context_manager,
             max_iterations,
             security_gateway,
             error_handler: ErrorHandler::default(),
-            cost_manager,
             actor_token,
             system_spawn_tx,
             workspace_paths,
@@ -361,11 +345,6 @@ impl AgentLoop {
             "rebinding agent loop to the reloaded LLM client for this turn",
         );
         let window = client.model_info().context_window;
-        self.billed_chat_factory = crate::runtime::billed_chat::BilledChatFactory::new(
-            client.clone(),
-            Arc::clone(&self.cost_manager),
-            Arc::clone(&self.security_gateway),
-        );
         self.llm_client = client;
         self.context_manager.set_active_model_context_window(window);
     }
@@ -680,7 +659,7 @@ impl AgentLoop {
         let recorder_for_calls = Arc::clone(span_recorder);
         let step_for_calls = step.clone();
         let notifier_for_calls = notifier.clone();
-        let bcf_for_calls = Arc::clone(&self.billed_chat_factory);
+        let llm_for_calls = Arc::clone(&self.llm_client);
         let exec_futures = response.tool_calls.iter().map(|tc| {
             let executor = Arc::clone(&executor);
             let session_id = session_id_for_calls.clone();
@@ -690,7 +669,7 @@ impl AgentLoop {
             let step = step_for_calls.clone();
             let cancel = cancel_token.child_token();
             let notifier = notifier_for_calls.clone();
-            let bcf = Arc::clone(&bcf_for_calls);
+            let bind_source = Arc::clone(&llm_for_calls);
             let tool_name = tc.name.clone();
             let arguments = tc.arguments.clone();
             let tool_use_id = tc.id.clone();
@@ -712,7 +691,7 @@ impl AgentLoop {
                         Some(job_id),
                         cancel,
                         notifier,
-                        Some(&bcf),
+                        Some(&bind_source),
                     )
                     .await
             }
@@ -894,10 +873,19 @@ impl AgentLoop {
             None,
             |span| async move {
                 let started_at = std::time::Instant::now();
+                // Bind this call to its `LlmCall` span so the spend lands
+                // on the right span. `BoundBilledChat` does gate → call →
+                // record internally — no manual `record_call` afterward.
+                let bound = self.llm_client.bind(Attribution {
+                    user_id: session.user.id.clone(),
+                    session_id: session.id.clone(),
+                    job_id: step.job_id,
+                    span_id: span.span_id,
+                });
                 let (partial_usage, llm_result) = match delta_tx {
-                    Some(tx) => self.chat_streaming(&request, session, tx).await,
-                    None => match self.llm_client.chat(&request).await {
-                        Ok(r) => (r.usage, Ok(r)),
+                    Some(tx) => self.chat_streaming(&bound, &request, session, tx).await,
+                    None => match bound.chat(&request).await {
+                        Ok(billed) => (billed.response.usage, Ok(billed.response)),
                         Err(e) => (TokenUsage::default(), Err(e)),
                     },
                 };
@@ -984,21 +972,12 @@ impl AgentLoop {
                     }
                 };
 
-                // Memory-first, disk-second: in-memory budget state
-                // updates synchronously here so the next iteration's
-                // `check()` sees this spend; persistence is fire-and-
-                // forget inside record_call.
-                self.cost_manager.record_call(
-                    &session.user.id,
-                    session.id.clone(),
-                    step.job_id,
-                    span.span_id,
-                    &model_info.id,
-                    finalize.input_tokens,
-                    finalize.output_tokens,
-                    finalize.cached_input_tokens,
-                    finalize.cache_creation_input_tokens,
-                );
+                // Cost was already recorded inside the bound call
+                // (`BoundBilledChat`) — synchronously bumping the budget
+                // accumulator before the next iteration's `check()`, with
+                // disk persistence fire-and-forget. Streaming bills the
+                // last-seen usage on stream end/drop; a non-streaming
+                // provider error records nothing (no usage to bill).
 
                 // `record_call_actual` self-skips on zero. The
                 // assistant message is appended later by
@@ -1123,11 +1102,12 @@ impl AgentLoop {
     /// see the failed call instead of silent under-billing.
     async fn chat_streaming(
         &self,
+        bound: &BoundBilledChat,
         request: &ChatRequest,
         session: &Session,
         delta_tx: &mpsc::Sender<AgentOutput>,
     ) -> (TokenUsage, aura_llm::Result<LlmResponse>) {
-        let mut stream = match self.llm_client.chat_stream(request).await {
+        let mut stream = match bound.chat_stream(request).await {
             Ok(s) => s,
             Err(e) => return (TokenUsage::default(), Err(e)),
         };
@@ -1282,7 +1262,6 @@ impl AgentLoop {
         CompressionRunner {
             llm_client: self.llm_client.clone(),
             recorder: Arc::clone(span_recorder),
-            cost_manager: self.cost_manager.clone(),
             security_gateway: Arc::clone(&self.security_gateway),
             job_id,
             user_id: session.user.id.clone(),
@@ -1466,7 +1445,6 @@ impl AgentLoop {
         let cleanup_owner = payload.in_flight_owner.clone();
         let llm_client = self.llm_client.clone();
         let security_gateway = self.security_gateway.clone();
-        let cost_manager = self.cost_manager.clone();
         let tokenizer = Arc::clone(self.context_manager.tokenizer());
         let model_info = self.llm_client.model_info().clone();
         let user_id = session.user.id.clone();
@@ -1494,7 +1472,6 @@ impl AgentLoop {
                     let refresher = crate::runtime::compression::BackgroundCompressionRunner {
                         llm_client,
                         security_gateway,
-                        cost_manager,
                         sessions,
                         workspace_paths,
                         tokenizer,

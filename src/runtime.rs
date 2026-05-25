@@ -565,10 +565,10 @@ pub async fn build_managers(
         work_dir
     });
     info!(path = %sandbox_root.display(), "sandbox FS scope rooted at workspace work/");
-    // The per-actor `BilledChatFactory` now lives on each
-    // `AgentLoop` (constructed by the spawner once the actor's
-    // chosen LLM is resolved), so `ToolExecutor` no longer stores
-    // one — it's passed in per `execute` call.
+    // `ToolExecutor` doesn't store an LLM handle; the active
+    // `GuardedLlm` is passed in per `execute` call and bound to the
+    // tool span there, so a tool's side-LLM call bills against the
+    // model the surrounding actor is currently using.
     let tool_executor = Arc::new(ToolExecutor::new(
         Arc::clone(&tool_registry),
         gate_map,
@@ -721,7 +721,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let session_logger = Arc::clone(&session_logger);
         let tokenizer = Arc::clone(&tokenizer);
         let trace_event_stream = trace_event_stream.clone();
-        let cost_manager = Arc::clone(&cost_manager);
         let token_calibration = Arc::clone(&token_calibration);
 
         let sessions = Arc::clone(&graph.session_manager);
@@ -770,7 +769,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),
-                    cost_manager: Arc::clone(&cost_manager),
                     actor_token: actor_token.clone(),
                     system_spawn_tx: Some(system_spawn_tx.clone()),
                     workspace_paths: Some(Arc::clone(&workspace_paths_arc)),

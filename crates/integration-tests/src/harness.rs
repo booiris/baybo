@@ -424,7 +424,6 @@ impl AgentTestHarnessBuilder {
             context_manager,
             max_iterations: 20,
             security_gateway: gateway.clone(),
-            cost_manager: Arc::clone(&cost_manager),
             actor_token: actor_token.clone(),
             system_spawn_tx: None,
             workspace_paths: None,
