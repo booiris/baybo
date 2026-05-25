@@ -134,6 +134,18 @@ fn is_slash_command(content: &[ContentBlock]) -> bool {
         .is_some_and(|c| !c.is_whitespace())
 }
 
+/// True for a `UserInput` eligible to be folded into a running turn: a
+/// **non-slash** user message. Both pop sites — the coalescer in
+/// [`AgentActor::run`] and the in-turn interjection drain
+/// ([`MailboxInterjections::drain_injectable`]) — must use this *exact*
+/// predicate: that sameness is what makes a queued slash command a hard barrier
+/// for both, so a message queued behind a slash can't be pulled past it. (The
+/// two sites drifting is exactly how the slash-barrier broke once before; keep
+/// them routed through here.)
+fn is_coalescable_user_input(msg: &AgentMessage) -> bool {
+    matches!(msg, AgentMessage::UserInput(inc) if !is_slash_command(&inc.message.content))
+}
+
 /// Adapts the actor's mailbox into an
 /// [`InterjectionSource`](crate::runtime::agent_loop::InterjectionSource) for
 /// the running agent loop: drains the leading run of **non-slash** `UserInput`s
@@ -148,9 +160,9 @@ struct MailboxInterjections<'a> {
 impl crate::runtime::agent_loop::InterjectionSource for MailboxInterjections<'_> {
     fn drain_injectable(&mut self) -> Vec<Vec<ContentBlock>> {
         let mut out = Vec::new();
-        while let Some(AgentMessage::UserInput(inc)) = self.rx.try_recv_if(|m| {
-            matches!(m, AgentMessage::UserInput(inc) if !is_slash_command(&inc.message.content))
-        }) {
+        while let Some(AgentMessage::UserInput(inc)) =
+            self.rx.try_recv_if(is_coalescable_user_input)
+        {
             out.push(inc.message.content);
         }
         out
@@ -274,9 +286,9 @@ impl AgentActor {
                     if !is_slash_command(&incoming.message.content) =>
                 {
                     let mut batch = vec![*incoming];
-                    while let Some(AgentMessage::UserInput(inc)) = mailbox.try_recv_if(|m| {
-                        matches!(m, AgentMessage::UserInput(i) if !is_slash_command(&i.message.content))
-                    }) {
+                    while let Some(AgentMessage::UserInput(inc)) =
+                        mailbox.try_recv_if(is_coalescable_user_input)
+                    {
                         batch.push(*inc);
                     }
                     if let Err(e) = self.handle_merged_user_turn(batch, &mut mailbox).await {

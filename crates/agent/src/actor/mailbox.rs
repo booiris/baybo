@@ -233,6 +233,10 @@ impl<T> MailboxReceiver<T> {
     /// interjections at a tool boundary and stops at the first non-injectable
     /// message (a queued slash command, a `SubagentFinished`, an `ActorStop`),
     /// leaving everything behind it for the actor's normal dispatch.
+    ///
+    /// `pred` runs **while the queue mutex is held**, so it must be a pure,
+    /// cheap inspection of the message — it must not call back into this mailbox
+    /// (send/recv) or it will deadlock.
     pub fn try_recv_if<F: FnOnce(&T) -> bool>(&mut self, pred: F) -> Option<T> {
         let mut queue = self.shared.queue.lock();
         let matches = queue.peek().is_some_and(|e| pred(&e.msg));

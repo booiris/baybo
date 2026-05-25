@@ -152,12 +152,37 @@ no per-boundary cap beyond the mailbox's 4096 capacity; `reply_to` stays `None`.
 ## Self-review polish
 - `messages_for_llm` short-circuits the framing pass (and its clone) when the
   transcript holds no interjection rows — the common case — via a cheap O(n) scan.
-- Wire-size token counting lives in `append_user_interjection` (+ a shared private
-  `append_with_count`), so the generic `append` carries no interjection special-case.
+- Wire-size token counting is centralized in `ContextManager::message_budget_tokens`
+  (see "Second review round"), so the generic `append` carries no inline special-case.
 - `wrap_interjections` documents why it is **not** breakout-escaped (the content is
   the user's own message — the trusted principal of their own turn — unlike the
   untrusted `tool_output` envelope).
 - Added `drained_interjection_survives_a_failed_turn` (durability across a failed turn).
+
+## Second review round (2026-05-25)
+- **TS mirror drifted.** `MessageSource` now serializes `"user_interjection"`, but the
+  hand-maintained `web/src/types/trace.ts` union still listed `'user' | 'cron' | 'agent'`.
+  `check-ts-bindings.sh` does NOT cover this file (it only spans the ts-rs surfaces), so the
+  earlier "bindings up to date" claim missed it. The trace overview serves raw persisted rows,
+  so the frontend can receive the new value. Added `'user_interjection'` to the union + doc;
+  web `tsc --noEmit` clean. (`TraceSessionPage`'s `source === 'user'` genuine-prompt check is
+  intentionally left exact — the TS analogue of Rust's exact `== User`.)
+- **Framed counting was only on the live append path.** `restore_messages` (actor restart) and
+  the compaction apply rebuilt `per_message_tokens` with the raw `count_message`, so a preserved
+  `UserInterjection` row silently reverted to the un-framed count and could under-budget after a
+  restart/compaction. Centralized into `ContextManager::message_budget_tokens`, now used by
+  `append` **and** both rebuild paths. Regression: `restore_charges_interjection_at_framed_wire_size`.
+- **Duplicated injectability predicate.** Extracted `is_coalescable_user_input`; the coalescer
+  and `MailboxInterjections::drain_injectable` share it, so the slash-barrier invariant can't
+  drift between the two pop sites.
+- **`try_recv_if` predicate runs under the queue lock** — documented (must be a pure inspection,
+  must not re-enter the mailbox).
+- **Drained interjection on a *failed* turn is not re-triggered (accepted, not fixed).** Once
+  drained it's persisted and surfaces on the next inbound message, but a turn that fails *after*
+  the drain won't auto-run it (whereas a still-queued mailbox message would have). Kept as-is:
+  the window is narrow (turn must reach a tool boundary, drain, then fail), durability holds, and
+  a failed turn already returns no reply (the user re-sends, which surfaces it in-context).
+  Re-enqueue-on-failure is the fix if this proves undesirable.
 
 ## Related
 - `crates/agent/src/actor/mod.rs` — actor run loop, `is_slash_command`, coalescing

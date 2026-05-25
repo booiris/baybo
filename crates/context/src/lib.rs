@@ -567,10 +567,13 @@ impl ContextManager {
     /// `append` / `force_compress` already maintain the invariants
     /// incrementally.
     pub fn restore_messages(&mut self, messages: Vec<ChatMessage>) {
-        self.per_message_tokens = messages
+        // `message_budget_tokens` (not the raw tokenizer) so a preserved
+        // `UserInterjection` row keeps its framed wire size across restart.
+        let per_message_tokens: Vec<usize> = messages
             .iter()
-            .map(|m| self.tokenizer.count_message(m))
+            .map(|m| self.message_budget_tokens(m))
             .collect();
+        self.per_message_tokens = per_message_tokens;
         self.called_skills = self.called_skills_in(&messages);
         self.messages = messages;
         self.invalidate_baseline();
@@ -653,21 +656,40 @@ impl ContextManager {
     /// `append` calls is resolved before the next LLM request is
     /// built.
     pub async fn append(&mut self, msg: &ChatMessage) -> Option<i64> {
-        let count = self.tokenizer.count_message(msg);
-        self.append_with_count(msg, count).await
+        let count = self.message_budget_tokens(msg);
+        record_skill_calls(&mut self.called_skills, msg);
+        self.messages.push(msg.clone());
+        self.per_message_tokens.push(count);
+        self.budget.update(self.count_tokens());
+        let ordinal = self.persist_appended(msg).await;
+        self.log_message_to_session_log(msg).await;
+        ordinal
     }
 
-    /// Append a mid-turn user interjection. Identical to a persisted user row
-    /// except the budget is charged the row's **framed wire size**: the row is
-    /// sent wrapped in the `<user_interjection>` envelope (`messages_for_llm` /
-    /// [`frame_interjections`]), so counting the raw text would under-count the
-    /// request and let the compression gate skip a pass it should run. Non-text
-    /// blocks (images) are preserved in the count. A multi-row run shares one
-    /// envelope on the wire, so counting per-row slightly over-counts (the safe
-    /// direction); the estimate is transient anyway — `record_call_actual`
-    /// resets the baseline to the provider's real count after the next call.
+    /// Append a mid-turn user interjection as a faithful user-bubble row. The
+    /// budget is charged the framed wire size via [`Self::message_budget_tokens`]
+    /// (the row is sent wrapped in the `<user_interjection>` envelope); this thin
+    /// wrapper exists for call-site clarity.
     pub async fn append_user_interjection(&mut self, content: Vec<ContentBlock>) -> Option<i64> {
-        let msg = ChatMessage::user_interjection(content);
+        self.append(&ChatMessage::user_interjection(content)).await
+    }
+
+    /// Tokens to charge the budget for `msg`. A `UserInterjection` row is sent
+    /// wrapped in the `<user_interjection>` envelope (`messages_for_llm` /
+    /// [`frame_interjections`]), so the budget must count the **framed** size or
+    /// it under-counts the request and the compression gate may skip a pass it
+    /// should run. This is the single place that knows the framed cost, so it
+    /// applies on the live [`Self::append`] path **and** every cache-rebuild path
+    /// ([`Self::restore_messages`], the compaction apply) — otherwise a row
+    /// preserved across restart/compaction would silently revert to the raw
+    /// count. Non-text blocks (images) are preserved; a multi-row run over-counts
+    /// by the shared envelope (the safe direction), and the estimate is transient
+    /// anyway (`record_call_actual` resets the baseline after the next call).
+    /// Everything else is the plain message count.
+    fn message_budget_tokens(&self, msg: &ChatMessage) -> usize {
+        if msg.source() != aura_model::MessageSource::UserInterjection {
+            return self.tokenizer.count_message(msg);
+        }
         let text = aura_llm::multimodal::extract_text(&msg.content);
         let mut framed = vec![ContentBlock::Text(
             crate::prompts::interjection::wrap_interjections(&[text]),
@@ -678,20 +700,7 @@ impl ContextManager {
                 .filter(|b| !matches!(b, ContentBlock::Text(_)))
                 .cloned(),
         );
-        let count = self.tokenizer.count_message(&ChatMessage::user(framed));
-        self.append_with_count(&msg, count).await
-    }
-
-    /// Shared append body: record skill calls, push the row with its budgeted
-    /// token `count`, refresh the budget, persist, and mirror to the JSONL log.
-    async fn append_with_count(&mut self, msg: &ChatMessage, count: usize) -> Option<i64> {
-        record_skill_calls(&mut self.called_skills, msg);
-        self.messages.push(msg.clone());
-        self.per_message_tokens.push(count);
-        self.budget.update(self.count_tokens());
-        let ordinal = self.persist_appended(msg).await;
-        self.log_message_to_session_log(msg).await;
-        ordinal
+        self.tokenizer.count_message(&ChatMessage::user(framed))
     }
 
     /// Read-only access to the session JSONL logger so the owning `AgentLoop`
@@ -906,9 +915,11 @@ impl ContextManager {
         // a length-only check despite a real token cut. Drop the
         // baseline first — it's anchored to the old slice.
         self.invalidate_baseline();
+        // `message_budget_tokens` so a `UserInterjection` row preserved by the
+        // summary keeps its framed wire size rather than reverting to raw.
         let new_per_message: Vec<usize> = new_messages
             .iter()
-            .map(|m| self.tokenizer.count_message(m))
+            .map(|m| self.message_budget_tokens(m))
             .collect();
         let after_tokens = self.calibrate(new_per_message.iter().copied().sum());
 
@@ -2267,6 +2278,32 @@ mod tests {
         assert!(
             framed_tokens > plain_tokens + 20,
             "interjection must be budgeted at framed wire size: framed={framed_tokens}, plain={plain_tokens}"
+        );
+    }
+
+    /// The framed wire size must be charged on **rebuild** paths too, not just
+    /// the live append — otherwise a `UserInterjection` row preserved across an
+    /// actor restart (`restore_messages`) or compaction would silently revert to
+    /// the raw count and under-budget the next request.
+    #[tokio::test]
+    async fn restore_charges_interjection_at_framed_wire_size() {
+        let body = "please switch the implementation to TypeScript";
+
+        // Live append charges the framed size.
+        let mut live = make_ctx(50, 100_000, 0.95);
+        live.append_user_interjection(vec![ContentBlock::Text(body.into())])
+            .await;
+        let live_tokens = live.count_tokens();
+
+        // Rebuilding the same row via restore_messages must match it.
+        let mut restored = make_ctx(50, 100_000, 0.95);
+        restored.restore_messages(vec![ChatMessage::user_interjection(vec![
+            ContentBlock::Text(body.into()),
+        ])]);
+        assert_eq!(
+            restored.count_tokens(),
+            live_tokens,
+            "restore must charge a UserInterjection row the same framed size as the live append"
         );
     }
 
