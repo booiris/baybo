@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
+use aura_llm::{Attribution, BillableLlm, BilledChat};
 use aura_model::{JobId, ParallelGroup, SessionId, SpanId, TrustLevel, User};
 
 use aura_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
@@ -307,7 +308,7 @@ impl ToolExecutor {
         cancel_token: CancellationToken,
         notifier: Option<Arc<dyn aura_tools::SessionNotifier>>,
         // `None` ⇒ tool's `ctx.llm` is unset (argv-mode / older tests).
-        billed_chat_factory: Option<&Arc<crate::runtime::billed_chat::BilledChatFactory>>,
+        bind_source: Option<&Arc<BillableLlm>>,
     ) -> anyhow::Result<ToolOutput> {
         debug!(tool = tool_name, "executing tool");
 
@@ -472,13 +473,17 @@ impl ToolExecutor {
                 // makes a side-LLM call (e.g. `WebFetch`'s extraction)
                 // sees its `cost_records` row attributed to the running
                 // tool span, not a synthetic placeholder.
-                let llm = billed_chat_factory.map(|factory| {
-                    factory.bind(
-                        user.id.clone(),
-                        session_id.clone(),
+                let llm: Option<Arc<dyn BilledChat>> = bind_source.map(|guarded| {
+                    let bound = guarded.bind(Attribution {
+                        user_id: user.id.clone(),
+                        session_id: session_id.clone(),
                         job_id,
-                        span_handle.span_id,
-                    )
+                        span_id: span_handle.span_id,
+                    });
+                    Arc::new(crate::runtime::billed_chat::BilledChatRunner::new(
+                        bound,
+                        Arc::clone(&self.security_gateway),
+                    )) as Arc<dyn BilledChat>
                 });
                 let ctx = ToolContext {
                     session_id: session_id.clone(),

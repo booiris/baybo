@@ -23,14 +23,16 @@ use crate::{
     ToolContext, ToolManifest, ToolOutput,
 };
 
-/// Wraps a [`aura_llm::GuardedLlm`] in a [`BilledChat`] handle that
-/// reports `cost_micros: MicroUsd::ZERO` — bridges tests that drive
-/// `LlmCompletion` stubs into the per-call `ctx.llm` slot WebFetch
-/// (and any future tool) reads from. No real `CostManager` is
-/// involved; budget assertions belong in agent-crate tests.
-pub fn unbilled_chat(inner: Arc<aura_llm::GuardedLlm>) -> Arc<dyn BilledChat> {
+/// Binds a [`aura_llm::BillableLlm`] to a throwaway system
+/// [`Attribution`](aura_llm::Attribution) and exposes it as a
+/// [`BilledChat`] — bridges tests that drive `LlmCompletion` stubs into
+/// the per-call `ctx.llm` slot WebFetch (and any future tool) reads
+/// from. Pass a [`BillableLlm::passthrough`](aura_llm::BillableLlm::passthrough)
+/// client so its no-op recorder reports `cost_micros: MicroUsd::ZERO`;
+/// budget assertions belong in agent-crate tests.
+pub fn unbilled_chat(inner: Arc<aura_llm::BillableLlm>) -> Arc<dyn BilledChat> {
     struct UnbilledChat {
-        inner: Arc<aura_llm::GuardedLlm>,
+        inner: aura_llm::BoundBilledLlm,
     }
     #[async_trait]
     impl BilledChat for UnbilledChat {
@@ -41,17 +43,12 @@ pub fn unbilled_chat(inner: Arc<aura_llm::GuardedLlm>) -> Arc<dyn BilledChat> {
             &self,
             request: &aura_llm::ChatRequest,
         ) -> std::result::Result<BilledChatResponse, String> {
-            self.inner
-                .chat(request)
-                .await
-                .map(|response| BilledChatResponse {
-                    response,
-                    cost_micros: aura_model::MicroUsd::ZERO,
-                })
-                .map_err(|e| e.to_string())
+            self.inner.chat(request).await.map_err(|e| e.to_string())
         }
     }
-    Arc::new(UnbilledChat { inner })
+    Arc::new(UnbilledChat {
+        inner: inner.bind(aura_llm::Attribution::system("tool-test")),
+    })
 }
 
 /// `Tool` that returns its serialized parameters as text. Trust level

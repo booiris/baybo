@@ -17,9 +17,9 @@ use aura_agent::router::LiveRateLimit;
 use aura_agent::service::ShutdownSignal;
 use aura_agent::{LlmClientPool, LlmPoolHandle};
 use aura_config::{AuraConfig, ConfigHandle, hot_reload_diff};
-use aura_cost::{CostManager, SpendingLimits, cost_call_guard};
+use aura_cost::{CostManager, SpendingLimits, cost_hooks};
 use aura_gateway::{ConfigReloader, ReloadError, ReloadOutcome};
-use aura_llm::{GuardedLlm, LlmProviderRegistry, ModelPricing};
+use aura_llm::{BillableLlm, LlmProviderRegistry, ModelPricing};
 use aura_model::LlmEntryName;
 use aura_security::SecretVault;
 use aura_store::BlobStore;
@@ -29,7 +29,7 @@ use tracing::{info, warn};
 
 use crate::boot;
 
-/// Build one `Arc<GuardedLlm>` per `config.llm` entry, concurrently.
+/// Build one `Arc<BillableLlm>` per `config.llm` entry, concurrently.
 /// Mirrors boot's failure policy exactly: a **default** entry that
 /// fails to build is a hard error (the pool would be unusable); a
 /// non-default failure is dropped with a `warn!` and its name returned
@@ -40,14 +40,14 @@ pub(crate) async fn build_pool_clients(
     blob: Arc<dyn BlobStore>,
     vault: Arc<SecretVault>,
     cost_manager: &Arc<CostManager>,
-) -> anyhow::Result<(HashMap<LlmEntryName, Arc<GuardedLlm>>, Vec<LlmEntryName>)> {
+) -> anyhow::Result<(HashMap<LlmEntryName, Arc<BillableLlm>>, Vec<LlmEntryName>)> {
     let results = futures::future::join_all(config.llm.iter().map(|entry| {
         let blob = blob.clone();
         let vault = Arc::clone(&vault);
-        let guard = cost_call_guard(cost_manager);
+        let billing = cost_hooks(cost_manager);
         async move {
             let r =
-                boot::build_llm_client_for_entry(entry, registry, Some(blob), Some(vault), guard)
+                boot::build_llm_client_for_entry(entry, registry, Some(blob), Some(vault), billing)
                     .await;
             (entry.name.clone(), r)
         }
@@ -81,7 +81,7 @@ pub(crate) async fn build_pool_clients(
 /// keyed by `model_info.id` to match the cost lookup in
 /// `aura_agent`'s `billed_chat`.
 pub(crate) fn pricing_overlay(
-    clients: &HashMap<LlmEntryName, Arc<GuardedLlm>>,
+    clients: &HashMap<LlmEntryName, Arc<BillableLlm>>,
 ) -> HashMap<String, ModelPricing> {
     clients
         .values()

@@ -1,162 +1,83 @@
-//! Shared "chat → sanitize → record cost" core. A successful return
-//! guarantees a `cost_records` row was written. Span lifecycle is
-//! the caller's responsibility — compression wraps the call in
-//! `with_llm_span`; the tool path attributes cost to the running tool
-//! span via [`BilledChatFactory::bind`].
+//! Tool-facing billed-chat adapter.
 //!
-//! Placeholder policy mirrors the agent loop's tool-dispatch model:
-//! compression's response stays placeholdered (just like the agent's
-//! brain operates against the sanitized session). The tool-facing
-//! adapter [`BilledChatRunner`] reveals placeholders in the LLM's
-//! **response** before handing it to the tool — the same step
-//! [`ToolExecutor`] takes on the main LLM's `tool_use` args before
-//! invoking the tool. The tool gets a plaintext view, then anything
-//! it surfaces back through `ToolOutput` is re-tokenised at the
-//! sanitize-tool-output boundary.
+//! [`BoundBilledLlm`](aura_llm::BoundBilledLlm) is the billing
+//! chokepoint — it runs gate → call → record and returns the *raw*
+//! provider response. [`BilledChatRunner`] is the agent-side decorator a
+//! tool's `ctx.llm` resolves to: on top of a bound call it adds the
+//! security steps the tool path needs — sanitize the response, then
+//! **reveal** session placeholders so the tool sees plaintext for its
+//! own API call (mirroring `ToolExecutor`'s reveal of `tool_use` args).
+//! Anything the tool surfaces back through `ToolOutput` is re-tokenised
+//! at the sanitize-tool-output boundary.
+//!
+//! The main reasoning loop and compression don't use this adapter — they
+//! bind their own [`BoundBilledLlm`] and sanitize inline, because their
+//! brain operates against the *placeholdered* transcript (no reveal).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_llm::{BilledChat, BilledChatResponse, ChatRequest, GuardedLlm, ModelInfo};
-use aura_model::{JobId, MicroUsd, SessionId, SpanId};
+use aura_llm::{BilledChat, BilledChatResponse, BoundBilledLlm, ChatRequest, ModelInfo};
 use tracing::warn;
 
 use crate::security::SecurityGateway;
-use aura_cost::CostManager;
 
-#[derive(Debug, Clone)]
-pub(crate) struct BilledAttribution {
-    pub user_id: String,
-    pub session_id: SessionId,
-    pub job_id: JobId,
-    pub span_id: SpanId,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct BilledChatRun {
-    pub response: aura_llm::LlmResponse,
-    pub cost_micros: MicroUsd,
-}
-
-pub(crate) async fn chat_billed_core(
-    llm: &GuardedLlm,
-    security: &SecurityGateway,
-    cost_manager: &Arc<CostManager>,
-    model_info: &ModelInfo,
-    attribution: &BilledAttribution,
-    request: &ChatRequest,
-) -> Result<BilledChatRun, String> {
-    match llm.chat(request).await {
-        Ok(mut response) => {
-            if let Err(e) = security.sanitize_llm_response(&mut response).await {
-                warn!(error = %e, "billed_chat: sanitize_llm_response failed");
-            }
-            let cost_micros = cost_manager.record_call(
-                &attribution.user_id,
-                attribution.session_id.clone(),
-                attribution.job_id,
-                attribution.span_id,
-                &model_info.id,
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-                response.usage.cached_input_tokens,
-                response.usage.cache_creation_input_tokens,
-            );
-            Ok(BilledChatRun {
-                response,
-                cost_micros,
-            })
-        }
-        Err(e) => {
-            let raw = e.to_string();
-            let sanitized = security.sanitize_error(&raw).await.unwrap_or(raw);
-            Err(sanitized)
-        }
-    }
-}
-
-pub struct BilledChatFactory {
-    llm: Arc<GuardedLlm>,
-    cost_manager: Arc<CostManager>,
+/// Tool-facing [`BilledChat`]: a bound billed call plus the response
+/// sanitize + placeholder-reveal the tool path requires.
+pub struct BilledChatRunner {
+    bound: BoundBilledLlm,
     security_gateway: Arc<SecurityGateway>,
 }
 
-impl BilledChatFactory {
-    pub fn new(
-        llm: Arc<GuardedLlm>,
-        cost_manager: Arc<CostManager>,
-        security_gateway: Arc<SecurityGateway>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            llm,
-            cost_manager,
+impl BilledChatRunner {
+    pub fn new(bound: BoundBilledLlm, security_gateway: Arc<SecurityGateway>) -> Self {
+        Self {
+            bound,
             security_gateway,
-        })
+        }
     }
-
-    pub fn bind(
-        self: &Arc<Self>,
-        user_id: String,
-        session_id: SessionId,
-        job_id: JobId,
-        span_id: SpanId,
-    ) -> Arc<dyn BilledChat> {
-        Arc::new(BilledChatRunner {
-            factory: Arc::clone(self),
-            attribution: BilledAttribution {
-                user_id,
-                session_id,
-                job_id,
-                span_id,
-            },
-        })
-    }
-}
-
-struct BilledChatRunner {
-    factory: Arc<BilledChatFactory>,
-    attribution: BilledAttribution,
 }
 
 #[async_trait]
 impl BilledChat for BilledChatRunner {
     fn model_info(&self) -> &ModelInfo {
-        self.factory.llm.model_info()
+        self.bound.model_info()
     }
 
     async fn chat(&self, request: &ChatRequest) -> Result<BilledChatResponse, String> {
-        let model_info = self.factory.llm.model_info();
-        let mut run = chat_billed_core(
-            &self.factory.llm,
-            &self.factory.security_gateway,
-            &self.factory.cost_manager,
-            model_info,
-            &self.attribution,
-            request,
-        )
-        .await?;
-        self.factory
+        let mut billed = match self.bound.chat(request).await {
+            Ok(b) => b,
+            Err(e) => {
+                let raw = e.to_string();
+                return Err(self
+                    .security_gateway
+                    .sanitize_error(&raw)
+                    .await
+                    .unwrap_or(raw));
+            }
+        };
+        if let Err(e) = self
             .security_gateway
-            .reveal_llm_response(&mut run.response)
+            .sanitize_llm_response(&mut billed.response)
+            .await
+        {
+            warn!(error = %e, "billed_chat: sanitize_llm_response failed");
+        }
+        self.security_gateway
+            .reveal_llm_response(&mut billed.response)
             .await
             .map_err(|e| format!("reveal_llm_response failed: {e}"))?;
-        Ok(BilledChatResponse {
-            response: run.response,
-            cost_micros: run.cost_micros,
-        })
+        Ok(billed)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use aura_cost::test_support::MemoryCostStore;
-    use aura_llm::LlmCompletion;
     use aura_llm::test_support::StubLlm;
-    use aura_llm::{GuardedLlm, LlmResponse, TokenUsage};
-    use aura_model::{ChatMessage, ContentBlock, JobId, SessionId, SpanId};
+    use aura_llm::{Attribution, BillableLlm, LlmCompletion, LlmResponse, TokenUsage};
+    use aura_model::{ChatMessage, ContentBlock};
     use aura_security::leak_detector::{LeakAction, LeakDetectionRule, LeakDetector};
     use aura_security::test_support::MemorySecretStore;
     use aura_security::{EncryptionKey, SecretVault};
@@ -164,7 +85,6 @@ mod tests {
 
     use super::*;
     use crate::security::SecurityGateway;
-    use aura_cost::{CostManager, SpendingLimits};
 
     fn fixture(stub: Arc<StubLlm>) -> (Arc<dyn BilledChat>, Arc<SecurityGateway>) {
         let mut detector = LeakDetector::new();
@@ -178,22 +98,11 @@ mod tests {
         let vault = Arc::new(SecretVault::new(vault_key, secret_store));
         let gateway = Arc::new(SecurityGateway::new(Arc::new(detector), vault));
 
-        let pricing = HashMap::new();
-        let cost = CostManager::new(
-            Arc::new(MemoryCostStore::new()),
-            pricing,
-            SpendingLimits::default(),
-        );
-
-        let llm = GuardedLlm::passthrough(stub as Arc<dyn LlmCompletion>);
-        let factory = BilledChatFactory::new(llm, cost, Arc::clone(&gateway));
-        let billed = factory.bind(
-            "u".into(),
-            SessionId::from("s"),
-            JobId::new(),
-            SpanId::new(),
-        );
-        (billed, gateway)
+        let llm = BillableLlm::passthrough(stub as Arc<dyn LlmCompletion>);
+        let bound = llm.bind(Attribution::system("tool-test"));
+        let runner =
+            Arc::new(BilledChatRunner::new(bound, Arc::clone(&gateway))) as Arc<dyn BilledChat>;
+        (runner, gateway)
     }
 
     /// Mint a placeholder for `plaintext` so the SecretVault knows how to
@@ -214,18 +123,14 @@ mod tests {
     }
 
     /// Tool-side LLM responses must arrive at the tool as plaintext.
-    /// `ToolExecutor::reveal_in_value` decrypts the main LLM's
-    /// `tool_use` args before the tool runs; the [`BilledChatRunner`]
-    /// adapter mirrors that for the tool's own side-LLM call by
-    /// revealing the **response**. Anything the tool surfaces through
-    /// `ToolOutput` will be re-tokenised by `sanitize_tool_output`.
+    /// `ToolExecutor::reveal_in_value` decrypts the main LLM's `tool_use`
+    /// args before the tool runs; the [`BilledChatRunner`] adapter
+    /// mirrors that for the tool's own side-LLM call by revealing the
+    /// **response**. Anything the tool surfaces through `ToolOutput` will
+    /// be re-tokenised by `sanitize_tool_output`.
     #[tokio::test]
     async fn billed_chat_reveals_placeholders_in_response() {
         let stub = Arc::new(StubLlm::new());
-        // Seed the vault with a placeholder so the stub can return a
-        // response carrying it (mimicking the model echoing back a
-        // session-level placeholder the tool already sees as
-        // plaintext via its revealed args).
         let (billed, gateway) = fixture(Arc::clone(&stub));
         let placeholder = seed_placeholder(&gateway, "SECRET_TOKEN_abc123").await;
         stub.push_response(LlmResponse {

@@ -30,10 +30,13 @@ use rig::streaming::{self, StreamedAssistantContent};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-pub use crate::billed::{BilledChat, BilledChatResponse};
+pub use crate::billed::{
+    Attribution, BilledChat, BilledChatResponse, BoundBilledLlm, CostHooks, LlmCostRecorder,
+    SYSTEM_USER_ID,
+};
 pub use crate::error::LlmError;
 pub(crate) use crate::error::{reqwest_to_error, rig_completion_to_error, status_to_error};
-pub use crate::guard::{GuardedLlm, LlmCallGuard};
+pub use crate::guard::{BillableLlm, LlmCallGuard};
 pub use crate::providers::{FactoryDefaults, factory_defaults_for};
 pub use crate::registry::{
     LiveModelInfo, LlmPricingOverride, LlmProviderConfig, LlmProviderRegistry,
@@ -249,6 +252,18 @@ impl LlmStream {
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_events(events: Vec<crate::Result<StreamEvent>>) -> Self {
         let stream = futures::stream::iter(events);
+        Self {
+            inner: Box::pin(stream),
+        }
+    }
+
+    /// Wrap an arbitrary event stream into an `LlmStream`. The billing
+    /// layer uses this to interpose a recording wrapper over a provider
+    /// stream without the consumer seeing a different type.
+    pub(crate) fn from_stream<S>(stream: S) -> Self
+    where
+        S: Stream<Item = crate::Result<StreamEvent>> + Send + 'static,
+    {
         Self {
             inner: Box::pin(stream),
         }

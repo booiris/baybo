@@ -1,6 +1,6 @@
 //! Pre-call guard wrapper for [`LlmCompletion`].
 //!
-//! [`GuardedLlm`] runs an injected closure before each
+//! [`BillableLlm`] runs an injected closure before each
 //! `chat` / `chat_stream` call and short-circuits with
 //! [`LlmError::GuardRejected`] if the closure says no. The closure
 //! captures whatever caller-side state it needs (cost budgets, rate
@@ -8,57 +8,93 @@
 //! sessions, jobs, or spans.
 //!
 //! Wrap the raw client once at startup and hand the resulting
-//! `Arc<GuardedLlm>` to every consumer (the agent loop *and* any
+//! `Arc<BillableLlm>` to every consumer (the agent loop *and* any
 //! in-process summarizer / retriever / probe). The handle is sealed
-//! — `GuardedLlm` deliberately does *not* implement `LlmCompletion`,
-//! so `Arc<GuardedLlm>` cannot be unsizing-coerced back to
+//! — `BillableLlm` deliberately does *not* implement `LlmCompletion`,
+//! so `Arc<BillableLlm>` cannot be unsizing-coerced back to
 //! `Arc<dyn LlmCompletion>`. The only public way to mint one is
-//! [`GuardedLlm::new`], which requires a guard. Production
+//! [`BillableLlm::new`], which requires a guard. Production
 //! constructors (`AgentLoop`, `ToolRegistry`, etc.) take
-//! `Arc<GuardedLlm>` directly so the type alone refuses a raw client.
+//! `Arc<BillableLlm>` directly so the type alone refuses a raw client.
 
 use std::sync::Arc;
 
-use crate::{ChatRequest, LlmCompletion, LlmError, LlmResponse, LlmStream, ModelInfo};
+use aura_model::MicroUsd;
+
+use crate::billed::{Attribution, BoundBilledLlm, CostHooks, LlmCostRecorder};
+use crate::{ChatRequest, LlmCompletion, LlmError, LlmResponse, LlmStream, ModelInfo, TokenUsage};
 
 /// Closure invoked before every guarded LLM call. Returns `Err` to
 /// reject the call before the provider is contacted.
 pub type LlmCallGuard = Arc<dyn Fn() -> Result<(), LlmError> + Send + Sync>;
 
 /// Sealed LLM client handle. Holding one is type-level proof that an
-/// [`LlmCallGuard`] runs before every `chat` / `chat_stream`.
-pub struct GuardedLlm {
+/// [`LlmCallGuard`] runs before every call and a cost recorder runs
+/// after it. The handle itself is attribution-free and shared across all
+/// sessions; [`BillableLlm::bind`] pins an [`Attribution`] to produce a
+/// [`BoundBilledLlm`], which is the path that actually reaches a
+/// provider with recording attached.
+pub struct BillableLlm {
     inner: Arc<dyn LlmCompletion>,
     guard: LlmCallGuard,
+    recorder: LlmCostRecorder,
 }
 
-impl GuardedLlm {
+impl BillableLlm {
     /// Wrap `inner` with `guard` and return the sealed handle.
     /// Returns `Arc<Self>` directly because every realistic consumer
     /// wants cheap clones, and constructing the `Arc` here keeps the
-    /// caller from accidentally building a non-shared `GuardedLlm`
+    /// caller from accidentally building a non-shared `BillableLlm`
     /// they then can't fan out.
-    pub fn new(inner: Arc<dyn LlmCompletion>, guard: LlmCallGuard) -> Arc<Self> {
-        Arc::new(Self { inner, guard })
+    pub fn new(inner: Arc<dyn LlmCompletion>, billing: CostHooks) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            guard: billing.guard,
+            recorder: billing.record,
+        })
     }
 
-    /// Test-only construction with a pass-through guard that always
-    /// admits the call. Use sparingly — every call site is a place
+    /// Test-only construction with pass-through billing (admit every
+    /// call, record nothing). Use sparingly — every call site is a place
     /// where the gate intentionally doesn't fire (CLI probes, gateway
     /// fixtures, unit tests). Gated behind `cfg(any(test,
-    /// feature = "test-support"))` so a release build can never reach
-    /// it accidentally.
+    /// feature = "test-support"))` so a release build can never reach it
+    /// accidentally.
     #[cfg(any(test, feature = "test-support"))]
     pub fn passthrough(inner: Arc<dyn LlmCompletion>) -> Arc<Self> {
-        Self::new(inner, Arc::new(|| Ok(())))
+        Self::new(inner, CostHooks::passthrough())
     }
 
-    pub async fn chat(&self, request: &ChatRequest) -> crate::Result<LlmResponse> {
+    /// Pin an [`Attribution`] to this client, yielding the
+    /// [`BoundBilledLlm`] that performs gate → call → record. Cheap
+    /// (an `Arc` clone); bind once per context (per turn, per tool call,
+    /// or once at startup for a system component).
+    pub fn bind(self: &Arc<Self>, attribution: Attribution) -> BoundBilledLlm {
+        BoundBilledLlm::new(Arc::clone(self), attribution)
+    }
+
+    /// Run the injected cost recorder. `pub(crate)` so only
+    /// [`BoundBilledLlm`] can invoke it — recording is never a
+    /// caller-visible step, it rides on the bound call.
+    pub(crate) fn record(
+        &self,
+        attribution: &Attribution,
+        model_id: &str,
+        usage: &TokenUsage,
+    ) -> MicroUsd {
+        (self.recorder)(attribution, model_id, usage)
+    }
+
+    /// `pub(crate)` on purpose: the only way to reach a provider from
+    /// outside this crate is [`BillableLlm::bind`] → [`BoundBilledLlm`],
+    /// which runs the recorder after the call. Exposing a bare `chat`
+    /// again would reopen the unbilled-spend hole this design closes.
+    pub(crate) async fn chat(&self, request: &ChatRequest) -> crate::Result<LlmResponse> {
         (self.guard)()?;
         self.inner.chat(request).await
     }
 
-    pub async fn chat_stream(&self, request: &ChatRequest) -> crate::Result<LlmStream> {
+    pub(crate) async fn chat_stream(&self, request: &ChatRequest) -> crate::Result<LlmStream> {
         (self.guard)()?;
         self.inner.chat_stream(request).await
     }
@@ -172,7 +208,7 @@ mod tests {
     async fn guard_pass_delegates_to_inner() {
         let inner = Arc::new(CountingLlm::new());
         let guard: LlmCallGuard = Arc::new(|| Ok(()));
-        let guarded = GuardedLlm::new(inner.clone(), guard);
+        let guarded = BillableLlm::new(inner.clone(), CostHooks::unrecorded(guard));
 
         guarded.chat(&empty_request()).await.unwrap();
         assert_eq!(inner.chat_count(), 1);
@@ -182,7 +218,7 @@ mod tests {
     async fn guard_reject_short_circuits_chat() {
         let inner = Arc::new(CountingLlm::new());
         let guard: LlmCallGuard = Arc::new(|| Err(LlmError::GuardRejected("over budget".into())));
-        let guarded = GuardedLlm::new(inner.clone(), guard);
+        let guarded = BillableLlm::new(inner.clone(), CostHooks::unrecorded(guard));
 
         let err = guarded.chat(&empty_request()).await.unwrap_err();
         assert!(matches!(err, LlmError::GuardRejected(ref m) if m == "over budget"));
@@ -193,7 +229,7 @@ mod tests {
     async fn guard_reject_short_circuits_chat_stream() {
         let inner = Arc::new(CountingLlm::new());
         let guard: LlmCallGuard = Arc::new(|| Err(LlmError::GuardRejected("over budget".into())));
-        let guarded = GuardedLlm::new(inner.clone(), guard);
+        let guarded = BillableLlm::new(inner.clone(), CostHooks::unrecorded(guard));
 
         match guarded.chat_stream(&empty_request()).await {
             Err(LlmError::GuardRejected(m)) => assert_eq!(m, "over budget"),
@@ -207,7 +243,7 @@ mod tests {
     async fn model_info_passes_through() {
         let inner = Arc::new(CountingLlm::new());
         let guard: LlmCallGuard = Arc::new(|| Ok(()));
-        let guarded = GuardedLlm::new(inner.clone(), guard);
+        let guarded = BillableLlm::new(inner.clone(), CostHooks::unrecorded(guard));
 
         assert_eq!(guarded.model_info().id, "test-model");
         assert_eq!(inner.chat_count(), 0);

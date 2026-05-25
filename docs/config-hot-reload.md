@@ -14,7 +14,7 @@ The headline win is **LLM identity** (`provider`, `model`, `base_url`, `api_key`
 - Hot-reloading anything outside the whitelist (ports, bind address, workspace path, encryption key file, channels, session, the rest of `agent`). These **hard-reject** on reload.
 - HTTP add/remove model endpoints — the `aura llm` CLI already does full CRUD, and reload rebuilds the whole pool from `config.llm` regardless of which surface triggered it.
 - TUI inline reload (the TUI boot path has no admin HTTP server; SIGHUP only, if wired).
-- Migrating `skill_assessor` onto the billed path — tracked as a TODO below.
+- Making `skill_assessor` *follow* a hot-reload model swap — it's now on the billed path (a system-attributed `BoundBilledLlm`) but stays pinned to the boot-time default; see the TODO below.
 
 ## Contract (non-negotiable)
 
@@ -70,7 +70,7 @@ Every reload runs the full set of steps — the LLM pool is **always** rebuilt, 
 
 `LlmClientPool` is held as `Arc<parking_lot::RwLock<Arc<LlmClientPool>>>` (alias `LlmPoolHandle`). This changes the `AgentLoopConfig.llm_pool` field type, which ripples to every construction site (the single `wire_router` spawn closure in `src/runtime.rs` — used for top-level, cron, subagent, and background-compression actors alike — plus the integration-test harness and `AgentLoop` unit tests).
 
-`AgentLoop` resolves at **turn start** (not construction): `pool_handle.read().resolve(self.initial_llm)`, pinned for the whole turn (a turn may issue many LLM calls; they all use one model). When the resolved client differs from the current one **by pointer** (`Arc::ptr_eq`, *not* by model id — a reload always builds fresh `Arc<GuardedLlm>`s, so this also catches a `base_url` / credential / `reasoning_effort` / `context_window` edit that kept the same model id; an unchanged pool returns the same `Arc`, so the common path stays a no-op), the loop:
+`AgentLoop` resolves at **turn start** (not construction): `pool_handle.read().resolve(self.initial_llm)`, pinned for the whole turn (a turn may issue many LLM calls; they all use one model). When the resolved client differs from the current one **by pointer** (`Arc::ptr_eq`, *not* by model id — a reload always builds fresh `Arc<BillableLlm>`s, so this also catches a `base_url` / credential / `reasoning_effort` / `context_window` edit that kept the same model id; an unchanged pool returns the same `Arc`, so the common path stays a no-op), the loop:
 
 - swaps `self.llm_client`,
 - rebuilds `self.billed_chat_factory` from the new client (so in-tool side-LLM calls bill the new model),
@@ -82,7 +82,7 @@ Subagent pinning needs no special handling: `resolve(Some(removed_entry))` alrea
 
 ### Admin read-through (no stale snapshots)
 
-`AdminState` holds the pool handle instead of a captured `Arc<GuardedLlm>`; `get_llm` resolves the current default per request, so it's always truthful after a reload. (`aura-gateway` already depends on `aura-agent`, so it can name the pool type directly — no trait indirection.)
+`AdminState` holds the pool handle instead of a captured `Arc<BillableLlm>`; `get_llm` resolves the current default per request, so it's always truthful after a reload. (`aura-gateway` already depends on `aura-agent`, so it can name the pool type directly — no trait indirection.)
 
 The generic config endpoints (`GET`/`PUT`/`DELETE /v1/config`) read the **current on-disk** config via `read_config_for_dashboard`, not the boot `state.config` snapshot. Otherwise `GET` would lie after a reload, and `PUT`/`DELETE` would build from the stale snapshot and write it back — clobbering changes a prior hot-reload already applied. (The LLM admin endpoints already used `read_config_for_dashboard`.) The path `read_config_for_dashboard` reads and the path the reloader applies are the **same** value (`resolve_config_path()`, or the default file when none existed at boot) — otherwise a first-run create + reload would apply the file to the live pool yet leave `GET /v1/config` still reporting the empty boot snapshot.
 
@@ -132,7 +132,7 @@ Both are infallible to prepare.
 
 ## Out of scope / follow-up TODOs
 
-- **`skill_assessor` billing + swap:** it currently holds `Arc<GuardedLlm>` and calls `.chat()` directly (`crates/skills-assessor/src/{queue,assessor}.rs`), so its calls hit the budget *gate* but are never `record_call`'d — unbilled spend, invisible to `cost_records` and the accumulator. Migrating it onto a `BilledChatFactory` bound to the pool handle fixes the billing gap **and** makes it follow hot-reload swaps in one change. Pinned to the boot default until then.
+- **`skill_assessor` swap-follow:** billing is **fixed** — it now holds an `Arc<BoundBilledLlm>` bound once to a `system:skill-assessor` `Attribution`, so its calls record to `cost_records` under the system bucket (`crates/skills-assessor/src/{queue,assessor}.rs`). What remains: it's bound to the boot-time default client, so it does **not** follow a hot-reload model swap. Re-binding on swap would need the runtime to re-inject the handle (the assessor would hold a swappable slot, or read the pool handle per call). Deferred because verdicts cache by content hash, not model, and pinning a safety classifier to a known model is arguably preferable — also an open question whether the assessor should have its own model config rather than tracking the chat default.
 - **Incremental pool rebuild (trim rebind churn):** `reload` rebuilds the **whole** pool every time, minting fresh client `Arc`s for every entry, so every live session rebinds on its next turn. `build_pool_clients` could instead diff per entry-name (config fields + a stored credential fingerprint) and reuse the unchanged entries' `Arc`s, so only sessions pinned to a genuinely-changed entry rebind — and a pricing-only edit, which doesn't alter the client, would reuse every `Arc`. The credential fingerprint is what keeps this correct (a vault rotation changes the fingerprint even with an identical config entry), so it doesn't reintroduce the gap that forced unconditional rebuild. The churn is cheap (client build is local, no network) and doesn't affect provider-side prompt cache, so this is an optimization, not a correctness fix.
 - HTTP add/remove model endpoints (CLI covers CRUD today).
 - TUI inline reload.

@@ -25,7 +25,7 @@ linux = []
 macos = []
 # Exposes test helpers to downstream crate-level tests. Never enabled in
 # release builds. Pulls in `aura-llm/test-support` so the gateway's own
-# test fixtures can construct `GuardedLlm::passthrough`.
+# test fixtures can construct `BillableLlm::passthrough`.
 test-support = ["aura-llm/test-support"]
 
 [dependencies]

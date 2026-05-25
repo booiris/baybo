@@ -763,7 +763,7 @@ fn truncate_utf8(bytes: &[u8], max: usize) -> String {
 mod tests {
     use super::*;
     use crate::test_support::unbilled_chat;
-    use aura_llm::{GuardedLlm, LlmCompletion};
+    use aura_llm::{BillableLlm, LlmCompletion};
     use aura_model::{ChannelType, User};
     use axum::{
         Router,
@@ -779,7 +779,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn billed(stub: Arc<dyn LlmCompletion>) -> Arc<dyn BilledChat> {
-        unbilled_chat(GuardedLlm::passthrough(stub))
+        unbilled_chat(BillableLlm::passthrough(stub))
     }
 
     fn ctx_with_timeout(timeout: Duration) -> ToolContext {

@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use aura_llm::{ChatRequest, GuardedLlm};
+use aura_llm::{BoundBilledLlm, ChatRequest};
 use aura_skills::SkillDefinition;
 use aura_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 use thiserror::Error;
@@ -83,14 +83,13 @@ pub struct AssessedSkill {
 /// the classifier runs at all, and if so which scope it judges —
 /// `Primary` reads only `SKILL.md`, `Full` reads the whole tree.
 pub struct SkillAssessor {
-    // TODO(config-hot-reload): this is the boot-time default client,
-    // pinned for the assessor's lifetime — it does NOT follow a config
-    // hot-reload's model swap, and its `.chat()` calls hit the budget
-    // gate but are never `record_call`'d (unbilled spend, invisible to
-    // cost_records). Migrating to a `BilledChatFactory` bound to the
-    // shared `LlmPoolHandle` fixes both in one change. See
-    // docs/config-hot-reload.md "Out of scope / follow-up TODOs".
-    llm: Arc<GuardedLlm>,
+    /// Billed handle bound once at startup to a `system:skill-assessor`
+    /// [`Attribution`](aura_llm::Attribution): every `chat` records its
+    /// spend to that bucket. Assessment is platform safety overhead, not
+    /// user-attributable work, and verdicts are cached by content hash
+    /// (not model), so the boot-time client is pinned for the assessor's
+    /// lifetime — it does not follow a config hot-reload's model swap.
+    llm: Arc<BoundBilledLlm>,
     store: Arc<dyn SkillRiskStore>,
     mode: AssessmentMode,
     /// Background worker handle. Under `Full` mode `check_full` tiers
@@ -106,7 +105,7 @@ impl SkillAssessor {
     /// spawned on the current Tokio runtime and lives as long as any
     /// sender is held.
     pub fn with_background_worker(
-        llm: Arc<GuardedLlm>,
+        llm: Arc<BoundBilledLlm>,
         store: Arc<dyn SkillRiskStore>,
         mode: AssessmentMode,
     ) -> Self {
@@ -354,7 +353,8 @@ impl SkillAssessor {
             .llm
             .chat(&request)
             .await
-            .map_err(|e| AssessError::Llm(e.to_string()))?;
+            .map_err(|e| AssessError::Llm(e.to_string()))?
+            .response;
 
         let (level, rationale) = match parse_verdict(&response.content) {
             Some(v) => v,

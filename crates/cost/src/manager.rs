@@ -431,7 +431,7 @@ impl CostManager {
     }
 
     /// Synchronous in-memory budget gate. Runs before every
-    /// dispatched LLM call (via `GuardedLlm`) and at `Router`
+    /// dispatched LLM call (via `BillableLlm`) and at `Router`
     /// ingress. A UTC rollover between the most recent `record_call`
     /// and `now` is honoured by treating the stale window as zero
     /// spend.
@@ -479,6 +479,40 @@ pub fn cost_call_guard(manager: &Arc<CostManager>) -> aura_llm::LlmCallGuard {
         cm.check()
             .map_err(|e| aura_llm::LlmError::GuardRejected(e.to_string()))
     })
+}
+
+/// Bundle the admission guard and cost recorder for a `CostManager` into
+/// the [`CostHooks`](aura_llm::CostHooks) every `BillableLlm` is built
+/// with. This is the production wiring; argv one-shots and tests use
+/// [`CostHooks::passthrough`](aura_llm::CostHooks::passthrough).
+pub fn cost_hooks(manager: &Arc<CostManager>) -> aura_llm::CostHooks {
+    aura_llm::CostHooks {
+        guard: cost_call_guard(manager),
+        record: cost_record_closure(manager),
+    }
+}
+
+/// Bridge `CostManager::record_call` to the
+/// [`LlmCostRecorder`](aura_llm::LlmCostRecorder) closure shape. Lives
+/// here, alongside [`cost_call_guard`], so `aura-llm` needn't know the
+/// manager's `record_call` signature.
+fn cost_record_closure(manager: &Arc<CostManager>) -> aura_llm::LlmCostRecorder {
+    let cm = Arc::clone(manager);
+    Arc::new(
+        move |attr: &aura_llm::Attribution, model_id: &str, usage: &aura_llm::TokenUsage| {
+            cm.record_call(
+                &attr.user_id,
+                attr.session_id.clone(),
+                attr.job_id,
+                attr.span_id,
+                model_id,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_input_tokens,
+                usage.cache_creation_input_tokens,
+            )
+        },
+    )
 }
 
 fn utc_day_start(now: chrono::DateTime<Utc>) -> Option<chrono::DateTime<Utc>> {

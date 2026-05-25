@@ -718,7 +718,7 @@ impl ContextManager {
 
     /// Assemble + append an LLM-call record to the session JSONL log. No-op
     /// without a logger. The owning `AgentLoop` calls this on its LLM-call path
-    /// with the call's request/outcome + the model info from its `GuardedLlm`
+    /// with the call's request/outcome + the model info from its `BillableLlm`
     /// (which context doesn't hold) — so the record format + the write live
     /// here, while the model identity stays the agent's to supply.
     pub async fn log_llm_call(

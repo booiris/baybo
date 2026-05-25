@@ -32,7 +32,7 @@ use std::sync::Arc;
 use aura_context::{
     BackgroundSummaryConfig, BackgroundSummaryOutcome, Tokenizer, run_background_summary,
 };
-use aura_llm::{GuardedLlm, ModelInfo};
+use aura_llm::{Attribution, BillableLlm, ModelInfo};
 use aura_model::{BackgroundCompressionPayload, JobId, SessionId};
 use aura_session::SessionManager;
 use aura_trace::{LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepKind};
@@ -40,9 +40,7 @@ use aura_workspace::WorkspacePaths;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::runtime::billed_chat::{BilledAttribution, chat_billed_core};
 use crate::security::SecurityGateway;
-use aura_cost::CostManager;
 
 /// Synthetic `model_id` recorded against `session_summaries.error_count`
 /// when the orphan reaper bumps a parent's failure count for a
@@ -53,9 +51,8 @@ const ORPHAN_REAP_MODEL_TAG: &str = "orphan-reap";
 /// trace recorder, cost ledger, the LLM client, and the identity /
 /// cancel context that pin the call to a specific job + session.
 pub(crate) struct CompressionRunner {
-    pub(crate) llm_client: Arc<GuardedLlm>,
+    pub(crate) llm_client: Arc<BillableLlm>,
     pub(crate) recorder: Arc<SpanRecorder>,
-    pub(crate) cost_manager: Arc<CostManager>,
     /// Same gateway as the main LLM path. Compression LLM output and
     /// errors are scrubbed through it before they land in the trace,
     /// the cost record's joinable content, or the [Conversation
@@ -89,7 +86,6 @@ impl CompressionRunner {
         let CompressionRunner {
             llm_client,
             recorder,
-            cost_manager,
             security_gateway,
             job_id,
             user_id,
@@ -126,46 +122,51 @@ impl CompressionRunner {
                     cancel_ctx,
                     |span| async move {
                         let span_id_str = span.span_id.to_string();
-                        let attribution = BilledAttribution {
+                        let bound = llm_client.bind(Attribution {
                             user_id: user_id.clone(),
                             session_id: session_id.clone(),
                             job_id,
                             span_id: span.span_id,
-                        };
-                        match chat_billed_core(
-                            &llm_client,
-                            &security_gateway,
-                            &cost_manager,
-                            &model_info,
-                            &attribution,
-                            &request,
-                        )
-                        .await
-                        {
-                            Ok(run) => {
+                        });
+                        match bound.chat(&request).await {
+                            Ok(billed) => {
+                                let mut response = billed.response;
+                                // Scrub before the summary lands in the
+                                // trace, the cost row's joinable content,
+                                // or the re-injected [Conversation
+                                // Summary]. Placeholders are kept, not
+                                // revealed — the summarized brain operates
+                                // against the sanitized transcript.
+                                if let Err(e) =
+                                    security_gateway.sanitize_llm_response(&mut response).await
+                                {
+                                    warn!(error = %e, "compression: sanitize_llm_response failed");
+                                }
                                 let call_result = LlmCallResult {
-                                    output_content: run.response.content.clone(),
-                                    thinking: run.response.thinking.clone(),
+                                    output_content: response.content.clone(),
+                                    thinking: response.thinking.clone(),
                                     tool_calls: vec![],
-                                    input_tokens: run.response.usage.input_tokens,
-                                    output_tokens: run.response.usage.output_tokens,
-                                    cached_input_tokens: run.response.usage.cached_input_tokens,
-                                    cache_creation_input_tokens: run
-                                        .response
+                                    input_tokens: response.usage.input_tokens,
+                                    output_tokens: response.usage.output_tokens,
+                                    cached_input_tokens: response.usage.cached_input_tokens,
+                                    cache_creation_input_tokens: response
                                         .usage
                                         .cache_creation_input_tokens,
                                 };
                                 (
                                     call_result,
                                     Ok(aura_context::SummaryChatRun {
-                                        response: run.response,
+                                        response,
                                         span_id: span_id_str,
-                                        cost_micros: run.cost_micros.into_micros(),
+                                        cost_micros: billed.cost_micros.into_micros(),
                                     }),
                                 )
                             }
-                            Err(error_msg) => {
-                                (LlmCallResult::default(), Err(anyhow::anyhow!(error_msg)))
+                            Err(e) => {
+                                let raw = e.to_string();
+                                let msg =
+                                    security_gateway.sanitize_error(&raw).await.unwrap_or(raw);
+                                (LlmCallResult::default(), Err(anyhow::anyhow!(msg)))
                             }
                         }
                     },
@@ -185,9 +186,8 @@ impl CompressionRunner {
 /// [`aura_context::run_background_summary`]; this struct is the
 /// agent-side adapter.
 pub(crate) struct BackgroundCompressionRunner {
-    pub llm_client: Arc<GuardedLlm>,
+    pub llm_client: Arc<BillableLlm>,
     pub security_gateway: Arc<SecurityGateway>,
-    pub cost_manager: Arc<CostManager>,
     pub sessions: Arc<SessionManager>,
     pub workspace_paths: Arc<WorkspacePaths>,
     pub tokenizer: Arc<dyn Tokenizer>,
@@ -210,7 +210,6 @@ impl BackgroundCompressionRunner {
         let BackgroundCompressionRunner {
             llm_client,
             security_gateway,
-            cost_manager,
             sessions,
             workspace_paths,
             tokenizer,
@@ -240,7 +239,6 @@ impl BackgroundCompressionRunner {
             let runner = CompressionRunner {
                 llm_client: llm_client.clone(),
                 recorder: recorder.clone(),
-                cost_manager: cost_manager.clone(),
                 security_gateway: security_gateway.clone(),
                 job_id,
                 user_id: maintenance_user_id.clone(),
