@@ -13,7 +13,8 @@ use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
 use serde_json::Value;
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{ChildStderr, Command};
 
 use crate::mcp::config::{McpServerEntry, McpTransportConfig};
 use crate::mcp::credentials::VaultCredentialStore;
@@ -84,12 +85,11 @@ async fn connect_stdio(
     let env = load_string_map(vault, &vault_keys::env_bag(server_name)).await?;
 
     let mut tokio_cmd = Command::new(command);
-    tokio_cmd
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear();
+    // Stdio is configured on the rmcp builder below, not here:
+    // `TokioChildProcessBuilder::spawn` overwrites the command's
+    // stdin/stdout/stderr with its own values, so anything set on
+    // `tokio_cmd` would be silently clobbered.
+    tokio_cmd.args(args).env_clear();
     for var in ["PATH", "HOME", "LANG", "TZ", "TMPDIR"] {
         if let Ok(value) = std::env::var(var) {
             tokio_cmd.env(var, value);
@@ -108,13 +108,52 @@ async fn connect_stdio(
         tokio_cmd.env(k, v);
     }
 
-    let (process, _stderr) = TokioChildProcess::builder(tokio_cmd)
+    // rmcp's child builder defaults stderr to `Stdio::inherit()`, which
+    // would dump the server's diagnostics straight onto the gateway's
+    // terminal (and never capture them anywhere). Force `piped` and pump
+    // the captured stream into tracing so the lines land in the gateway
+    // log file / admin LogBuffer instead of the operator's TTY.
+    let (process, stderr) = TokioChildProcess::builder(tokio_cmd)
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| McpError::Transport(format!("spawn '{command}': {e}")))?;
+    if let Some(stderr) = stderr {
+        drain_mcp_stderr(server_name.to_owned(), stderr);
+    }
 
     ().serve(process)
         .await
         .map_err(|e| McpError::Connection(e.to_string()))
+}
+
+/// Forward a stdio MCP server's stderr into the tracing subscriber.
+///
+/// rmcp inherits the child's stderr by default; [`connect_stdio`] spawns
+/// it `piped` and hands the stream here. Each line becomes a `tracing`
+/// event tagged with `mcp_server`, so the gateway's file subscriber
+/// records server diagnostics in `aura.log` (and the admin LogBuffer)
+/// rather than scrolling them past on the terminal. The task ends on EOF
+/// when the child exits. No per-line cap: MCP servers are operator-added
+/// (`aura mcp add`) and write line-oriented diagnostics, unlike the
+/// untrusted channel sidecars that justify the supervisor's pipe cap.
+fn drain_mcp_stderr(server_name: String, stderr: ChildStderr) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => tracing::info!(mcp_server = %server_name, "{line}"),
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!(
+                        mcp_server = %server_name,
+                        error = %e,
+                        "mcp server stderr read failed",
+                    );
+                    break;
+                }
+            }
+        }
+    });
 }
 
 async fn connect_http(

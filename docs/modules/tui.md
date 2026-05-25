@@ -32,11 +32,12 @@ server side.
 
 ### Chat
 
-- Scrollback is a fixed-capacity ring (`SCROLLBACK_CAP = 5000`) of `ChatLine::{User,Assistant,System,Log,Approval}` entries.
+- There is no in-memory scrollback buffer or cap. Completed lines (user / assistant / system / log / resolved approval) are committed straight into the terminal's **native** scrollback via `Terminal::insert_before`; the TUI itself owns only a small inline live region (input box + streaming preview + pending-approval prompt).
 - Assistant lines render each `ContentBlock`: text inline, and `Image`/`Audio`/`File` as a bracketed placeholder.
 - Input history keeps up to `HISTORY_CAP = 500` non-empty submissions with trivial de-duplication of consecutive identical lines. The ring is **persistent**: see [Persistent input history](#persistent-input-history) below.
-- `scroll_offset` is measured in rendered rows from the tail: `0` keeps the newest line pinned at the bottom; `PageUp`/`PageDown` grow or shrink the offset by 10.
-- While the LLM is responding, an ephemeral streaming buffer is drawn immediately below the scrollback tail. Each `AgentOutput::Delta` extends the buffer; the final `AgentOutput::Message` replaces it with a persisted `ChatLine::Assistant` carrying the canonical `ContentBlock` list.
+- Chat scrolling is the terminal's own (mouse wheel / the emulator's scrollback); the TUI keeps no scroll offset for chat. `PageUp`/`PageDown` page the **dashboard** table only (`DashboardPageUp`/`DashboardPageDown`, ±10 rows).
+- While the LLM is responding, an ephemeral streaming buffer is drawn immediately below the scrollback tail. Each `AgentOutput::Delta` extends it; complete lines are committed to the terminal scrollback (`insert_before`) as they arrive, leaving only the trailing partial in the buffer. The agent loop streams deltas on **every** iteration, so a final answer that lands after tool calls still streams.
+- The final `AgentOutput::Message` does **not** replace the streamed text — those lines are already committed. `finalize_stream` (via the pure `finalize_lines`) commits the trailing partial plus any non-text extras the stream didn't carry (e.g. the CronCreate hint). When the response **never streamed** — the non-streaming delivery path, where the agent loop ran with `delta_tx = None` (cron fires, subagent-notification turns) and only a final Message arrives — it renders the full message body from the blocks so the text isn't dropped.
 
 ### Slash completion
 
@@ -50,7 +51,7 @@ server side.
 
 ### Inline approval prompt
 
-- Approval requests are rendered **inline in the scrollback** as a `ChatLine::Approval(ApprovalChatEntry)` entry — no overlay modal.
+- Approval requests render **inline** (no overlay modal): while pending, as a live prompt in the bottom region driven by `AppState.pending_approval: Option<ApprovalChatEntry>`; once resolved, as a committed scrollback line (see below).
 - When pending, the entry is expanded: tool name, resource accesses, params preview, and three selectable options (`Approve` / `Always approve` / `Deny`). The user navigates options with `Up`/`Down` (or `k`/`j`) and confirms with `Enter`, or presses a direct shortcut (`a`/`A`/`d`).
 - After resolution the entry collapses to a single `aura>` line with the decision, tool name, and the first resource access detail — e.g. `aura> approved: Bash (echo hello)` or `aura> denied: Read (/etc/shadow)`. Normal input resumes immediately.
 - Approvals originate on the gateway. The WS transport observes `Frame::ApprovalRequested` and mirrors the entry into a *local* `ApprovalQueue` so the existing TUI modal logic picks it up unchanged. The queue's resolver callback (installed by `WsTransport::connect`) wraps the TUI's "approve/deny" decision in a `Frame::ResolveApproval` echoed back over the same socket, so the gateway-side gate unblocks. Inbound `Frame::ApprovalResolved` frames drop any stale local mirror — useful when a second frontend resolves the same entry.
@@ -211,8 +212,8 @@ as a subprocess, polls the channel-port file + a loopback
 `TcpStream::connect` with exponential backoff (100 ms → 1 s, 15 s
 deadline), re-reads the freshly-rotated TUI token from the vault,
 retries the WS connect, and returns an RAII guard that sends
-SIGKILL on drop. A loud banner prints before the alternate screen
-takes over. The flag is gated by `#[cfg(debug_assertions)]` so
+SIGKILL on drop. A loud banner prints before the TUI takes over
+the terminal. The flag is gated by `#[cfg(debug_assertions)]` so
 `cargo build --release` cannot compile it in.
 
 ## Architecture
@@ -222,7 +223,7 @@ takes over. The flag is gated by `#[cfg(debug_assertions)]` so
 The loop multiplexes three sources with `tokio::select!`:
 
 1. **Shutdown** — `Arc<Notify>` toggled by `TuiAdapter::stop` or the WS pump's teardown guard.
-2. **Terminal input** — a `crossterm::event::EventStream`. Raw reads are required because the terminal is in raw-mode + alternate screen; a `tokio::io::stdin` reader would fight crossterm for `/dev/tty`.
+2. **Terminal input** — a `crossterm::event::EventStream`. Raw reads are required because the terminal is in raw mode and crossterm owns `/dev/tty`; a `tokio::io::stdin` reader would fight it for the device.
 3. **Internal events** — `AppEvent` sent by the `WsTransport` pump (streaming deltas, responses, approval events) and by the background dashboard-fetch task.
 
 ### Transport
@@ -254,7 +255,7 @@ each `TransportEvent` onto an `AppEvent` variant so rendering code
 does not need to know about the transport:
 
 - `StreamDelta(text)` → `AppEvent::StreamDelta(String)`. Appended to `AppState.streaming`, redrawn live.
-- `Response(blocks)` → `AppEvent::Outgoing(Vec<ContentBlock>)`. Clears `AppState.streaming`; pushes `ChatLine::Assistant`.
+- `Response(blocks)` → `AppEvent::Outgoing(Vec<ContentBlock>)`. Finalises the response via `finalize_stream` (commit the trailing partial + non-text extras, or render the body from blocks when nothing streamed — see [Chat](#chat)), then clears `AppState.streaming`.
 - `Notice { level, text }` → `AppEvent::Log(LogRecord { level, target: "agent", message })`. Reuses the log surface.
 - `ApprovalRequested` / `ApprovalResolved` — see [Inline approval prompt](#inline-approval-prompt).
 
@@ -262,9 +263,10 @@ Single-consumer ordering on the mpsc keeps delta/response ordering correct as WS
 
 ### Raw-mode discipline
 
-- Entry (`run_loop`): `enable_raw_mode()` + `EnterAlternateScreen` + `Terminal::new`.
-- Teardown: `disable_raw_mode()` + `LeaveAlternateScreen` + `DisableMouseCapture`, best-effort, logged on failure.
-- Panic hook: installed once via `OnceLock`, calls the same restoration sequence before delegating to the previous hook. Without it a panic would leave the terminal unusable.
+- Entry (`run_loop`): install the panic hook, `enable_raw_mode()`, then `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)` once for the session (Kitty protocol, so `Shift`/`Alt+Enter` reach us with modifier bits set; unsupported terminals ignore it). Chat then renders into an **inline viewport** (`Viewport::Inline`) on the **main** screen — it does **not** enter the alternate screen, so the user's shell history stays above the live region and native mouse-wheel scroll / copy-paste keep working.
+- Alternate screen + mouse capture are **dashboard-only**: `enter_dashboard_mode` issues `EnterAlternateScreen` + `EnableMouseCapture` and flips an `in_alt_screen` flag; leaving the dashboard reverses both.
+- Teardown is RAII via `TuiTeardownGuard::drop`, so any early return restores the terminal: pop the keyboard-enhancement flags (if pushed), `LeaveAlternateScreen` + `DisableMouseCapture` **only if** `in_alt_screen`, `disable_raw_mode()`, then fire `on_exit`. Best-effort, logged on failure.
+- Panic hook: installed once via `OnceLock` — pops the keyboard flags, disables raw mode, and best-effort leaves the alt screen + mouse capture, then delegates to the previous hook. Without it a panic would leave the terminal unusable.
 
 ### Logging in chat mode
 
@@ -284,9 +286,9 @@ Argv mode keeps the old stdout layer — one-shot commands don't own the termina
 
 ## Constraints
 
-- Each `AgentOutput::Message` delivered to the TUI produces exactly one persisted chat line. `AgentOutput::Delta` chunks may precede it, but they are ephemeral — the final message supersedes whatever was streamed and is the canonical record.
+- The streamed deltas and the final `AgentOutput::Message` are **not** redundant: deltas commit the body to scrollback line-by-line as it streams, and the final Message only finalises it (trailing partial + non-text extras). The Message re-renders the body from its blocks **only** when nothing streamed (`delta_tx = None`: cron / subagent-notification, or reconnect catch-up of persisted rows) — so the body is never both streamed and re-rendered.
 - Renderer state (`AppState`) is mutated only on the event-loop task. External code uses the mpsc event channel; there is no shared `Mutex<AppState>`.
-- Input/state mutation in `app.rs` and key translation in `keymap.rs` are pure — unit tests exercise them without a terminal. Renderer tests use Ratatui's `TestBackend` when needed.
+- Input/state mutation in `app.rs` and key translation in `keymap.rs` are pure — unit tests exercise them without a terminal. Line-rendering helpers (e.g. `finalize_lines`, the `render_*` functions) are pure too — they return `Vec<Line>`, so tests assert on them directly; the one buffer-level fixup (`elide_wide_char_continuations`) is tested against a ratatui `Buffer`.
 - Dashboard providers must not block; the `DashboardProvider` trait method is `async` and the bundled `TuiDashboardProvider` returns synchronously without I/O.
 
 ## Collaboration

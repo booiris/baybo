@@ -515,34 +515,63 @@ fn flush_complete_stream_lines(state: &mut AppState, terminal: &mut Term) -> io:
     Ok(())
 }
 
-/// Finalise the in-flight agent response: commit the trailing partial
-/// line (if any), commit any non-text blocks the stream didn't carry
-/// (e.g. the CronCreate recurring-trigger hint), and add one trailing
-/// blank for visual separation. Caller is responsible for clearing
-/// streaming state and decrementing the outstanding-response counter.
+/// Build the scrollback lines for a finalised agent response.
+///
+/// `started` is whether any streamed line already reached the scrollback
+/// for this response; `partial` is the trailing streamed line still
+/// buffered, if any.
+///
+/// When the body streamed, its text is already in the scrollback, so we
+/// append only the trailing partial plus any non-text extras the stream
+/// didn't carry (e.g. the CronCreate recurring-trigger hint). When
+/// nothing streamed — the non-streaming delivery path where `delta_tx`
+/// was `None`: cron fires and subagent-notification turns (see
+/// `AgentActor::run_agent_loop` callers) deliver only a final Message,
+/// no deltas — the body never reached the scrollback, so the full
+/// message is rendered from `blocks`. A trailing blank separates this
+/// response from the next, emitted only when something was committed (an
+/// empty Outgoing is a no-op).
+fn finalize_lines(
+    blocks: &[ContentBlock],
+    started: bool,
+    partial: Option<String>,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut committed = started;
+    if let Some(partial) = partial {
+        out.extend(chat::render_stream_line(&partial, committed));
+        committed = true;
+    }
+    if committed {
+        out.extend(chat::render_non_text_blocks(blocks, true));
+    } else {
+        let body = chat::render_assistant_lines(blocks);
+        if !body.is_empty() {
+            committed = true;
+            out.extend(body);
+        }
+    }
+    if committed {
+        out.push(Line::from(""));
+    }
+    out
+}
+
+/// Finalise the in-flight agent response and commit it to scrollback.
+/// See [`finalize_lines`] for the streamed-vs-non-streamed split. Caller
+/// clears streaming state and decrements the outstanding-response
+/// counter afterwards.
 fn finalize_stream(
     state: &mut AppState,
     terminal: &mut Term,
     blocks: &[ContentBlock],
 ) -> io::Result<()> {
-    if let Some(partial) = state.take_stream_partial() {
-        let leader_is_continuation = state.streaming_committed_any;
-        commit_lines_compact(
-            terminal,
-            chat::render_stream_line(&partial, leader_is_continuation),
-        )?;
+    let started = state.streaming_committed_any;
+    let partial = state.take_stream_partial();
+    let lines = finalize_lines(blocks, started, partial);
+    if !lines.is_empty() {
         state.streaming_committed_any = true;
-    }
-    let non_text = chat::render_non_text_blocks(blocks, state.streaming_committed_any);
-    if !non_text.is_empty() {
-        commit_lines_compact(terminal, non_text)?;
-        state.streaming_committed_any = true;
-    }
-    // Trailing blank so the next entry doesn't butt up against this
-    // response. Only emit it if we actually committed something on
-    // behalf of this response — an empty Outgoing is a no-op.
-    if state.streaming_committed_any {
-        commit_lines_compact(terminal, vec![Line::from("")])?;
+        commit_lines_compact(terminal, lines)?;
     }
     Ok(())
 }
@@ -1055,5 +1084,65 @@ mod tests {
         assert_eq!(buf.content[0].symbol(), "h");
         assert_eq!(buf.content[1].symbol(), "e");
         assert_eq!(buf.content[5].symbol(), "!");
+    }
+
+    /// Concatenate the visible text of every span on a line.
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn finalize_renders_body_when_nothing_streamed() {
+        // Non-streaming delivery (cron / subagent-notification): the
+        // Message arrives with no preceding deltas, so its text must
+        // render from the blocks rather than be dropped.
+        let blocks = vec![ContentBlock::Text("cron result".into())];
+        let lines = finalize_lines(&blocks, false, None);
+        let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("cron result"),
+            "body must render: {joined:?}"
+        );
+        assert!(
+            lines
+                .first()
+                .is_some_and(|l| line_text(l).starts_with("aura> ")),
+            "first line carries the aura> leader: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_skips_text_when_body_streamed() {
+        // A streamed response already committed its text line-by-line, so
+        // the final blocks' Text must not be re-rendered (no duplicate).
+        let blocks = vec![ContentBlock::Text("already streamed".into())];
+        let lines = finalize_lines(&blocks, true, None);
+        let joined = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !joined.contains("already streamed"),
+            "streamed text must not be re-rendered: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_uses_partial_not_blocks_for_short_stream() {
+        // A short streamed response leaves a trailing partial (no newline)
+        // without ever committing a complete line. The partial is the
+        // body — render it once, don't also re-render from blocks.
+        let blocks = vec![ContentBlock::Text("hello".into())];
+        let lines = finalize_lines(&blocks, false, Some("hello".into()));
+        let hits = lines
+            .iter()
+            .map(line_text)
+            .filter(|t| t.contains("hello"))
+            .count();
+        assert_eq!(hits, 1, "exactly one 'hello' line, no duplicate");
+    }
+
+    #[test]
+    fn finalize_empty_message_is_noop() {
+        // Nothing streamed and no renderable blocks → no lines, not even
+        // a stray trailing blank.
+        assert!(finalize_lines(&[], false, None).is_empty());
     }
 }

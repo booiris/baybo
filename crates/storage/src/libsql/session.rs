@@ -46,7 +46,9 @@ fn rehydrate_message(
 ) -> Result<ChatMessage> {
     use aura_model::{MessageSource, Role};
     let role = role.parse::<Role>().map_err(StorageError::Storage)?;
-    let source = source.parse::<MessageSource>().map_err(StorageError::Storage)?;
+    let source = source
+        .parse::<MessageSource>()
+        .map_err(StorageError::Storage)?;
     Ok(match source {
         MessageSource::User => ChatMessage::user(content),
         MessageSource::UserInterjection => ChatMessage::user_interjection(content),
@@ -721,9 +723,9 @@ impl SessionStore for LibsqlSessionStore {
             let content_json: String = row
                 .get(1)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-            let source_str: String = row.get(2).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get source: {e}"))
-            })?;
+            let source_str: String = row
+                .get(2)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get source: {e}")))?;
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
             out.push(rehydrate_message(&role, content, &source_str)?);
@@ -848,9 +850,9 @@ impl SessionStore for LibsqlSessionStore {
             let content_json: String = row
                 .get(1)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-            let source_str: String = row.get(2).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get source: {e}"))
-            })?;
+            let source_str: String = row
+                .get(2)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get source: {e}")))?;
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
             out.push(rehydrate_message(&role, content, &source_str)?);
@@ -905,9 +907,9 @@ impl SessionStore for LibsqlSessionStore {
             let content_json: String = row
                 .get(2)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-            let source_str: String = row.get(3).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get source: {e}"))
-            })?;
+            let source_str: String = row
+                .get(3)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get source: {e}")))?;
             let created_us: i64 = row.get(4).map_err(|e| {
                 StorageError::Internal(anyhow::anyhow!("libsql get created_at: {e}"))
             })?;
@@ -976,15 +978,12 @@ impl SessionStore for LibsqlSessionStore {
             let content_json: String = row
                 .get(2)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
-            let source_str: String = row.get(3).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get source: {e}"))
-            })?;
+            let source_str: String = row
+                .get(3)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get source: {e}")))?;
             let content = serde_json::from_str(&content_json)
                 .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
-            out.push((
-                ordinal,
-                rehydrate_message(&role, content, &source_str)?,
-            ));
+            out.push((ordinal, rehydrate_message(&role, content, &source_str)?));
         }
         Ok(out)
     }
@@ -1027,9 +1026,9 @@ impl SessionStore for LibsqlSessionStore {
             let created_us: i64 = row
                 .get(4)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get created: {e}")))?;
-            let source_str: String = row.get(5).map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!("libsql get source: {e}"))
-            })?;
+            let source_str: String = row
+                .get(5)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get source: {e}")))?;
             let created_at = super::time::from_us(created_us).ok_or_else(|| {
                 StorageError::Internal(anyhow::anyhow!(
                     "session_messages.created_at out of range: {created_us}"
