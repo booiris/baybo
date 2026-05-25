@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use aura_config::{AuraConfig, LlmEntry, RiskCheckConfig, SecurityConfig, WorkspaceConfig};
 use aura_llm::credentials::resolve_api_key;
-use aura_llm::{GuardedLlm, LlmCallGuard, LlmProviderConfig, LlmProviderRegistry};
+use aura_llm::{GuardedLlm, LlmBilling, LlmProviderConfig, LlmProviderRegistry};
 use aura_security::{EncryptionKey, LeakDetector};
 use aura_skills_assessor::AssessmentMode;
 use aura_workspace::WorkspacePaths;
@@ -86,16 +86,17 @@ pub fn resolve_config_path() -> Option<PathBuf> {
 /// only for one-shot tooling (e.g. a `probe` subcommand) that never
 /// sends multimodal content.
 ///
-/// `guard` is the gate the resulting client will run before every
-/// LLM call. Production wiring derives this from `CostManager`; CLI
-/// `aura llm probe` and similar one-shot tools pass an
-/// always-`Ok(())` closure so the probe isn't billed against anyone.
+/// `billing` carries the gate the resulting client runs before every
+/// LLM call and the recorder it runs after. Production wiring derives
+/// this from `CostManager` (`aura_cost::cost_billing`); CLI `aura llm
+/// probe` and similar one-shot tools pass [`LlmBilling::passthrough`] so
+/// the probe isn't gated or billed against anyone.
 pub async fn build_llm_client(
     cfg: &AuraConfig,
     registry: &LlmProviderRegistry,
     blob_store: Option<std::sync::Arc<dyn aura_store::BlobStore>>,
     vault: Option<std::sync::Arc<aura_security::SecretVault>>,
-    guard: LlmCallGuard,
+    billing: LlmBilling,
 ) -> anyhow::Result<std::sync::Arc<GuardedLlm>> {
     let entry = cfg.default_llm_entry().ok_or_else(|| {
         if cfg.llm.is_empty() {
@@ -114,7 +115,7 @@ pub async fn build_llm_client(
             )
         }
     })?;
-    build_llm_client_for_entry(entry, registry, blob_store, vault, guard).await
+    build_llm_client_for_entry(entry, registry, blob_store, vault, billing).await
 }
 
 /// Same wiring as [`build_llm_client`] but pinned to a specific
@@ -126,7 +127,7 @@ pub async fn build_llm_client_for_entry(
     registry: &LlmProviderRegistry,
     blob_store: Option<std::sync::Arc<dyn aura_store::BlobStore>>,
     vault: Option<std::sync::Arc<aura_security::SecretVault>>,
-    guard: LlmCallGuard,
+    billing: LlmBilling,
 ) -> anyhow::Result<std::sync::Arc<GuardedLlm>> {
     let api_key = resolve_api_key(
         entry.name.as_str(),
@@ -152,7 +153,7 @@ pub async fn build_llm_client_for_entry(
                 vault,
             },
             blob_fetcher,
-            guard,
+            billing,
         )
         .map_err(|e| anyhow::anyhow!("failed to build LLM client: {e}"))
 }

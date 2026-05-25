@@ -168,8 +168,14 @@ async fn main() -> anyhow::Result<()> {
         // provider's create() returns a clear error if it's selected
         // without a vault.
         let provider_registry = aura_llm::LlmProviderRegistry::with_default_providers();
-        match boot::build_llm_client(&config, &provider_registry, None, None, Arc::new(|| Ok(())))
-            .await
+        match boot::build_llm_client(
+            &config,
+            &provider_registry,
+            None,
+            None,
+            aura_llm::LlmBilling::passthrough(),
+        )
+        .await
         {
             Ok(c) => Some(c),
             Err(e) => {

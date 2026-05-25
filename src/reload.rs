@@ -17,7 +17,7 @@ use aura_agent::router::LiveRateLimit;
 use aura_agent::service::ShutdownSignal;
 use aura_agent::{LlmClientPool, LlmPoolHandle};
 use aura_config::{AuraConfig, ConfigHandle, hot_reload_diff};
-use aura_cost::{CostManager, SpendingLimits, cost_call_guard};
+use aura_cost::{CostManager, SpendingLimits, cost_billing};
 use aura_gateway::{ConfigReloader, ReloadError, ReloadOutcome};
 use aura_llm::{GuardedLlm, LlmProviderRegistry, ModelPricing};
 use aura_model::LlmEntryName;
@@ -44,10 +44,10 @@ pub(crate) async fn build_pool_clients(
     let results = futures::future::join_all(config.llm.iter().map(|entry| {
         let blob = blob.clone();
         let vault = Arc::clone(&vault);
-        let guard = cost_call_guard(cost_manager);
+        let billing = cost_billing(cost_manager);
         async move {
             let r =
-                boot::build_llm_client_for_entry(entry, registry, Some(blob), Some(vault), guard)
+                boot::build_llm_client_for_entry(entry, registry, Some(blob), Some(vault), billing)
                     .await;
             (entry.name.clone(), r)
         }

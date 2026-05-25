@@ -9,7 +9,7 @@ use crate::providers::{
     gemini::GeminiProviderFactory, minimax::MiniMaxProviderFactory, openai::OpenAIProviderFactory,
     openai_subscription::OpenAiSubscriptionProviderFactory,
 };
-use crate::{BlobFetcher, GuardedLlm, LlmCallGuard, LlmClient, LlmCompletion};
+use crate::{BlobFetcher, GuardedLlm, LlmBilling, LlmClient, LlmCompletion};
 
 /// Configuration for creating an LLM provider client.
 #[derive(Clone, Serialize, Deserialize)]
@@ -227,23 +227,22 @@ impl LlmProviderRegistry {
     /// LlmCompletion>` at a public boundary.
     ///
     /// `blob_fetcher` is optional; passing `None` is correct for
-    /// text-only deployments and one-shot probes. `guard` is supplied
-    /// by the caller — production wires `aura_agent::CostManager`'s
-    /// guard, while CLI / test fixtures pass
-    /// `Arc::new(|| Ok(()))` (or use [`GuardedLlm::passthrough`] /
-    /// [`crate::guard::LlmCallGuard`] directly).
+    /// text-only deployments and one-shot probes. `billing` carries the
+    /// pre-call guard and post-call cost recorder — production wires
+    /// `aura_cost::cost_billing`, while CLI / test fixtures pass
+    /// [`LlmBilling::passthrough`].
     pub fn create_client(
         &self,
         config: &LlmProviderConfig,
         blob_fetcher: Option<Arc<dyn BlobFetcher>>,
-        guard: LlmCallGuard,
+        billing: LlmBilling,
     ) -> crate::Result<Arc<GuardedLlm>> {
         let mut client = self.build_client(config)?;
         if let Some(fetcher) = blob_fetcher {
             client = client.with_blob_fetcher(fetcher);
         }
         let inner: Arc<dyn LlmCompletion> = Arc::new(client);
-        Ok(GuardedLlm::new(inner, guard))
+        Ok(GuardedLlm::new(inner, billing))
     }
 
     /// Internal raw-client construction. Kept `pub(crate)` because

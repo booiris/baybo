@@ -1,36 +1,313 @@
-//! In-flow LLM call abstraction with built-in cost accounting.
+//! Billing primitives: the [`Attribution`] a call is billed to, the cost
+//! hooks ([`LlmBilling`]) every [`GuardedLlm`] runs, and
+//! [`BoundBilledChat`] — the bound handle that performs
+//! gate → call → record, so a successful return guarantees the spend was
+//! accounted (or explicitly waived via a no-op recorder).
 //!
-//! [`GuardedLlm`](crate::guard::GuardedLlm) only runs the pre-call admission
-//! closure; recording the spend after a successful response is the
-//! caller's responsibility. [`BilledChat`] codifies the next step up:
-//! one `chat()` performs the full sequence (guard → sanitize → record
-//! cost), so a successful return guarantees the spend already landed
-//! in the budget ledger. Implementations live downstream (in
-//! `aura-agent`, where the budget ledger and security gateway are
-//! known); this crate only owns the trait so any caller that holds an
-//! `Arc<dyn BilledChat>` can make a billed call without knowing about
-//! agent-layer types.
+//! `aura-llm` never names `CostManager`: the recorder is an opaque
+//! closure the cost layer injects (mirroring the admission guard), so the
+//! `aura-cost → aura-llm` dependency stays one-directional. Response
+//! *sanitization* is intentionally not part of this layer — the billing
+//! chokepoint records raw spend; scrubbing the response for display is a
+//! separate, caller-side step (`aura-agent`, where the gateway lives).
+
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use aura_model::MicroUsd;
+use aura_model::{JobId, MicroUsd, SessionId, SpanId};
+use futures::stream::{Stream, StreamExt};
 
-use crate::{ChatRequest, LlmResponse, ModelInfo};
+use crate::guard::{GuardedLlm, LlmCallGuard};
+use crate::{ChatRequest, LlmResponse, LlmStream, ModelInfo, StreamEvent, TokenUsage};
 
-/// Result returned by [`BilledChat::chat`]: the provider response paired
-/// with the billed cost in micro-USD. `cost_micros == 0` is normal for
-/// models the [`MicroUsd`] pricing table hasn't yet learned.
+/// Reserved `user_id` for spend no end user triggered — background safety
+/// checks, maintenance probes, other platform overhead. Pairs with a
+/// `session_id` of `system:<component>` (see [`Attribution::system`]) so a
+/// single filter surfaces all system-initiated spend in `cost_records`.
+pub const SYSTEM_USER_ID: &str = "system";
+
+/// Who an LLM call is billed to. Threaded into [`GuardedLlm::bind`] and
+/// handed to the cost recorder on every call.
+#[derive(Debug, Clone)]
+pub struct Attribution {
+    pub user_id: String,
+    pub session_id: SessionId,
+    pub job_id: JobId,
+    pub span_id: SpanId,
+}
+
+impl Attribution {
+    /// Attribution for platform-internal spend that no end user
+    /// triggered. `component` names the subsystem (e.g.
+    /// `"skill-assessor"`) and becomes the `session_id` suffix so its
+    /// spend stays independently filterable. A fresh job/span is minted
+    /// per call — callers that bind once at startup get one stable pair
+    /// for the process lifetime, which is the intended grouping.
+    pub fn system(component: &str) -> Self {
+        Self {
+            user_id: SYSTEM_USER_ID.to_string(),
+            session_id: SessionId::new(format!("system:{component}")),
+            job_id: JobId::new(),
+            span_id: SpanId::new(),
+        }
+    }
+}
+
+/// Post-call cost recorder: invoked after a provider response with the
+/// call's attribution, model id, and token usage; returns the billed
+/// amount. Opaque so `aura-llm` needn't depend on `aura-cost` — the cost
+/// layer injects a closure capturing its `CostManager`.
+pub type LlmCostRecorder = Arc<dyn Fn(&Attribution, &str, &TokenUsage) -> MicroUsd + Send + Sync>;
+
+/// The two cost hooks every [`GuardedLlm`] runs: an admission `guard`
+/// before the provider call and a `record` after it. Bundled because both
+/// derive from the same `CostManager` and must be wired together — a
+/// client that gates spend but never records it is exactly the bug this
+/// pairing makes unrepresentable.
+#[derive(Clone)]
+pub struct LlmBilling {
+    pub guard: LlmCallGuard,
+    pub record: LlmCostRecorder,
+}
+
+impl LlmBilling {
+    /// Real guard, no-op recorder. For the rare context that must gate
+    /// spend but has no ledger to record into, and for tests that only
+    /// exercise the gate.
+    pub fn unrecorded(guard: LlmCallGuard) -> Self {
+        Self {
+            guard,
+            record: Arc::new(|_, _, _| MicroUsd::ZERO),
+        }
+    }
+
+    /// Admit every call, record nothing. The deliberate escape hatch for
+    /// argv one-shots and tests with no `CostManager` — the only place an
+    /// unbilled provider call is intentional. Grep for it.
+    pub fn passthrough() -> Self {
+        Self::unrecorded(Arc::new(|| Ok(())))
+    }
+}
+
+/// Result returned by a billed call: the provider response paired with the
+/// billed cost in micro-USD. `cost_micros == 0` is normal for models the
+/// pricing table hasn't learned, and for the no-op recorder.
 #[derive(Debug, Clone)]
 pub struct BilledChatResponse {
     pub response: LlmResponse,
     pub cost_micros: MicroUsd,
 }
 
-/// In-flow LLM call with built-in cost accounting. Errors are
-/// returned as a sanitized string — the implementation's security
-/// gateway has already scrubbed any leaked secrets from the provider
-/// message.
+/// In-flow LLM call with built-in cost accounting. Errors are returned as
+/// a sanitized string — implementations scrub leaked secrets before
+/// surfacing the provider message. Implemented downstream (in
+/// `aura-agent`, where the security gateway lives); this crate owns the
+/// trait so any holder of `Arc<dyn BilledChat>` can make a billed call
+/// without agent-layer types.
 #[async_trait]
 pub trait BilledChat: Send + Sync {
     fn model_info(&self) -> &ModelInfo;
     async fn chat(&self, request: &ChatRequest) -> Result<BilledChatResponse, String>;
+}
+
+/// A [`GuardedLlm`] bound to a fixed [`Attribution`]. The sole way to
+/// reach a provider with recording attached: every `chat` / `chat_stream`
+/// runs gate → call → record. Returns the *raw* provider response —
+/// response sanitization is a separate, caller-side concern.
+pub struct BoundBilledChat {
+    llm: Arc<GuardedLlm>,
+    attribution: Attribution,
+}
+
+impl BoundBilledChat {
+    pub(crate) fn new(llm: Arc<GuardedLlm>, attribution: Attribution) -> Self {
+        Self { llm, attribution }
+    }
+
+    pub fn model_info(&self) -> &ModelInfo {
+        self.llm.model_info()
+    }
+
+    pub fn attribution(&self) -> &Attribution {
+        &self.attribution
+    }
+
+    /// Gate → call → record. A successful return means the recorder ran (a
+    /// `cost_records` row was written, or the no-op recorder waived it). A
+    /// provider error short-circuits before recording — a call that
+    /// produced no usage has nothing to bill.
+    pub async fn chat(&self, request: &ChatRequest) -> crate::Result<BilledChatResponse> {
+        let response = self.llm.chat(request).await?;
+        let cost_micros =
+            self.llm
+                .record(&self.attribution, &self.llm.model_info().id, &response.usage);
+        Ok(BilledChatResponse {
+            response,
+            cost_micros,
+        })
+    }
+
+    /// Streaming variant. The returned stream records cost when it ends or
+    /// is dropped, billing the last-observed `Usage` event (zero on an
+    /// early drop). This preserves partial-spend-on-error: tokens streamed
+    /// before a mid-stream failure are still billed.
+    pub async fn chat_stream(&self, request: &ChatRequest) -> crate::Result<LlmStream> {
+        let inner = self.llm.chat_stream(request).await?;
+        Ok(LlmStream::from_stream(RecordingStream {
+            inner,
+            llm: Arc::clone(&self.llm),
+            attribution: self.attribution.clone(),
+            last_usage: TokenUsage::default(),
+            recorded: false,
+        }))
+    }
+}
+
+/// Wraps an [`LlmStream`] so the bound attribution is billed exactly
+/// once — on the terminal `None` if the consumer drains it, or on `Drop`
+/// if it bails early. Records the last `Usage` event observed.
+struct RecordingStream {
+    inner: LlmStream,
+    llm: Arc<GuardedLlm>,
+    attribution: Attribution,
+    last_usage: TokenUsage,
+    recorded: bool,
+}
+
+impl RecordingStream {
+    fn record_once(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        let model_id = self.llm.model_info().id.clone();
+        self.llm
+            .record(&self.attribution, &model_id, &self.last_usage);
+    }
+}
+
+impl Stream for RecordingStream {
+    type Item = crate::Result<StreamEvent>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(StreamEvent::Usage(usage)))) => {
+                this.last_usage = usage;
+                Poll::Ready(Some(Ok(StreamEvent::Usage(usage))))
+            }
+            Poll::Ready(None) => {
+                this.record_once();
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+}
+
+impl Drop for RecordingStream {
+    fn drop(&mut self) {
+        self.record_once();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::LlmCompletion;
+    use crate::test_support::StubLlm;
+    use parking_lot::Mutex;
+
+    /// Records every recorder invocation so a test can assert the bound
+    /// attribution + usage that landed in the ledger.
+    #[derive(Default)]
+    struct RecorderProbe {
+        calls: Mutex<Vec<(String, String, TokenUsage)>>,
+    }
+
+    fn billing_with_probe(probe: Arc<RecorderProbe>) -> LlmBilling {
+        LlmBilling {
+            guard: Arc::new(|| Ok(())),
+            record: Arc::new(move |attr, model_id, usage| {
+                probe.calls.lock().push((
+                    attr.session_id.as_str().to_string(),
+                    model_id.to_string(),
+                    *usage,
+                ));
+                MicroUsd::ZERO
+            }),
+        }
+    }
+
+    fn usage(input: usize, output: usize) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }
+    }
+
+    fn empty_request() -> ChatRequest {
+        ChatRequest {
+            messages: vec![],
+            temperature: None,
+            tools: vec![],
+        }
+    }
+
+    #[test]
+    fn system_attribution_uses_reserved_identity() {
+        let attr = Attribution::system("skill-assessor");
+        assert_eq!(attr.user_id, SYSTEM_USER_ID);
+        assert_eq!(attr.session_id.as_str(), "system:skill-assessor");
+    }
+
+    #[tokio::test]
+    async fn chat_records_response_usage() {
+        let probe = Arc::new(RecorderProbe::default());
+        let stub = Arc::new(StubLlm::new());
+        stub.push_response(LlmResponse {
+            content: "ok".into(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: usage(12, 34),
+            thinking: None,
+        });
+        let guarded =
+            GuardedLlm::new(stub as Arc<dyn LlmCompletion>, billing_with_probe(probe.clone()));
+        let bound = guarded.bind(Attribution::system("unit-test"));
+
+        bound.chat(&empty_request()).await.expect("chat ok");
+
+        let calls = probe.calls.lock();
+        assert_eq!(calls.len(), 1, "exactly one record per chat");
+        assert_eq!(calls[0].0, "system:unit-test");
+        assert_eq!(calls[0].2.input_tokens, 12);
+        assert_eq!(calls[0].2.output_tokens, 34);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_records_terminal_usage_once() {
+        let probe = Arc::new(RecorderProbe::default());
+        let stub = Arc::new(StubLlm::new());
+        stub.push_stream(vec![
+            StreamEvent::Text("hi".into()),
+            StreamEvent::Usage(usage(7, 9)),
+        ]);
+        let guarded =
+            GuardedLlm::new(stub as Arc<dyn LlmCompletion>, billing_with_probe(probe.clone()));
+        let bound = guarded.bind(Attribution::system("stream-test"));
+
+        let mut stream = bound.chat_stream(&empty_request()).await.expect("stream ok");
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let calls = probe.calls.lock();
+        assert_eq!(calls.len(), 1, "drained stream records exactly once");
+        assert_eq!(calls[0].2.input_tokens, 7);
+        assert_eq!(calls[0].2.output_tokens, 9);
+    }
 }

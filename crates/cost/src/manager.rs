@@ -481,6 +481,40 @@ pub fn cost_call_guard(manager: &Arc<CostManager>) -> aura_llm::LlmCallGuard {
     })
 }
 
+/// Bundle the admission guard and cost recorder for a `CostManager` into
+/// the [`LlmBilling`](aura_llm::LlmBilling) every `GuardedLlm` is built
+/// with. This is the production wiring; argv one-shots and tests use
+/// [`LlmBilling::passthrough`](aura_llm::LlmBilling::passthrough).
+pub fn cost_billing(manager: &Arc<CostManager>) -> aura_llm::LlmBilling {
+    aura_llm::LlmBilling {
+        guard: cost_call_guard(manager),
+        record: cost_record_closure(manager),
+    }
+}
+
+/// Bridge `CostManager::record_call` to the
+/// [`LlmCostRecorder`](aura_llm::LlmCostRecorder) closure shape. Lives
+/// here, alongside [`cost_call_guard`], so `aura-llm` needn't know the
+/// manager's `record_call` signature.
+fn cost_record_closure(manager: &Arc<CostManager>) -> aura_llm::LlmCostRecorder {
+    let cm = Arc::clone(manager);
+    Arc::new(
+        move |attr: &aura_llm::Attribution, model_id: &str, usage: &aura_llm::TokenUsage| {
+            cm.record_call(
+                &attr.user_id,
+                attr.session_id.clone(),
+                attr.job_id,
+                attr.span_id,
+                model_id,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_input_tokens,
+                usage.cache_creation_input_tokens,
+            )
+        },
+    )
+}
+
 fn utc_day_start(now: chrono::DateTime<Utc>) -> Option<chrono::DateTime<Utc>> {
     now.date_naive()
         .and_hms_opt(0, 0, 0)
