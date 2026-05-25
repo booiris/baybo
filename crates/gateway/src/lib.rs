@@ -25,6 +25,7 @@ pub mod config;
 pub mod error;
 pub mod installer;
 pub mod log_buffer;
+pub mod reload;
 pub mod server;
 pub mod sidecar;
 pub mod spawn;
@@ -43,6 +44,7 @@ pub use crate::installer::{
     InstallContext, InstallerError, ServiceInstaller, ServiceStatus, for_current_platform,
 };
 pub use crate::log_buffer::{LogBuffer, LogBufferLayer, LogLevel, LogPage, LogQuery, LogRecord};
+pub use crate::reload::{ConfigReloader, ReloadError, ReloadOutcome};
 pub use crate::server::{GatewayDeps, GatewayServer};
 pub use crate::sidecar::{
     BUN_BINARY_ENV, NODE_BINARY_ENV, SidecarError, SidecarRuntime, SidecarSupervisor,

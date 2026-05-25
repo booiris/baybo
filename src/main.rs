@@ -1,5 +1,6 @@
 mod boot;
 mod gateway_cmd;
+mod reload;
 mod runtime;
 mod setup_cmd;
 mod singleton;

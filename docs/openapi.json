@@ -551,7 +551,7 @@
         },
         "responses": {
           "200": {
-            "description": "Config updated on disk. Gateway restart required to pick up.",
+            "description": "Config written to disk and applied in-process; `requires_restart` is true only when a non-hot field changed.",
             "content": {
               "application/json": {
                 "schema": {
@@ -609,7 +609,7 @@
         },
         "responses": {
           "200": {
-            "description": "Config entry removed on disk. Gateway restart required to pick up.",
+            "description": "Config entry removed on disk and applied in-process; `requires_restart` is true only when a non-hot field changed.",
             "content": {
               "application/json": {
                 "schema": {
@@ -640,6 +640,46 @@
           },
           "500": {
             "description": "Write failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/config/reload": {
+      "post": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "reload_config",
+        "responses": {
+          "200": {
+            "description": "Config re-read; hot-updatable changes applied in-process",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReloadOutcome"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Reload rejected — a non-hot field changed, the config is invalid, or the default model is unbuildable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
             "content": {
               "application/json": {
                 "schema": {
@@ -1275,7 +1315,7 @@
         },
         "responses": {
           "200": {
-            "description": "`default-llm` updated on disk. Gateway restart required to pick up.",
+            "description": "`default-llm` updated and hot-reloaded in-process (no restart needed).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1376,7 +1416,7 @@
         },
         "responses": {
           "200": {
-            "description": "Entry updated on disk. Gateway restart required to pick up.",
+            "description": "Entry updated and hot-reloaded in-process (no restart needed).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3472,6 +3512,40 @@
           },
           "written_to": {
             "type": "string"
+          }
+        }
+      },
+      "ReloadOutcome": {
+        "type": "object",
+        "description": "Outcome of a successful reload, surfaced to the operator (HTTP\nresponse + logs).",
+        "required": [
+          "active_model",
+          "default_entry",
+          "entries",
+          "dropped"
+        ],
+        "properties": {
+          "active_model": {
+            "type": "string",
+            "description": "Model id of the (possibly new) default entry now serving turns."
+          },
+          "default_entry": {
+            "type": "string",
+            "description": "`default-llm` entry name after the reload."
+          },
+          "dropped": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Non-default entries that failed to build and were dropped with a\nwarning (mirrors boot's failure policy)."
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "All entry names present in the rebuilt pool."
           }
         }
       },

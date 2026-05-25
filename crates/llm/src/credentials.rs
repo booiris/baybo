@@ -109,4 +109,31 @@ mod tests {
         .await;
         assert_eq!(resolved.as_deref(), Some("explicit-env-value"));
     }
+
+    /// Credential rotation: overwriting an entry's vault key is reflected
+    /// by the next `resolve_api_key`. This is the property a config
+    /// reload's pool rebuild depends on — the rebuild re-resolves from the
+    /// vault every time and never caches, so `reload` (which always
+    /// rebuilds) and the `aura llm edit --api-key` → SIGHUP path both pick
+    /// up a rotated key on the next reload. The vault key beats the
+    /// provider-default env var, so this holds regardless of ambient
+    /// `OPENAI_API_KEY`.
+    #[tokio::test]
+    async fn resolve_reflects_a_rotated_vault_key() {
+        let v = vault();
+        let key_name = vault_api_key_name("rotato");
+
+        v.store_secret(&key_name, b"old-secret").await.unwrap();
+        let before = resolve_api_key("rotato", "openai", None, Some(v.as_ref())).await;
+        assert_eq!(before.as_deref(), Some("old-secret"));
+
+        // Rotate the key in place.
+        v.store_secret(&key_name, b"new-secret").await.unwrap();
+        let after = resolve_api_key("rotato", "openai", None, Some(v.as_ref())).await;
+        assert_eq!(
+            after.as_deref(),
+            Some("new-secret"),
+            "a vault rotation must be visible to the next resolve (a reload's rebuild re-resolves)"
+        );
+    }
 }

@@ -20,6 +20,11 @@ pub enum ConfigError {
 
     #[error("failed to write config file '{path}': {reason}")]
     FileWrite { path: String, reason: String },
+
+    #[error(
+        "config section '{section}' is not hot-updatable; that change requires a gateway restart"
+    )]
+    NotHotReloadable { section: String },
 }
 
 /// A single validation failure, identifying the offending field and the reason.

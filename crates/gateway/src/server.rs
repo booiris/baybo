@@ -30,11 +30,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use aura_agent::LlmPoolHandle;
 use aura_agent::{CronScheduler, SessionManager, service::ShutdownSignal};
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
 use aura_job::JobLifecycle;
-use aura_llm::GuardedLlm;
+
+use crate::reload::ConfigReloader;
 use aura_memory::MemoryManager;
 use aura_security::SecretVault;
 use aura_skills::SkillRegistry;
@@ -79,7 +81,10 @@ pub struct GatewayDeps {
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
     pub channel_registry: Arc<ChannelRegistry>,
-    pub llm_client: Arc<GuardedLlm>,
+    pub llm_pool: LlmPoolHandle,
+    /// Triggers an in-process config hot-reload; held so admin endpoints
+    /// and the SIGHUP handler can call it. See docs/config-hot-reload.md.
+    pub config_reloader: Arc<dyn ConfigReloader>,
     /// Bearer token for the admin TCP listener. Stored in the vault as
     /// `gateway.admin_token`.
     pub admin_token: String,
@@ -143,7 +148,8 @@ pub struct AdminState {
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
     pub channel_registry: Arc<ChannelRegistry>,
-    pub llm_client: Arc<GuardedLlm>,
+    pub llm_pool: LlmPoolHandle,
+    pub config_reloader: Arc<dyn ConfigReloader>,
     pub log_buffer: Arc<LogBuffer>,
     pub channel_bot_store: Arc<dyn ChannelBotStore>,
     pub channel_control: Arc<crate::channel::ChannelControlRegistry>,
@@ -201,7 +207,8 @@ impl AdminState {
             skill_registry: Arc::clone(&deps.skill_registry),
             tool_registry: Arc::clone(&deps.tool_registry),
             channel_registry: Arc::clone(&deps.channel_registry),
-            llm_client: Arc::clone(&deps.llm_client),
+            llm_pool: Arc::clone(&deps.llm_pool),
+            config_reloader: Arc::clone(&deps.config_reloader),
             log_buffer: Arc::clone(&deps.log_buffer),
             channel_bot_store: Arc::clone(&deps.stores.channel_bot),
             channel_control: Arc::clone(&deps.channel_control),

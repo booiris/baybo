@@ -33,7 +33,7 @@ use aura_config::{AuraConfig, LlmEntryName};
 use aura_context::{
     ContextManager, ContextManagerConfig, SessionLlmLogger, TiktokenTokenizer, Tokenizer,
 };
-use aura_cost::{CostManager, SpendingLimits, cost_call_guard};
+use aura_cost::{CostManager, SpendingLimits};
 use aura_job::JobLifecycle;
 use aura_llm::GuardedLlm;
 use aura_memory::MemoryManager;
@@ -147,13 +147,22 @@ pub struct ManagerGraph {
     /// `llm_client` is `pool.default_client()`. The pool exists so the
     /// actor spawner can resolve a per-session pick from
     /// `Session.state.last_llm`.
-    pub llm_pool: Arc<aura_agent::LlmClientPool>,
+    pub llm_pool: aura_agent::LlmPoolHandle,
     /// Owner of cost-record persistence and the budget gate used by
     /// `llm_client` above. Kept on the graph so `wire_router` can
     /// hand it to `AgentLoop` without reconstructing — and so the
     /// gate built into `llm_client` and the records the agent loop
     /// writes are guaranteed to come from the same instance.
     pub cost_manager: Arc<CostManager>,
+    /// Live rate-limit knobs shared between the router's `RateLimiter`
+    /// and the config-reload `CostReloader`. Created in
+    /// [`build_managers`] so both the router wiring and the reloader
+    /// hold the same `Arc`.
+    pub rate_limit: Arc<aura_agent::router::LiveRateLimit>,
+    /// Config hot-reload orchestrator. Handed to `GatewayDeps` so admin
+    /// endpoints + the SIGHUP handler can trigger a reload; owns the
+    /// pricing-refresh loop. See `docs/config-hot-reload.md`.
+    pub config_reloader: Arc<dyn aura_gateway::ConfigReloader>,
     pub workspace: Arc<WorkspaceManager>,
     pub channels_registry: Arc<ChannelRegistry>,
     pub secret_vault: Arc<SecretVault>,
@@ -204,6 +213,9 @@ pub struct ManagerGraph {
 /// inside [`ManagerGraph`].
 pub async fn build_managers(
     config: Arc<AuraConfig>,
+    // On-disk config path, threaded into the hot-reload orchestrator so
+    // it knows what to re-read. `None` disables reload (no file to read).
+    config_path: Option<std::path::PathBuf>,
     shutdown: ShutdownSignal,
     leak_detector: Arc<LeakDetector>,
     // Pre-assembled embedded MCP server entries the reconciler should
@@ -303,105 +315,42 @@ pub async fn build_managers(
     );
     cost_manager.hydrate().await;
 
-    // Refresh pricing for every configured entry (not just default —
-    // subagents and side-LLM consumers pin specific names; missing
-    // one widens the global budget since `cost_records` is keyed by
-    // model id). Spawned so boot doesn't await the network.
-    let configured_for_refresh: Vec<(String, String)> = config
-        .llm
-        .iter()
-        .map(|e| (e.provider.clone(), e.model.clone()))
-        .collect();
-    if !configured_for_refresh.is_empty() {
-        let cm_for_refresh = Arc::clone(&cost_manager);
-        let refresh_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            let entries: Vec<(&str, &str)> = configured_for_refresh
-                .iter()
-                .map(|(p, m)| (p.as_str(), m.as_str()))
-                .collect();
-            loop {
-                let overlay = aura_llm::openrouter::fetch_overlay_for(&entries).await;
-                let pricings = overlay
-                    .into_iter()
-                    .map(|(model, (pricing, _caps))| (model, pricing))
-                    .collect();
-                cm_for_refresh.merge_pricings(pricings);
-                tokio::select! {
-                    _ = tokio::time::sleep(aura_llm::openrouter::REFRESH_INTERVAL) => {}
-                    _ = refresh_shutdown.wait() => break,
-                }
-            }
-        });
-    }
+    // Live rate-limit knobs, shared between the router and the
+    // config-reload `CostReloader` so `cost.rate_limit` edits apply
+    // without rebuilding the router.
+    let rate_limit = aura_agent::router::LiveRateLimit::new(
+        config.cost.rate_limit.max_requests,
+        std::time::Duration::from_secs(config.cost.rate_limit.window_secs),
+    );
 
-    // One `Arc<GuardedLlm>` per `cfg.llm[*]` entry, built concurrently.
-    // Entries that fail to build are absent from the pool; the default
-    // entry failing is a hard error.
-    let entry_results = futures::future::join_all(config.llm.iter().map(|entry| {
-        let provider_registry = &provider_registry;
-        let blob = stores.blob.clone();
-        let vault = Arc::clone(&secret_vault);
-        let cost_guard = cost_call_guard(&cost_manager);
-        async move {
-            let result = boot::build_llm_client_for_entry(
-                entry,
-                provider_registry,
-                Some(blob),
-                Some(vault),
-                cost_guard,
-            )
-            .await;
-            (entry.name.clone(), result)
-        }
-    }))
-    .await;
-    let mut pool_clients: std::collections::HashMap<LlmEntryName, Arc<aura_llm::GuardedLlm>> =
-        std::collections::HashMap::new();
-    for (name, result) in entry_results {
-        match result {
-            Ok(client) => {
-                pool_clients.insert(name, client);
-            }
-            Err(e) => {
-                if name == config.default_llm {
-                    return Err(e);
-                }
-                tracing::warn!(
-                    entry = %name,
-                    error = %e,
-                    "failed to build LLM client for entry; the entry is unavailable until the issue is resolved"
-                );
-            }
-        }
-    }
-    // Prime the budget gate offline from each built client's own pricing
-    // (set in the factory's `create()` from the snapshot via
-    // `pricing_for_model`), keyed by `model_info.id` == `config.model` to
-    // match the cost lookup. The async refresh below overlays live prices.
-    cost_manager.merge_pricings(
-        pool_clients
-            .values()
-            .map(|c| {
-                let info = c.model_info();
-                (info.id.clone(), info.pricing)
-            })
-            .collect(),
-    );
-    let llm_pool = Arc::new(
-        aura_agent::LlmClientPool::with_tier_map(
-            pool_clients,
-            config.default_llm.clone(),
-            config.agent.model_tiers.clone(),
-        )
-        .map_err(|e| anyhow::anyhow!("build LLM client pool: {e}"))?,
-    );
-    let llm_client = llm_pool.default_client();
+    // Build one client per `config.llm` entry (default failure aborts
+    // boot; non-default failures drop with a warn). Shared with the
+    // hot-reload path — see `crate::reload::build_pool_clients`.
+    let (pool_clients, _dropped) = crate::reload::build_pool_clients(
+        &config,
+        &provider_registry,
+        stores.blob.clone(),
+        Arc::clone(&secret_vault),
+        &cost_manager,
+    )
+    .await?;
+    // Prime the budget gate offline from each built client's own
+    // (snapshot-derived) pricing, keyed by `model_info.id` to match the
+    // cost lookup. The refresh loop (owned by the reloader below)
+    // overlays live prices.
+    cost_manager.merge_pricings(crate::reload::pricing_overlay(&pool_clients));
+    let pool = aura_agent::LlmClientPool::with_tier_map(
+        pool_clients,
+        config.default_llm.clone(),
+        config.agent.model_tiers.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("build LLM client pool: {e}"))?;
+    let llm_client = pool.default_client();
     let info = llm_client.model_info();
     info!(
         provider = %info.provider,
         model = %info.id,
-        pool_entries = %llm_pool
+        pool_entries = %pool
             .entry_names()
             .iter()
             .map(LlmEntryName::as_str)
@@ -410,6 +359,31 @@ pub async fn build_managers(
         supports_vision = info.supports_vision,
         "configured LLM client pool"
     );
+    // Wrapped in a swap handle so a config reload can atomically replace
+    // the whole pool; in-flight turns keep the `Arc` they already cloned.
+    let llm_pool: aura_agent::LlmPoolHandle = Arc::new(parking_lot::RwLock::new(Arc::new(pool)));
+
+    // Hot-reload orchestrator. The `LlmReloader` owns the pricing-refresh
+    // loop from here on (it spawns the initial one), so a reload can
+    // cancel + respawn it against the new model set.
+    let config_reloader: Arc<dyn aura_gateway::ConfigReloader> = {
+        let llm_reloader = crate::reload::LlmReloader::new(
+            Arc::clone(&llm_pool),
+            Arc::clone(&cost_manager),
+            stores.blob.clone(),
+            Arc::clone(&secret_vault),
+            shutdown.clone(),
+            crate::reload::refresh_pairs(&config),
+        );
+        let cost_reloader =
+            crate::reload::CostReloader::new(Arc::clone(&cost_manager), Arc::clone(&rate_limit));
+        Arc::new(crate::reload::RuntimeConfigReloader::new(
+            config_path,
+            aura_config::ConfigHandle::new(Arc::clone(&config)),
+            llm_reloader,
+            cost_reloader,
+        ))
+    };
 
     let mut tool_registry = ToolRegistry::with_defaults(
         stores.blob.clone(),
@@ -663,6 +637,8 @@ pub async fn build_managers(
         llm_client,
         llm_pool,
         cost_manager,
+        rate_limit,
+        config_reloader,
         workspace,
         channels_registry,
         secret_vault,
@@ -830,8 +806,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         )
     };
 
-    let rate_limit_cfg = &graph.config.cost.rate_limit;
-
     // `take` cron + system rxs eagerly — a caller who forgot to plumb
     // either would silently drop every cron-fired turn / maintenance
     // trigger. Calling `wire_router` twice panics here loudly rather
@@ -882,8 +856,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         cron_trigger_rx,
         system_trigger_rx,
         actor_parent_token: graph.actor_parent_token.clone(),
-        rate_limit_max_requests: rate_limit_cfg.max_requests,
-        rate_limit_window: std::time::Duration::from_secs(rate_limit_cfg.window_secs),
+        rate_limit: Arc::clone(&graph.rate_limit),
         external_agents: Arc::new(external_agents),
         workspace_paths: workspace_paths_for_router,
     });

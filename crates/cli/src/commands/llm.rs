@@ -22,12 +22,11 @@ use crate::context::CommandContext;
 use crate::error::{CliError, Result};
 use crate::format::CommandOutput;
 
-/// Hint appended to every config-mutating output. The runtime
-/// (`aura gateway start`) loads aura.json once at boot and holds the
-/// snapshot for the process lifetime — there is no file watcher, so
-/// any LLM change only takes effect on next restart.
-const RESTART_HINT: &str =
-    "\n(note: a running `aura gateway` keeps the old config; restart it to pick up)";
+/// Fallback note for config-mutating commands when no running gateway
+/// was signalled to hot-reload (none running, or the workspace lock
+/// could not be inspected). [`notify_running_gateway`] returns a
+/// "signalled pid N" message instead when it does signal one.
+const RESTART_HINT: &str = "\n(start or restart `aura gateway` to apply this change)";
 
 pub async fn handle(ctx: &CommandContext, cmd: LlmCmd) -> Result<CommandOutput> {
     match cmd {
@@ -254,7 +253,7 @@ async fn add(ctx: &CommandContext) -> Result<CommandOutput> {
     if became_default {
         human.push_str(&format!("\ndefault-llm = {}", entry.name));
     }
-    human.push_str(RESTART_HINT);
+    human.push_str(&notify_running_gateway(ctx));
     Ok(CommandOutput {
         human,
         data: Some(json!({
@@ -263,7 +262,7 @@ async fn add(ctx: &CommandContext) -> Result<CommandOutput> {
             "model": entry.model,
             "is_default": became_default,
             "written_to": target.display().to_string(),
-            "requires_restart": true,
+            "requires_restart": false,
         })),
     })
 }
@@ -465,7 +464,7 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
         working.name,
         changed.join(", "),
         target.display(),
-        RESTART_HINT,
+        notify_running_gateway(ctx),
     );
     Ok(CommandOutput {
         human,
@@ -473,7 +472,7 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
             "name": working.name,
             "changed": changed,
             "written_to": target.display().to_string(),
-            "requires_restart": true,
+            "requires_restart": false,
         })),
     })
 }
@@ -563,7 +562,7 @@ async fn remove(ctx: &CommandContext) -> Result<CommandOutput> {
     let human = format!(
         "removed entry {entry_name:?} (provider={provider}); wrote {}{}",
         target.display(),
-        RESTART_HINT,
+        notify_running_gateway(ctx),
     );
     Ok(CommandOutput {
         human,
@@ -572,7 +571,7 @@ async fn remove(ctx: &CommandContext) -> Result<CommandOutput> {
             "provider": provider,
             "subscription_revoked": sub_revoked,
             "written_to": target.display().to_string(),
-            "requires_restart": true,
+            "requires_restart": false,
         })),
     })
 }
@@ -603,12 +602,12 @@ async fn set_default(ctx: &CommandContext) -> Result<CommandOutput> {
             "default-llm = {} (wrote {}){}",
             entry.name,
             target.display(),
-            RESTART_HINT,
+            notify_running_gateway(ctx),
         ),
         data: Some(json!({
             "default": entry.name,
             "written_to": target.display().to_string(),
-            "requires_restart": true,
+            "requires_restart": false,
         })),
     })
 }
@@ -736,6 +735,54 @@ fn resolve_target_path(ctx: &CommandContext) -> Result<PathBuf> {
                 "no config file resolved; set {ENV_CONFIG_PATH} (or pass --config <path>)"
             ))
         })
+}
+
+/// After a config-mutating command writes the file, nudge a running
+/// gateway to hot-reload it. We only SIGHUP when the workspace singleton
+/// lock is *held* by another process: the kernel drops the flock when its
+/// owner exits, so a held lock means a live process owns the workspace,
+/// and the gateway records its own pid in the lock file on startup
+/// (`singleton::acquire`).
+///
+/// The one false-positive is a sibling `aura` CLI that holds the lock for
+/// the microsecond of its own "acquired" branch below. To stop a
+/// concurrent CLI from observing that as `WouldBlock`, reading a *stale*
+/// pid left by an exited gateway, and SIGHUP-ing an unrelated (pid-reused)
+/// process — whose default SIGHUP action is to terminate — the acquired
+/// branch clears the stale pid before releasing. Returns the note to
+/// append to the command's human output.
+fn notify_running_gateway(ctx: &CommandContext) -> String {
+    use std::fs::{OpenOptions, TryLockError};
+
+    let lock_path =
+        aura_workspace::WorkspacePaths::new(ctx.workspace.root.clone()).singleton_lock();
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
+        return RESTART_HINT.to_string();
+    };
+    match file.try_lock() {
+        // Acquired ⇒ no gateway holds the workspace ⇒ nothing to signal.
+        // The recorded pid is now stale; clear it while we hold the lock
+        // so a racing sibling CLI can't read and SIGHUP it. The lock
+        // releases when `file` drops at end of scope.
+        Ok(()) => {
+            let _ = file.set_len(0);
+            RESTART_HINT.to_string()
+        }
+        // Held ⇒ a live aura process owns the workspace; SIGHUP its pid.
+        // The gateway's handler reloads instead of terminating.
+        Err(TryLockError::WouldBlock) => {
+            let pid: Option<i32> = std::fs::read_to_string(&lock_path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok());
+            match pid {
+                Some(pid) if unsafe { libc::kill(pid, libc::SIGHUP) } == 0 => {
+                    format!("\n(signalled running gateway pid {pid} to hot-reload this change)")
+                }
+                _ => RESTART_HINT.to_string(),
+            }
+        }
+        Err(_) => RESTART_HINT.to_string(),
+    }
 }
 
 fn require_tty() -> Result<()> {

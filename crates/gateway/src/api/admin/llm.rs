@@ -51,7 +51,10 @@ pub fn routes() -> OpenApiRouter<AdminState> {
     )
 )]
 async fn get_llm(State(state): State<AdminState>) -> Result<Json<LlmInfo>> {
-    let info = state.llm_client.model_info();
+    // Read-through: resolve the current default from the live pool so
+    // this reflects a config hot-reload, not the boot-time client.
+    let client = state.llm_pool.read().default_client();
+    let info = client.model_info();
     Ok(Json(LlmInfo {
         model_id: info.id.clone(),
         provider: info.provider.clone(),
@@ -89,7 +92,7 @@ async fn list_models(State(state): State<AdminState>) -> Result<Json<LlmModelsRe
     ),
     request_body = UpdateLlmModelRequest,
     responses(
-        (status = 200, description = "Entry updated on disk. Gateway restart required to pick up.", body = MutateResponse),
+        (status = 200, description = "Entry updated and hot-reloaded in-process (no restart needed).", body = MutateResponse),
         (status = 400, description = "Invalid update", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 404, description = "Entry not found", body = ErrorBody),
@@ -146,43 +149,50 @@ async fn update_model(
         entry.pricing = p.map(Into::into);
     }
 
-    // Persist config first; vault write below is a separate concern.
     current
         .validate()
         .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
-    current
-        .write_to_file(target)
-        .await
-        .map_err(|e| GatewayError::Internal(e.to_string()))?;
 
-    // Optional vault update — runs *after* the config write so a failed
-    // serialize doesn't leave a dangling vault secret. Empty string
-    // clears the entry; presence-without-empty stores the literal key.
-    if let Some(api_key) = req.api_key {
-        let key_name = vault_api_key_name(&name);
+    // Stage a rotated API key in the vault *before* the pre-flight build:
+    // every provider requires the key at client construction, so dry-run
+    // (and the rebuild) must resolve the new credential, not the old. Empty
+    // string = clear, a no-op here — there's no per-key delete on this
+    // path, so the prior secret stays until a fresh value is set.
+    if let Some(api_key) = req.api_key.as_deref() {
         if api_key.is_empty() {
-            // delete_secret would be the precise op, but the vault API
-            // only exposes `store_secret`. The setup flow handles
-            // "clear" by simply skipping the write; preserve that
-            // contract here.
             tracing::info!(
                 entry = %name,
-                "api_key clear requested; vault does not expose a delete op, leaving prior secret in place \
-                 (operator can rotate by setting a fresh non-empty value)"
+                "api_key clear requested; this path has no per-key vault delete, leaving the prior \
+                 secret in place (rotate by setting a fresh non-empty value)"
             );
         } else {
             state
                 .secret_vault
-                .store_secret(&key_name, api_key.as_bytes())
+                .store_secret(&vault_api_key_name(&name), api_key.as_bytes())
                 .await
                 .map_err(|e| GatewayError::Internal(format!("vault write failed: {e}")))?;
         }
     }
 
+    // Pre-flight before persisting, so an unbuildable edit is rejected
+    // without dirtying the file (a later SIGHUP would otherwise re-read and
+    // silently drop it). With the new key already staged, this validates
+    // the real post-edit build.
+    state.config_reloader.dry_run(&current).await?;
+    current
+        .write_to_file(target)
+        .await
+        .map_err(|e| GatewayError::Internal(e.to_string()))?;
+
+    // Apply in-process. `reload` always rebuilds the LLM pool, so a vault
+    // key rotation (invisible in the config diff) takes effect too. A
+    // failed rebuild returns 400; the file keeps the edit for the operator.
+    state.config_reloader.reload().await?;
+
     Ok(Json(MutateResponse {
         path: format!("llm[{name}]"),
         written_to: target.display().to_string(),
-        requires_restart: true,
+        requires_restart: false,
     }))
 }
 
@@ -275,7 +285,7 @@ async fn test_model(
     tag = "llm",
     request_body = SetDefaultLlmRequest,
     responses(
-        (status = 200, description = "`default-llm` updated on disk. Gateway restart required to pick up.", body = MutateResponse),
+        (status = 200, description = "`default-llm` updated and hot-reloaded in-process (no restart needed).", body = MutateResponse),
         (status = 400, description = "Name does not match any entry", body = ErrorBody),
         (status = 401, description = "Unauthorized", body = ErrorBody),
         (status = 500, description = "Write failure", body = ErrorBody),
@@ -302,15 +312,19 @@ async fn set_default(
     current
         .validate()
         .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
+    // Pre-flight: reject a default that can't be built before writing it.
+    state.config_reloader.dry_run(&current).await?;
     current
         .write_to_file(target)
         .await
         .map_err(|e| GatewayError::Internal(e.to_string()))?;
 
+    state.config_reloader.reload().await?;
+
     Ok(Json(MutateResponse {
         path: "default-llm".into(),
         written_to: target.display().to_string(),
-        requires_restart: true,
+        requires_restart: false,
     }))
 }
 
@@ -401,7 +415,7 @@ async fn get_usage(
 /// the cached `state.config` snapshot when no `config_path` was set
 /// (dev mode with implicit defaults) — mutation endpoints still gate
 /// on `config_path` separately.
-async fn read_config_for_dashboard(state: &AdminState) -> GatewayResult<AuraConfig> {
+pub(crate) async fn read_config_for_dashboard(state: &AdminState) -> GatewayResult<AuraConfig> {
     match state.config_path.as_ref() {
         Some(path) if path.exists() => AuraConfig::load_from_file(path)
             .await

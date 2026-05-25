@@ -39,6 +39,16 @@ fn auth(req: Request<Body>) -> Request<Body> {
 /// configured admin router and the tempdir / path so callers can
 /// re-read the file after a mutation.
 async fn router_with_seed_config(seed: AuraConfig) -> (axum::Router, TempDir, std::path::PathBuf) {
+    router_with_reloader(seed, None).await
+}
+
+/// As [`router_with_seed_config`], but lets a caller substitute the
+/// `config_reloader` (e.g. one whose `dry_run` rejects) to exercise the
+/// admin endpoints' apply/pre-flight wiring.
+async fn router_with_reloader(
+    seed: AuraConfig,
+    reloader_override: Option<Arc<dyn aura_gateway::reload::ConfigReloader>>,
+) -> (axum::Router, TempDir, std::path::PathBuf) {
     let tg = build_test_deps(SocketAddr::from(([127, 0, 0, 1], 0))).await;
     let cfg_dir = tempfile::tempdir().expect("config tempdir");
     let cfg_path = cfg_dir.path().join("aura.json");
@@ -48,6 +58,7 @@ async fn router_with_seed_config(seed: AuraConfig) -> (axum::Router, TempDir, st
 
     use aura_gateway::auth::admin::{AdminAuthState, require_admin_token};
     let auth_state = AdminAuthState::new(tg.deps.admin_token.clone());
+    let config_reloader = reloader_override.unwrap_or_else(|| tg.deps.config_reloader.clone());
     let state = aura_gateway::server::AdminState {
         config: Arc::new(seed),
         config_path: Some(cfg_path.clone()),
@@ -66,7 +77,8 @@ async fn router_with_seed_config(seed: AuraConfig) -> (axum::Router, TempDir, st
         skill_registry: Arc::clone(&tg.deps.skill_registry),
         tool_registry: Arc::clone(&tg.deps.tool_registry),
         channel_registry: Arc::clone(&tg.deps.channel_registry),
-        llm_client: tg.deps.llm_client.clone(),
+        llm_pool: tg.deps.llm_pool.clone(),
+        config_reloader,
         log_buffer: Arc::clone(&tg.deps.log_buffer),
         channel_bot_store: tg.deps.stores.channel_bot.clone(),
         channel_control: Arc::clone(&tg.deps.channel_control),
@@ -184,7 +196,9 @@ async fn update_model_persists_overrides_to_disk() {
     );
     let (status, resp) = read_json(router.oneshot(req).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(resp["requires_restart"], true);
+    // The endpoint now hot-reloads in-process (the test's stub reloader
+    // returns Ok), so no restart is required.
+    assert_eq!(resp["requires_restart"], false);
     assert_eq!(resp["path"], "llm[primary]");
 
     let on_disk = AuraConfig::load_from_file(&path).await.expect("reload");
@@ -392,7 +406,8 @@ async fn get_usage_aggregates_by_model() {
         skill_registry: Arc::clone(&tg.deps.skill_registry),
         tool_registry: Arc::clone(&tg.deps.tool_registry),
         channel_registry: Arc::clone(&tg.deps.channel_registry),
-        llm_client: tg.deps.llm_client.clone(),
+        llm_pool: tg.deps.llm_pool.clone(),
+        config_reloader: tg.deps.config_reloader.clone(),
         log_buffer: Arc::clone(&tg.deps.log_buffer),
         channel_bot_store: tg.deps.stores.channel_bot.clone(),
         channel_control: Arc::clone(&tg.deps.channel_control),
@@ -457,4 +472,46 @@ fn urlencoding(s: &str) -> String {
     // Light-weight: only percent-encode the characters that actually
     // need it inside an RFC 3339 timestamp (`:` and `+`).
     s.replace(':', "%3A").replace('+', "%2B")
+}
+
+// C4: a candidate the reloader's `dry_run` rejects (e.g. unbuildable
+// default) must be refused with a 400 *before* the handler writes — so
+// the on-disk config is never dirtied (and can't be re-read and silently
+// dropped by a later SIGHUP).
+#[tokio::test]
+async fn rejected_dry_run_leaves_config_file_untouched() {
+    let (router, _dir, cfg_path) = router_with_reloader(
+        seed_two_entries(),
+        Some(Arc::new(
+            aura_gateway::test_support::RejectingDryRunReloader,
+        )),
+    )
+    .await;
+
+    let before = tokio::fs::read_to_string(&cfg_path)
+        .await
+        .expect("read seed config");
+
+    let req = auth(
+        Request::builder()
+            .method("PUT")
+            .uri("/v1/llm/models/primary")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "model": "gpt-4o-mini" }).to_string()))
+            .unwrap(),
+    );
+    let (status, _body) = read_json(router.oneshot(req).await.unwrap()).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unbuildable edit must be rejected"
+    );
+
+    let after = tokio::fs::read_to_string(&cfg_path)
+        .await
+        .expect("read config after rejected edit");
+    assert_eq!(
+        before, after,
+        "a rejected dry-run must not write the config file"
+    );
 }

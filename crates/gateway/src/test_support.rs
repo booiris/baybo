@@ -31,6 +31,61 @@ use crate::config::RuntimeGatewayConfig;
 use crate::log_buffer::LogBuffer;
 use crate::server::GatewayDeps;
 
+/// Canned outcome the test reloaders return so endpoints that surface a
+/// `ReloadOutcome` still produce a 200.
+fn canned_reload_outcome() -> crate::reload::ReloadOutcome {
+    crate::reload::ReloadOutcome {
+        active_model: "stub-model".into(),
+        default_entry: "stub".into(),
+        entries: vec!["stub".into()],
+        dropped: vec![],
+    }
+}
+
+/// Stub reloader for gateway crate tests — they don't exercise a real
+/// reload, they just need the `config_reloader` field populated. Returns
+/// a canned outcome so a test that does hit the reload endpoint gets 200.
+struct StubConfigReloader;
+
+#[async_trait::async_trait]
+impl crate::reload::ConfigReloader for StubConfigReloader {
+    async fn reload(
+        &self,
+    ) -> std::result::Result<crate::reload::ReloadOutcome, crate::reload::ReloadError> {
+        Ok(canned_reload_outcome())
+    }
+
+    async fn dry_run(
+        &self,
+        _candidate: &aura_config::AuraConfig,
+    ) -> std::result::Result<(), crate::reload::ReloadError> {
+        Ok(())
+    }
+}
+
+/// Reloader whose `dry_run` always rejects the candidate. Lets a test
+/// assert the C4 contract: a rejected dry-run short-circuits the handler
+/// with a 400 *before* it writes, so the on-disk config is never dirtied.
+pub struct RejectingDryRunReloader;
+
+#[async_trait::async_trait]
+impl crate::reload::ConfigReloader for RejectingDryRunReloader {
+    async fn reload(
+        &self,
+    ) -> std::result::Result<crate::reload::ReloadOutcome, crate::reload::ReloadError> {
+        Ok(canned_reload_outcome())
+    }
+
+    async fn dry_run(
+        &self,
+        _candidate: &aura_config::AuraConfig,
+    ) -> std::result::Result<(), crate::reload::ReloadError> {
+        Err(crate::reload::ReloadError::LlmRebuild(
+            "test: default entry unbuildable".into(),
+        ))
+    }
+}
+
 /// Bearer token every test gateway is wired with. Exposed so callers
 /// that talk to the admin listener can authenticate without duplicating
 /// the constant.
@@ -115,6 +170,17 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         )
         .expect("stub LLM client");
 
+    // Wrap the stub client in a single-entry pool handle so GatewayDeps
+    // hands the gateway a hot-swappable pool (matches production).
+    let llm_pool: aura_agent::LlmPoolHandle = {
+        let name = aura_model::LlmEntryName::from(llm_client.model_info().id.clone());
+        let mut clients = std::collections::HashMap::new();
+        clients.insert(name.clone(), llm_client);
+        Arc::new(parking_lot::RwLock::new(Arc::new(
+            aura_agent::LlmClientPool::new(clients, name).expect("stub pool default present"),
+        )))
+    };
+
     let runtime_config = RuntimeGatewayConfig {
         admin_bind,
         cors_allowed_origins: Vec::new(),
@@ -138,7 +204,8 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         skill_registry,
         tool_registry,
         channel_registry,
-        llm_client,
+        llm_pool,
+        config_reloader: Arc::new(StubConfigReloader),
         admin_token: TEST_ADMIN_TOKEN.to_string(),
         log_buffer: LogBuffer::new(256),
         incoming_tx,
