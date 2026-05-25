@@ -17,7 +17,7 @@ env:
   CARGO_TERM_COLOR: always
   # The repo's .cargo/config.toml pins sccache as the rustc wrapper and
   # -fuse-ld=lld; stock GitHub runners have neither. Disable both for CI —
-  # Swatinem/rust-cache handles caching and the default linker is fine here.
+  # the toolchain action handles caching and the default linker is fine here.
   RUSTC_WRAPPER: ""
   RUSTFLAGS: ""
 
@@ -27,9 +27,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      # Channel + components come from rust-toolchain.toml; this action
+      # reads it and caches the cargo registry/target.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: cargo fmt --all --check
 
   clippy:
@@ -37,10 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: cargo clippy --all --benches --tests --examples --all-features --locked -- -D warnings
 
   test:
@@ -48,8 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: cargo test --workspace --locked
 
   ts-bindings:
@@ -57,8 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: scripts/check-ts-bindings.sh
 
   frontend:
