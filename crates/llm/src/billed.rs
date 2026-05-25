@@ -161,6 +161,11 @@ impl BilledLlm {
     /// is dropped, billing the last-observed `Usage` event (zero on an
     /// early drop). This preserves partial-spend-on-error: tokens streamed
     /// before a mid-stream failure are still billed.
+    ///
+    /// Poll and drop the returned stream within a Tokio runtime context:
+    /// recording persists asynchronously (`record_call` spawns a task), so
+    /// dropping it on a non-runtime thread would panic in that spawn.
+    /// Every current caller drains it inside the agent loop, which holds.
     pub async fn chat_stream(&self, request: &ChatRequest) -> crate::Result<LlmStream> {
         let inner = self.llm.chat_stream(request).await?;
         Ok(LlmStream::from_stream(RecordingStream {
@@ -322,6 +327,44 @@ mod tests {
 
         let calls = probe.calls.lock();
         assert_eq!(calls.len(), 1, "drained stream records exactly once");
+        assert_eq!(calls[0].2.input_tokens, 7);
+        assert_eq!(calls[0].2.output_tokens, 9);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_records_last_usage_on_mid_stream_error_drop() {
+        // The subtle path: the consumer bails on a mid-stream error and
+        // drops the stream WITHOUT reaching the terminal `None`, so cost
+        // is recorded by `Drop`, not `poll_next(None)`. The last-seen
+        // `Usage` (partial spend before the failure) must still be billed.
+        let probe = Arc::new(RecorderProbe::default());
+        let stub = Arc::new(StubLlm::new());
+        stub.push_stream_results(vec![
+            Ok(StreamEvent::Usage(usage(7, 9))),
+            Err(crate::LlmError::Transient("mid-stream boom".into())),
+        ]);
+        let guarded = BillableLlm::new(
+            stub as Arc<dyn LlmCompletion>,
+            billing_with_probe(probe.clone()),
+        );
+        let bound = guarded.bind(Attribution::system("stream-err"));
+
+        let mut stream = bound
+            .chat_stream(&empty_request())
+            .await
+            .expect("stream ok");
+        let mut saw_err = false;
+        while let Some(ev) = stream.next().await {
+            if ev.is_err() {
+                saw_err = true;
+                break; // bail like a real consumer; never reach None
+            }
+        }
+        assert!(saw_err, "expected the injected mid-stream error");
+        drop(stream); // Drop, not poll_next(None), must do the recording
+
+        let calls = probe.calls.lock();
+        assert_eq!(calls.len(), 1, "error + early drop records exactly once");
         assert_eq!(calls[0].2.input_tokens, 7);
         assert_eq!(calls[0].2.output_tokens, 9);
     }
