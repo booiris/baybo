@@ -280,9 +280,7 @@ mod tests {
         std::fs::write(&other, b"keep").unwrap();
         back_date(&stale, Duration::from_secs(SESSION_LOG_TTL.as_secs() + 60));
 
-        let report = Janitor::new(paths)
-            .sweep_once()
-            .await;
+        let report = Janitor::new(paths).sweep_once().await;
 
         assert_eq!(report.session_logs_removed, 1);
         assert!(!stale.exists());
@@ -313,9 +311,7 @@ mod tests {
             Duration::from_secs(LOG_FILE_TTL.as_secs() + 60),
         );
 
-        let report = Janitor::new(paths)
-            .sweep_once()
-            .await;
+        let report = Janitor::new(paths).sweep_once().await;
 
         assert_eq!(report.log_files_removed, 2);
         assert!(!stale_main.exists());
@@ -352,12 +348,10 @@ mod tests {
 
         let paths = workspace_paths(tmp.path());
         let live_dirs: HashSet<String> = ["browser-livehash".to_string()].into_iter().collect();
-        let janitor = Janitor::new(paths).with_sidecar_cache(
-            SidecarCache {
-                cache_root: cache.clone(),
-                live_dirs,
-            },
-        );
+        let janitor = Janitor::new(paths).with_sidecar_cache(SidecarCache {
+            cache_root: cache.clone(),
+            live_dirs,
+        });
 
         let removed = janitor.sweep_sidecar_cache().await;
         assert_eq!(removed, 1, "only the stale non-live dir is removed");
@@ -374,9 +368,7 @@ mod tests {
     async fn sidecar_cache_sweep_is_noop_when_disabled() {
         let tmp = TempDir::new().unwrap();
         let paths = workspace_paths(tmp.path());
-        let n = Janitor::new(paths)
-            .sweep_sidecar_cache()
-            .await;
+        let n = Janitor::new(paths).sweep_sidecar_cache().await;
         assert_eq!(n, 0);
     }
 
@@ -385,12 +377,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cache = tmp.path().join("does-not-exist");
         let paths = workspace_paths(tmp.path());
-        let janitor = Janitor::new(paths).with_sidecar_cache(
-            SidecarCache {
-                cache_root: cache,
-                live_dirs: HashSet::new(),
-            },
-        );
+        let janitor = Janitor::new(paths).with_sidecar_cache(SidecarCache {
+            cache_root: cache,
+            live_dirs: HashSet::new(),
+        });
         assert_eq!(janitor.sweep_sidecar_cache().await, 0);
     }
 
@@ -398,9 +388,7 @@ mod tests {
     async fn sweep_short_circuits_when_target_dirs_do_not_exist() {
         let tmp = TempDir::new().unwrap();
         let paths = workspace_paths(tmp.path());
-        let report = Janitor::new(paths)
-            .sweep_once()
-            .await;
+        let report = Janitor::new(paths).sweep_once().await;
         assert_eq!(report.session_logs_removed, 0);
         assert_eq!(report.log_files_removed, 0);
     }
