@@ -88,6 +88,14 @@ pub enum MessageSource {
     /// A genuine message a human sent through a channel input. The only source
     /// that renders as a user bubble on chat surfaces.
     User,
+    /// A genuine human channel message that arrived **mid-turn**, while the
+    /// agent loop was still working on the user's previous request. Renders as
+    /// a user bubble just like [`MessageSource::User`] (see
+    /// [`ChatMessage::from_user`]), but is tracked distinctly so the wire layer
+    /// can frame it with a `<user_interjection>` steering envelope
+    /// (`aura_context::prompts::interjection`). See
+    /// `docs/todo/mid-turn-user-interjection.md`.
+    UserInterjection,
     /// A cron job's fire-time framed prompt: synthesized by the agent, so
     /// hidden from the chat transcript, but surfaced on its own in the
     /// operator cron inbox (which finds it by this variant rather than by
@@ -105,6 +113,7 @@ impl MessageSource {
     pub fn as_str(&self) -> &'static str {
         match self {
             MessageSource::User => "user",
+            MessageSource::UserInterjection => "user_interjection",
             MessageSource::Cron => "cron",
             MessageSource::Agent => "agent",
         }
@@ -117,6 +126,7 @@ impl std::str::FromStr for MessageSource {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "user" => Ok(MessageSource::User),
+            "user_interjection" => Ok(MessageSource::UserInterjection),
             "cron" => Ok(MessageSource::Cron),
             "agent" => Ok(MessageSource::Agent),
             other => Err(format!("unknown message source: {other}")),
@@ -151,6 +161,20 @@ impl ChatMessage {
             role: Role::User,
             content,
             source: MessageSource::User,
+        }
+    }
+
+    /// A genuine human channel message that arrived **mid-turn**, while the
+    /// agent loop was still working on the user's previous request. Like
+    /// [`Self::user`] it carries human-authored content and renders as a user
+    /// bubble, but it is stamped [`MessageSource::UserInterjection`] so the wire
+    /// layer frames it with a `<user_interjection>` steering envelope. The
+    /// **only** constructor that marks a row [`MessageSource::UserInterjection`].
+    pub fn user_interjection(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content,
+            source: MessageSource::UserInterjection,
         }
     }
 
@@ -221,12 +245,19 @@ impl ChatMessage {
         self.source
     }
 
-    /// `true` only when this row came directly from a human channel input
-    /// (i.e. [`MessageSource::User`]; see [`ChatMessage::user`]). Chat surfaces
-    /// use it to surface the genuine prompt and hide agent-injected
-    /// `Role::User` rows.
+    /// `true` when this row came directly from a human channel input — a
+    /// genuine prompt ([`MessageSource::User`]) or a mid-turn interjection
+    /// ([`MessageSource::UserInterjection`]); see [`ChatMessage::user`] /
+    /// [`ChatMessage::user_interjection`]. Chat surfaces use it to surface
+    /// human-authored turns and hide agent-injected `Role::User` rows. Note
+    /// this is broader than "is a genuine top-level prompt" — slash-command
+    /// detection keys off `source() == MessageSource::User` exactly, since an
+    /// interjection is never a slash command.
     pub fn from_user(&self) -> bool {
-        matches!(self.source, MessageSource::User)
+        matches!(
+            self.source,
+            MessageSource::User | MessageSource::UserInterjection
+        )
     }
 }
 
@@ -269,3 +300,35 @@ impl std::str::FromStr for Role {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageMetadata {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_source_string_round_trips() {
+        for src in [
+            MessageSource::User,
+            MessageSource::UserInterjection,
+            MessageSource::Cron,
+            MessageSource::Agent,
+        ] {
+            assert_eq!(src.as_str().parse::<MessageSource>(), Ok(src));
+        }
+        assert_eq!(
+            MessageSource::UserInterjection.as_str(),
+            "user_interjection"
+        );
+    }
+
+    #[test]
+    fn user_interjection_is_a_user_bubble_role_and_source() {
+        let m = ChatMessage::user_interjection(vec![ContentBlock::Text("hi".into())]);
+        assert_eq!(m.role, Role::User);
+        assert_eq!(m.source(), MessageSource::UserInterjection);
+        // Renders as a user bubble (broadened from_user), unlike agent-injected
+        // Role::User rows.
+        assert!(m.from_user());
+        assert!(!ChatMessage::agent_context(vec![ContentBlock::Text("x".into())]).from_user());
+    }
+}

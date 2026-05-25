@@ -225,6 +225,24 @@ impl<T> MailboxReceiver<T> {
         self.shared.queue.lock().peek().map(|e| e.priority)
     }
 
+    /// Conditionally receive: pop the highest-priority queued message **only
+    /// if** `pred` accepts it; otherwise leave it queued and return `None`.
+    /// Only the single highest-priority entry is examined — a non-matching top
+    /// blocks the pop even when a matching entry sits lower, which is exactly
+    /// what the agent loop wants: it drains the *leading run* of injectable user
+    /// interjections at a tool boundary and stops at the first non-injectable
+    /// message (a queued slash command, a `SubagentFinished`, an `ActorStop`),
+    /// leaving everything behind it for the actor's normal dispatch.
+    pub fn try_recv_if<F: FnOnce(&T) -> bool>(&mut self, pred: F) -> Option<T> {
+        let mut queue = self.shared.queue.lock();
+        let matches = queue.peek().is_some_and(|e| pred(&e.msg));
+        if matches {
+            queue.pop().map(|e| e.msg)
+        } else {
+            None
+        }
+    }
+
     /// Non-blocking receive.
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         if let Some(entry) = self.shared.queue.lock().pop() {
@@ -377,6 +395,32 @@ mod tests {
             tx.try_send(Msg::new(Trigger, 4)),
             Err(TrySendError::Closed(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn try_recv_if_pops_only_on_match() {
+        let (tx, mut rx) = channel::<Msg>(8);
+        tx.send(Msg::new(Trigger, 1)).await.unwrap();
+        // Predicate rejects -> leaves it queued.
+        assert!(rx.try_recv_if(|m| m.id == 99).is_none());
+        // Predicate accepts -> pops it.
+        assert_eq!(rx.try_recv_if(|m| m.id == 1).unwrap().id, 1);
+        // Empty -> None.
+        assert!(rx.try_recv_if(|_| true).is_none());
+    }
+
+    #[tokio::test]
+    async fn try_recv_if_only_considers_the_top_priority_entry() {
+        let (tx, mut rx) = channel::<Msg>(8);
+        // A lower-priority SubagentFinished queued behind a Trigger.
+        tx.send(Msg::new(SubagentFinished, 1)).await.unwrap();
+        tx.send(Msg::new(Trigger, 2)).await.unwrap();
+        // Top is the Trigger: a Trigger-only predicate pops it.
+        assert_eq!(rx.try_recv_if(|m| m.pri == Trigger).unwrap().id, 2);
+        // Now the top is the SubagentFinished: a Trigger-only predicate leaves it.
+        assert!(rx.try_recv_if(|m| m.pri == Trigger).is_none());
+        // Still queued, served by a normal recv.
+        assert_eq!(rx.recv().await.unwrap().id, 1);
     }
 
     #[tokio::test]

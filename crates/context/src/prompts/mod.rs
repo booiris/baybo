@@ -5,6 +5,7 @@
 
 pub mod compression;
 pub mod cron;
+pub mod interjection;
 pub mod soul;
 pub mod subagent;
 pub mod tool_output;

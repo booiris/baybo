@@ -162,6 +162,20 @@ enum IterationOutcome {
     Continue,
 }
 
+/// Source of mid-turn user messages ("interjections") that arrived while the
+/// loop was running. Consulted at each tool boundary (after a tool batch, before
+/// the next LLM call) — never mid-call, so injection stays non-preemptive.
+/// Implemented by the actor over its mailbox (draining the leading run of
+/// non-slash `UserInput`s); a fake stands in for it in tests. Returns each
+/// injectable message's content in arrival order, or empty when nothing is
+/// queued. See `docs/todo/mid-turn-user-interjection.md`.
+///
+/// `Send` supertrait so the `&mut dyn InterjectionSource` the loop holds across
+/// `.await` points keeps the agent task `Send`.
+pub trait InterjectionSource: Send {
+    fn drain_injectable(&mut self) -> Vec<Vec<ContentBlock>>;
+}
+
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
 pub struct AgentLoop {
     /// Currently-active client, re-resolved from `llm_pool` at the
@@ -380,6 +394,7 @@ impl AgentLoop {
         parent_job_id: Option<JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
+        interjections: Option<&mut dyn InterjectionSource>,
     ) -> anyhow::Result<OutgoingMessage> {
         self.refresh_active_llm();
         let spec = JobSpec {
@@ -402,6 +417,7 @@ impl AgentLoop {
                         job_id,
                         delta_tx,
                         cancel_token,
+                        interjections,
                     )
                     .await?;
                 let output = JobOutput::Message {
@@ -422,6 +438,7 @@ impl AgentLoop {
         job_id: JobId,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
+        mut interjections: Option<&mut dyn InterjectionSource>,
     ) -> anyhow::Result<OutgoingMessage> {
         let _ = job_lifecycle;
         self.context_manager.ensure_seeded().await;
@@ -473,9 +490,17 @@ impl AgentLoop {
             }
             iterations += 1;
 
-            // Iteration-boundary summary-refresh check. Skip iter 1 —
-            // no work has happened yet to gate against.
+            // Both gate on iter > 1: iteration 1 is the original turn (no tool
+            // batch has run yet to inject after), and a Final response returns
+            // before looping, so it never reaches here.
             if iterations > 1 {
+                // Drain any messages the user sent while the loop was running
+                // and inject them (framed as steering) BEFORE the next LLM call,
+                // so the user can steer an in-progress turn. Messages that don't
+                // make a boundary fall through to the next turn. See
+                // docs/todo/mid-turn-user-interjection.md.
+                self.drain_user_interjections(&mut interjections).await;
+                // Iteration-boundary summary-refresh check.
                 self.maybe_spawn_background_compression(job_id, /* job_done */ false)
                     .await;
             }
@@ -1022,6 +1047,33 @@ impl AgentLoop {
         self.context_manager
             .log_llm_call(request, outcome, &info.provider, &info.id)
             .await;
+    }
+
+    /// Drain mid-turn user interjections from `src` and append each as a
+    /// faithful `UserInterjection` transcript row (persisted like any user
+    /// message). The steering envelope is applied wire-only later by
+    /// `ContextManager::messages_for_llm`; here we store the raw text so the
+    /// chat surface shows a clean user bubble and the row survives turn
+    /// cancellation. A `None` source (cron / subagent / notification turns) is a
+    /// no-op — this is a UserChat-turn affordance.
+    /// See `docs/todo/mid-turn-user-interjection.md`.
+    async fn drain_user_interjections(&mut self, src: &mut Option<&mut dyn InterjectionSource>) {
+        let Some(src) = src.as_deref_mut() else {
+            return;
+        };
+        let drained = src.drain_injectable();
+        if drained.is_empty() {
+            return;
+        }
+        let count = drained.len();
+        for content in drained {
+            // Budgeted at the framed wire size; see `append_user_interjection`.
+            self.context_manager.append_user_interjection(content).await;
+        }
+        info!(
+            interjections = count,
+            "injected mid-turn user interjection(s) before the next LLM call"
+        );
     }
 
     /// Append a user-authored message to this session's transcript — both the

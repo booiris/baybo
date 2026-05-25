@@ -308,12 +308,25 @@ impl ContextManager {
         &self.messages
     }
 
-    /// The transcript shaped for an LLM request: adjacent same-role
-    /// user/assistant rows coalesced (see [`merge_for_llm`]) so providers that
-    /// require strict alternation accept it. An owned snapshot — the stored
-    /// transcript keeps each row separate.
+    /// The transcript shaped for an LLM request: mid-turn user interjections
+    /// wrapped in their steering envelope ([`frame_interjections`]), then
+    /// adjacent same-role user/assistant rows coalesced ([`merge_for_llm`]) so
+    /// providers that require strict alternation accept it. An owned snapshot —
+    /// the stored transcript keeps each row separate and unframed.
     pub fn messages_for_llm(&self) -> Vec<ChatMessage> {
-        merge_for_llm(&self.messages)
+        // Skip the interjection-framing pass (and its full clone) unless the
+        // transcript actually holds an interjection — the common case. The scan
+        // is O(n) with no allocation; `frame_interjections` would otherwise
+        // clone every row before `merge_for_llm` clones again.
+        if self
+            .messages
+            .iter()
+            .any(|m| m.source() == aura_model::MessageSource::UserInterjection)
+        {
+            merge_for_llm(&frame_interjections(&self.messages))
+        } else {
+            merge_for_llm(&self.messages)
+        }
     }
 
     /// Resolve the system prompt to seed the leading `Role::System` row. The
@@ -641,6 +654,37 @@ impl ContextManager {
     /// built.
     pub async fn append(&mut self, msg: &ChatMessage) -> Option<i64> {
         let count = self.tokenizer.count_message(msg);
+        self.append_with_count(msg, count).await
+    }
+
+    /// Append a mid-turn user interjection. Identical to a persisted user row
+    /// except the budget is charged the row's **framed wire size**: the row is
+    /// sent wrapped in the `<user_interjection>` envelope (`messages_for_llm` /
+    /// [`frame_interjections`]), so counting the raw text would under-count the
+    /// request and let the compression gate skip a pass it should run. Non-text
+    /// blocks (images) are preserved in the count. A multi-row run shares one
+    /// envelope on the wire, so counting per-row slightly over-counts (the safe
+    /// direction); the estimate is transient anyway — `record_call_actual`
+    /// resets the baseline to the provider's real count after the next call.
+    pub async fn append_user_interjection(&mut self, content: Vec<ContentBlock>) -> Option<i64> {
+        let msg = ChatMessage::user_interjection(content);
+        let text = aura_llm::multimodal::extract_text(&msg.content);
+        let mut framed = vec![ContentBlock::Text(
+            crate::prompts::interjection::wrap_interjections(&[text]),
+        )];
+        framed.extend(
+            msg.content
+                .iter()
+                .filter(|b| !matches!(b, ContentBlock::Text(_)))
+                .cloned(),
+        );
+        let count = self.tokenizer.count_message(&ChatMessage::user(framed));
+        self.append_with_count(&msg, count).await
+    }
+
+    /// Shared append body: record skill calls, push the row with its budgeted
+    /// token `count`, refresh the budget, persist, and mirror to the JSONL log.
+    async fn append_with_count(&mut self, msg: &ChatMessage, count: usize) -> Option<i64> {
         record_skill_calls(&mut self.called_skills, msg);
         self.messages.push(msg.clone());
         self.per_message_tokens.push(count);
@@ -1351,6 +1395,49 @@ pub fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
 /// boundary into a single text block (joined with `\n\n`). Non-text
 /// blocks (images, tool_use, tool_result, thinking) are appended as-is so
 /// signatures, IDs, and modality data are preserved verbatim.
+/// Wire-only pass: collapse each maximal run of consecutive
+/// [`aura_model::MessageSource::UserInterjection`] rows into a single
+/// `Role::User` message whose text is wrapped in the `<user_interjection>`
+/// steering envelope ([`crate::prompts::interjection`]). Re-derived on every
+/// LLM call from the source flag, so the framing survives compaction/rebuild
+/// and is never persisted. Non-text blocks (e.g. images) ride after the
+/// envelope text in the same message. Non-interjection rows pass through
+/// untouched.
+fn frame_interjections(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    use aura_model::MessageSource;
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    let mut i = 0;
+    while i < messages.len() {
+        if messages[i].source() != MessageSource::UserInterjection {
+            out.push(messages[i].clone());
+            i += 1;
+            continue;
+        }
+        // Gather the maximal run of consecutive interjection rows so a batch
+        // injected at one boundary becomes one envelope, not N merged ones.
+        let mut texts: Vec<String> = Vec::new();
+        let mut extra_blocks: Vec<ContentBlock> = Vec::new();
+        while i < messages.len() && messages[i].source() == MessageSource::UserInterjection {
+            let text = aura_llm::multimodal::extract_text(&messages[i].content);
+            if !text.is_empty() {
+                texts.push(text);
+            }
+            for block in &messages[i].content {
+                if !matches!(block, ContentBlock::Text(_)) {
+                    extra_blocks.push(block.clone());
+                }
+            }
+            i += 1;
+        }
+        let mut content = vec![ContentBlock::Text(
+            crate::prompts::interjection::wrap_interjections(&texts),
+        )];
+        content.append(&mut extra_blocks);
+        out.push(ChatMessage::user(content));
+    }
+    out
+}
+
 fn merge_for_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
     for msg in messages {
@@ -1378,6 +1465,96 @@ fn merge_for_llm(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod frame_interjections_tests {
+    use super::frame_interjections;
+    use aura_model::{BlobRef, ChatMessage, ContentBlock, Role};
+
+    fn txt(s: &str) -> Vec<ContentBlock> {
+        vec![ContentBlock::Text(s.into())]
+    }
+
+    #[test]
+    fn non_interjection_rows_pass_through() {
+        let msgs = vec![
+            ChatMessage::user(txt("prompt")),
+            ChatMessage::assistant(txt("reply")),
+        ];
+        assert_eq!(frame_interjections(&msgs), msgs);
+    }
+
+    #[test]
+    fn collapses_a_run_into_one_envelope() {
+        let msgs = vec![
+            ChatMessage::user_interjection(txt("one")),
+            ChatMessage::user_interjection(txt("two")),
+        ];
+        let out = frame_interjections(&msgs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, Role::User);
+        let ContentBlock::Text(t) = &out[0].content[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(t.matches("<user_interjection>").count(), 1);
+        assert!(t.contains("one\n\ntwo"));
+    }
+
+    #[test]
+    fn interjection_after_tool_does_not_fold_into_prompt() {
+        // Realistic mid-turn shape: prompt → assistant → tool result → injected
+        // interjection. The interjection becomes its own enveloped user message.
+        let msgs = vec![
+            ChatMessage::user(txt("do X")),
+            ChatMessage::assistant(txt("working")),
+            ChatMessage::tool(txt("result")),
+            ChatMessage::user_interjection(txt("also do Y")),
+        ];
+        let out = frame_interjections(&msgs);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], msgs[0]);
+        let ContentBlock::Text(t) = &out[3].content[0] else {
+            panic!("expected text block");
+        };
+        assert!(t.contains("<user_interjection>") && t.contains("also do Y"));
+    }
+
+    #[test]
+    fn separate_runs_get_separate_envelopes() {
+        let msgs = vec![
+            ChatMessage::user_interjection(txt("a")),
+            ChatMessage::assistant(txt("mid")),
+            ChatMessage::user_interjection(txt("b")),
+        ];
+        let out = frame_interjections(&msgs);
+        assert_eq!(out.len(), 3);
+        for idx in [0usize, 2] {
+            let ContentBlock::Text(t) = &out[idx].content[0] else {
+                panic!("expected text block");
+            };
+            assert_eq!(t.matches("<user_interjection>").count(), 1);
+        }
+    }
+
+    #[test]
+    fn non_text_blocks_ride_after_envelope() {
+        let img = ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: "sha256:x".into(),
+            },
+            mime_type: "image/png".into(),
+        };
+        let msgs = vec![ChatMessage::user_interjection(vec![
+            ContentBlock::Text("see this".into()),
+            img.clone(),
+        ])];
+        let out = frame_interjections(&msgs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content.len(), 2);
+        assert!(matches!(&out[0].content[0], ContentBlock::Text(t) if t.contains("see this")));
+        assert_eq!(out[0].content[1], img);
+    }
 }
 
 #[cfg(test)]
@@ -2062,6 +2239,35 @@ mod tests {
         let expected_delta =
             ctx.tokenizer.count_message(&new_a) + ctx.tokenizer.count_message(&new_b);
         assert_eq!(ctx.count_tokens(), 5_000 + expected_delta);
+    }
+
+    /// A `UserInterjection` row is sent wrapped in the `<user_interjection>`
+    /// envelope (`messages_for_llm`), so `append` must charge the budget the
+    /// framed wire size — not the raw text — or the compression gate would
+    /// under-count the request. Regression for the wire-only-framing gap.
+    #[tokio::test]
+    async fn interjection_row_is_budgeted_at_framed_wire_size() {
+        let body = "please switch the implementation to TypeScript";
+
+        let mut plain = make_ctx(50, 100_000, 0.95);
+        plain
+            .append(&ChatMessage::user(vec![ContentBlock::Text(body.into())]))
+            .await;
+        let plain_tokens = plain.count_tokens();
+
+        let mut interject = make_ctx(50, 100_000, 0.95);
+        interject
+            .append_user_interjection(vec![ContentBlock::Text(body.into())])
+            .await;
+        let framed_tokens = interject.count_tokens();
+
+        // Same raw text, but the interjection is charged the envelope on top —
+        // its budgeted size is strictly larger, and by more than a stray token
+        // or two (the framing preamble is substantial).
+        assert!(
+            framed_tokens > plain_tokens + 20,
+            "interjection must be budgeted at framed wire size: framed={framed_tokens}, plain={plain_tokens}"
+        );
     }
 
     /// Compression mutates the message prefix in place, so the
