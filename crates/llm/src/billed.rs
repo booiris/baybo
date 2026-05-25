@@ -73,21 +73,27 @@ pub struct LlmBilling {
 }
 
 impl LlmBilling {
-    /// Real guard, no-op recorder. For the rare context that must gate
-    /// spend but has no ledger to record into, and for tests that only
-    /// exercise the gate.
-    pub fn unrecorded(guard: LlmCallGuard) -> Self {
-        Self {
-            guard,
-            record: Arc::new(|_, _, _| MicroUsd::ZERO),
-        }
-    }
-
     /// Admit every call, record nothing. The deliberate escape hatch for
     /// argv one-shots and tests with no `CostManager` — the only place an
     /// unbilled provider call is intentional. Grep for it.
     pub fn passthrough() -> Self {
-        Self::unrecorded(Arc::new(|| Ok(())))
+        Self {
+            guard: Arc::new(|| Ok(())),
+            record: Arc::new(|_, _, _| MicroUsd::ZERO),
+        }
+    }
+
+    /// Real guard, no-op recorder — for unit tests that exercise the gate
+    /// without standing up a `CostManager`. Test-gated on purpose:
+    /// "gate but don't record" has no production use, and leaving it
+    /// callable in release builds would be a billing bypass — exactly
+    /// what routing every call through [`BoundBilledChat`] prevents.
+    #[cfg(test)]
+    pub(crate) fn unrecorded(guard: LlmCallGuard) -> Self {
+        Self {
+            guard,
+            ..Self::passthrough()
+        }
     }
 }
 
