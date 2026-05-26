@@ -137,7 +137,7 @@ pub struct ToolContext {
 /// Severity of a [`SessionNotifier`] event. Matches
 /// `aura_channels::NoticeLevel` exactly — the agent-loop bridge does
 /// a one-to-one variant mapping when it forwards onto
-/// `AgentOutput::Notice`.
+/// `AgentEvent::Notice`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeLevel {
     Info,

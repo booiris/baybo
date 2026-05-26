@@ -1,4 +1,4 @@
-use aura_channels::{AgentOutput, OutgoingMessage};
+use aura_channels::{AgentEvent, AgentOutput, OutgoingMessage};
 use aura_model::SessionId;
 use tracing::{debug, error, warn};
 
@@ -6,30 +6,21 @@ use super::Router;
 
 impl Router {
     pub(super) async fn handle_agent_output(&self, output: AgentOutput) {
-        let (session_id, channel) = match &output {
-            AgentOutput::Delta {
-                session_id,
-                channel,
-                ..
-            }
-            | AgentOutput::Notice {
-                session_id,
-                channel,
-                ..
-            } => (session_id.clone(), channel.clone()),
-            AgentOutput::Message(outgoing) => {
-                (outgoing.session_id.clone(), outgoing.channel.clone())
-            }
-        };
+        let AgentOutput {
+            session_id,
+            user_id,
+            channel,
+            event,
+        } = output;
 
         // `Message` is the only variant that carries user-visible prose
-        // subject to policy egress — sanitize it in place before dispatch.
-        // `Delta` chunks are intentionally exempt (incremental streaming;
-        // the final `Message` is the authoritative sanitized egress per
+        // subject to policy egress — sanitize it before dispatch. `Delta`
+        // chunks are intentionally exempt (incremental streaming; the final
+        // `Message` is the authoritative sanitized egress per
         // `docs/modules/security.md`), and `Notice` is system-authored.
-        let output = match output {
-            AgentOutput::Message(outgoing) => {
-                AgentOutput::Message(self.sanitize_outgoing(outgoing).await)
+        let event = match event {
+            AgentEvent::Message(outgoing) => {
+                AgentEvent::Message(self.sanitize_outgoing(outgoing).await)
             }
             other => other,
         };
@@ -47,7 +38,12 @@ impl Router {
         // subscriber, drops on full (signalling Reset to the slow
         // peer), and detaches closed transports. No await — backpressure
         // is per-connection, not agent-wide.
-        channel_handle.dispatch_agent(output);
+        channel_handle.dispatch_agent(AgentOutput {
+            session_id,
+            user_id,
+            channel,
+            event,
+        });
     }
 
     /// Run the security gateway over an outgoing message. Returns the

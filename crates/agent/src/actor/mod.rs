@@ -9,7 +9,9 @@ pub mod state;
 pub mod subagent;
 pub mod supervisor;
 
-use aura_channels::{AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage};
+use aura_channels::{
+    AgentEvent, AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage,
+};
 use aura_job::JobInput;
 use aura_model::{BackgroundCompressionPayload, ContentBlock, PendingSubagentResult};
 use tokio::sync::mpsc;
@@ -417,7 +419,7 @@ impl AgentActor {
                 "cron turn produced no output; suppressing send"
             );
         } else {
-            self.send_response(AgentOutput::Message(response), "cron")
+            self.send_response(response.into(), "cron")
                 .await;
         }
         Ok(())
@@ -434,7 +436,7 @@ impl AgentActor {
         // turn keeps a clean leading `/command` for slash detection.
         //
         // Pass a clone of the response channel so the loop can stream
-        // text deltas as `AgentOutput::Delta` while the final assembled
+        // text deltas as `AgentEvent::Delta` while the final assembled
         // message still flows through the normal path.
         let response_tx = self.volatile.response_tx.clone();
         self.volatile
@@ -657,7 +659,7 @@ impl AgentActor {
                     );
                     return;
                 }
-                self.send_response(AgentOutput::Message(response), "subagent_notification")
+                self.send_response(response.into(), "subagent_notification")
                     .await;
             }
             Err(e) => {
@@ -691,18 +693,19 @@ impl AgentActor {
                 session_id = %self.durable.session.id,
                 "user turn produced an empty reply; surfacing fallback notice"
             );
-            let notice = AgentOutput::Notice {
+            let notice = AgentOutput {
                 session_id: self.durable.session.id.clone(),
                 user_id: self.durable.session.user.id.clone(),
                 channel: self.durable.session.channel.clone(),
-                level: NoticeLevel::Warn,
-                text: EMPTY_USER_REPLY_NOTICE.to_string(),
+                event: AgentEvent::Notice {
+                    level: NoticeLevel::Warn,
+                    text: EMPTY_USER_REPLY_NOTICE.to_string(),
+                },
             };
             self.send_response(notice, "user_empty_fallback").await;
             return;
         }
-        self.send_response(AgentOutput::Message(response), "user")
-            .await;
+        self.send_response(response.into(), "user").await;
     }
 
     /// `/compact` is a control command, not an assistant turn, so the
@@ -720,12 +723,14 @@ impl AgentActor {
                 self.volatile.actor_token.child_token(),
             )
             .await?;
-        let notice = AgentOutput::Notice {
+        let notice = AgentOutput {
             session_id: self.durable.session.id.clone(),
             user_id: self.durable.session.user.id.clone(),
             channel: self.durable.session.channel.clone(),
-            level: NoticeLevel::Info,
-            text,
+            event: AgentEvent::Notice {
+                level: NoticeLevel::Info,
+                text,
+            },
         };
         self.send_response(notice, "compact").await;
         Ok(())
@@ -756,8 +761,7 @@ impl AgentActor {
                 None,
             )
             .await?;
-        self.send_response(AgentOutput::Message(response), "subagent")
-            .await;
+        self.send_response(response.into(), "subagent").await;
         Ok(())
     }
 

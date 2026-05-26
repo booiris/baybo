@@ -644,9 +644,9 @@ The full frame set (see `crates/channels/src/wire.rs`):
   { session_id, patch }`, `SessionActivity { session_id, source, at }`.
 
 A note on `Delta`: the `Frame::Delta` variant exists and
-`agent_output_to_frame` maps `AgentOutput::Delta` to it, but the gateway
+`agent_output_to_frame` maps `AgentEvent::Delta` to it, but the gateway
 does **not** stream live deltas on the wire today —
-`AgentOutput::Delta` is coalesced into a single `Message` frame per the
+`AgentEvent::Delta` is coalesced into a single `Message` frame per the
 note in `channel/mod.rs`. Treat `Delta` as a defined-but-unused wire
 shape rather than a live stream the TUI/sidecars receive.
 

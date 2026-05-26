@@ -22,7 +22,8 @@ pub use slash::{
     ViewKind,
 };
 pub use types::{
-    AgentOutput, IncomingMessage, Message, MessageRole, NoticeLevel, OutgoingMessage, SessionEvent,
+    AgentEvent, AgentOutput, IncomingMessage, Message, MessageRole, NoticeLevel, OutgoingMessage,
+    SessionEvent,
 };
 
 pub type Result<T> = std::result::Result<T, ChannelError>;

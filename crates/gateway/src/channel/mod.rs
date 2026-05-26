@@ -13,7 +13,7 @@
 //! disconnect.
 //!
 //! Not currently exposed:
-//! * **Streaming delta frames** — `AgentOutput::Delta` is coalesced into
+//! * **Streaming delta frames** — `AgentEvent::Delta` is coalesced into
 //!   a single `Message` frame on the wire.
 
 pub(crate) mod adapter;

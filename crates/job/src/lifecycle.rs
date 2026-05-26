@@ -51,7 +51,7 @@ pub struct JobLifecycle {
     /// Fire-and-forget bus for terminal transitions. The subagent
     /// runtime subscribes to this so the parent unblocks on the
     /// child's `Completed` / `Failed` / `Cancelled` regardless of
-    /// whether the child also produced an `AgentOutput::Message`.
+    /// whether the child also produced an `AgentEvent::Message`.
     terminal_events: broadcast::Sender<JobTerminalEvent>,
 }
 

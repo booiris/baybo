@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_channels::{AgentOutput, COMPACT_COMMAND, OutgoingMessage};
+use aura_channels::{AgentEvent, AgentOutput, COMPACT_COMMAND, OutgoingMessage};
 use aura_context::ContextManager;
 use aura_job::{JobInput, JobLifecycle, JobOutput};
 use aura_llm::{
@@ -142,12 +142,11 @@ impl aura_tools::SessionNotifier for DeltaTxNotifier {
         } else {
             format!("{summary}: {detail}")
         };
-        let _ = self.tx.try_send(AgentOutput::Notice {
+        let _ = self.tx.try_send(AgentOutput {
             session_id: self.session_id.clone(),
             user_id: self.user_id.clone(),
             channel: self.channel.clone(),
-            level,
-            text,
+            event: AgentEvent::Notice { level, text },
         });
     }
 }
@@ -323,10 +322,10 @@ impl AgentLoop {
     /// Run the main conversation loop for a single user message.
     ///
     /// When `delta_tx` is `Some`, each text chunk emitted by the LLM is
-    /// forwarded as `AgentOutput::Delta` so adapters that support partial
+    /// forwarded as `AgentEvent::Delta` so adapters that support partial
     /// rendering (e.g. the TUI) can show incremental output. The final
     /// `OutgoingMessage` returned here should still be dispatched by the
-    /// caller as `AgentOutput::Message` so non-streaming adapters receive
+    /// caller as `AgentEvent::Message` so non-streaming adapters receive
     /// the canonical response.
     // `job_input` records why this job exists (provenance: which trigger
     // kicked it off — User / Cron / System / Spawned), used for the JobSpec.
@@ -422,7 +421,7 @@ impl AgentLoop {
         let _ = job_lifecycle;
         self.context_manager.ensure_seeded().await;
 
-        // Tool-authored notices (`AgentOutput::Notice`) ride the job-wide
+        // Tool-authored notices (`AgentEvent::Notice`) ride the job-wide
         // delta_tx directly, not the per-iteration `iter_delta_tx`: they
         // are a distinct output variant from the LLM's streamed `Delta`
         // and must reach the channel on every iteration, independent of
@@ -1272,11 +1271,11 @@ impl AgentLoop {
         content.push_str(&sanitized);
 
         if delta_tx
-            .send(AgentOutput::Delta {
+            .send(AgentOutput {
                 session_id: session.id.clone(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
-                text: sanitized,
+                event: AgentEvent::Delta(sanitized),
             })
             .await
             .is_err()
@@ -1329,7 +1328,7 @@ impl AgentLoop {
     }
 
     /// Run an on-demand compression pass and return the confirmation
-    /// text for the caller to ship as an `AgentOutput::Notice`.
+    /// text for the caller to ship as an `AgentEvent::Notice`.
     /// The variants of `CompressionOutcome` map to specific user-facing
     /// messages so the caller (typically a `/compact` notice) can
     /// distinguish "strategy declined", "no savings", and a real
@@ -1615,7 +1614,7 @@ fn trim_response_text_edges(response: &mut LlmResponse) {
 #[cfg(test)]
 mod notifier_bridge_tests {
     use super::*;
-    use aura_channels::AgentOutput;
+    use aura_channels::{AgentEvent, AgentOutput};
     use aura_tools::{NoticeLevel as ToolsNoticeLevel, SessionNotifier};
 
     fn mk_notifier() -> (DeltaTxNotifier, tokio::sync::mpsc::Receiver<AgentOutput>) {
@@ -1635,9 +1634,8 @@ mod notifier_bridge_tests {
         n.emit(ToolsNoticeLevel::Warn, "summary", "detail");
         let out = rx.try_recv().expect("notice should be queued");
         match out {
-            AgentOutput::Notice {
-                level,
-                text,
+            AgentOutput {
+                event: AgentEvent::Notice { level, text },
                 session_id,
                 user_id,
                 ..
@@ -1656,7 +1654,10 @@ mod notifier_bridge_tests {
         let (n, mut rx) = mk_notifier();
         n.emit(ToolsNoticeLevel::Error, "blocked", "rationale");
         match rx.try_recv().unwrap() {
-            AgentOutput::Notice { level, text, .. } => {
+            AgentOutput {
+                event: AgentEvent::Notice { level, text },
+                ..
+            } => {
                 assert_eq!(level, aura_channels::NoticeLevel::Error);
                 assert_eq!(text, "blocked: rationale");
             }
@@ -1669,7 +1670,10 @@ mod notifier_bridge_tests {
         let (n, mut rx) = mk_notifier();
         n.emit(ToolsNoticeLevel::Warn, "headline", "");
         match rx.try_recv().unwrap() {
-            AgentOutput::Notice { text, .. } => assert_eq!(text, "headline"),
+            AgentOutput {
+                event: AgentEvent::Notice { text, .. },
+                ..
+            } => assert_eq!(text, "headline"),
             _ => panic!(),
         }
     }

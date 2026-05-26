@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use aura_channels::AgentOutput;
+use aura_channels::{AgentEvent, AgentOutput};
 use aura_job::{JobLifecycle, JobStatusKind, JobTerminalEvent};
 use aura_model::{ContentBlock, SessionId, SubagentExitStatus, SubagentResult};
 use tokio::sync::{broadcast, mpsc};
@@ -43,7 +43,10 @@ pub async fn await_subagent_terminal(
                 }
                 msg = output_rx.recv() => {
                     match msg {
-                        Some(AgentOutput::Message(m)) => {
+                        Some(AgentOutput {
+                            event: AgentEvent::Message(m),
+                            ..
+                        }) => {
                             captured = Some(m.content);
                         }
                         Some(_) => continue,
@@ -59,7 +62,7 @@ pub async fn await_subagent_terminal(
                                 // `JobLifecycle::complete` publishes the terminal
                                 // event inside `with_job` BEFORE
                                 // `handle_subagent_spawned` dispatches the final
-                                // `AgentOutput::Message`. Drain `output_rx` so the
+                                // `AgentEvent::Message`. Drain `output_rx` so the
                                 // queued message isn't lost when the terminal
                                 // event wins the select with `captured == None`.
                                 captured = drain_for_final_message(&mut output_rx).await;
@@ -154,7 +157,7 @@ async fn check_child_terminal_via_store(
     })
 }
 
-/// Drain `output_rx` until the child actor's final `AgentOutput::Message`
+/// Drain `output_rx` until the child actor's final `AgentEvent::Message`
 /// arrives (or the channel closes). Other `AgentOutput` variants
 /// (`Delta`, `Notice`) are skipped — only `Message` carries the
 /// subagent's final content. Bounded by the caller's outer timeout.
@@ -162,7 +165,11 @@ async fn drain_for_final_message(
     output_rx: &mut mpsc::Receiver<AgentOutput>,
 ) -> Option<Vec<ContentBlock>> {
     while let Some(out) = output_rx.recv().await {
-        if let AgentOutput::Message(m) = out {
+        if let AgentOutput {
+            event: AgentEvent::Message(m),
+            ..
+        } = out
+        {
             return Some(m.content);
         }
     }
@@ -257,7 +264,7 @@ mod tests {
     }
 
     fn outgoing(text: &str) -> AgentOutput {
-        AgentOutput::Message(OutgoingMessage {
+        OutgoingMessage {
             session_id: SessionId::from(CHILD_SESSION),
             user_id: String::new(),
             channel: ChannelType::from("subagent"),
@@ -265,7 +272,8 @@ mod tests {
             reply_to: None,
             metadata: MessageMetadata::default(),
             ordinal: None,
-        })
+        }
+        .into()
     }
 
     /// Spawned waiter plus the peer endpoints that must outlive it —
@@ -304,7 +312,7 @@ mod tests {
 
     /// `JobLifecycle::complete` publishes the terminal event inside
     /// `with_job` BEFORE `handle_subagent_spawned` dispatches the final
-    /// `AgentOutput::Message`. The waiter must keep draining `output_rx`
+    /// `AgentEvent::Message`. The waiter must keep draining `output_rx`
     /// after observing `Completed` with `captured == None`, otherwise
     /// the queued final Message is lost and the parent sees an empty
     /// "subagent completed without producing a final message" answer.

@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use aura_channels::wire::{self, AttachmentKind, Frame, Message as WireMessage, WireAttachment};
 use aura_channels::{
-    AgentOutput, Channel, ChannelError, ChannelRegistry, Connection, ConnectionId, ConnectionSink,
-    MessageRole, NoticeLevel, SendOutcome, SessionEvent,
+    AgentEvent, AgentOutput, Channel, ChannelError, ChannelRegistry, Connection, ConnectionId,
+    ConnectionSink, MessageRole, NoticeLevel, SendOutcome, SessionEvent,
 };
 use aura_model::{ChannelType, ContentBlock};
 use aura_store::BlobStore;
@@ -301,18 +301,19 @@ async fn agent_output_to_frame(
     channel_type: &ChannelType,
     blob_store: &dyn BlobStore,
 ) -> Frame {
-    match output {
-        AgentOutput::Delta {
-            session_id,
-            user_id,
-            text,
-            ..
-        } => Frame::Delta {
+    let AgentOutput {
+        session_id,
+        user_id,
+        event,
+        ..
+    } = output;
+    match event {
+        AgentEvent::Delta(text) => Frame::Delta {
             session_id,
             user_id,
             text,
         },
-        AgentOutput::Message(response) => {
+        AgentEvent::Message(response) => {
             let (content, attachments) = split_content(&response.content, blob_store).await;
             Frame::Message(WireMessage {
                 content,
@@ -332,13 +333,7 @@ async fn agent_output_to_frame(
                 ordinal: response.ordinal,
             })
         }
-        AgentOutput::Notice {
-            session_id,
-            user_id,
-            level,
-            text,
-            ..
-        } => {
+        AgentEvent::Notice { level, text } => {
             let level = match level {
                 NoticeLevel::Info => "info",
                 NoticeLevel::Warn => "warn",

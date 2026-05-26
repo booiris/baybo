@@ -74,27 +74,38 @@ pub enum MessageRole {
     Assistant,
 }
 
-/// Things the agent itself emits while running a turn. Narrow on
-/// purpose: producers in the agent crate can only ever construct one
-/// of these three variants. Channel-side fan-out events (user echo,
-/// approval prompts) live on [`SessionEvent`] instead, so the agent
-/// can't accidentally synthesise a frame that's supposed to come from
-/// the channel.
+/// Something the agent emits about an in-flight turn, addressed to one
+/// session. The addressing triple (`session_id` / `user_id` / `channel`)
+/// is hoisted into this envelope so every [`AgentEvent`] variant shares
+/// it without repetition; `event` carries what actually happened.
+///
+/// Narrow on purpose: producers in the agent crate construct these.
+/// Channel-side fan-out events (user echo, approval prompts) live on
+/// [`SessionEvent`] instead, so the agent can't accidentally synthesise
+/// a frame that's supposed to come from the channel.
 #[derive(Debug, Clone)]
-pub enum AgentOutput {
-    /// Incremental text chunk for the in-flight response on a session.
-    Delta {
-        session_id: SessionId,
-        /// Aura user id the in-flight response is addressed to. See
-        /// [`OutgoingMessage::user_id`] for the per-channel routing
-        /// rationale. Empty string when not user-addressed.
-        user_id: String,
-        channel: ChannelType,
-        text: String,
-    },
+pub struct AgentOutput {
+    /// Session this emission belongs to. Channel fan-out keys on this
+    /// for selective-kind channels; broadcast channels still expose it
+    /// for logging.
+    pub session_id: SessionId,
+    /// Aura user id this emission is addressed to. See
+    /// [`OutgoingMessage::user_id`] for the per-channel routing
+    /// rationale. Empty string when not user-addressed (cron / system).
+    pub user_id: String,
+    pub channel: ChannelType,
+    pub event: AgentEvent,
+}
+
+/// What the agent emitted, minus the addressing carried by the
+/// enclosing [`AgentOutput`].
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    /// Incremental answer-prose chunk for the in-flight response.
+    Delta(String),
     /// Final, canonical assistant response for the turn.
     Message(OutgoingMessage),
-    /// Out-of-band notice addressed to the user for a specific session.
+    /// Out-of-band notice addressed to the user.
     ///
     /// Distinct from `Message` because the user did not prompt for it —
     /// it's emitted by the agent when an operational condition warrants
@@ -102,36 +113,18 @@ pub enum AgentOutput {
     /// `Suspicious`, so it still runs but the user should know).
     /// Channels decide how to render; the TUI inlines it into scrollback
     /// styled by `level`, transports without a banner surface may drop it.
-    Notice {
-        session_id: SessionId,
-        /// Aura user id the notice is addressed to. See
-        /// [`OutgoingMessage::user_id`].
-        user_id: String,
-        channel: ChannelType,
-        level: NoticeLevel,
-        text: String,
-    },
+    Notice { level: NoticeLevel, text: String },
 }
 
-impl AgentOutput {
-    /// `session_id` this emission belongs to. Channel fan-out keys on
-    /// this for selective-kind channels; broadcast channels still
-    /// expose it for logging.
-    pub fn session_id(&self) -> &SessionId {
-        match self {
-            AgentOutput::Delta { session_id, .. } => session_id,
-            AgentOutput::Message(m) => &m.session_id,
-            AgentOutput::Notice { session_id, .. } => session_id,
-        }
-    }
-
-    /// Optional `user_id` addressee, when one is known. Empty string
-    /// when the emission isn't user-addressed (cron / system).
-    pub fn user_id(&self) -> &str {
-        match self {
-            AgentOutput::Delta { user_id, .. } => user_id,
-            AgentOutput::Message(m) => &m.user_id,
-            AgentOutput::Notice { user_id, .. } => user_id,
+impl From<OutgoingMessage> for AgentOutput {
+    /// Wrap a final response into an output addressed to its own
+    /// session — the envelope's addressing triple mirrors the message's.
+    fn from(m: OutgoingMessage) -> Self {
+        Self {
+            session_id: m.session_id.clone(),
+            user_id: m.user_id.clone(),
+            channel: m.channel.clone(),
+            event: AgentEvent::Message(m),
         }
     }
 }
@@ -196,7 +189,7 @@ impl SessionEvent {
     /// expose it for logging.
     pub fn session_id(&self) -> &SessionId {
         match self {
-            SessionEvent::Agent(out) => out.session_id(),
+            SessionEvent::Agent(out) => &out.session_id,
             SessionEvent::UserEcho(m) => &m.message.session_id,
             SessionEvent::ApprovalRequested { session_id, .. } => session_id,
             SessionEvent::ApprovalResolved { session_id, .. } => session_id,
@@ -208,7 +201,7 @@ impl SessionEvent {
     /// notice).
     pub fn user_id(&self) -> &str {
         match self {
-            SessionEvent::Agent(out) => out.user_id(),
+            SessionEvent::Agent(out) => &out.user_id,
             SessionEvent::UserEcho(m) => &m.message.sender.id,
             SessionEvent::ApprovalRequested { user_id, .. } => user_id,
             SessionEvent::ApprovalResolved { .. } => "",
@@ -216,7 +209,7 @@ impl SessionEvent {
     }
 }
 
-/// Severity attached to an `AgentOutput::Notice`. Used only for
+/// Severity attached to an `AgentEvent::Notice`. Used only for
 /// presentation — semantics (whether the action proceeded) are already
 /// baked into the text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

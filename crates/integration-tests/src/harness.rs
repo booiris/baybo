@@ -17,7 +17,7 @@ use aura_agent::{
     actor::{AgentActor, AgentMessage, mailbox::MailboxSender},
     tool_executor::ToolExecutor,
 };
-use aura_channels::{AgentOutput, IncomingMessage, Message};
+use aura_channels::{AgentEvent, AgentOutput, IncomingMessage, Message};
 use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer};
 use aura_cost::test_support::MemoryCostStore;
 use aura_cost::{CostManager, SpendingLimits, cost_hooks};
@@ -135,7 +135,10 @@ impl AgentTestHarness {
         outputs
             .iter()
             .filter_map(|o| match o {
-                AgentOutput::Delta { text, .. } => Some(text.as_str()),
+                AgentOutput {
+                    event: AgentEvent::Delta(text),
+                    ..
+                } => Some(text.as_str()),
                 _ => None,
             })
             .collect()

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use aura_channels::{AgentOutput, IncomingMessage, NoticeLevel, STOP_COMMAND_NAME};
+use aura_channels::{AgentEvent, AgentOutput, IncomingMessage, NoticeLevel, STOP_COMMAND_NAME};
 use aura_job::{CancelReason, JobStatusKind};
 use aura_model::{ChannelType, ContentBlock, JobId, SessionId};
 use tracing::{debug, warn};
@@ -185,12 +185,14 @@ impl Router {
         // that already finished; `/stop` stops running work, it doesn't discard
         // completed work — so once the cancelled turn returns, the actor reports
         // them via the normal notification path.
-        self.handle_agent_output(AgentOutput::Notice {
+        self.handle_agent_output(AgentOutput {
             session_id: session_id.clone(),
             user_id: user_id.to_string(),
             channel: channel.clone(),
-            level: NoticeLevel::Info,
-            text: build_stop_notice(cancelled_turn, &background),
+            event: AgentEvent::Notice {
+                level: NoticeLevel::Info,
+                text: build_stop_notice(cancelled_turn, &background),
+            },
         })
         .await;
     }

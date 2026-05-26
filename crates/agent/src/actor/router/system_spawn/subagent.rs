@@ -26,7 +26,7 @@ use crate::external_agent::{
 
 /// `output_tx` buffer for a subagent's actor. Intentionally smaller than
 /// the operator-configured channel size for top-level actors — a child
-/// session only emits its final `AgentOutput::Message` (deltas are not
+/// session only emits its final `AgentEvent::Message` (deltas are not
 /// forwarded back through this channel), so 64 is overkill but matches
 /// the wait routine's earlier sizing.
 const SUBAGENT_OUTPUT_BUFFER: usize = 64;

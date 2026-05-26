@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::actor::AgentMessage;
-use aura_channels::{AgentOutput, IncomingMessage, Message};
+use aura_channels::{AgentEvent, AgentOutput, IncomingMessage, Message};
 use aura_cost::SpendingLimits;
 use aura_integration_tests::{AgentTestHarness, SessionBuilder, capture_tracing};
 use aura_llm::test_support::StubLlm;
@@ -60,7 +60,7 @@ async fn clean_conversation_streams_text_then_final_message() {
         "deltas concatenate to the LLM's text"
     );
     assert!(
-        outs.iter().any(|o| matches!(o, AgentOutput::Message(_))),
+        outs.iter().any(|o| matches!(o, AgentOutput { event: AgentEvent::Message(_), .. })),
         "expected a final Message, got {outs:?}"
     );
     assert_eq!(
@@ -156,7 +156,7 @@ async fn tool_call_round_trip_invokes_recording_tool() {
     assert_eq!(calls.len(), 1, "tool invoked exactly once");
     assert_eq!(calls[0], json!({"q": "ping"}));
     assert!(
-        outs.iter().any(|o| matches!(o, AgentOutput::Message(_))),
+        outs.iter().any(|o| matches!(o, AgentOutput { event: AgentEvent::Message(_), .. })),
         "expected a final Message after the tool round-trip, got {outs:?}"
     );
     // Regression: the final answer lands on iteration 2 (after the tool
@@ -484,7 +484,7 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
     assert!(
         outputs.iter().any(|o| matches!(
             o,
-            aura_channels::AgentOutput::Message(m)
+            aura_channels::AgentOutput { event: AgentEvent::Message(m), .. }
                 if m.content.iter().any(|b| matches!(
                     b,
                     ContentBlock::Text(t) if t.contains("FOO lives at lib/foo.rs:7")
@@ -540,7 +540,7 @@ async fn subagent_notification_suppresses_empty_reply() {
     assert!(
         !outputs
             .iter()
-            .any(|o| matches!(o, aura_channels::AgentOutput::Message(_))),
+            .any(|o| matches!(o, AgentOutput { event: AgentEvent::Message(_), .. })),
         "blank notification reply must not be sent to the channel"
     );
 
@@ -667,7 +667,7 @@ async fn failed_subagent_notification_retries_until_success() {
     assert!(
         outputs.iter().any(|o| matches!(
             o,
-            AgentOutput::Message(m)
+            AgentOutput { event: AgentEvent::Message(m), .. }
                 if m.content.iter().any(|b| matches!(
                     b,
                     ContentBlock::Text(t) if t.contains("research done")
@@ -972,13 +972,13 @@ async fn user_turn_empty_reply_surfaces_fallback_notice() {
     let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
 
     assert!(
-        !outputs.iter().any(|o| matches!(o, AgentOutput::Message(_))),
+        !outputs.iter().any(|o| matches!(o, AgentOutput { event: AgentEvent::Message(_), .. })),
         "blank user reply must not be sent as an empty assistant message"
     );
     assert!(
         outputs
             .iter()
-            .any(|o| matches!(o, AgentOutput::Notice { .. })),
+            .any(|o| matches!(o, AgentOutput { event: AgentEvent::Notice { .. }, .. })),
         "blank user reply must surface a fallback notice"
     );
 
@@ -1024,7 +1024,7 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
         .unwrap();
     let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert!(
-        outs.iter().any(|o| matches!(o, AgentOutput::Message(_))),
+        outs.iter().any(|o| matches!(o, AgentOutput { event: AgentEvent::Message(_), .. })),
         "cron fire should produce a Message, got {outs:?}"
     );
 
