@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Shared pre-commit hook (tracked). Enable per clone with:
+#   git config core.hooksPath .githooks
+#
+# Rejects commits containing unformatted Rust — the same check the
+# `rustfmt` CI job runs, caught before the push instead of after a red CI.
+# Escape hatch: `git commit --no-verify`.
+set -euo pipefail
+
+# Only pay the cost when Rust files are actually staged.
+if git diff --cached --name-only --diff-filter=ACMR | grep -q '\.rs$'; then
+    if ! cargo fmt --all --check; then
+        echo >&2
+        echo "✗ pre-commit: unformatted Rust. Run 'cargo fmt --all', re-stage, then commit." >&2
+        exit 1
+    fi
+fi
