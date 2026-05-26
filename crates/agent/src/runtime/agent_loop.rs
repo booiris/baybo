@@ -169,7 +169,7 @@ enum IterationOutcome {
 /// Implemented by the actor over its mailbox (draining the leading run of
 /// non-slash `UserInput`s); a fake stands in for it in tests. Returns each
 /// injectable message's content in arrival order, or empty when nothing is
-/// queued. See `docs/todo/mid-turn-user-interjection.md`.
+/// queued. See `docs/mid-turn-user-interjection.md`.
 ///
 /// `Send` supertrait so the `&mut dyn InterjectionSource` the loop holds across
 /// `.await` points keeps the agent task `Send`.
@@ -479,7 +479,7 @@ impl AgentLoop {
                 // and inject them (framed as steering) BEFORE the next LLM call,
                 // so the user can steer an in-progress turn. Messages that don't
                 // make a boundary fall through to the next turn. See
-                // docs/todo/mid-turn-user-interjection.md.
+                // docs/mid-turn-user-interjection.md.
                 self.drain_user_interjections(&mut interjections).await;
                 // Iteration-boundary summary-refresh check.
                 self.maybe_spawn_background_compression(job_id, /* job_done */ false)
@@ -1040,7 +1040,7 @@ impl AgentLoop {
     /// chat surface shows a clean user bubble and the row survives turn
     /// cancellation. A `None` source (cron / subagent / notification turns) is a
     /// no-op — this is a UserChat-turn affordance.
-    /// See `docs/todo/mid-turn-user-interjection.md`.
+    /// See `docs/mid-turn-user-interjection.md`.
     async fn drain_user_interjections(&mut self, src: &mut Option<&mut dyn InterjectionSource>) {
         let Some(src) = src.as_deref_mut() else {
             return;

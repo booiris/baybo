@@ -152,7 +152,7 @@ fn is_coalescable_user_input(msg: &AgentMessage) -> bool {
 /// queued mid-turn, leaving a queued slash command / `SubagentFinished` /
 /// `ActorStop` in place for the actor's normal dispatch. `try_recv_if` stops at
 /// the first non-injectable message, so coalescing boundaries and priority
-/// ordering are preserved. See `docs/todo/mid-turn-user-interjection.md`.
+/// ordering are preserved. See `docs/mid-turn-user-interjection.md`.
 struct MailboxInterjections<'a> {
     rx: &'a mut mailbox::MailboxReceiver<AgentMessage>,
 }
@@ -497,7 +497,7 @@ impl AgentActor {
         let response_tx = self.volatile.response_tx.clone();
         // Let the loop drain user messages that arrive *during* this turn and
         // inject them at tool boundaries (see `MailboxInterjections` /
-        // docs/todo/mid-turn-user-interjection.md). The coalesced burst above is
+        // docs/mid-turn-user-interjection.md). The coalesced burst above is
         // already appended; this only pulls messages that land after the turn
         // starts. Anything still queued at turn-end falls to the next turn.
         let mut interjections = MailboxInterjections { rx: mailbox };

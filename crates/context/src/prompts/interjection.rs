@@ -9,7 +9,7 @@
 //!
 //! The framing tells the model the message arrived mid-turn — steering, not a
 //! reply to anything it asked — and how to weigh it against the in-progress
-//! task. See `docs/todo/mid-turn-user-interjection.md`.
+//! task. See `docs/mid-turn-user-interjection.md`.
 
 const OPEN_TAG: &str = "<user_interjection>";
 const CLOSE_TAG: &str = "</user_interjection>";

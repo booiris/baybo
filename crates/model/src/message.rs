@@ -94,7 +94,7 @@ pub enum MessageSource {
     /// [`ChatMessage::from_user`]), but is tracked distinctly so the wire layer
     /// can frame it with a `<user_interjection>` steering envelope
     /// (`aura_context::prompts::interjection`). See
-    /// `docs/todo/mid-turn-user-interjection.md`.
+    /// `docs/mid-turn-user-interjection.md`.
     UserInterjection,
     /// A cron job's fire-time framed prompt: synthesized by the agent, so
     /// hidden from the chat transcript, but surfaced on its own in the
