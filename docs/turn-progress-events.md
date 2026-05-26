@@ -1,12 +1,12 @@
 # Turn Progress Events (Live Work Display)
 
-**Status:** 📐 Designed, not yet built (2026-05-26). The three forks below were
-settled with the user: (1) **extend the `AgentOutput` channel** rather than drive
-UI from the trace bus; (2) scope this round to **reasoning + tool lifecycle**;
-(3) emit tool lifecycle **from the agent loop** (not the executor). This doc is
-the design of record; on implementation, fold the runtime mechanism into
-[`docs/modules/agent.md`](modules/agent.md) and the rendering into
-[`docs/modules/tui.md`](modules/tui.md), and keep this doc as the rationale.
+**Status:** ✅ Built on branch `turn-progress-events` (2026-05-26), in the five
+staged commits below atop this design: type reshape → wire frames → producers →
+TUI render → web render. The three forks were settled with the user: (1) **extend
+the `AgentOutput` channel** rather than drive UI from the trace bus; (2) scope
+this round to **reasoning + tool lifecycle**; (3) emit tool lifecycle **from the
+agent loop** (not the executor). The TUI rendering is also documented in
+[`docs/modules/tui.md`](modules/tui.md); this doc keeps the design rationale.
 
 ## Problem
 
@@ -62,7 +62,7 @@ progress is **opt-in per channel** — the TUI/web render it, sidecars ignore it
 | **Tool result summary** | Derived generically in the result loop from `ToolOutput`, reusing the existing match (`agent_loop.rs:735`): `Text → "N lines"`, attachments → `"+N files/images"`, `Error → status=Error`, `Err(Denied) → status=Denied`. A tool-authored `Tool::result_summary` is a later refinement. |
 | **Security** | `Reasoning`, `label`, and `summary` are model-/tool-derived text and MUST pass the same sanitize + vault-reveal boundary as `Delta` (`stream_emit`). The trace keeps placeholder form; the channel gets revealed form. |
 | **Ordering / backpressure** | One ordered mpsc. Answer `Delta` and tool `ToolStarted/ToolCompleted` use `await` (load-bearing / display self-consistency); `Reasoning` uses `try_send` (ephemeral, droppable) — matching how `Notice` already drops on a full channel. The final `Message` is the reconciliation point that clears any in-flight progress UI. |
-| **TUI dedup** | Once a turn has emitted any `ToolStarted`, `finalize_stream` skips `ToolUse` blocks on the final `Message` (they were shown live). `accumulated_tool_uses` stays attached to `OutgoingMessage` because non-streaming paths (cron fires, reconnect catch-up rendered from persisted blocks) still render from it. |
+| **TUI dedup** | **None needed** (confirmed during Stage 4a). `render_block` only renders the CronCreate recurring-trigger hint for `ToolUse` blocks — never general tool calls — so the final `Message`'s `accumulated_tool_uses` were never a visible source of tool lines in the TUI. The live `ToolStarted`/`ToolCompleted` lines are the only tool display; `accumulated_tool_uses` stays attached to `OutgoingMessage` untouched (other channels / the CronCreate hint still use it). |
 | **Approval interleave** | `ToolStarted` (loop) precedes `ApprovalRequested` (emitted inside `execute` by the gate) precedes `ToolCompleted` — naturally reads as "started → waiting for approval → done". |
 | **Wire / non-streaming channels** | New `Frame` variants mirror the events and are ts-exported (`sdks/channel-ts`). Sidecars without a partial surface ignore them, exactly as they ignore `Frame::Delta` today. |
 
@@ -110,23 +110,28 @@ pub enum ToolStatus { Ok, Error, Denied }
 - **Wire** — `Frame::{Reasoning, ToolStarted, ToolCompleted}` in
   `crates/channels/src/wire.rs`; `agent_output_to_frame` (`crates/gateway/src/channel/adapter.rs:299`)
   gains the matching arms; `scripts/check-ts-bindings.sh` regenerates the SDK types.
-- **TUI** — `ToolStarted` commits `⏺ tool(label)` into native scrollback
-  (`insert_before`) immediately; `ToolCompleted` appends `⎿ summary`; `Reasoning`
-  renders dim in the ephemeral inline region (replaced by the answer). See the
-  dedup rule above for `finalize_stream`.
-- **Web** — `web/src/pages/ChatPage.tsx` adds cases beside the existing
-  `case 'delta'` (`:544`, `:1249`): a collapsible reasoning block and tool-status chips.
+- **TUI** — `ToolStarted` commits a cyan `⏺ tool(label)` line into native scrollback
+  (`insert_before`) immediately; `ToolCompleted` commits a `⎿ summary` line coloured
+  by status; `Reasoning` buffers into a dim line-buffer (`AppState.reasoning`,
+  mirroring `streaming`) and commits dim `✻` lines as they form, the partial flushing
+  ahead of any tool line / the answer / finalize. **No dedup needed** — `render_block`
+  only renders the CronCreate hint, never general tool calls, so the final `Message`
+  is not a second source of tool lines.
+- **Web** — `web/src/pages/ChatPage.tsx` adds `routeInboundFrame` cases beside the
+  existing `case 'delta'`: a dim reasoning row and tool chips (`⏺`/`⎿`), all
+  `role: 'system'` so they never collide with the assistant-streaming reconciliation,
+  and live-only (never persisted → dropped on a REST history reload).
 
-## Staged implementation (each stage: `cargo clippy --all --tests` zero warnings, `cargo test` green; keep diffs focused per the merge-back convention)
+## Staged implementation — done (branch `turn-progress-events`; each commit: `cargo clippy --all --tests` zero warnings, `cargo test` green)
 
-1. **Type reshape** — `AgentOutput` → envelope + `AgentEvent`; update every match site
-   (helpers, adapter, actor `send_response` / `send_user_reply`, tests). **Pure
-   mechanical, zero behaviour change.** Own commit.
-2. **Wire + adapter + ts-export** — new `Frame` variants wired end to end; consumers add
-   idle placeholders (nothing emits / renders yet).
-3. **Producers** — reasoning forwarding + `ToolStarted/Completed` + `ToolRegistry::call_label`
-   + summary derivation.
-4. **Consumers** — TUI activity rendering + dedup; web.
+1. ✅ **Type reshape** (`c26cb81`) — `AgentOutput` → envelope + `AgentEvent`; every match
+   site updated. Pure mechanical, zero behaviour change.
+2. ✅ **Wire + adapter + ts-export** (`22e9890`) — new `Frame` variants wired end to end;
+   consumers accept-and-drop until producers land.
+3. ✅ **Producers** (`39f157a8`) — reasoning forwarding + `ToolStarted/Completed` +
+   `ToolRegistry::call_label` + `tool_completion_summary`; labels/summaries sanitized.
+4. ✅ **Consumers** — TUI rendering (`d157faeb`) and web rendering (`94b9348`). No dedup
+   was needed (see above).
 
 ## Out of scope / future
 
