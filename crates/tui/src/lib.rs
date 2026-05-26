@@ -60,6 +60,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{TerminalOptions, Viewport};
 use tokio::sync::{Notify, mpsc};
+use tokio::time::Instant as TokioInstant;
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -310,6 +311,15 @@ fn new_dashboard_terminal() -> io::Result<Term> {
     Terminal::new(backend)
 }
 
+/// How long a terminal-resize burst must go quiet before we rebuild the inline
+/// viewport. A drag-resize emits many `Resize` events in quick succession;
+/// reacting to each one re-anchors the inline viewport and prints newlines (see
+/// [`rebuild_chat_terminal_after_resize`]), so we coalesce them and rebuild once
+/// the size stops changing. The window sits above a per-frame (~16ms) event
+/// cadence so a continuous drag never fires it mid-gesture, yet it feels instant
+/// on release.
+const RESIZE_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
+
 async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     install_panic_hook();
 
@@ -352,6 +362,13 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     commit_banner(&mut terminal, &ctx.initial_session_id)?;
     terminal.draw(|f| render_chat(f, &mut state))?;
 
+    // Debounce timer for coalescing terminal-resize bursts. Parked far in the
+    // future and re-armed on each `Resize`; the select arm is gated on
+    // `resize_pending` so the parked timer never fires spuriously.
+    let resize_debounce = tokio::time::sleep(std::time::Duration::from_secs(86_400));
+    tokio::pin!(resize_debounce);
+    let mut resize_pending = false;
+
     loop {
         tokio::select! {
             biased;
@@ -376,7 +393,15 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
                     }
                     Some(Ok(CrosstermEvent::Resize(_, _))) => {
-                        draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
+                        // Coalesce the burst: arm/re-arm the debounce and let the
+                        // resize_debounce arm rebuild once it settles. Redrawing
+                        // here would route through ratatui's in-place inline
+                        // resize, which re-anchors from a pre-reflow cursor offset
+                        // and garbles the live region.
+                        resize_pending = true;
+                        resize_debounce
+                            .as_mut()
+                            .reset(TokioInstant::now() + RESIZE_COALESCE_WINDOW);
                     }
                     Some(Ok(CrosstermEvent::Mouse(_))) => {
                         // Mouse capture is only enabled in dashboard mode and
@@ -407,12 +432,16 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         {
                             dispatch_submission(&mut state, &ctx, &mut terminal, next).await?;
                         }
-                        resize_chat_viewport_if_needed(
-                            &state,
+                        // Resolving an approval shrinks the viewport, so this draw
+                        // may rebuild the inline terminal (a cursor query). Route it
+                        // through the stream-safe path since we're on a non-keyboard
+                        // wake-up with the EventStream reader parked.
+                        term_events = draw_active_stream_safe(
+                            term_events,
                             &mut terminal,
+                            &mut state,
                             &mut current_viewport_h,
                         )?;
-                        draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
                     }
                     AppEvent::StreamDelta(delta) => {
                         state.append_stream_delta(&delta);
@@ -453,10 +482,38 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                                 state: ApprovalChatState::Pending { selected: 0 },
                             });
                         }
-                        draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
+                        // Showing the approval grows the viewport, so this draw
+                        // rebuilds the inline terminal (a cursor query) on a
+                        // non-keyboard wake-up — pause the reader for it.
+                        term_events = draw_active_stream_safe(
+                            term_events,
+                            &mut terminal,
+                            &mut state,
+                            &mut current_viewport_h,
+                        )?;
                     }
                     AppEvent::Shutdown => break Ok(()),
                 }
+            }
+            _ = &mut resize_debounce, if resize_pending => {
+                resize_pending = false;
+                // Chat mode: rebuild the inline terminal so its viewport
+                // re-anchors cleanly at the new size; history is left to the
+                // terminal's own reflow. The rebuild queries the cursor (DSR),
+                // which crossterm can't read while the EventStream reader thread
+                // owns stdin — so drop it for the rebuild and resume after.
+                // Dashboard mode is fullscreen — ratatui's autoresize handles it.
+                if matches!(state.mode, ViewMode::Chat) {
+                    drop(term_events);
+                    let rebuilt = rebuild_chat_terminal_after_resize(
+                        &mut terminal,
+                        &state,
+                        &mut current_viewport_h,
+                    );
+                    term_events = EventStream::new();
+                    rebuilt?;
+                }
+                draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
             }
         }
     }
@@ -499,6 +556,65 @@ fn resize_chat_viewport_if_needed(
     *terminal = new_chat_terminal(desired)?;
     *current = desired;
     Ok(())
+}
+
+/// Rebuild the inline chat terminal after a terminal-resize burst settles.
+///
+/// A resize makes the terminal reflow its native scrollback (both the user's
+/// pre-launch shell history and our committed chat lines) — that part is
+/// correct and we leave it alone. What breaks is ratatui's inline viewport:
+/// its in-place `resize()` re-derives the viewport top from a *pre-reflow*
+/// cursor offset, so the live region lands at the wrong row and every later
+/// `insert_before` compounds the drift. Reconstructing the terminal re-queries
+/// the live cursor and anchors a fresh viewport with consistent internal state.
+///
+/// We deliberately do not clear or replay history: clearing would wipe the
+/// reflowed shell history above, and the terminal already reflowed our lines.
+/// The known artifact is that the old input box (a full-width bordered box the
+/// terminal just reflowed, its border line wrapping into extra rows) leaves
+/// stale fragment rows just above the new input. `insert_before` scrolls rather
+/// than overwrites, so these drift upward as new output arrives and only vanish
+/// once they scroll off the top — they are NOT overwritten by the next line.
+/// Fully removing them needs the post-reflow physical layout, which stock
+/// ratatui/crossterm doesn't expose (blind clearing would risk erasing the
+/// history line just above); that's the Codex `custom_terminal` fork territory.
+fn rebuild_chat_terminal_after_resize(
+    terminal: &mut Term,
+    state: &AppState,
+    current: &mut u16,
+) -> io::Result<()> {
+    let desired = desired_viewport_height(state);
+    *terminal = new_chat_terminal(desired)?;
+    *current = desired;
+    Ok(())
+}
+
+/// Run [`draw_active`], dropping the terminal event stream around it when the
+/// draw will rebuild the inline terminal. A rebuild queries the cursor via DSR
+/// (`ESC[6n`), and crossterm's `cursor::position()` can only read that reply off
+/// stdin when no `EventStream` is polling it — otherwise the stream's reader
+/// thread holds crossterm's internal reader and the query times out, surfacing
+/// as an error that tears down the loop. This matters on non-keyboard wake-ups
+/// (an approval popping up, a response resolving an approval) where the reader
+/// is parked. Returns the (possibly recreated) stream so the caller can rebind
+/// it. Keys typed during the brief rebuild stay buffered in the tty.
+fn draw_active_stream_safe(
+    term_events: EventStream,
+    terminal: &mut Term,
+    state: &mut AppState,
+    current_viewport_h: &mut u16,
+) -> anyhow::Result<EventStream> {
+    let will_rebuild = matches!(state.mode, ViewMode::Chat)
+        && desired_viewport_height(state) != *current_viewport_h;
+    if !will_rebuild {
+        draw_active(terminal, state, current_viewport_h)?;
+        return Ok(term_events);
+    }
+    drop(term_events);
+    let drawn = draw_active(terminal, state, current_viewport_h);
+    let stream = EventStream::new();
+    drawn?;
+    Ok(stream)
 }
 
 /// Stream-mode helpers — see [`AppState::streaming`] / `streaming_committed_any`.
