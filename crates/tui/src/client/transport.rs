@@ -266,7 +266,7 @@ fn map_frame(
     queue: &ApprovalQueue,
 ) -> Option<TransportEvent> {
     match frame {
-        Frame::Delta {
+        Frame::AnswerDelta {
             session_id, text, ..
         } => {
             if &session_id != target_session {
@@ -342,6 +342,44 @@ fn map_frame(
             let _ = queue.drop_call(&call_id);
             Some(TransportEvent::ApprovalResolved { call_id, decision })
         }
+        Frame::Reasoning {
+            session_id, text, ..
+        } => {
+            if &session_id != target_session {
+                return None;
+            }
+            Some(TransportEvent::Reasoning(text))
+        }
+        Frame::ToolStarted {
+            session_id,
+            tool,
+            label,
+            ..
+        } => {
+            if &session_id != target_session {
+                return None;
+            }
+            Some(TransportEvent::ToolStarted { tool, label })
+        }
+        Frame::ToolCompleted {
+            session_id,
+            status,
+            summary,
+            ..
+        } => {
+            if &session_id != target_session {
+                return None;
+            }
+            Some(TransportEvent::ToolCompleted { status, summary })
+        }
+        Frame::Status {
+            session_id, phase, ..
+        } => {
+            if &session_id != target_session {
+                return None;
+            }
+            Some(TransportEvent::Status { phase })
+        }
         Frame::SessionUpdated { .. } | Frame::SessionActivity { .. } => {
             // Web-chat sidebar signals — TUI tracks a single session
             // of its own and has no list view, so it ignores rather
@@ -406,7 +444,7 @@ mod tests {
     fn map_frame_forwards_delta_for_pinned_session() {
         let queue = ApprovalQueue::new();
         let target = sid("alpha");
-        let frame = Frame::Delta {
+        let frame = Frame::AnswerDelta {
             session_id: target.clone(),
             user_id: String::new(),
             text: "tick".into(),
@@ -425,7 +463,7 @@ mod tests {
         // leak old-session output into the new transcript.
         let queue = ApprovalQueue::new();
         let target = sid("beta");
-        let frame = Frame::Delta {
+        let frame = Frame::AnswerDelta {
             session_id: sid("alpha"),
             user_id: String::new(),
             text: "stale".into(),
@@ -444,6 +482,58 @@ mod tests {
         let frame = Frame::HistorySnapshot {
             session_id: target.clone(),
             entries: vec!["echo".into()],
+        };
+        assert!(map_frame(frame, &target, &queue).is_none());
+    }
+
+    #[test]
+    fn map_frame_forwards_tool_lifecycle_for_pinned_session() {
+        let queue = ApprovalQueue::new();
+        let target = sid("alpha");
+        match map_frame(
+            Frame::ToolStarted {
+                session_id: target.clone(),
+                user_id: String::new(),
+                call_id: "c1".into(),
+                tool: "Read".into(),
+                label: Some("foo.rs".into()),
+            },
+            &target,
+            &queue,
+        ) {
+            Some(TransportEvent::ToolStarted { tool, label }) => {
+                assert_eq!(tool, "Read");
+                assert_eq!(label.as_deref(), Some("foo.rs"));
+            }
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+        match map_frame(
+            Frame::ToolCompleted {
+                session_id: target.clone(),
+                user_id: String::new(),
+                call_id: "c1".into(),
+                status: "ok".into(),
+                summary: "200 lines".into(),
+            },
+            &target,
+            &queue,
+        ) {
+            Some(TransportEvent::ToolCompleted { status, summary }) => {
+                assert_eq!(status, "ok");
+                assert_eq!(summary, "200 lines");
+            }
+            other => panic!("expected ToolCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_frame_drops_reasoning_for_other_session() {
+        let queue = ApprovalQueue::new();
+        let target = sid("beta");
+        let frame = Frame::Reasoning {
+            session_id: sid("alpha"),
+            user_id: String::new(),
+            text: "stale thought".into(),
         };
         assert!(map_frame(frame, &target, &queue).is_none());
     }

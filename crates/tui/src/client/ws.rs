@@ -202,7 +202,7 @@ impl WsClient {
     }
 
     /// Await the next raw wire frame from Aura. Exposes the full frame
-    /// surface (`Delta`, `Notice`, approval events, …) so streaming and
+    /// surface (`AnswerDelta`, `Notice`, approval events, …) so streaming and
     /// approval-flow consumers can reconstruct them directly.
     pub async fn recv_any(&self) -> Result<Frame, WsClientError> {
         self.recv_frame().await

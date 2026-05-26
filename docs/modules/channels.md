@@ -195,7 +195,8 @@ agent / tool path           channel / connection
 ```
 
 [`AgentOutput`] is the narrow set of things the agent itself emits
-(`Delta`, `Message`, `Notice`). [`SessionEvent`] wraps that plus the
+(`AnswerDelta`, `Reasoning`, `ToolStarted`/`ToolCompleted`, `Message`,
+`Notice`). [`SessionEvent`] wraps that plus the
 channel-side events (`UserEcho`, `ApprovalRequested`, `ApprovalResolved`)
 so the agent's output surface stays statically narrow. The gateway's
 per-connection translator converts each `SessionEvent` to the matching

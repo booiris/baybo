@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_channels::wire::{self, Frame, Message as WireMessage, SessionPatch};
-use aura_channels::{AgentOutput, ChannelKind, MessageRole, OutgoingMessage};
+use aura_channels::{AgentEvent, AgentOutput, ChannelKind, MessageRole, OutgoingMessage};
 use aura_config::ChannelsConfig;
 use aura_gateway::auth::{
     ChannelTokenTable, ClientIdentity, TokenHandle, WEB_CLIENT_LABEL_PREFIX, WEB_OPERATOR_USER_ID,
@@ -212,7 +212,7 @@ async fn web_token_attaches_subscribes_and_receives_dispatch() {
         metadata: MessageMetadata::default(),
         ordinal: Some(7),
     };
-    http_channel.dispatch_agent(AgentOutput::Message(outgoing));
+    http_channel.dispatch_agent(outgoing.into());
 
     let frame = recv_frame_skip_activity(&mut client, Duration::from_secs(2))
         .await
@@ -291,11 +291,11 @@ async fn two_subscribers_to_same_session_both_receive_dispatch() {
     expect_empty_pending_snapshot(&mut tab_a, "shared").await;
     expect_empty_pending_snapshot(&mut tab_b, "shared").await;
 
-    http_channel.dispatch_agent(AgentOutput::Delta {
+    http_channel.dispatch_agent(AgentOutput {
         session_id: "shared".into(),
         user_id: WEB_OPERATOR_USER_ID.into(),
         channel: ChannelType::http(),
-        text: "stream chunk".into(),
+        event: AgentEvent::AnswerDelta("stream chunk".into()),
     });
 
     let a = recv_frame_skip_activity(&mut tab_a, Duration::from_secs(2))
@@ -306,13 +306,13 @@ async fn two_subscribers_to_same_session_both_receive_dispatch() {
         .expect("tab B received");
     for (label, frame) in [("A", a), ("B", b)] {
         match frame {
-            Frame::Delta {
+            Frame::AnswerDelta {
                 session_id, text, ..
             } => {
                 assert_eq!(session_id, "shared", "tab {label} session id");
                 assert_eq!(text, "stream chunk", "tab {label} text");
             }
-            other => panic!("tab {label} expected Delta, got {other:?}"),
+            other => panic!("tab {label} expected AnswerDelta, got {other:?}"),
         }
     }
 
@@ -367,12 +367,14 @@ async fn unsubscribed_session_does_not_receive_dispatch() {
     // connection regardless of subscription — that's the deliberate
     // sidebar signal — so we should receive exactly the pulse and
     // *nothing else*.
-    http_channel.dispatch_agent(AgentOutput::Notice {
+    http_channel.dispatch_agent(AgentOutput {
         session_id: "unrelated".into(),
         user_id: String::new(),
         channel: ChannelType::http(),
-        level: aura_channels::NoticeLevel::Info,
-        text: "for some other tab".into(),
+        event: AgentEvent::Notice {
+            level: aura_channels::NoticeLevel::Info,
+            text: "for some other tab".into(),
+        },
     });
 
     let activity = recv_frame(&mut client, Duration::from_secs(1))
@@ -500,7 +502,7 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
     // F sees activity, without paying for F's full content stream.
     // This exercises both directions through the same dispatch
     // observer: a UserEcho should produce `ActivityKind::User`; an
-    // agent Delta should produce `ActivityKind::Assistant`.
+    // agent AnswerDelta should produce `ActivityKind::Assistant`.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let port_file =
         aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
@@ -527,14 +529,14 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
 
     let http_channel = channel_registry.get(&ChannelType::http()).expect("http");
 
-    // Assistant-side: dispatch a Delta for a session the client never
+    // Assistant-side: dispatch a AnswerDelta for a session the client never
     // subscribed to. Content frame drops on the floor for this
     // connection; the activity pulse broadcasts to every http tab.
-    http_channel.dispatch_agent(AgentOutput::Delta {
+    http_channel.dispatch_agent(AgentOutput {
         session_id: "sess-bg".into(),
         user_id: String::new(),
         channel: ChannelType::http(),
-        text: "agent reply".into(),
+        event: AgentEvent::AnswerDelta("agent reply".into()),
     });
     let activity = recv_frame(&mut client, Duration::from_secs(1))
         .await

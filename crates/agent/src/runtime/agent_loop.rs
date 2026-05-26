@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use aura_channels::{AgentOutput, COMPACT_COMMAND, OutgoingMessage};
+use aura_channels::{
+    AgentEvent, AgentOutput, COMPACT_COMMAND, OutgoingMessage, ToolStatus, TurnStatus,
+};
 use aura_context::ContextManager;
 use aura_job::{JobInput, JobLifecycle, JobOutput};
 use aura_llm::{
@@ -44,6 +46,68 @@ const STREAM_BUFFER_HIGH_WATER: usize = 128;
 /// screenshots from earlier iterations are typically stale anyway
 /// (page state has moved on).
 const MAX_ATTACHMENTS_PER_TURN: usize = 16;
+
+/// Max characters in a `ToolCompleted` progress summary before it is
+/// truncated with an ellipsis. Presentation-only — the full result still
+/// reaches the LLM (capped separately) and the trace.
+const TOOL_SUMMARY_MAX: usize = 80;
+
+/// Trim and length-cap a single-line summary string. Char-based so a
+/// multibyte boundary is never split.
+fn truncate_summary(s: &str) -> String {
+    let s = s.trim();
+    let mut out: String = s.chars().take(TOOL_SUMMARY_MAX).collect();
+    if s.chars().count() > TOOL_SUMMARY_MAX {
+        out.push('…');
+    }
+    out
+}
+
+/// Render a tool's textual output as a short progress caption: the
+/// trimmed single line when it is one short line, else a line count.
+/// Never returns raw multi-line content — the caller still sanitizes it
+/// for leaks before it leaves the agent.
+fn summarize_text(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return "no output".to_string();
+    }
+    let lines = trimmed.lines().count();
+    if lines <= 1 {
+        truncate_summary(trimmed)
+    } else {
+        format!("{lines} lines")
+    }
+}
+
+/// Derive the `(status, summary)` for a finished tool call's
+/// `ToolCompleted` progress event from its result. Presentation-only and
+/// content-light; the summary still passes the leak boundary before it is
+/// emitted. Mirrors the result match the loop runs for the LLM-facing
+/// `tool_result` text.
+fn tool_completion_summary(result: &anyhow::Result<ToolOutput>) -> (ToolStatus, String) {
+    match result {
+        Ok(ToolOutput::Text(s)) => (ToolStatus::Ok, summarize_text(s)),
+        Ok(ToolOutput::Json(_)) => (ToolStatus::Ok, "ok".to_string()),
+        Ok(ToolOutput::WithAttachments { attachments, .. }) => (
+            ToolStatus::Ok,
+            format!("{} attachment(s)", attachments.len()),
+        ),
+        Ok(ToolOutput::MultiModalText { llm_images, .. }) => {
+            (ToolStatus::Ok, format!("{} image(s)", llm_images.len()))
+        }
+        Ok(ToolOutput::Error(msg)) => (ToolStatus::Error, truncate_summary(msg)),
+        Err(e) => {
+            if let Some(aura_tools::ToolError::Denied { .. }) =
+                e.downcast_ref::<aura_tools::ToolError>()
+            {
+                (ToolStatus::Denied, "denied".to_string())
+            } else {
+                (ToolStatus::Error, truncate_summary(&e.to_string()))
+            }
+        }
+    }
+}
 
 /// Compute the byte index at which it is safe to flush `pending` to the
 /// output stream. Anything after that index is withheld because it might
@@ -142,12 +206,11 @@ impl aura_tools::SessionNotifier for DeltaTxNotifier {
         } else {
             format!("{summary}: {detail}")
         };
-        let _ = self.tx.try_send(AgentOutput::Notice {
+        let _ = self.tx.try_send(AgentOutput {
             session_id: self.session_id.clone(),
             user_id: self.user_id.clone(),
             channel: self.channel.clone(),
-            level,
-            text,
+            event: AgentEvent::Notice { level, text },
         });
     }
 }
@@ -323,10 +386,10 @@ impl AgentLoop {
     /// Run the main conversation loop for a single user message.
     ///
     /// When `delta_tx` is `Some`, each text chunk emitted by the LLM is
-    /// forwarded as `AgentOutput::Delta` so adapters that support partial
+    /// forwarded as `AgentEvent::AnswerDelta` so adapters that support partial
     /// rendering (e.g. the TUI) can show incremental output. The final
     /// `OutgoingMessage` returned here should still be dispatched by the
-    /// caller as `AgentOutput::Message` so non-streaming adapters receive
+    /// caller as `AgentEvent::Message` so non-streaming adapters receive
     /// the canonical response.
     // `job_input` records why this job exists (provenance: which trigger
     // kicked it off — User / Cron / System / Spawned), used for the JobSpec.
@@ -422,9 +485,9 @@ impl AgentLoop {
         let _ = job_lifecycle;
         self.context_manager.ensure_seeded().await;
 
-        // Tool-authored notices (`AgentOutput::Notice`) ride the job-wide
+        // Tool-authored notices (`AgentEvent::Notice`) ride the job-wide
         // delta_tx directly, not the per-iteration `iter_delta_tx`: they
-        // are a distinct output variant from the LLM's streamed `Delta`
+        // are a distinct output variant from the LLM's streamed `AnswerDelta`
         // and must reach the channel on every iteration, independent of
         // any per-iteration streaming decision.
         let notifier: Option<Arc<dyn aura_tools::SessionNotifier>> = delta_tx.as_ref().map(|tx| {
@@ -487,8 +550,14 @@ impl AgentLoop {
             }
 
             // Proactive compression before building the ChatRequest.
-            self.compress_if_needed(session, span_recorder, job_id, &cancel_token)
-                .await?;
+            self.compress_if_needed(
+                session,
+                span_recorder,
+                job_id,
+                &cancel_token,
+                delta_tx.as_ref(),
+            )
+            .await?;
 
             // Stream deltas on every iteration, not just the first. The
             // final answer can land on any iteration (it follows however
@@ -663,6 +732,16 @@ impl AgentLoop {
         let assistant_msg = ChatMessage::assistant(assistant_blocks);
         self.context_manager.append(&assistant_msg).await;
 
+        // Surface each tool call as a live progress line before dispatch
+        // (streaming turns only; cron / subagent pass `delta_tx = None`).
+        // Emitted ahead of `join_all` so the user sees "starting" before
+        // any approval prompt the executor raises mid-call.
+        for tc in &response.tool_calls {
+            let label = self.tool_registry.progress_label(&tc.name, &tc.arguments);
+            self.emit_tool_started(delta_tx, session, tc.id.clone(), tc.name.clone(), label)
+                .await;
+        }
+
         // Execute tool calls concurrently. Approved resources are shared
         // via a Mutex so concurrent calls see each other's grants
         // immediately. Wrapped in an `Arc` so that any persist-always
@@ -731,6 +810,10 @@ impl AgentLoop {
         // Sequential post-processing: append results in `tool_calls`
         // order so context state stays byte-stable across calls.
         for (tool_call, tool_result) in response.tool_calls.iter().zip(tool_results) {
+            let (status, raw_summary) = tool_completion_summary(&tool_result);
+            self.emit_tool_completed(delta_tx, session, tool_call.id.clone(), status, raw_summary)
+                .await;
+
             let mut llm_visible_images: Vec<ContentBlock> = Vec::new();
             let raw_result_text = match &tool_result {
                 Ok(ToolOutput::Text(s)) => s.clone(),
@@ -1187,6 +1270,11 @@ impl AgentLoop {
         // formatting is preserved.
         let mut leading_stripped = false;
 
+        // Separate buffer for reasoning ("thinking") fragments — same
+        // placeholder-safe flush discipline as the answer text, but
+        // streamed as ephemeral `Reasoning` rather than answer `AnswerDelta`.
+        let mut pending_reasoning = String::new();
+
         while let Some(event) = stream.next().await {
             let event = match event {
                 Ok(e) => e,
@@ -1207,7 +1295,19 @@ impl AgentLoop {
                     }
                 }
                 StreamEvent::ToolCall(info) => tool_calls.push(info),
-                StreamEvent::Reasoning(r) => thinking.push_str(&r),
+                StreamEvent::Reasoning(r) => {
+                    // Raw accumulates into `thinking` for the response (sanitized
+                    // wholesale at finalize); a parallel buffer streams it to the
+                    // channel through the same leak boundary the answer text uses.
+                    thinking.push_str(&r);
+                    pending_reasoning.push_str(&r);
+                    let flush_to = safe_flush_boundary(&pending_reasoning);
+                    if flush_to > 0 {
+                        let flushable: String = pending_reasoning.drain(..flush_to).collect();
+                        self.stream_emit_reasoning(&flushable, session, delta_tx)
+                            .await;
+                    }
+                }
                 StreamEvent::ThinkingBlock(block) => thinking_blocks.push(block),
                 StreamEvent::Usage(u) => usage = u,
             }
@@ -1220,6 +1320,13 @@ impl AgentLoop {
                 self.stream_emit(&flushable, session, &mut content, delta_tx)
                     .await;
             }
+        }
+
+        // Flush any remaining buffered reasoning.
+        if !pending_reasoning.is_empty() {
+            let flushable = std::mem::take(&mut pending_reasoning);
+            self.stream_emit_reasoning(&flushable, session, delta_tx)
+                .await;
         }
 
         // Build content_blocks: thinking blocks first (providers expect
@@ -1272,11 +1379,11 @@ impl AgentLoop {
         content.push_str(&sanitized);
 
         if delta_tx
-            .send(AgentOutput::Delta {
+            .send(AgentOutput {
                 session_id: session.id.clone(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
-                text: sanitized,
+                event: AgentEvent::AnswerDelta(sanitized),
             })
             .await
             .is_err()
@@ -1285,26 +1392,162 @@ impl AgentLoop {
         }
     }
 
+    /// Stream a reasoning ("thinking") fragment to the channel as
+    /// `AgentEvent::Reasoning`, through the same leak boundary as `AnswerDelta`.
+    /// Reasoning is ephemeral progress, so it `try_send`s and drops on a
+    /// full channel rather than backpressuring the LLM stream.
+    async fn stream_emit_reasoning(
+        &self,
+        fragment: &str,
+        session: &Session,
+        delta_tx: &mpsc::Sender<AgentOutput>,
+    ) {
+        let sanitized = match self
+            .security_gateway
+            .sanitize_stream_fragment(fragment)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to sanitize reasoning fragment; dropping");
+                return;
+            }
+        };
+        let _ = delta_tx.try_send(AgentOutput {
+            session_id: session.id.clone(),
+            user_id: session.user.id.clone(),
+            channel: session.channel.clone(),
+            event: AgentEvent::Reasoning(sanitized),
+        });
+    }
+
+    /// Emit a `ToolStarted` progress event before a tool call runs. The
+    /// `label` (from `Tool::progress_label`, derived from LLM-written
+    /// arguments) passes the leak boundary first. No-op when the turn
+    /// isn't streaming (`delta_tx` is `None`: cron / subagent).
+    async fn emit_tool_started(
+        &self,
+        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        session: &Session,
+        call_id: String,
+        tool: String,
+        raw_label: Option<String>,
+    ) {
+        let Some(tx) = delta_tx else { return };
+        let label = match raw_label {
+            Some(l) => self
+                .security_gateway
+                .sanitize_stream_fragment(&l)
+                .await
+                .ok(),
+            None => None,
+        };
+        let _ = tx
+            .send(AgentOutput {
+                session_id: session.id.clone(),
+                user_id: session.user.id.clone(),
+                channel: session.channel.clone(),
+                event: AgentEvent::ToolStarted {
+                    call_id,
+                    tool,
+                    label,
+                },
+            })
+            .await;
+    }
+
+    /// Emit a `ToolCompleted` progress event after a tool call returns.
+    /// `raw_summary` passes the leak boundary before leaving the agent; on
+    /// a sanitize failure the summary is dropped (empty) rather than risk
+    /// a leak. No-op when the turn isn't streaming.
+    async fn emit_tool_completed(
+        &self,
+        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        session: &Session,
+        call_id: String,
+        status: ToolStatus,
+        raw_summary: String,
+    ) {
+        let Some(tx) = delta_tx else { return };
+        let summary = self
+            .security_gateway
+            .sanitize_stream_fragment(&raw_summary)
+            .await
+            .unwrap_or_default();
+        let _ = tx
+            .send(AgentOutput {
+                session_id: session.id.clone(),
+                user_id: session.user.id.clone(),
+                channel: session.channel.clone(),
+                event: AgentEvent::ToolCompleted {
+                    call_id,
+                    status,
+                    summary,
+                },
+            })
+            .await;
+    }
+
+    /// Emit a transient turn-[`AgentEvent::Status`] event (today:
+    /// compaction start/end). No sanitization — the variant carries no
+    /// free text. No-op when the turn isn't streaming (`delta_tx` is
+    /// `None`: cron / subagent).
+    async fn emit_status(
+        &self,
+        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        session: &Session,
+        status: TurnStatus,
+    ) {
+        let Some(tx) = delta_tx else { return };
+        let _ = tx
+            .send(AgentOutput {
+                session_id: session.id.clone(),
+                user_id: session.user.id.clone(),
+                channel: session.channel.clone(),
+                event: AgentEvent::Status(status),
+            })
+            .await;
+    }
+
     /// Compress if the budget calls for it. The `chat` closure is
     /// invoked only when the strategy returns `NeedsLlmCall`; pure
     /// strategies (Truncate, Summarize fallback) skip it entirely. The
     /// closure brackets the real LLM call in a `Compression` step +
     /// `LlmCall` span and records cost against that span — budget
     /// enforcement on the call itself rides on the wrapped client.
+    ///
+    /// Reports the compaction phase as `Status(Compacting)` / `Compacted`
+    /// when a pass actually runs, so the user sees why the turn paused.
     async fn compress_if_needed(
         &mut self,
         session: &mut Session,
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
         cancel_token: &CancellationToken,
+        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<()> {
         let runner = self.build_compression_runner(session, span_recorder, job_id, cancel_token);
         let model_id = runner.model_info.id.clone();
-        self.context_manager
+        // `needs_compression` mirrors `maybe_compress`'s gate, so we only
+        // report the phase when a pass will actually run; the `Compacted`
+        // end always follows the `Compacting` start (emitted even on a
+        // compress error) so the status line never dangles.
+        let compacting = self.context_manager.needs_compression(&model_id);
+        if compacting {
+            self.emit_status(delta_tx, session, TurnStatus::Compacting)
+                .await;
+        }
+        let result = self
+            .context_manager
             .maybe_compress(&model_id, |req| async move {
                 runner.run(req).await.map(|run| run.response)
             })
-            .await?;
+            .await;
+        if compacting {
+            self.emit_status(delta_tx, session, TurnStatus::Compacted)
+                .await;
+        }
+        result?;
         Ok(())
     }
 
@@ -1329,7 +1572,7 @@ impl AgentLoop {
     }
 
     /// Run an on-demand compression pass and return the confirmation
-    /// text for the caller to ship as an `AgentOutput::Notice`.
+    /// text for the caller to ship as an `AgentEvent::Notice`.
     /// The variants of `CompressionOutcome` map to specific user-facing
     /// messages so the caller (typically a `/compact` notice) can
     /// distinguish "strategy declined", "no savings", and a real
@@ -1615,7 +1858,7 @@ fn trim_response_text_edges(response: &mut LlmResponse) {
 #[cfg(test)]
 mod notifier_bridge_tests {
     use super::*;
-    use aura_channels::AgentOutput;
+    use aura_channels::{AgentEvent, AgentOutput};
     use aura_tools::{NoticeLevel as ToolsNoticeLevel, SessionNotifier};
 
     fn mk_notifier() -> (DeltaTxNotifier, tokio::sync::mpsc::Receiver<AgentOutput>) {
@@ -1635,9 +1878,8 @@ mod notifier_bridge_tests {
         n.emit(ToolsNoticeLevel::Warn, "summary", "detail");
         let out = rx.try_recv().expect("notice should be queued");
         match out {
-            AgentOutput::Notice {
-                level,
-                text,
+            AgentOutput {
+                event: AgentEvent::Notice { level, text },
                 session_id,
                 user_id,
                 ..
@@ -1656,7 +1898,10 @@ mod notifier_bridge_tests {
         let (n, mut rx) = mk_notifier();
         n.emit(ToolsNoticeLevel::Error, "blocked", "rationale");
         match rx.try_recv().unwrap() {
-            AgentOutput::Notice { level, text, .. } => {
+            AgentOutput {
+                event: AgentEvent::Notice { level, text },
+                ..
+            } => {
                 assert_eq!(level, aura_channels::NoticeLevel::Error);
                 assert_eq!(text, "blocked: rationale");
             }
@@ -1669,7 +1914,10 @@ mod notifier_bridge_tests {
         let (n, mut rx) = mk_notifier();
         n.emit(ToolsNoticeLevel::Warn, "headline", "");
         match rx.try_recv().unwrap() {
-            AgentOutput::Notice { text, .. } => assert_eq!(text, "headline"),
+            AgentOutput {
+                event: AgentEvent::Notice { text, .. },
+                ..
+            } => assert_eq!(text, "headline"),
             _ => panic!(),
         }
     }

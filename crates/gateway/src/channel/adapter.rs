@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use aura_channels::wire::{self, AttachmentKind, Frame, Message as WireMessage, WireAttachment};
 use aura_channels::{
-    AgentOutput, Channel, ChannelError, ChannelRegistry, Connection, ConnectionId, ConnectionSink,
-    MessageRole, NoticeLevel, SendOutcome, SessionEvent,
+    AgentEvent, AgentOutput, Channel, ChannelError, ChannelRegistry, Connection, ConnectionId,
+    ConnectionSink, MessageRole, NoticeLevel, SendOutcome, SessionEvent, ToolStatus, TurnStatus,
 };
 use aura_model::{ChannelType, ContentBlock};
 use aura_store::BlobStore;
@@ -301,18 +301,64 @@ async fn agent_output_to_frame(
     channel_type: &ChannelType,
     blob_store: &dyn BlobStore,
 ) -> Frame {
-    match output {
-        AgentOutput::Delta {
-            session_id,
-            user_id,
-            text,
-            ..
-        } => Frame::Delta {
+    let AgentOutput {
+        session_id,
+        user_id,
+        event,
+        ..
+    } = output;
+    match event {
+        AgentEvent::AnswerDelta(text) => Frame::AnswerDelta {
             session_id,
             user_id,
             text,
         },
-        AgentOutput::Message(response) => {
+        AgentEvent::Reasoning(text) => Frame::Reasoning {
+            session_id,
+            user_id,
+            text,
+        },
+        AgentEvent::ToolStarted {
+            call_id,
+            tool,
+            label,
+        } => Frame::ToolStarted {
+            session_id,
+            user_id,
+            call_id,
+            tool,
+            label,
+        },
+        AgentEvent::ToolCompleted {
+            call_id,
+            status,
+            summary,
+        } => {
+            let status = match status {
+                ToolStatus::Ok => "ok",
+                ToolStatus::Error => "error",
+                ToolStatus::Denied => "denied",
+            };
+            Frame::ToolCompleted {
+                session_id,
+                user_id,
+                call_id,
+                status: status.to_owned(),
+                summary,
+            }
+        }
+        AgentEvent::Status(status) => {
+            let phase = match status {
+                TurnStatus::Compacting => "compacting",
+                TurnStatus::Compacted => "compacted",
+            };
+            Frame::Status {
+                session_id,
+                user_id,
+                phase: phase.to_owned(),
+            }
+        }
+        AgentEvent::Message(response) => {
             let (content, attachments) = split_content(&response.content, blob_store).await;
             Frame::Message(WireMessage {
                 content,
@@ -332,13 +378,7 @@ async fn agent_output_to_frame(
                 ordinal: response.ordinal,
             })
         }
-        AgentOutput::Notice {
-            session_id,
-            user_id,
-            level,
-            text,
-            ..
-        } => {
+        AgentEvent::Notice { level, text } => {
             let level = match level {
                 NoticeLevel::Info => "info",
                 NoticeLevel::Warn => "warn",

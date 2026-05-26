@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::AgentOutput;
+use aura_channels::{AgentEvent, AgentOutput};
 use aura_integration_tests::AgentTestHarness;
 use aura_llm::{StreamEvent, ToolCallInfo};
 use aura_model::{BlobRef, ContentBlock, Role};
@@ -67,7 +67,10 @@ async fn multi_modal_text_forwards_image_to_user_channel_and_next_llm_turn() {
     let final_msg = outs
         .iter()
         .find_map(|o| match o {
-            AgentOutput::Message(m) => Some(m),
+            AgentOutput {
+                event: AgentEvent::Message(m),
+                ..
+            } => Some(m),
             _ => None,
         })
         .expect("expected a final Message");
@@ -155,7 +158,10 @@ async fn with_attachments_does_not_round_trip_image_to_llm() {
     let final_msg = outs
         .iter()
         .find_map(|o| match o {
-            AgentOutput::Message(m) => Some(m),
+            AgentOutput {
+                event: AgentEvent::Message(m),
+                ..
+            } => Some(m),
             _ => None,
         })
         .expect("final Message");

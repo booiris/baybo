@@ -7,7 +7,7 @@
 //! throttle window has elapsed, emits a `Frame::SessionActivity` to
 //! every connection on the channel — subscribed or not. That's the
 //! whole point: a sidebar tab parked on session A still wants the
-//! cheap "F had activity" signal without paying for F's full Delta
+//! cheap "F had activity" signal without paying for F's full AnswerDelta
 //! stream.
 //!
 //! The two pulse streams (user / assistant) throttle independently
@@ -31,7 +31,7 @@ use dashmap::DashMap;
 
 /// Coalescing window. Short enough that the sidebar age string never
 /// looks more than a beat stale; long enough that a five-message burst
-/// (or a fifty-token Delta stream) fans out exactly one frame per
+/// (or a fifty-token AnswerDelta stream) fans out exactly one frame per
 /// source.
 const THROTTLE_WINDOW: Duration = Duration::from_millis(1500);
 
@@ -64,7 +64,7 @@ impl SessionPulse {
     pub(crate) fn observe(&self, event: &SessionEvent, view: SubscribedView<'_>) {
         let (session_id, source) = match event {
             SessionEvent::UserEcho(msg) => (msg.message.session_id.clone(), ActivityKind::User),
-            SessionEvent::Agent(out) => (out.session_id().clone(), ActivityKind::Assistant),
+            SessionEvent::Agent(out) => (out.session_id.clone(), ActivityKind::Assistant),
             // Approval prompts already have their own dedicated frame
             // (`ApprovalRequested`) that reaches every subscriber to
             // the call's session. Re-emitting as activity would

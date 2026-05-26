@@ -61,8 +61,8 @@ pub enum ActivityKind {
     /// tab of the same operator, or arrived via a non-http channel
     /// (telegram/weixin) that the operator also watches.
     User,
-    /// The agent emitted toward the session: streaming `Delta`, a
-    /// final `Message`, or a `Notice`. First Delta of a stream is the
+    /// The agent emitted toward the session: streaming `AnswerDelta`, a
+    /// final `Message`, or a `Notice`. First AnswerDelta of a stream is the
     /// "agent started responding" signal; throttling collapses the
     /// rest.
     Assistant,
@@ -243,18 +243,70 @@ pub enum Frame {
     /// echo of inbound to other subscribers of the same session
     /// (role=User).
     Message(Message),
-    /// Server → client: incremental assistant text chunk for the
-    /// in-flight response on a session. Channels without a partial
+    /// Server → client: incremental assistant **answer** text chunk for
+    /// the in-flight response on a session (the reply prose — distinct
+    /// from `Reasoning`, the thinking trace). Channels without a partial
     /// surface may drop this. `user_id` mirrors the Message frame so
     /// sidecars that route outbound by platform user (Telegram chat,
     /// Discord DM) don't need a `session_id → user` reverse map.
     /// Empty string for non-user-addressed emissions (cron, system).
-    Delta {
+    AnswerDelta {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         user_id: String,
         text: String,
+    },
+    /// Server → client: incremental model reasoning ("thinking") chunk
+    /// for the in-flight response. Rendered dim/collapsible; channels
+    /// without a reasoning surface drop it. `user_id` mirrors `AnswerDelta` —
+    /// empty string for non-user-addressed emissions (cron, system).
+    Reasoning {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        text: String,
+    },
+    /// Server → client: a tool call started. Clients render it as a live
+    /// work-progress line; `label` is a human preview (falling back to
+    /// `tool` when absent) and `call_id` pairs it with the later
+    /// `ToolCompleted`. Channels without a progress surface drop it.
+    ToolStarted {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        call_id: String,
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        label: Option<String>,
+    },
+    /// Server → client: a tool call finished. `status` is a lower-case
+    /// string (`"ok"` / `"error"` / `"denied"`) like `Notice.level`, so
+    /// third-party clients don't need a typed enum; `summary` is a short
+    /// result rendering. Pairs with `ToolStarted` by `call_id`.
+    ToolCompleted {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        call_id: String,
+        status: String,
+        summary: String,
+    },
+    /// Server → client: a coarse turn-phase transition for a transient
+    /// status line. `phase` is a lower-case string (today `"compacting"` /
+    /// `"compacted"` for context compaction start/end); clients show a
+    /// spinner/banner on the start and clear it on the matching end, and
+    /// surfaces without one drop it.
+    Status {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        phase: String,
     },
     /// Server → client: out-of-band notice surfaced by the agent
     /// (skill warnings, degraded-mode banners). `level` is a lower-
@@ -402,7 +454,7 @@ pub enum Frame {
     /// that is the whole point: a sidebar tab whose operator is
     /// looking at session A still gets a cheap unread signal for
     /// session F, without having to subscribe to F and pay for the
-    /// full Delta stream.
+    /// full AnswerDelta stream.
     ///
     /// Throttled at the broadcaster (see
     /// `gateway::channel::session_pulse`) to one frame per
@@ -625,7 +677,7 @@ mod tests {
 
     #[test]
     fn round_trip_delta() {
-        let frame = Frame::Delta {
+        let frame = Frame::AnswerDelta {
             session_id: "s1".into(),
             user_id: "u1".into(),
             text: "hel".into(),

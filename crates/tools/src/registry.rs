@@ -151,6 +151,14 @@ impl ToolRegistry {
         self.builtin.get(name).cloned()
     }
 
+    /// Short progress preview for a pending call via
+    /// [`Tool::progress_label`] (Bash's command, WebFetch's URL, …).
+    /// `None` when the tool is unregistered or declares no preview. Used by
+    /// the agent loop to caption `ToolStarted` progress events.
+    pub fn progress_label(&self, name: &str, params: &Value) -> Option<String> {
+        self.get(name).and_then(|tool| tool.progress_label(params))
+    }
+
     /// Execute a tool by name with the given parameters and context.
     pub async fn execute(
         &self,

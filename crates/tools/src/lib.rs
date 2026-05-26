@@ -60,6 +60,17 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Short preview of this call for the live progress line
+    /// (`⏺ tool(label)` — see `docs/turn-progress-events.md`). Defaults to
+    /// [`Self::call_label`] so a tool whose approval label is already a
+    /// good preview reuses it (e.g. WebFetch's URL). A tool whose
+    /// `call_label` is a *warning* rather than a preview — e.g. Bash,
+    /// which only labels destructive commands — overrides this to return a
+    /// plain preview of the action (the command) for every call.
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        self.call_label(params)
+    }
+
     /// Maximum wall-clock time this tool is allowed to run, declared
     /// by the tool itself. The default is 30 s; tools whose natural
     /// upper bound differs (e.g. `BashTool` for long shell commands,
@@ -137,7 +148,7 @@ pub struct ToolContext {
 /// Severity of a [`SessionNotifier`] event. Matches
 /// `aura_channels::NoticeLevel` exactly — the agent-loop bridge does
 /// a one-to-one variant mapping when it forwards onto
-/// `AgentOutput::Notice`.
+/// `AgentEvent::Notice`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeLevel {
     Info,

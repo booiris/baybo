@@ -290,7 +290,7 @@ impl Channel {
                 let Some(subs) = self.subscriptions.get(&session_id) else {
                     // Drop ephemeral: the storage layer persists
                     // Messages before this dispatch site, so the
-                    // session history is the canonical record. Delta /
+                    // session history is the canonical record. AnswerDelta /
                     // Notice / ApprovalRequested are advisory and
                     // recoverable via REST.
                     return;

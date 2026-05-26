@@ -229,6 +229,70 @@ pub(crate) fn render_stream_line(text: &str, is_continuation: bool) -> Vec<Line<
     vec![Line::from(vec![leader, Span::raw(text.to_string())])]
 }
 
+/// One dim line of the agent's reasoning ("thinking") trace. The first
+/// line of a run gets a `✻ ` leader; continuations align under it. All
+/// `DarkGray` so it reads as background working, distinct from the
+/// `aura> ` answer. `is_continuation` mirrors
+/// `AppState::reasoning_committed_any`.
+pub(crate) fn render_reasoning_line(text: &str, is_continuation: bool) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let leader = if is_continuation { "  " } else { "✻ " };
+    vec![Line::from(vec![
+        Span::styled(leader, dim),
+        Span::styled(text.to_string(), dim),
+    ])]
+}
+
+/// A `⏺ tool(label)` line committed the moment a tool call is dispatched.
+/// The bullet + name are cyan; the optional human label is dim in parens.
+pub(crate) fn render_tool_started(tool: &str, label: Option<&str>) -> Vec<Line<'static>> {
+    let mut spans = vec![
+        Span::styled("⏺ ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            tool.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(label) = label.filter(|l| !l.is_empty()) {
+        spans.push(Span::styled(
+            format!("({label})"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    vec![Line::from(spans)]
+}
+
+/// A `⎿ summary` line committed when a tool call finishes, coloured by
+/// `status` (`"error"` red, `"denied"` yellow, else dim).
+pub(crate) fn render_tool_completed(status: &str, summary: &str) -> Vec<Line<'static>> {
+    let color = match status {
+        "error" => Color::Red,
+        "denied" => Color::Yellow,
+        _ => Color::DarkGray,
+    };
+    vec![Line::from(vec![
+        Span::styled("  ⎿ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(summary.to_string(), Style::default().fg(color)),
+    ])]
+}
+
+/// A dim turn-status line (`⟳ …`) for a coarse phase transition — today
+/// context compaction start/end. Unknown phases render verbatim.
+pub(crate) fn render_status_line(phase: &str) -> Vec<Line<'static>> {
+    let text = match phase {
+        "compacting" => "Compacting context…",
+        "compacted" => "Context compacted",
+        other => other,
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    vec![Line::from(vec![
+        Span::styled("⟳ ", dim),
+        Span::styled(text.to_string(), dim),
+    ])]
+}
+
 /// Render the non-text portion of a finalised assistant response. Text
 /// blocks are skipped because they've already been streamed line-by-line
 /// to scrollback; only blocks that aren't covered by the stream
@@ -624,6 +688,39 @@ mod tests {
     /// snapshot just the visible characters of a rendered banner.
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn tool_started_line_shows_bullet_name_and_label() {
+        let lines = render_tool_started("Read", Some("foo.rs"));
+        let text = line_text(&lines[0]);
+        assert!(text.starts_with("⏺ "), "got {text:?}");
+        assert!(text.contains("Read"));
+        assert!(text.contains("(foo.rs)"));
+    }
+
+    #[test]
+    fn tool_started_line_omits_empty_label() {
+        assert_eq!(line_text(&render_tool_started("now", None)[0]), "⏺ now");
+        assert_eq!(line_text(&render_tool_started("now", Some(""))[0]), "⏺ now");
+    }
+
+    #[test]
+    fn tool_completed_line_shows_connector_and_summary() {
+        let text = line_text(&render_tool_completed("ok", "200 lines")[0]);
+        assert!(text.contains('⎿'), "got {text:?}");
+        assert!(text.contains("200 lines"));
+    }
+
+    #[test]
+    fn reasoning_line_leader_differs_by_continuation() {
+        let first = line_text(&render_reasoning_line("hmm", false)[0]);
+        let cont = line_text(&render_reasoning_line("more", true)[0]);
+        assert!(first.starts_with("✻ "), "got {first:?}");
+        assert!(
+            cont.starts_with("  ") && !cont.contains('✻'),
+            "got {cont:?}"
+        );
     }
 
     #[test]
