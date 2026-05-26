@@ -159,7 +159,7 @@ async fn check_child_terminal_via_store(
 
 /// Drain `output_rx` until the child actor's final `AgentEvent::Message`
 /// arrives (or the channel closes). Other `AgentOutput` variants
-/// (`Delta`, `Notice`) are skipped — only `Message` carries the
+/// (`AnswerDelta`, `Notice`) are skipped — only `Message` carries the
 /// subagent's final content. Bounded by the caller's outer timeout.
 async fn drain_for_final_message(
     output_rx: &mut mpsc::Receiver<AgentOutput>,

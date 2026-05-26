@@ -266,7 +266,7 @@ fn map_frame(
     queue: &ApprovalQueue,
 ) -> Option<TransportEvent> {
     match frame {
-        Frame::Delta {
+        Frame::AnswerDelta {
             session_id, text, ..
         } => {
             if &session_id != target_session {
@@ -436,7 +436,7 @@ mod tests {
     fn map_frame_forwards_delta_for_pinned_session() {
         let queue = ApprovalQueue::new();
         let target = sid("alpha");
-        let frame = Frame::Delta {
+        let frame = Frame::AnswerDelta {
             session_id: target.clone(),
             user_id: String::new(),
             text: "tick".into(),
@@ -455,7 +455,7 @@ mod tests {
         // leak old-session output into the new transcript.
         let queue = ApprovalQueue::new();
         let target = sid("beta");
-        let frame = Frame::Delta {
+        let frame = Frame::AnswerDelta {
             session_id: sid("alpha"),
             user_id: String::new(),
             text: "stale".into(),

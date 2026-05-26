@@ -61,8 +61,8 @@ pub enum ActivityKind {
     /// tab of the same operator, or arrived via a non-http channel
     /// (telegram/weixin) that the operator also watches.
     User,
-    /// The agent emitted toward the session: streaming `Delta`, a
-    /// final `Message`, or a `Notice`. First Delta of a stream is the
+    /// The agent emitted toward the session: streaming `AnswerDelta`, a
+    /// final `Message`, or a `Notice`. First AnswerDelta of a stream is the
     /// "agent started responding" signal; throttling collapses the
     /// rest.
     Assistant,
@@ -243,13 +243,14 @@ pub enum Frame {
     /// echo of inbound to other subscribers of the same session
     /// (role=User).
     Message(Message),
-    /// Server → client: incremental assistant text chunk for the
-    /// in-flight response on a session. Channels without a partial
+    /// Server → client: incremental assistant **answer** text chunk for
+    /// the in-flight response on a session (the reply prose — distinct
+    /// from `Reasoning`, the thinking trace). Channels without a partial
     /// surface may drop this. `user_id` mirrors the Message frame so
     /// sidecars that route outbound by platform user (Telegram chat,
     /// Discord DM) don't need a `session_id → user` reverse map.
     /// Empty string for non-user-addressed emissions (cron, system).
-    Delta {
+    AnswerDelta {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -258,7 +259,7 @@ pub enum Frame {
     },
     /// Server → client: incremental model reasoning ("thinking") chunk
     /// for the in-flight response. Rendered dim/collapsible; channels
-    /// without a reasoning surface drop it. `user_id` mirrors `Delta` —
+    /// without a reasoning surface drop it. `user_id` mirrors `AnswerDelta` —
     /// empty string for non-user-addressed emissions (cron, system).
     Reasoning {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
@@ -441,7 +442,7 @@ pub enum Frame {
     /// that is the whole point: a sidebar tab whose operator is
     /// looking at session A still gets a cheap unread signal for
     /// session F, without having to subscribe to F and pay for the
-    /// full Delta stream.
+    /// full AnswerDelta stream.
     ///
     /// Throttled at the broadcaster (see
     /// `gateway::channel::session_pulse`) to one frame per
@@ -664,7 +665,7 @@ mod tests {
 
     #[test]
     fn round_trip_delta() {
-        let frame = Frame::Delta {
+        let frame = Frame::AnswerDelta {
             session_id: "s1".into(),
             user_id: "u1".into(),
             text: "hel".into(),

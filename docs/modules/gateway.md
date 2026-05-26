@@ -630,8 +630,12 @@ The full frame set (see `crates/channels/src/wire.rs`):
   since_ordinal? }`, `Unsubscribe { session_id }`. `Multiplexed`
   channels (telegram/weixin/discord) auto-wildcard and ignore these.
 - **Messages:** `Message` (user input in; agent's final response or an
-  echo of inbound to other subscribers out), `Delta` (incremental
-  assistant text, server → client), `Notice` (out-of-band warn/error).
+  echo of inbound to other subscribers out), `AnswerDelta` (incremental
+  answer text, server → client), `Notice` (out-of-band warn/error).
+- **Turn progress (server → client):** `Reasoning` (incremental thinking),
+  `ToolStarted` / `ToolCompleted` (tool-call lifecycle). Streaming clients
+  (TUI / web) render these live; clients without a partial surface drop
+  them. See [`docs/turn-progress-events.md`](../turn-progress-events.md).
 - **Approvals:** `ApprovalRequested` / `ApprovalResolved` (server →
   client), `ResolveApproval` (client → server), `PendingApprovalsSnapshot
   { session_id, call_ids }` (server → client, on Subscribe).
@@ -643,12 +647,13 @@ The full frame set (see `crates/channels/src/wire.rs`):
 - **Web-chat session signalling (http channel):** `SessionUpdated
   { session_id, patch }`, `SessionActivity { session_id, source, at }`.
 
-A note on `Delta`: the `Frame::Delta` variant exists and
-`agent_output_to_frame` maps `AgentEvent::Delta` to it, but the gateway
-does **not** stream live deltas on the wire today —
-`AgentEvent::Delta` is coalesced into a single `Message` frame per the
-note in `channel/mod.rs`. Treat `Delta` as a defined-but-unused wire
-shape rather than a live stream the TUI/sidecars receive.
+A note on `AnswerDelta`: `agent_output_to_frame` maps
+`AgentEvent::AnswerDelta` to `Frame::AnswerDelta` and the
+`translator_loop` sends it live on the wire (no coalescing) — the TUI
+and web chat stream the reply prose from it. Clients without a partial
+surface (multiplexed sidecars) ignore it and render the final `Message`.
+The same holds for the `Reasoning` / `ToolStarted` / `ToolCompleted`
+turn-progress frames.
 
 Session resolution is **not** "create on first message via
 `SessionManager::get_or_create`". It depends on the channel kind:
@@ -787,7 +792,7 @@ crates/gateway/
 │   ├── reload.rs            # ConfigReloader trait + ReloadOutcome/ReloadError (in-process config hot-reload)
 │   ├── log_buffer.rs        # LogBuffer ring + tracing Layer behind /v1/logs[/stream]
 │   ├── channel/             # /v1/channel-ws WS server + /v1/blobs for sidecars, TUI, and web chat
-│   │   ├── mod.rs           #   module glue + re-exports; notes Delta is coalesced into Message on the wire
+│   │   ├── mod.rs           #   module glue + re-exports; notes every SessionEvent is sent live 1:1 (no coalescing)
 │   │   ├── adapter.rs       #   Sidecar — SessionEvent→Frame translator + outbound pump; attaches to Channel
 │   │   ├── blobs.rs         #   POST /v1/blobs + GET /v1/blobs/{id}
 │   │   ├── boot.rs          #   install_channels / build_channel; APPROVAL_TIMEOUT=300s; per-channel gate

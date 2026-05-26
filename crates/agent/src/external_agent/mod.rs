@@ -70,7 +70,7 @@ pub struct ExternalAgentRequest {
 #[derive(Debug, Clone)]
 pub enum ExternalAgentEvent {
     /// Incremental assistant text. The spawn router can forward these
-    /// to the parent as `AgentEvent::Delta` for live progress.
+    /// to the parent as `AgentEvent::AnswerDelta` for live progress.
     TextDelta(String),
     /// Resume-key the parent's next spawn can pass back via
     /// `ExternalAgentRequest.resume_key`. The spawn router stores

@@ -101,12 +101,13 @@ pub struct AgentOutput {
 /// enclosing [`AgentOutput`].
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    /// Incremental answer-prose chunk for the in-flight response.
-    Delta(String),
+    /// Incremental answer-prose chunk for the in-flight response — the
+    /// reply text, distinct from the `Reasoning` thinking trace.
+    AnswerDelta(String),
     /// Incremental model reasoning ("thinking") chunk. Rendered
     /// dim/collapsible by channels that support it; never persisted as
     /// answer content. Goes through the same sanitize/reveal boundary as
-    /// `Delta`.
+    /// `AnswerDelta`.
     Reasoning(String),
     /// A tool call has started. `label` is the human preview
     /// (`Tool::call_label`), falling back to the tool name client-side;

@@ -129,14 +129,14 @@ impl AgentTestHarness {
         out
     }
 
-    /// Concatenate every `Delta` text in arrival order. Convenient for
+    /// Concatenate every `AnswerDelta` text in arrival order. Convenient for
     /// asserting placeholder integrity across streamed chunks.
     pub fn delta_text(outputs: &[AgentOutput]) -> String {
         outputs
             .iter()
             .filter_map(|o| match o {
                 AgentOutput {
-                    event: AgentEvent::Delta(text),
+                    event: AgentEvent::AnswerDelta(text),
                     ..
                 } => Some(text.as_str()),
                 _ => None,

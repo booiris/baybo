@@ -546,7 +546,7 @@ async fn channel_multi_attach_fans_out_to_all_subscribers() {
         session_id: "sess-shared".into(),
         user_id: "u1".into(),
         channel: ChannelType::http(),
-        event: AgentEvent::Delta("chunk".into()),
+        event: AgentEvent::AnswerDelta("chunk".into()),
     });
     assert_eq!(bucket_a.lock().len(), 2);
     assert_eq!(bucket_b.lock().len(), 1, "detached tab no longer receives");

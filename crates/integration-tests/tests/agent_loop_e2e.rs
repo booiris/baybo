@@ -241,10 +241,10 @@ async fn reasoning_chunks_stream_as_reasoning_events() {
         reasoning.contains("thinking hard about it"),
         "expected reasoning to stream as Reasoning events, got {outs:?}"
     );
-    // The answer still streams as Delta, distinct from reasoning.
+    // The answer still streams as AnswerDelta, distinct from reasoning.
     assert!(
         AgentTestHarness::delta_text(&outs).contains("the answer"),
-        "answer must still stream as Delta, got {outs:?}"
+        "answer must still stream as AnswerDelta, got {outs:?}"
     );
 
     harness.shutdown().await;

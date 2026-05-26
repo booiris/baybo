@@ -17,7 +17,7 @@ intermediate information and only one of them is user-facing:
 
 1. **Reaches the user — text delta.** `delta_tx` is a clone of the session's one
    ordered output channel (`response_tx: mpsc::Sender<AgentOutput>`). `AgentOutput`
-   (`crates/channels/src/types.rs:84`) has three variants: `Delta` (streamed
+   (`crates/channels/src/types.rs:84`) has three variants: `AnswerDelta` (streamed
    answer text, `chat_streaming` at `agent_loop.rs:1160` forwards only
    `StreamEvent::Text` via `stream_emit`), `Notice` (out-of-band, via
    `DeltaTxNotifier` at `agent_loop.rs:126` — the `SessionNotifier` bridge, today
@@ -39,7 +39,7 @@ intermediate information and only one of them is user-facing:
 
 Goal: turn `delta_tx` from a text pipe into a **curated, per-session, ordered
 turn-progress event stream** so streaming channels render live work progress;
-non-streaming channels drop it exactly as they drop `Delta` today.
+non-streaming channels drop it exactly as they drop `AnswerDelta` today.
 
 ## How Claude Code / Codex do it (reference)
 
@@ -60,11 +60,11 @@ progress is **opt-in per channel** — the TUI/web render it, sidecars ignore it
 | **Tool-lifecycle emission point** | The **agent loop** (`run_iteration`), not the executor. `ToolStarted` for every call before `join_all` (`agent_loop.rs:729`); `ToolCompleted` in the result loop after (`:733`). For the common single-call iteration this is indistinguishable from per-tool timing; concurrent multi-tool batches "start together / finish together" — accepted. Per-tool real-time interleaving is a later upgrade that would move emission into `ToolExecutor::execute`. |
 | **Tool label** | Reuse `Tool::call_label(params)` (`crates/tools/src/lib.rs:59`) — the same human preview the approval prompt shows — exposed to the loop via a new `ToolRegistry::call_label(name, &params)`. Falls back to the tool name. |
 | **Tool result summary** | Derived generically in the result loop from `ToolOutput`, reusing the existing match (`agent_loop.rs:735`): `Text → "N lines"`, attachments → `"+N files/images"`, `Error → status=Error`, `Err(Denied) → status=Denied`. A tool-authored `Tool::result_summary` is a later refinement. |
-| **Security** | `Reasoning`, `label`, and `summary` are model-/tool-derived text and MUST pass the same sanitize + vault-reveal boundary as `Delta` (`stream_emit`). The trace keeps placeholder form; the channel gets revealed form. |
-| **Ordering / backpressure** | One ordered mpsc. Answer `Delta` and tool `ToolStarted/ToolCompleted` use `await` (load-bearing / display self-consistency); `Reasoning` uses `try_send` (ephemeral, droppable) — matching how `Notice` already drops on a full channel. The final `Message` is the reconciliation point that clears any in-flight progress UI. |
+| **Security** | `Reasoning`, `label`, and `summary` are model-/tool-derived text and MUST pass the same sanitize + vault-reveal boundary as `AnswerDelta` (`stream_emit`). The trace keeps placeholder form; the channel gets revealed form. |
+| **Ordering / backpressure** | One ordered mpsc. Answer `AnswerDelta` and tool `ToolStarted/ToolCompleted` use `await` (load-bearing / display self-consistency); `Reasoning` uses `try_send` (ephemeral, droppable) — matching how `Notice` already drops on a full channel. The final `Message` is the reconciliation point that clears any in-flight progress UI. |
 | **TUI dedup** | **None needed** (confirmed during Stage 4a). `render_block` only renders the CronCreate recurring-trigger hint for `ToolUse` blocks — never general tool calls — so the final `Message`'s `accumulated_tool_uses` were never a visible source of tool lines in the TUI. The live `ToolStarted`/`ToolCompleted` lines are the only tool display; `accumulated_tool_uses` stays attached to `OutgoingMessage` untouched (other channels / the CronCreate hint still use it). |
 | **Approval interleave** | `ToolStarted` (loop) precedes `ApprovalRequested` (emitted inside `execute` by the gate) precedes `ToolCompleted` — naturally reads as "started → waiting for approval → done". |
-| **Wire / non-streaming channels** | New `Frame` variants mirror the events and are ts-exported (`sdks/channel-ts`). Sidecars without a partial surface ignore them, exactly as they ignore `Frame::Delta` today. |
+| **Wire / non-streaming channels** | New `Frame` variants mirror the events and are ts-exported (`sdks/channel-ts`). Sidecars without a partial surface ignore them, exactly as they ignore `Frame::AnswerDelta` today. |
 
 ## Event model
 
@@ -81,7 +81,7 @@ pub struct AgentOutput {
 }
 
 pub enum AgentEvent {
-    Delta(String),                 // answer-prose increment (semantics unchanged)
+    AnswerDelta(String),                 // answer-prose increment (semantics unchanged)
     Reasoning(String),             // thinking increment — dim/collapsible, not answer content
     ToolStarted   { call_id: String, tool: String, label: Option<String> },
     ToolCompleted { call_id: String, status: ToolStatus, summary: String },
@@ -118,7 +118,7 @@ pub enum ToolStatus { Ok, Error, Denied }
   only renders the CronCreate hint, never general tool calls, so the final `Message`
   is not a second source of tool lines.
 - **Web** — `web/src/pages/ChatPage.tsx` adds `routeInboundFrame` cases beside the
-  existing `case 'delta'`: a dim reasoning row and tool chips (`⏺`/`⎿`), all
+  existing `case 'answer_delta'`: a dim reasoning row and tool chips (`⏺`/`⎿`), all
   `role: 'system'` so they never collide with the assistant-streaming reconciliation,
   and live-only (never persisted → dropped on a REST history reload).
 

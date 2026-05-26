@@ -436,7 +436,7 @@ impl AgentActor {
         // turn keeps a clean leading `/command` for slash detection.
         //
         // Pass a clone of the response channel so the loop can stream
-        // text deltas as `AgentEvent::Delta` while the final assembled
+        // text deltas as `AgentEvent::AnswerDelta` while the final assembled
         // message still flows through the normal path.
         let response_tx = self.volatile.response_tx.clone();
         self.volatile

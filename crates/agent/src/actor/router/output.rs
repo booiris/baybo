@@ -14,7 +14,7 @@ impl Router {
         } = output;
 
         // `Message` is the only variant that carries user-visible prose
-        // subject to policy egress — sanitize it before dispatch. `Delta`
+        // subject to policy egress — sanitize it before dispatch. `AnswerDelta`
         // chunks are intentionally exempt (incremental streaming; the final
         // `Message` is the authoritative sanitized egress per
         // `docs/modules/security.md`), and `Notice` is system-authored.

@@ -12,9 +12,11 @@
 //! [`aura_channels::ChannelRegistry`] and tears itself down on
 //! disconnect.
 //!
-//! Not currently exposed:
-//! * **Streaming delta frames** — `AgentEvent::Delta` is coalesced into
-//!   a single `Message` frame on the wire.
+//! Streaming: every `SessionEvent` (including `AgentEvent::AnswerDelta`,
+//! `Reasoning`, and the `Tool*` progress events) is translated 1:1 to its
+//! wire `Frame` and sent live — `translator_loop` does no coalescing.
+//! Clients without a partial surface (multiplexed sidecars) simply ignore
+//! the streaming frames and render the final `Message`.
 
 pub(crate) mod adapter;
 pub(crate) mod blobs;

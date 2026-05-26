@@ -74,7 +74,7 @@ export type Frame =
   | { kind: 'unsubscribe'; session_id: string }
   | { kind: 'reset'; reason: string }
   | ({ kind: 'message' } & WireMessage)
-  | { kind: 'delta'; session_id: string; user_id?: string; text: string }
+  | { kind: 'answer_delta'; session_id: string; user_id?: string; text: string }
   | { kind: 'reasoning'; session_id: string; user_id?: string; text: string }
   | {
       kind: 'tool_started';

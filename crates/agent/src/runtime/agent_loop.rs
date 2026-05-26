@@ -383,7 +383,7 @@ impl AgentLoop {
     /// Run the main conversation loop for a single user message.
     ///
     /// When `delta_tx` is `Some`, each text chunk emitted by the LLM is
-    /// forwarded as `AgentEvent::Delta` so adapters that support partial
+    /// forwarded as `AgentEvent::AnswerDelta` so adapters that support partial
     /// rendering (e.g. the TUI) can show incremental output. The final
     /// `OutgoingMessage` returned here should still be dispatched by the
     /// caller as `AgentEvent::Message` so non-streaming adapters receive
@@ -484,7 +484,7 @@ impl AgentLoop {
 
         // Tool-authored notices (`AgentEvent::Notice`) ride the job-wide
         // delta_tx directly, not the per-iteration `iter_delta_tx`: they
-        // are a distinct output variant from the LLM's streamed `Delta`
+        // are a distinct output variant from the LLM's streamed `AnswerDelta`
         // and must reach the channel on every iteration, independent of
         // any per-iteration streaming decision.
         let notifier: Option<Arc<dyn aura_tools::SessionNotifier>> = delta_tx.as_ref().map(|tx| {
@@ -1263,7 +1263,7 @@ impl AgentLoop {
 
         // Separate buffer for reasoning ("thinking") fragments — same
         // placeholder-safe flush discipline as the answer text, but
-        // streamed as ephemeral `Reasoning` rather than answer `Delta`.
+        // streamed as ephemeral `Reasoning` rather than answer `AnswerDelta`.
         let mut pending_reasoning = String::new();
 
         while let Some(event) = stream.next().await {
@@ -1372,7 +1372,7 @@ impl AgentLoop {
                 session_id: session.id.clone(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
-                event: AgentEvent::Delta(sanitized),
+                event: AgentEvent::AnswerDelta(sanitized),
             })
             .await
             .is_err()
@@ -1382,7 +1382,7 @@ impl AgentLoop {
     }
 
     /// Stream a reasoning ("thinking") fragment to the channel as
-    /// `AgentEvent::Reasoning`, through the same leak boundary as `Delta`.
+    /// `AgentEvent::Reasoning`, through the same leak boundary as `AnswerDelta`.
     /// Reasoning is ephemeral progress, so it `try_send`s and drops on a
     /// full channel rather than backpressuring the LLM stream.
     async fn stream_emit_reasoning(

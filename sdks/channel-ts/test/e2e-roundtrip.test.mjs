@@ -45,7 +45,7 @@ function startFixture() {
             // Stream some server → client frames now that the handshake is done.
             ws.send(
               encodeFrame({
-                kind: "delta",
+                kind: "answer_delta",
                 session_id: "sess-1",
                 user_id: "tg_42",
                 text: "par",

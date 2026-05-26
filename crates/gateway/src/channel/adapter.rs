@@ -308,7 +308,7 @@ async fn agent_output_to_frame(
         ..
     } = output;
     match event {
-        AgentEvent::Delta(text) => Frame::Delta {
+        AgentEvent::AnswerDelta(text) => Frame::AnswerDelta {
             session_id,
             user_id,
             text,

@@ -554,7 +554,7 @@ export function ChatPage() {
         // only signals (session_updated) shouldn't bias retention of
         // a transcript the user isn't engaging with.
         switch (frame.kind) {
-          case 'delta':
+          case 'answer_delta':
           case 'reasoning':
           case 'tool_started':
           case 'tool_completed':
@@ -570,7 +570,7 @@ export function ChatPage() {
         // setViews — the pacer's rAF loop owns the bubble's text while
         // streaming is in flight. routeInboundFrame's delta case stays
         // as a defensive fallback but should not fire from this path.
-        if (frame.kind === 'delta') {
+        if (frame.kind === 'answer_delta') {
           enqueueDelta(frame.session_id, frame.text);
           return;
         }
@@ -1262,7 +1262,7 @@ function routeInboundFrame(
   lastConnectedAt: number,
 ): void {
   switch (frame.kind) {
-    case 'delta': {
+    case 'answer_delta': {
       const sid = frame.session_id;
       setViews((prev) => {
         const view = prev[sid] ?? EMPTY_VIEW;

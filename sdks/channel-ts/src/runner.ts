@@ -568,7 +568,7 @@ function dispatchFrame(
       );
       return;
     }
-    case "delta": {
+    case "answer_delta": {
       if (!channel.onDelta) return;
       void safeInvoke(
         () =>
