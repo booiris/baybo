@@ -381,7 +381,9 @@ impl AppState {
     /// Append a chunk to the in-flight reasoning trace. Mirrors
     /// [`append_stream_delta`] for the dim reasoning buffer.
     pub(crate) fn append_reasoning_delta(&mut self, delta: &str) {
-        self.reasoning.get_or_insert_with(String::new).push_str(delta);
+        self.reasoning
+            .get_or_insert_with(String::new)
+            .push_str(delta);
     }
 
     /// Drain every newline-terminated reasoning line, leaving the

@@ -717,7 +717,10 @@ mod tests {
         let first = line_text(&render_reasoning_line("hmm", false)[0]);
         let cont = line_text(&render_reasoning_line("more", true)[0]);
         assert!(first.starts_with("✻ "), "got {first:?}");
-        assert!(cont.starts_with("  ") && !cont.contains('✻'), "got {cont:?}");
+        assert!(
+            cont.starts_with("  ") && !cont.contains('✻'),
+            "got {cont:?}"
+        );
     }
 
     #[test]

@@ -60,7 +60,13 @@ async fn clean_conversation_streams_text_then_final_message() {
         "deltas concatenate to the LLM's text"
     );
     assert!(
-        outs.iter().any(|o| matches!(o, AgentOutput { event: AgentEvent::Message(_), .. })),
+        outs.iter().any(|o| matches!(
+            o,
+            AgentOutput {
+                event: AgentEvent::Message(_),
+                ..
+            }
+        )),
         "expected a final Message, got {outs:?}"
     );
     assert_eq!(
@@ -156,7 +162,13 @@ async fn tool_call_round_trip_invokes_recording_tool() {
     assert_eq!(calls.len(), 1, "tool invoked exactly once");
     assert_eq!(calls[0], json!({"q": "ping"}));
     assert!(
-        outs.iter().any(|o| matches!(o, AgentOutput { event: AgentEvent::Message(_), .. })),
+        outs.iter().any(|o| matches!(
+            o,
+            AgentOutput {
+                event: AgentEvent::Message(_),
+                ..
+            }
+        )),
         "expected a final Message after the tool round-trip, got {outs:?}"
     );
     // Regression: the final answer lands on iteration 2 (after the tool
@@ -616,9 +628,13 @@ async fn subagent_notification_suppresses_empty_reply() {
     );
     // … but the blank reply was suppressed.
     assert!(
-        !outputs
-            .iter()
-            .any(|o| matches!(o, AgentOutput { event: AgentEvent::Message(_), .. })),
+        !outputs.iter().any(|o| matches!(
+            o,
+            AgentOutput {
+                event: AgentEvent::Message(_),
+                ..
+            }
+        )),
         "blank notification reply must not be sent to the channel"
     );
 
@@ -1050,13 +1066,23 @@ async fn user_turn_empty_reply_surfaces_fallback_notice() {
     let outputs = harness.drain_outputs(DRAIN_TIMEOUT).await;
 
     assert!(
-        !outputs.iter().any(|o| matches!(o, AgentOutput { event: AgentEvent::Message(_), .. })),
+        !outputs.iter().any(|o| matches!(
+            o,
+            AgentOutput {
+                event: AgentEvent::Message(_),
+                ..
+            }
+        )),
         "blank user reply must not be sent as an empty assistant message"
     );
     assert!(
-        outputs
-            .iter()
-            .any(|o| matches!(o, AgentOutput { event: AgentEvent::Notice { .. }, .. })),
+        outputs.iter().any(|o| matches!(
+            o,
+            AgentOutput {
+                event: AgentEvent::Notice { .. },
+                ..
+            }
+        )),
         "blank user reply must surface a fallback notice"
     );
 
@@ -1102,7 +1128,13 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
         .unwrap();
     let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert!(
-        outs.iter().any(|o| matches!(o, AgentOutput { event: AgentEvent::Message(_), .. })),
+        outs.iter().any(|o| matches!(
+            o,
+            AgentOutput {
+                event: AgentEvent::Message(_),
+                ..
+            }
+        )),
         "cron fire should produce a Message, got {outs:?}"
     );
 

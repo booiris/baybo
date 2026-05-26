@@ -763,7 +763,10 @@ fn flush_complete_reasoning_lines(state: &mut AppState, terminal: &mut Term) -> 
 fn flush_reasoning_partial(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
     if let Some(partial) = state.take_reasoning_partial() {
         let continuation = state.reasoning_committed_any;
-        commit_lines_compact(terminal, chat::render_reasoning_line(&partial, continuation))?;
+        commit_lines_compact(
+            terminal,
+            chat::render_reasoning_line(&partial, continuation),
+        )?;
     }
     state.reasoning_committed_any = false;
     Ok(())

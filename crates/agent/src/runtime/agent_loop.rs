@@ -89,9 +89,10 @@ fn tool_completion_summary(result: &anyhow::Result<ToolOutput>) -> (ToolStatus, 
     match result {
         Ok(ToolOutput::Text(s)) => (ToolStatus::Ok, summarize_text(s)),
         Ok(ToolOutput::Json(_)) => (ToolStatus::Ok, "ok".to_string()),
-        Ok(ToolOutput::WithAttachments { attachments, .. }) => {
-            (ToolStatus::Ok, format!("{} attachment(s)", attachments.len()))
-        }
+        Ok(ToolOutput::WithAttachments { attachments, .. }) => (
+            ToolStatus::Ok,
+            format!("{} attachment(s)", attachments.len()),
+        ),
         Ok(ToolOutput::MultiModalText { llm_images, .. }) => {
             (ToolStatus::Ok, format!("{} image(s)", llm_images.len()))
         }
@@ -549,8 +550,14 @@ impl AgentLoop {
             }
 
             // Proactive compression before building the ChatRequest.
-            self.compress_if_needed(session, span_recorder, job_id, &cancel_token, delta_tx.as_ref())
-                .await?;
+            self.compress_if_needed(
+                session,
+                span_recorder,
+                job_id,
+                &cancel_token,
+                delta_tx.as_ref(),
+            )
+            .await?;
 
             // Stream deltas on every iteration, not just the first. The
             // final answer can land on any iteration (it follows however
@@ -1297,7 +1304,8 @@ impl AgentLoop {
                     let flush_to = safe_flush_boundary(&pending_reasoning);
                     if flush_to > 0 {
                         let flushable: String = pending_reasoning.drain(..flush_to).collect();
-                        self.stream_emit_reasoning(&flushable, session, delta_tx).await;
+                        self.stream_emit_reasoning(&flushable, session, delta_tx)
+                            .await;
                     }
                 }
                 StreamEvent::ThinkingBlock(block) => thinking_blocks.push(block),
@@ -1317,7 +1325,8 @@ impl AgentLoop {
         // Flush any remaining buffered reasoning.
         if !pending_reasoning.is_empty() {
             let flushable = std::mem::take(&mut pending_reasoning);
-            self.stream_emit_reasoning(&flushable, session, delta_tx).await;
+            self.stream_emit_reasoning(&flushable, session, delta_tx)
+                .await;
         }
 
         // Build content_blocks: thinking blocks first (providers expect
@@ -1426,7 +1435,11 @@ impl AgentLoop {
     ) {
         let Some(tx) = delta_tx else { return };
         let label = match raw_label {
-            Some(l) => self.security_gateway.sanitize_stream_fragment(&l).await.ok(),
+            Some(l) => self
+                .security_gateway
+                .sanitize_stream_fragment(&l)
+                .await
+                .ok(),
             None => None,
         };
         let _ = tx

@@ -419,8 +419,7 @@ impl AgentActor {
                 "cron turn produced no output; suppressing send"
             );
         } else {
-            self.send_response(response.into(), "cron")
-                .await;
+            self.send_response(response.into(), "cron").await;
         }
         Ok(())
     }

@@ -296,7 +296,10 @@ impl Tool for BashTool {
             return None;
         }
         if one_line.chars().count() > MAX {
-            Some(format!("{}…", one_line.chars().take(MAX).collect::<String>()))
+            Some(format!(
+                "{}…",
+                one_line.chars().take(MAX).collect::<String>()
+            ))
         } else {
             Some(one_line)
         }
@@ -1277,7 +1280,10 @@ mod tests {
         let label = tool
             .progress_label(&serde_json::json!({ "command": "x".repeat(200) }))
             .expect("long command yields a label");
-        assert!(label.ends_with('…'), "over-long command is truncated: {label:?}");
+        assert!(
+            label.ends_with('…'),
+            "over-long command is truncated: {label:?}"
+        );
         assert_eq!(label.chars().count(), 61, "60 chars + ellipsis");
     }
 
