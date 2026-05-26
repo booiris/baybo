@@ -38,7 +38,7 @@ interface TranscriptRow {
   key: string;
   role: 'user' | 'assistant' | 'system';
   text: string;
-  /** Streaming text appended via Frame::Delta until the final
+  /** Streaming text appended via Frame::AnswerDelta until the final
    *  Frame::Message arrives. */
   streaming?: boolean;
   notice?: { level: 'info' | 'warn' | 'error'; text: string };
@@ -143,7 +143,7 @@ interface SessionView {
    *  (delta or message). Drives the left-aligned typing indicator
    *  bubble so the user gets immediate visual feedback that the agent
    *  is working, instead of staring at a frozen transcript. Cleared
-   *  on first `Frame::Delta` (the streaming bubble itself takes over
+   *  on first `Frame::AnswerDelta` (the streaming bubble itself takes over
    *  as the activity signal) or on a non-streaming assistant
    *  `Frame::Message`, and on Reset / session switch. */
   awaitingReply: boolean;
@@ -284,6 +284,28 @@ export function ChatPage() {
     if (!pacer) return;
     if (pacer.rafId !== null) cancelAnimationFrame(pacer.rafId);
     delete streamPacersRef.current[sid];
+  }, []);
+
+  // Settle the streaming answer bubble before an interrupting progress row
+  // (reasoning / tool) appends below it: reveal the pacer's full buffered
+  // text at once and finalize the bubble (`streaming: false`), so the row
+  // order matches the server stream and any post-interruption answer text
+  // starts a fresh bubble. No-op when no answer is mid-stream.
+  const flushPacer = useCallback((sid: string) => {
+    const pacer = streamPacersRef.current[sid];
+    if (!pacer) return;
+    if (pacer.rafId !== null) cancelAnimationFrame(pacer.rafId);
+    const full = pacer.target;
+    delete streamPacersRef.current[sid];
+    setViews((prev) => {
+      const view = prev[sid];
+      if (!view) return prev;
+      const last = view.transcript[view.transcript.length - 1];
+      if (!last?.streaming || last.role !== 'assistant') return prev;
+      const next = view.transcript.slice();
+      next[next.length - 1] = { ...last, text: full, streaming: false };
+      return { ...prev, [sid]: { ...view, transcript: next } };
+    });
   }, []);
 
   const pacerTick = useCallback((sid: string) => {
@@ -574,6 +596,17 @@ export function ChatPage() {
           enqueueDelta(frame.session_id, frame.text);
           return;
         }
+        // Progress frames (reasoning / tool lifecycle) interrupt the answer
+        // stream. Settle the paced answer bubble first so the progress row
+        // lands below the text the model emitted before it — otherwise the
+        // pacer's next rAF tick would append that text after the row.
+        if (
+          frame.kind === 'reasoning' ||
+          frame.kind === 'tool_started' ||
+          frame.kind === 'tool_completed'
+        ) {
+          flushPacer(frame.session_id);
+        }
         // An assistant message frame is the authoritative final text
         // for the stream — drop any pacer state so its in-flight rAF
         // doesn't overwrite the finalized bubble a tick later.
@@ -619,7 +652,7 @@ export function ChatPage() {
       ws.close();
       wsRef.current = null;
     };
-  }, [baseUrl, channelToken, releaseSessionView, enqueueDelta, cancelPacer]);
+  }, [baseUrl, channelToken, releaseSessionView, enqueueDelta, cancelPacer, flushPacer]);
 
   // ── Active session: subscribe + lazy-load history ───────────────────
   // Subscribe stays sticky once added: when the user switches away,

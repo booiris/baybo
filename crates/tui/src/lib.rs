@@ -472,6 +472,9 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                     AppEvent::Reasoning(text) => {
                         state.append_reasoning_delta(&text);
                         if matches!(state.mode, ViewMode::Chat) {
+                            // Any answer text streamed before this reasoning chunk
+                            // must land above it.
+                            flush_stream_partial(&mut state, &mut terminal)?;
                             flush_complete_reasoning_lines(&mut state, &mut terminal)?;
                         }
                         term_events = redraw_after_event(
@@ -484,9 +487,11 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                     }
                     AppEvent::ToolStarted { tool, label } => {
                         if matches!(state.mode, ViewMode::Chat) {
-                            // End any reasoning run first so the tool line lands
-                            // below the dim trace that prompted it.
+                            // Land below whatever streamed ahead of the call: the
+                            // dim reasoning trace and any answer text the model
+                            // emitted before invoking the tool.
                             flush_reasoning_partial(&mut state, &mut terminal)?;
+                            flush_stream_partial(&mut state, &mut terminal)?;
                             commit_lines_compact(
                                 &mut terminal,
                                 chat::render_tool_started(&tool, label.as_deref()),
@@ -502,6 +507,8 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                     }
                     AppEvent::ToolCompleted { status, summary } => {
                         if matches!(state.mode, ViewMode::Chat) {
+                            flush_reasoning_partial(&mut state, &mut terminal)?;
+                            flush_stream_partial(&mut state, &mut terminal)?;
                             commit_lines_compact(
                                 &mut terminal,
                                 chat::render_tool_completed(&status, &summary),
@@ -744,6 +751,20 @@ fn flush_reasoning_partial(state: &mut AppState, terminal: &mut Term) -> io::Res
         commit_lines_compact(terminal, chat::render_reasoning_line(&partial, continuation))?;
     }
     state.reasoning_committed_any = false;
+    Ok(())
+}
+
+/// Commit the trailing answer partial (text streamed without a closing
+/// newline) so the next scrollback commit — a tool line, a reasoning line,
+/// or finalize — lands *below* it. Without this, answer text the model
+/// emitted before a tool call would sit in `state.streaming` and only
+/// surface at finalize, i.e. *under* the tool line, reordering the turn.
+fn flush_stream_partial(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
+    if let Some(partial) = state.take_stream_partial() {
+        let continuation = state.streaming_committed_any;
+        commit_lines_compact(terminal, chat::render_stream_line(&partial, continuation))?;
+        state.streaming_committed_any = true;
+    }
     Ok(())
 }
 

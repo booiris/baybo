@@ -728,7 +728,7 @@ impl AgentLoop {
         // Emitted ahead of `join_all` so the user sees "starting" before
         // any approval prompt the executor raises mid-call.
         for tc in &response.tool_calls {
-            let label = self.tool_registry.call_label(&tc.name, &tc.arguments);
+            let label = self.tool_registry.progress_label(&tc.name, &tc.arguments);
             self.emit_tool_started(delta_tx, session, tc.id.clone(), tc.name.clone(), label)
                 .await;
         }
@@ -1411,9 +1411,9 @@ impl AgentLoop {
     }
 
     /// Emit a `ToolStarted` progress event before a tool call runs. The
-    /// caller-supplied `label` (from `Tool::call_label`, derived from
-    /// LLM-written arguments) passes the leak boundary first. No-op when
-    /// the turn isn't streaming (`delta_tx` is `None`: cron / subagent).
+    /// `label` (from `Tool::progress_label`, derived from LLM-written
+    /// arguments) passes the leak boundary first. No-op when the turn
+    /// isn't streaming (`delta_tx` is `None`: cron / subagent).
     async fn emit_tool_started(
         &self,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,

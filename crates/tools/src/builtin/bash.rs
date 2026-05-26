@@ -284,6 +284,24 @@ impl Tool for BashTool {
         }
     }
 
+    /// Progress preview = the command itself (whitespace-collapsed to one
+    /// line, length-capped), so the live `⏺ Bash(<cmd>)` line is useful
+    /// for *every* call — `call_label` above is a destructive-command
+    /// warning, not a preview, so we don't inherit it here.
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        const MAX: usize = 60;
+        let cmd = params.get("command").and_then(|v| v.as_str())?;
+        let one_line = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+        if one_line.is_empty() {
+            return None;
+        }
+        if one_line.chars().count() > MAX {
+            Some(format!("{}…", one_line.chars().take(MAX).collect::<String>()))
+        } else {
+            Some(one_line)
+        }
+    }
+
     fn max_timeout(&self) -> Duration {
         // Builds, test suites and migration scripts are all fair game
         // through Bash, so the trait default 30 s would clip anything
@@ -1228,6 +1246,39 @@ mod tests {
             out.contains("export AURA_CONFIG_PATH='/tmp/aura'\\''s space/aura.json'"),
             "expected POSIX-quoted path, got: {out}"
         );
+    }
+
+    #[test]
+    fn progress_label_previews_every_command_while_call_label_only_warns() {
+        let tool = BashTool::for_test();
+        // The ⏺ Bash(...) progress preview is the command for any call…
+        assert_eq!(
+            tool.progress_label(&serde_json::json!({ "command": "ls -la" })),
+            Some("ls -la".to_string()),
+        );
+        // …while call_label (the approval warning) stays None unless destructive.
+        assert_eq!(
+            tool.call_label(&serde_json::json!({ "command": "ls -la" })),
+            None,
+        );
+        assert!(
+            tool.call_label(&serde_json::json!({ "command": "rm -rf build" }))
+                .is_some(),
+        );
+    }
+
+    #[test]
+    fn progress_label_collapses_whitespace_and_caps_length() {
+        let tool = BashTool::for_test();
+        assert_eq!(
+            tool.progress_label(&serde_json::json!({ "command": "echo a\n   echo b" })),
+            Some("echo a echo b".to_string()),
+        );
+        let label = tool
+            .progress_label(&serde_json::json!({ "command": "x".repeat(200) }))
+            .expect("long command yields a label");
+        assert!(label.ends_with('…'), "over-long command is truncated: {label:?}");
+        assert_eq!(label.chars().count(), 61, "60 chars + ellipsis");
     }
 
     #[test]
