@@ -76,9 +76,13 @@ pair approve`, short enough that a one-time curious user's code
 doesn't linger in libsql for days.
 
 Expiry only applies to `pending` rows. On approval, `status` flips
-to `approved` and `expires_at` is cleared (`NULL`) — approved
-pairings don't auto-expire; they stay live until `aura pair revoke`
-deletes them.
+to `approved` and `expires_at` is cleared (`NULL`). Approved rows
+don't carry an `expires_at`, but they are **not** kept forever: the
+`aura-janitor` sweep also reaps approved rows whose `approved_at` is
+older than `PAIRING_APPROVAL_TTL` (7 days) — an old approval is a
+record of a one-time grant, not a live capability (access is
+re-established at message-time via the channel route). `aura pair
+revoke` still deletes an approved row on demand before the TTL fires.
 
 Behavior on an expired row:
 
@@ -94,10 +98,16 @@ Behavior on an expired row:
   out; the row still occupies the triple until the user retries (at
   which point it's overwritten).
 
-Rows are never deleted by a background sweep. An expired row is
-harmless — the triple is unreachable via `approve`, and a new
-inbound will overwrite in place. A future `aura pair prune` can
-clean them up if operators complain about libsql growth.
+Stale rows are reaped by a background sweep. `aura-janitor` runs
+`ChannelPairingStore::purge_expired` on an hourly cadence
+(`PAIRING_SWEEP_INTERVAL` = 1h, faster than the day-scoped log
+sweeps because pending codes expire on the order of minutes); it
+hard-deletes expired pending rows (`expires_at <= now`) and
+TTL-aged approved rows in one `DELETE`. The sweep is wired in
+production via `Janitor::with_pairing_store`. There is **no** `aura
+pair prune` CLI subcommand — the CLI surface is still only
+`list` / `approve` / `revoke`; retention is the janitor's job, not
+an operator command.
 
 ### Code format
 
@@ -110,8 +120,8 @@ generation attempts before surfacing an error.
 Codes stay stable for the row's lifetime — once a pending row has a
 code, concurrent inbound messages from the same user see the same
 code (the store's upsert keeps the existing code on live-row
-conflict, provided `expires_at > now`). A revoke, an expiry, or an
-operator-driven prune followed by a new inbound mints a fresh code.
+conflict, provided `expires_at > now`). A revoke, an expiry, or a
+janitor sweep followed by a new inbound mints a fresh code.
 
 ### Gate flow
 

@@ -9,9 +9,9 @@ Bottom-up along the dependency graph:
 1. [model.md](model.md) → [config.md](config.md) → [session.md](session.md) → [channels.md](channels.md)
 2. [job.md](job.md) → [cron.md](cron.md) → [skills.md](skills.md)
 3. [llm.md](llm.md) → [security.md](security.md)
-4. [tools.md](tools.md) → [workspace.md](workspace.md) → [context.md](context.md)
+4. [tools.md](tools.md) → [workspace.md](workspace.md) → [subagent.md](subagent.md) → [context.md](context.md)
 5. [trace.md](trace.md)
-6. [storage.md](storage.md) → [pairing.md](pairing.md) → [agent.md](agent.md) → [setup.md](setup.md) → [bootstrap.md](bootstrap.md) → [cli.md](cli.md) → [gateway.md](gateway.md) → [tui.md](tui.md)
+6. [storage.md](storage.md) → [janitor.md](janitor.md) → [pairing.md](pairing.md) → [agent.md](agent.md) → [setup.md](setup.md) → [bootstrap.md](bootstrap.md) → [cli.md](cli.md) → [gateway.md](gateway.md) → [tui.md](tui.md)
 
 ## Module Groups
 
@@ -33,6 +33,7 @@ Bottom-up along the dependency graph:
 - **[sandbox](sandbox.md)** — OS-native per-invocation isolation for tools declaring `ToolCapability::ExecCommand`. `bwrap` on Linux, `sandbox-exec` on macOS, `docker` as a cross-platform fallback when the native backend is unavailable; the `ToolExecutor` injects a `SandboxAdapter` into `ToolContext.sandbox` so `BashTool` (and any future ExecCommand tools) routes its child process through the platform's isolation primitive. Filesystem-scoped to the workspace; network gated all-or-nothing on the manifest's `Http` capability.
 - **skills** — Declarative skill definitions, selection, trust tiers, hot reload.
 - **[skills-assessor](skills-assessor.md)** — LLM-backed risk classifier for skills. Hashes the skill directory, caches verdicts (`Safe`/`Suspicious`/`Dangerous`) in `SkillRiskStore`, tiers large skills (primary-scope synchronous + full-scope background worker with restart-safe job recovery), and gates skill injection in `AgentLoop` so only `Dangerous` blocks. Kept separate from `skills` so selection stays deterministic and offline-capable.
+- **[subagent](subagent.md)** — Typed subagents: the `SubagentProfile` + process-wide `SubagentRegistry`, the per-root fan-out `SubagentDispatchLimiter`, and the `spawn_subagent` tool. Profiles load from `<workspace>/agents/<name>.md` and the profile's system prompt fully replaces the parent's Soul in the spawned child actor. Like `skills`/`cron`, it owns its own `Tool` and depends on `aura-tools` for the trait. External `claude`/`codex`/`gemini` backends are documented in [`../external-agents.md`](../external-agents.md).
 - **workspace** — Identity files and long-running configuration.
 - **cron** — Cron scheduling: the `CronScheduler` business logic and `CronError`, standard cron syntax. The cron data types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`) now live in `model` (re-exported here for back-compat); the `CronStore` trait lives in `store`.
 - **context** — Per-actor token budget + compression strategy + transcript ownership (`ContextManager`). Pure in-memory; persistence is the agent loop's job, brokered through `SessionStore` from `session`.
@@ -49,7 +50,7 @@ Bottom-up along the dependency graph:
 ### Infrastructure and Assembly Layer
 
 - **storage** — The libsql **adapter**: implements every `*Store` trait from `store` over a single libsql backend and bundles the impls in `Store` for DI. All trait contracts + their row types (incl. `RiskVerdict` / `RiskLevel`, `ChannelPairingRow` / `PairingStatus`, `JobRow`, `StepRow` / `SpanRow` / `SpanEventRow`) now live in `store`; consumers import them from `aura_store` directly (`aura-storage` does **not** re-export them — it exposes only the `Store` DI bundle, the `libsql` module, and the `retry` helper). Normal deps are just `store` + `model` — no longer on any domain crate (`session` / `job` / `trace` / `cost` / `cron` / `memory` / `security`). `job` / `trace` remain only as `dev-dependencies`, so the round-trip tests can build the rich types.
-- **janitor** — `aura-janitor`. Background maintenance tasks (storage compaction, log rotation, scratch-dir cleanup) that run on a cadence outside the agent loop.
+- **[janitor](janitor.md)** — `aura-janitor`. Best-effort, cadence-driven maintenance outside the agent loop: filesystem TTL sweeps (session logs at 15d, rotated log files at 30d, stale sidecar-cache dirs at 7d) plus the hourly `channel_pairings` retention purge (pending-expired + approved older than 7d). No storage compaction. Spawned by the gateway boot path.
 - **[pairing](pairing.md)** — Per-user pairing gate for sidecar-routed inbound messages. `PairingService` checks the `(channel_type, bot_id, user_id)` triple, mints 6-char codes for unknown senders, and refuses with a `Frame::Notice` until `aura pair approve <code>` flips the row to `approved`. The `ChannelPairingStore` trait + its row type live in `store` (imported directly from `aura_store`); `aura-pairing` is the service + code generator.
 - **agent** — Assembly layer: Actor, AgentLoop, ToolExecutor, cost management (`CostManager` as a `TraceEventStream` subscriber, with `CostGuardError` for limit breaches), and `SecurityGateway` (cross-cutting interception facade tied to the execution path). Observability facades live in their domain crates now: `JobLifecycle` in `aura-job`, `SpanRecorder` in `aura-trace`, `MemoryManager` in `aura-memory`, `SessionManager` in `aura-session`. Agent assembles them via dependency injection. Bridges cron domain types and storage row types.
 - **[setup](setup.md)** — Interactive first-run wizard (`aura-setup`, exposed as `aura setup`). Bootstraps the workspace skeleton, mints the master encryption key under `<root>/.key/encryption.key`, writes a default `aura.json`, opens libsql + the secret vault, then runs Quick / Full step sequences (LLM / channel / browser). Same flow primitives back `aura llm add` / `aura channel add` (`flow::configure_*_step`), so the wizard's per-step UX is structurally identical to the argv path. β2 commit semantics — `aura.json` is the only deferred write.
@@ -82,12 +83,14 @@ model (owns Session/User/ChannelType/SessionState + memory/message types; no int
 
 store     ──► model (ports crate: every *Store trait contract + the row/DTO types they exchange + StorageError; no logic)
 storage   ──► store, model (implements every *Store trait from the ports crate; exposes the Store DI bundle + libsql + retry; sole backend: libsql)
-context   ──► model, llm, skills, session (owns ContextManager; pure in-memory; persistence routed via SessionStore)
+janitor   ──► store, workspace, model (best-effort background sweeps; consumes ChannelPairingStore; spawned by the gateway)
+context   ──► model, llm, skills, session, subagent, tools, trace (owns ContextManager; pure in-memory; resolves subagent_type→system prompt; persistence routed via SessionStore)
 session   ──► model, store (owns SessionManager + SessionError; the SessionStore / SessionSummaryStore traits live in store)
 pairing   ──► model, store (owns PairingService + code generator; consumes ChannelPairingStore + ChannelPairingRow + PairingStatus from the ports crate)
 sandbox   ──► (no internal deps; OS sandbox runner consumed by agent)
-agent     ──► model, llm, tools, workspace, context, session, trace, job, cron, security, sandbox, storage, channels, config
-gateway   ──► agent, channels, config, cron, job, llm, model, pairing, security, skills, storage, tools, trace, workspace
+subagent  ──► model, session, tools (typed subagents + spawn_subagent tool; owns its Tool like skills/cron; profiles from <workspace>/agents/)
+agent     ──► model, llm, tools, subagent, skills, skills-assessor, workspace, context, session, trace, job, memory, cost, cron, security, sandbox, storage, channels
+gateway   ──► agent, channels, config, context, cron, cost, job, llm, memory, model, pairing, query, security, session, skills, storage, store, tools, trace, workspace
 tui       ──► channels, model, tools (trait defs + shared types; talks to gateway over HTTP+SSE)
 setup     ──► channels, config, gateway, llm, model, security, storage, workspace (interactive first-run wizard; aura-cli's llm-add/channel-add wrap its flow primitives)
 bootstrap ──► config + all domain crates it assembles (entry point only)

@@ -11,8 +11,10 @@ use aura_model::ChannelType;
 pub type Result<T> = std::result::Result<T, String>;
 
 /// Lifecycle state of a pairing row. `Pending` rows carry an
-/// `expires_at`; `Approved` rows clear it — approved pairings don't
-/// auto-expire, they stay live until [`ChannelPairingStore::delete`].
+/// `expires_at`; `Approved` rows clear it. An approved row has no
+/// `expires_at` but is not retained forever: [`ChannelPairingStore::delete`]
+/// removes it on demand, and the janitor's [`ChannelPairingStore::purge_expired`]
+/// reaps it once `approved_at` ages past the retention TTL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairingStatus {
     Pending,
@@ -57,7 +59,9 @@ pub struct ChannelPairingRow {
 impl ChannelPairingRow {
     /// `true` when the row is `Pending` and `now >= expires_at`.
     /// Approved rows and pending rows without an `expires_at` stamp
-    /// never report as expired.
+    /// never report as expired. This drives only the CLI `EXPIRED`
+    /// badge; reaping (including TTL-aged approved rows) is decided by
+    /// [`ChannelPairingStore::purge_expired`], not this helper.
     pub fn is_expired(&self, now: i64) -> bool {
         matches!(self.status, PairingStatus::Pending)
             && self.expires_at.is_some_and(|exp| now >= exp)

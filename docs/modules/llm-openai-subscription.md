@@ -80,10 +80,12 @@ All of the above lives in `crates/cli/src/commands/llm.rs`. The OAuth surface it
 
 ```
 openai_subscription/
-├── mod.rs              — pub use; OpenAiSubscriptionProviderFactory
+├── mod.rs              — module declarations + pub use re-exports only
 ├── token_bundle.rs     — OAuthTokenBundle, JWT parsing (exp + chatgpt_account_id)
-├── token_store.rs      — VaultBackedTokenStore (SecretVault wrapper)
-├── oauth.rs            — pkce_flow(), device_code_flow(), refresh()
+├── token_store.rs      — VaultTokenStore (SecretVault wrapper)
+├── oauth.rs            — pkce_login(), device_code_login(), refresh(), revoke()
+├── reasoning.rs        — allowed_efforts_for() (reasoning-effort allow-list)
+├── factory.rs          — OpenAiSubscriptionProviderFactory + base-url validator
 └── completion_model.rs — OpenAiSubscriptionCompletionModel: rig::CompletionModel impl
 ```
 
@@ -124,7 +126,7 @@ Concrete consequences:
 - `LlmProviderConfig` grows an `Option<Arc<SecretVault>>` field. For the openai-subscription factory it MUST be `Some` (returns `LlmError::Config` otherwise); for every other provider it's ignored.
 - `with_default_providers()` registers the openai-subscription factory like all the others — boot doesn't have to do anything special.
 - `boot::build_llm_client` gains a `vault: Arc<SecretVault>` parameter (touches every test fixture that builds an `LlmClient` — accepted cost per user).
-- The factory's `create()` reads the bundle synchronously off the vault via a `tokio::runtime::Handle::current().block_on(...)` — `LlmProviderFactory::create` is sync and the vault accessor is async. Acceptable because boot runs inside a tokio runtime; if that ever changes we expose an async factory variant.
+- The factory's `create()` does **not** read the vault — it just constructs the `VaultTokenStore` and the completion model (sync, no `block_on`). The bundle load is deferred to the async hot path: `ensure_fresh_bundle()` lazily reads the vault on the first request (and re-validates periodically), so a configured-but-not-yet-signed-in provider only errors when a call is actually attempted.
 
 `aura-llm` already depends on `tokio` for its streams, so the extra `aura-security` edge doesn't pull in a new ecosystem.
 
@@ -191,11 +193,11 @@ Tool-call return path: Responses API emits `response.function_call_arguments.del
 | Vault returns None | `Config("openai-subscription: not signed in — add an entry via `aura llm add` (pick the openai-subscription provider) or re-authenticate an existing entry via `aura llm edit`")` |
 | Bundle JSON parse error | `Config("openai-subscription: corrupt token bundle")` (then auto-clear vault entry) |
 | Refresh permanent failure | `Config("openai-subscription: refresh token expired/revoked — re-login required")` (auto-clear bundle) |
-| Refresh transient failure | `Provider("openai-subscription: token refresh transient: <err>")` |
-| Responses API 401 after refresh | `Provider("openai-subscription: unauthorized after refresh")` |
-| Responses API 429 | `RateLimit` (existing variant) — agent's `ErrorHandler` already retries |
-| Responses API 5xx | `Provider("...")` — agent retries through its existing path |
-| SSE parse error | `Provider("openai-subscription: malformed SSE: <err>")` |
+| Refresh transient failure | surfaced as a rig `CompletionError::ProviderError`, classified to `LlmError::Transient` by `rig_completion_to_error` |
+| Responses API 401 after refresh | rig `CompletionError::ProviderError("openai-subscription: unauthorized after refresh — ...")` (completion_model.rs), classified to `LlmError::Transient` by `rig_completion_to_error` |
+| Responses API 429 | `RateLimited { retry_after, message }` (via `status_to_error`) — agent's `ErrorHandler` already retries |
+| Responses API 5xx | `Transient(...)` (via `status_to_error`) — agent retries through its existing path |
+| SSE / response parse error | `Decode(...)` (via `reqwest_to_error`) or a rig `ProviderError` on the streaming path |
 
 ## Security & TOS
 
@@ -209,8 +211,8 @@ Tool-call return path: Responses API emits `response.function_call_arguments.del
 - **Cross-process logout invalidation** *(Codex R2-F1)*: every cache hit re-validates against the vault on a periodic interval (`CACHE_VAULT_REVALIDATE_INTERVAL_SECS = 60`). Within the window, repeat calls skip the vault read entirely (hot path stays cheap). Past the window, a missing vault entry drops the in-memory cached bundle so a `aura llm remove` run by another process (which clears the vault entry as part of removal) is honoured within ~60s. Without this, a CLI removal would only delete the on-disk vault entry while a running gateway / TUI keeps using its cached bundle (and 401 reactive refresh would even write a new bundle back into vault, partially undoing the logout). Regression tested (`ensure_fresh_bundle_invalidates_cache_when_vault_is_emptied`, `ensure_fresh_bundle_skips_vault_within_revalidate_interval`).
 - **Anti-impersonation**: aura sets `User-Agent: aura/...`. Only `originator: codex_cli_rs` mimics Codex (mandatory header for the route). Rationale documented inline.
 - **Token at rest**: encrypted with the same AES-256-GCM master key as every other vault entry — same blast radius as a stored API key.
-- **Token in memory**: kept in an `Arc<RwLock<OAuthTokenBundle>>` for the process lifetime; on logout we zero it (best-effort) and delete the vault entry.
-- **Audit log**: every refresh emits a tracing event with `event=oai_subscription_token_refresh`, `outcome=success|transient|permanent`, `account_id` (hashed), no token material in logs ever.
+- **Token in memory**: cached in an `Arc<tokio::sync::Mutex<Option<CachedBundle>>>` for the process lifetime (`CachedBundle` wraps the bundle plus `persisted` / `last_vault_check` bookkeeping); on logout we drop it and delete the vault entry.
+- **Audit log**: every refresh emits a tracing event with `event=openai_subscription_token_refresh`, `outcome=success|transient|permanent`, `account_id` (hashed), no token material in logs ever.
 
 ## Testing
 

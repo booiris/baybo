@@ -32,7 +32,7 @@ Every transition is validated strictly. Illegal transitions return errors, never
 
 ### Cancelled is independent of Failed
 
-`Cancelled` carries a `reason: CancelReason` (`UserPreempt`, `SystemCrash`, `SubagentTimeout`, `ParentCancelled`, `ParentDeleted`, `OperatorCancel`) and `partial_artifacts: Vec<SpanId>` — the spans that completed (or partially completed) before the cancel. Both fields are nested **inside** the `JobStatus::Cancelled { reason, partial_artifacts }` variant; the top-level `Job` exposes `emitted_span_ids` for general progress indexing. The next job's prompt-assembly step reads `partial_artifacts` and renders a "previously completed steps:" preamble so the LLM has context. Content lives only in the trace; the field is indices.
+`Cancelled` carries a `reason: CancelReason` (`UserPreempt`, `SystemCrash`, `SubagentTimeout`, `ParentCancelled`, `ParentDeleted`, `OperatorCancel`, `UserStopped`) and `partial_artifacts: Vec<SpanId>` — the spans that completed (or partially completed) before the cancel. Both fields are nested **inside** the `JobStatus::Cancelled { reason, partial_artifacts }` variant; the top-level `Job` exposes `emitted_span_ids` for general progress indexing. The next job's prompt-assembly step reads `partial_artifacts` and renders a "previously completed steps:" preamble so the LLM has context. Content lives only in the trace; the field is indices.
 
 `SystemCrash` is reserved for a future restart-recovery scan — there is no production code path that mints it today.
 
@@ -44,20 +44,22 @@ pub enum JobKind {
     Cron,
     System,
     Spawned,
+    SubagentNotification,
 }
 ```
 
-Invariant: `session.trigger.kind() == job.kind()` at job creation time. `JobInput` and `JobOutput` are strongly typed enums whose variants line up 1:1 with `JobKind`.
+Invariant: `session.trigger.kind() == job.kind()` at job creation time. `JobInput` is a strongly typed enum whose variants line up 1:1 with `JobKind`. `JobOutput` does not — it has only `Message` and `Structured`, the two shapes any kind can produce.
 
 ### Job owns its behavior
 
 `Job` is not a passive data struct — it encapsulates the state machine:
 
 - `Job::new(session_id, input, effective_soul_version, parent_job_id)` — constructor with ULID, `Pending` status, timestamps. `kind` is derived from `input.kind()`.
-- `Job::transition(target, ...)` — validates transition, mutates status/timestamps, returns `JobTransition` record
+- `Job::transition(target, ...)` — validates transition, mutates status/timestamps, returns `JobTransition` record. `transition_at(target, ..., at)` / `cancel_at(reason, artifacts, at)` are explicit-timestamp variants reserved for the boot-recovery sweep, which must backdate `ended_at` to the last observed activity rather than the boot wall-clock; live callers use `transition` / `cancel`.
 - Convenience methods: `start()`, `complete(output)`, `fail(reason)`, `cancel(reason, partial_artifacts)`, `stuck(reason)`, `recover()`
 - `Job::is_terminal()` — true for `Completed | Cancelled | Failed`
 - `JobStatus::needs_recovery()` — true for `Pending | InProgress | Stuck` (consumed by admin queries that surface in-flight jobs)
+- Provenance fields: `effective_soul_version: String` (the soul actually loaded at start time) and `provenance_drift: Vec<DriftRecord>` (empty unless the job ran under a soul different from the session's `bound_soul_version`)
 
 Timestamp rules are enforced inside `transition()`:
 - `started_at` is set on first entry to `InProgress` (not on recovery re-entry)
@@ -90,6 +92,8 @@ The job state machine itself is trigger-agnostic, but the actor that drives it f
 | `Cron`          | Queue: actor mailbox holds it until current job is terminal     |
 | `System`        | Queue                                                            |
 | Subagent (any)  | Preempt: parent's cancellation token tree propagates downward   |
+
+Distinct from a new trigger arriving, the out-of-band `/stop` control command cancels the in-flight turn (and every in-flight descendant subagent) with `Cancelled { UserStopped, ... }` — that reason lets the subagent wait task suppress the terminal `SubagentFinished` delivery so a stopped result never repopulates `pending_subagent_results`.
 
 ### Collaboration with Trace
 

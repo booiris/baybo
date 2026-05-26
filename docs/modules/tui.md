@@ -42,7 +42,7 @@ server side.
 ### Slash completion
 
 - When the input starts with `/` and the cursor sits on the command token (no whitespace between `/` and cursor), a popup renders above the input box listing matching commands.
-- Candidates come from `SlashHandler::commands()`; `TuiSlashHandler` returns the fixed list `/clear`, `/quit`, `/exit`. Skill enumeration is not done client-side — any other `/<name>` falls through to the gateway as `SlashOutcome::PassThrough` so skill invocations keep working without a client-side allow-list.
+- Candidates come from `SlashHandler::commands()`; `TuiSlashHandler` returns a name-sorted list of `/clear`, `/new`, `/stop`, `/quit`, `/exit`. Skill enumeration is not done client-side — any other `/<name>` falls through to the gateway as `SlashOutcome::PassThrough` so skill invocations keep working without a client-side allow-list.
 - `Tab` accepts the highlighted candidate, rewriting the prefix up to the next whitespace and appending a trailing space so arguments can follow. `Enter` submits without accepting the completion.
 - `Up`/`Down` follow zsh/bash conventions, which also cleanly resolves the popup ambiguity:
     - **Empty input** — `Up`/`Down` walk the input-history ring. A slash popup never opens on an empty line, so there is no conflict.
@@ -63,8 +63,8 @@ server side.
 - Single-table layout: title, bold header row, equal-width columns, footer hint.
 - Backed by a `DashboardSnapshot { title, columns, rows, footer }` value fetched from a `DashboardProvider`.
 - Refresh (`r`) re-fetches on a background task; the snapshot swap is transactional (existing selection clamps to the new row count).
-- Four built-in views map to `ViewKind::{Skills, Jobs, Sessions, Memory}`.
-- `TuiDashboardProvider` (`crates/tui/src/client/dashboard.rs`) renders each view as an admin-only placeholder: title and column headers for the requested `ViewKind`, an empty `rows: Vec::new()`, and a footer pointing the operator at the `aura` CLI. The TUI's channel surface no longer carries session / job / skill / memory CRUD — those views live in the CLI subcommands.
+- Three built-in views map to `ViewKind::{Skills, Jobs, Sessions}`.
+- `TuiDashboardProvider` (`crates/tui/src/client/dashboard.rs`) renders each view as an admin-only placeholder: title and column headers for the requested `ViewKind`, an empty `rows: Vec::new()`, and a footer pointing the operator at the `aura` CLI. The TUI's channel surface no longer carries session / job / skill CRUD — those views live in the CLI subcommands.
 
 ### Persistent input history
 
@@ -90,13 +90,12 @@ Bare commands with no arguments open the matching dashboard view:
 | `/skills`   | `SlashOutcome::OpenView(ViewKind::Skills)`   |
 | `/jobs`     | `SlashOutcome::OpenView(ViewKind::Jobs)`     |
 | `/sessions` | `SlashOutcome::OpenView(ViewKind::Sessions)` |
-| `/memory`   | `SlashOutcome::OpenView(ViewKind::Memory)`   |
 
 Dashboard shortcuts only fire when invoked with no arguments — anything with additional tokens (e.g. `/skills info foo`) falls through as `SlashOutcome::PassThrough` and is forwarded to the gateway like any other line.
 
 ### Slash handler
 
-`TuiSlashHandler` (`crates/tui/src/client/slash.rs`) is the TUI's `SlashHandler` implementation. The WS channel surface is narrow, so the handler only ships what it can actually satisfy: `/clear`, `/quit`, `/exit`, and the dashboard shortcuts (`/sessions`, `/jobs`, `/memory`, `/skills`). Tool approvals are handled through the modal keybindings (`a` / `A` / `d`), not a slash command. Any other `/<name>` falls through as `SlashOutcome::PassThrough` so skill invocations keep working without a client-side allow-list.
+`TuiSlashHandler` (`crates/tui/src/client/slash.rs`) is the TUI's `SlashHandler` implementation. The WS channel surface is narrow, so the handler only ships what it can actually satisfy: `/clear`, `/new` (`SlashOutcome::NewSession` — abandon the current session and start a fresh one), `/quit`, `/exit`, `/help` (renders inline help), and the dashboard shortcuts (`/sessions`, `/jobs`, `/skills`). `/stop` is also recognised but returns `SlashOutcome::PassThrough` — it forwards to the agent runtime, where the `Router` cancels the in-flight turn and its subagents out-of-band (the TUI can't reach those handles). Tool approvals are handled through the modal keybindings (`a` / `A` / `d`), not a slash command. Any other `/<name>` falls through as `SlashOutcome::PassThrough` so skill invocations keep working without a client-side allow-list.
 
 ### Adapter-reserved tokens
 
@@ -157,27 +156,28 @@ When an approval is pending, keymap translation short-circuits — chat edits, s
 `singleton::acquire`, no `build_managers`, and no `wire_router` —
 none of those exist on the TUI side.
 
-1. **Resolve the loopback port** — read
-   `<workspace>/state/channel.port` (the file the gateway writes on
-   bind). The path is fixed at
-   `WorkspacePaths::new(config.workspace.path).channel_port()` so
-   gateway and TUI resolve it identically; there are no CLI or env
-   overrides.
+1. **Resolve the admin address** — `admin_addr_from_config(&config)`
+   builds a `SocketAddr` from `config.gateway.bind_address` and
+   `config.gateway.port` (the same admin listener that co-hosts
+   `/v1/channel-ws`). When the gateway is bound to a wildcard
+   (`0.0.0.0` / `::`), a same-host TUI rewrites it to loopback — the
+   wildcard is a server-side bind directive, not a dialable target.
+   There is no port file and no `channel.port` discovery step.
 2. **Resolve the bearer token** — open the workspace secret vault via
    `crate::runtime::build_secret_vault(config)` and read
    `aura_gateway::TUI_TOKEN_VAULT_KEY` (`"gateway.tui_token"`). The
    vault open is best-effort; a missing token is treated as
    `ChannelError::NotReachable` so it flows into the same fallback
-   path as a missing port file.
-3. **Connection probe** — `WsTransport::connect(port, token,
-   session_id)` dials `ws://127.0.0.1:<port>/v1/channel-ws` with the
-   token on the channel WS upgrade and performs the
+   path as an unreachable admin listener.
+3. **Connection probe** — `WsTransport::connect(addr, tui_token,
+   session_id)` dials the resolved admin `addr`'s `/v1/channel-ws`
+   upgrade, presents the token on the upgrade, and performs the
    `Frame::Register` handshake. There is no separate `/healthz`
    probe; the WS connect is what proves the gateway is up. Failure
    produces a concrete error block:
 
    ```
-   no aura gateway reachable (port file: <path>)
+   no aura gateway reachable at <addr>
      - start it with:       aura gateway start
      (underlying error: ...)
    ```
@@ -189,10 +189,13 @@ none of those exist on the TUI side.
    to provision one.
 5. **Wire the providers** — construct `WsTransport` (the connect
    above), `TuiSlashHandler::new()`, and `TuiDashboardProvider::new()`.
-   Attach them to `TuiAdapter` via `with_transport`, `with_slash_handler`,
-   and `with_dashboard_provider`. Input history is delivered over the
-   WS itself (see [Persistent input history](#persistent-input-history)),
-   so no history store is wired in.
+   The transport is a **required constructor argument** —
+   `TuiAdapter::new(transport)` — while the slash handler and
+   dashboard provider are attached via the `with_slash_handler` and
+   `with_dashboard_provider` builders (`with_on_exit` wires the
+   shutdown trigger). Input history is delivered over the WS itself
+   (see [Persistent input history](#persistent-input-history)), so no
+   history store is wired in.
 6. **Start the adapter**. There is no local `ChannelRegistry` and no
    cron trigger receiver: the TUI has no router. User input is
    framed as `Frame::Message` and sent through the transport; the
@@ -208,7 +211,7 @@ Debug builds add a `--dev-auto-gateway` flag. When the initial
 `WsTransport::connect` returns `ChannelError::NotReachable` and the
 flag is set, `src/tui_cmd.rs::dev_auto` spawns
 `Command::new(std::env::current_exe()).args(["gateway", "start"])`
-as a subprocess, polls the channel-port file + a loopback
+as a subprocess, polls the admin address with a loopback
 `TcpStream::connect` with exponential backoff (100 ms → 1 s, 15 s
 deadline), re-reads the freshly-rotated TUI token from the vault,
 retries the WS connect, and returns an RAII guard that sends
@@ -273,7 +276,9 @@ Single-consumer ordering on the mpsc keeps delta/response ordering correct as WS
 Writing `tracing` records to stdout while ratatui owns raw mode corrupts the frame. Chat mode therefore uses a two-layer subscriber:
 
 - **File layer** — `tracing_appender::rolling::daily("<workspace>/logs", "aura.log")` wrapped in a non-blocking writer. A `WorkerGuard` held on the stack of `main` flushes pending lines on shutdown.
-- **TUI echo layer** — `TuiLogLayer` (`src/tui_log.rs`) filters events to `WARN` and `ERROR`, extracts `message` + structured fields, and forwards them through `TuiLogSink::emit` as `AppEvent::Log(LogRecord)`. The event loop pushes the record onto the scrollback as a coloured line (`warn` yellow, `error` red, with the event `target` in grey).
+- **TUI echo layer** — `TuiLogLayer` (`src/tui_log.rs`) filters **tracing** events to `WARN` and `ERROR` (lower `tracing` levels stay in the file only), extracts `message` + structured fields, and forwards them through `TuiLogSink::emit` as `AppEvent::Log(LogRecord)`. The event loop pushes the record onto the scrollback as a coloured line (`warn` yellow, `error` red, with the event `target` in grey).
+
+The `WARN`/`ERROR` cut applies only to this tracing-echo layer. Agent **notices** take a separate route: the transport maps `Frame::Notice` → `TransportEvent::Notice` → `AppEvent::Log` (see [Output path](#output-path)), preserving all three `NoticeLevel`s — `Info` notices reach the same `LogRecord` surface and render as a cyan `info` line (`LogLevel::Info`), so an agent-emitted info notice is not filtered out the way a `tracing` INFO event is.
 
 The sink is plumbed into the layer via `Arc<OnceLock<TuiLogSink>>`: `init_tracing` allocates the cell, then `main` sets it from `TuiAdapter::log_sink()` after the adapter is constructed. Events emitted before the cell is filled still reach the file layer; they simply don't appear in the TUI.
 
@@ -298,6 +303,7 @@ Argv mode keeps the old stdout layer — one-shot commands don't own the termina
 | `model`    | `ContentBlock` for rendering assistant messages; `ChannelType::tui()`, `User` used when constructing `IncomingMessage` |
 | `gateway`  | Server-side owner of sessions, approvals, outbound frame fan-out, and the vault-encrypted input-history store. The TUI talks to it over `/v1/channel-ws` (WebSocket + MessagePack) |
 | `channels` | Trait definitions only: `SlashHandler`, `SlashOutcome`, `ViewKind`, `DashboardProvider`, `DashboardSnapshot`, `IncomingMessage`, `NoticeLevel`, `ChannelError`. No TUI code. |
+| `tools`    | Approval-prompt machinery: `ApprovalQueue` (re-exported via `pub use aura_tools::ApprovalQueue`), `ApprovalDecision`, `ApprovalRequest`, `ResourceAccess`. The transport mirrors gateway `Frame::ApprovalRequested` into a local `ApprovalQueue` and the modal renders/resolves from it. |
 
 ## Verification
 
@@ -310,9 +316,9 @@ cargo run -- tui                   # terminal B: WS+MessagePack client
 Manual smoke:
 
 - `aura tui` against a running `aura gateway` opens the Ratatui UI and the chat pane is live. Bare `aura` prints help instead.
-- With no gateway reachable, `aura tui` exits with the concrete "no aura gateway reachable (port file: <path>)" block.
+- With no gateway reachable, `aura tui` exits with the concrete "no aura gateway reachable at <addr>" block.
 - `cargo run -- tui --dev-auto-gateway` (debug build) in a fresh workspace with no gateway running spawns the backend inline, prints the banner, and connects.
-- Typing + `Enter` appends a user line and sends a `Frame::Message` to the gateway; inbound `Frame::Delta`s render live, the final `Frame::Message` replaces the streaming buffer.
+- Typing + `Enter` appends a user line and sends a `Frame::Message` to the gateway; inbound `Frame::Delta`s render live and commit to scrollback line-by-line, and the final `Frame::Message` only finalises the trailing partial (it does **not** replace the already-committed lines).
 - `/skills` opens the admin-placeholder skills view (footer points at the `aura` CLI); `r` refreshes; `Esc` returns to chat.
 - A tool call that requires approval queues an inline prompt; `a` resolves it, the gateway-side gate unblocks, and the tool result renders.
 - Killing the gateway mid-session surfaces the next inbound frame as an error notice rather than crashing the TUI.

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `trace` crate is the home for the four-tier observability model: domain types (`Step`, `StepKind`, `Span`, `SpanKind`, `SpanEvent`, `SpanEventKind`, `LlmToolCallRecord`, `ToolCallOrigin`), the row conversions that persist them, and the `SpanRecorder` lifecycle facade (with its `TraceEvent` / `TraceEventStream` broadcast bus).
+The `trace` crate is the home for the four-tier observability model: domain types (`Step`, `StepKind`, `Span`, `SpanKind`, `SpanEvent`, `SpanEventKind`, `ToolEventPayload`, `LlmToolCallRecord`, `ToolCallOrigin`), the row conversions that persist them, and the `SpanRecorder` lifecycle facade (with its `TraceEvent` / `TraceEventStream` broadcast bus).
 
 The `TraceStore` trait itself lives in the `aura-store` ports crate and trades in row DTOs — `StepRow` / `SpanRow` / `SpanEventRow`, each a queryable key plus the serialized entity in a `data` field. This crate owns the `Step::to_row` / `Step::from_row` (and `Span` / `SpanEvent`) conversions and converts at the recorder boundary, so the rich types and the recorder logic stay here while the trait sits in a leaf crate every store consumer can reach. `aura-storage` provides the libsql implementation, shuttling rows without depending on `aura-trace` (it converts in its tests only). `impl From<aura_store::StorageError> for TraceError` bridges errors at the call sites.
 
@@ -29,7 +29,6 @@ pub enum StepKind {
     MemoryRecall,
     MemoryWrite,
     SkillSelection,
-    Subagent { child_session_id: SessionId },
 }
 
 pub enum SpanKind {
@@ -41,7 +40,6 @@ pub enum SpanKind {
         begin: ToolCallBegin,           // tool_name, tool_artifact_hash, triggered_by, params
         result: Option<ToolCallResult>, // output, success (None while Pending)
     },
-    SubagentStub { child_session_id },
 }
 ```
 
@@ -51,7 +49,6 @@ pub enum SpanKind {
 - Parallel tool calls are **sibling spans** under the same Step with the same `parallel_group: GroupId`. Their time windows may overlap.
 - LLM ↔ tool pairing is by `ToolCallOrigin { llm_span_id, tool_use_id }`, not by tree structure. Tool spans are direct children of the Step.
 - `Compression`, `MemoryRecall`, `MemoryWrite`, `SkillSelection` are first-class Step kinds, not events on an LLM step.
-- `Subagent` is a Step kind. Its inner span is a `SubagentStub` that records nothing but the parent's wait window — the actual execution happens in `child_session_id`.
 
 ### Provenance lives on Span variants, not on Step
 
@@ -63,11 +60,19 @@ Each `SpanKind` variant carries the provenance fields that apply to it (`model_i
 pub enum SpanEventKind {
     SanitizeHit { hits_count, kinds: Vec<SecretKind>, placeholder_ids: Vec<PlaceholderId> },
     Approval { decision: ApprovalDecision, resource: ResourceAccess },
+    ToolEvent { action: String, payload: ToolEventPayload },
+}
+
+pub enum ToolEventPayload {
+    Phase { duration_ms: u64 },
+    HttpFetch { status: u16, bytes: u64, content_type: Option<String>, body_preview: Option<String> },
+    LlmCall { model: String, input: String, output: String },
 }
 ```
 
 - `SanitizeHit` is emitted **only when sanitize actually modified content**. Misses are not recorded — the trace records what happened, not what ran.
 - `Approval` records **every** decision (`Approve`, `ApproveAlways`, `Deny`). The audit trail of "what did the user approve and when" is complete.
+- `ToolEvent` is a tool-emitted phase artifact — one per `ToolEventSink::emit` call inside a tool body (a sub-action's elapsed time, an HTTP response summary, a side-LLM round-trip). The agent layer drains the tool's event buffer after execution, sanitizes text payload fields, then emits one `SpanEvent` per entry. `ToolEventPayload` text fields are producer-truncated and still pass through the leak detector before persistence.
 
 ### Sanitization constraints
 

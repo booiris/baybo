@@ -17,7 +17,7 @@ Core responsibilities:
 ## Public surface
 
 ```
-AssessError            — enum: NoSourcePath | Hash | Store | Llm | UnparseableReply
+AssessError            — enum: NoSourcePath | Hash | Store | Llm | UnparsableReply { preview: String }
 AssessmentMode         — enum: Off | Primary (default) | Full
 AssessmentScope        — enum: Disabled | Primary | Full
 AssessedSkill          — { verdict: RiskVerdict, scope: AssessmentScope, background_pending: bool }
@@ -25,7 +25,7 @@ SkillAssessor
   ::with_background_worker(llm, store, mode) — spawns a recovery worker on the current Tokio runtime
   .check(skill) -> AssessedSkill             — main entrypoint; dispatches on mode
   .mode() -> AssessmentMode
-  .recover_pending_jobs(lookup)              — re-enqueue persisted jobs at startup (no-op when mode=Off)
+  .recover_pending_jobs(lookup)              — re-enqueue persisted jobs at startup, regardless of mode (no-op only when no background worker is attached)
 
 hash_skill_dir(dir)     -> io::Result<String>          — full-scope SHA-256
 hash_skill_primary(dir) -> io::Result<Option<String>>  — SKILL.md-only SHA-256
@@ -140,7 +140,7 @@ Owned by `storage::risk` (see [storage.md](storage.md)):
 
 - **`aura skills check` / `/skills check`** — runs the validator, then invokes the assessor per skill. JSON output includes `scope` and `background_pending`.
 - **`Skill` builtin tool** (`aura-skills::tools`) — calls `Arc<dyn SkillRiskCheck>::assess` per invocation. `Block` aborts the call with `ToolError::Denied`; `PassWithWarning` returns the body with a `risk_warning` field and emits a `NoticeLevel::Warn` notice; `Pass` runs silently. Risk is checked once per call, not once per turn.
-- **`main.rs`** — constructs the assessor with `with_background_worker(llm, store, mode)`, mapping `config.skills.risk_check` via `boot::to_assessment_mode`, then calls `recover_pending_jobs` once after the skill registry is populated. Argv-mode commands that don't open the chat loop leave the assessor `None`, which the CLI surfaces as `status: "not_configured"`.
+- **`src/runtime.rs`** — constructs the assessor with `with_background_worker(llm, store, mode)`, mapping `config.skills.risk_check` via `boot::to_assessment_mode`, then calls `recover_pending_jobs` once after the skill registry is populated. Argv-mode commands that don't open the chat loop leave the assessor `None`, which the CLI surfaces as `status: "not_configured"`.
 
 ## Constraints
 
@@ -154,6 +154,6 @@ Owned by `storage::risk` (see [storage.md](storage.md)):
 |--------|------|
 | `skills`  | Owns `SkillDefinition`, `source_path`, and the registry the assessor hashes. |
 | `storage` | Defines `SkillRiskStore`, `RiskVerdict`, `AssessmentJob`; owns the libsql backend. |
-| `llm`     | Provides the `LlmClient` used for the classifier call. |
+| `llm`     | Provides the `BoundBilledLlm` (bound to `Attribution::system("skill-assessor")`) used for the classifier call. |
 | `agent`   | Hosts the `Skill` builtin tool that consults `SkillRiskCheck` per invocation. |
 | `cli`     | `aura skills check` renders `AssessedSkill` for operator review. |

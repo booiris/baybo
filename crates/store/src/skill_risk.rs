@@ -58,7 +58,7 @@ pub struct RiskVerdict {
     pub level: RiskLevel,
     pub rationale: String,
     pub model: String,
-    /// Unix epoch seconds.
+    /// Unix epoch microseconds.
     pub assessed_at: i64,
 }
 
@@ -109,9 +109,9 @@ pub struct AssessmentJob {
     pub status: AssessmentJobStatus,
     pub attempts: u32,
     pub last_error: Option<String>,
-    /// Unix epoch seconds.
+    /// Unix epoch microseconds.
     pub created_at: i64,
-    /// Unix epoch seconds.
+    /// Unix epoch microseconds.
     pub updated_at: i64,
 }
 

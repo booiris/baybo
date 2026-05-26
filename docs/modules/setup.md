@@ -26,10 +26,11 @@ a wizard, an operator's first run goes:
 - writes a default `aura.json` pinned to that key,
 - opens libsql storage and the secret vault,
 - walks an LLM-provider step (Quick + Full both run it), an optional
-  channel-bot step, and (Full only) an optional browser-tool step,
+  channel-bot step, (Full only) an optional browser-tool step, and an
+  external-agents step (Quick + Full both run it),
 - writes the final `aura.json` once at the end (never partway through),
-- and offers to spawn the gateway and open the dashboard in a
-  browser, or print a hint and exit.
+- and prints a hint with the next commands (`aura gateway start` /
+  `aura tui`) and exits — it never starts the gateway itself.
 
 The command is also idempotent: running it on a workspace that
 already exists reuses the key and the existing `aura.json`, and
@@ -43,7 +44,7 @@ re-prompts only the steps the operator chooses (LLM step's
 ```text
 aura-cli (top)            aura-cli::commands::{llm,channel}::add — thin wrappers
     │
-    └─► aura-setup ◄──── public API: Prompter, flow::*, run_*, end picker
+    └─► aura-setup ◄──── public API: Prompter, flow::*, run_*, print_exit_hint
             │
             ├─ aura-config / aura-security (vault + encryption key)
             ├─ aura-llm (provider catalog + OAuth)
@@ -67,9 +68,14 @@ Before showing any picker, `bootstrap_workspace_if_needed`:
 1. Calls `WorkspaceManager::ensure_layout`, which creates every
    workspace subdir and runs `git init` inside `config/`,
    `profile/`, and `skills/` (per-dir repos, no top-level repo).
-2. If `<root>/.key/encryption.key` is missing: mint 32 random bytes
-   via `rand::rng().fill`, hex-encode, and write to that path with
-   `O_CREAT | O_EXCL` and mode 0600. Exists → reused as-is.
+   Then calls `WorkspaceManager::seed_default_identity_files`, which
+   re-seeds any missing identity file (e.g. a deleted `SOUL.md`) from
+   its default template without clobbering operator edits — load-
+   bearing on a re-run.
+2. If `<root>/.key/encryption.key` is missing: mint the key via
+   `hex::encode(EncryptionKey::generate().as_bytes())` and write that
+   hex to the path with `O_CREAT | O_EXCL` and mode 0600. Exists →
+   reused as-is.
 3. Resolves the config path (`AURA_CONFIG_PATH` env override else
    `<root>/config/aura.json`). Missing → write
    `AuraConfig::default()` with `security.encryption_key_file`
@@ -141,6 +147,18 @@ Other knobs (viewport, profile_dir, chrome_path, cdp_url) stay at
 defaults — operators wanting custom values edit `aura.json`
 directly.
 
+### External-agents step (Quick + Full)
+
+`configure_external_agents_step` probes `claude`, `codex`, and
+`gemini` on `PATH`, then shows the detected ones in a single
+multi-select so the operator enables the set they want in one pass.
+If more than one ends up enabled it prompts for the default. Each
+enabled agent's discovered binary path is recorded under
+`external_agents.<kind>.binary_path`, and the chosen default lands in
+`external_agents.default_external_agent`. When nothing is detected the
+step is a no-op. The resulting `ExternalAgentsStepOutcome { enabled,
+default }` is surfaced on `SetupOutcome`.
+
 ### Exit hint
 
 Setup never starts the gateway itself. Once the config is committed it
@@ -190,6 +208,7 @@ pub mod flow {
     pub fn configure_llm_step(...) -> Result<LlmStepOutcome>;
     pub fn configure_channel_step(...) -> Result<ChannelStepOutcome>;
     pub fn configure_browser_step(...) -> Result<BrowserStepOutcome>;
+    pub fn configure_external_agents_step(...) -> Result<ExternalAgentsStepOutcome>;
     pub fn run_registration(...) -> Result<RegistrationResult>;  // sidecar driver
 }
 
@@ -199,9 +218,7 @@ pub async fn bootstrap_workspace_if_needed(workspace_root) -> Result<SetupContex
 pub async fn run(prompter, ctx) -> Result<SetupOutcome>;          // mode picker → quick/full
 pub async fn run_quick(prompter, ctx) -> Result<SetupOutcome>;
 pub async fn run_full(prompter, ctx) -> Result<SetupOutcome>;
-pub fn pick_end_action(prompter) -> Result<EndAction>;
-pub async fn launch_gateway_and_open_browser() -> Result<()>;
-pub fn print_exit_hint(outcome, config_path);
+pub fn print_exit_hint(config_path: &Path);
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
@@ -234,9 +251,9 @@ pub mod test_support {
 | -------------------- | ----------------------------------------------------------------------- |
 | `aura-config`        | `AuraConfig` (load/validate/write), `LlmEntry`, `BrowserConfig`         |
 | `aura-security`      | `EncryptionKey::new`, `SecretVault::new`/`store_secret`                 |
-| `aura-llm`           | `LlmProviderRegistry`, `BUILTIN_PROVIDERS`, `default_base_url_for_*`, OAuth (`pkce_login` / `device_code_login`, `VaultTokenStore`) |
+| `aura-llm`           | `LlmProviderRegistry`, `default_base_url_for_provider`, OAuth (`pkce_login` / `device_code_login`, `VaultTokenStore`). (`BUILTIN_PROVIDERS` is a local `const` in `flow/llm.rs`, not from `aura-llm`.) |
 | `aura-channels`      | `register_wire::*`, `registration::Prompter` + `RegistrationResult`     |
-| `aura-storage`       | `Store::open`, `ChannelBotStore`, `retry_on_busy`                       |
+| `aura-storage`       | `Store::open`, `retry_on_busy`. (`ChannelBotStore` is defined in `aura-store` and imported via `aura_store::ChannelBotStore`.) |
 | `aura-workspace`     | `WorkspacePaths`, `WorkspaceManager::ensure_layout`, `default_workspace_root` |
 | `aura-gateway`       | `SidecarRuntime`, `BUN_BINARY_ENV`, `SIDECAR_ENV_ALLOWLIST`             |
 | `aura-cli`           | Wrappers: `commands::llm::add`, `commands::channel::add_bot`            |

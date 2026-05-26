@@ -7,12 +7,12 @@
 //! when the skill tree changes, so tampered skills are re-judged.
 //!
 //! ```text
-//!   +-----------+   hash(dir)    +-----------------+   miss    +------------+
-//!   |  caller   | -------------> |  SkillRiskStore::get | --------> |  LlmClient |
-//!   +-----------+                +-----------------+           +------------+
-//!         ^                             |                             |
-//!         |         hit (cached)        |        put verdict          |
-//!         +-----------------------------+-----------------------------+
+//!   +--------+   hash(dir)    +---------------------+   miss    +----------------+
+//!   | caller | -------------> | SkillRiskStore::get | --------> | BoundBilledLlm |
+//!   +--------+                +---------------------+           +----------------+
+//!        ^                               |                               |
+//!        |         hit (cached)          |          put verdict          |
+//!        +-------------------------------+-------------------------------+
 //! ```
 //!
 //! The assessor deliberately does not own an in-process regex or

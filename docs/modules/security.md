@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `security` crate provides low-level security primitives: cryptographic operations (`EncryptionKey`, `encrypt`/`decrypt`), encrypted secret storage (`SecretVault`, `SecretValue`), leak detection (`LeakDetector`, `LeakDetectionRule`, `LeakMatch`, `LeakScanResult`), deterministic placeholder minting (`PlaceholderMinter`), prompt-injection detection (`InjectionDetector`, `InjectionWarning`, `InjectionSeverity`), filesystem path sensitivity checks (`is_sensitive_path`), and the `SecurityError` error type.
+The `security` crate provides low-level security primitives: cryptographic operations (`EncryptionKey` is re-exported at the crate root; the `encrypt`/`decrypt` functions are reached as `crypto::encrypt` / `crypto::decrypt`), encrypted secret storage (`SecretVault`, `SecretValue`), leak detection (`LeakDetector`, `LeakDetectionRule`, `LeakMatch`, `LeakScanResult`, `LeakAction`), deterministic placeholder minting (`PlaceholderMinter`), prompt-injection detection (`InjectionDetector`, `InjectionWarning`, `InjectionSeverity`), filesystem path sensitivity checks (`is_sensitive_path`), log redaction (the `log_redact` module with `RedactingMakeWriter` / `RedactingWriter`), and the `SecurityError` error type.
 
 The gateway (`SecurityGateway`) lives in `agent::security` — it holds session-scoped state and orchestrates scanning, minting, and reveal across the agent loop. The `SecretStore` trait lives in the `aura-store` ports crate; `SecretVault` and the rest of the crypto surface live here, and `aura-storage` provides the libsql implementation. `MemorySecretStore` for downstream tests is exposed via the `test-support` feature gate.
 
@@ -19,7 +19,7 @@ Core responsibilities of the primitives in this crate:
 
 The gateway in `agent::security` builds on these primitives:
 
-- **SecurityGateway**: input/output sanitization, LLM-response defensive scrubbing, stream-fragment scrubbing, tool-output scrubbing (including prompt-injection warnings and structural wrapping), error-string scrubbing, and the reveal API. Also owns the tool-output length cap (`MAX_TOOL_OUTPUT_BYTES = 32 KiB`).
+- **SecurityGateway**: input/output sanitization, LLM-response defensive scrubbing, stream-fragment scrubbing, tool-output secret scrubbing and prompt-injection scanning, error-string scrubbing, and the reveal API. The tool-output *framing* — structural wrapping, the length cap, and `MAX_TOOL_OUTPUT_BYTES = 32 KiB` — lives in `aura-context` (`crates/context/src/prompts/tool_output.rs`), not here.
 
 ## Design Decisions
 
@@ -37,7 +37,7 @@ Before any response leaves the system, `sanitize_output()` runs again. Placehold
 
 ### Stream-delta buffering
 
-Streaming output never reveals plaintext. `AgentLoop::chat_streaming` buffers chunks in a small `pending: String` and calls `safe_flush_boundary` to find the largest prefix that cannot contain a partial placeholder. The rule: locate the last `[{`; if its tail lacks `}]`, withhold from that `[{`. A lone trailing `[` is also withheld in case the next chunk completes it into `[{`. The buffer is capped at 128 bytes (`STREAM_BUFFER_HIGH_WATER`) to bound worst-case memory.
+Streaming output never reveals plaintext. `AgentLoop::chat_streaming` buffers chunks in a small `pending: String` and calls `safe_flush_boundary` to find the largest prefix that cannot contain a partial placeholder. Both the `safe_flush_boundary` free function and the `STREAM_BUFFER_HIGH_WATER` const live in `crates/agent/src/runtime/agent_loop.rs`, not on `SecurityGateway`. The rule: locate the last `[{`; if its tail lacks `}]`, withhold from that `[{`. A lone trailing `[` is also withheld in case the next chunk completes it into `[{`. The buffer is capped at 128 bytes (`STREAM_BUFFER_HIGH_WATER`) to bound worst-case memory.
 
 For the flushable prefix the gateway runs the scan/mint/vault pipeline, and the *scanned* (placeholder-bearing) text is both:
 
@@ -59,15 +59,15 @@ For the flushable prefix the gateway runs the scan/mint/vault pipeline, and the 
 Injection markers (`ignore previous`, fake turn prefixes, ChatML/LLaMA control tokens, forged `<tool_output>` tags, etc.) are scanned at two points:
 
 - **Inbound messages** (`sanitize_input`): every text block is scanned; hits are logged via `tracing` at a level that scales with severity (`Critical`/`High` → `warn`, `Medium` → `info`, `Low` → `debug`). User input is not blocked — legitimate prose contains many of these literals — but the logs give operators a signal.
-- **Tool output** (`sanitize_tool_output` + `wrap_tool_output_for_llm`): warnings are logged the same way, and `wrap_tool_output_for_llm` prepends an inline security banner naming the triggered rules inside the `<tool_output>` envelope so the LLM treats the content as untrusted data rather than instructions.
+- **Tool output** (`sanitize_tool_output` in this crate + `wrap_tool_output` in `aura-context`): warnings are logged the same way, and `wrap_tool_output` prepends an inline security banner naming the triggered rules (passed in as `warning_rules`) inside the `<tool_output>` envelope so the LLM treats the content as untrusted data rather than instructions.
 
 ### Tool-output structural wrapping
 
-`SecurityGateway::wrap_tool_output_for_llm(tool_name, content)` wraps the result in `<tool_output name="...">...</tool_output>`. The tool name is XML-attribute-escaped; any literal `</tool_output` inside the body is neutralized with a zero-width space between the slash and the tag name so untrusted content cannot forge the closing boundary. The agent loop applies this wrap to every tool result before appending it to `ContentBlock::ToolResult`.
+`aura_context::prompts::tool_output::wrap_tool_output(tool_name, content, warning_rules)` (in `aura-context`, not this crate) wraps the result in `<tool_output name="...">...</tool_output>`. The tool name is XML-attribute-escaped; any literal `</tool_output` inside the body is neutralized with a zero-width space between the slash and the tag name so untrusted content cannot forge the closing boundary. `warning_rules` are the injection-marker rule names the caller pulled from this crate's `InjectionDetector::scan`; passing them as plain strings keeps `aura-context` free of an `aura-security` dependency. The agent loop applies this wrap to every tool result before appending it to `ContentBlock::ToolResult`.
 
 ### Tool-output length cap
 
-`SecurityGateway::cap_tool_output(content)` truncates to `MAX_TOOL_OUTPUT_BYTES` on a UTF-8 char boundary and appends a truncation notice. The cap runs **before** wrapping so the notice lands inside the `<tool_output>` envelope. Individual tools keep their own tighter bounds (`Bash` 64 KiB, `WebFetch` 256 KiB, `Grep` 500 hits, `Read` 2000 lines × 2000 chars/line, `Glob` 1000 paths) — the gateway cap is a final defense for any tool that didn't apply one.
+`aura_context::prompts::tool_output::cap_tool_output(content, spill_path)` (in `aura-context`, not this crate) truncates to `MAX_TOOL_OUTPUT_BYTES` on a UTF-8 char boundary and appends a truncation notice; when `spill_path` is set the notice points the model at the full payload (readable back via the `Read` tool). The cap runs **before** wrapping so the notice lands inside the `<tool_output>` envelope. Individual tools keep their own tighter bounds (`Bash` 64 KiB, `WebFetch` 256 KiB, `Grep` 500 hits, `Read` 2000 lines × 2000 chars/line, `Glob` 1000 paths) — this cap is a final defense for any tool that didn't apply one.
 
 ### Sensitive-path filter
 

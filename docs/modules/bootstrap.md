@@ -16,6 +16,7 @@ It is **not** a reusable library. Alternative entry points (e.g. integration tes
 | `src/gateway_cmd.rs` | Long-running entry point for `aura gateway start` and the supporting installer / token / status subcommands. |
 | `src/setup_cmd.rs` | First-run wizard (`aura setup`). |
 | `src/tui_cmd.rs` | Interactive `aura tui` entry point: connects to a running gateway over the channel WS. |
+| `src/reload.rs` | In-process config hot-reload orchestrator. Implements `aura_gateway::ConfigReloader` with a two-phase prepare→commit swap; lives here because rebuilding the LLM pool needs `boot::build_llm_client_for_entry`. |
 | `src/singleton.rs` | Per-workspace `flock` lock acquired by `gateway_cmd::start`. |
 | `src/tracing_init.rs` / `src/tui_log.rs` | Tracing setup variants (stdout, file, TUI) plus the in-memory `LogBuffer` and TUI mirror sink. |
 
@@ -27,14 +28,13 @@ It is **not** a reusable library. Alternative entry points (e.g. integration tes
 
 | Function | Maps |
 |----------|------|
-| `to_execution_policy` | `AgentConfig` → `aura_agent::ExecutionPolicy` |
-| `to_token_budget` | `ContextConfig` → `aura_context::TokenBudget` |
-| `to_session_timeout` | `SessionConfig` → `chrono::Duration` |
 | `to_assessment_mode` | `RiskCheckConfig` → `aura_skills_assessor::AssessmentMode` |
-| `build_leak_detector` | `SecurityConfig` → `aura_security::LeakDetector` |
+| `build_leak_detector` | `SecurityConfig` → `aura_security::LeakDetector` (the base detector). A second `runtime::build_leak_detector(security, gateway_tokens)` wraps this one to also add per-token redaction rules for the live gateway tokens; `boot`'s version is the config-only base. |
 | `storage_db_path` | `WorkspaceConfig` → `PathBuf` at `<workspace.path>/state/storage.db` (the workspace root is itself the aura data directory) |
 
-Each has a unit test in `boot::tests` that pins the mapping. These act as drift detectors: if a config field is renamed or a domain constructor's signature changes, the test fails at compile time.
+Larger domain objects (`AgentLoop`, `ContextManager`, `Router`) are no longer built through a `boot::to_*` mapping; they are assembled in `runtime.rs` via each type's `from_config` constructor (`AgentLoop::from_config`, `ContextManager::from_config`, `Router::from_config`), populating a sibling `XxxConfig` struct literal so every required field shows up by name at the call site.
+
+`storage_db_path` and `build_leak_detector` each have a unit test in `boot::tests` that pins the mapping. These act as drift detectors: if a config field is renamed or a domain constructor's signature changes, the test fails at compile time.
 
 ### Loaders (perform I/O)
 
