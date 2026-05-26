@@ -5,6 +5,7 @@ import {
   RiArchiveLine,
   RiBookmark3Line,
   RiBrainLine,
+  RiCornerDownLeftLine,
   RiCornerDownRightLine,
   RiCpuLine,
   RiLoader4Line,
@@ -1008,10 +1009,12 @@ function formatTok(n: number): string {
 function JobSidebar({
   jobs,
   active,
+  interjectionCounts,
   onChange,
 }: {
   jobs: TraceJobSummary[];
   active: string;
+  interjectionCounts: Map<string, number>;
   onChange: (id: string) => void;
 }) {
   return (
@@ -1041,6 +1044,15 @@ function JobSidebar({
               <div className="font-mono text-[0.65rem] text-ink-soft mt-0.5">
                 ↑{formatTok(inputTotal)} ↓{formatTok(output)}
               </div>
+              {(interjectionCounts.get(j.job_id) ?? 0) > 0 && (
+                <div
+                  title="This job folded in mid-turn user message(s) (steering)"
+                  className="mt-1 inline-flex items-center gap-0.5 border-2 border-black rounded bg-warn/15 px-1 py-px text-[0.6rem] font-bold uppercase tracking-wider text-warn"
+                >
+                  <RiCornerDownLeftLine className="text-[0.7rem]" />
+                  {interjectionCounts.get(j.job_id)}
+                </div>
+              )}
             </button>
           );
         })}
@@ -1058,6 +1070,7 @@ function JobSummaryPanel({
   messageLog,
   jobIndex,
   totalJobs,
+  interjectionCount,
 }: {
   summary: TraceJobSummary | undefined;
   trace: JobTrace | undefined;
@@ -1065,6 +1078,7 @@ function JobSummaryPanel({
   messageLog: SessionMessageRow[];
   jobIndex: number;
   totalJobs: number;
+  interjectionCount: number;
 }) {
   if (!summary) {
     return (
@@ -1114,6 +1128,15 @@ function JobSummaryPanel({
                   ? ' • loading…'
                   : ` • ${formatDuration(durMs)}`}
             </div>
+            {interjectionCount > 0 && (
+              <div
+                title="This job folded in mid-turn user message(s) (steering)"
+                className="mt-1 inline-flex items-center gap-1 border-2 border-black rounded bg-warn/15 px-1.5 py-0.5 text-[0.65rem] font-bold uppercase tracking-wider text-warn"
+              >
+                <RiCornerDownLeftLine className="text-[0.8rem]" />
+                {interjectionCount} interjection{interjectionCount === 1 ? '' : 's'}
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -1182,6 +1205,12 @@ function JobSummaryPanel({
             <dd>{llmCount}</dd>
             <dt className="font-bold text-ink-soft">Tool calls</dt>
             <dd>{toolCount}</dd>
+            {interjectionCount > 0 && (
+              <>
+                <dt className="font-bold text-ink-soft">Interjections</dt>
+                <dd className="text-warn font-bold">{interjectionCount}</dd>
+              </>
+            )}
             <dt className="font-bold text-ink-soft">Input tokens</dt>
             <dd>{input.toLocaleString()}</dd>
             <dt className="font-bold text-ink-soft">Output tokens</dt>
@@ -1326,6 +1355,31 @@ export function TraceSessionPage() {
   const activeJobSummary = overview?.jobs.find((j) => j.job_id === activeJobId);
   const activeJobTrace = activeJobId ? jobTraces.get(activeJobId) : undefined;
   const messageLog = overview?.session_messages ?? [];
+
+  // Map each job to the count of mid-turn user interjections folded into
+  // it. A `user_interjection` row is only persisted mid-drain, so it
+  // belongs to the job whose [started_at, ended_at) window contains its
+  // `created_at` — jobs run sequentially, so the assignment is unambiguous.
+  const interjectionCountByJob = useMemo(() => {
+    const counts = new Map<string, number>();
+    const interjections = (overview?.session_messages ?? []).filter(
+      (r) => r.message.source === 'user_interjection',
+    );
+    if (interjections.length === 0) return counts;
+    for (const job of overview?.jobs ?? []) {
+      const startIso = job.started_at ?? job.created_at;
+      if (!startIso) continue;
+      const start = new Date(startIso).getTime();
+      const end = job.ended_at ? new Date(job.ended_at).getTime() : Number.POSITIVE_INFINITY;
+      let n = 0;
+      for (const r of interjections) {
+        const t = new Date(r.created_at).getTime();
+        if (t >= start && t < end) n += 1;
+      }
+      if (n > 0) counts.set(job.job_id, n);
+    }
+    return counts;
+  }, [overview]);
 
   // Fetch the active job's step/span tree on demand. Re-fires when the
   // user picks a different sidebar entry or the polling tick bumps
@@ -1537,6 +1591,7 @@ export function TraceSessionPage() {
         <JobSidebar
           jobs={overview.jobs}
           active={activeJobId}
+          interjectionCounts={interjectionCountByJob}
           onChange={(j) => updateUrl({ job: j, span: null })}
         />
 
@@ -1588,6 +1643,7 @@ export function TraceSessionPage() {
             messageLog={messageLog}
             jobIndex={activeJobIndex}
             totalJobs={overview.jobs.length}
+            interjectionCount={interjectionCountByJob.get(activeJobId) ?? 0}
           />
         )}
       </div>

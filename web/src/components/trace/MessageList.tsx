@@ -3,6 +3,7 @@ import {
   RiArrowDownSLine,
   RiArrowRightSLine,
   RiBrainLine,
+  RiCornerDownLeftLine,
   RiRobot2Line,
   RiToolsLine,
   RiUser3Line,
@@ -187,6 +188,15 @@ function MessageCard({
         {open ? <RiArrowDownSLine className="text-ink-soft" /> : <RiArrowRightSLine className="text-ink-soft" />}
         <Icon className={`text-base ${meta.accent}`} />
         <span className="font-bold uppercase tracking-wider text-[0.75rem]">{meta.label}</span>
+        {message.source === 'user_interjection' && (
+          <span
+            title="Sent mid-turn while the agent was working (steering); folded into this turn's input"
+            className="inline-flex items-center gap-1 border-2 border-black rounded bg-warn/15 px-1.5 py-0.5 text-[0.6rem] font-bold uppercase tracking-wider text-warn"
+          >
+            <RiCornerDownLeftLine className="text-[0.7rem]" />
+            Interjected
+          </span>
+        )}
         <span className="ml-auto text-ink-soft text-[0.8rem] font-mono truncate max-w-[60%]">
           {previewLine(message.content, toolNames)}
         </span>

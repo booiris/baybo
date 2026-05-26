@@ -64,9 +64,11 @@ export type Role = 'system' | 'user' | 'assistant' | 'tool';
 // Provenance of a ChatMessage row (mirrors `aura_model::MessageSource`).
 // Several origins ride as a `user` role, so role alone can't tell a genuine
 // prompt from a cron fire or an agent-injected reminder — this distinguishes
-// them. 'user' = human channel input; 'cron' = a cron fire's framed prompt;
-// 'agent' = everything else the agent injects/produces.
-export type MessageSource = 'user' | 'cron' | 'agent';
+// them. 'user' = human channel input; 'user_interjection' = a human message
+// that arrived mid-turn (steering) — also a user bubble, but framed wire-side;
+// 'cron' = a cron fire's framed prompt; 'agent' = everything else the agent
+// injects/produces.
+export type MessageSource = 'user' | 'user_interjection' | 'cron' | 'agent';
 
 export interface BlobRef {
   blob_id: string;

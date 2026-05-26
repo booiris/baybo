@@ -34,7 +34,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 300,
+            max_iterations: 1000,
             context: ContextConfig::default(),
             max_subagent_depth: 3,
             max_subagents_per_root: 8,

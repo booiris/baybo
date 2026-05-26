@@ -51,6 +51,7 @@ fn rehydrate_message(
         .map_err(StorageError::Storage)?;
     Ok(match source {
         MessageSource::User => ChatMessage::user(content),
+        MessageSource::UserInterjection => ChatMessage::user_interjection(content),
         MessageSource::Cron => ChatMessage::cron_fire(content),
         MessageSource::Agent => match role {
             Role::User => ChatMessage::agent_context(content),

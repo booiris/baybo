@@ -1063,3 +1063,324 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
 
     harness.shutdown().await;
 }
+
+/// Tool that, on execution, enqueues a pre-armed `UserInput` onto the actor
+/// mailbox — simulating a user sending a message *during* the turn
+/// (mid-tool-execution, strictly before the next iteration's interjection
+/// drain). The send completes synchronously on the current-thread runtime
+/// (mailbox has capacity), so the message is queued by the time iter 2 drains.
+mod interjecting_tool {
+    use async_trait::async_trait;
+    use aura_agent::actor::AgentMessage;
+    use aura_agent::actor::mailbox::MailboxSender;
+    use aura_model::TrustLevel;
+    use aura_tools::{Tool, ToolContext, ToolManifest, ToolOutput};
+    use parking_lot::Mutex;
+    use serde_json::{Value, json};
+
+    pub struct InterjectingTool {
+        armed: Mutex<Option<(MailboxSender<AgentMessage>, AgentMessage)>>,
+    }
+
+    impl InterjectingTool {
+        pub fn new() -> Self {
+            Self {
+                armed: Mutex::new(None),
+            }
+        }
+
+        /// Arm the message to enqueue on the next execution.
+        pub fn arm(&self, tx: MailboxSender<AgentMessage>, msg: AgentMessage) {
+            *self.armed.lock() = Some((tx, msg));
+        }
+
+        pub fn manifest(&self) -> ToolManifest {
+            ToolManifest {
+                name: "interject".into(),
+                description: "Test tool that enqueues a mid-turn user message.".into(),
+                trust_level: TrustLevel::Trusted,
+                parameters_schema: json!({"type": "object", "additionalProperties": true}),
+                capabilities: vec![],
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for InterjectingTool {
+        fn name(&self) -> &str {
+            "interject"
+        }
+        fn description(&self) -> String {
+            "Test tool that enqueues a mid-turn user message.".to_string()
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object", "additionalProperties": true})
+        }
+        async fn execute(
+            &self,
+            _params: Value,
+            _ctx: &ToolContext,
+        ) -> aura_tools::Result<ToolOutput> {
+            // Take out of the lock before awaiting (no lock held across await).
+            let armed = self.armed.lock().take();
+            if let Some((tx, msg)) = armed {
+                let _ = tx.send(msg).await;
+            }
+            Ok(ToolOutput::Text("did the thing".into()))
+        }
+    }
+}
+
+#[tokio::test]
+async fn mid_turn_message_is_injected_at_next_tool_boundary() {
+    // A message that arrives WHILE the loop is running (here: enqueued by a
+    // tool during iter 1) is drained at the next tool boundary and injected —
+    // wrapped in the `<user_interjection>` steering envelope — into the iter 2
+    // request, before that LLM call. The raw text is persisted faithfully (a
+    // user bubble); the envelope is wire-only.
+    use interjecting_tool::InterjectingTool;
+
+    let tool = Arc::new(InterjectingTool::new());
+    let manifest = tool.manifest();
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(tool.clone() as Arc<dyn Tool>, manifest)
+        .build();
+
+    // Iter 1 (streaming): one tool call, no text → loop fires the tool (which
+    // enqueues the interjection), appends its result, and continues.
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+            id: "call-1".into(),
+            name: "interject".into(),
+            arguments: json!({}),
+            signature: None,
+        })]);
+    // Iter 2 (non-streaming chat): final response → loop exits.
+    harness.stub_llm.push_response(LlmResponse {
+        content: "handled both".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage::default(),
+        thinking: None,
+    });
+
+    // Arm the tool to enqueue this interjection mid-turn.
+    let interjection = user_input(&harness, "actually, also do Y");
+    tool.arm(harness.mailbox.clone(), interjection);
+
+    harness.send_text("do X").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let captured = harness.stub_llm.captured_requests();
+    assert_eq!(
+        captured.len(),
+        2,
+        "exactly two iterations — the interjection is folded into the running turn, not run as a third turn"
+    );
+
+    // Iter 1 predates the interjection.
+    let iter1_user: String = captured[0]
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !iter1_user.contains("also do Y"),
+        "iter 1 must predate the interjection: {iter1_user}"
+    );
+
+    // Iter 2 carries it, wrapped in the steering envelope with framing.
+    let iter2_user: String = captured[1]
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        iter2_user.contains("<user_interjection>"),
+        "iter 2 must carry the steering envelope: {iter2_user}"
+    );
+    assert!(
+        iter2_user.contains("also do Y"),
+        "envelope must carry the interjection text: {iter2_user}"
+    );
+    assert!(
+        iter2_user.contains("finish the current task first"),
+        "envelope must carry the steering framing: {iter2_user}"
+    );
+
+    // The persisted transcript stores RAW text (a faithful user bubble), not
+    // the wire envelope — framing is applied wire-only.
+    let persisted = harness
+        .session_manager
+        .load_active_session_messages(&harness.session.id)
+        .await
+        .expect("load transcript");
+    let interjection_row = persisted
+        .iter()
+        .find(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("also do Y")))
+        })
+        .expect("interjection row persisted");
+    assert!(
+        interjection_row.from_user(),
+        "interjection renders as a user bubble"
+    );
+    assert!(
+        !interjection_row
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("<user_interjection>"))),
+        "persisted row must be raw text, not the wire envelope"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn slash_boundary_is_not_bypassed_by_mid_turn_drain() {
+    // Regression: a burst [A, /x, B] where A performs a tool call. The slash
+    // command is a hard boundary, so B (queued behind it) must NOT be drained
+    // into A's turn at A's tool boundary — it runs as its own turn AFTER the
+    // slash. (Before the fix, the coalescer popped the slash into a local and
+    // left B at the mailbox head, so the in-turn interjection drain pulled B
+    // into A's turn, jumping it ahead of the slash.)
+    let tool = Arc::new(RecordingTool::new("echo_tool"));
+    tool.set_response(ToolOutput::Text("tool ok".into()));
+    let manifest = tool.manifest();
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(tool.clone() as Arc<dyn Tool>, manifest)
+        .build();
+
+    // A: iter 1 streams a tool call, iter 2 (chat) finalizes.
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+            id: "call-A".into(),
+            name: "echo_tool".into(),
+            arguments: json!({}),
+            signature: None,
+        })]);
+    harness.stub_llm.push_response(LlmResponse {
+        content: "A done".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage::default(),
+        thinking: None,
+    });
+    // The /x turn streams, then the B turn streams.
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("x done".into())]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("B done".into())]);
+
+    // Burst: all enqueued before the actor polls (current-thread runtime), so
+    // the coalescer sees [A, /x, B] together.
+    for t in ["do A", "/x", "message B"] {
+        harness
+            .mailbox
+            .send(user_input(&harness, t))
+            .await
+            .expect("send");
+    }
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let captured = harness.stub_llm.captured_requests();
+    // A (tool + final = 2) + /x (1) + B (1) = 4. If B had been folded into A,
+    // there would be only 3 requests and no standalone B turn.
+    assert_eq!(
+        captured.len(),
+        4,
+        "B must run as its own turn after the slash boundary, not fold into A's turn"
+    );
+
+    // A's tool-boundary (second) request must not carry B.
+    let a_iter2: String = captured[1]
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !a_iter2.contains("message B"),
+        "B must not be injected into A's turn across the slash boundary: {a_iter2}"
+    );
+    assert!(
+        !a_iter2.contains("<user_interjection>"),
+        "no interjection envelope should appear in A's turn: {a_iter2}"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn drained_interjection_survives_a_failed_turn() {
+    // Durability: once an interjection is drained it is popped from the mailbox
+    // AND persisted (at the iteration boundary, before the next LLM call), so
+    // even if the turn then fails it is not lost — it stays in the transcript
+    // and surfaces on the next turn (and is never re-drained, having left the
+    // mailbox). Here iter 2's LLM call errors *after* the interjection was
+    // drained at the iter-2 boundary.
+    use interjecting_tool::InterjectingTool;
+
+    let tool = Arc::new(InterjectingTool::new());
+    let manifest = tool.manifest();
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(tool.clone() as Arc<dyn Tool>, manifest)
+        .build();
+
+    // Iter 1: tool call (enqueues the interjection). Iter 2: provider error →
+    // the turn fails after the interjection has been drained + persisted.
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+            id: "call-1".into(),
+            name: "interject".into(),
+            arguments: json!({}),
+            signature: None,
+        })]);
+    harness
+        .stub_llm
+        .push_response_err(LlmError::Internal(anyhow::anyhow!("provider down")));
+
+    let interjection = user_input(&harness, "steer: also do Y");
+    tool.arm(harness.mailbox.clone(), interjection);
+
+    harness.send_text("do X").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    // The turn errored, but the interjection row is durably persisted (raw
+    // text, a user bubble) rather than lost with the failed turn.
+    let persisted = harness
+        .session_manager
+        .load_active_session_messages(&harness.session.id)
+        .await
+        .expect("load transcript");
+    assert!(
+        persisted.iter().any(|m| m.from_user()
+            && m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("also do Y")))),
+        "a drained interjection must survive a failed turn in the persisted transcript"
+    );
+
+    harness.shutdown().await;
+}
