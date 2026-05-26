@@ -186,16 +186,18 @@ Token comparison differs by listener:
   `auth::admin::require_admin_token` runs the presented token through
   `aura_gateway::constant_time_eq` against the expected value
   (`auth/admin.rs`).
-- **Channel token** is *not* a constant-time compare.
+- **Channel token** is *not* a constant-time compare, by design.
   `ChannelTokenTable::lookup` is a plain `DashMap::get(token)`
-  (`auth/token.rs`) — the token is the map key, so matching it relies on
-  the hash-map probe, not a fixed-time byte comparison. The mitigation
-  here is the token's entropy (256 random bits, hex-encoded) plus the
-  loopback-only, same-UID delivery surface, not timing-safe equality.
+  (`auth/token.rs`) — the token is the map key, so matching it goes
+  through the hash-map probe rather than a fixed-time byte comparison.
+  This is an accepted trade-off, not a gap: the token is 256 random bits
+  (hex-encoded) delivered over a loopback-only, same-UID surface, so a
+  hash-probe timing side-channel on a high-entropy key is not a realistic
+  recovery vector. Timing-safe equality is reserved for the admin bearer.
 
-`aura_gateway::constant_time_eq` is exported for reuse but is currently
-wired only on the admin bearer path. `/healthz` and `/readyz` skip auth
-on both listeners.
+`aura_gateway::constant_time_eq` is wired on the admin bearer path only,
+deliberately per the above. `/healthz` and `/readyz` skip auth on both
+listeners.
 
 ### Admin auth — bearer token, URI sanitisation before tracing
 
