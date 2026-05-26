@@ -19,6 +19,13 @@ use futures::Stream;
 pub enum TransportEvent {
     /// Incremental assistant text chunk.
     StreamDelta(String),
+    /// Incremental model reasoning ("thinking") chunk.
+    Reasoning(String),
+    /// A tool call started; `label` is the optional human preview.
+    ToolStarted { tool: String, label: Option<String> },
+    /// A tool call finished. `status` is the wire string (`"ok"` /
+    /// `"error"` / `"denied"`); `summary` is the short result rendering.
+    ToolCompleted { status: String, summary: String },
     /// Final assistant response for the turn.
     Response(Vec<ContentBlock>),
     /// Out-of-band notice surfaced by the agent.

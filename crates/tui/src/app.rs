@@ -66,6 +66,15 @@ pub(crate) struct AppState {
     /// the `      ` (six-space) continuation indent so the conversation
     /// reads as one coherent block.
     pub(crate) streaming_committed_any: bool,
+    /// Trailing partial line of the in-flight reasoning ("thinking")
+    /// trace, mirroring [`streaming`] but for dim reasoning lines. Each
+    /// `AppEvent::Reasoning` appends; complete lines commit dim as they
+    /// form, and the partial flushes before the answer / a tool line.
+    pub(crate) reasoning: Option<String>,
+    /// Whether the current reasoning run has committed any line — drives
+    /// the dim `✻ ` leader (first line) vs the continuation indent. Reset
+    /// once a non-reasoning line (tool / answer) ends the run.
+    pub(crate) reasoning_committed_any: bool,
     /// Active inline approval prompt. At most one is live at a time; further
     /// queued requests stay on [`ApprovalQueue`] until the head is resolved.
     pub(crate) pending_approval: Option<ApprovalChatEntry>,
@@ -113,6 +122,8 @@ impl AppState {
             history_cursor: None,
             streaming: None,
             streaming_committed_any: false,
+            reasoning: None,
+            reasoning_committed_any: false,
             pending_approval: None,
             commands: Vec::new(),
             completion_cursor: 0,
@@ -358,10 +369,50 @@ impl AppState {
 
     /// Clear the streaming buffer + reset the "first line committed"
     /// flag. Called after `Outgoing` finalises the response so the
-    /// next stream starts with `aura> ` again.
+    /// next stream starts with `aura> ` again. Also clears any leftover
+    /// reasoning state (normally already flushed before finalize).
     pub(crate) fn clear_stream(&mut self) {
         self.streaming = None;
         self.streaming_committed_any = false;
+        self.reasoning = None;
+        self.reasoning_committed_any = false;
+    }
+
+    /// Append a chunk to the in-flight reasoning trace. Mirrors
+    /// [`append_stream_delta`] for the dim reasoning buffer.
+    pub(crate) fn append_reasoning_delta(&mut self, delta: &str) {
+        self.reasoning.get_or_insert_with(String::new).push_str(delta);
+    }
+
+    /// Drain every newline-terminated reasoning line, leaving the
+    /// trailing partial for the next chunk. Mirrors
+    /// [`drain_complete_stream_lines`].
+    pub(crate) fn drain_complete_reasoning_lines(&mut self) -> Vec<String> {
+        let Some(buf) = self.reasoning.as_mut() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Some(idx) = buf.find('\n') {
+            let mut line: String = buf.drain(..=idx).collect();
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            out.push(line);
+        }
+        out
+    }
+
+    /// Take whatever partial reasoning line remains, leaving
+    /// `reasoning = None`. Returns `None` when empty. Called to flush the
+    /// reasoning run before a tool line / the answer / finalize.
+    pub(crate) fn take_reasoning_partial(&mut self) -> Option<String> {
+        let partial = self.reasoning.take()?;
+        if partial.is_empty() {
+            None
+        } else {
+            Some(partial)
+        }
     }
 
     pub(crate) fn take_input(&mut self) -> Option<String> {

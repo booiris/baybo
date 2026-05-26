@@ -38,6 +38,7 @@ server side.
 - Chat scrolling is the terminal's own (mouse wheel / the emulator's scrollback); the TUI keeps no scroll offset for chat. `PageUp`/`PageDown` page the **dashboard** table only (`DashboardPageUp`/`DashboardPageDown`, ±10 rows).
 - While the LLM is responding, an ephemeral streaming buffer is drawn immediately below the scrollback tail. Each `AgentEvent::Delta` extends it; complete lines are committed to the terminal scrollback (`insert_before`) as they arrive, leaving only the trailing partial in the buffer. The agent loop streams deltas on **every** iteration, so a final answer that lands after tool calls still streams.
 - The final `AgentEvent::Message` does **not** replace the streamed text — those lines are already committed. `finalize_stream` (via the pure `finalize_lines`) commits the trailing partial plus any non-text extras the stream didn't carry (e.g. the CronCreate hint). When the response **never streamed** — the non-streaming delivery path, where the agent loop ran with `delta_tx = None` (cron fires, subagent-notification turns) and only a final Message arrives — it renders the full message body from the blocks so the text isn't dropped.
+- **Turn-progress events** (see [`docs/turn-progress-events.md`](../turn-progress-events.md)) commit to scrollback in arrival order, interleaved with the answer, so a turn reads as `✻ thinking… → ⏺ Tool(label) → ⎿ summary → aura> answer`. `Reasoning` chunks buffer into a dim line-buffer (`AppState.reasoning`, mirroring `streaming`) and commit dim as complete lines form; the partial flushes ahead of any tool line / the answer / finalize. `ToolStarted` commits a cyan `⏺ tool(label)` line at dispatch (before any approval prompt); `ToolCompleted` commits a `⎿ summary` line coloured by status (red error / yellow denied / dim ok). The final `Message`'s `ToolUse` blocks are **not** a duplicate source here — `render_block` only renders the CronCreate hint, never general tool calls, so no dedup is needed.
 
 ### Slash completion
 
@@ -239,7 +240,7 @@ concrete transport used by the TUI. The adapter holds an
   send a `Frame::Message` over the WS.
 - `subscribe(session_id) -> TransportEventStream` — decode inbound
   frames from the same WS and translate them into
-  `TransportEvent::{StreamDelta, Response, Notice, ApprovalRequested, ApprovalResolved}`.
+  `TransportEvent::{StreamDelta, Reasoning, ToolStarted, ToolCompleted, Response, Notice, ApprovalRequested, ApprovalResolved}`.
 - `approval_queue()` — returns the transport's local `ApprovalQueue`.
   On construction, `WsTransport::connect` installs a resolver so
   `queue.resolve_head(decision)` also sends a
@@ -258,6 +259,7 @@ each `TransportEvent` onto an `AppEvent` variant so rendering code
 does not need to know about the transport:
 
 - `StreamDelta(text)` → `AppEvent::StreamDelta(String)`. Appended to `AppState.streaming`, redrawn live.
+- `Reasoning(text)` / `ToolStarted { tool, label }` / `ToolCompleted { status, summary }` → the matching `AppEvent` variants. Each commits dim reasoning / `⏺` / `⎿` lines to scrollback — see [Chat](#chat).
 - `Response(blocks)` → `AppEvent::Outgoing(Vec<ContentBlock>)`. Finalises the response via `finalize_stream` (commit the trailing partial + non-text extras, or render the body from blocks when nothing streamed — see [Chat](#chat)), then clears `AppState.streaming`.
 - `Notice { level, text }` → `AppEvent::Log(LogRecord { level, target: "agent", message })`. Reuses the log surface.
 - `ApprovalRequested` / `ApprovalResolved` — see [Inline approval prompt](#inline-approval-prompt).
