@@ -60,6 +60,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{TerminalOptions, Viewport};
 use tokio::sync::{Notify, mpsc};
+use tokio::time::Instant as TokioInstant;
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -310,6 +311,15 @@ fn new_dashboard_terminal() -> io::Result<Term> {
     Terminal::new(backend)
 }
 
+/// How long a terminal-resize burst must go quiet before we rebuild the inline
+/// viewport. A drag-resize emits many `Resize` events in quick succession;
+/// reacting to each one re-anchors the inline viewport and prints newlines (see
+/// [`rebuild_chat_terminal_after_resize`]), so we coalesce them and rebuild once
+/// the size stops changing. The window sits above a per-frame (~16ms) event
+/// cadence so a continuous drag never fires it mid-gesture, yet it feels instant
+/// on release.
+const RESIZE_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
+
 async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     install_panic_hook();
 
@@ -352,6 +362,13 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     commit_banner(&mut terminal, &ctx.initial_session_id)?;
     terminal.draw(|f| render_chat(f, &mut state))?;
 
+    // Debounce timer for coalescing terminal-resize bursts. Parked far in the
+    // future and re-armed on each `Resize`; the select arm is gated on
+    // `resize_pending` so the parked timer never fires spuriously.
+    let resize_debounce = tokio::time::sleep(std::time::Duration::from_secs(86_400));
+    tokio::pin!(resize_debounce);
+    let mut resize_pending = false;
+
     loop {
         tokio::select! {
             biased;
@@ -376,7 +393,15 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
                     }
                     Some(Ok(CrosstermEvent::Resize(_, _))) => {
-                        draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
+                        // Coalesce the burst: arm/re-arm the debounce and let the
+                        // resize_debounce arm rebuild once it settles. Redrawing
+                        // here would route through ratatui's in-place inline
+                        // resize, which re-anchors from a pre-reflow cursor offset
+                        // and garbles the live region.
+                        resize_pending = true;
+                        resize_debounce
+                            .as_mut()
+                            .reset(TokioInstant::now() + RESIZE_COALESCE_WINDOW);
                     }
                     Some(Ok(CrosstermEvent::Mouse(_))) => {
                         // Mouse capture is only enabled in dashboard mode and
@@ -407,19 +432,31 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         {
                             dispatch_submission(&mut state, &ctx, &mut terminal, next).await?;
                         }
-                        resize_chat_viewport_if_needed(
-                            &state,
+                        // This redraw can rebuild the inline terminal (a pending
+                        // resize, or a viewport-height change as an approval
+                        // clears) — a cursor query. We're on a non-keyboard
+                        // wake-up with the reader parked, so route it through the
+                        // guard that drops the stream around any such query.
+                        term_events = redraw_after_event(
+                            term_events,
                             &mut terminal,
+                            &mut state,
                             &mut current_viewport_h,
+                            &mut resize_pending,
                         )?;
-                        draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
                     }
                     AppEvent::StreamDelta(delta) => {
                         state.append_stream_delta(&delta);
                         if matches!(state.mode, ViewMode::Chat) {
                             flush_complete_stream_lines(&mut state, &mut terminal)?;
                         }
-                        draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
+                        term_events = redraw_after_event(
+                            term_events,
+                            &mut terminal,
+                            &mut state,
+                            &mut current_viewport_h,
+                            &mut resize_pending,
+                        )?;
                     }
                     AppEvent::DashboardReady(kind, snapshot) => {
                         if state.dashboard_kind() == Some(kind) {
@@ -433,13 +470,25 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                                 snapshot,
                             )?;
                         }
-                        draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
+                        term_events = redraw_after_event(
+                            term_events,
+                            &mut terminal,
+                            &mut state,
+                            &mut current_viewport_h,
+                            &mut resize_pending,
+                        )?;
                     }
                     AppEvent::Log(record) => {
                         if matches!(state.mode, ViewMode::Chat) {
                             commit_lines(&mut terminal, chat::render_log_lines(&record))?;
                         }
-                        draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
+                        term_events = redraw_after_event(
+                            term_events,
+                            &mut terminal,
+                            &mut state,
+                            &mut current_viewport_h,
+                            &mut resize_pending,
+                        )?;
                     }
                     AppEvent::ApprovalRequested => {
                         if !state.approval_pending()
@@ -453,10 +502,33 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                                 state: ApprovalChatState::Pending { selected: 0 },
                             });
                         }
-                        draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
+                        // Showing the approval grows the viewport, so this draw
+                        // rebuilds the inline terminal (a cursor query) on a
+                        // non-keyboard wake-up — the guard pauses the reader for it.
+                        term_events = redraw_after_event(
+                            term_events,
+                            &mut terminal,
+                            &mut state,
+                            &mut current_viewport_h,
+                            &mut resize_pending,
+                        )?;
                     }
                     AppEvent::Shutdown => break Ok(()),
                 }
+            }
+            _ = &mut resize_debounce, if resize_pending => {
+                // The resize burst settled with no AppEvent in between (the idle
+                // path — an interleaved AppEvent would have applied the resize via
+                // `redraw_after_event` and cleared the flag, disabling this arm).
+                // Re-anchor the inline viewport at the new size; the guard drops
+                // the stream for the cursor query and clears `resize_pending`.
+                term_events = redraw_after_event(
+                    term_events,
+                    &mut terminal,
+                    &mut state,
+                    &mut current_viewport_h,
+                    &mut resize_pending,
+                )?;
             }
         }
     }
@@ -499,6 +571,86 @@ fn resize_chat_viewport_if_needed(
     *terminal = new_chat_terminal(desired)?;
     *current = desired;
     Ok(())
+}
+
+/// Rebuild the inline chat terminal after a terminal-resize burst settles.
+///
+/// A resize makes the terminal reflow its native scrollback (both the user's
+/// pre-launch shell history and our committed chat lines) — that part is
+/// correct and we leave it alone. What breaks is ratatui's inline viewport:
+/// its in-place `resize()` re-derives the viewport top from a *pre-reflow*
+/// cursor offset, so the live region lands at the wrong row and every later
+/// `insert_before` compounds the drift. Reconstructing the terminal re-queries
+/// the live cursor and anchors a fresh viewport with consistent internal state.
+///
+/// We deliberately do not clear or replay history: clearing would wipe the
+/// reflowed shell history above, and the terminal already reflowed our lines.
+/// The known artifact is that the old input box (a full-width bordered box the
+/// terminal just reflowed, its border line wrapping into extra rows) leaves
+/// stale fragment rows just above the new input. `insert_before` scrolls rather
+/// than overwrites, so these drift upward as new output arrives and only vanish
+/// once they scroll off the top — they are NOT overwritten by the next line.
+/// Fully removing them needs the post-reflow physical layout, which stock
+/// ratatui/crossterm doesn't expose (blind clearing would risk erasing the
+/// history line just above); that's the Codex `custom_terminal` fork territory.
+fn rebuild_chat_terminal_after_resize(
+    terminal: &mut Term,
+    state: &AppState,
+    current: &mut u16,
+) -> io::Result<()> {
+    let desired = desired_viewport_height(state);
+    *terminal = new_chat_terminal(desired)?;
+    *current = desired;
+    Ok(())
+}
+
+/// Redraw after a non-keyboard wake-up (an `AppEvent`, or the resize debounce),
+/// dropping the terminal event stream around the draw when it will query the
+/// cursor. Two things make a chat-mode draw query the cursor (DSR `ESC[6n`):
+///
+/// - **A pending terminal resize** we haven't applied yet: `terminal`'s known
+///   size is stale, so `draw_active`'s `autoresize` re-anchors the inline
+///   viewport via `cursor::position()`. We pre-empt that with our own clean
+///   rebuild ([`rebuild_chat_terminal_after_resize`]) so the viewport doesn't
+///   get the stale-offset garble, then let the draw run without a resize.
+/// - **A live-region height change** (approval shown/cleared, input grew):
+///   `resize_chat_viewport_if_needed` inside `draw_active` rebuilds.
+///
+/// `crossterm::cursor::position()` can only read its reply off stdin when no
+/// `EventStream` is polling it; on these wake-ups the stream's reader thread is
+/// parked holding crossterm's internal reader, so the query would time out and
+/// the error would tear down the loop. Dropping the stream releases the reader
+/// for the query; we recreate it after (keys typed meanwhile stay buffered in
+/// the tty). `resize_pending` is consumed — this redraw applies it.
+///
+/// Returns the (possibly recreated) stream so the caller can rebind it.
+/// Keyboard-event redraws don't use this: they run while the reader is free
+/// (the key was just delivered), so a plain `draw_active` is safe there.
+fn redraw_after_event(
+    term_events: EventStream,
+    terminal: &mut Term,
+    state: &mut AppState,
+    current_viewport_h: &mut u16,
+    resize_pending: &mut bool,
+) -> anyhow::Result<EventStream> {
+    let pending_resize = std::mem::replace(resize_pending, false);
+    let queries_cursor = matches!(state.mode, ViewMode::Chat)
+        && (pending_resize || desired_viewport_height(state) != *current_viewport_h);
+    if !queries_cursor {
+        draw_active(terminal, state, current_viewport_h)?;
+        return Ok(term_events);
+    }
+    drop(term_events);
+    let mut result: io::Result<()> = Ok(());
+    if pending_resize {
+        result = rebuild_chat_terminal_after_resize(terminal, state, current_viewport_h);
+    }
+    if result.is_ok() {
+        result = draw_active(terminal, state, current_viewport_h);
+    }
+    let stream = EventStream::new();
+    result?;
+    Ok(stream)
 }
 
 /// Stream-mode helpers — see [`AppState::streaming`] / `streaming_committed_any`.
