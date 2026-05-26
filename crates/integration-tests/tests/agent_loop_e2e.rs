@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::actor::AgentMessage;
-use aura_channels::{AgentEvent, AgentOutput, IncomingMessage, Message};
+use aura_channels::{AgentEvent, AgentOutput, IncomingMessage, Message, ToolStatus};
 use aura_cost::SpendingLimits;
 use aura_integration_tests::{AgentTestHarness, SessionBuilder, capture_tracing};
 use aura_llm::test_support::StubLlm;
@@ -169,6 +169,84 @@ async fn tool_call_round_trip_invokes_recording_tool() {
     );
 
     let _: Arc<StubLlm> = harness.stub_llm.clone();
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn tool_call_emits_started_and_completed_progress() {
+    let tool = Arc::new(RecordingTool::new("echo_tool"));
+    tool.set_response(ToolOutput::Text("line one\nline two\nline three".into()));
+    let manifest = tool.manifest();
+
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(tool.clone() as Arc<dyn Tool>, manifest)
+        .build();
+
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+            id: "call-1".into(),
+            name: "echo_tool".into(),
+            arguments: json!({"q": "ping"}),
+            signature: None,
+        })]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("all done".into())]);
+
+    harness.send_text("call the tool please").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert!(
+        outs.iter().any(|o| matches!(
+            &o.event,
+            AgentEvent::ToolStarted { call_id, tool, .. }
+                if call_id == "call-1" && tool == "echo_tool"
+        )),
+        "expected a ToolStarted for the echo_tool call, got {outs:?}"
+    );
+    assert!(
+        outs.iter().any(|o| matches!(
+            &o.event,
+            AgentEvent::ToolCompleted { call_id, status, summary }
+                if call_id == "call-1" && *status == ToolStatus::Ok && summary == "3 lines"
+        )),
+        "expected a ToolCompleted(Ok, \"3 lines\") for the echo_tool call, got {outs:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn reasoning_chunks_stream_as_reasoning_events() {
+    let mut harness = AgentTestHarness::builder().build();
+
+    // One streamed response carrying a thinking chunk ahead of the answer.
+    harness.stub_llm.push_stream(vec![
+        StreamEvent::Reasoning("thinking hard about it".into()),
+        StreamEvent::Text("the answer".into()),
+    ]);
+
+    harness.send_text("ponder this").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let reasoning: String = outs
+        .iter()
+        .filter_map(|o| match &o.event {
+            AgentEvent::Reasoning(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        reasoning.contains("thinking hard about it"),
+        "expected reasoning to stream as Reasoning events, got {outs:?}"
+    );
+    // The answer still streams as Delta, distinct from reasoning.
+    assert!(
+        AgentTestHarness::delta_text(&outs).contains("the answer"),
+        "answer must still stream as Delta, got {outs:?}"
+    );
+
     harness.shutdown().await;
 }
 

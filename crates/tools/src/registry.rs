@@ -151,6 +151,14 @@ impl ToolRegistry {
         self.builtin.get(name).cloned()
     }
 
+    /// Human label a tool produces for a pending call via
+    /// [`Tool::call_label`] (e.g. Bash's `description`, WebFetch's URL).
+    /// `None` when the tool is unregistered or declares no label. Used by
+    /// the agent loop to caption `ToolStarted` progress events.
+    pub fn call_label(&self, name: &str, params: &Value) -> Option<String> {
+        self.get(name).and_then(|tool| tool.call_label(params))
+    }
+
     /// Execute a tool by name with the given parameters and context.
     pub async fn execute(
         &self,
