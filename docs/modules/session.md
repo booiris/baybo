@@ -12,9 +12,9 @@ The conversation transcript itself is **not** carried on `Session`. It lives in 
 
 ## Manager surface
 
-`SessionManager` wraps `Arc<dyn SessionStore>` and exposes:
+`SessionManager` wraps two stores — `store: Arc<dyn SessionStore>` (the session rows + transcript) and `summary_store: Arc<dyn SessionSummaryStore>` (per-session summary-cursor metadata) — both required at `new()`. It exposes:
 
-- Lifecycle: `create_session` / `create_session_with_trigger` / `create_spawned_session` / `get_or_create` / `get` / `list` / `delete` / `cleanup_expired` / `touch`.
+- Lifecycle: `create_session` / `create_session_with_trigger` / `create_spawned_session` / `get_or_create` / `get` / `list` / `delete` / `idle_sessions` / `touch`. `idle_sessions(threshold)` only **returns** the IDs of sessions idle past the threshold — it never deletes a row (its sole consumer is the actor reaper, which evicts in-memory actors, not rows).
 - Transcript brokerage (thin pass-throughs to `SessionStore`): `append_session_message`, `apply_session_compaction`, `load_active_session_messages`, `latest_session_ordinal`, `load_session_messages_with_supersede`, `history`. The agent loop calls these every turn so the in-memory `ContextManager` stays in sync with `session_messages` rows. The leading system message rides the same log — no separate dedup table.
 
 ## Design Decisions
@@ -41,7 +41,7 @@ One `AgentActor` per session. All messages targeting the same session (user inpu
 
 ### Source deletion is rejected when live forks exist
 
-`SessionStore::delete(source_id)` returns `Err(SessionError::HasLiveForks { fork_session_ids })` when any session has a `Lineage::UserFork` pointing into the source. Callers must delete the forks first or accept the error. There is no materialize-on-delete escape hatch — the case is rare enough to surface as an error rather than silently rewrite snapshots. The same delete cascades the session's `session_messages` rows so a stranded transcript can never outlive its parent.
+`SessionStore::delete(source_id)` returns `Err(StorageError::HasLiveForks { fork_session_ids })` at the trait boundary when any session has a `LineageKind::UserFork` pointing into the source; the manager layer translates this into `SessionError::HasLiveForks { fork_session_ids }`, preserving the id list so the `aura session delete` CLI surface can render the offending forks back to the operator. Callers must delete the forks first or accept the error. There is no materialize-on-delete escape hatch — the case is rare enough to surface as an error rather than silently rewrite snapshots. The same delete cascades the session's `session_messages` rows so a stranded transcript can never outlive its parent.
 
 ### Subagent parent deletion drains the subtree first
 
@@ -66,19 +66,21 @@ When a session with an in-flight subagent is deleted, the subagent's cancellatio
 
 `Session.bound_soul_version` is locked when the session is created. Each `Job` records its own `effective_soul_version` at start time. If they diverge (hot reload changed the soul mid-session), the job records a `DriftRecord` in `provenance_drift`. The session's contract stays anchored even when the runtime config moves underneath it.
 
-### Session timeout flow
+### Idle actor reaping — never row deletion
 
-1. Periodic cleanup task triggers `SessionManager::cleanup_expired()`
-2. Compute cutoff time: `now - session_timeout`
-3. `list_expired(cutoff)` returns expired session IDs
-4. For each: `SessionStore::delete(session_id)` removes the session row and cascades the `session_messages` log.
+Session rows and their transcripts are core user data and are **never** dropped by any background sweep (see CLAUDE.md, "Session data is core data — never delete"). Idleness only evicts the in-memory `AgentActor`, never the durable row:
+
+1. The actor reaper (`AgentSupervisor::reap_idle`) periodically calls `SessionManager::idle_sessions(threshold)`.
+2. That computes `cutoff = now - threshold` and returns `SessionStore::list_expired(cutoff)` — a list of candidate session IDs and nothing more. The method's doc-comment states it "must never become a delete."
+3. For each candidate that has a live registered actor (and no in-flight background subagents), the supervisor sends `AgentMessage::ActorStop`, which trips the actor's cancellation token and lets the registry guard drop the in-memory entry.
+4. The session row, transcript, summary cursor, and channel binding all stay live; the next user message re-hydrates a fresh actor from the store. Dropping the actor is therefore lossless.
 
 ## Collaboration
 
 | Module    | Role                                                                                                |
 | --------- | --------------------------------------------------------------------------------------------------- |
 | `model`   | Defines `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`               |
-| `storage` | Implements `SessionStore` / `SessionSummaryStore` against libsql; pulls the traits from `aura-session` |
+| `storage` | Implements `SessionStore` / `SessionSummaryStore` against libsql; pulls the traits from `aura-store` (no `aura-session` dependency) |
 | `context` | Owns the in-memory transcript via `ContextManager`; agent loop brokers persistence via this crate  |
 | `agent`   | Re-exports `SessionManager`; Router calls it; `AgentActor` holds the `Session` instance            |
 | `cli` / `gateway` | Operator-facing surfaces consume `aura_agent::SessionManager`                              |

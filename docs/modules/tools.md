@@ -23,8 +23,9 @@ permission rules.
 | `Read`, `Write`, `Edit`                                                                                                                                                                                                                                               | implemented | file I/O on absolute paths. `Edit` carries extra guards when `file_path` resolves under `<workspace>/profile/`: writes are restricted to the three identity files (`SOUL.md`, `USER.md`, `IDENTITY.md`), the existing file is capped at 1 MiB, and after a successful write the change is staged and committed to `profile/`'s standalone git repo with a fixed `Aura <aura@local>` author and `--no-verify` (audit history, not a hand-curated repo). Detached HEAD or commit failure leaves the file write in place and surfaces a `commit_warning` in the tool output. A profile edit does **not** change the running session's system prompt mid-turn; `ContextManager` re-resolves it on the next compaction (see [`agent.md`](agent.md)), so the edit takes effect from then on. |
 | `Bash`                                                                                                                                                                                                                                                                | implemented | `sh -c` inside the OS sandbox in **permissive filesystem** mode capped at `workspace_root + $HOME` (FHS roots RO; nothing outside that union is visible — no full host-root bind), with `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.docker`, `~/.kube`, `$AURA_HOME`, … masked by per-call tmpfs. Network enabled. Approval gate fires only on file-delete (`rm`/`rmdir`/`find -delete`) or destructive `git` (`reset --hard`, `push --force`, `branch -D`, …). No env/cwd persistence across calls. See `docs/modules/sandbox.md#filesystem-policy-workspace-vs-permissive`. |
 | `Glob`, `Grep`                                                                                                                                                                                                                                                        | implemented | basic walkdir + regex; will be upgraded if throughput becomes an issue                                      |
-| `WebFetch`                                                                                                                                                                                                                                                            | implemented | renders the response as Markdown; when `prompt` is supplied, `default_tools` was given a side `LlmCompletion` (gateway/runtime path passes `Some`, argv-mode passes `None`), AND the rendered content is at least `SUMMARY_MIN_CHARS` (2048 chars), runs a fixed-system extraction pass and returns the model's reply instead of the raw body. Shorter pages and LLM-less builds fall through to raw markdown — the prompt is silently ignored. |
+| `WebFetch`                                                                                                                                                                                                                                                            | implemented | renders the response as Markdown; when `prompt` is supplied, the agent layer has bound a side LLM into `ToolContext::llm` (gateway/runtime path binds `Some`, argv-mode leaves `None`), AND the rendered content is at least `SUMMARY_MIN_CHARS` (2048 chars), runs a fixed-system extraction pass and returns the model's reply instead of the raw body. Shorter pages and LLM-less builds fall through to raw markdown — the prompt is silently ignored. |
 | `SendFile`                                                                                                                                                                                                                                                            | implemented | streams a local file into `BlobStore` and returns a channel attachment                                      |
+| `Now`                                                                                                                                                                                                                                                                 | implemented | returns the current UTC + host-local time so the LLM can anchor relative-time reasoning; no parameters, no capabilities |
 | `Echo`                                                                                                                                                                                                                                                                | debug-only  | returns params verbatim; registered only under `debug_assertions` for round-trip smoke-testing              |
 | `CronCreate`, `CronDelete`, `CronList`                                                                                                                                                                                                                                | implemented | live in `aura-cron::tools` (not `aura-tools::builtin`) because they hold `Arc<CronScheduler>`; registered from `src/runtime.rs` after the scheduler is constructed |
 | `Skill`                                                                                                                                                                                                                                                               | implemented | lives in `aura-skills::tools` (parallel to `aura-cron::tools`) because it holds `Arc<SkillRegistry>` + `Arc<dyn SkillRiskCheck>`; registered from `src/runtime.rs` after the assessor is constructed. Mode 1 (no `file_path`) returns the SKILL.md body plus a categorized inventory of helper files (`references/`, `templates/`, `scripts/`, `other`). Mode 2 (`file_path` set) returns a sub-file's contents with path-traversal protections. Risk assessor and `required_env` approval gate fire on every call. |
@@ -32,9 +33,14 @@ permission rules.
 | `SkillUninstall`                                                                                                                                                                                                                                                      | implemented | symmetric counterpart to `SkillInstall`. Looks up the skill by name, refuses if it has no on-disk source or its canonicalized `source_path` doesn't sit under the workspace skills dir (so registry-only or third-party-mounted skills aren't deletable), removes the directory recursively, then triggers `SkillRegistry::reload()`. Same `WriteFile` capability scoping. |
 | `Agent`, `AskUserQuestion`, `SendMessage`, `EnterPlanMode`/`ExitPlanMode`, `EnterWorktree`/`ExitWorktree`, `LSP`, `Monitor`, `NotebookEdit`, `Task*`/`TodoWrite`, `ToolSearch`, `WebSearch`, `Team*`                                                                   | TODO stub   | lives in `builtin::todo`; not auto-registered — each depends on a backing subsystem that has not yet landed |
 
-`ToolRegistry::with_defaults(blob_store, llm)` registers the implemented set with
-`TrustLevel::Trusted` manifests declaring their capabilities
-(`ReadFile`, `WriteFile`, `Http`, `ExecCommand`). `SendFile` is part of this
+`ToolRegistry::with_defaults(blob_store, workspace_paths)` registers the
+implemented set with `TrustLevel::Trusted` manifests declaring their
+capabilities (`ReadFile`, `WriteFile`, `Http`, `ExecCommand`). No LLM handle is
+threaded through the constructor or the `default_tools(blob_store, workspace_paths)`
+factory; `WebFetch`'s prompt-driven extraction reads its LLM from the per-call
+`ToolContext::llm` slot the agent layer binds at tool-call time. `workspace_paths`
+is forwarded to `Edit` (and `Write`/`Bash`) so the `profile/` write guard binds to
+the real workspace rather than a path-string heuristic. `SendFile` is part of this
 default set and uses the supplied `BlobStore` to stage channel attachments.
 Stubs exist so downstream can register them once their backing subsystem is
 ready without having to invent the tool name/schema at that point.
@@ -94,6 +100,33 @@ rule, MCP tools never bridge to slash, mention, or elicitation surfaces.
   reports a single `ResourceAccess::Http { host }` (HTTP) or
   `ResourceAccess::ExecCommand { command }` (stdio) so the approval
   gate can prompt per host or per command.
+
+### Embedded MCP servers
+
+Beyond user-configured `.mcp.json` servers, the binary ships its own
+always-on MCP servers (`EmbeddedMcpServer`, `mcp/embedded.rs`). A
+tool-domain family builds an `EmbeddedMcpProfile` via a
+`*_mcp_profile()` helper (`browser_mcp_profile` today); the boot path
+collects whichever profiles fire and `embedded_servers` materialises
+each into the `EmbeddedMcpServer` entry the reconciler consumes (all
+re-exported from `mcp/mod.rs`). Embedded entries are baked into the
+binary and never appear in or are editable via `.mcp.json`.
+
+- The reconciler merges embedded servers with the user list on every
+  tick; embedded names win on collision and shadow any same-named
+  `.mcp.json` entry. Embedded children are probed for liveness and run
+  with **restart-on-disconnect backoff** (`mcp/reconciler.rs`) so a
+  crashed child surfaces as disconnect-and-reconnect.
+- An **embedded server with `capabilities=[]`** yields an empty
+  per-server resource list, so its tools **skip per-call approval**
+  (`mcp/reconciler.rs`) — the contract being "Aura controls the spawn
+  and trusts the vendor; don't gate on the transport command." Embedded
+  servers that *do* declare capabilities still get the transport-derived
+  approval like any stdio server.
+
+The browser sidecar arrives as one of these embedded servers; see
+[`sidecars.md`](../sidecars.md) for the CDDM wrapper, security
+trade-offs, and docker mode in depth rather than duplicating it here.
 
 ### Skill tool
 

@@ -43,11 +43,11 @@ Commands return `CommandOutput`, not `String`. The sink decides how to render:
 
 ### Shell completion is built-in
 
-`aura completion <shell>` uses `clap_complete` to emit bash/zsh/fish/powershell scripts. No extra scaffolding is needed because clap already owns the tree.
+`aura completion <shell>` uses `clap_complete` to emit bash/zsh/fish/powershell/elvish scripts. No extra scaffolding is needed because clap already owns the tree.
 
 ### No new error enum
 
-`CliError` (thiserror) carries CLI-specific variants (`Parse`, `ConfirmationRequired`, `UnknownCommand`, `AgentSendForbiddenInSlash`) plus catch-all wrapper variants (`Config`, `Io`, `Serialization`, `Manager`). `From` impls cover `std::io::Error`, `serde_json::Error`, `aura_config::ConfigError`, and `aura_setup::SetupError`; every other domain error is wrapped via `.to_string()` so `aura-cli` does not take a hard dependency on every domain crate's error enum.
+`CliError` (thiserror) carries CLI-specific variants (`Parse`, `ConfirmationRequired`, `UnknownCommand`, `AgentSendForbiddenInSlash`, `NotAvailableInSlash`) plus catch-all wrapper variants (`Config`, `Io`, `Serialization`, `Manager`). `From` impls cover `std::io::Error`, `serde_json::Error`, `aura_config::ConfigError`, and `aura_setup::SetupError`; every other domain error is wrapped via `.to_string()` so `aura-cli` does not take a hard dependency on every domain crate's error enum.
 
 ### `SlashHandler` lives in `channels`
 
@@ -56,7 +56,9 @@ The trait that lets a channel adapter intercept `/` input is defined in `aura-ch
 ## Command Reference
 
 **Global flags** (apply to every command in both modes):
-`--config <path>` · `--profile <name>` · `--json` · `--plain` · `--no-color` · `-V/--version`
+`--config <path>` · `--json` · `--plain` · `--no-color`
+
+(`-V`/`--version` is clap's root `aura --version`, derived on the top-level `Cli`, not a `GlobalArgs` member.)
 
 `--config` is UX sugar: `main` writes its value into `AURA_CONFIG_PATH`
 once at startup, and every downstream reader goes through the env var.
@@ -80,7 +82,6 @@ custom help printer to keep in sync.
 
 Hidden by default — only listed when `AURA_HELP_AGENT` is set:
 
-- Flag: `-v` / `--verbose` (log verbosity, repeatable)
 - Subcommands: `config`, `session`, `job`, `cron`, `log`, `cost`
 
 `session` is the unified "everything about a session" surface: metadata
@@ -128,13 +129,13 @@ variables and ignore them, so a false-positive injection is a no-op.
 | `config`     | `get <path>` · `set <path> <value>` · `unset <path>`                                                      | `AuraConfig::{set_at_path, unset_at_path, write_to_file}`                    | `set`/`unset` write `aura.json`; take effect after restart (hot-reload deferred — see `config.md`) | shipped                                           |
 | `skills`     | `list` · `info <name>`                                                                                    | `SkillRegistry`                                                              | read-only                                                                                          | shipped                                           |
 | `skills`     | `search [query]` · `check [name]`                                                                         | `SkillRegistry::search` / `validate_all`                                     | read-only; `check` validates declared `required_bins` on `$PATH`, `required_env` in env, and basic declarative shape; `required_models` is reported as a note only | shipped                                           |
-| `tools`      | `list` · `info <name>`                                                                                    | `ToolRegistry`                                                               | read-only                                                                                          | shipped                                           |
 | `channel`    | `list` · `add` · `remove`                                                                                 | `ChannelBotStore` + vault                                                    | `add`/`remove` mutate; `list` is read-only                                                         | shipped                                           |
 | `channel`    | `status` · `logs [channel]`                                                                               | `ChannelRegistry` / adapter logs                                             | read-only                                                                                          | deferred — needs per-adapter status + log drain   |
 | `mcp`        | `add <name> <command-or-url> [...]` · `list` · `get <name>` · `remove <name>`                              | `aura-tools::mcp` (config: `<workspace>/.mcp.json`) + `SecretVault` (tokens) | `add`/`remove` mutate `.mcp.json` + vault; `add` runs the OAuth flow inline when an OAuth flag is passed for an HTTP server. The running gateway's `McpReconciler` picks up changes within ~5s. | shipped                                           |
 | `llm`        | `status`                                                                                                  | `LlmClient`                                                                  | read-only                                                                                          | shipped                                           |
 | `llm`        | `probe [name]` · `live-model [name]`                                                                      | `LlmProviderRegistry::list_models` / `LlmClient::probe`                      | `probe` issues a minimal chat request                                                              | shipped                                           |
 | `llm`        | `add` · `edit` · `remove` · `default`                                                                     | Interactive editors that write the active config + vault                     | mutates `aura.json` and per-entry vault keys                                                       | shipped                                           |
+| `external-agent` | `status` · `setup`                                                                                    | `aura-agent::external_agent` CLI backends (Claude Code / Codex / Gemini)     | `status` re-probes each kind offline (read-only); `setup` is an interactive wizard that probes a binary path and writes `external_agents.<kind>.binary_path` to `aura.json` | shipped                                           |
 | `session`    | `list` · `show <id>` · `history <id> [--include-superseded \| --superseded-only]` · `export <id> [--out <path>]` | `SessionManager` + `QueryApi::replay`                                        | read-only. `show` returns metadata + message count + (when `QueryApi` is wired) jobs/steps/spans counts from the trace store. `history` defaults to the *active* (non-superseded) transcript; `--include-superseded` walks the full log and tags each row `[active]` or `[→ #N]`, `--superseded-only` keeps just the dropped rows. `export` writes the full fork-aware call tree as pretty JSON (stdout, or `--out <path>` with `--yes` required in slash mode). | shipped                                           |
 | `job`        | `list [--status]` · `show <id>` · `cancel <id>`                                                           | `JobLifecycle`                                                               | `cancel` mutates                                                                                   | shipped                                           |
 | `cron`       | `list` · `show <id>`                                                                                      | `CronScheduler::list_all_jobs` / `get_job`                                   | read-only operator view. `show` returns the full job row (prompt body + `origin_session_id` + timestamps); cron jobs are bound to `user_id + channel`, not to a session, so a session's audit trail of cron creations is better viewed via `session export` than a cron-side filter. All cron mutations (create/delete/enable/disable/run) are driven through the LLM tools (`CronCreate`, `CronDelete`, `CronList`) registered by `aura-cron::tools::agent_tools`. | shipped                                           |
@@ -199,7 +200,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 
 | Module                                                                                                              | Role                                                                                                                                                             |
 | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `bootstrap` (`src/main.rs`, `src/boot.rs`, `src/runtime.rs`)                                                        | Promotes `--config` into `AURA_CONFIG_PATH`, then routes to a per-subcommand entry: `gateway_cmd::run` for `gateway`, `setup_cmd::run` for `setup`, `tui_cmd::run` for `tui`, and the lightweight argv path (`aura_cli::dispatch::run` against a `CommandContext`) for everything else. The TUI side (`tui_cmd`) wires `aura-tui`'s WS-backed `TuiSlashHandler` / `TuiDashboardProvider`, not the in-crate `CliSlashHandler`. |
+| `bootstrap` — the `aura` binary at the **workspace root** (`src/main.rs`, `src/boot.rs`, `src/runtime.rs`, `src/gateway_cmd.rs`, `src/tui_cmd.rs`, `src/setup_cmd.rs`), not `crates/cli` (`aura-cli` is lib-only, no `main.rs`) | Promotes `--config` into `AURA_CONFIG_PATH`, then routes to a per-subcommand entry: `gateway_cmd::run` for `gateway`, `setup_cmd::run` for `setup`, `tui_cmd::run` for `tui`, and the lightweight argv path (`aura_cli::dispatch::run` against a `CommandContext`) for everything else. The TUI side (`tui_cmd`) wires `aura-tui`'s WS-backed `TuiSlashHandler` / `TuiDashboardProvider`, not the in-crate `CliSlashHandler`. |
 | `config`                                                                                                            | `config` family directly reads/writes `AuraConfig`; `doctor` calls `validate`.                                                                                   |
 | `agent`                                                                                                             | Supplies all manager `Arc`s.                                                                                              |
 | `channels`                                                                                                          | Owns `SlashHandler`, `SlashOutcome`, `DashboardProvider`, `ViewKind`; `TuiAdapter` is the first consumer of all four.                                            |

@@ -89,7 +89,8 @@ All libsql-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tomb
 | Module                                   | Role                                                                                      |
 | ---------------------------------------- | ----------------------------------------------------------------------------------------- |
 | `storage` (self)                         | Provides libsql implementations for every Store trait; defines the channel / pairing / cron / risk / blob trait surface |
-| `model` / `trace` / `security` / `job` / `memory` / `cost` / `session` | Provide domain types and store traits consumed by the libsql impls         |
+| `store`                                  | Owns every `*Store` trait contract + its row/DTO types; `storage` implements them and depends only on this crate (+ `model`) |
+| `model` / `trace` / `job`                | Provide domain types the libsql impls round-trip (`trace` / `job` are `dev-dependencies` only, for the round-trip tests) |
 | `context`                                | Owns `ContextManager`; pure in-memory                                                     |
-| `session`                                | Owns `SessionStore` / `SessionSummaryStore` traits + `SessionManager`; `storage` depends on `session` |
+| `session`                                | Owns the `SessionManager` facade and calls `SessionStore` / `SessionSummaryStore` (whose traits live in `aura-store`); `storage` does **not** depend on `session` |
 | `agent`                                  | Injects stores into managers (MemoryManager, JobLifecycle, etc.); re-exports SessionManager |

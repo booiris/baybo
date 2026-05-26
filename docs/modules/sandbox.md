@@ -14,7 +14,8 @@ What the crate provides:
 - A `SandboxRunner` trait and a `current_platform_runner()` factory that
   returns the right backend for the current `target_os`.
 - A `SandboxSpec` describing the program, workspace root, readable
-  paths, network policy, environment policy, stdin source, timeout, and
+  paths, extra `writable_paths`, network policy, environment policy,
+  stdin source, timeout, `resource_limits` (memory + pids caps), and
   the `FilesystemPolicy` selecting between strict workspace-only writes
   and the permissive "host RW + denylist" model used by `BashTool`.
 - `cfg`-free `args.rs` that renders the bwrap argv and the SBPL profile,
@@ -88,8 +89,10 @@ There is no shared "policy" type beyond `SandboxSpec` itself.
 - **Symlinked cwd spelling**: when a caller supplies an explicit `cwd`
   whose canonical target is inside `SandboxSpec.workspace_root`, the
   backend also exposes that requested spelling inside the sandbox
-  (`source = cwd.canonicalize()`, `destination = cwd`). This is a
-  convenience mount only; the security decision stays anchored on the
+  (`source = cwd.canonicalize()`, `destination = cwd`). The crate-public
+  `workspace_symlink_mount_for` helper computes this `WorkspaceSymlinkMount`
+  (both re-exported from the crate root); each backend consumes it. This
+  is a convenience mount only; the security decision stays anchored on the
   canonical workspace root. The sandbox does not parse arbitrary shell
   command strings to discover path spellings.
 - **Network**: `--network none` for `NetworkPolicy::None`, `--network
@@ -396,8 +399,9 @@ backend binary is absent.
 
 ## Constraints
 
-- Linux + macOS only. Other targets receive
-  `SandboxError::UnsupportedPlatform`.
+- Linux + macOS only. On an unsupported target both
+  `current_platform_runner()` and `probe()` return
+  `SandboxError::NoBackendAvailable`.
 - Per-host network allowlist enforces only on macOS (SBPL, all TCP).
   bwrap and Docker both accept the field as advisory (warn + ignore).
   The proper kernel-level Linux/Docker enforcer is deferred — see

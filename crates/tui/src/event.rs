@@ -14,7 +14,10 @@ use tokio::sync::mpsc;
 pub(crate) enum AppEvent {
     /// Router delivered the final assistant response for the active
     /// session. Arrives after any preceding `StreamDelta` events and
-    /// replaces the streaming buffer with the full content blocks.
+    /// finalises the stream: deltas already committed each line to
+    /// scrollback, so this only commits the trailing partial plus any
+    /// non-text extras — it re-renders the full blocks only when
+    /// nothing streamed (the non-streaming delivery path).
     Outgoing(Vec<ContentBlock>),
     /// Incremental text chunk for the in-flight assistant response.
     /// Appended to the live streaming buffer shown at the tail of the

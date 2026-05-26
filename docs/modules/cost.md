@@ -25,6 +25,8 @@ Every monetary field — `CostRecord.cost_usd`, `CostSummary.total_cost_usd`, `S
 
 `LlmProviderRegistry::create_client` takes a closure-shaped `LlmCallGuard` (from `aura-llm`). `cost_call_guard(&Arc<CostManager>)` produces that closure: it calls `CostManager::check` and maps `CostGuardError` → `LlmError::GuardRejected`. Lives as a free function rather than a `CostManager` method so the manager doesn't have to know about `LlmError`.
 
+The production wiring is `cost_hooks(&Arc<CostManager>)`, which bundles `cost_call_guard` (the admission guard) with the `record_call` recorder closure into the `aura_llm::CostHooks` every `BillableLlm` is built with; argv one-shots and tests use `CostHooks::passthrough` instead.
+
 ### Pricing snapshot reload
 
 The bundled `ModelPricing` snapshot is good enough for first boot, but rates drift. `CostManager::merge_pricings` overlays a freshly-fetched live pricing map without blocking LLM-client wiring on the network fetch; rates differing by more than `PRICING_DRIFT_WARN = 25%` from the bundled snapshot log a `warn!` so operators see a tier rename or list-price cut before it silently distorts the budget.
@@ -35,7 +37,7 @@ The bundled `ModelPricing` snapshot is good enough for first boot, but rates dri
 
 ## Constraints
 
-- Depends on `aura-llm` (for `ModelPricing`) — must not be pulled by `aura-storage` to avoid a cycle (`storage → cost → llm → security → storage`). The libsql `CostStore` impl lives in `aura-storage` and depends on `aura-cost`; the chain stops there.
+- Depends on `aura-llm` (for `ModelPricing`) — must not be pulled by `aura-storage` to avoid a cycle (`storage → cost → llm → security → storage`). The libsql `CostStore` impl (`LibsqlCostStore`) lives in `aura-storage` and implements the `aura-store` trait over `aura-model` types only — it does **not** depend on `aura-cost`, so the cycle never forms.
 - No dependency on `aura-storage` — the libsql impl converts its own errors at the trait boundary
 - `test_support::MemoryCostStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `aura-cost = { workspace = true, features = ["test-support"] }`
 
@@ -47,4 +49,4 @@ The bundled `ModelPricing` snapshot is good enough for first boot, but rates dri
 | `llm`     | Provides `ModelPricing` (rates per 1M tokens) and the `LlmCallGuard` closure shape `cost_call_guard` adapts to       |
 | `agent`   | Constructs one `CostManager` per process; calls `record_call` after every LLM span closes, gates ingress with `check` |
 | `store`   | Owns the `CostStore` trait contract and `StorageError`                                                              |
-| `storage` | Provides the libsql implementation of `CostStore` (trait from `aura-store`)                                          |
+| `storage` | `LibsqlCostStore` implements the `CostStore` trait (from `aura-store`) over `aura-model` types; no dependency on `aura-cost`  |

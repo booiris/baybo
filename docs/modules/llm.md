@@ -10,13 +10,13 @@ Core responsibilities:
 - Hide provider differences behind registry-style extension via `LlmProviderRegistry`
 - Leverage rig's native function calling for structured tool-use responses
 
-**Design constraint**: this crate is pure infrastructure with no business logic. It does not depend on `security`, `tools`, or `skills`.
+**Design constraint**: this crate is pure infrastructure with no business logic. It does not depend on `tools` or `skills`. It does depend on `aura-security` — the `openai-subscription` provider reads its OAuth bundle from the `SecretVault`.
 
 ## Design Decisions
 
 ### rig-based completion with enum dispatch
 
-`LlmClient` wraps `AnyCompletionModel`, an enum with four variants: `OpenAI`, `Anthropic`, `Gemini`, and `OpenAiSubscription` (the ChatGPT/Codex OAuth path, documented in [`llm-openai-subscription.md`](llm-openai-subscription.md)). The MiniMax provider also routes through the `Anthropic` variant by reusing rig's Anthropic client against MiniMax's Anthropic-compatible endpoint; symmetrically, the DeepSeek provider routes through the `OpenAI` variant against DeepSeek's OpenAI-compatible endpoint (`https://api.deepseek.com/v1`). This uses compile-time enum dispatch instead of trait objects — rig's `CompletionModel` trait is not object-safe (`Clone` + `impl Future`), and the deprecated `CompletionModelDyn` has been removed. Adding a new provider means adding an enum variant and a match arm.
+`LlmClient` wraps `AnyCompletionModel`, an enum with four variants: `OpenAI`, `Anthropic`, `Gemini`, and `OpenAiSubscription` (the ChatGPT/Codex OAuth path, documented in [`llm-openai-subscription.md`](llm-openai-subscription.md)). The MiniMax provider also routes through the `Anthropic` variant by reusing rig's Anthropic client against MiniMax's Anthropic-compatible endpoint; symmetrically, the DeepSeek provider routes through the `OpenAI` variant against DeepSeek's OpenAI-compatible endpoint (`https://api.deepseek.com`). This uses compile-time enum dispatch instead of trait objects — rig's `CompletionModel` trait is not object-safe (`Clone` + `impl Future`), and the deprecated `CompletionModelDyn` has been removed. Adding a new provider means adding an enum variant and a match arm.
 
 `OpenAiSubscription` bypasses the rig adapter: it speaks the Codex Responses API directly over HTTP with its own OAuth dance, intercepted by `LlmClient::chat` / `chat_stream` before the rig `CompletionRequest` is built.
 
@@ -44,7 +44,7 @@ Rate-limit retries are not handled in `llm`. They are managed by `AgentLoop` thr
 
 ## Constraints
 
-- Depends only on `model` (plus `rig-core`, `futures`, `serde`, `tokio`)
+- Depends on `model` and `aura-security` (the latter for the `openai-subscription` OAuth token vault), plus external crates `rig-core`, `reqwest`, `futures`, `serde`, `tokio`, `chrono`, `url`, and similar HTTP/serialization utilities
 - Does not depend on `cost` — instead, `cost` consumes `TokenUsage` produced by `llm`, assembled by `agent`
 - Does not depend on `aura-storage` / `aura-session`
 - API keys should use environment-variable placeholders and must not be stored directly in config files

@@ -7,28 +7,40 @@ by side against the same manager graph:
 
 1. **Admin listener** — TCP, bearer-token authenticated. Surfaces the
    operator controls (config, jobs, cron, memory, traces, skills, tools,
-   channels-list, llm, status) that mirror the CLI command families. No
-   chat content or session data flows here.
+   channels-list, llm, status) that mirror the CLI command families, plus
+   the `/v1/chat/*` web-chat family that backs the embedded React
+   dashboard. The admin listener also **co-hosts** the channel-token-
+   authed `/v1/channel-ws` + `/v1/blobs` subrouter (see
+   `build_admin_router` in `src/server.rs`) so a browser chat tab loaded
+   from the admin origin can open its WebSocket without discovering the
+   loopback port — that subrouter rides its own channel-token middleware,
+   independent of the admin bearer. The admin/channel split is about
+   *which credential* gates a route, not a hard "no session data here"
+   boundary.
 2. **Channel listener** — loopback TCP (`127.0.0.1:<ephemeral>`),
-   authenticated by either the TUI pre-shared key or a per-subprocess
-   token. The chosen port is published to `<workspace>/state/channel.port`
+   authenticated by a vault-issued channel token (TUI, subprocess
+   sidecar, embedded tool sidecar, or web chat tab). The chosen port is
+   published to `<workspace>/state/channel.port`
    (mode `0o600`) so the TUI and spawned sidecars discover it without
-   a config roundtrip. The listener hosts a single
-   `GET /v1/channel-ws` endpoint that upgrades authed requests to a
-   WebSocket. Each connection registers itself as a live
-   [`aura_channels::Channel`] on the workspace [`ChannelRegistry`] and
-   exchanges MessagePack-framed events with the agent. The built-in
-   TUI and every out-of-process sidecar plugin speak this one
-   protocol. `127.0.0.1` binding is hardcoded — config cannot loosen
-   it to `0.0.0.0`.
+   a config roundtrip. The listener hosts `GET /v1/channel-ws` (upgrades
+   authed requests to a WebSocket) plus the blob endpoints (`POST
+   /v1/blobs`, `GET /v1/blobs/{blob_id}`) via `channel::routes()` merging
+   `blobs::routes()`. The built-in TUI and every out-of-process sidecar
+   plugin speak this one protocol. `127.0.0.1` binding is hardcoded —
+   config cannot loosen it to `0.0.0.0`.
 
-Per-connection state lives in `src/channel/adapter.rs::Sidecar`: it
-builds the [`aura_channels::Channel`] handle the registry sees, owns an
-outbound frame mpsc, and spawns one pump task that drains the receiver
-onto the WS sink. The agent's [`AgentOutput`] stream, the
-[`ApprovalGate`] waker, and the inbound loop's `resolve_approval` path
-all push [`Frame`](aura_channels::wire::Frame)s through the same
-mpsc, so the pump is the single serialisation point onto the wire.
+The per-type [`aura_channels::Channel`] is installed at gateway **boot**
+from `ChannelsConfig` (`src/channel/boot.rs::install_channels`), not per
+connection. Each accepted WS upgrade builds a `src/channel/adapter.rs::
+Sidecar` that resolves the existing channel from the [`ChannelRegistry`]
+and calls `Channel::attach(Connection)` (a lazy-install fallback only
+covers out-of-tree sidecar types declared via `aura.json` or test
+fixtures that skipped boot). The `Sidecar` owns an outbound frame mpsc
+and spawns two tasks: a translator that converts
+[`SessionEvent`](aura_channels::SessionEvent) → [`Frame`](aura_channels::wire::Frame),
+and a pump that drains the receiver onto the WS sink. Everything fans in
+to the same mpsc, so the pump is the single serialisation point onto the
+wire.
 
 The gateway is driven by the `aura gateway …` command tree. `start` runs
 both listeners in the foreground; `install` / `enable` / `disable` /
@@ -46,43 +58,64 @@ unconditionally installed at boot.
 
 ### Two listeners, one router graph
 
-Splitting the gateway isolates blast radius: a leaked admin bearer
-token cannot read chat content or message sessions, and a sidecar
-channel plugin running as a child of the gateway has no admin surface
-to hit even if compromised. Both listeners share the same manager
-graph (`SessionManager`, `JobLifecycle`, …); the channel listener hosts
-the `GET /v1/channel-ws` upgrade path and nothing else, so the router
-sees a single `IncomingMessage` stream regardless of whether a given
-frame came from the built-in TUI or an out-of-process sidecar. Each
-accepted WS connection registers an [`aura_channels::Channel`] against
-the workspace registry, which the router then dispatches to by
-`ChannelType` — no parallel agent pipeline.
+Splitting the gateway separates credentials by blast radius: the admin
+bearer gates the operator/dashboard surface, and a sidecar channel
+plugin running as a child of the gateway holds only a channel token,
+not the admin bearer, so it has no admin surface to hit even if
+compromised. The split is **not** a hard "no session data on admin"
+boundary — the admin listener serves the `/v1/chat/*` web-chat family
+(create/list/get/hide session, transcript history, token mint) and
+co-hosts the channel-token-authed `/v1/channel-ws` + `/v1/blobs`
+subrouter so the browser dashboard can chat over the public admin bind.
+Both listeners share the same manager graph (`SessionManager`,
+`JobLifecycle`, …). The channel listener hosts `/v1/channel-ws` and
+`/v1/blobs`; the router sees a single `IncomingMessage` stream
+regardless of whether a frame came from the TUI, a sidecar, or a web
+chat tab. The per-type [`aura_channels::Channel`] each connection
+attaches to is installed at boot and dispatched by `ChannelType` — no
+parallel agent pipeline.
 
 ### Admin token, stored in `SecretVault`
 
-On `aura gateway enable`, `GatewayToken::mint_if_absent` either reads
+On `aura gateway enable`, `AdminToken::mint_if_absent` either reads
 the current token or generates a fresh 32-byte random value (hex-
 encoded) and writes it under the vault key `gateway.admin_token` — the
-same AES-256-GCM store the rest of Aura uses. Vault loads also accept
-the legacy `gateway.auth_token` key for backwards compatibility with
-installs that pre-date the listener split. `token show` reads,
+same AES-256-GCM store the rest of Aura uses. `gateway.admin_token` is
+the only key the code reads or writes for the admin bearer. `token show`
+reads,
 `token rotate` overwrites. `uninstall` removes the service unit but
 leaves the token in the vault; `token rotate` is the explicit way to
 invalidate a leaked token. Because the vault requires the master
 encryption key, the token's confidentiality rides on the same root
 secret as every other credential in the project.
 
-### Channel auth — vault-issued tokens (TUI + subprocess)
+### Channel auth — vault-issued tokens (TUI, subprocess, tool, web)
 
 The channel listener enforces a single header on every request:
 `x-aura-channel-token: <hex>`, looked up against the in-memory
-`ChannelTokenTable`. Each entry carries a `ClientIdentity { pid, label }`
-and the auth middleware uses the reserved label
-`aura_gateway::TUI_CLIENT_LABEL` ("tui") to distinguish a bundled-TUI
-connection from a subprocess sidecar — the same channel-token pipeline
-carries both.
+`ChannelTokenTable`. Each entry carries a `ClientIdentity { pid, label,
+bound_channel_type }`; the auth middleware maps the entry's `label` to
+one of four `auth::channel::AuthedClient` variants by reserved label /
+prefix:
 
-Two flavours of token end up in the table:
+- **`Tui`** — label equals `aura_gateway::TUI_CLIENT_LABEL` ("tui").
+- **`Tool`** — label starts with `TOOL_CLIENT_LABEL_PREFIX` ("tool/",
+  e.g. `tool/browser`). The embedded tool sidecars (the browser MCP
+  server today). Session-scoped like the TUI, so it **bypasses the
+  per-channel pairing gate on `/v1/blobs`**, and it is **rejected from
+  the channel-WS handshake** — tool sidecars don't register channels.
+- **`Subprocess`** — any other label (e.g. `sidecar-telegram`). Carries
+  `pid`, `label`, and the bound `channel_type`.
+- **`Web`** — label starts with `WEB_CLIENT_LABEL_PREFIX` ("web/", e.g.
+  `web/<uuid>`). Minted by `POST /v1/chat/sessions` after the operator
+  presents a valid admin bearer; it is the **only** identity allowed to
+  claim the otherwise-reserved `http` channel type on `/v1/channel-ws`.
+  Carries the raw token string so the WS route can take the matching
+  `TokenHandle` out of `web_chat_tokens` on upgrade (bind token lifetime
+  to the WS) and `WEB_OPERATOR_USER_ID` ("web-operator") is stamped as
+  the synthetic user on web-originated sessions.
+
+The flavours of token that end up in the table:
 
 - **TUI token.** Generated on every `aura gateway start`, written to
   the secret vault under the key
@@ -103,6 +136,10 @@ Two flavours of token end up in the table:
   TCP carries no kernel-attested peer credential and the token's
   uniqueness + same-UID-only delivery already cover the threat
   model.
+- **Web chat tokens.** Minted by the admin `POST /v1/chat/sessions`
+  handler (and refreshed by `.../token`), stashed in `web_chat_tokens`
+  keyed by the token string, and revoked when the WS that claimed them
+  closes (`WebTokenJanitor` sweeps mints that never reached a WS).
 
 For runtimes whose WebSocket client cannot set custom headers (any
 WHATWG `WebSocket`, browser-style clients) the listener also accepts
@@ -143,11 +180,22 @@ read `/proc/<pid>/environ` on Linux and lift the env-var-delivered
 token. They are workspace/lifetime binding, not hostile-process
 resistance.
 
-All token compares are constant-time via
-`aura_gateway::constant_time_eq` (re-exported from
-`crate::auth::token` and used internally by `ChannelTokenTable::lookup`'s
-underlying `DashMap` plus the header-extraction path). `/healthz` and
-`/readyz` skip auth on both listeners.
+Token comparison differs by listener:
+
+- **Admin bearer** is compared in constant time:
+  `auth::admin::require_admin_token` runs the presented token through
+  `aura_gateway::constant_time_eq` against the expected value
+  (`auth/admin.rs`).
+- **Channel token** is *not* a constant-time compare.
+  `ChannelTokenTable::lookup` is a plain `DashMap::get(token)`
+  (`auth/token.rs`) — the token is the map key, so matching it relies on
+  the hash-map probe, not a fixed-time byte comparison. The mitigation
+  here is the token's entropy (256 random bits, hex-encoded) plus the
+  loopback-only, same-UID delivery surface, not timing-safe equality.
+
+`aura_gateway::constant_time_eq` is exported for reuse but is currently
+wired only on the admin bearer path. `/healthz` and `/readyz` skip auth
+on both listeners.
 
 ### Admin auth — bearer token, URI sanitisation before tracing
 
@@ -177,36 +225,48 @@ forwarded into `build_managers`, so the runtime graph's
 Each accepted WS upgrade builds one `Sidecar`
 (`src/channel/adapter.rs`). The struct owns a
 `mpsc::Sender<Frame>` (the outbound frame mpsc) plus a translator task
-that converts `AgentOutput` → `Frame` and forwards it onto the same
-mpsc. `Sidecar::build` returns the `Arc<Channel>` the route task hands
-to `ChannelRegistry::register`; the registry then populates the
-shared `ApprovalGateMap` from `Channel::approval_gate()` so tool
-approvals resolve to this connection. A single pump task drains the
-receiver and writes each frame to the WS sink with
+that converts `SessionEvent` → `Frame` and forwards it onto the same
+mpsc. The channel already exists (installed at boot); `Sidecar::build`
+resolves it from the registry and calls
+`Channel::attach(Arc<Connection>)`, returning the `Sidecar` itself
+(it does *not* hand an `Arc<Channel>` to a `register` call). The
+approval gate lives on the `Channel`, not the connection — the boot-time
+registry wiring installs a type-level gate into the shared
+`ApprovalGateMap`. A single pump task drains the receiver and writes each
+frame to the WS sink with
 [`rmp_serde::to_vec_named`](aura_channels::wire::encode) —
 everything fans *in* to the mpsc, the pump is the only thing that
-touches the socket. When the registry `unregister`s on disconnect the
-gate map eviction and `Sidecar::into_pump()` drop the last
-`frame_tx` clones, so the pump exits cleanly without a separate stop
-signal.
+touches the socket. On disconnect `Sidecar::into_pump()` detaches the
+connection from the channel and drops the last `frame_tx` clones, so the
+pump exits cleanly without a separate stop signal.
 
 ### Tool approval over the sidecar WS
 
-`Channel::approval_gate()` returns a `ChannelApprovalGate` backed by a
-per-connection `ApprovalQueue`. When a tool call hits the gate the
-entry is pushed on the queue and the waker closure sends an
-`ApprovalRequested` frame through the outbound mpsc. The client echoes
-a `ResolveApproval { call_id, decision }` frame; the inbound loop
-calls `Sidecar::resolve_approval`, which pops the matching entry off
-the queue and sends an `ApprovalResolved` frame back through the same
-mpsc so the client can drop any optimistic UI. The 5-minute timeout
-mirrors the TUI's original budget — long enough for a human, short
-enough that forgotten prompts don't pin tool executors forever.
+Each `Channel` is born at boot with its own `ChannelApprovalGate` +
+`ApprovalQueue` (the `ApprovalSurface` on
+`crates/channels/src/channel.rs`), built in `src/channel/boot.rs::
+build_channel`. When a tool call hits the gate the entry is pushed on
+the queue and the waker dispatches a `SessionEvent::ApprovalRequested`
+through the channel's fan-out so every subscriber of the call's session
+sees it. The client echoes a `ResolveApproval { call_id, decision }`
+frame; the inbound loop calls `Sidecar::resolve_approval`, which
+delegates to `Channel::resolve_approval` — that pops the matching queue
+entry, reads the `session_id` off it, and broadcasts
+`SessionEvent::ApprovalResolved` to every subscriber so all frontends
+drop the prompt. The 5-minute timeout (`APPROVAL_TIMEOUT = 300s` in
+`channel/boot.rs`) mirrors the TUI's original budget — long enough for a
+human, short enough that forgotten prompts don't pin tool executors
+forever.
 
-Approvals are *per-connection*, not per-session: a leaked or
-disconnected sidecar simply evicts its gate, and `ToolExecutor` falls
-back to the registry-wide fail-closed `AutoDenyGate` for that
-`ChannelType` until a fresh connection registers.
+Approvals resolve through the **channel-level** gate (`ApprovalGateMap`
+keyed by `ChannelType`), with a second **session-level** tier
+(`(ChannelType, SessionId)`) for session-scoped clients;
+`ApprovalGateMap::get` tries session-level first, then type-level, then
+falls back to the fail-closed `AutoDenyGate` (`crates/tools/src/
+approval.rs`). Because the gate lives on the long-lived channel rather
+than on a connection, a sidecar reconnecting does not lose pending
+approvals — a resubscribe replays them (see the `Frame::Subscribe`
+handler).
 
 ### Gateway owns its own DTOs — utoipa stays in the gateway
 
@@ -266,13 +326,17 @@ The `/v1/logs` surface has two endpoints:
   `level`, `q`, `since`, `until`, `limit`, `offset`; `total` is
   independent of pagination).
 - `GET /v1/logs/stream` — SSE stream subscribed to the same buffer's
-  `broadcast::Sender`. Each captured record that matches the query
-  params ships as an `event: log` frame with `LogEntry` JSON as `data`.
-  Back-pressure is bounded: a client that falls behind receives an
-  `event: lagged` with the drop count, then resumes. The admin auth
-  middleware accepts `?token=…` as a fallback because `EventSource`
-  can't set headers; the webui's Live toggle uses it for real-time
-  tail without polling.
+  `broadcast::Sender`. The stream first emits an SSE comment (`: ready`)
+  so the browser's `EventSource` fires `open` even on an idle system.
+  Each captured record that matches the query params then ships as an
+  `event: log` frame with `LogEntry` JSON as `data`. Back-pressure is
+  bounded: a client that falls behind receives an `event: lagged` with
+  the drop count, then resumes. Two terminal events also exist: an
+  `event: error` (sent if a record fails to encode, then the stream
+  ends) and an `event: end` (sent when the buffer's sender is dropped).
+  The admin auth middleware accepts `?token=…` as a fallback because
+  `EventSource` can't set headers; the webui's Live toggle uses it for
+  real-time tail without polling.
 
 - `openapi-typescript` (`npm run gen:api`, also wired into `npm run
   build`) reads `docs/openapi.json` and writes
@@ -467,25 +531,43 @@ GET    /v1/config                       redacted config snapshot (read-only)
 PUT    /v1/config                       { path, value } → 200 { path, written_to, requires_restart }
 DELETE /v1/config                       { path } → 200 { path, written_to, requires_restart }
 
-GET    /v1/jobs                         ?status=pending|in_progress|completed|failed|stuck
+POST   /v1/config/reload               re-read config; hot fields applied live → 200 ReloadOutcome
+GET    /v1/jobs                         ?session=&status=&limit=&cursor=  (cursor pagination)
 GET    /v1/jobs/:id
 POST   /v1/jobs/:id/cancel
 
 GET    /v1/cron
-POST   /v1/cron                         { schedule, text, name? }
+POST   /v1/cron                         { schedule, user_id, channel?, text, timezone, origin_session_id? }
 GET    /v1/cron/:id
 DELETE /v1/cron/:id
 
-GET    /v1/memory                       ?category=&limit=
-POST   /v1/memory                       { content, category }
+GET    /v1/memory                       ?q=&user_id=&limit=
+POST   /v1/memory                       { content, user_id?, importance? }  (category is always KeyFact)
 DELETE /v1/memory/:id
 
-GET    /v1/traces/:session_id
+GET    /v1/traces                       ?status=&since=&until=&limit=&cursor=  filtered session-summary list
+GET    /v1/traces/:session_id           session overview (message log + job summaries)
+GET    /v1/traces/:session_id/jobs/:job_id   per-job step/span tree
 
 GET    /v1/skills
 GET    /v1/tools
 GET    /v1/channels                     read-only registry list
-GET    /v1/llm
+
+GET    /v1/llm                          currently active provider/model
+GET    /v1/llm/models                   configured LLM entries + effective settings
+PUT    /v1/llm/models/:name             edit an entry (hot-reloaded in-process)
+POST   /v1/llm/models/:name/test        probe the entry's provider
+PUT    /v1/llm/default                  set default-llm (hot-reloaded)
+GET    /v1/llm/usage                    ?since=&until=  per-entry usage aggregates
+
+POST   /v1/chat/sessions                create http session + mint web channel-token
+GET    /v1/chat/sessions                ?include_hidden=&include_cron=  newest-first list
+GET    /v1/chat/sessions/:id            ?before_ordinal=&limit=  detail + transcript slice
+DELETE /v1/chat/sessions/:id            hide (row preserved); 204
+POST   /v1/chat/sessions/:id/unhide     restore a hidden session
+POST   /v1/chat/sessions/:id/token      refresh the web channel-token
+GET    /v1/chat/cron-messages           cron-fire sessions with prompt/response previews
+GET    /v1/chat/slash-manifest          slash commands for the composer's /-autocomplete
 
 GET    /v1/analytics                    aggregated tokens / cost / sessions over a time range
 GET    /v1/logs                         paged snapshot from LogBuffer
@@ -493,6 +575,14 @@ GET    /v1/logs/stream                  SSE tail of the same buffer
 
 GET    /v1/openapi.json                 live OpenAPI 3.1 document for the admin surface
 ```
+
+`/v1/chat/*` is the web-chat family (`api/admin/chat.rs`, OpenAPI tag
+`chat`). Despite the admin bearer in front of these routes, they read and
+write session rows and transcripts — the admin/channel split is by
+credential, not by "session data never touches admin". The web client
+exchanges the bearer for a short-lived `web/` channel-token via `POST
+/v1/chat/sessions`, then opens `/v1/channel-ws` (co-hosted on this same
+admin listener) with that token.
 
 **Channel listener (loopback TCP, vault-issued tokens)** —
 `auth::channel::require_channel_auth`:
@@ -502,81 +592,144 @@ GET    /healthz                         liveness (no auth)
 GET    /readyz                          managers ready (no auth)
 
 GET    /v1/channel-ws                   WebSocket upgrade (MessagePack frames)
+POST   /v1/blobs                        upload non-text media → blob_id
+GET    /v1/blobs/:blob_id               fetch media bytes by blob_id
 ```
 
-Hitting a channel route on the admin listener returns `404` — the route
-is not mounted there at all, so a leaked admin token yields nothing. The
-`admin_has_no_channels` integration test enforces this.
+The `/v1/channel-ws` + `/v1/blobs` subrouter (`build_channel_v1_subrouter`
+in `src/server.rs`) is mounted on **both** listeners under the same
+channel-token middleware — the loopback channel listener for the TUI and
+subprocess sidecars, and the admin listener so a browser chat tab loaded
+from the admin origin can open the WS without discovering the ephemeral
+loopback port. The admin bearer does **not** gate this subrouter; the
+channel token does. (The repo's `admin_has_no_channels` test asserts
+404s for `/v1/sessions*` / `/v1/approvals*` — routes that never existed —
+and does not exercise the channel subrouter, so it does *not* establish
+that channel routes are absent from the admin listener.)
 
 The WS protocol is defined by [`aura_channels::wire::Frame`]
 (tagged on `kind`, MessagePack-named). The client opens with a
-`Register { token, channel_type, protocol_version }` frame; the server
-validates it via `channel::handshake::validate_register` against the
-[`auth::channel::AuthedClient`] the middleware already attached (TUI
-token → must claim `"tui"` and a non-empty `session_id`; subprocess
-token → must match the minted identity's `(pid, label)` and claim a
-non-reserved channel type).
-`RegisterAck { ok, reason? }` closes the handshake; subsequent frames
-are `Message` (user input in, final assistant response out), `Delta`
-(streaming assistant text, server → client), `Notice` (out-of-band
-warn/error, server → client), `ApprovalRequested` / `ApprovalResolved`
-(server → client), and `ResolveApproval` (client → server). Session
-ids are client-generated UUIDs: the router resolves or creates the
-session on first message via `SessionManager::get_or_create`, so no
-client has to pre-provision one.
+`Register { token, channel_type }` frame (no `protocol_version`); the
+server validates it via `channel::handshake::validate_register` against
+the [`auth::channel::AuthedClient`] the middleware already attached:
+`Tui` → must claim `"tui"`; `Web` → must claim `"http"` (the only path
+that may claim the reserved `http` type); `Subprocess` → must match the
+minted identity's `(pid, label)`, respect its `bound_channel_type`, and
+claim a non-reserved type; `Tool` → rejected outright (tool sidecars
+don't register channels). The validator returns only the channel type —
+per-session interest is negotiated **after** the handshake via
+`Subscribe`, so `Register` carries no `session_id`.
 
-For session-scoped TUI clients only, two additional frames carry the
-persistent input-history ring: `HistorySnapshot { session_id, entries }`
-is pushed once by the server immediately after a successful
-`RegisterAck` (sidecars never see it), and `HistoryAppend { session_id,
-entry }` is sent by the client after every accepted submission. The
-gateway owns the encrypted ring via `channel::TuiHistoryStore` (vault
-key `aura.tui.input_history`, 500-entry cap, consecutive-duplicate
-dedup); concurrent appends from multiple TUIs on the same gateway
-serialise through a `tokio::sync::Mutex` on the store. TUI clients
-never open the vault themselves. See [`tui.md`](./tui.md) and
-[`security.md`](./security.md).
+The full frame set (see `crates/channels/src/wire.rs`):
 
-Mutation endpoints (`PUT /v1/config`, `DELETE /v1/config`) write
-through to the same on-disk `aura.json` that `aura config set/unset`
-targets. The in-memory `Arc<AuraConfig>` held by managers is **not**
-swapped; `requires_restart: true` in the response signals that the
-gateway must be restarted for the change to take effect. If the
-gateway was booted without a config path (pure-default boot), both
-endpoints return `400 Bad Request`.
+- **Handshake / lifecycle:** `Register`, `RegisterAck { ok, reason? }`,
+  `Reset { reason }`, `Ping`, `Pong`.
+- **Subscription (Subscribed-kind only):** `Subscribe { session_id,
+  since_ordinal? }`, `Unsubscribe { session_id }`. `Multiplexed`
+  channels (telegram/weixin/discord) auto-wildcard and ignore these.
+- **Messages:** `Message` (user input in; agent's final response or an
+  echo of inbound to other subscribers out), `Delta` (incremental
+  assistant text, server → client), `Notice` (out-of-band warn/error).
+- **Approvals:** `ApprovalRequested` / `ApprovalResolved` (server →
+  client), `ResolveApproval` (client → server), `PendingApprovalsSnapshot
+  { session_id, call_ids }` (server → client, on Subscribe).
+- **TUI history:** `HistorySnapshot { session_id, entries }`,
+  `HistoryAppend { session_id, entry }`.
+- **Bot multiplexing (Multiplexed channels):** `StartBot`, `StopBot`
+  (server → client), `BotStatus` (client → server), `SlashManifest`
+  (server → client).
+- **Web-chat session signalling (http channel):** `SessionUpdated
+  { session_id, patch }`, `SessionActivity { session_id, source, at }`.
+
+A note on `Delta`: the `Frame::Delta` variant exists and
+`agent_output_to_frame` maps `AgentOutput::Delta` to it, but the gateway
+does **not** stream live deltas on the wire today —
+`AgentOutput::Delta` is coalesced into a single `Message` frame per the
+note in `channel/mod.rs`. Treat `Delta` as a defined-but-unused wire
+shape rather than a live stream the TUI/sidecars receive.
+
+Session resolution is **not** "create on first message via
+`SessionManager::get_or_create`". It depends on the channel kind:
+
+- **Subscribed** channels (tui, http): the connection must first
+  `Subscribe` to a client-named `session_id`; an inbound `Message` for a
+  session the connection isn't subscribed to is dropped
+  (`resolve_inbound_session` in `channel/route.rs`). The TUI generates
+  its own session UUID and subscribes to it.
+- **Multiplexed** channels (telegram, …): the server derives the session
+  from `(channel_type, user_id)` via
+  `ChannelSessionResolver::resolve_or_create`, but only after a pairing
+  gate passes; sidecar-supplied `session_id`s are ignored.
+
+For TUI clients only, the input-history ring rides two frames:
+`HistorySnapshot { session_id, entries }` is sent **inside the
+`Frame::Subscribe` handler**, gated on `channel_type == "tui"` (it must
+be the next frame after the per-session subscribe, before any catch-up
+replay), and `HistoryAppend { session_id, entry }` is sent by the
+client after every accepted submission. The gateway owns the encrypted
+ring via `channel::TuiHistoryStore` (vault key `aura.tui.input_history`,
+500-entry cap, consecutive-duplicate dedup); concurrent appends from
+multiple TUIs on the same gateway serialise through a
+`tokio::sync::Mutex` on the store. TUI clients never open the vault
+themselves. See [`tui.md`](./tui.md) and [`security.md`](./security.md).
+
+Config mutation endpoints (`PUT /v1/config`, `DELETE /v1/config`, `PUT
+/v1/llm/...`) write through to the same on-disk `aura.json` that `aura
+config set/unset` targets, then trigger an **in-process reload** via the
+shared `ConfigReloader` (`src/reload.rs`, re-exported from `lib.rs`).
+Hot-updatable fields take effect live; only a non-hot field forces a
+restart, surfaced as `requires_restart: true` (the reloader reports
+`ReloadError::NotHotReloadable`, which the handler maps to "true", not an
+error). `POST /v1/config/reload` re-reads the file on demand and returns
+a `ReloadOutcome`. If the gateway was booted without a config path
+(pure-default boot), the mutation endpoints return `400 Bad Request`.
 
 ## Runtime Assembly
 
 `start` builds the full manager graph — `SessionManager`,
 `JobLifecycle`, `CronScheduler`, `MemoryManager`, `TraceStore`,
 `SecurityGateway`, `SkillRegistry`, `ToolRegistry`, `ToolExecutor`,
-`SkillAssessor`, `LlmClient`, `WorkspaceManager`, `LeakDetector`,
-`ChannelRegistry`, `CostManager` — plus a `ShutdownSignal` and a
-`TaskTracker` for graceful teardown. The wiring lives in
-`src/runtime.rs`:
+`SkillAssessor`, the LLM stack (`llm_client: Arc<BillableLlm>` plus the
+`llm_pool: LlmPoolHandle` it's the default client of), `WorkspaceManager`,
+`LeakDetector`, `ChannelRegistry`, `CostManager` — plus a
+`ShutdownSignal` and a `TaskTracker` for graceful teardown. The wiring
+lives in `src/runtime.rs` (the binary crate's `src/`, not under
+`crates/gateway/`):
 
 ```rust
 // src/runtime.rs
-pub struct ManagerGraph { /* all Arcs + channels_registry */ }
-pub async fn build_managers(config: Arc<AuraConfig>, shutdown: ShutdownSignal, leak_detector: Arc<LeakDetector>) -> Result<ManagerGraph>;
+pub struct ManagerGraph { /* all Arcs; llm_client + llm_pool; channels_registry; … */ }
+pub async fn build_managers(
+    config: Arc<AuraConfig>,
+    config_path: Option<PathBuf>,
+    shutdown: ShutdownSignal,
+    leak_detector: Arc<LeakDetector>,
+    embedded_mcp_servers: Vec<EmbeddedMcpServer>,
+) -> anyhow::Result<ManagerGraph>;
 pub struct RouterRunHandle { /* router, incoming_tx, incoming_rx, response_rx */ }
 pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle;
 pub fn install_signal_handler(tracker: &mut TaskTracker, shutdown: ShutdownSignal);
-pub async fn build_secret_vault(config: &AuraConfig) -> Result<Arc<SecretVault>>; // vault-only path, no manager graph
+pub async fn build_secret_vault(config: &AuraConfig) -> anyhow::Result<Arc<SecretVault>>; // vault-only path, no manager graph
 ```
 
-`gateway_cmd::start` is now the **only** caller of `build_managers` +
+`gateway_cmd::start` is the boot-path caller of `build_managers` +
 `wire_router` — the TUI talks to the gateway over loopback TCP and
-holds no manager graph of its own. The gateway builds a
-`GatewayServer` from `GatewayDeps`, binds the admin `TcpListener`
-and a second loopback `TcpListener` (127.0.0.1:0) for the channel
-WS, and drives them in parallel with the router via `tokio::select!`
-on `shutdown.wait`. The channel listener publishes its chosen port
-to `<workspace>/state/channel.port` (mode `0o600`) and the file is
-unlinked on shutdown (plus a `Drop` guard covers panic exits).
-`graph.channels_registry` starts empty at boot — every
-registered channel (including the bundled TUI) arrives later as a
-`/v1/channel-ws` client and registers itself from its route task.
+holds no manager graph of its own. The `embedded_mcp_servers` arg lets
+the gateway pre-assemble in-process MCP servers (the browser tool
+sidecar's blob-upload bridge, etc.); non-gateway callers pass an empty
+`Vec`. `GatewayDeps`/`AdminState` carry `llm_pool`; the admin LLM
+handlers read the live pool's `default_client()` so a hot-reload is
+reflected. The gateway builds a `GatewayServer` from `GatewayDeps`, binds
+the admin `TcpListener` and a second loopback `TcpListener` (127.0.0.1:0)
+for the channel WS, and drives them in parallel with the router via
+`tokio::select!` on `shutdown.wait`. The channel listener publishes its
+chosen port to `<workspace>/state/channel.port` (mode `0o600`) and the
+file is unlinked on shutdown (plus a `Drop` guard covers panic exits).
+`graph.channels_registry` is **populated at boot** by
+`channel::boot::install_channels` (one `Channel` per enabled channel
+type, including the always-on `http` channel and the bundled TUI when
+`cli.enabled`); incoming `/v1/channel-ws` connections then `attach` to
+the channel for their type rather than installing it.
 
 `build_secret_vault` is a narrow helper that only opens the libsql
 store far enough to construct a `SecretVault`. The TUI's remote boot
@@ -619,24 +772,45 @@ subcommands use it for the same reason.
 ```
 crates/gateway/
 ├── Cargo.toml               # features above, all deps via workspace = true
-├── build.rs                 # emits $OUT_DIR/webui_assets.rs with include_bytes! + MIME per web/dist file
+├── build.rs                 # three pipelines: (1) pnpm install; (2) WebUI → $OUT_DIR/webui_assets.rs;
+│                            #   (3) sidecars → $OUT_DIR/sidecar_assets.rs (bun build for channel-src/*,
+│                            #   esbuild+node for tool-src/*). All assets zstd-compressed + include_bytes!.
 ├── src/
-│   ├── lib.rs               # re-exports GatewayServer, GatewayDeps, ChannelServer, …
-│   ├── config.rs            # RuntimeGatewayConfig (admin bind + shutdown grace)
-│   ├── server.rs            # GatewayDeps, AdminState, GatewayServer (admin TCP)
+│   ├── lib.rs               # re-exports GatewayServer, GatewayDeps, ChannelServer, ConfigReloader, Sidecar*, …
+│   ├── config.rs            # RuntimeGatewayConfig (admin bind + shutdown grace + CORS)
+│   ├── server.rs            # GatewayDeps, AdminState, ChannelState, GatewayServer; build_admin_router
+│   │                        #   (admin TCP + co-hosted /v1/channel-ws + /v1/blobs subrouter)
 │   ├── channel_listener.rs  # ChannelServer (loopback TCP + channel.port discovery + accept loop)
 │   ├── spawn.rs             # ChannelSpawner — spawn a subprocess client with a channel token
-│   ├── channel/             # /v1/channel-ws WS server for sidecar plugins + the TUI
-│   │   ├── mod.rs           #   module glue; re-exports route + state
-│   │   ├── adapter.rs       #   Sidecar — per-connection Channel + outbound frame pump
-│   │   ├── handshake.rs     #   validate_register (TUI vs. subprocess gating via AuthedClient)
-│   │   ├── route.rs         #   ws_handler + inbound loop
-│   │   └── state.rs         #   WsChannelState (registry, incoming_tx, tokens, sessions)
+│   ├── reload.rs            # ConfigReloader trait + ReloadOutcome/ReloadError (in-process config hot-reload)
+│   ├── log_buffer.rs        # LogBuffer ring + tracing Layer behind /v1/logs[/stream]
+│   ├── channel/             # /v1/channel-ws WS server + /v1/blobs for sidecars, TUI, and web chat
+│   │   ├── mod.rs           #   module glue + re-exports; notes Delta is coalesced into Message on the wire
+│   │   ├── adapter.rs       #   Sidecar — SessionEvent→Frame translator + outbound pump; attaches to Channel
+│   │   ├── blobs.rs         #   POST /v1/blobs + GET /v1/blobs/{id}
+│   │   ├── boot.rs          #   install_channels / build_channel; APPROVAL_TIMEOUT=300s; per-channel gate
+│   │   ├── bot_reconciler.rs#   reconciles StartBot/StopBot rosters to Multiplexed sidecars
+│   │   ├── control.rs       #   ChannelControlRegistry (push control frames from outside the route task)
+│   │   ├── dedup.rs         #   InboundDedup (recent-window (channel,bot,platform_msg_id) dedup)
+│   │   ├── handshake.rs     #   validate_register (Tui/Tool/Subprocess/Web gating via AuthedClient)
+│   │   ├── history.rs       #   TuiHistoryStore (vault-backed TUI input-history ring)
+│   │   ├── route.rs         #   ws_handler + inbound loop (Subscribe/Message/ResolveApproval/…)
+│   │   ├── session_pulse.rs #   http-channel dispatch observer → throttled Frame::SessionActivity
+│   │   ├── session_resolver.rs # ChannelSessionResolver (Multiplexed (channel,user)→session)
+│   │   ├── slash.rs         #   slash-command manifest + sidecar slash handling
+│   │   ├── state.rs         #   WsChannelState (registry, tokens, web_chat_tokens, stores, pairing, …)
+│   │   └── web_token_janitor.rs # StashedTokenHandle + WebTokenJanitor (TTL-sweep unused web tokens)
+│   ├── sidecar/             # embedded JS sidecar packaging + supervision
+│   │   ├── mod.rs           #   SidecarRuntime / SidecarSupervisor, BUN/NODE binary env, domains
+│   │   ├── assets.rs        #   include!s $OUT_DIR/sidecar_assets.rs; materialises bundles to disk
+│   │   ├── embedded_mcp.rs  #   EmbeddedMcpServer entries (browser tool blob-upload bridge, …)
+│   │   ├── pipe_pump.rs     #   drains sidecar stdout/stderr NDJSON into the LogBuffer
+│   │   └── supervisor.rs    #   spawn/restart lifecycle for in-tree sidecars
 │   ├── auth/                # gateway auth surface (re-exports common types from mod.rs)
 │   │   ├── mod.rs           #   re-exports AdminToken, AuthedClient, ChannelTokenTable, …
-│   │   ├── admin.rs         #   AdminAuthState, AdminToken, require_admin_token
-│   │   ├── channel.rs       #   ChannelAuthState, AuthedClient, require_channel_auth
-│   │   └── token.rs         #   ChannelTokenTable + ClientIdentity + TokenHandle, vault-key + label consts
+│   │   ├── admin.rs         #   AdminAuthState, AdminToken, require_admin_token (constant_time_eq compare)
+│   │   ├── channel.rs       #   ChannelAuthState, AuthedClient {Tui,Tool,Subprocess,Web}, require_channel_auth
+│   │   └── token.rs         #   ChannelTokenTable (DashMap lookup) + ClientIdentity + TokenHandle, consts
 │   ├── error.rs             # GatewayError : IntoResponse
 │   ├── test_support.rs      # cfg(test-support) build_test_deps + TestGateway
 │   ├── api/
@@ -646,21 +820,29 @@ crates/gateway/
 │   │   ├── health.rs        # /healthz + /readyz (shared between listeners)
 │   │   ├── webui.rs         # admin-fallback handler; include!s $OUT_DIR/webui_assets.rs
 │   │   └── admin/           # mod.rs: v1_router_and_spec() → (Router, OpenApi), mounted on admin TCP
-│   │       └── {status,config,jobs,cron,memory,traces,skills,tools,channels,llm,analytics,logs}.rs
+│   │       └── {status,config,jobs,cron,memory,traces,analytics,skills,tools,channels,chat,llm,logs}.rs
 │   └── installer/
 │       ├── mod.rs           # ServiceInstaller trait, InstallContext, ServiceStatus,
 │       │                    # for_current_platform, resolve_exec_start
 │       ├── systemd.rs       # cfg(all(target_os = "linux",  feature = "linux"))
 │       └── launchd.rs       # cfg(all(target_os = "macos",  feature = "macos"))
-└── tests/
+└── tests/                   # all.rs aggregates the rest into one binary
     ├── auth.rs                  # admin bearer auth
-    ├── admin_has_no_channels.rs # /v1/channel-ws is 404 on the admin listener
-    ├── openapi_spec_sync.rs     # asserts router spec == docs/openapi.json (UPDATE_OPENAPI=1 to rewrite)
-    └── channel_ws.rs            # full loopback-TCP WS round-trip via tokio-tungstenite
+    ├── admin_has_no_channels.rs # asserts 404 on /v1/sessions*/* approvals* (routes that never existed)
+    ├── channel_ws.rs            # full loopback-TCP WS round-trip via tokio-tungstenite
+    ├── chat_api.rs              # /v1/chat/* web-chat session + token-mint surface
+    ├── jobs_pagination.rs       # /v1/jobs cursor pagination + filters
+    ├── llm_endpoint.rs          # /v1/llm* models/default/usage surface
+    ├── logs_endpoint.rs         # /v1/logs + /v1/logs/stream SSE
+    └── openapi_spec_sync.rs     # asserts router spec == docs/openapi.json (UPDATE_OPENAPI=1 to rewrite)
 ```
 
-The frontend sources live outside the crate at `web/` (npm workspace,
-not a Cargo member) and produce `web/dist/` which `build.rs` consumes.
+The frontend sources live outside the crate at `web/` (pnpm workspace,
+not a Cargo member) and produce `web/dist/` which `build.rs` consumes;
+the in-tree JS sidecars live at `channel-src/*` and `tool-src/*` and are
+bundled into `$OUT_DIR/sidecar_assets.rs`. Note `src/runtime.rs` and
+`src/gateway_cmd.rs` (the boot path) live in the **binary** crate's
+`src/`, not in `crates/gateway/`.
 
 The channel-listener wire constants (`CHANNEL_TOKEN_HEADER`, the
 reserved `TUI_CLIENT_LABEL`, the vault key `TUI_TOKEN_VAULT_KEY`) and
@@ -677,11 +859,13 @@ at runtime and stored in the per-workspace vault.
 - **agent** — provides `SessionManager`, `JobLifecycle`, `CronScheduler`,
   `MemoryManager`, `SecurityGateway`, `service::{ShutdownSignal,
   TaskTracker}` used by the server's graceful shutdown path.
-- **channels** — the `Channel` handle, `IncomingMessage`,
-  `OutgoingMessage`, `NoticeLevel`, `ChannelRegistry`, and the
-  `wire::{Frame, Message}` MessagePack types the WS route speaks.
-  Every accepted `/v1/channel-ws` connection registers its
-  `Arc<Channel>` on the shared registry and unregisters on disconnect.
+- **channels** — the `Channel` / `Connection` / `SessionEvent` handles,
+  `IncomingMessage`, `NoticeLevel`, `ChannelRegistry`, and the
+  `wire::{Frame, Message}` MessagePack types the WS route speaks. The
+  per-type `Channel` is installed once at boot; every accepted
+  `/v1/channel-ws` connection `attach`es a `Connection` to its channel
+  and `detach`es on disconnect (the `Channel` itself stays in the
+  registry for the gateway's lifetime).
 - **security** — `SecretVault` for admin-token + TUI-token persistence;
   `LeakDetector` for log redaction; `SecurityGateway` for the outgoing
   reveal path. The admin token and the per-start TUI token are

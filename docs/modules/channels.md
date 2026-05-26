@@ -38,6 +38,14 @@ Core responsibilities:
   (MessagePack, named fields) so the gateway's WS server, the built-in
   TUI's private WS client, the embedded web chat client, and the
   third-party TypeScript SDK all speak the same protocol.
+- Define the slash-command surface (`slash` module): the
+  [`SlashHandler`] / [`DashboardProvider`] traits and their value
+  types ([`SlashCommand`], [`SlashOutcome`], [`DashboardSnapshot`],
+  [`ViewKind`]), plus the shared command constants (`COMPACT_COMMAND`
+  / `COMPACT_COMMAND_NAME`, `STOP_COMMAND` / `STOP_COMMAND_NAME` /
+  `STOP_COMMAND_DESCRIPTION`). The trait impls live outside the crate
+  (e.g. `aura-cli`) so channel adapters stay independent of the
+  command layer while every adapter hooks into the same dispatcher.
 
 ## Channel and Connection
 
@@ -76,6 +84,7 @@ impl Channel {
     pub fn approval_gate(&self) -> Option<Arc<dyn ApprovalGate>>;
     pub fn has_subscribers(&self, session_id: &SessionId) -> bool;
     pub fn connection_count(&self) -> usize;
+    pub fn pending_approvals(&self, session_id: &SessionId) -> Vec<ApprovalRequest>;
     pub fn pending_approval_call_ids(&self, session_id: &SessionId) -> Vec<String>;
     pub fn resolve_approval(&self, call_id: &str, decision: ApprovalDecision) -> Option<SessionId>;
 
@@ -392,8 +401,8 @@ register: async (ctx) => {
 }
 ```
 
-**CLI driver**: `crates/cli/src/commands/channel/register.rs` enforces
-the contract from the host side. It runs the bundle with
+**CLI driver**: `crates/setup/src/flow/channel/register_driver.rs`
+(`run_registration`) enforces the contract from the host side. It runs the bundle with
 `Command::env_clear()` + a small allowlist (`PATH`, `HOME`, `TERM`,
 `LANG`, `LC_*`, `TZ`, `TMPDIR`, plus `AURA_CHANNEL_MODE=register`) so
 no `AURA_*` value (capability tokens, vault endpoints, gateway URL)
@@ -451,7 +460,7 @@ carrier didn't set one (older bundles, TUI, fixtures).
 
 | Module     | Role                                                                                                              |
 | ---------- | ----------------------------------------------------------------------------------------------------------------- |
-| `model`    | Provides `ContentBlock`, `ChatMessage`, `ChannelType`, `SessionId`, `ResourceAccess`, `User`                      |
+| `model`    | Provides `ContentBlock`, `ChannelType`, `SessionId`, `ResourceAccess`, `User`                      |
 | `agent`    | Router owns the registry and calls `Channel::dispatch_agent` (and the approval-dispatch helpers) by `ChannelType` |
 | `tools`    | Provides `ApprovalGate` + `ApprovalGateMap` reused by the registry; `ApprovalQueue` backs `ApprovalSurface`       |
 | `gateway`  | Hosts the only in-tree transport (`/v1/channel-ws`); installs channels at boot, builds per-WS `Connection`s, owns the `ConnectionSink` impl, and translates `SessionEvent` → `wire::Frame` |

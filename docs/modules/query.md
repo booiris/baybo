@@ -4,7 +4,7 @@
 
 The `query` crate is the read-only facade over `Session` / `Job` / `Step` / `Span` / `Cost` for admin / CLI / UI consumers. `QueryApi` collapses session + job + trace + cost reads behind a single error type (`QueryError`) so handlers don't match four different store error types.
 
-Nine endpoints today:
+Thirteen endpoints today:
 
 1. `load_session` — resolves lineage
 2. `list_jobs` — fork-prefix UNION + `is_inherited` flag
@@ -15,6 +15,10 @@ Nine endpoints today:
 7. `lineage_tree` — ancestry + immediate descendants
 8. `cost_summary` — `User` / `Session` / `Job` / `TimeRange` scope
 9. `replay` — chronological Job → Step → Span tree (also the backend for fork's view-layer UNION)
+10. `list_session_summaries` — paginated, filtered per-session aggregates for the admin session browser
+11. `compute_analytics` — cost + session-creation aggregates for the analytics dashboard (`Unsupported` without a `CostStore`)
+12. `load_trace_overview` — a session's job list + message log once, for the trace sidebar
+13. `load_job_trace` — one job's full `steps → spans → events` tree (follow-up to `load_trace_overview`)
 
 ## Design Decisions
 
@@ -32,7 +36,7 @@ The job read path needs `JobLifecycle::list` (pre-sorted, status-filtered). Usin
 
 ### `Option<Arc<dyn CostStore>>` so trace-only callers can skip cost wiring
 
-`QueryApi::new_trace_only` constructs an API without a `CostStore`; `cost_summary` then returns `Unsupported`. CLI `aura trace …` commands use this path so they don't need to open the cost table.
+`QueryApi::without_costs` constructs an API without a `CostStore`; `cost_summary` then returns `Unsupported`. CLI `aura trace …` commands use this path so they don't need to open the cost table.
 
 ## Constraints
 

@@ -166,7 +166,7 @@ The hash is a **metadata fingerprint**, not a content hash — see [skills-asses
 | `level`        | `Safe` · `Suspicious` · `Dangerous`. |
 | `rationale`    | One-to-two sentence justification from the model. Surfaced to the operator; kept so future reviewers don't have to rerun. |
 | `model`        | Which LLM produced the verdict. |
-| `assessed_at`  | Unix seconds. |
+| `assessed_at`  | Unix microseconds. |
 
 **Non-blocking error policy**: only `Dangerous` blocks execution. Assessor errors (LLM unreachable, unparseable reply, I/O failure), skills without an on-disk `source_path` (e.g. test fixtures), and the `Suspicious` tier all pass through with a `warn!` log. Availability is preferred over false-positive blocks; the verdict is still surfaced in `aura skills check` output so a human can review.
 
@@ -175,7 +175,14 @@ The hash is a **metadata fingerprint**, not a content hash — see [skills-asses
 - **CLI `aura skills check` / `/skills check`** — runs the validator, then invokes the assessor per skill. Output includes `risk: {status, scope, background_pending, level, rationale, model, content_hash, assessed_at}`.
 - **`Skill` tool** — `SkillRiskCheck::assess` returns a `SkillGate` (`Pass` / `PassWithWarning { rationale }` / `Block { rationale }`). `Block` aborts the call with `ToolError::Denied`; `PassWithWarning` returns the body with the rationale embedded as a `risk_warning` JSON field (and emits `Notice { level: Warn }` if a `SessionNotifier` is wired); `Pass` returns silently. Risk is checked once per call, not once per turn — the LLM only pays for assessment of the skill it actually invoked.
 
-The assessor is wired in `main.rs` alongside the other shared services using `with_background_worker(llm, store, mode)` where `mode` is read from `config.skills.risk_check`; `recover_pending_jobs` runs once after the skill registry is populated and drains persisted rows regardless of mode — `Off` only suppresses new enqueues. Argv-mode commands that don't open the chat loop leave the assessor `None`, which the CLI surfaces as `status: "not_configured"`.
+The assessor is wired in `src/runtime.rs` alongside the other shared services using `with_background_worker(llm, store, mode)` where `mode` is read from `config.skills.risk_check`; `recover_pending_jobs` runs once after the skill registry is populated and drains persisted rows regardless of mode — `Off` only suppresses new enqueues. Argv-mode commands that don't open the chat loop leave the assessor `None`, which the CLI surfaces as `status: "not_configured"`.
+
+### Skill installation
+
+The crate ships two governance-gated lifecycle tools (built by `build_install_tool` / `build_uninstall_tool` in `tools.rs`, wired in `src/runtime.rs` after the assessor is constructed), both declaring `TrustLevel::Trusted` with the `WriteFile` capability scoped to the workspace skills directory:
+
+- **`SkillInstall`** — validates a source directory (must contain a parseable `SKILL.md`, must live outside the workspace skills dir, must not collide with an existing install), runs the risk assessor (`Dangerous` aborts with `ToolError::Denied`), copies the tree to `<workspace>/skills/<name>/` via a temp-dir-and-rename for atomicity, then calls `SkillRegistry::reload()` so the new skill is available next turn.
+- **`SkillUninstall`** — looks up the skill by name and refuses unless its canonicalized `source_path` sits under the workspace skills dir (registry-only or third-party-mounted skills aren't deletable), removes the directory, then calls `SkillRegistry::reload()`.
 
 ### Hot reload constraints
 
@@ -198,9 +205,9 @@ Skills declare `allowed-tools`, but this is only one input to the upper bound. B
 
 ## Constraints
 
-- Depends on `aura-model` and `aura-tools`
+- Depends on `aura-model`, `aura-tools`, and `aura-workspace` (the last for `aura_workspace::paths::BIN_NAME`), plus `regex`, `dashmap`, `walkdir`, and `uuid`
 - Does not call `llm` or execute tools directly
-- Does not install extensions
+- The crate's own `SkillInstall` / `SkillUninstall` tools (see below) are the supported way to add or remove a workspace skill at runtime; nothing else here mutates the installed set
 - Every skill execution must record `skill_name`, `skill_version`, `source`, `trust_level` in Trace
 
 ## Collaboration

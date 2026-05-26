@@ -169,4 +169,4 @@ Wiring contract:
 
 ## See also
 
-- [`background-compression.md`](../background-compression.md) — async per-session summary maintenance. Adds `SummaryAwareWrapper` (a `CompressionStrategy` that swaps in a precomputed summary when available) and `last_summary_anchor` tracking on `ContextManager`. The existing `Summarize` strategy stays as the inner fall-through and as the `force_compress` (`/compact`) target.
+- [`background-compression.md`](../background-compression.md) — async per-session summary maintenance. It feeds the summary fast-path **inside** the existing hardcoded `Compressor` (Stage 1 `try_summary_fast_path`, which reads the precomputed `summary.md` and swaps it in when fresh); it does **not** introduce a new strategy type. There is no `CompressionStrategy` trait, no dispatch, and no swappable `Summarize`/`SummaryAwareWrapper` — when the fast-path declines, the same `Compressor` falls through to the live LLM summary (Stage 2) and the truncate fallback (Stage 3). `force_compress` (`/compact`) runs that same flow without the budget gate.

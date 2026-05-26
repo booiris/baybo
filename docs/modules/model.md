@@ -2,20 +2,27 @@
 
 ## Overview
 
-`model` is Aura's lowest-level shared data crate. It provides only content representation types exchanged across modules and contains no business traits or error types.
+`model` is Aura's lowest-level shared data crate. It provides the data types — content representations, shared domain records, ID newtypes, and protocol shapes — exchanged across modules, and contains no business traits or error types (each is a plain data definition consumed by higher layers).
 
 Contents:
 
-- **Content models**: `ContentBlock`, `BlobRef`, `ChatMessage`, `Role`, `MessageMetadata`
-- **Session types**: `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `SystemReason`, `Lineage`, `LineageKind`
+- **Content models**: `ContentBlock`, `BlobRef`, `ChatMessage`, `Role`, `MessageSource`, `ThinkingContent`, `MessageMetadata` (now an empty struct), plus the `TOOL_OUTPUT_OPEN_PREFIX` / `TOOL_OUTPUT_CLOSE_PREFIX` marker constants
+- **Session types**: `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `SystemReason`, `Lineage`, `LineageKind`, `BackgroundCompressionPayload`
 - **Memory types**: `MemoryEntry`, `MemoryCategory`
 - **Governance types**: `TrustLevel`, `ArtifactSource`, `ExtensionManifest`, `ExtensionKind`
+- **Cost & money types**: `CostRecord`, `CostSummary`, `TimeRange`, `MicroUsd` (integer micro-USD; the project never uses floats for money)
+- **Cron types**: `CronJob`, `CronExecution`, `CronSchedule`, `CronStatus`, `ExecutionStatus`
+- **Approval types**: `ApprovalDecision`, `ApprovedResource`, `HostPattern`, `ResourceAccess`
+- **Subagent spawn protocol** (`spawn_protocol`): `SubagentSpawnRequest`, `SubagentResult`, `PendingSubagentResult`, `SubagentReturn`, `SubagentExitStatus`, the `SPAWN_SUBAGENT_TOOL_NAME` const, and related markers
+- **External-agent types**: `ExternalAgentKind`, `SubagentBackend`, `SubagentBackendKind`
+- **LLM routing types**: `LlmEntryName`, `ModelTier`, `LlmPricingOverride`
+- **ID newtypes**: `SessionId`, `JobId`, `SpanId`, `StepId`, `CostRecordId`, `ParallelGroup`
 
 ## Design Decisions
 
 ### Minimal scope
 
-`model` retains only the content primitives that are genuinely used by both the channel layer and the LLM layer and cannot naturally belong to either. Session/user domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `SystemReason`, `Lineage`, `LineageKind`) live here so every consumer (channels, agent, storage, session manager) shares one shape; `aura-session` re-uses them via `aura_model` and adds only the lifecycle manager + error type. Message types live in `channels`, operation types in `job`, and per-module error types replace any shared error enum. Governance types (`TrustLevel`, `ArtifactSource`) also live here as they are consumed by both `tools` and `skills`. Filesystem addresses (`WorkspacePaths`, `IdentityKind`, the workspace-relative filename constants, `AURA_CONFIG_PATH`) live in `aura-workspace::paths`, not here — they are workspace-shaped data, not content primitives.
+`model` retains the data types that are shared by two or more layers (channel, LLM, storage, agent) and cannot naturally belong to any single one — content primitives, cross-cutting domain records, ID newtypes, and protocol shapes. Session/user domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `SystemReason`, `Lineage`, `LineageKind`) live here so every consumer (channels, agent, storage, session manager) shares one shape; `aura-session` re-uses them via `aura_model` and adds only the lifecycle manager + error type. Message types live in `channels`, operation types in `job`, and per-module error types replace any shared error enum. Governance types (`TrustLevel`, `ArtifactSource`) also live here as they are consumed by both `tools` and `skills`. Filesystem addresses (`WorkspacePaths`, `IdentityKind`, the workspace-relative filename constants, `AURA_CONFIG_PATH`) live in `aura-workspace::paths`, not here — they are workspace-shaped data, not content primitives.
 
 ### Media by reference, not inline
 

@@ -6,17 +6,19 @@ The `workspace` crate is the single source of truth for Aura's workspace layout.
 
 - **Filesystem addresses** (`paths` module, always available): `WorkspacePaths`, `IdentityKind`, the `&str` constants for every workspace-relative file/dir name (`profile/`, `skills/`, `state/`, `work/`, `logs/`, `aura.json`, `.mcp.json`, `storage.db`, `aura.lock`, `channel.port`, `SOUL.md` / `USER.md` / `IDENTITY.md`, `.uv/`), the `ENV_CONFIG_PATH` constant (whose value is the env-var name `AURA_CONFIG_PATH`), and the `default_workspace_root` / `default_config_file` / `aura_cache_root` resolvers.
 - **Identity I/O** (`io` feature, default-on): `WorkspaceManager`, `IdentityFiles`, `load_identity_files`, `write_identity_file`, `WorkspaceManager::ensure_layout` — the async readers/writers backing the three identity documents and the workspace-skeleton initializer.
+- **Default identity templates** (`prompt` module, always available): the `DEFAULT_SOUL_CONTENT` / `DEFAULT_USER_CONTENT` / `DEFAULT_IDENTITY_CONTENT` seed strings that `IdentityKind::default_content` returns when `seed_default_identity_files` writes a missing `SOUL.md` / `USER.md` / `IDENTITY.md`.
 
 Pure-data consumers (e.g. `aura-config`, `aura-tools`) take this crate with `default-features = false` so they never inherit a transitive `tokio`/`anyhow` dependency just to read a path constant. Crates that actually drive workspace I/O (`aura-agent`, `aura-cli`, `aura-gateway`, the binary) depend on it with `features = ["io"]`.
 
 ## Layout
 
-The workspace root is the single **project root** for the entire runtime: every subsystem that needs a persistent path derives its location from it. The root is divided into four top-level subdirectories that describe what kind of content lives there.
+The workspace root is the single **project root** for the entire runtime: every subsystem that needs a persistent path derives its location from it. The root is divided into six top-level subdirectories that describe what kind of content lives there.
 
 ```text
 <workspace_root>/
   profile/         # standalone git repo: aura.json, .mcp.json, identity .md files
   skills/          # standalone git repo: workspace-local skill definitions
+  agents/          # standalone git repo: subagent profile definitions
   state/           # not version-controlled: storage.db, aura.lock, channel.port, browser/profile
   work/            # not version-controlled: .uv/ (uv cache + downloaded pythons + tools), future scratch
   logs/            # not version-controlled: aura.log.<date>, channel/<type>.log.<date>, sessions/<id>.jsonl
@@ -52,10 +54,10 @@ New subsystem files belong as a method on `WorkspacePaths`, not as another `work
 
 `WorkspaceManager::ensure_layout` runs at every boot (gateway start, TUI, argv subcommands once `boot::load_config` returns) and is idempotent:
 
-- Creates `config/`, `profile/`, `skills/`, `.key/`, `state/`, `work/`, `logs/` if missing.
-- Runs `git init --quiet` inside `config/`, `profile/`, and `skills/` if the directory isn't already a git repo (`<dir>/.git` check).
+- Creates `config/`, `profile/`, `skills/`, `agents/`, `.key/`, `state/`, `work/`, `logs/` if missing.
+- Runs `git init --quiet` inside `config/`, `profile/`, `skills/`, and `agents/` if the directory isn't already a git repo (`<dir>/.git` check).
 
-`config/`, `profile/`, and `skills/` are each their own standalone git repo. The workspace root itself is **not** version-controlled — there is no top-level `.gitignore`, and `.key/`, `state/`, `work/`, `logs/` simply live next to the three declarative dirs without needing an ignore list to keep them out of any tree above them. Users who want to back up or sync their config commit inside `config/`; identity edits commit inside `profile/`; skill authors do the same inside `skills/`. **Never** commit anything from `.key/` — `aura setup` mints the master encryption key there with mode 0600, and treating that file as version-controllable would leak every secret in the vault.
+`config/`, `profile/`, `skills/`, and `agents/` are each their own standalone git repo. The workspace root itself is **not** version-controlled — there is no top-level `.gitignore`, and `.key/`, `state/`, `work/`, `logs/` simply live next to the four declarative dirs without needing an ignore list to keep them out of any tree above them. Users who want to back up or sync their config commit inside `config/`; identity edits commit inside `profile/`; skill authors do the same inside `skills/`; subagent profiles commit inside `agents/`. **Never** commit anything from `.key/` — `aura setup` mints the master encryption key there with mode 0600, and treating that file as version-controllable would leak every secret in the vault.
 
 ## Config file resolution
 
