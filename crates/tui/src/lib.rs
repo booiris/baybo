@@ -432,15 +432,17 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         {
                             dispatch_submission(&mut state, &ctx, &mut terminal, next).await?;
                         }
-                        // Resolving an approval shrinks the viewport, so this draw
-                        // may rebuild the inline terminal (a cursor query). Route it
-                        // through the stream-safe path since we're on a non-keyboard
-                        // wake-up with the EventStream reader parked.
-                        term_events = draw_active_stream_safe(
+                        // This redraw can rebuild the inline terminal (a pending
+                        // resize, or a viewport-height change as an approval
+                        // clears) — a cursor query. We're on a non-keyboard
+                        // wake-up with the reader parked, so route it through the
+                        // guard that drops the stream around any such query.
+                        term_events = redraw_after_event(
                             term_events,
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
+                            &mut resize_pending,
                         )?;
                     }
                     AppEvent::StreamDelta(delta) => {
@@ -448,7 +450,13 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         if matches!(state.mode, ViewMode::Chat) {
                             flush_complete_stream_lines(&mut state, &mut terminal)?;
                         }
-                        draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
+                        term_events = redraw_after_event(
+                            term_events,
+                            &mut terminal,
+                            &mut state,
+                            &mut current_viewport_h,
+                            &mut resize_pending,
+                        )?;
                     }
                     AppEvent::DashboardReady(kind, snapshot) => {
                         if state.dashboard_kind() == Some(kind) {
@@ -462,13 +470,25 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                                 snapshot,
                             )?;
                         }
-                        draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
+                        term_events = redraw_after_event(
+                            term_events,
+                            &mut terminal,
+                            &mut state,
+                            &mut current_viewport_h,
+                            &mut resize_pending,
+                        )?;
                     }
                     AppEvent::Log(record) => {
                         if matches!(state.mode, ViewMode::Chat) {
                             commit_lines(&mut terminal, chat::render_log_lines(&record))?;
                         }
-                        draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
+                        term_events = redraw_after_event(
+                            term_events,
+                            &mut terminal,
+                            &mut state,
+                            &mut current_viewport_h,
+                            &mut resize_pending,
+                        )?;
                     }
                     AppEvent::ApprovalRequested => {
                         if !state.approval_pending()
@@ -484,36 +504,31 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         }
                         // Showing the approval grows the viewport, so this draw
                         // rebuilds the inline terminal (a cursor query) on a
-                        // non-keyboard wake-up — pause the reader for it.
-                        term_events = draw_active_stream_safe(
+                        // non-keyboard wake-up — the guard pauses the reader for it.
+                        term_events = redraw_after_event(
                             term_events,
                             &mut terminal,
                             &mut state,
                             &mut current_viewport_h,
+                            &mut resize_pending,
                         )?;
                     }
                     AppEvent::Shutdown => break Ok(()),
                 }
             }
             _ = &mut resize_debounce, if resize_pending => {
-                resize_pending = false;
-                // Chat mode: rebuild the inline terminal so its viewport
-                // re-anchors cleanly at the new size; history is left to the
-                // terminal's own reflow. The rebuild queries the cursor (DSR),
-                // which crossterm can't read while the EventStream reader thread
-                // owns stdin — so drop it for the rebuild and resume after.
-                // Dashboard mode is fullscreen — ratatui's autoresize handles it.
-                if matches!(state.mode, ViewMode::Chat) {
-                    drop(term_events);
-                    let rebuilt = rebuild_chat_terminal_after_resize(
-                        &mut terminal,
-                        &state,
-                        &mut current_viewport_h,
-                    );
-                    term_events = EventStream::new();
-                    rebuilt?;
-                }
-                draw_active(&mut terminal, &mut state, &mut current_viewport_h)?;
+                // The resize burst settled with no AppEvent in between (the idle
+                // path — an interleaved AppEvent would have applied the resize via
+                // `redraw_after_event` and cleared the flag, disabling this arm).
+                // Re-anchor the inline viewport at the new size; the guard drops
+                // the stream for the cursor query and clears `resize_pending`.
+                term_events = redraw_after_event(
+                    term_events,
+                    &mut terminal,
+                    &mut state,
+                    &mut current_viewport_h,
+                    &mut resize_pending,
+                )?;
             }
         }
     }
@@ -589,31 +604,52 @@ fn rebuild_chat_terminal_after_resize(
     Ok(())
 }
 
-/// Run [`draw_active`], dropping the terminal event stream around it when the
-/// draw will rebuild the inline terminal. A rebuild queries the cursor via DSR
-/// (`ESC[6n`), and crossterm's `cursor::position()` can only read that reply off
-/// stdin when no `EventStream` is polling it — otherwise the stream's reader
-/// thread holds crossterm's internal reader and the query times out, surfacing
-/// as an error that tears down the loop. This matters on non-keyboard wake-ups
-/// (an approval popping up, a response resolving an approval) where the reader
-/// is parked. Returns the (possibly recreated) stream so the caller can rebind
-/// it. Keys typed during the brief rebuild stay buffered in the tty.
-fn draw_active_stream_safe(
+/// Redraw after a non-keyboard wake-up (an `AppEvent`, or the resize debounce),
+/// dropping the terminal event stream around the draw when it will query the
+/// cursor. Two things make a chat-mode draw query the cursor (DSR `ESC[6n`):
+///
+/// - **A pending terminal resize** we haven't applied yet: `terminal`'s known
+///   size is stale, so `draw_active`'s `autoresize` re-anchors the inline
+///   viewport via `cursor::position()`. We pre-empt that with our own clean
+///   rebuild ([`rebuild_chat_terminal_after_resize`]) so the viewport doesn't
+///   get the stale-offset garble, then let the draw run without a resize.
+/// - **A live-region height change** (approval shown/cleared, input grew):
+///   `resize_chat_viewport_if_needed` inside `draw_active` rebuilds.
+///
+/// `crossterm::cursor::position()` can only read its reply off stdin when no
+/// `EventStream` is polling it; on these wake-ups the stream's reader thread is
+/// parked holding crossterm's internal reader, so the query would time out and
+/// the error would tear down the loop. Dropping the stream releases the reader
+/// for the query; we recreate it after (keys typed meanwhile stay buffered in
+/// the tty). `resize_pending` is consumed — this redraw applies it.
+///
+/// Returns the (possibly recreated) stream so the caller can rebind it.
+/// Keyboard-event redraws don't use this: they run while the reader is free
+/// (the key was just delivered), so a plain `draw_active` is safe there.
+fn redraw_after_event(
     term_events: EventStream,
     terminal: &mut Term,
     state: &mut AppState,
     current_viewport_h: &mut u16,
+    resize_pending: &mut bool,
 ) -> anyhow::Result<EventStream> {
-    let will_rebuild = matches!(state.mode, ViewMode::Chat)
-        && desired_viewport_height(state) != *current_viewport_h;
-    if !will_rebuild {
+    let pending_resize = std::mem::replace(resize_pending, false);
+    let queries_cursor = matches!(state.mode, ViewMode::Chat)
+        && (pending_resize || desired_viewport_height(state) != *current_viewport_h);
+    if !queries_cursor {
         draw_active(terminal, state, current_viewport_h)?;
         return Ok(term_events);
     }
     drop(term_events);
-    let drawn = draw_active(terminal, state, current_viewport_h);
+    let mut result: io::Result<()> = Ok(());
+    if pending_resize {
+        result = rebuild_chat_terminal_after_resize(terminal, state, current_viewport_h);
+    }
+    if result.is_ok() {
+        result = draw_active(terminal, state, current_viewport_h);
+    }
     let stream = EventStream::new();
-    drawn?;
+    result?;
     Ok(stream)
 }
 
