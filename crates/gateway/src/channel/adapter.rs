@@ -21,7 +21,7 @@ use std::sync::Arc;
 use aura_channels::wire::{self, AttachmentKind, Frame, Message as WireMessage, WireAttachment};
 use aura_channels::{
     AgentEvent, AgentOutput, Channel, ChannelError, ChannelRegistry, Connection, ConnectionId,
-    ConnectionSink, MessageRole, NoticeLevel, SendOutcome, SessionEvent,
+    ConnectionSink, MessageRole, NoticeLevel, SendOutcome, SessionEvent, ToolStatus,
 };
 use aura_model::{ChannelType, ContentBlock};
 use aura_store::BlobStore;
@@ -313,6 +313,40 @@ async fn agent_output_to_frame(
             user_id,
             text,
         },
+        AgentEvent::Reasoning(text) => Frame::Reasoning {
+            session_id,
+            user_id,
+            text,
+        },
+        AgentEvent::ToolStarted {
+            call_id,
+            tool,
+            label,
+        } => Frame::ToolStarted {
+            session_id,
+            user_id,
+            call_id,
+            tool,
+            label,
+        },
+        AgentEvent::ToolCompleted {
+            call_id,
+            status,
+            summary,
+        } => {
+            let status = match status {
+                ToolStatus::Ok => "ok",
+                ToolStatus::Error => "error",
+                ToolStatus::Denied => "denied",
+            };
+            Frame::ToolCompleted {
+                session_id,
+                user_id,
+                call_id,
+                status: status.to_owned(),
+                summary,
+            }
+        }
         AgentEvent::Message(response) => {
             let (content, attachments) = split_content(&response.content, blob_store).await;
             Frame::Message(WireMessage {

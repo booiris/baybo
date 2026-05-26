@@ -342,6 +342,12 @@ fn map_frame(
             let _ = queue.drop_call(&call_id);
             Some(TransportEvent::ApprovalResolved { call_id, decision })
         }
+        Frame::Reasoning { .. } | Frame::ToolStarted { .. } | Frame::ToolCompleted { .. } => {
+            // Turn-progress events (reasoning + tool lifecycle). Live
+            // rendering lands in a later stage; for now they're accepted
+            // and dropped so the transport stays exhaustive over the wire.
+            None
+        }
         Frame::SessionUpdated { .. } | Frame::SessionActivity { .. } => {
             // Web-chat sidebar signals — TUI tracks a single session
             // of its own and has no list view, so it ignores rather

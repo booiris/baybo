@@ -103,6 +103,26 @@ pub struct AgentOutput {
 pub enum AgentEvent {
     /// Incremental answer-prose chunk for the in-flight response.
     Delta(String),
+    /// Incremental model reasoning ("thinking") chunk. Rendered
+    /// dim/collapsible by channels that support it; never persisted as
+    /// answer content. Goes through the same sanitize/reveal boundary as
+    /// `Delta`.
+    Reasoning(String),
+    /// A tool call has started. `label` is the human preview
+    /// (`Tool::call_label`), falling back to the tool name client-side;
+    /// `call_id` pairs this with the matching [`AgentEvent::ToolCompleted`].
+    ToolStarted {
+        call_id: String,
+        tool: String,
+        label: Option<String>,
+    },
+    /// A tool call finished. `summary` is a short, presentation-only
+    /// rendering of the result ("Read 200 lines", "exit 0", "Error: …").
+    ToolCompleted {
+        call_id: String,
+        status: ToolStatus,
+        summary: String,
+    },
     /// Final, canonical assistant response for the turn.
     Message(OutgoingMessage),
     /// Out-of-band notice addressed to the user.
@@ -114,6 +134,20 @@ pub enum AgentEvent {
     /// Channels decide how to render; the TUI inlines it into scrollback
     /// styled by `level`, transports without a banner surface may drop it.
     Notice { level: NoticeLevel, text: String },
+}
+
+/// Outcome of a finished tool call, carried by
+/// [`AgentEvent::ToolCompleted`]. Presentation-only — flattened to a
+/// lower-case string on the wire (`Frame::ToolCompleted`), mirroring how
+/// [`NoticeLevel`] becomes `Notice.level`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolStatus {
+    /// Tool returned normally.
+    Ok,
+    /// Tool errored (`ToolOutput::Error`, or the executor itself failed).
+    Error,
+    /// The user denied the call at the approval gate.
+    Denied,
 }
 
 impl From<OutgoingMessage> for AgentOutput {

@@ -256,6 +256,45 @@ pub enum Frame {
         user_id: String,
         text: String,
     },
+    /// Server → client: incremental model reasoning ("thinking") chunk
+    /// for the in-flight response. Rendered dim/collapsible; channels
+    /// without a reasoning surface drop it. `user_id` mirrors `Delta` —
+    /// empty string for non-user-addressed emissions (cron, system).
+    Reasoning {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        text: String,
+    },
+    /// Server → client: a tool call started. Clients render it as a live
+    /// work-progress line; `label` is a human preview (falling back to
+    /// `tool` when absent) and `call_id` pairs it with the later
+    /// `ToolCompleted`. Channels without a progress surface drop it.
+    ToolStarted {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        call_id: String,
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional))]
+        label: Option<String>,
+    },
+    /// Server → client: a tool call finished. `status` is a lower-case
+    /// string (`"ok"` / `"error"` / `"denied"`) like `Notice.level`, so
+    /// third-party clients don't need a typed enum; `summary` is a short
+    /// result rendering. Pairs with `ToolStarted` by `call_id`.
+    ToolCompleted {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        call_id: String,
+        status: String,
+        summary: String,
+    },
     /// Server → client: out-of-band notice surfaced by the agent
     /// (skill warnings, degraded-mode banners). `level` is a lower-
     /// case string (`"warn"` / `"error"`) so third-party clients don't
