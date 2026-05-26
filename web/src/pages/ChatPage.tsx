@@ -61,6 +61,19 @@ interface TranscriptRow {
    *  replays — those rows are also reachable via the REST history
    *  surface with the real value once the page refetches. */
   createdAt?: string;
+  /** Discriminates ephemeral turn-progress rows from normal
+   *  message/notice rows: `'reasoning'` is a dim thinking trace,
+   *  `'tool'` is a tool-call chip. Both are live-only — never persisted,
+   *  so a REST history reload drops them. See
+   *  `docs/turn-progress-events.md`. */
+  kind?: 'reasoning' | 'tool';
+  /** Tool-call fields, set when `kind === 'tool'`. `toolCallId` keys the
+   *  row so the completion frame updates the one its start created. */
+  toolCallId?: string;
+  tool?: string;
+  toolLabel?: string | null;
+  toolStatus?: 'running' | 'ok' | 'error' | 'denied';
+  toolSummary?: string;
 }
 
 interface PendingApproval {
@@ -542,6 +555,9 @@ export function ChatPage() {
         // a transcript the user isn't engaging with.
         switch (frame.kind) {
           case 'delta':
+          case 'reasoning':
+          case 'tool_started':
+          case 'tool_completed':
           case 'message':
           case 'notice':
           case 'approval_requested':
@@ -1261,6 +1277,60 @@ function routeInboundFrame(
       });
       return;
     }
+    case 'reasoning': {
+      const sid = frame.session_id;
+      setViews((prev) => {
+        const view = prev[sid] ?? EMPTY_VIEW;
+        return {
+          ...prev,
+          [sid]: {
+            ...view,
+            transcript: appendReasoningDelta(view.transcript, frame.text),
+            awaitingReply: false,
+          },
+        };
+      });
+      return;
+    }
+    case 'tool_started': {
+      const sid = frame.session_id;
+      setViews((prev) => {
+        const view = prev[sid] ?? EMPTY_VIEW;
+        return {
+          ...prev,
+          [sid]: {
+            ...view,
+            transcript: pushToolStarted(
+              view.transcript,
+              frame.call_id,
+              frame.tool,
+              frame.label ?? null,
+            ),
+            awaitingReply: false,
+          },
+        };
+      });
+      return;
+    }
+    case 'tool_completed': {
+      const sid = frame.session_id;
+      setViews((prev) => {
+        const view = prev[sid] ?? EMPTY_VIEW;
+        return {
+          ...prev,
+          [sid]: {
+            ...view,
+            transcript: applyToolCompleted(
+              view.transcript,
+              frame.call_id,
+              frame.status,
+              frame.summary,
+            ),
+          },
+        };
+      });
+      return;
+    }
     case 'message': {
       const sid = frame.session_id;
       const role: 'user' | 'assistant' = frame.role === 'user' ? 'user' : 'assistant';
@@ -1619,6 +1689,77 @@ function appendStreamingDelta(prev: TranscriptRow[], text: string): TranscriptRo
       createdAt: new Date().toISOString(),
     },
   ];
+}
+
+/** Append a reasoning chunk to the trailing reasoning row, or start a
+ *  new one. Reasoning rows are `role: 'system'` so they never collide
+ *  with the assistant-streaming reconciliation in `finalizeMessage` /
+ *  the Message-replay path. */
+function appendReasoningDelta(prev: TranscriptRow[], text: string): TranscriptRow[] {
+  const last = prev[prev.length - 1];
+  if (last?.kind === 'reasoning') {
+    return [...prev.slice(0, -1), { ...last, text: last.text + text }];
+  }
+  return [
+    ...prev,
+    { key: `reason-${prev.length}-${Date.now()}`, role: 'system', kind: 'reasoning', text },
+  ];
+}
+
+/** Push a running tool-call chip, keyed by `callId`. Idempotent on a
+ *  re-delivered start. */
+function pushToolStarted(
+  prev: TranscriptRow[],
+  callId: string,
+  tool: string,
+  label: string | null,
+): TranscriptRow[] {
+  if (prev.some((r) => r.kind === 'tool' && r.toolCallId === callId)) return prev;
+  return [
+    ...prev,
+    {
+      key: `tool-${callId}`,
+      role: 'system',
+      kind: 'tool',
+      text: '',
+      toolCallId: callId,
+      tool,
+      toolLabel: label,
+      toolStatus: 'running',
+    },
+  ];
+}
+
+/** Resolve a tool chip by `callId` with its final status + summary. If
+ *  the start was never seen (dropped), synthesize a completed row so the
+ *  result still shows. */
+function applyToolCompleted(
+  prev: TranscriptRow[],
+  callId: string,
+  status: string,
+  summary: string,
+): TranscriptRow[] {
+  const toolStatus: TranscriptRow['toolStatus'] =
+    status === 'error' ? 'error' : status === 'denied' ? 'denied' : 'ok';
+  const idx = prev.findIndex((r) => r.kind === 'tool' && r.toolCallId === callId);
+  if (idx < 0) {
+    return [
+      ...prev,
+      {
+        key: `tool-${callId}`,
+        role: 'system',
+        kind: 'tool',
+        text: '',
+        toolCallId: callId,
+        tool: 'tool',
+        toolStatus,
+        toolSummary: summary,
+      },
+    ];
+  }
+  const next = prev.slice();
+  next[idx] = { ...next[idx], toolStatus, toolSummary: summary };
+  return next;
 }
 
 function finalizeMessage(
@@ -2053,6 +2194,40 @@ function MarkdownBody({ text }: { text: string }) {
 }
 
 function MessageBubble({ row }: { row: TranscriptRow }) {
+  if (row.kind === 'reasoning') {
+    return (
+      <div className="flex items-start gap-2 px-1 font-mono text-xs text-ink-soft whitespace-pre-wrap">
+        <span className="select-none">✻</span>
+        <span className="italic">{row.text}</span>
+      </div>
+    );
+  }
+  if (row.kind === 'tool') {
+    const statusColor =
+      row.toolStatus === 'error'
+        ? 'text-error'
+        : row.toolStatus === 'denied'
+          ? 'text-warning'
+          : 'text-ink-soft';
+    return (
+      <div className="flex flex-col gap-0.5 px-1 font-mono text-xs">
+        <div className="flex items-center gap-1.5">
+          <span className="text-info">⏺</span>
+          <span className="font-bold text-ink">{row.tool}</span>
+          {row.toolLabel ? <span className="text-ink-soft">({row.toolLabel})</span> : null}
+          {row.toolStatus === 'running' ? (
+            <RiLoader4Line className="text-ink-soft animate-spin" title="Running…" />
+          ) : null}
+        </div>
+        {row.toolSummary ? (
+          <div className={`flex items-start gap-1.5 pl-1 ${statusColor}`}>
+            <span className="select-none">⎿</span>
+            <span className="whitespace-pre-wrap">{row.toolSummary}</span>
+          </div>
+        ) : null}
+      </div>
+    );
+  }
   if (row.notice) {
     const palette =
       row.notice.level === 'error'

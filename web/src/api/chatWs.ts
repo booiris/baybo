@@ -75,6 +75,23 @@ export type Frame =
   | { kind: 'reset'; reason: string }
   | ({ kind: 'message' } & WireMessage)
   | { kind: 'delta'; session_id: string; user_id?: string; text: string }
+  | { kind: 'reasoning'; session_id: string; user_id?: string; text: string }
+  | {
+      kind: 'tool_started';
+      session_id: string;
+      user_id?: string;
+      call_id: string;
+      tool: string;
+      label?: string;
+    }
+  | {
+      kind: 'tool_completed';
+      session_id: string;
+      user_id?: string;
+      call_id: string;
+      status: string;
+      summary: string;
+    }
   | { kind: 'notice'; session_id: string; user_id?: string; level: string; text: string }
   | {
       kind: 'approval_requested';
