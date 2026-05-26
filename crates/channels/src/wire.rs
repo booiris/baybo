@@ -296,6 +296,18 @@ pub enum Frame {
         status: String,
         summary: String,
     },
+    /// Server → client: a coarse turn-phase transition for a transient
+    /// status line. `phase` is a lower-case string (today `"compacting"` /
+    /// `"compacted"` for context compaction start/end); clients show a
+    /// spinner/banner on the start and clear it on the matching end, and
+    /// surfaces without one drop it.
+    Status {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        phase: String,
+    },
     /// Server → client: out-of-band notice surfaced by the agent
     /// (skill warnings, degraded-mode banners). `level` is a lower-
     /// case string (`"warn"` / `"error"`) so third-party clients don't

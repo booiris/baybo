@@ -34,6 +34,9 @@ pub(crate) enum AppEvent {
     /// A tool call finished. Commits a `⎿ summary` line, coloured by
     /// `status` (`"ok"` / `"error"` / `"denied"`).
     ToolCompleted { status: String, summary: String },
+    /// A coarse turn-phase transition (today context compaction
+    /// start/end). Commits a dim `⟳ …` status line.
+    Status { phase: String },
     /// A dashboard snapshot (re-)fetched after an OpenView or refresh.
     DashboardReady(ViewKind, DashboardSnapshot),
     /// A warn/error tracing event, forwarded from the subscriber for display

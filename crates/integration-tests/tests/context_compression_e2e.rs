@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aura_channels::{AgentEvent, AgentOutput, TurnStatus};
 use aura_integration_tests::AgentTestHarness;
 use aura_llm::{LlmResponse, ModelPricing, StreamEvent, TokenUsage};
 use aura_model::MicroUsd;
@@ -186,4 +187,58 @@ async fn compression_call_records_cost_with_matching_span_id() {
     }
 
     harness.shutdown().await;
+}
+
+/// The compaction pass reports its phase: turn 2 crosses the tight budget,
+/// so the loop emits `Status(Compacting)` before the summariser call and
+/// `Status(Compacted)` after; turn 1 stays under threshold and is silent.
+#[tokio::test]
+async fn compaction_reports_compacting_then_compacted_status() {
+    let mut harness = AgentTestHarness::builder()
+        .with_model_context_window(200)
+        .with_compression_threshold(0.1)
+        .with_keep_recent(1)
+        .build();
+
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("first".into())]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("second".into())]);
+    // The turn-2 compression pass's non-streaming summariser call.
+    harness.stub_llm.push_response(LlmResponse {
+        content: "summary of earlier conversation".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage::default(),
+        thinking: None,
+    });
+
+    harness.send_text("hello").await.unwrap();
+    let turn1 = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert!(
+        status_phases(&turn1).is_empty(),
+        "turn 1 is under the budget — no compaction status, got {turn1:?}"
+    );
+
+    harness.send_text("again").await.unwrap();
+    let turn2 = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(
+        status_phases(&turn2),
+        vec![TurnStatus::Compacting, TurnStatus::Compacted],
+        "turn 2 must report Compacting then Compacted, got {turn2:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+fn status_phases(outputs: &[AgentOutput]) -> Vec<TurnStatus> {
+    outputs
+        .iter()
+        .filter_map(|o| match &o.event {
+            AgentEvent::Status(s) => Some(*s),
+            _ => None,
+        })
+        .collect()
 }

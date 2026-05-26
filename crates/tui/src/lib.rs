@@ -224,6 +224,7 @@ async fn spawn_transport_pump(transport: Arc<WsTransport>, event_tx: mpsc::Sende
                 TransportEvent::ToolCompleted { status, summary } => {
                     Some(AppEvent::ToolCompleted { status, summary })
                 }
+                TransportEvent::Status { phase } => Some(AppEvent::Status { phase }),
                 TransportEvent::Response(blocks) => Some(AppEvent::Outgoing(blocks)),
                 TransportEvent::Notice { level, text } => Some(AppEvent::Log(LogRecord {
                     level: match level {
@@ -513,6 +514,20 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                                 &mut terminal,
                                 chat::render_tool_completed(&status, &summary),
                             )?;
+                        }
+                        term_events = redraw_after_event(
+                            term_events,
+                            &mut terminal,
+                            &mut state,
+                            &mut current_viewport_h,
+                            &mut resize_pending,
+                        )?;
+                    }
+                    AppEvent::Status { phase } => {
+                        if matches!(state.mode, ViewMode::Chat) {
+                            flush_reasoning_partial(&mut state, &mut terminal)?;
+                            flush_stream_partial(&mut state, &mut terminal)?;
+                            commit_lines_compact(&mut terminal, chat::render_status_line(&phase))?;
                         }
                         term_events = redraw_after_event(
                             term_events,

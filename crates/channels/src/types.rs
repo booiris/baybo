@@ -124,6 +124,10 @@ pub enum AgentEvent {
         status: ToolStatus,
         summary: String,
     },
+    /// Coarse turn-phase transition for a transient status line (today:
+    /// context compaction start/end). Channels show a spinner/banner and
+    /// clear it on the matching end; surfaces without one drop it.
+    Status(TurnStatus),
     /// Final, canonical assistant response for the turn.
     Message(OutgoingMessage),
     /// Out-of-band notice addressed to the user.
@@ -149,6 +153,19 @@ pub enum ToolStatus {
     Error,
     /// The user denied the call at the approval gate.
     Denied,
+}
+
+/// Coarse turn-phase signal carried by [`AgentEvent::Status`]. Today only
+/// context compaction reports start/end; future phases (Thinking,
+/// Responding, …) can extend this. Presentation-only — flattened to a
+/// lower-case string on the wire (`Frame::Status.phase`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnStatus {
+    /// Context compaction (summarisation) has started — the turn paused
+    /// to shrink the transcript before the next LLM call.
+    Compacting,
+    /// Context compaction finished; the turn resumes.
+    Compacted,
 }
 
 impl From<OutgoingMessage> for AgentOutput {

@@ -278,6 +278,21 @@ pub(crate) fn render_tool_completed(status: &str, summary: &str) -> Vec<Line<'st
     ])]
 }
 
+/// A dim turn-status line (`⟳ …`) for a coarse phase transition — today
+/// context compaction start/end. Unknown phases render verbatim.
+pub(crate) fn render_status_line(phase: &str) -> Vec<Line<'static>> {
+    let text = match phase {
+        "compacting" => "Compacting context…",
+        "compacted" => "Context compacted",
+        other => other,
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    vec![Line::from(vec![
+        Span::styled("⟳ ", dim),
+        Span::styled(text.to_string(), dim),
+    ])]
+}
+
 /// Render the non-text portion of a finalised assistant response. Text
 /// blocks are skipped because they've already been streamed line-by-line
 /// to scrollback; only blocks that aren't covered by the stream

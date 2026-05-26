@@ -66,7 +66,7 @@ interface TranscriptRow {
    *  `'tool'` is a tool-call chip. Both are live-only — never persisted,
    *  so a REST history reload drops them. See
    *  `docs/turn-progress-events.md`. */
-  kind?: 'reasoning' | 'tool';
+  kind?: 'reasoning' | 'tool' | 'status';
   /** Tool-call fields, set when `kind === 'tool'`. `toolCallId` keys the
    *  row so the completion frame updates the one its start created. */
   toolCallId?: string;
@@ -580,6 +580,7 @@ export function ChatPage() {
           case 'reasoning':
           case 'tool_started':
           case 'tool_completed':
+          case 'status':
           case 'message':
           case 'notice':
           case 'approval_requested':
@@ -603,7 +604,8 @@ export function ChatPage() {
         if (
           frame.kind === 'reasoning' ||
           frame.kind === 'tool_started' ||
-          frame.kind === 'tool_completed'
+          frame.kind === 'tool_completed' ||
+          frame.kind === 'status'
         ) {
           flushPacer(frame.session_id);
         }
@@ -1359,6 +1361,35 @@ function routeInboundFrame(
               frame.status,
               frame.summary,
             ),
+          },
+        };
+      });
+      return;
+    }
+    case 'status': {
+      const sid = frame.session_id;
+      const text =
+        frame.phase === 'compacting'
+          ? 'Compacting context…'
+          : frame.phase === 'compacted'
+            ? 'Context compacted'
+            : frame.phase;
+      setViews((prev) => {
+        const view = prev[sid] ?? EMPTY_VIEW;
+        return {
+          ...prev,
+          [sid]: {
+            ...view,
+            transcript: [
+              ...view.transcript,
+              {
+                key: `status-${view.transcript.length}-${Date.now()}`,
+                role: 'system',
+                kind: 'status',
+                text,
+              },
+            ],
+            awaitingReply: false,
           },
         };
       });
@@ -2232,6 +2263,14 @@ function MessageBubble({ row }: { row: TranscriptRow }) {
       <div className="flex items-start gap-2 px-1 font-mono text-xs text-ink-soft whitespace-pre-wrap">
         <span className="select-none">✻</span>
         <span className="italic">{row.text}</span>
+      </div>
+    );
+  }
+  if (row.kind === 'status') {
+    return (
+      <div className="flex items-center gap-2 px-1 font-mono text-xs text-ink-soft">
+        <span className="select-none">⟳</span>
+        <span>{row.text}</span>
       </div>
     );
   }

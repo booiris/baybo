@@ -26,6 +26,9 @@ pub enum TransportEvent {
     /// A tool call finished. `status` is the wire string (`"ok"` /
     /// `"error"` / `"denied"`); `summary` is the short result rendering.
     ToolCompleted { status: String, summary: String },
+    /// A coarse turn-phase transition (today `"compacting"` /
+    /// `"compacted"` for context compaction start/end).
+    Status { phase: String },
     /// Final assistant response for the turn.
     Response(Vec<ContentBlock>),
     /// Out-of-band notice surfaced by the agent.

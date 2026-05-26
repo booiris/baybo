@@ -831,6 +831,17 @@ impl ContextManager {
     /// Truncate-equivalent slice on transport / sanitize failure or
     /// empty content so a transient summarizer failure never kills
     /// the user's turn.
+    /// Whether the next [`Self::maybe_compress`] for `model_id` would
+    /// actually run a pass (budget over threshold) rather than return
+    /// `BelowThreshold`. Lets the caller bracket the pass with progress
+    /// events without re-implementing the gate. Cheap — the token count
+    /// is a baseline-plus-delta sum, the same one `maybe_compress` does.
+    pub fn needs_compression(&mut self, model_id: &str) -> bool {
+        self.set_current_model(model_id);
+        self.budget.update(self.count_tokens());
+        self.budget.needs_compression()
+    }
+
     pub async fn maybe_compress<F, Fut>(
         &mut self,
         model_id: &str,
@@ -840,11 +851,7 @@ impl ContextManager {
         F: FnOnce(ChatRequest) -> Fut + Send + 'static,
         Fut: Future<Output = std::result::Result<LlmResponse, ContextError>> + Send + 'static,
     {
-        self.set_current_model(model_id);
-
-        self.budget.update(self.count_tokens());
-
-        if !self.budget.needs_compression() {
+        if !self.needs_compression(model_id) {
             return Ok(CompressionOutcome::BelowThreshold);
         }
 

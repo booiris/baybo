@@ -372,6 +372,14 @@ fn map_frame(
             }
             Some(TransportEvent::ToolCompleted { status, summary })
         }
+        Frame::Status {
+            session_id, phase, ..
+        } => {
+            if &session_id != target_session {
+                return None;
+            }
+            Some(TransportEvent::Status { phase })
+        }
         Frame::SessionUpdated { .. } | Frame::SessionActivity { .. } => {
             // Web-chat sidebar signals — TUI tracks a single session
             // of its own and has no list view, so it ignores rather

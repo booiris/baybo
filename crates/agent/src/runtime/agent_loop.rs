@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use aura_channels::{AgentEvent, AgentOutput, COMPACT_COMMAND, OutgoingMessage, ToolStatus};
+use aura_channels::{
+    AgentEvent, AgentOutput, COMPACT_COMMAND, OutgoingMessage, ToolStatus, TurnStatus,
+};
 use aura_context::ContextManager;
 use aura_job::{JobInput, JobLifecycle, JobOutput};
 use aura_llm::{
@@ -547,7 +549,7 @@ impl AgentLoop {
             }
 
             // Proactive compression before building the ChatRequest.
-            self.compress_if_needed(session, span_recorder, job_id, &cancel_token)
+            self.compress_if_needed(session, span_recorder, job_id, &cancel_token, delta_tx.as_ref())
                 .await?;
 
             // Stream deltas on every iteration, not just the first. The
@@ -1473,26 +1475,66 @@ impl AgentLoop {
             .await;
     }
 
+    /// Emit a transient turn-[`AgentEvent::Status`] event (today:
+    /// compaction start/end). No sanitization — the variant carries no
+    /// free text. No-op when the turn isn't streaming (`delta_tx` is
+    /// `None`: cron / subagent).
+    async fn emit_status(
+        &self,
+        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        session: &Session,
+        status: TurnStatus,
+    ) {
+        let Some(tx) = delta_tx else { return };
+        let _ = tx
+            .send(AgentOutput {
+                session_id: session.id.clone(),
+                user_id: session.user.id.clone(),
+                channel: session.channel.clone(),
+                event: AgentEvent::Status(status),
+            })
+            .await;
+    }
+
     /// Compress if the budget calls for it. The `chat` closure is
     /// invoked only when the strategy returns `NeedsLlmCall`; pure
     /// strategies (Truncate, Summarize fallback) skip it entirely. The
     /// closure brackets the real LLM call in a `Compression` step +
     /// `LlmCall` span and records cost against that span — budget
     /// enforcement on the call itself rides on the wrapped client.
+    ///
+    /// Reports the compaction phase as `Status(Compacting)` / `Compacted`
+    /// when a pass actually runs, so the user sees why the turn paused.
     async fn compress_if_needed(
         &mut self,
         session: &mut Session,
         span_recorder: &Arc<SpanRecorder>,
         job_id: JobId,
         cancel_token: &CancellationToken,
+        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
     ) -> anyhow::Result<()> {
         let runner = self.build_compression_runner(session, span_recorder, job_id, cancel_token);
         let model_id = runner.model_info.id.clone();
-        self.context_manager
+        // `needs_compression` mirrors `maybe_compress`'s gate, so we only
+        // report the phase when a pass will actually run; the `Compacted`
+        // end always follows the `Compacting` start (emitted even on a
+        // compress error) so the status line never dangles.
+        let compacting = self.context_manager.needs_compression(&model_id);
+        if compacting {
+            self.emit_status(delta_tx, session, TurnStatus::Compacting)
+                .await;
+        }
+        let result = self
+            .context_manager
             .maybe_compress(&model_id, |req| async move {
                 runner.run(req).await.map(|run| run.response)
             })
-            .await?;
+            .await;
+        if compacting {
+            self.emit_status(delta_tx, session, TurnStatus::Compacted)
+                .await;
+        }
+        result?;
         Ok(())
     }
 

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use aura_channels::wire::{self, AttachmentKind, Frame, Message as WireMessage, WireAttachment};
 use aura_channels::{
     AgentEvent, AgentOutput, Channel, ChannelError, ChannelRegistry, Connection, ConnectionId,
-    ConnectionSink, MessageRole, NoticeLevel, SendOutcome, SessionEvent, ToolStatus,
+    ConnectionSink, MessageRole, NoticeLevel, SendOutcome, SessionEvent, ToolStatus, TurnStatus,
 };
 use aura_model::{ChannelType, ContentBlock};
 use aura_store::BlobStore;
@@ -345,6 +345,17 @@ async fn agent_output_to_frame(
                 call_id,
                 status: status.to_owned(),
                 summary,
+            }
+        }
+        AgentEvent::Status(status) => {
+            let phase = match status {
+                TurnStatus::Compacting => "compacting",
+                TurnStatus::Compacted => "compacted",
+            };
+            Frame::Status {
+                session_id,
+                user_id,
+                phase: phase.to_owned(),
             }
         }
         AgentEvent::Message(response) => {
