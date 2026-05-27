@@ -468,6 +468,22 @@ impl SessionManager {
             .map_err(SessionError::from)
     }
 
+    /// The freshest human-authored message (source `user` /
+    /// `user_interjection`), paired with its persisted `created_at`, or
+    /// `None`. A single indexed lookup — powers the chat sidebar preview
+    /// without walking the tail, so a prompt buried under a long tool loop
+    /// is still found. No existence pre-check: an unknown session and one
+    /// with no user turn both yield `None` (both render no preview).
+    pub async fn last_user_message(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<(DateTime<Utc>, ChatMessage)>> {
+        self.store
+            .load_last_user_message(session_id)
+            .await
+            .map_err(SessionError::from)
+    }
+
     /// Append a single message to the session's transcript log.
     /// Called by `AgentLoop` from the `&mut self` append paths so
     /// every turn's worth of messages reaches storage incrementally

@@ -265,4 +265,15 @@ pub trait SessionStore: Send + Sync {
         after_ordinal: i64,
         limit: usize,
     ) -> Result<Vec<(i64, ChatMessage)>>;
+
+    /// The freshest **human-authored** active message — source `user` or
+    /// `user_interjection` (i.e. [`ChatMessage::from_user`]) — paired with
+    /// its persisted `created_at`, or `None` when the session has no such
+    /// turn. A single indexed `ORDER BY ordinal DESC LIMIT 1` lookup;
+    /// powers the chat sidebar preview so a prompt buried under a long
+    /// tool loop is found without walking the tail.
+    async fn load_last_user_message(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<(DateTime<Utc>, ChatMessage)>>;
 }
