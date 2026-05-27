@@ -45,6 +45,7 @@ impl LlmProviderFactory for DeepSeekProviderFactory {
         let client = openai::Client::builder()
             .api_key(api_key)
             .base_url(base_url)
+            .http_client(crate::proxied_client(config.proxy.as_ref())?)
             .build()
             .map_err(|e| {
                 crate::LlmError::Config(format!("failed to create DeepSeek client: {e}"))
@@ -91,6 +92,7 @@ mod tests {
             pricing: None,
             reasoning_effort: None,
             vault: None,
+            proxy: None,
         }
     }
 

@@ -113,11 +113,13 @@ fn build_model(
     })?;
     validate_base_url(config.base_url.as_deref())?;
     let token_store = VaultTokenStore::new(vault.clone());
+    let http = crate::proxied_client(config.proxy.as_ref())?;
     Ok(OpenAiSubscriptionCompletionModel::new(
         config.model.clone(),
         config.base_url.clone(),
         config.reasoning_effort.as_deref(),
         token_store,
+        http,
         background,
     ))
 }
@@ -146,6 +148,7 @@ mod tests {
             pricing: None,
             reasoning_effort: None,
             vault,
+            proxy: None,
         }
     }
 

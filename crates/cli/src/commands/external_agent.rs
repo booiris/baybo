@@ -347,15 +347,15 @@ fn probe(
 ) -> std::result::Result<String, ExternalAgentError> {
     match kind {
         ExternalAgentKind::Claude => {
-            let agent = ClaudeCliAgent::probe_and_build(binary_path)?;
+            let agent = ClaudeCliAgent::probe_and_build(binary_path, None)?;
             Ok(agent.binary_path().display().to_string())
         }
         ExternalAgentKind::Codex => {
-            let agent = CodexCliAgent::probe_and_build(binary_path)?;
+            let agent = CodexCliAgent::probe_and_build(binary_path, None)?;
             Ok(agent.binary_path().display().to_string())
         }
         ExternalAgentKind::Gemini => {
-            let agent = GeminiCliAgent::probe_and_build(binary_path)?;
+            let agent = GeminiCliAgent::probe_and_build(binary_path, None)?;
             Ok(agent.binary_path().display().to_string())
         }
     }

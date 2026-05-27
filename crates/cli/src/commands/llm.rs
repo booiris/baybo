@@ -116,6 +116,7 @@ async fn probe(ctx: &CommandContext, name: Option<String>) -> Result<CommandOutp
         base_url: entry.base_url.clone(),
         model: entry.model.clone(),
         supports_vision: entry.supports_vision,
+        proxy: ctx.proxy_settings(),
         context_window: None,
         pricing: None,
         reasoning_effort: entry.reasoning_effort.clone(),
@@ -186,7 +187,7 @@ async fn live_model(ctx: &CommandContext, name: Option<String>) -> Result<Comman
             .ok_or_else(|| CliError::Config(format!("no llm entry named {n:?}")))?,
         None => pick_entry(entries, "Select an LLM entry to query:")?,
     };
-    let models = fetch_live_models(entry, ctx.secret_vault.clone()).await?;
+    let models = fetch_live_models(entry, ctx.secret_vault.clone(), ctx.proxy_settings()).await?;
     let mut human = format!("{} (live models for {}):\n", entry.name, entry.provider);
     if models.is_empty() {
         human.push_str("  (catalog endpoint returned no models)\n");
@@ -343,7 +344,9 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
         if picked.starts_with("model ") {
             // Re-fetch live catalog so the operator can pick the new
             // model from a fresh list. Custom-id row stays available.
-            let live = match fetch_live_models(&working, Some(vault.clone())).await {
+            let live = match fetch_live_models(&working, Some(vault.clone()), ctx.proxy_settings())
+                .await
+            {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("(live model discovery failed: {e}; falling back to manual entry)");
@@ -416,7 +419,7 @@ async fn edit(ctx: &CommandContext) -> Result<CommandOutput> {
                 changed.push("api_key");
             }
         } else if picked.starts_with("OAuth login") {
-            run_subscription_login(vault).await?;
+            run_subscription_login(vault, ctx.proxy_settings()).await?;
             changed.push("oauth");
         } else if picked.starts_with("reasoning ") {
             let levels =
@@ -535,7 +538,9 @@ async fn remove(ctx: &CommandContext) -> Result<CommandOutput> {
         if !other_sub_entries {
             let store = VaultTokenStore::new(vault.clone());
             if let Ok(Some(bundle)) = store.load().await {
-                match revoke(&bundle.refresh_token).await {
+                let http = aura_security::http::client(ctx.proxy_settings().as_ref())
+                    .map_err(|e| CliError::Manager(format!("build proxied http client: {e}")))?;
+                match revoke(&bundle.refresh_token, &http).await {
                     Ok(()) => sub_revoked = true,
                     Err(e) => tracing::warn!(
                         error = %e,
@@ -696,6 +701,7 @@ fn pick_entry<'a>(entries: &'a [LlmEntry], prompt: &str) -> Result<&'a LlmEntry>
 async fn fetch_live_models(
     entry: &LlmEntry,
     vault: Option<Arc<SecretVault>>,
+    proxy: Option<aura_security::http::ProxySettings>,
 ) -> Result<Vec<LiveModelInfo>> {
     let registry = LlmProviderRegistry::with_default_providers();
     let cfg = LlmProviderConfig {
@@ -718,6 +724,7 @@ async fn fetch_live_models(
         pricing: None,
         reasoning_effort: entry.reasoning_effort.clone(),
         vault,
+        proxy,
     };
     registry
         .list_live_models(&cfg)
@@ -801,19 +808,24 @@ fn require_tty() -> Result<()> {
     Ok(())
 }
 
-async fn run_subscription_login(vault: &Arc<SecretVault>) -> Result<()> {
+async fn run_subscription_login(
+    vault: &Arc<SecretVault>,
+    proxy: Option<aura_security::http::ProxySettings>,
+) -> Result<()> {
     let store = VaultTokenStore::new(vault.clone());
+    let http = aura_security::http::client(proxy.as_ref())
+        .map_err(|e| CliError::Manager(format!("build proxied http client: {e}")))?;
     // PKCE wants a browser that can reach 127.0.0.1; device code
     // only needs a browser somewhere. On a headless SSH box the TTY
     // is fine but the localhost callback won't reach a browser, so
     // we ask rather than auto-pick on is_terminal alone.
     let methods = ["PKCE (open browser, localhost callback)", "Device code"];
     let bundle = if !std::io::stdin().is_terminal() {
-        device_code_login(print_device_code).await
+        device_code_login(print_device_code, &http).await
     } else {
         match select_one("Login method:", &methods)? {
-            0 => pkce_login(print_pkce_url).await,
-            _ => device_code_login(print_device_code).await,
+            0 => pkce_login(print_pkce_url, &http).await,
+            _ => device_code_login(print_device_code, &http).await,
         }
     }
     .map_err(|e| CliError::Manager(format!("openai-subscription login: {e}")))?;

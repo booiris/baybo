@@ -115,6 +115,17 @@ pub(crate) fn reqwest_to_error(e: reqwest::Error, context: impl Into<String>) ->
     }
 }
 
+/// Build a `reqwest::Client` honoring the optional egress proxy, mapping a
+/// proxy/build failure to `LlmError::Config`. Shared by the rig client
+/// builders and by provider live-model discovery so every in-crate HTTP
+/// client picks up the configured proxy uniformly.
+pub(crate) fn proxied_client(
+    proxy: Option<&aura_security::http::ProxySettings>,
+) -> Result<reqwest::Client, LlmError> {
+    aura_security::http::client(proxy)
+        .map_err(|e| LlmError::Config(format!("build proxied http client: {e}")))
+}
+
 /// Map a `rig::completion::CompletionError` to the appropriate
 /// `LlmError`. This is the classifier the main chat dispatch path
 /// (`LlmClient::chat` / `chat_stream`) relies on, since rig is the

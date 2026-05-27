@@ -66,6 +66,16 @@ async fn add_entry<P: Prompter>(
     vault: &Arc<SecretVault>,
     config: &mut AuraConfig,
 ) -> Result<LlmStepOutcome> {
+    // If the operator has already set a proxy (e.g. pre-edited aura.json),
+    // route setup's own HTTP — OAuth login + live model discovery — through
+    // it too, so discovery works behind a firewall.
+    let proxy = config
+        .proxy
+        .as_ref()
+        .map(|p| aura_security::http::ProxySettings {
+            url: p.url.clone(),
+            no_proxy: p.no_proxy.clone(),
+        });
     let provider_idx = prompter.select("Provider:", BUILTIN_PROVIDERS)?;
     let provider = BUILTIN_PROVIDERS[provider_idx].to_string();
 
@@ -91,7 +101,7 @@ async fn add_entry<P: Prompter>(
     // `api_key_env` stays unset on the new entry — setting it would
     // let a global `OPENAI_API_KEY` mask the per-entry vault secret.
     let api_key_env: Option<String> = if provider == SUB_PROVIDER_NAME {
-        run_subscription_login(prompter, vault).await?;
+        run_subscription_login(prompter, vault, proxy.clone()).await?;
         None
     } else {
         let api_key = prompter.password("API key (will be encrypted into the vault): ")?;
@@ -118,7 +128,7 @@ async fn add_entry<P: Prompter>(
     };
 
     tracing::info!("Fetching live model catalog…");
-    let live = match fetch_live_models(&temp_entry, Some(vault.clone())).await {
+    let live = match fetch_live_models(&temp_entry, Some(vault.clone()), proxy).await {
         Ok(models) => models,
         Err(e) => {
             tracing::info!("(live model discovery failed: {e}; falling back to manual entry)");
@@ -213,6 +223,7 @@ fn unique_default_name(provider: &str, existing: &[LlmEntry]) -> String {
 async fn fetch_live_models(
     entry: &LlmEntry,
     vault: Option<Arc<SecretVault>>,
+    proxy: Option<aura_security::http::ProxySettings>,
 ) -> Result<Vec<LiveModelInfo>> {
     let registry = LlmProviderRegistry::with_default_providers();
     let cfg = LlmProviderConfig {
@@ -237,6 +248,7 @@ async fn fetch_live_models(
         pricing: None,
         reasoning_effort: entry.reasoning_effort.clone(),
         vault,
+        proxy,
     };
     registry
         .list_live_models(&cfg)
@@ -247,15 +259,18 @@ async fn fetch_live_models(
 async fn run_subscription_login<P: Prompter>(
     prompter: &mut P,
     vault: &Arc<SecretVault>,
+    proxy: Option<aura_security::http::ProxySettings>,
 ) -> Result<()> {
     let store = VaultTokenStore::new(vault.clone());
+    let http = aura_security::http::client(proxy.as_ref())
+        .map_err(|e| SetupError::Llm(format!("build proxied http client: {e}")))?;
     // PKCE wants a browser that can reach 127.0.0.1; device code only
     // needs a browser somewhere. Both modes are offered so the user
     // can pick what their environment supports.
     let methods = ["PKCE (open browser, localhost callback)", "Device code"];
     let bundle = match prompter.select("Login method:", &methods)? {
-        0 => pkce_login(print_pkce_url).await,
-        _ => device_code_login(print_device_code).await,
+        0 => pkce_login(print_pkce_url, &http).await,
+        _ => device_code_login(print_device_code, &http).await,
     }
     .map_err(|e| SetupError::Llm(format!("openai-subscription login: {e}")))?;
     store

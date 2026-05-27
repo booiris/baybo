@@ -58,6 +58,9 @@ pub struct McpReconciler {
     vault: Arc<SecretVault>,
     blob_store: Option<Arc<dyn BlobStore>>,
     embedded: Vec<EmbeddedMcpServer>,
+    /// Egress proxy applied to HTTP MCP transports and injected into stdio
+    /// MCP children's env. `None` = direct.
+    proxy: Option<aura_security::http::ProxySettings>,
     cancel: CancellationToken,
     notify: Arc<Notify>,
     state: Mutex<HashMap<String, Connected>>,
@@ -72,6 +75,7 @@ impl McpReconciler {
         blob_store: Option<Arc<dyn BlobStore>>,
         embedded: Vec<EmbeddedMcpServer>,
         cancel: CancellationToken,
+        proxy: Option<aura_security::http::ProxySettings>,
     ) -> Arc<Self> {
         Arc::new(Self {
             workspace_root,
@@ -79,6 +83,7 @@ impl McpReconciler {
             vault,
             blob_store,
             embedded,
+            proxy,
             cancel,
             notify: Arc::new(Notify::new()),
             state: Mutex::new(HashMap::new()),
@@ -320,7 +325,8 @@ impl McpReconciler {
         // hand-edited `.mcp.json` could otherwise smuggle in an
         // `installed`-trust stdio command and run it at boot.
         entry.validate()?;
-        let session = connect_with_extra_env(entry, &self.vault, extra_env).await?;
+        let session =
+            connect_with_extra_env(entry, &self.vault, extra_env, self.proxy.as_ref()).await?;
         let resources = resource_access_for(entry, is_embedded);
         let trust_level: aura_model::TrustLevel = entry.trust_level.into();
 

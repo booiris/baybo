@@ -29,14 +29,16 @@ impl LlmProviderFactory for OpenAIProviderFactory {
             .as_deref()
             .ok_or_else(|| crate::LlmError::Config("OpenAI requires an API key".into()))?;
 
-        let client = match config.base_url {
-            Some(ref base_url) => openai::Client::builder()
-                .api_key(api_key)
-                .base_url(base_url)
-                .build(),
-            None => openai::Client::new(api_key),
-        }
-        .map_err(|e| crate::LlmError::Config(format!("failed to create OpenAI client: {e}")))?;
+        let base_url = config
+            .base_url
+            .as_deref()
+            .unwrap_or(OPENAI_DEFAULT_BASE_URL);
+        let client = openai::Client::builder()
+            .api_key(api_key)
+            .base_url(base_url)
+            .http_client(crate::proxied_client(config.proxy.as_ref())?)
+            .build()
+            .map_err(|e| crate::LlmError::Config(format!("failed to create OpenAI client: {e}")))?;
 
         let model = client.completions_api().completion_model(&config.model);
 
@@ -71,7 +73,7 @@ impl LlmProviderFactory for OpenAIProviderFactory {
             .unwrap_or(OPENAI_DEFAULT_BASE_URL)
             .trim_end_matches('/');
         let url = format!("{base}/models");
-        let resp = reqwest::Client::new()
+        let resp = crate::proxied_client(config.proxy.as_ref())?
             .get(&url)
             .bearer_auth(api_key)
             .send()

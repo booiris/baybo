@@ -675,6 +675,7 @@ dependencies = [
  "parking_lot",
  "rand 0.10.1",
  "regex",
+ "reqwest 0.13.2",
  "serde",
  "serde_json",
  "sha2",

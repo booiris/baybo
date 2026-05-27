@@ -115,7 +115,8 @@ pub async fn build_llm_client(
             )
         }
     })?;
-    build_llm_client_for_entry(entry, registry, blob_store, vault, billing).await
+    let proxy = proxy_settings(cfg);
+    build_llm_client_for_entry(entry, registry, blob_store, vault, billing, proxy).await
 }
 
 /// Same wiring as [`build_llm_client`] but pinned to a specific
@@ -128,6 +129,7 @@ pub async fn build_llm_client_for_entry(
     blob_store: Option<std::sync::Arc<dyn aura_store::BlobStore>>,
     vault: Option<std::sync::Arc<aura_security::SecretVault>>,
     billing: CostHooks,
+    proxy: Option<aura_security::http::ProxySettings>,
 ) -> anyhow::Result<std::sync::Arc<BillableLlm>> {
     let api_key = resolve_api_key(
         entry.name.as_str(),
@@ -151,6 +153,7 @@ pub async fn build_llm_client_for_entry(
                 pricing: entry.pricing,
                 reasoning_effort: entry.reasoning_effort.clone(),
                 vault,
+                proxy,
             },
             blob_fetcher,
             billing,
@@ -205,6 +208,18 @@ pub fn storage_db_path(cfg: &WorkspaceConfig) -> PathBuf {
     WorkspacePaths::new(PathBuf::from(&cfg.path)).storage_db()
 }
 
+/// Map the optional `proxy` config into the runtime [`ProxySettings`] every
+/// HTTP client + spawned child threads through. `None` (no `proxy` block) =
+/// direct connections, today's behavior.
+pub fn proxy_settings(cfg: &AuraConfig) -> Option<aura_security::http::ProxySettings> {
+    cfg.proxy
+        .as_ref()
+        .map(|p| aura_security::http::ProxySettings {
+            url: p.url.clone(),
+            no_proxy: p.no_proxy.clone(),
+        })
+}
+
 pub fn to_assessment_mode(cfg: RiskCheckConfig) -> AssessmentMode {
     match cfg {
         RiskCheckConfig::Off => AssessmentMode::Off,
@@ -234,6 +249,24 @@ mod tests {
         assert_eq!(
             storage_db_path(&cfg),
             std::path::PathBuf::from("/tmp/project/state/storage.db"),
+        );
+    }
+
+    #[test]
+    fn proxy_settings_maps_config_to_runtime() {
+        let cfg = AuraConfig {
+            proxy: Some(aura_config::ProxyConfig {
+                url: "socks5://127.0.0.1:1080".into(),
+                no_proxy: Some(vec![".internal".into()]),
+            }),
+            ..Default::default()
+        };
+        let settings = proxy_settings(&cfg).expect("Some when proxy configured");
+        assert_eq!(settings.url, "socks5://127.0.0.1:1080");
+        assert_eq!(settings.no_proxy, Some(vec![".internal".to_string()]));
+        assert!(
+            proxy_settings(&AuraConfig::default()).is_none(),
+            "no proxy block ⇒ None ⇒ direct connections"
         );
     }
 

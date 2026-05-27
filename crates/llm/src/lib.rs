@@ -35,7 +35,9 @@ pub use crate::billed::{
     SYSTEM_USER_ID,
 };
 pub use crate::error::LlmError;
-pub(crate) use crate::error::{reqwest_to_error, rig_completion_to_error, status_to_error};
+pub(crate) use crate::error::{
+    proxied_client, reqwest_to_error, rig_completion_to_error, status_to_error,
+};
 pub use crate::guard::{BillableLlm, LlmCallGuard};
 pub use crate::providers::{FactoryDefaults, factory_defaults_for};
 pub use crate::registry::{
@@ -1117,6 +1119,7 @@ mod multimodal_dispatch_tests {
                 pricing: None,
                 reasoning_effort: None,
                 vault: None,
+                proxy: None,
             })
             .unwrap()
     }
@@ -1211,6 +1214,7 @@ mod multimodal_dispatch_tests {
                 pricing: None,
                 reasoning_effort: None,
                 vault: None,
+                proxy: None,
             })
             .unwrap();
         // OpenAI factory may set vision=true on some models; force

@@ -90,6 +90,7 @@ const PKCE_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// wait (bounded) for the browser callback, exchange code for tokens.
 pub async fn pkce_login(
     present_url: impl FnOnce(&str) -> io::Result<()> + Send + 'static,
+    client: &reqwest::Client,
 ) -> Result<OAuthTokenBundle> {
     let pkce = PkceCodes::generate()?;
     let redirect_uri = format!("http://localhost:{CALLBACK_PORT}/auth/callback");
@@ -133,7 +134,8 @@ pub async fn pkce_login(
         }
     };
 
-    let raw = exchange_code_for_tokens(&callback, &redirect_uri, &pkce.code_verifier).await?;
+    let raw =
+        exchange_code_for_tokens(&callback, &redirect_uri, &pkce.code_verifier, client).await?;
     let (access, refresh, id) = unpack_token_response(raw)?;
     OAuthTokenBundle::from_token_response(access, refresh, id)
 }
@@ -143,8 +145,8 @@ pub async fn pkce_login(
 /// the resulting authorization code for tokens.
 pub async fn device_code_login(
     present_prompt: impl FnOnce(&DeviceCode) + Send,
+    client: &reqwest::Client,
 ) -> Result<OAuthTokenBundle> {
-    let client = reqwest::Client::new();
     let api_base = format!("{ISSUER}/api/accounts");
 
     // Step 1: ask for a user code. Read body as text first so a non-JSON
@@ -229,6 +231,7 @@ pub async fn device_code_login(
         &code_resp.authorization_code,
         &redirect_uri,
         &code_resp.code_verifier,
+        client,
     )
     .await?;
     let (access, refresh, id) = unpack_token_response(raw)?;
@@ -253,8 +256,10 @@ fn unpack_token_response(resp: TokenEndpointResponse) -> Result<(String, String,
 
 /// Exchange a refresh_token for a new bundle. `Permanent` = re-login
 /// required (caller should clear the vault); `Transient` = try again later.
-pub async fn refresh(refresh_token: &str) -> std::result::Result<OAuthTokenBundle, RefreshError> {
-    let client = reqwest::Client::new();
+pub async fn refresh(
+    refresh_token: &str,
+    client: &reqwest::Client,
+) -> std::result::Result<OAuthTokenBundle, RefreshError> {
     let endpoint = format!("{ISSUER}/oauth/token");
     let body = form_urlencoded::Serializer::new(String::new())
         .append_pair("client_id", CLIENT_ID)
@@ -340,8 +345,7 @@ pub enum RefreshError {
 /// Best-effort RFC 7009 revoke. Caller decides success/failure handling;
 /// either way the local vault entry is the user's source of truth for
 /// "logged out".
-pub async fn revoke(refresh_token: &str) -> std::io::Result<()> {
-    let client = reqwest::Client::new();
+pub async fn revoke(refresh_token: &str, client: &reqwest::Client) -> std::io::Result<()> {
     let endpoint = format!("{ISSUER}/oauth/revoke");
     let body = form_urlencoded::Serializer::new(String::new())
         .append_pair("client_id", CLIENT_ID)
@@ -582,16 +586,17 @@ async fn exchange_code_for_tokens(
     code: &str,
     redirect_uri: &str,
     code_verifier: &str,
+    client: &reqwest::Client,
 ) -> Result<TokenEndpointResponse> {
-    exchange_code_for_tokens_with_redirect(code, redirect_uri, code_verifier).await
+    exchange_code_for_tokens_with_redirect(code, redirect_uri, code_verifier, client).await
 }
 
 async fn exchange_code_for_tokens_with_redirect(
     code: &str,
     redirect_uri: &str,
     code_verifier: &str,
+    client: &reqwest::Client,
 ) -> Result<TokenEndpointResponse> {
-    let client = reqwest::Client::new();
     let endpoint = format!("{ISSUER}/oauth/token");
     let body = form_urlencoded::Serializer::new(String::new())
         .append_pair("grant_type", "authorization_code")

@@ -363,6 +363,15 @@ pub async fn build_managers(
     // the whole pool; in-flight turns keep the `Arc` they already cloned.
     let llm_pool: aura_agent::LlmPoolHandle = Arc::new(parking_lot::RwLock::new(Arc::new(pool)));
 
+    // Resolve the egress proxy once for every HTTP consumer below: the LLM
+    // pricing-refresh loop, the WebFetch client, and MCP transports/children.
+    let proxy = boot::proxy_settings(&config);
+    let tool_proxy = proxy
+        .as_ref()
+        .map(|p| p.to_proxy())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("invalid proxy.url: {e}"))?;
+
     // Hot-reload orchestrator. The `LlmReloader` owns the pricing-refresh
     // loop from here on (it spawns the initial one), so a reload can
     // cancel + respawn it against the new model set.
@@ -374,6 +383,7 @@ pub async fn build_managers(
             Arc::clone(&secret_vault),
             shutdown.clone(),
             crate::reload::refresh_pairs(&config),
+            proxy.clone(),
         );
         let cost_reloader =
             crate::reload::CostReloader::new(Arc::clone(&cost_manager), Arc::clone(&rate_limit));
@@ -388,6 +398,7 @@ pub async fn build_managers(
     let mut tool_registry = ToolRegistry::with_defaults(
         stores.blob.clone(),
         aura_workspace::WorkspacePaths::new(workspace_root.clone()),
+        tool_proxy,
     );
 
     let assessment_mode = boot::to_assessment_mode(config.skills.risk_check);
@@ -625,6 +636,7 @@ pub async fn build_managers(
         Some(stores.blob.clone()),
         embedded_mcp_servers,
         mcp_cancel,
+        proxy.clone(),
     );
     mcp_reconciler.spawn();
 
@@ -843,8 +855,10 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     // NOT a trust signal — registration would expose the LLM to a
     // host-execution channel that bypasses aura's sandbox + approval
     // gate.
-    let external_agents =
-        aura_agent::external_agent::build_registry(graph.config.external_agents.boot_entries());
+    let external_agents = aura_agent::external_agent::build_registry(
+        graph.config.external_agents.boot_entries(),
+        boot::proxy_settings(&graph.config),
+    );
 
     let router = Router::from_config(aura_agent::router::RouterConfig {
         session_manager: Arc::clone(&graph.session_manager),

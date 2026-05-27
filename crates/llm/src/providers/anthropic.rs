@@ -30,14 +30,18 @@ impl LlmProviderFactory for AnthropicProviderFactory {
             .as_deref()
             .ok_or_else(|| crate::LlmError::Config("Anthropic requires an API key".into()))?;
 
-        let client = match config.base_url {
-            Some(ref base_url) => anthropic::Client::builder()
-                .api_key(api_key)
-                .base_url(base_url)
-                .build(),
-            None => anthropic::Client::new(api_key),
-        }
-        .map_err(|e| crate::LlmError::Config(format!("failed to create Anthropic client: {e}")))?;
+        let base_url = config
+            .base_url
+            .as_deref()
+            .unwrap_or(ANTHROPIC_DEFAULT_BASE_URL);
+        let client = anthropic::Client::builder()
+            .api_key(api_key)
+            .base_url(base_url)
+            .http_client(crate::proxied_client(config.proxy.as_ref())?)
+            .build()
+            .map_err(|e| {
+                crate::LlmError::Config(format!("failed to create Anthropic client: {e}"))
+            })?;
 
         // rig's Anthropic model ships with caching off; without this the
         // request omits cache_control breakpoints and Anthropic returns
@@ -78,7 +82,7 @@ impl LlmProviderFactory for AnthropicProviderFactory {
             .unwrap_or(ANTHROPIC_DEFAULT_BASE_URL)
             .trim_end_matches('/');
         let url = format!("{base}/v1/models");
-        let resp = reqwest::Client::new()
+        let resp = crate::proxied_client(config.proxy.as_ref())?
             .get(&url)
             .header("x-api-key", api_key)
             .header("anthropic-version", ANTHROPIC_API_VERSION)

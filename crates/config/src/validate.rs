@@ -25,6 +25,7 @@ impl AuraConfig {
         validate_workspace(&self.workspace, &mut errors);
         validate_browser(&self.browser, &mut errors);
         validate_gateway(&self.gateway, &mut errors);
+        validate_proxy(self.proxy.as_ref(), &mut errors);
         validate_cross_section(self, &mut errors);
         if errors.is_empty() {
             Ok(())
@@ -239,6 +240,21 @@ fn validate_gateway(gateway: &GatewayConfig, errors: &mut Vec<ValidationError>) 
                 "must be non-empty",
             ));
         }
+    }
+}
+
+fn validate_proxy(proxy: Option<&crate::proxy::ProxyConfig>, errors: &mut Vec<ValidationError>) {
+    let Some(proxy) = proxy else {
+        return;
+    };
+    if proxy.url.trim().is_empty() {
+        errors.push(ValidationError::new("proxy.url", "must be non-empty"));
+    } else if !proxy.has_supported_scheme() {
+        errors.push(ValidationError::new(
+            "proxy.url",
+            "must start with a supported scheme: http://, https://, socks5://, \
+             socks5h://, socks4:// or socks4a://",
+        ));
     }
 }
 

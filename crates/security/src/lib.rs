@@ -10,6 +10,7 @@
 
 pub mod crypto;
 pub mod error;
+pub mod http;
 pub mod injection_detector;
 pub mod leak_detector;
 pub mod log_redact;
@@ -28,6 +29,7 @@ pub type Result<T> = std::result::Result<T, SecurityError>;
 
 // Re-exports for convenient access.
 pub use crate::crypto::EncryptionKey;
+pub use crate::http::ProxySettings;
 pub use crate::injection_detector::{InjectionDetector, InjectionSeverity, InjectionWarning};
 pub use crate::leak_detector::{
     LeakAction, LeakDetectionRule, LeakDetector, LeakMatch, LeakScanResult,

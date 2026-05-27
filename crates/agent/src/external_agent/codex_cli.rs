@@ -61,12 +61,18 @@ pub struct CodexCliAgent {
     /// `--model <NAME>` override. Empty = let codex pick from its
     /// own config (`~/.codex/`).
     model: String,
+    /// Egress proxy injected into the child's env so the external CLI's
+    /// own LLM calls route through it. `None` = inherit the parent env.
+    proxy: Option<aura_security::http::ProxySettings>,
 }
 
 impl CodexCliAgent {
     /// Resolve the binary + run `codex --version`. Same fail-fast
     /// shape as claude_cli.
-    pub fn probe_and_build(binary_path: Option<&str>) -> Result<Arc<Self>> {
+    pub fn probe_and_build(
+        binary_path: Option<&str>,
+        proxy: Option<aura_security::http::ProxySettings>,
+    ) -> Result<Arc<Self>> {
         let resolved = resolve_binary(
             binary_path,
             ExternalAgentKind::Codex.binary_name(),
@@ -76,6 +82,7 @@ impl CodexCliAgent {
         Ok(Arc::new(Self {
             binary_path: resolved,
             model: String::new(),
+            proxy,
         }))
     }
 
@@ -139,6 +146,11 @@ impl CodexCliAgent {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        if let Some(proxy) = &self.proxy {
+            for (k, v) in proxy.env_vars() {
+                cmd.env(k, v);
+            }
+        }
 
         cmd.spawn().map_err(|e| {
             ExternalAgentError::Config(format!(
@@ -470,14 +482,14 @@ mod tests {
     #[test]
     fn probe_succeeds_with_working_binary() {
         let (_dir, bin) = fake_binary("codex", "codex 0.42.0");
-        let agent = CodexCliAgent::probe_and_build(Some(bin.to_str().unwrap()))
+        let agent = CodexCliAgent::probe_and_build(Some(bin.to_str().unwrap()), None)
             .expect("probe should succeed");
         assert_eq!(agent.kind(), ExternalAgentKind::Codex);
     }
 
     #[test]
     fn probe_fails_when_binary_path_missing() {
-        let err = CodexCliAgent::probe_and_build(Some("/nonexistent/codex-binary-xyzzy"))
+        let err = CodexCliAgent::probe_and_build(Some("/nonexistent/codex-binary-xyzzy"), None)
             .expect_err("expected error for missing binary path");
         match err {
             ExternalAgentError::NotInstalled(msg) => {
