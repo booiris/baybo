@@ -9,7 +9,9 @@ use aura_llm::{
     Attribution, BillableLlm, BoundBilledLlm, ChatRequest, LlmResponse, StreamEvent, TokenUsage,
     ToolDefinitionForLlm,
 };
-use aura_model::{ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SystemSpawnRequest};
+use aura_model::{
+    ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SystemSpawnRequest, ThinkingContent,
+};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -1332,6 +1334,23 @@ impl AgentLoop {
         // Build content_blocks: thinking blocks first (providers expect
         // them before text), then text.
         let mut content_blocks = thinking_blocks;
+
+        // Providers that stream reasoning only as deltas (DeepSeek thinking
+        // mode and other OpenAI-compatible endpoints) never emit a complete
+        // thinking block, so synthesize one from the accumulated text. Without
+        // it the reasoning is dropped from the persisted assistant turn and
+        // can't be echoed back next request — which DeepSeek rejects with a
+        // 400 "reasoning_content must be passed back".
+        if content_blocks.is_empty() && !thinking.is_empty() {
+            content_blocks.push(ContentBlock::Thinking {
+                id: None,
+                content: vec![ThinkingContent::Text {
+                    text: thinking.clone(),
+                    signature: None,
+                }],
+            });
+        }
+
         if !content.is_empty() {
             content_blocks.push(ContentBlock::Text(content.clone()));
         }

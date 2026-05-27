@@ -31,7 +31,7 @@ use aura_llm::test_support::StubLlm;
 use aura_llm::{LlmError, LlmResponse, ModelPricing, StreamEvent, TokenUsage, ToolCallInfo};
 use aura_model::{
     ContentBlock, MessageMetadata, MicroUsd, PendingSubagentResult, Role, SessionId,
-    SubagentExitStatus, TriggerSource,
+    SubagentExitStatus, ThinkingContent, TriggerSource,
 };
 use aura_tools::test_support::RecordingTool;
 use aura_tools::{Tool, ToolOutput};
@@ -257,6 +257,70 @@ async fn reasoning_chunks_stream_as_reasoning_events() {
     assert!(
         AgentTestHarness::delta_text(&outs).contains("the answer"),
         "answer must still stream as AnswerDelta, got {outs:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn reasoning_deltas_round_trip_as_thinking_block_on_tool_loop() {
+    // DeepSeek thinking mode streams reasoning only as deltas (never a
+    // complete thinking block) alongside its tool call. That reasoning must
+    // be persisted as a Thinking block so it is echoed back on the next
+    // request — DeepSeek rejects a tool-call turn whose `reasoning_content`
+    // is missing with a 400.
+    let tool = Arc::new(RecordingTool::new("echo_tool"));
+    tool.set_response(ToolOutput::Text("tool says hi".into()));
+    let manifest = tool.manifest();
+
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(tool.clone() as Arc<dyn Tool>, manifest)
+        .build();
+
+    // Iter 1: reasoning streamed as deltas + a tool call, no ThinkingBlock.
+    harness.stub_llm.push_stream(vec![
+        StreamEvent::Reasoning("let me check the tool".into()),
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: "call-1".into(),
+            name: "echo_tool".into(),
+            arguments: json!({"q": "ping"}),
+            signature: None,
+        }),
+    ]);
+    // Iter 2: final answer, loop exits.
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("all done".into())]);
+
+    harness.send_text("call the tool please").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    // The post-tool request must replay the assistant turn carrying the
+    // reasoning as a Thinking block.
+    let captured = harness.stub_llm.captured_requests();
+    assert!(
+        captured.len() >= 2,
+        "expected a second request after the tool call, got {}",
+        captured.len()
+    );
+    let thinking_text: String = captured[1]
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::Assistant)
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::Thinking { content, .. } => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|tc| match tc {
+            ThinkingContent::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        thinking_text.contains("let me check the tool"),
+        "reasoning streamed as deltas must round-trip in a Thinking block, got {thinking_text:?}"
     );
 
     harness.shutdown().await;

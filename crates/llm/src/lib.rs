@@ -25,7 +25,7 @@ use rig::completion::{
     ToolDefinition,
 };
 use rig::message::{Message, Text, UserContent};
-use rig::providers::{anthropic, gemini, openai};
+use rig::providers::{anthropic, deepseek, gemini, openai};
 use rig::streaming::{self, StreamedAssistantContent};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -417,6 +417,9 @@ pub(crate) enum AnyCompletionModel {
     OpenAI(openai::completion::CompletionModel),
     Anthropic(anthropic::completion::CompletionModel),
     Gemini(gemini::completion::CompletionModel),
+    /// DeepSeek's dedicated provider — round-trips `reasoning_content`
+    /// on assistant tool-call turns, which thinking mode requires.
+    DeepSeek(deepseek::CompletionModel),
     /// ChatGPT/Codex OAuth subscription path. Doesn't go through rig — the
     /// Codex Responses API uses a different request shape and needs custom
     /// auth + 401-refresh handling. See `providers::openai_subscription`.
@@ -467,6 +470,15 @@ impl AnyCompletionModel {
                     message_id: resp.message_id,
                 })
             }
+            Self::DeepSeek(m) => {
+                let resp = m.completion(request).await?;
+                Ok(completion::CompletionResponse {
+                    choice: resp.choice,
+                    usage: resp.usage,
+                    raw_response: (),
+                    message_id: resp.message_id,
+                })
+            }
             Self::OpenAiSubscription(m) => m.completion(request).await,
         }
     }
@@ -487,6 +499,10 @@ impl AnyCompletionModel {
             Self::Gemini(m) => {
                 let stream = m.stream(request).await?;
                 Ok(LlmStream::from_gemini_stream(stream))
+            }
+            Self::DeepSeek(m) => {
+                let stream = m.stream(request).await?;
+                Ok(LlmStream::from_rig_stream(stream))
             }
             Self::OpenAiSubscription(m) => m.stream(request).await,
         }
