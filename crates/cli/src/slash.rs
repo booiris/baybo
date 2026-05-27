@@ -74,7 +74,6 @@ impl CliSlashHandler {
             session: self.ctx.session.clone(),
             job: self.ctx.job.clone(),
             cron: self.ctx.cron.clone(),
-            memory: self.ctx.memory.clone(),
             trace: self.ctx.trace.clone(),
             query_api: self.ctx.query_api.clone(),
             security: self.ctx.security.clone(),
@@ -150,7 +149,7 @@ impl SlashHandler for CliSlashHandler {
     }
 
     async fn handle(&self, raw: &str) -> SlashOutcome {
-        // Bare `/skills`, `/jobs`, `/sessions`, `/memory` (no args)
+        // Bare `/skills`, `/jobs`, `/sessions` (no args)
         // open the corresponding dashboard view in TUI-capable adapters;
         // adapters that don't support views treat this as a no-op.
         if let Some(kind) = dashboard_shortcut(raw) {

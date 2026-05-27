@@ -9,8 +9,10 @@ use aura_llm::{
     Attribution, BillableLlm, BoundBilledLlm, ChatRequest, LlmResponse, StreamEvent, TokenUsage,
     ToolDefinitionForLlm,
 };
+use aura_memory::{Memory, MemoryContext};
 use aura_model::{
-    ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SystemSpawnRequest, ThinkingContent,
+    ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SpanId, SystemSpawnRequest,
+    ThinkingContent,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -243,6 +245,33 @@ pub trait InterjectionSource: Send {
 }
 
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
+/// The recall query for a job, or `None` for job kinds that don't recall.
+/// Memory recall/write run only for `UserChat` and `Cron` jobs — `System`,
+/// `Spawned` (subagent), and `SubagentNotification` have no direct user input
+/// and would pollute or double-write. The exhaustive match forces a
+/// classification when a new `JobInput` variant is added.
+fn memory_recall_query(input: &JobInput) -> Option<Vec<ContentBlock>> {
+    match input {
+        JobInput::UserChat { content } => Some(content.clone()),
+        JobInput::Cron { action_payload } => Some(cron_prompt_blocks(action_payload)),
+        JobInput::System { .. }
+        | JobInput::Spawned { .. }
+        | JobInput::SubagentNotification { .. } => None,
+    }
+}
+
+/// Best-effort extraction of a cron fire's prompt text for the recall query.
+/// The cron router writes `action_payload` as `{cron_job_id, prompt}` (an
+/// opaque trace blob — see `aura_job::JobInput::Cron`); a missing or non-string
+/// `prompt` yields an empty query, so recall degrades to a no-op rather than
+/// coupling hard to that shape.
+fn cron_prompt_blocks(action_payload: &serde_json::Value) -> Vec<ContentBlock> {
+    match action_payload.get("prompt").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => vec![ContentBlock::Text(p.to_string())],
+        _ => Vec::new(),
+    }
+}
+
 pub struct AgentLoop {
     /// Currently-active client, re-resolved from `llm_pool` at the
     /// start of each turn ([`Self::refresh_active_llm`]) so a config
@@ -284,6 +313,10 @@ pub struct AgentLoop {
     /// Distinct from the `SessionManager` plumbed inside
     /// `ContextManager` because that one is per-session-bound.
     sessions: Option<Arc<crate::SessionManager>>,
+    /// Pluggable long-term memory. `None` disables every memory hook (recall,
+    /// `on_job_complete`) — the runtime wires `None` until a real
+    /// implementation is registered.
+    memory: Option<Arc<dyn Memory>>,
 }
 
 /// Construction bundle for [`AgentLoop`]. Every field maps 1:1 to a
@@ -314,6 +347,9 @@ pub struct AgentLoopConfig {
     /// Cross-session manager. Used by system handlers that operate
     /// across sessions.
     pub sessions: Option<Arc<crate::SessionManager>>,
+    /// Pluggable long-term memory handle — one registered implementation, or
+    /// `None` to disable the memory hooks (recall / `on_job_complete`).
+    pub memory: Option<Arc<dyn Memory>>,
 }
 
 impl AgentLoop {
@@ -330,6 +366,7 @@ impl AgentLoop {
             system_spawn_tx,
             workspace_paths,
             sessions,
+            memory,
         } = config;
         let (llm_client, _effective_name) = llm_pool.read().resolve(initial_llm.as_ref());
         let mut context_manager = context_manager;
@@ -349,6 +386,7 @@ impl AgentLoop {
             system_spawn_tx,
             workspace_paths,
             sessions,
+            memory,
         }
     }
 
@@ -441,6 +479,9 @@ impl AgentLoop {
         interjections: Option<&mut dyn InterjectionSource>,
     ) -> anyhow::Result<OutgoingMessage> {
         self.refresh_active_llm();
+        // Memory recall query (and write eligibility) for this job — `None`
+        // for kinds that don't participate (System / Spawned / notification).
+        let memory_query = memory_recall_query(&job_input);
         let spec = JobSpec {
             session_id: session.id.clone(),
             session_trigger_kind: session.trigger.kind(),
@@ -462,6 +503,7 @@ impl AgentLoop {
                         delta_tx,
                         cancel_token,
                         interjections,
+                        memory_query,
                     )
                     .await?;
                 let output = JobOutput::Message {
@@ -474,6 +516,7 @@ impl AgentLoop {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn run_inner(
         &mut self,
         session: &mut Session,
@@ -483,6 +526,7 @@ impl AgentLoop {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
         mut interjections: Option<&mut dyn InterjectionSource>,
+        memory_query: Option<Vec<ContentBlock>>,
     ) -> anyhow::Result<OutgoingMessage> {
         let _ = job_lifecycle;
         self.context_manager.ensure_seeded().await;
@@ -505,6 +549,17 @@ impl AgentLoop {
         // context reads the matching skill's body and appends it (persisted +
         // JSONL-logged) as a hidden agent-context row for the loop to act on.
         self.context_manager.expand_slash_command().await;
+
+        // Recall relevant long-term memories for the triggering input and
+        // inject them (framed) before the first LLM call. No-op without a
+        // memory impl or for ineligible job kinds (`memory_query` is `None`).
+        if let Some(query) = memory_query.as_deref() {
+            self.recall_and_inject(query, session, span_recorder, job_id, &cancel_token)
+                .await;
+        }
+        // Accumulates this job's user-authored input (initial prompt + any
+        // mid-turn interjections) for the `on_job_complete` write at turn end.
+        let mut job_user_input: Vec<ContentBlock> = memory_query.clone().unwrap_or_default();
 
         // Iterative LLM loop
         let mut iterations = 0;
@@ -545,7 +600,23 @@ impl AgentLoop {
                 // so the user can steer an in-progress turn. Messages that don't
                 // make a boundary fall through to the next turn. See
                 // docs/mid-turn-user-interjection.md.
-                self.drain_user_interjections(&mut interjections).await;
+                let drained = self.drain_user_interjections(&mut interjections).await;
+                // Recall against each freshly-drained interjection so the next
+                // LLM call also sees memory relevant to the steering message,
+                // and fold it into this job's input for the end-of-turn write.
+                if memory_query.is_some() {
+                    for content in &drained {
+                        self.recall_and_inject(
+                            content,
+                            session,
+                            span_recorder,
+                            job_id,
+                            &cancel_token,
+                        )
+                        .await;
+                        job_user_input.extend(content.iter().cloned());
+                    }
+                }
                 // Iteration-boundary summary-refresh check.
                 self.maybe_spawn_background_compression(job_id, /* job_done */ false)
                     .await;
@@ -601,6 +672,17 @@ impl AgentLoop {
                     // the tokens / diff conjuncts still apply.
                     self.maybe_spawn_background_compression(job_id, /* job_done */ true)
                         .await;
+                    // Fire-and-forget the memory write for this finished
+                    // exchange (initial input + interjections, final output).
+                    if memory_query.is_some() {
+                        self.spawn_job_complete_write(
+                            session,
+                            job_id,
+                            span_recorder,
+                            std::mem::take(&mut job_user_input),
+                            msg.content.clone(),
+                        );
+                    }
                     return Ok(msg);
                 }
                 IterationOutcome::Continue => {
@@ -1126,23 +1208,134 @@ impl AgentLoop {
     /// cancellation. A `None` source (cron / subagent / notification turns) is a
     /// no-op — this is a UserChat-turn affordance.
     /// See `docs/mid-turn-user-interjection.md`.
-    async fn drain_user_interjections(&mut self, src: &mut Option<&mut dyn InterjectionSource>) {
+    async fn drain_user_interjections(
+        &mut self,
+        src: &mut Option<&mut dyn InterjectionSource>,
+    ) -> Vec<Vec<ContentBlock>> {
         let Some(src) = src.as_deref_mut() else {
-            return;
+            return Vec::new();
         };
         let drained = src.drain_injectable();
         if drained.is_empty() {
-            return;
+            return Vec::new();
         }
         let count = drained.len();
-        for content in drained {
+        for content in &drained {
             // Budgeted at the framed wire size; see `append_user_interjection`.
-            self.context_manager.append_user_interjection(content).await;
+            self.context_manager
+                .append_user_interjection(content.clone())
+                .await;
         }
         info!(
             interjections = count,
             "injected mid-turn user interjection(s) before the next LLM call"
         );
+        drained
+    }
+
+    /// Recall memories relevant to `query` and inject each as a framed
+    /// [`aura_model::MessageSource::RecalledMemory`] row before the next LLM
+    /// call. No-op when no memory is wired. Recall failure is logged and
+    /// swallowed — it must never fail the turn. The impl bills its own
+    /// embedding/LLM work against the minted [`Attribution`]; a `MemoryRecall`
+    /// trace step marks the operation.
+    async fn recall_and_inject(
+        &mut self,
+        query: &[ContentBlock],
+        session: &Session,
+        span_recorder: &Arc<SpanRecorder>,
+        job_id: JobId,
+        cancel_token: &CancellationToken,
+    ) {
+        let Some(memory) = self.memory.clone() else {
+            return;
+        };
+        let user_id = session.user.id.clone();
+        let session_id = session.id.clone();
+        let query = query.to_vec();
+        let recalled = crate::runtime::scope::with_step(
+            span_recorder.as_ref(),
+            job_id,
+            StepKind::MemoryRecall,
+            Some((cancel_token, aura_job::CancelReason::ParentCancelled)),
+            |_step| async move {
+                let ctx = MemoryContext {
+                    attribution: Attribution {
+                        user_id,
+                        session_id,
+                        job_id,
+                        span_id: SpanId::new(),
+                    },
+                };
+                match memory.recall(&ctx, &query).await {
+                    Ok(mems) => Ok((LifecycleOutcome::Ok, mems)),
+                    Err(e) => Err(anyhow::Error::new(e)),
+                }
+            },
+        )
+        .await;
+        let recalled = match recalled {
+            Ok(mems) => mems,
+            Err(e) => {
+                warn!(error = %e, "memory recall failed; continuing without recalled context");
+                return;
+            }
+        };
+        for mem in recalled {
+            self.context_manager
+                .append_recalled_memory(vec![ContentBlock::Text(mem.content)])
+                .await;
+        }
+    }
+
+    /// Fire-and-forget the [`Memory::on_job_complete`] write for a finished
+    /// exchange. Detached so the actor returns the answer without waiting on
+    /// the memory write; the impl bills its work against the minted
+    /// [`Attribution`] under a `MemoryWrite` trace step. No-op when no memory
+    /// is wired.
+    fn spawn_job_complete_write(
+        &self,
+        session: &Session,
+        job_id: JobId,
+        span_recorder: &Arc<SpanRecorder>,
+        user_input: Vec<ContentBlock>,
+        final_output: Vec<ContentBlock>,
+    ) {
+        let Some(memory) = self.memory.clone() else {
+            return;
+        };
+        let recorder = Arc::clone(span_recorder);
+        let user_id = session.user.id.clone();
+        let session_id = session.id.clone();
+        tokio::spawn(async move {
+            let result = crate::runtime::scope::with_step(
+                recorder.as_ref(),
+                job_id,
+                StepKind::MemoryWrite,
+                None,
+                |_step| async move {
+                    let ctx = MemoryContext {
+                        attribution: Attribution {
+                            user_id,
+                            session_id,
+                            job_id,
+                            span_id: SpanId::new(),
+                        },
+                    };
+                    match memory
+                        .on_job_complete(&ctx, &user_input, &final_output)
+                        .await
+                    {
+                        Ok(()) => Ok((LifecycleOutcome::Ok, ())),
+                        Err(e) => Err(anyhow::Error::new(e)),
+                    }
+                },
+            )
+            .await;
+            if let Err(e) = result {
+                warn!(error = %e, "memory on_job_complete write failed");
+            }
+        });
     }
 
     /// Append a user-authored message to this session's transcript — both the

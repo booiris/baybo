@@ -21,6 +21,7 @@ pub mod error;
 pub mod external_agents;
 pub mod gateway;
 pub mod llm;
+pub mod memory;
 pub mod proxy;
 pub mod reload;
 pub mod security;
@@ -43,6 +44,7 @@ pub use crate::error::{ConfigError, Result, ValidationError};
 pub use crate::external_agents::{ClaudeConfig, CodexConfig, ExternalAgentsConfig, GeminiConfig};
 pub use crate::gateway::GatewayConfig;
 pub use crate::llm::{LlmEntry, LlmPricingOverride};
+pub use crate::memory::MemoryConfig;
 pub use crate::proxy::ProxyConfig;
 pub use crate::reload::{ConfigHandle, hot_reload_diff};
 pub use crate::security::SecurityConfig;
@@ -79,6 +81,7 @@ pub struct AuraConfig {
     /// direct connections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyConfig>,
+    pub memory: MemoryConfig,
 }
 
 impl AuraConfig {

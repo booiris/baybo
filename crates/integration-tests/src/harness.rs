@@ -431,6 +431,7 @@ impl AgentTestHarnessBuilder {
             system_spawn_tx: None,
             workspace_paths: None,
             sessions: None,
+            memory: None,
         });
         let (mailbox_tx, mailbox_rx) = aura_agent::mailbox::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);

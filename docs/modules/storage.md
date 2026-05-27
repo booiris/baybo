@@ -6,7 +6,7 @@ The `storage` crate is the **libsql adapter**: it implements every `*Store` trai
 
 Its job is:
 
-- Implement every `*Store` trait from `aura-store` (`SessionStore`, `SessionSummaryStore`, `JobStore`, `TraceStore`, `MemoryStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`, `SkillRiskStore`) via libsql
+- Implement every `*Store` trait from `aura-store` (`SessionStore`, `SessionSummaryStore`, `JobStore`, `TraceStore`, `CostStore`, `SecretStore`, `CronStore`, `BlobStore`, `ChannelSessionStore`, `ChannelBotStore`, `ChannelPairingStore`, `SkillRiskStore`) via libsql
 - Provide `Store` for dependency injection
 - Manage database schema initialization
 
@@ -20,7 +20,6 @@ Every `*Store` trait contract lives in `aura-store`; `aura-storage` only *implem
 
 ```
 libsql/session.rs         → impl SessionStore + SessionSummaryStore   (traits + StoredMessage / SessionSummaryRow from aura-store)
-libsql/memory.rs          → impl MemoryStore                          (trait from aura-store)
 libsql/trace.rs           → impl TraceStore                           (trait from aura-store; rows ↔ Step/Span/SpanEvent via aura-trace)
 libsql/secret.rs          → impl SecretStore                          (trait from aura-store; one secrets table shared by minted placeholders, mcp.* creds, and user_env.* user secrets)
 libsql/job.rs             → impl JobStore                             (trait from aura-store; rows ↔ Job via aura-job)
@@ -93,4 +92,4 @@ All libsql-backed deletes are plain `DELETE FROM`. There is no `deleted_at` tomb
 | `model` / `trace` / `job`                | Provide domain types the libsql impls round-trip (`trace` / `job` are `dev-dependencies` only, for the round-trip tests) |
 | `context`                                | Owns `ContextManager`; pure in-memory                                                     |
 | `session`                                | Owns the `SessionManager` facade and calls `SessionStore` / `SessionSummaryStore` (whose traits live in `aura-store`); `storage` does **not** depend on `session` |
-| `agent`                                  | Injects stores into managers (MemoryManager, JobLifecycle, etc.); re-exports SessionManager |
+| `agent`                                  | Injects stores into managers (JobLifecycle, etc.); re-exports SessionManager |

@@ -74,6 +74,7 @@ pub fn hot_reload_diff(old: &AuraConfig, new: &AuraConfig) -> Result<()> {
         browser,
         external_agents,
         proxy,
+        memory,
     } = new;
 
     if &old.channels != channels {
@@ -101,6 +102,9 @@ pub fn hot_reload_diff(old: &AuraConfig, new: &AuraConfig) -> Result<()> {
     // MCP) and re-spawning sidecars with new env — not safe live.
     if &old.proxy != proxy {
         return Err(not_hot("proxy"));
+    }
+    if &old.memory != memory {
+        return Err(not_hot("memory"));
     }
 
     let AgentConfig {

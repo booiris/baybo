@@ -36,7 +36,7 @@ use aura_context::{
 use aura_cost::{CostManager, SpendingLimits};
 use aura_job::JobLifecycle;
 use aura_llm::BillableLlm;
-use aura_memory::MemoryManager;
+use aura_memory::Memory;
 use aura_model::SystemSpawnRequest;
 use aura_security::{LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
@@ -126,7 +126,6 @@ pub struct ManagerGraph {
     pub config: Arc<AuraConfig>,
     pub session_manager: Arc<SessionManager>,
     pub job_lifecycle: Arc<JobLifecycle>,
-    pub memory_manager: Arc<MemoryManager>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub security_gateway: Arc<SecurityGateway>,
     pub skill_registry: Arc<SkillRegistry>,
@@ -594,8 +593,6 @@ pub async fn build_managers(
         sandbox_runner,
     ));
 
-    let memory_manager = Arc::new(MemoryManager::new(stores.memory.clone()));
-
     // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and
     // dynamically registers/unregisters MCP-discovered tools. Bridge the
     // shared `ShutdownSignal` to a `CancellationToken` since the
@@ -644,7 +641,6 @@ pub async fn build_managers(
         config,
         session_manager,
         job_lifecycle,
-        memory_manager,
         cron_scheduler,
         security_gateway,
         skill_registry,
@@ -747,6 +743,14 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         ));
         let system_spawn_tx = graph.system_spawn_tx.clone();
         let supervisor_for_spawn = supervisor.clone();
+        // Memory subsystem. No real backend ships yet, so this is `None` — the
+        // inert no-op path: every memory hook (recall, `on_job_complete`) is
+        // skipped, no `MemoryRecall`/`MemoryWrite` trace step is opened, nothing
+        // is billed. This is the single construction point: a real
+        // `Arc<dyn Memory>` is built here from `config.memory` + the
+        // LLM/embedding clients, its `tools()` registered into `tool_registry`,
+        // and the handle threaded into every actor's `AgentLoopConfig` below.
+        let memory: Option<Arc<dyn Memory>> = None;
         Box::new(
             move |session: aura_model::Session,
                   initial_llm: Option<LlmEntryName>,
@@ -790,6 +794,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     system_spawn_tx: Some(system_spawn_tx.clone()),
                     workspace_paths: Some(Arc::clone(&workspace_paths_arc)),
                     sessions: Some(Arc::clone(&sessions)),
+                    memory: memory.clone(),
                 });
 
                 let span_recorder = Arc::new(SpanRecorder::new(

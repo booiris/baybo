@@ -28,9 +28,6 @@ pub enum GatewayError {
     #[error("cron error: {0}")]
     Cron(String),
 
-    #[error("memory error: {0}")]
-    Memory(String),
-
     #[error("trace error: {0}")]
     Trace(String),
 

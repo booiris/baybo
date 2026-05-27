@@ -206,7 +206,6 @@ fn build_admin_state(
         session_manager: Arc::clone(&tg.deps.session_manager),
         job_lifecycle: Arc::clone(&tg.deps.job_lifecycle),
         cron_scheduler: Arc::clone(&tg.deps.cron_scheduler),
-        memory_manager: Arc::clone(&tg.deps.memory_manager),
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
         query_api: Arc::new(aura_query::QueryApi::new(

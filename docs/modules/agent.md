@@ -8,13 +8,13 @@ Core responsibilities:
 
 - **Message dispatch**: Actor model, one Actor per session for isolation
 - **Agent main loop**: LLM calls, tool/skill execution, reply generation
-- **Business logic managers**: `SessionManager` (in `aura-session`), `JobLifecycle` (in `aura-job`), `SpanRecorder` (in `aura-trace`), `MemoryManager` (in `aura-memory`), `CostManager` (in `aura-cost`), `SecretVault` (in `aura-security`), `SecurityGateway` — all domain managers live in their respective domain crates now; `agent` assembles them. `SecurityGateway` stays here because it is a cross-cutting interception facade tied to the execution path
+- **Business logic managers**: `SessionManager` (in `aura-session`), `JobLifecycle` (in `aura-job`), `SpanRecorder` (in `aura-trace`), the `Memory` trait (in `aura-memory`), `CostManager` (in `aura-cost`), `SecretVault` (in `aura-security`), `SecurityGateway` — all domain managers live in their respective domain crates now; `agent` assembles them. `SecurityGateway` stays here because it is a cross-cutting interception facade tied to the execution path
 - **Long-running execution**: cron scheduling, background notifications
 - **Unified observability**: `SpanRecorder` (in `aura-trace`, Step / Span / SpanEvent) and `JobLifecycle` (in `aura-job`, Job state machine)
 - **Cost management**: `CostManager` (in `aura-cost`) records LLM-call cost and gates spend; agent constructs it and threads it through the loop
 - **Runtime logic**: error recovery, timeout control
 
-It does not own low-level storage or backend implementation — it consumes every `*Store` trait from the `aura-store` ports crate through dependency injection, and the libsql impls (`aura-storage`) are wired in at assembly time. Domain managers and rich types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`); the `JobStore` / `TraceStore` it calls trade in row DTOs that `aura-job` / `aura-trace` convert to and from. Each manager defines its own error type for business-level failures (e.g. `MemoryManager` defines errors for embedding and dedup failures).
+It does not own low-level storage or backend implementation — it consumes every `*Store` trait from the `aura-store` ports crate through dependency injection, and the libsql impls (`aura-storage`) are wired in at assembly time. Domain managers and rich types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`); the `JobStore` / `TraceStore` it calls trade in row DTOs that `aura-job` / `aura-trace` convert to and from. Each manager defines its own error type for business-level failures (e.g. `JobLifecycle` defines errors for invalid state transitions).
 
 ## Source Layout
 
@@ -147,8 +147,8 @@ Before a message enters an actor, Router completes: session identification/creat
 | `llm` | `AgentLoop` initiates model calls |
 | `tools` | `ToolExecutor` executes tools |
 | `skills` | `AgentLoop` parses and executes skills |
-| `model` | Provides memory domain types (`MemoryEntry`, `MemoryCategory`) used by `aura-memory::MemoryManager`; session domain types (`Session`, `User`, `ChannelType`) used by `aura-session::SessionManager` |
-| `memory` | Owns `MemoryStore` trait and `MemoryManager` (list/search/store/delete/importance, per-user eviction). The agent loop does **not** consult `MemoryManager`; it is exposed only through the gateway admin REST surface |
+| `model` | Provides `MessageSource::RecalledMemory` (the framed recall-injection marker); session domain types (`Session`, `User`, `ChannelType`) used by `aura-session::SessionManager` |
+| `memory` | Owns the pluggable `Memory` trait + `NoopMemory` default. The agent loop drives `recall` / `on_job_complete` for `UserChat` + `Cron` jobs; no real backend ships yet (runtime wires `None`) |
 | `workspace` | Identity files for system prompt |
 | `cron` | Owns `CronJob`, `CronExecution`, and `CronScheduler`; agent re-exports `CronScheduler` / `CronTriggerEvent` for assembly-layer wiring |
 | `context` | Conversation window and compression |

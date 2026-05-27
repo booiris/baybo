@@ -7,7 +7,6 @@ use aura_config::AuraConfig;
 use aura_cost::CostStore;
 use aura_job::JobLifecycle;
 use aura_llm::BillableLlm;
-use aura_memory::MemoryManager;
 use aura_query::QueryApi;
 use aura_security::{LeakDetector, SecretVault};
 use aura_skills::SkillRegistry;
@@ -43,7 +42,6 @@ pub struct CommandContext {
     pub session: Option<Arc<SessionManager>>,
     pub job: Option<Arc<JobLifecycle>>,
     pub cron: Option<Arc<CronScheduler>>,
-    pub memory: Option<Arc<MemoryManager>>,
     pub trace: Option<Arc<dyn TraceStore>>,
     /// Pre-built `QueryApi` so trace / job / session commands don't
     /// allocate one per invocation. `None` when the context lacks any
@@ -115,7 +113,6 @@ pub struct ContextBuilder {
     session: Option<Arc<SessionManager>>,
     job: Option<Arc<JobLifecycle>>,
     cron: Option<Arc<CronScheduler>>,
-    memory: Option<Arc<MemoryManager>>,
     trace: Option<Arc<dyn TraceStore>>,
     cost_store: Option<Arc<dyn CostStore>>,
     security: Option<Arc<SecurityGateway>>,
@@ -139,7 +136,6 @@ impl ContextBuilder {
             session: None,
             job: None,
             cron: None,
-            memory: None,
             trace: None,
             cost_store: None,
             security: None,
@@ -193,11 +189,6 @@ impl ContextBuilder {
 
     pub fn cron(mut self, cron: Arc<CronScheduler>) -> Self {
         self.cron = Some(cron);
-        self
-    }
-
-    pub fn memory(mut self, memory: Arc<MemoryManager>) -> Self {
-        self.memory = Some(memory);
         self
     }
 
@@ -270,7 +261,6 @@ impl ContextBuilder {
             session: self.session,
             job: self.job,
             cron: self.cron,
-            memory: self.memory,
             trace: self.trace,
             query_api,
             security: self.security,

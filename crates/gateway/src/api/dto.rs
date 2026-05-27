@@ -382,28 +382,6 @@ pub struct SendMessageResponse {
     pub message_id: String,
 }
 
-/// `POST /v1/memory` body.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct StoreMemoryRequest {
-    pub content: String,
-    #[serde(default)]
-    pub user_id: Option<String>,
-    #[serde(default)]
-    pub importance: Option<f32>,
-}
-
-/// `GET /v1/memory` query params.
-#[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct MemoryListQuery {
-    #[serde(default)]
-    pub user_id: Option<String>,
-    #[serde(default)]
-    pub q: Option<String>,
-    #[serde(default)]
-    pub limit: Option<usize>,
-}
-
 /// `POST /v1/cron` body. Schedule format is the standard 5-field cron
 /// string accepted by [`aura_cron`].
 #[derive(Debug, Deserialize, ToSchema)]
@@ -420,81 +398,6 @@ pub struct CreateCronRequest {
     pub timezone: String,
     #[serde(default)]
     pub origin_session_id: Option<String>,
-}
-
-// ── MemoryEntry ──────────────────────────────────────────────────────
-
-/// Mirror of [`aura_model::MemoryCategory`]. Serde uses an adjacently
-/// tagged shape where unit variants collapse to `{"type":"KeyFact"}`;
-/// utoipa's derive can't express that, so the schema is hand-written.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value")]
-pub enum MemoryCategory {
-    UserPreference,
-    KeyFact,
-}
-
-impl utoipa::PartialSchema for MemoryCategory {
-    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::Schema> {
-        use utoipa::openapi::{ObjectBuilder, Type, schema::SchemaType};
-        ObjectBuilder::new()
-            .property(
-                "type",
-                ObjectBuilder::new()
-                    .schema_type(SchemaType::Type(Type::String))
-                    .enum_values(Some(vec!["UserPreference", "KeyFact"])),
-            )
-            .required("type")
-            .build()
-            .into()
-    }
-}
-
-impl utoipa::ToSchema for MemoryCategory {
-    fn name() -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed("MemoryCategory")
-    }
-}
-
-impl From<aura_model::MemoryCategory> for MemoryCategory {
-    fn from(v: aura_model::MemoryCategory) -> Self {
-        match v {
-            aura_model::MemoryCategory::UserPreference => Self::UserPreference,
-            aura_model::MemoryCategory::KeyFact => Self::KeyFact,
-        }
-    }
-}
-
-/// Mirror of [`aura_model::MemoryEntry`].
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct MemoryEntry {
-    pub id: String,
-    pub user_id: String,
-    pub content: String,
-    pub category: MemoryCategory,
-    pub importance: f32,
-    pub embedding: Option<Vec<f32>>,
-    pub created_at: DateTime<Utc>,
-    pub last_accessed: DateTime<Utc>,
-    pub source_session_id: Option<String>,
-    pub expires_at: Option<DateTime<Utc>>,
-}
-
-impl From<aura_model::MemoryEntry> for MemoryEntry {
-    fn from(v: aura_model::MemoryEntry) -> Self {
-        Self {
-            id: v.id,
-            user_id: v.user_id,
-            content: v.content,
-            category: v.category.into(),
-            importance: v.importance,
-            embedding: v.embedding,
-            created_at: v.created_at,
-            last_accessed: v.last_accessed,
-            source_session_id: v.source_session_id,
-            expires_at: v.expires_at,
-        }
-    }
 }
 
 // ── Job ──────────────────────────────────────────────────────────────

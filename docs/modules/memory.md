@@ -1,37 +1,160 @@
-# memory - User-scoped Memory Store
+# memory — pluggable long-term memory
 
 ## Overview
 
-The `memory` crate owns a thin `MemoryManager` business-logic facade (list / search / store / delete / importance, with per-user eviction). The `MemoryStore` trait lives in the `aura-store` ports crate; domain types (`MemoryEntry`, `MemoryCategory`) live in `aura-model` so the wire shape is reusable from non-storage call sites.
+The `aura-memory` crate defines a **single pluggable [`Memory`] trait**. The
+system knows memory only through one `Arc<dyn Memory>` slot (not a many-registry
+like tools/channels): at most one implementation is registered at startup. The
+trait is intentionally thin and **storage-opaque** — an implementation owns its
+own persistence (libsql, a vector DB, an external service) and receives its LLM
++ embedding handles and config in its own constructor.
 
-`aura-storage` provides the libsql implementation of `MemoryStore` (the trait itself lives in `aura-store`), so downstream callers and tests can depend on `aura-memory` plus the ports crate for memory work.
+The core ships the trait, its value types (`MemoryContext`, `RecalledMemory`,
+`MemoryError`), and a **`NoopMemory`** reference default. **No real backend ships
+yet** — the runtime wires `None` (the inert no-op path), so in production today
+nothing is recalled, written, or billed. The plumbing below activates the moment
+a real `Arc<dyn Memory>` is registered.
 
-There is currently **no automatic recall path and no auto-store path**. The agent loop does not consult the memory subsystem on incoming user content, and it does not write the assistant's response back to memory. The previous heuristic-based `recall` + `maybe_store` pipeline was removed because it pulled in arbitrary substrings, treated entire assistant outputs (including embedded code or document content) as memorable, and re-injected those snapshots as `Role::System` messages in subsequent turns. Any future memory mechanism must be driven by an explicit signal (a tool call, an operator action), not by substring matching against free-form text.
+This supersedes the previous CRUD `MemoryManager` facade (now removed, along with
+`MemoryStore`/`MemoryEntry`/`MemoryCategory`, the libsql impl, the `/v1/memory`
+admin REST, and the `memories` table — dropped by migration). The earlier
+heuristic `recall` + `maybe_store` pipeline was retired because it (1) recalled
+by arbitrary substring match, (2) treated entire assistant outputs as memorable,
+and (3) re-injected snapshots as `Role::System` messages that polluted every
+later turn. Those three failure modes are now **hard constraints** (below), not a
+reason to forbid the whole shape.
 
-## Surface
+## The trait
 
-`MemoryManager` exposes only operator-facing operations:
+```rust
+// crates/memory/src/lib.rs
+pub struct MemoryContext { pub attribution: aura_llm::Attribution }
+pub struct RecalledMemory { pub content: String }
 
-- `store(entry)` — persist a single `MemoryEntry`; runs per-user eviction afterwards.
-- `list(user_id?)` — list entries, optionally scoped to one user.
-- `search(user_id?, query, limit)` — substring search, scoped or global.
-- `get(id)` / `delete(id)` — point lookup / point delete.
-- `set_importance(id, importance)` — clamp `[0,1]` and persist.
-- `delete_for_session(session_id)` — bulk delete entries tagged with `source_session_id`.
+#[async_trait]
+pub trait Memory: Send + Sync {
+    async fn recall(&self, ctx: &MemoryContext, query: &[ContentBlock])
+        -> Result<Vec<RecalledMemory>>;
+    async fn on_job_complete(&self, ctx: &MemoryContext,
+        user_input: &[ContentBlock], final_output: &[ContentBlock]) -> Result<()>;
+    async fn on_session_end(&self, ctx: &MemoryContext,
+        transcript: &[ChatMessage]) -> Result<()>;
+    fn tools(&self) -> Vec<(Arc<dyn Tool>, ToolManifest)> { Vec::new() }
+}
+```
 
-These power the gateway admin REST endpoints (`/v1/memory`) and any future operator-facing CLI surface. Nothing in the agent loop calls them.
+- **`recall`** — synchronous query, on the critical path (job start + each
+  interjection). De-duplication against already-surfaced memories is **internal
+  to the impl** (keyed off `ctx`; one impl is a process singleton, so that state
+  survives actor reap/rehydration for free). The core injects exactly what is
+  returned.
+- **`on_job_complete` / `on_session_end`** — fire-and-forget lifecycle events
+  (the read/write asymmetry is intentional; the verb is **not** "sync", which
+  would imply bidirectional reconciliation). `on_job_complete` sees one finished
+  exchange (`user_input` includes mid-turn interjections); `on_session_end` sees
+  the full durable transcript at idle-timeout.
+- **`tools`** — the model's "explicit signal" path, coexisting with the
+  automatic recall/write path. Registered statically at startup.
 
-## Constraints
+## Clients & billing
 
-- No dependency on `aura-storage` — the libsql impl converts its own errors at the trait boundary.
-- `test_support::MemoryMemoryStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `aura-memory = { workspace = true, features = ["test-support"] }`.
-- Per-user limit eviction (`enforce_user_limit`, default 1000 entries) runs after every successful write, scoring entries by `(importance, last_accessed)` ascending and dropping the lowest-ranked ones.
+The implementation holds the **unbound** `Arc<BillableLlm>` and a billed
+embedding handle, constructor-injected. Each call gets a `MemoryContext` whose
+`Attribution` the core mints when it opens the `MemoryRecall` / `MemoryWrite`
+trace step; the impl binds its handles per call, so spend bills to the **real**
+user/session (mirrors `compression.rs`, not `Attribution::system`).
+
+A new **`EmbeddingClient`** trait lives in `aura-llm` beside `BilledChat`:
+batch `embed(&[String]) -> EmbeddingResponse` + `dimensions()`, sealed behind
+`BillableEmbedding` / `BoundBilledEmbedding` so embedding spend flows through the
+identical micro-USD guard→record chokepoint as chat. Trait + billed wrapper only;
+no concrete provider ships yet.
+
+## Recall injection (enforces hard constraint #3)
+
+Recalled memories enter the prompt as a **persisted, framed** block — never
+`Role::System`. The path mirrors the user-interjection pattern:
+
+- `MessageSource::RecalledMemory` (`aura-model`) + `ChatMessage::recalled_memory`.
+- `aura_context::prompts::recalled_memory` — a `<recalled_memory>` envelope,
+  re-derived wire-only in `ContextManager::messages_for_llm` (via
+  `frame_recalled_memories`, alongside `frame_interjections` — both delegate to
+  one `frame_source_runs` helper). The budget counts the framed size.
+- Persisted once per recall (`append_recalled_memory`); rides the transcript
+  until compression folds it. Hidden from the chat bubble surface
+  (`from_user() == false`), so it never renders as a user turn.
+- The core does **no** dedup — it injects exactly what `recall` returns.
+
+## Flow & hook points (scope: `UserChat` + `Cron` jobs only)
+
+The agent loop (`agent_loop.rs`) drives memory; `System`, `Spawned` (subagent),
+and `SubagentNotification` jobs are excluded (no direct user input → would
+pollute / double-write). `memory_recall_query(&JobInput)` is the gate — an
+exhaustive match that returns the query for `UserChat`/`Cron` and `None`
+otherwise (forces classification when a `JobInput` variant is added).
+
+1. **Recall — inline, job start.** After the user message is in context and
+   before the first LLM call, `recall_and_inject` opens a `MemoryRecall` step,
+   mints `Attribution`, calls `recall`, and injects each result as a
+   `RecalledMemory` row. Recall failure is logged and swallowed — never fails
+   the turn.
+2. **Recall — inline, interjection.** Each mid-turn interjection drained at a
+   tool boundary is recalled against too, and folded into the job's input.
+3. **`on_job_complete` — background, job end.** At `IterationOutcome::Final`,
+   `spawn_job_complete_write` detaches a task (so the actor returns the answer
+   without waiting) that opens a `MemoryWrite` step and calls `on_job_complete`.
+4. **`on_session_end` — interface only; caller deferred.** The trait method
+   exists and `NoopMemory` implements it, but the idle-timeout **trigger is not
+   wired yet** (see Deferred). A real backend currently relies on the per-job
+   write for durability.
+
+With `memory == None` every hook above is skipped entirely — no trace step is
+opened and nothing is billed, so the no-op path is genuinely inert.
+
+## Config
+
+`MemoryConfig` on `AuraConfig` (`crates/config/src/memory.rs`): typed
+core-wiring knobs (`enabled`, `llm` entry name, `embedding_provider`,
+`embedding_model`) **plus** an opaque `extra: serde_json::Value` passed through
+verbatim to the plug-in. The `extra` bag is a deliberate, documented exception to
+the "typed over `Value`" rule — plug-in config is genuinely opaque to the core.
+Memory config is **not** hot-reloadable (`reload.rs` classifies it non-hot).
+
+## Hard constraints (carried forward from the retired pipeline)
+
+1. **No substring recall.** Recall is embedding/LLM-judged relevance, never
+   substring match against free-form text.
+2. **No whole-output storage.** The write path must judge salience, never treat
+   an entire assistant output as a memory.
+3. **No `Role::System` re-injection.** Recalled memories use the persisted,
+   wire-framed `RecalledMemory` path only — the core enforces this structurally
+   (it is the single injection path).
+
+These are the implementation's contract.
+
+## Deferred
+
+- **`on_session_end` caller wiring.** Triggering whole-session consolidation at
+  idle-timeout means emitting from / extending the supervisor's `reap_idle`
+  (which today only sends `ActorStop` and holds no `SpanRecorder`). It is inert
+  under the no-op default (production behaviour is identical whether or not it is
+  wired), so it was left as a follow-up to keep this change focused. The trait
+  method + `NoopMemory` impl are in place; `on_job_complete` already captures
+  incremental facts.
+- **Concrete embedding provider + the first real `Memory` impl.** Out of scope —
+  the trait + billed wrapper + all wiring are ready for one to drop in at the
+  single construction point in `runtime.rs::build_managers`.
+- Operator/GDPR wipe of memory rows: re-add behind a user-triggered command if a
+  future backend needs it (no background sweeper — see CLAUDE.md).
 
 ## Collaboration
 
-| Module    | Role                                                                                                  |
-| --------- | ----------------------------------------------------------------------------------------------------- |
-| `model`   | Provides `MemoryEntry`, `MemoryCategory`                                                              |
-| `gateway` | Wires `MemoryManager` into the admin REST surface (`/v1/memory` list / store / delete)                 |
-| `store`   | Owns the `MemoryStore` trait contract and `StorageError`                                              |
-| `storage` | Provides the libsql implementation of `MemoryStore` (trait from `aura-store`)                          |
+| Module      | Role                                                                            |
+| ----------- | ------------------------------------------------------------------------------- |
+| `model`     | `MessageSource::RecalledMemory`, `ChatMessage::recalled_memory`                 |
+| `llm`       | `Attribution`; `EmbeddingClient` + `BillableEmbedding`/`BoundBilledEmbedding`   |
+| `tools`     | `Tool` / `ToolManifest` for `Memory::tools()`                                   |
+| `context`   | `<recalled_memory>` framing + `append_recalled_memory` + budget                 |
+| `agent`     | Drives `recall` / `on_job_complete`; `AgentLoopConfig.memory`                   |
+| `config`    | `MemoryConfig` (typed knobs + opaque `extra`)                                   |
+| `trace`     | `StepKind::MemoryRecall` / `MemoryWrite`                                         |
