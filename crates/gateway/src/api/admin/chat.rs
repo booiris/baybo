@@ -84,13 +84,6 @@ pub const DEFAULT_HISTORY_LIMIT: usize = 50;
 /// whole transcript by passing `limit=999999`.
 pub const MAX_HISTORY_LIMIT: usize = 200;
 
-/// How far back to scan when fetching each session's sidebar preview.
-/// A typical conversation alternates user / assistant, so the most-
-/// recent user row is usually within the last couple of messages — but
-/// trailing assistant tool-only turns can push it further. Ten rows
-/// covers realistic shapes without paying a deep walk on long sessions.
-const PREVIEW_SCAN_DEPTH: usize = 10;
-
 /// Maximum length of the truncated preview the sidebar shows for each
 /// session. Sized to fit a 260px-wide sidebar row at the web client's
 /// font without wrapping; the client may truncate further with CSS.
@@ -472,11 +465,10 @@ async fn list_sessions(
         .filter(|s| query.include_hidden || !s.hidden)
         .filter(|s| query.include_cron || !is_cron_triggered(s))
         .collect();
-    // Fan out the per-session preview fetch — each row needs its own
-    // reverse-tail walk against `session_messages`, which is cheap
-    // individually (back-of-the-index walk capped at
-    // `PREVIEW_SCAN_DEPTH` rows) but adds up serially when a tab has
-    // dozens of conversations open. `join_all` runs the libsql queries
+    // Fan out the per-session preview fetch — each row is a single
+    // back-of-the-index lookup (`load_last_user_message`,
+    // `ORDER BY ordinal DESC LIMIT 1`) but they add up serially when a tab
+    // has dozens of conversations open. `join_all` runs the libsql queries
     // concurrently against the shared connection pool. A preview that
     // fails to load is dropped to `None` rather than failing the whole
     // list — the sidebar still renders the row, just without a
@@ -830,15 +822,9 @@ pub(crate) fn broadcast_session_patch(
     }
 }
 
-/// Fetch the most-recent user-authored text for `session_id` and shape
-/// it into the sidebar preview the list endpoint serves. Returns
-/// `None` when the session has no user turn yet, when the user turn's
-/// content is media-only, or when the underlying tail query fails —
-/// the sidebar treats all three as "no preview" rather than surfacing
-/// an error, so a single bad row never breaks the whole list. Walks
-/// at most [`PREVIEW_SCAN_DEPTH`] rows back; deeper user turns
-/// (e.g. a session whose recent activity is purely tool churn) fall
-/// off the window and are accepted as missing rather than chased.
+/// True when the session was spawned by a cron trigger rather than a user
+/// conversation. Cron sessions are filtered out of the chat list unless
+/// `include_cron` is set.
 fn is_cron_triggered(session: &Session) -> bool {
     matches!(session.trigger, TriggerSource::Cron { .. })
 }
@@ -910,40 +896,26 @@ fn extract_text(content: &[ContentBlock]) -> String {
     text
 }
 
+/// Fetch the most-recent user-authored text for `session_id` and shape it
+/// into the sidebar preview the list endpoint serves. Returns `None` when
+/// the session has no user turn, when that turn is media-only, or when the
+/// lookup fails — the sidebar treats all three as "no preview" rather than
+/// surfacing an error, so a single bad row never breaks the whole list.
+/// One indexed lookup ([`aura_session::SessionManager::last_user_message`]),
+/// so a prompt buried under a long tool loop is still found.
 async fn last_user_preview(
     manager: &aura_session::SessionManager,
     session_id: &SessionId,
 ) -> Option<String> {
-    // Walk the transcript newest-first in `PREVIEW_SCAN_DEPTH`-sized
-    // batches until the freshest genuine user turn turns up. Paging
-    // (rather than a single capped scan) matters because a tool-heavy
-    // turn appends many agent/tool rows after the user's message — a long
-    // agentic loop can push it well past any fixed window, which is why a
-    // tool-retry session would otherwise show "New conversation" in the
-    // sidebar despite having a clear prompt. Each batch's oldest ordinal
-    // seeds the next `before_ordinal`; the DB stops as soon as a user row
-    // is found, so the common (recent prompt) case is still one query.
-    let mut before: Option<i64> = None;
-    loop {
-        let batch = manager
-            .history_tail(session_id, before, PREVIEW_SCAN_DEPTH)
-            .await
-            .ok()?;
-        let oldest = batch.first().map(|(ordinal, _, _)| *ordinal);
-        for (_ord, created_at, msg) in batch.iter().rev() {
-            if !matches!(msg.role, Role::User) || !msg.from_user() {
-                continue;
-            }
-            let item = message_item(0, *created_at, "user", msg)?;
-            return (!item.text.is_empty()).then(|| truncate_preview(&item.text));
-        }
-        // No user turn in this batch — page older, or stop once the batch
-        // came back short (we've reached the session's first message).
-        match oldest {
-            Some(ordinal) if batch.len() >= PREVIEW_SCAN_DEPTH => before = Some(ordinal),
-            _ => return None,
-        }
-    }
+    // One indexed lookup for the freshest human-authored turn — no
+    // tail-walking, so a long tool loop can't bury the prompt past a fixed
+    // window (which used to make a tool-retry session show "New
+    // conversation" despite having a clear prompt). `message_item`
+    // extracts the display text the same way the transcript does; the
+    // ordinal it stamps is unused here.
+    let (created_at, msg) = manager.last_user_message(session_id).await.ok().flatten()?;
+    let item = message_item(0, created_at, "user", &msg)?;
+    (!item.text.is_empty()).then(|| truncate_preview(&item.text))
 }
 
 /// Collapse whitespace and clip to [`PREVIEW_MAX_CHARS`] for the
@@ -1076,7 +1048,12 @@ fn reconstruct_transcript(tail: Vec<(i64, DateTime<Utc>, ChatMessage)>) -> Vec<C
         }
     }
     // Trailing block: a turn whose final answer is beyond this page, or
-    // that ended on a tool with no narrated reply.
+    // that ended on a tool with no narrated reply. The work item inherits
+    // its first intermediate row's ordinal, so when it lands as the very
+    // last item the client seeds its WS catch-up cursor slightly behind
+    // the true tail — harmless, since the re-replayed rows are dropped by
+    // the message-only catch-up filter. A turn straddling the page
+    // boundary likewise reconstructs partially until an older page loads.
     work.flush(&mut items, None);
     items
 }

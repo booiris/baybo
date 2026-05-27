@@ -1499,6 +1499,20 @@ mod tests {
                 })
                 .unwrap_or_default())
         }
+        async fn load_last_user_message(
+            &self,
+            id: &SessionId,
+        ) -> std::result::Result<
+            Option<(chrono::DateTime<chrono::Utc>, aura_model::ChatMessage)>,
+            aura_store::StorageError,
+        > {
+            Ok(self.messages.lock().get(id).and_then(|log| {
+                log.iter()
+                    .filter(|m| m.superseded_by.is_none() && m.message.from_user())
+                    .max_by_key(|m| m.ordinal)
+                    .map(|m| (m.created_at, m.message.clone()))
+            }))
+        }
     }
 
     fn make_session(id: &str) -> Session {

@@ -331,6 +331,18 @@ impl SessionStore for MemorySessionStore {
             })
             .unwrap_or_default())
     }
+
+    async fn load_last_user_message(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<(DateTime<Utc>, ChatMessage)>> {
+        Ok(self.transcripts.lock().get(session_id).and_then(|log| {
+            log.iter()
+                .filter(|m| m.superseded_by.is_none() && m.message.from_user())
+                .max_by_key(|m| m.ordinal)
+                .map(|m| (m.created_at, m.message.clone()))
+        }))
+    }
 }
 
 /// In-memory `SessionSummaryStore` for tests across the workspace.
