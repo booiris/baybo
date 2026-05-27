@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aura_security::{
-    InjectionDetector, InjectionSeverity, InjectionWarning, LeakAction, LeakDetector,
-    PlaceholderMinter, SecretVault, SecurityError,
+    AddOutcome, InjectionDetector, InjectionSeverity, InjectionWarning, LeakAction, LeakDetector,
+    PlaceholderMinter, SecretVault, SecurityError, UserSecretManager,
 };
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,11 @@ use aura_model::{ContentBlock, Session, ThinkingContent};
 
 const SESSION_SECRETS_KEY: &str = "__security_placeholder_map";
 
+/// Minimum length of a value worth literal-redacting from tool output.
+/// Shorter values would mangle unrelated text, and a real credential is
+/// never this short.
+const MIN_REDACT_LEN: usize = 5;
+
 /// The security boundary through which all messages pass before entering
 /// or leaving the agent.
 pub struct SecurityGateway {
@@ -26,16 +31,19 @@ pub struct SecurityGateway {
     secret_vault: Arc<SecretVault>,
     minter: PlaceholderMinter,
     injection_detector: InjectionDetector,
+    user_secrets: UserSecretManager,
 }
 
 impl SecurityGateway {
     pub fn new(leak_detector: Arc<LeakDetector>, secret_vault: Arc<SecretVault>) -> Self {
         let minter = PlaceholderMinter::from_master_key(secret_vault.master_key());
+        let user_secrets = UserSecretManager::new(Arc::clone(&secret_vault));
         Self {
             leak_detector,
             secret_vault,
             minter,
             injection_detector: InjectionDetector::with_default_rules(),
+            user_secrets,
         }
     }
 
@@ -657,6 +665,77 @@ pub struct SecretVaultSummary {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Tool-side secret access (see `docs/todo/secret-management.md`). The gateway
+/// is the single secret authority, so this impl reuses its `minter` + vault for
+/// redaction and its `UserSecretManager` for add/list/check — guaranteeing the
+/// same mint/vault pipeline as input sanitization.
+#[async_trait::async_trait]
+impl aura_tools::SecretAccess for SecurityGateway {
+    async fn resolve_env(&self, names: &[String]) -> aura_tools::Result<Vec<(String, String)>> {
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let value = self
+                .user_secrets
+                .get(name)
+                .await
+                .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?
+                .ok_or_else(|| {
+                    aura_tools::ToolError::InvalidParams(format!(
+                        "secret '{name}' not found; add it with `aura secret add` first"
+                    ))
+                })?;
+            let plaintext = value
+                .as_str()
+                .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?
+                .to_string();
+            out.push((name.clone(), plaintext));
+        }
+        Ok(out)
+    }
+
+    async fn redact(&self, text: &str, values: &[String]) -> aura_tools::Result<String> {
+        let mut out = text.to_string();
+        for value in values {
+            if value.len() < MIN_REDACT_LEN || !out.contains(value.as_str()) {
+                continue;
+            }
+            let placeholder = self.minter.mint(value.as_bytes());
+            self.secret_vault
+                .store_secret(&placeholder, value.as_bytes())
+                .await
+                .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
+            out = out.replace(value.as_str(), &placeholder);
+        }
+        Ok(out)
+    }
+
+    async fn add(
+        &self,
+        name: &str,
+        value: &[u8],
+        overwrite: bool,
+    ) -> aura_tools::Result<AddOutcome> {
+        self.user_secrets
+            .add(name, value, overwrite)
+            .await
+            .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))
+    }
+
+    async fn list_names(&self) -> aura_tools::Result<Vec<String>> {
+        self.user_secrets
+            .list()
+            .await
+            .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))
+    }
+
+    async fn exists(&self, names: &[String]) -> aura_tools::Result<Vec<(String, bool)>> {
+        self.user_secrets
+            .exists_many(names)
+            .await
+            .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +757,47 @@ mod tests {
         let store = Arc::new(MemorySecretStore::new());
         let vault = Arc::new(make_vault_with_store(store.clone()));
         (SecurityGateway::new(detector, vault), store)
+    }
+
+    #[tokio::test]
+    async fn secret_access_impl_roundtrip() {
+        use aura_tools::SecretAccess;
+        let (gateway, _store) = make_gateway();
+
+        gateway
+            .add("TOK", b"sekret-value-123", false)
+            .await
+            .unwrap();
+        assert_eq!(gateway.list_names().await.unwrap(), vec!["TOK".to_string()]);
+        assert_eq!(
+            gateway
+                .exists(&["TOK".to_string(), "NOPE".to_string()])
+                .await
+                .unwrap(),
+            vec![("TOK".to_string(), true), ("NOPE".to_string(), false)]
+        );
+
+        // resolve_env yields plaintext for injection; a missing name errors.
+        assert_eq!(
+            gateway.resolve_env(&["TOK".to_string()]).await.unwrap(),
+            vec![("TOK".to_string(), "sekret-value-123".to_string())]
+        );
+        assert!(gateway.resolve_env(&["MISSING".to_string()]).await.is_err());
+
+        // redact mints + vaults a placeholder and replaces the value; the
+        // placeholder round-trips back through reveal (vault-consistent).
+        let redacted = gateway
+            .redact(
+                "leak: sekret-value-123 end",
+                &["sekret-value-123".to_string()],
+            )
+            .await
+            .unwrap();
+        assert!(!redacted.contains("sekret-value-123"), "{redacted}");
+        assert_eq!(
+            gateway.reveal_in_text(&redacted).await.unwrap(),
+            "leak: sekret-value-123 end"
+        );
     }
 
     fn make_message(text: &str) -> Message {

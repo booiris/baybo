@@ -161,6 +161,13 @@ pub enum EnvPolicy {
     Allowlist {
         vars: Vec<String>,
     },
+    /// Baseline env plus explicit `KEY=value` pairs that are NOT present in
+    /// the parent process (e.g. secrets resolved from the vault for a Bash
+    /// `secret_env`). Injected into the child via `--setenv` (bwrap) /
+    /// `env` args (macOS); never sourced from the parent environment.
+    BaselineWithExtra {
+        extra: Vec<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone, Default)]

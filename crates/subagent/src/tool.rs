@@ -630,6 +630,7 @@ mod tests {
             notifier: None,
             events: aura_tools::noop_event_sink(),
             llm: None,
+            secrets: None,
         }
     }
 

@@ -30,9 +30,12 @@ What gets wrapped:
 - Tools whose manifest declares `aura_tools::ToolCapability::ExecCommand`.
   The `ToolExecutor` builds a `SandboxAdapter` per call and injects it into
   `ToolContext.sandbox`; the tool then routes its child through
-  `ExecSandbox::spawn_command`. In-process Rust tools (Read, Write, Edit,
-  Glob, Grep, Now) are unchanged — their syscalls happen inside the gateway
-  and there is nothing for the sandbox to enforce.
+  `ExecSandbox::spawn_command(program, args, SpawnOpts { cwd, stdin, extra_env, timeout })`.
+  `extra_env` injects per-call `KEY=value` pairs (e.g. secrets resolved for a Bash
+  `secret_env`) that the adapter maps to `EnvPolicy::BaselineWithExtra` — emitted via
+  bwrap `--setenv` / macOS `env` args, never through the command string. In-process
+  Rust tools (Read, Write, Edit, Glob, Grep, Now) are unchanged — their syscalls
+  happen inside the gateway and there is nothing for the sandbox to enforce.
 
 If the backend binary is missing at startup, the gateway logs an error and
 runs with `sandbox_runner = None`; any subsequent `ExecCommand` tool call

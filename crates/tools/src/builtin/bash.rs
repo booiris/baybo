@@ -45,7 +45,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::paths::require_absolute;
-use crate::{ApprovalDecision, ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
+use crate::{
+    ApprovalDecision, ResourceAccess, SpawnOpts, Tool, ToolContext, ToolError, ToolOutput,
+};
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_KIB: usize = MAX_OUTPUT_BYTES / 1024;
@@ -245,6 +247,8 @@ struct Params {
     timeout_ms: Option<u64>,
     #[serde(default)]
     cwd: Option<PathBuf>,
+    #[serde(default)]
+    secret_env: Vec<String>,
 }
 
 #[async_trait]
@@ -263,7 +267,8 @@ impl Tool for BashTool {
             "properties": {
                 "command":    { "type": "string", "description": "The shell command to run" },
                 "timeout_ms": { "type": "integer", "minimum": 1, "description": "Per-command timeout in ms (falls back to the tool context timeout)" },
-                "cwd":        { "type": "string", "description": "Working directory for the command" }
+                "cwd":        { "type": "string", "description": "Working directory for the command" },
+                "secret_env": { "type": "array", "items": { "type": "string" }, "description": "Names of stored user secrets to inject as environment variables for THIS command only. Values are pulled from the vault, never shown to you, and scrubbed from the output. Discover names with SecretList / SecretCheck." }
             },
             "required": ["command"]
         })
@@ -381,6 +386,27 @@ impl Tool for BashTool {
             )));
         }
 
+        // Resolve any requested user secrets to plaintext for env injection.
+        // Fail closed if requested but the secret store isn't wired. The names
+        // (never the values) are recorded for audit; the values are scrubbed
+        // back out of the output below. See docs/todo/secret-management.md.
+        let extra_env = if p.secret_env.is_empty() {
+            Vec::new()
+        } else {
+            let handle = ctx.secrets.as_deref().ok_or_else(|| {
+                ToolError::Execution(
+                    "secret_env was requested but no secret store is available in this context"
+                        .into(),
+                )
+            })?;
+            tracing::info!(
+                target: "aura::tools::bash",
+                secrets = ?p.secret_env,
+                "bash: injecting user secrets as environment variables"
+            );
+            handle.resolve_env(&p.secret_env).await?
+        };
+
         let args = vec!["-c".into(), self.wrap_command(&command)];
 
         let out = if matches!(aura_resolution, AuraResolution::Bypass) {
@@ -395,7 +421,7 @@ impl Tool for BashTool {
                 _ = ctx.cancellation_token.cancelled() => {
                     return Err(ToolError::Execution("cancelled".into()));
                 }
-                res = run_unsandboxed("sh", &args, cwd_ref, timeout) => res?,
+                res = run_unsandboxed("sh", &args, cwd_ref, &extra_env, timeout) => res?,
             }
         } else {
             let Some(sandbox) = ctx.sandbox.as_ref() else {
@@ -409,7 +435,16 @@ impl Tool for BashTool {
                 _ = ctx.cancellation_token.cancelled() => {
                     return Err(ToolError::Execution("cancelled".into()));
                 }
-                res = sandbox.spawn_command(Path::new("sh"), &args, cwd_ref, None, timeout) => res,
+                res = sandbox.spawn_command(
+                    Path::new("sh"),
+                    &args,
+                    SpawnOpts {
+                        cwd: cwd_ref.map(Path::to_path_buf),
+                        stdin: None,
+                        extra_env: extra_env.clone(),
+                        timeout,
+                    },
+                ) => res,
             };
             match attempt {
                 Ok(out) => out,
@@ -422,6 +457,7 @@ impl Tool for BashTool {
                     self.prompt_and_run_unsandboxed_retry(
                         &command,
                         cwd_ref,
+                        &extra_env,
                         timeout,
                         ctx,
                         sandbox_err,
@@ -435,8 +471,18 @@ impl Tool for BashTool {
             return Err(ToolError::Timeout(format!("Bash exceeded {timeout:?}")));
         }
 
-        let stdout = truncate_utf8(&out.stdout, MAX_OUTPUT_BYTES);
-        let stderr = truncate_utf8(&out.stderr, MAX_OUTPUT_BYTES);
+        let mut stdout = truncate_utf8(&out.stdout, MAX_OUTPUT_BYTES);
+        let mut stderr = truncate_utf8(&out.stderr, MAX_OUTPUT_BYTES);
+        // Scrub injected secret values out of the output before it reaches the
+        // agent / LLM / trace — the leak detector only catches known formats,
+        // so arbitrary user tokens are redacted here by exact match.
+        if !extra_env.is_empty()
+            && let Some(handle) = ctx.secrets.as_deref()
+        {
+            let values: Vec<String> = extra_env.iter().map(|(_, v)| v.clone()).collect();
+            stdout = handle.redact(&stdout, &values).await?;
+            stderr = handle.redact(&stderr, &values).await?;
+        }
 
         let mut result = json!({
             "exit_code": out.exit_code,
@@ -1059,6 +1105,7 @@ impl BashTool {
         &self,
         command: &str,
         cwd: Option<&Path>,
+        extra_env: &[(String, String)],
         timeout: Duration,
         ctx: &ToolContext,
         sandbox_err: ToolError,
@@ -1097,7 +1144,7 @@ impl BashTool {
                     _ = ctx.cancellation_token.cancelled() => {
                         Err(ToolError::Execution("cancelled".into()))
                     }
-                    res = run_unsandboxed("sh", &args, cwd, timeout) => res,
+                    res = run_unsandboxed("sh", &args, cwd, extra_env, timeout) => res,
                 }
             }
             ApprovalDecision::Deny => Err(ToolError::Execution(format!(
@@ -1111,6 +1158,7 @@ async fn run_unsandboxed(
     program: &str,
     args: &[String],
     cwd: Option<&Path>,
+    extra_env: &[(String, String)],
     timeout: Duration,
 ) -> crate::Result<crate::SandboxedOutput> {
     use std::process::Stdio;
@@ -1123,6 +1171,9 @@ async fn run_unsandboxed(
         cmd.current_dir(dir);
         cmd.env("PWD", dir);
     }
+    // Inject resolved secrets as real env vars on the child only. The
+    // unsandboxed child inherits the parent env, so these add/override keys.
+    cmd.envs(extra_env.iter().cloned());
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -1652,6 +1703,7 @@ mod tests {
             notifier: None,
             events: crate::noop_event_sink(),
             llm: None,
+            secrets: None,
         }
     }
 
@@ -1674,6 +1726,83 @@ mod tests {
         (fake, dyn_handle)
     }
 
+    /// Minimal `SecretAccess` for bash tests: resolves each name to
+    /// `VAL_<name>` and redacts those known values to `[REDACTED]`.
+    struct StubSecrets;
+
+    #[async_trait::async_trait]
+    impl crate::SecretAccess for StubSecrets {
+        async fn resolve_env(&self, names: &[String]) -> crate::Result<Vec<(String, String)>> {
+            Ok(names
+                .iter()
+                .map(|n| (n.clone(), format!("VAL_{n}")))
+                .collect())
+        }
+        async fn redact(&self, text: &str, values: &[String]) -> crate::Result<String> {
+            let mut out = text.to_string();
+            for v in values {
+                out = out.replace(v, "[REDACTED]");
+            }
+            Ok(out)
+        }
+        async fn add(
+            &self,
+            _name: &str,
+            _value: &[u8],
+            _overwrite: bool,
+        ) -> crate::Result<aura_security::AddOutcome> {
+            unreachable!("bash never adds secrets")
+        }
+        async fn list_names(&self) -> crate::Result<Vec<String>> {
+            unreachable!("bash never lists secrets")
+        }
+        async fn exists(&self, _names: &[String]) -> crate::Result<Vec<(String, bool)>> {
+            unreachable!("bash never checks secrets")
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_env_injects_into_child_and_redacts_output() {
+        // The fake sandbox echoes the resolved secret value back in stdout so we
+        // can assert it is scrubbed before the tool result returns.
+        let (fake, sandbox) = fake_with_response(SandboxedOutput {
+            exit_code: 0,
+            stdout: b"token=VAL_TESTTOKEN done\n".to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+        let mut ctx = ctx_with(Some(sandbox));
+        ctx.secrets = Some(Arc::new(StubSecrets));
+
+        let out = BashTool::for_test()
+            .execute(
+                json!({ "command": "echo hi", "secret_env": ["TESTTOKEN"] }),
+                &ctx,
+            )
+            .await
+            .expect("bash with secret_env runs");
+
+        // (1) the resolved value reached the child via SpawnOpts.extra_env.
+        let call = &fake.calls()[0];
+        assert!(
+            call.extra_env
+                .iter()
+                .any(|(k, v)| k == "TESTTOKEN" && v == "VAL_TESTTOKEN"),
+            "secret must be injected into the child env: {:?}",
+            call.extra_env
+        );
+        // (2) the value is scrubbed out of the returned output.
+        let ToolOutput::Json(v) = out else {
+            panic!("expected json")
+        };
+        let stdout = v["stdout"].as_str().expect("stdout string");
+        assert!(
+            !stdout.contains("VAL_TESTTOKEN"),
+            "secret value must be redacted from stdout: {stdout}"
+        );
+        assert!(stdout.contains("[REDACTED]"), "stdout: {stdout}");
+    }
+
     /// `ExecSandbox` whose `spawn_command` always returns the configured
     /// `Err` — needed to exercise the sandbox-failure → unsandboxed-retry
     /// path. `FakeExecSandbox` only models the success side.
@@ -1687,9 +1816,7 @@ mod tests {
             &self,
             _program: &Path,
             _args: &[String],
-            _cwd: Option<&Path>,
-            _stdin: Option<&[u8]>,
-            _timeout: Duration,
+            _opts: crate::SpawnOpts,
         ) -> crate::Result<SandboxedOutput> {
             Err(ToolError::Execution(self.message.clone()))
         }
@@ -2735,9 +2862,15 @@ mod tests {
     #[tokio::test]
     async fn unsandboxed_runner_exports_pwd_from_effective_cwd() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let out = run_unsandboxed("env", &[], Some(workspace.path()), Duration::from_secs(5))
-            .await
-            .expect("env must run");
+        let out = run_unsandboxed(
+            "env",
+            &[],
+            Some(workspace.path()),
+            &[],
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("env must run");
         let stdout = String::from_utf8(out.stdout).expect("env stdout");
         let pwd = stdout
             .lines()
@@ -2747,5 +2880,27 @@ mod tests {
         let expected = workspace.path().canonicalize().expect("workspace path");
 
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn unsandboxed_runner_injects_extra_env() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let extra = [("AURA_TEST_SECRET".to_string(), "injected-value".to_string())];
+        let out = run_unsandboxed(
+            "env",
+            &[],
+            Some(workspace.path()),
+            &extra,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("env must run");
+        let stdout = String::from_utf8(out.stdout).expect("env stdout");
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l == "AURA_TEST_SECRET=injected-value"),
+            "injected env var must reach the child:\n{stdout}"
+        );
     }
 }

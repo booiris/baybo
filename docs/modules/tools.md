@@ -51,12 +51,30 @@ ready without having to invent the tool name/schema at that point.
 
 `ToolRegistry` exposes a single `Tool` interface: Rust tools implement it directly. This keeps `AgentLoop` independent of execution shape.
 
-### Secret access (deferred)
+### Secret access
 
-Tool-level secret declaration and runtime injection were removed pending the
-final tool-system design. `ToolContext` currently carries no secrets; a future
-iteration will reintroduce per-tool secret access on top of the finalized
-`Tool` trait and governance model.
+User-managed secrets (env-var-style tokens) reach tools through
+`ToolContext::secrets: Option<Arc<dyn SecretAccess>>`, bound by the agent layer
+like `ToolContext::llm` (gateway/runtime binds `Some`, argv-mode leaves `None`;
+consumers fail closed). The concrete impl is `SecurityGateway`, so `resolve_env`
+and `redact` reuse the same deterministic mint + vault pipeline as input
+sanitization, while `add`/`list`/`exists` delegate to
+`aura_security::UserSecretManager` (the `user_env.<NAME>` namespace). Tools see
+only the trait.
+
+- **`SecretAdd` / `SecretList` / `SecretCheck`** (`builtin/secret.rs`) — add a
+  secret (the value is resolved from a placeholder at the reveal boundary, so
+  the agent never holds plaintext), list names, and check existence. Value-blind:
+  no tool ever returns secret material. There is **no** delete tool — deletion is
+  CLI-only.
+- **`Bash` `secret_env`** — names listed there are resolved to plaintext and
+  injected as env vars into that one child process (via `SpawnOpts::extra_env`
+  through the sandbox, never the command string), then exact-redacted out of
+  stdout/stderr before the output returns. The agent only ever passes names;
+  injected names (never values) are recorded via `tracing` for audit (no approval
+  prompt — the user already chose to store the secret).
+
+Full design + rationale: [`../todo/secret-management.md`](../todo/secret-management.md).
 
 ### MCP client support
 

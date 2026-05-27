@@ -499,6 +499,9 @@ impl ToolExecutor {
                     notifier: notifier.clone(),
                     events: Arc::clone(&event_sink) as Arc<dyn aura_tools::ToolEventSink>,
                     llm,
+                    secrets: Some(
+                        Arc::clone(&self.security_gateway) as Arc<dyn aura_tools::SecretAccess>
+                    ),
                 };
 
                 // Reveal placeholders in the tool's arguments just

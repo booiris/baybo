@@ -7,7 +7,7 @@ use clap::{CommandFactory, Parser};
 
 use crate::cli::{
     ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, ExternalAgentCmd, JobCmd, LlmCmd,
-    LogCmd, McpCmd, PairCmd, SessionCmd, SkillsCmd,
+    LogCmd, McpCmd, PairCmd, SecretCmd, SessionCmd, SkillsCmd,
 };
 use crate::context::{CommandContext, Invocation};
 use crate::dispatch;
@@ -294,6 +294,14 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
         Commands::Mcp {
             cmd: McpCmd::List { .. } | McpCmd::Get { .. } | McpCmd::Remove { .. },
         } => Ok(()),
+        Commands::Secret { cmd } => match cmd {
+            // `add` reads a masked value from the TTY; list shows masked
+            // previews and delete self-guards with --yes (+ a NAME in slash).
+            SecretCmd::Add { .. } => {
+                Err("`secret add` reads a masked value from the terminal; run it from a shell")
+            }
+            SecretCmd::List | SecretCmd::Delete { .. } => Ok(()),
+        },
         Commands::Pair { cmd } => match cmd {
             PairCmd::List { .. } | PairCmd::Approve { .. } | PairCmd::Revoke { .. } => Ok(()),
         },

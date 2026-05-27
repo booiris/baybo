@@ -221,6 +221,7 @@ mod tests {
             notifier: None,
             events: crate::noop_event_sink(),
             llm: None,
+            secrets: None,
         };
         let err = AgentTool.execute(json!({}), &ctx).await.unwrap_err();
         assert!(matches!(err, ToolError::NotImplemented(_)));

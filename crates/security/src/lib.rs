@@ -18,6 +18,7 @@ pub mod placeholder;
 pub mod secret_value;
 pub mod secret_vault;
 pub mod sensitive_paths;
+pub mod user_secret;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -38,3 +39,4 @@ pub use crate::placeholder::PlaceholderMinter;
 pub use crate::secret_value::SecretValue;
 pub use crate::secret_vault::SecretVault;
 pub use crate::sensitive_paths::is_sensitive_path;
+pub use crate::user_secret::{AddOutcome, USER_SECRET_PREFIX, UserSecretManager};
