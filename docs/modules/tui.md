@@ -7,10 +7,10 @@
 The layout is intentionally minimal:
 
 - **Scrollback pane** — rendered chat lines (user, assistant, system, approval).
-- **Input line** — single-line editor with emacs-style cursor motions and a history ring.
+- **Input line** — editor with emacs-style cursor motions, a history ring, and a compact current-model footer below it when the gateway reports one.
 - **Dashboard view** (modal) — opened by dashboard-style slash commands; returns to chat on `Esc`.
 
-No status bar, no sidebars. Aura's operator surface lives in the CLI subcommands; the TUI only hosts the conversation and a handful of read-only views.
+No sidebars. Aura's operator surface lives in the CLI subcommands; the TUI only hosts the conversation, the current-model footer, and a handful of read-only views.
 
 `aura tui` is a thin `/v1/channel-ws` client of `aura gateway`,
 speaking the same WebSocket + MessagePack protocol every out-of-process
@@ -32,17 +32,35 @@ server side.
 
 ### Chat
 
-- There is no in-memory scrollback buffer or cap. Completed lines (user / assistant / system / log / resolved approval) are committed straight into the terminal's **native** scrollback via `Terminal::insert_before`; the TUI itself owns only a small inline live region (input box + streaming preview + pending-approval prompt).
+- The live chat history lives in the terminal's **native** scrollback, not an in-memory display buffer: completed lines (user / assistant / system / log / resolved approval) are committed straight in via `Terminal::insert_before`, and the TUI owns only a small inline live region (the animated working indicator, any queued-message lines, the pending-approval prompt, the input box, and the optional current-model footer — see [Working indicator & mid-turn steering](#working-indicator--mid-turn-steering)). A **bounded** `TranscriptBlock` log on `AppState` (capped at `TRANSCRIPT_MAX_LINES`, oldest blocks evicted) shadows what was committed, used **only** to re-render the conversation on a resize refresh (below) — never as the display source. The commit helpers record into it as they `insert_before`; width-dependent blocks (the user bar) store their **source text** so replay re-renders them at the new width, everything else stores rendered lines that re-wrap.
+- **Resize = refresh, then replay.** A terminal **width** change reflows the native scrollback and leaves stale fragments from the old full-width live region (input box / message bars) that the inline viewport can't precisely erase (no post-reflow layout is exposed by ratatui/crossterm). Rather than live with the ghosting, a settled resize burst (coalesced by `RESIZE_COALESCE_WINDOW`) triggers `rebuild_chat_terminal_after_resize`, which **clears the screen + scrollback, reprints the banner, then replays the `TranscriptBlock` log** (`replay_transcript`) so the conversation re-renders cleanly at the new width. Replay goes through the same commit helpers, so the leading-separator spacing is reproduced exactly. `AppState.session_id` is carried so the banner can be reprinted without a transport handle. What does **not** come back: history beyond the transcript cap, and any shell output above the original launch point (the entry clear wiped it). `/clear`, `/new`, and `Ctrl-L` call `clear_transcript`, so a later resize doesn't resurrect intentionally-cleared history.
 - Assistant lines render each `ContentBlock`: text inline, and `Image`/`Audio`/`File` as a bracketed placeholder.
 - Input history keeps up to `HISTORY_CAP = 500` non-empty submissions with trivial de-duplication of consecutive identical lines. The ring is **persistent**: see [Persistent input history](#persistent-input-history) below.
 - Chat scrolling is the terminal's own (mouse wheel / the emulator's scrollback); the TUI keeps no scroll offset for chat. `PageUp`/`PageDown` page the **dashboard** table only (`DashboardPageUp`/`DashboardPageDown`, ±10 rows).
 - While the LLM is responding, an ephemeral streaming buffer is drawn immediately below the scrollback tail. Each `AgentEvent::AnswerDelta` extends it; complete lines are committed to the terminal scrollback (`insert_before`) as they arrive, leaving only the trailing partial in the buffer. The agent loop streams deltas on **every** iteration, so a final answer that lands after tool calls still streams.
 - The final `AgentEvent::Message` does **not** replace the streamed text — those lines are already committed. `finalize_stream` (via the pure `finalize_lines`) commits the trailing partial plus any non-text extras the stream didn't carry (e.g. the CronCreate hint). When the response **never streamed** — the non-streaming delivery path, where the agent loop ran with `delta_tx = None` (cron fires, subagent-notification turns) and only a final Message arrives — it renders the full message body from the blocks so the text isn't dropped.
-- **Turn-progress events** (see [`docs/turn-progress-events.md`](../turn-progress-events.md)) commit to scrollback in arrival order, interleaved with the answer, so a turn reads as `✻ thinking… → ⏺ Tool(label) → ⎿ summary → aura> answer`. `Reasoning` chunks buffer into a dim line-buffer (`AppState.reasoning`, mirroring `streaming`) and commit dim as complete lines form; the partial flushes ahead of any tool line / the answer / finalize. `ToolStarted` commits a cyan `⏺ tool(label)` line at dispatch (before any approval prompt); `ToolCompleted` commits a `⎿ summary` line coloured by status (red error / yellow denied / dim ok). The final `Message`'s `ToolUse` blocks are **not** a duplicate source here — `render_block` only renders the CronCreate hint, never general tool calls, so no dedup is needed.
+- **Message styling.** There are no `you>` / `aura>` prefixes. A user message is a **full-width highlighted bar** — bright white background, black text (not `REVERSED`, which renders muted on many terminals) — with a `> ` quote leader, the row padded with spaces (via `render_user_lines(text, width)`) so the background spans the whole line. Everything else leads with a same-size `●` dot: an assistant answer (**pale `●`**, continuation lines indented under it), the tool line (cyan `●`), the resolved-approval summary, and the `cooked for` footer using the answer text foreground.
+- **Spacing (leading separators, no trailing blanks).** Blocks are separated by **exactly one** blank row via a *leading* separator: `begin_block(kind)` emits one blank when the block kind changes (always for `Other`; same-kind `Answer`/`Tool` lines stack tight as one block). It's deduped against `AppState.last_row_blank` so it never doubles, and there are **no** trailing blanks — the reserved working row (below) separates the last block from the input, and the next block adds its own leading separator. `AppState.last_block: Option<BlockKind>` tracks the kind.
+- **Turn-done footer.** When a turn (job) finishes, `finalize_stream` commits a `● cooked for <elapsed>` stamp (same foreground as answer text) with its own deduped separator above it, so it sits one blank below the answer/tool block. It's the turn's wall-clock from when its `working_since` clock armed; only turns the TUI actually clocked get it (a cancelled `/stop` turn or a non-streaming cron delivery does not).
+- **Model footer.** At startup `aura tui` queries the gateway admin endpoint `GET /v1/llm` with the local admin bearer token and passes the active `provider/model_id` label into `TuiAdapter::with_model_label`. When present, `AppState.model_label` adds one dim, slightly indented row below the input box (`chat::model_footer_height`); if the query fails, the footer is omitted and chat continues normally.
+- **Turn-progress events** (see [`docs/turn-progress-events.md`](../turn-progress-events.md)) interleave with the answer, so a turn reads as `● answer → ● Tool(label) → ⎿ summary → ● answer`. `ToolStarted` commits the `● tool(label)` line to scrollback immediately; `ToolCompleted` (matched by `call_id`) appends the `⎿ summary` line to the same `Tool` block. The final `Message`'s `ToolUse` blocks are **not** a duplicate source — `render_block` only renders the CronCreate hint, never general tool calls.
+- **Reasoning is not rendered.** `Frame::Reasoning` ("thinking") chunks are dropped by the WS pump (`map_frame` returns `None`); the TUI shows an animated *working* indicator in the live region instead of the model's reasoning trace. The wire frame still flows to other channels (e.g. the web UI). See [Working indicator & mid-turn steering](#working-indicator--mid-turn-steering).
+
+### Working indicator & mid-turn steering
+
+While a turn is in flight the live region shows an **animated working indicator**: a **colour-pulsing `●`** (same glyph/size as the answer dot — equal-width, so it never reflows; the pulse cycles the dot's colour through `WORKING_PULSE` on each tick, driven by **repaint** rather than terminal `SLOW_BLINK`, which many terminals don't render), then `Cooking…`, elapsed seconds, and a `/stop to interrupt` hint. Running tools render as normal scrollback messages, not in the working indicator. It's driven by a `tokio::time::interval` (`WORKING_TICK`, ~300 ms — each tick advances the pulse and refreshes the counter) select arm gated on `AppState::show_working()` (a turn is active and no approval is pending), so an idle TUI never wakes on it. The clock arms when a turn-initiating message is dispatched (`note_response_pending`) or on the first streaming/tool event of any turn (`ensure_working_clock`), and disarms when the last outstanding response lands. During a pending approval the indicator is hidden — the agent is blocked on the user, not working.
+
+The working line lives in a dynamic zone sized by `working_zone_height`: idle reserves one **blank** spacer row between the last scrollback message and the input; while a turn is in flight it reserves that same spacer plus one indicator row below it. The blank spacer gives the working indicator one line of separation from the last message without leaving two idle blank rows above the input box.
+
+Typing while the agent is busy no longer parks the message in a hidden queue with an `input · N queued` title. Instead:
+
+- A **plain message** is dispatched to the agent **immediately** — mid-turn steering, so the agent folds it into the running turn at its next tool boundary (see [`docs/mid-turn-user-interjection.md`](../mid-turn-user-interjection.md)) — and shown as a dim `↳ <text>` line under the working indicator. When the next `ToolCompleted` lands (the boundary where the agent drains the mailbox) the line is committed to scrollback as the full-width highlighted `> ` user bar, landing right after that tool block. A steer still pending when the turn finalises (no tool boundary followed it) commits at `Outgoing`; server-side it falls to the next turn, so the order still reads correctly. A steer does **not** bump `outstanding_responses` — it rides the current turn's single `Outgoing` rather than adding one.
+- A **slash command** is *deferred* in `outgoing_queue` and drained one-at-a-time at `Outgoing` (unchanged), so a client-side slash (`/clear`, `/new`, a dashboard) doesn't disrupt the live region mid-turn and a passthrough slash doesn't spawn a concurrent, interleaving turn. It also shows as a `↳` line while queued.
+- `/stop` is the **interrupt**: it is dispatched immediately (the gateway `Router` cancels the in-flight turn out-of-band) and the TUI resets its own live state to idle, because a cancelled turn delivers no `Outgoing`. Any partial answer is flushed and any pending steer committed first (the steer stays queued server-side and runs as its own turn); the gateway's stop `Notice` lands as the confirmation line. `is_stop_command` mirrors the gateway recognizer (`/stop`, case-insensitive, trailing args ignored).
 
 ### Slash completion
 
-- When the input starts with `/` and the cursor sits on the command token (no whitespace between `/` and cursor), a popup renders above the input box listing matching commands.
+- When the input starts with `/` and the cursor sits on the command token (no whitespace between `/` and cursor), a popup lists matching commands just above the input box. It is a real **layout section inside the inline viewport** (sized into `desired_viewport_height` via `chat::completion_popup_height`), not a float drawn above the viewport — the inline viewport's buffer doesn't extend above itself, so drawing there would write out of bounds and panic.
 - Candidates come from `SlashHandler::commands()`; `TuiSlashHandler` returns a name-sorted list of `/clear`, `/new`, `/stop`, `/quit`, `/exit`. Skill enumeration is not done client-side — any other `/<name>` falls through to the gateway as `SlashOutcome::PassThrough` so skill invocations keep working without a client-side allow-list.
 - `Tab` accepts the highlighted candidate, rewriting the prefix up to the next whitespace and appending a trailing space so arguments can follow. `Enter` submits without accepting the completion.
 - `Up`/`Down` follow zsh/bash conventions, which also cleanly resolves the popup ambiguity:
@@ -54,7 +72,7 @@ server side.
 
 - Approval requests render **inline** (no overlay modal): while pending, as a live prompt in the bottom region driven by `AppState.pending_approval: Option<ApprovalChatEntry>`; once resolved, as a committed scrollback line (see below).
 - When pending, the entry is expanded: tool name, resource accesses, params preview, and three selectable options (`Approve` / `Always approve` / `Deny`). The user navigates options with `Up`/`Down` (or `k`/`j`) and confirms with `Enter`, or presses a direct shortcut (`a`/`A`/`d`).
-- After resolution the entry collapses to a single `aura>` line with the decision, tool name, and the first resource access detail — e.g. `aura> approved: Bash (echo hello)` or `aura> denied: Read (/etc/shadow)`. Normal input resumes immediately.
+- After resolution the entry collapses to a single dot-led line with the decision, tool name, and the first resource access detail — e.g. `● approved: Bash (echo hello)` or `● denied: Read (/etc/shadow)` — committed as part of the tool run (it sits between the tool's `●` and `⎿`). Normal input resumes immediately.
 - Approvals originate on the gateway. The WS transport observes `Frame::ApprovalRequested` and mirrors the entry into a *local* `ApprovalQueue` so the existing TUI modal logic picks it up unchanged. The queue's resolver callback (installed by `WsTransport::connect`) wraps the TUI's "approve/deny" decision in a `Frame::ResolveApproval` echoed back over the same socket, so the gateway-side gate unblocks. Inbound `Frame::ApprovalResolved` frames drop any stale local mirror — useful when a second frontend resolves the same entry.
 - Dropping the responder (e.g. loop shutdown) still surfaces as `ApprovalDecision::Deny` on the local side; the gateway's own 5-minute timeout covers the server side.
 - If multiple approvals are queued (concurrent tool calls), resolving one auto-surfaces the next into the scrollback.
@@ -164,12 +182,14 @@ none of those exist on the TUI side.
    (`0.0.0.0` / `::`), a same-host TUI rewrites it to loopback — the
    wildcard is a server-side bind directive, not a dialable target.
    There is no port file and no `channel.port` discovery step.
-2. **Resolve the bearer token** — open the workspace secret vault via
+2. **Resolve the bearer tokens** — open the workspace secret vault via
    `crate::runtime::build_secret_vault(config)` and read
-   `aura_gateway::TUI_TOKEN_VAULT_KEY` (`"gateway.tui_token"`). The
-   vault open is best-effort; a missing token is treated as
-   `ChannelError::NotReachable` so it flows into the same fallback
-   path as an unreachable admin listener.
+   `aura_gateway::TUI_TOKEN_VAULT_KEY` (`"gateway.tui_token"`) for
+   `/v1/channel-ws`. The vault open is best-effort; a missing TUI token
+   is treated as `ChannelError::NotReachable` so it flows into the same
+   fallback path as an unreachable admin listener. The admin bearer token
+   is also read through `aura_gateway::AdminToken` for the optional
+   active-model lookup.
 3. **Connection probe** — `WsTransport::connect(addr, tui_token,
    session_id)` dials the resolved admin `addr`'s `/v1/channel-ws`
    upgrade, presents the token on the upgrade, and performs the
@@ -188,16 +208,22 @@ none of those exist on the TUI side.
    auto-creates the session on the first inbound frame via
    `SessionManager::get_or_create`, so no REST round-trip is needed
    to provision one.
-5. **Wire the providers** — construct `WsTransport` (the connect
+5. **Fetch the active model label** — after the WS connection proves the
+   gateway is live, the TUI performs a best-effort `GET /v1/llm` request
+   against the same admin address with `Authorization: Bearer <admin-token>`.
+   A successful response formats `provider/model_id` for the input footer;
+   any auth/network/JSON failure simply leaves the footer hidden.
+6. **Wire the providers** — construct `WsTransport` (the connect
    above), `TuiSlashHandler::new()`, and `TuiDashboardProvider::new()`.
    The transport is a **required constructor argument** —
    `TuiAdapter::new(transport)` — while the slash handler and
    dashboard provider are attached via the `with_slash_handler` and
-   `with_dashboard_provider` builders (`with_on_exit` wires the
-   shutdown trigger). Input history is delivered over the WS itself
+   `with_dashboard_provider` builders; the model label is attached via
+   `with_model_label` when available (`with_on_exit` wires the shutdown
+   trigger). Input history is delivered over the WS itself
    (see [Persistent input history](#persistent-input-history)), so no
    history store is wired in.
-6. **Start the adapter**. There is no local `ChannelRegistry` and no
+7. **Start the adapter**. There is no local `ChannelRegistry` and no
    cron trigger receiver: the TUI has no router. User input is
    framed as `Frame::Message` and sent through the transport; the
    gateway registers the connection on its side.
@@ -240,7 +266,7 @@ concrete transport used by the TUI. The adapter holds an
   send a `Frame::Message` over the WS.
 - `subscribe(session_id) -> TransportEventStream` — decode inbound
   frames from the same WS and translate them into
-  `TransportEvent::{StreamDelta, Reasoning, ToolStarted, ToolCompleted, Response, Notice, ApprovalRequested, ApprovalResolved}`.
+  `TransportEvent::{StreamDelta, ToolStarted, ToolCompleted, Status, Response, Notice, ApprovalRequested, ApprovalResolved}`. `Frame::Reasoning` is dropped (no variant) — the TUI shows a working indicator instead of the thinking trace.
 - `approval_queue()` — returns the transport's local `ApprovalQueue`.
   On construction, `WsTransport::connect` installs a resolver so
   `queue.resolve_head(decision)` also sends a
@@ -259,7 +285,7 @@ each `TransportEvent` onto an `AppEvent` variant so rendering code
 does not need to know about the transport:
 
 - `StreamDelta(text)` → `AppEvent::StreamDelta(String)`. Appended to `AppState.streaming`, redrawn live.
-- `Reasoning(text)` / `ToolStarted { tool, label }` / `ToolCompleted { status, summary }` → the matching `AppEvent` variants. Each commits dim reasoning / `⏺` / `⎿` lines to scrollback — see [Chat](#chat).
+- `ToolStarted { call_id, tool, label }` / `ToolCompleted { call_id, status, summary }` → the matching `AppEvent` variants. `ToolStarted` commits the `● tool` line as a scrollback message immediately; `ToolCompleted` appends the `⎿ summary` line — see [Chat](#chat). `Frame::Reasoning` has no `TransportEvent`/`AppEvent` mapping — the pump drops it (the working indicator stands in for the thinking trace).
 - `Response(blocks)` → `AppEvent::Outgoing(Vec<ContentBlock>)`. Finalises the response via `finalize_stream` (commit the trailing partial + non-text extras, or render the body from blocks when nothing streamed — see [Chat](#chat)), then clears `AppState.streaming`.
 - `Notice { level, text }` → `AppEvent::Log(LogRecord { level, target: "agent", message })`. Reuses the log surface.
 - `ApprovalRequested` / `ApprovalResolved` — see [Inline approval prompt](#inline-approval-prompt).
@@ -268,7 +294,7 @@ Single-consumer ordering on the mpsc keeps delta/response ordering correct as WS
 
 ### Raw-mode discipline
 
-- Entry (`run_loop`): install the panic hook, `enable_raw_mode()`, then `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)` once for the session (Kitty protocol, so `Shift`/`Alt+Enter` reach us with modifier bits set; unsupported terminals ignore it). Chat then renders into an **inline viewport** (`Viewport::Inline`) on the **main** screen — it does **not** enter the alternate screen, so the user's shell history stays above the live region and native mouse-wheel scroll / copy-paste keep working.
+- Entry (`run_loop`): install the panic hook, `enable_raw_mode()`, then `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)` once for the session (Kitty protocol, so `Shift`/`Alt+Enter` reach us with modifier bits set; unsupported terminals ignore it). The screen + scrollback are then **cleared** (`CLEAR_SCREEN_AND_SCROLLBACK`) for a clean start before the inline viewport is created. Chat renders into an **inline viewport** (`Viewport::Inline`) on the **main** screen — it does **not** enter the alternate screen, so native mouse-wheel scroll / copy-paste keep working (the pre-launch shell history is wiped by the entry clear rather than scrolled above).
 - Alternate screen + mouse capture are **dashboard-only**: `enter_dashboard_mode` issues `EnterAlternateScreen` + `EnableMouseCapture` and flips an `in_alt_screen` flag; leaving the dashboard reverses both.
 - Teardown is RAII via `TuiTeardownGuard::drop`, so any early return restores the terminal: pop the keyboard-enhancement flags (if pushed), `LeaveAlternateScreen` + `DisableMouseCapture` **only if** `in_alt_screen`, `disable_raw_mode()`, then fire `on_exit`. Best-effort, logged on failure.
 - Panic hook: installed once via `OnceLock` — pops the keyboard flags, disables raw mode, and best-effort leaves the alt screen + mouse capture, then delegates to the previous hook. Without it a panic would leave the terminal unusable.

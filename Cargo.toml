@@ -204,6 +204,7 @@ tracing-appender = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
 async-trait = { workspace = true }
 hex = { workspace = true }
 uuid = { workspace = true }

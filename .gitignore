@@ -32,3 +32,4 @@ origin_channel_plugin
 
 # stray submodule manifest from local sandbox
 .gitmodules
+.antigravitycli

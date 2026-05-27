@@ -11,6 +11,8 @@
 //!    `terminal.insert_before(...)` so they land in the terminal's native
 //!    scrollback.
 
+use std::time::Duration;
+
 use aura_model::ContentBlock;
 use aura_tools::{ApprovalDecision, ResourceAccess};
 use ratatui::Frame;
@@ -29,26 +31,159 @@ use crate::event::{LogLevel, LogRecord};
 /// cursor may scroll off-screen.
 pub(crate) const INPUT_MAX_ROWS: u16 = 10;
 
-/// Render the live region for chat mode. The viewport now exactly matches
-/// the needed height (input + optional approval), so there's no empty
-/// space between the latest scrollback message and the input box.
-/// Streaming text is committed to scrollback line-by-line (Codex style)
-/// rather than buffered into a viewport preview.
+/// Render the live region for chat mode. The viewport now exactly matches the
+/// needed height (working zone + queued lines + optional approval/completion +
+/// input + optional model footer). Streaming text is committed to scrollback
+/// line-by-line (Codex style) rather than buffered into a viewport preview.
 pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    // Build the live region top→bottom: a blank spacer, the working indicator
+    // row only while busy, then any queued lines, a pending approval block,
+    // the slash-completion popup, the input box, and the model footer.
+    let queued: Vec<&str> = state.queued_display_lines().collect();
+    let approval = state.pending_approval.as_ref();
+    // The slash-completion popup is a real section just above the input box,
+    // not a float — an inline viewport's buffer doesn't extend above itself,
+    // so drawing above it would write out of bounds.
+    let popup_h = completion_popup_height(state);
     let input_h = input_box_height(state);
-    if let Some(entry) = state.pending_approval.as_ref() {
-        let approval_h = approval_pending_height(entry);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(approval_h), Constraint::Length(input_h)])
-            .split(area);
-        render_approval_block(frame, chunks[0], entry);
-        render_input(frame, chunks[1], state);
-        render_completion_popup(frame, chunks[1], state);
-    } else {
-        render_input(frame, area, state);
-        render_completion_popup(frame, area, state);
+    let model_h = model_footer_height(state);
+
+    let mut constraints = Vec::with_capacity(queued.len() + 5);
+    constraints.push(Constraint::Length(working_zone_height(state)));
+    for _ in &queued {
+        constraints.push(Constraint::Length(1));
     }
+    if let Some(entry) = approval {
+        constraints.push(Constraint::Length(approval_pending_height(entry)));
+    }
+    if popup_h > 0 {
+        constraints.push(Constraint::Length(popup_h));
+    }
+    constraints.push(Constraint::Length(input_h));
+    if model_h > 0 {
+        constraints.push(Constraint::Length(model_h));
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    render_working_line(frame, chunks[0], state);
+    let mut next = 1;
+    for line in &queued {
+        render_queued_line(frame, chunks[next], line);
+        next += 1;
+    }
+    if let Some(entry) = approval {
+        render_approval_block(frame, chunks[next], entry);
+        next += 1;
+    }
+    if popup_h > 0 {
+        render_completion_popup(frame, chunks[next], state);
+        next += 1;
+    }
+    render_input(frame, chunks[next], state);
+    next += 1;
+    if model_h > 0 {
+        render_model_footer(frame, chunks[next], state);
+    }
+}
+
+const WORKING_SPACER_ROWS: u16 = 1;
+const WORKING_INDICATOR_ROWS: u16 = 1;
+
+/// Rows the working zone occupies: one spacer row while idle, and spacer plus
+/// indicator row while a turn is actively working.
+pub(crate) fn working_zone_height(state: &AppState) -> u16 {
+    WORKING_SPACER_ROWS
+        + if state.show_working() {
+            WORKING_INDICATOR_ROWS
+        } else {
+            0
+        }
+}
+
+/// Colours the working dot pulses through, one step per animation tick — a
+/// gentle dim→bright→dim breath. Driven by repainting (the elapsed-counter
+/// tick), not terminal blink, so it animates everywhere.
+const WORKING_PULSE: &[Color] = &[
+    Color::DarkGray,
+    Color::Cyan,
+    Color::White,
+    Color::White,
+    Color::Cyan,
+    Color::DarkGray,
+];
+
+/// The status word shown when the agent is working but no tool is running.
+const WORKING_WORD: &str = "Cooking";
+
+/// Hint appended to the working line; `/stop` cancels the in-flight turn.
+const STOP_HINT: &str = "/stop to interrupt";
+
+/// The animated working indicator, rendered on the **bottom** row of the
+/// reserved working zone while a turn is in flight (the row(s) above stay
+/// blank — the breathing room the indicator sits below). A colour-pulsing `●`
+/// — same glyph/size as the answer dot, so it never reflows — followed by
+/// `Cooking…`, then the live elapsed counter + `/stop` hint. Renders nothing
+/// when idle (the whole zone stays blank).
+fn render_working_line(frame: &mut Frame, area: Rect, state: &AppState) {
+    if area.height == 0 {
+        return;
+    }
+    // Paint the reserved spacer row explicitly; relying on the default buffer
+    // can leave the live indicator visually attached to the scrollback tail.
+    frame.render_widget(Clear, area);
+    if !state.show_working() {
+        return;
+    }
+    let line = working_indicator_line(state.spinner_tick, state.working_elapsed_secs());
+    let indicator_row = Rect {
+        x: area.x,
+        y: area.y + area.height - 1,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(line), indicator_row);
+}
+
+/// Build the working line. Pure so the colour pulse and `(Ns · …)` readout can
+/// be unit-tested without a frame.
+pub(crate) fn working_indicator_line(spinner_tick: usize, elapsed_secs: u64) -> Line<'static> {
+    let accent = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    // Equal-width, dot-sized `●` (the same glyph as answers/tools), animated
+    // by cycling its colour each tick — visible even where blink isn't.
+    let pulse = WORKING_PULSE[spinner_tick % WORKING_PULSE.len()];
+    let mut spans = vec![Span::styled(
+        format!("{ANSWER_DOT} "),
+        Style::default().fg(pulse).add_modifier(Modifier::BOLD),
+    )];
+    spans.push(Span::styled(format!("{WORKING_WORD}…"), accent));
+    spans.push(Span::styled(
+        format!(" ({elapsed_secs}s · {STOP_HINT})"),
+        dim,
+    ));
+    Line::from(spans)
+}
+
+/// One `↳ <text>` line under the working indicator for a message the user
+/// queued mid-turn (a dispatched steer awaiting a tool boundary, or a
+/// deferred slash awaiting turn end). Newlines are flattened to keep it a
+/// single row; the terminal truncates an over-long preview.
+fn render_queued_line(frame: &mut Frame, area: Rect, text: &str) {
+    if area.height == 0 {
+        return;
+    }
+    let preview = text.replace('\n', " ");
+    let line = Line::from(vec![
+        Span::styled("↳ ", Style::default().fg(Color::Cyan)),
+        Span::styled(preview, Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// Number of rows the pending-approval prompt occupies when rendered.
@@ -63,25 +198,22 @@ pub(crate) fn input_box_height(state: &AppState) -> u16 {
     (lines.min(INPUT_MAX_ROWS)).saturating_add(2)
 }
 
+pub(crate) fn model_footer_height(state: &AppState) -> u16 {
+    if state.model_label.is_some() { 1 } else { 0 }
+}
+
 fn render_input(frame: &mut Frame, area: Rect, state: &AppState) {
     let hint = Line::from(Span::styled(
         " shift+enter · alt+enter = newline ",
         Style::default().fg(Color::DarkGray),
     ))
     .right_aligned();
-    // Surface the queued-submission depth in the title so the user can
-    // tell their Enter "took effect" even though the message hasn't
-    // appeared in scrollback yet — it will flush after the in-flight
-    // agent response finishes.
-    let title = if state.outgoing_queue.is_empty() {
-        " input ".to_string()
-    } else {
-        format!(" input · {} queued ", state.outgoing_queue.len())
-    };
+    // Queued submissions surface as `↳` lines under the working
+    // indicator (see `render`), so the title stays a plain label.
     let block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::horizontal(1))
-        .title(title)
+        .title(" input ")
         .title_top(hint);
     let inner = block.inner(area);
     let paragraph = Paragraph::new(state.input.as_str()).block(block);
@@ -98,24 +230,57 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.set_cursor_position((cursor_x, cursor_y));
 }
 
-fn render_completion_popup(frame: &mut Frame, input_area: Rect, state: &AppState) {
+const MODEL_FOOTER_PREFIX: &str = "model: ";
+const MODEL_FOOTER_INDENT: &str = "  ";
+
+fn render_model_footer(frame: &mut Frame, area: Rect, state: &AppState) {
+    if area.height == 0 {
+        return;
+    }
+    let Some(label) = state.model_label.as_deref() else {
+        return;
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(model_footer_line(label)), area);
+}
+
+pub(crate) fn model_footer_line(label: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(MODEL_FOOTER_INDENT),
+        Span::styled(MODEL_FOOTER_PREFIX, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+/// Max command rows the completion popup shows before it stops growing.
+const COMPLETION_MAX_ROWS: usize = 8;
+
+/// Rows the slash-completion popup occupies (0 when not showing). It is a
+/// layout section just above the input box — sized into the inline viewport
+/// so it never draws outside the viewport buffer.
+pub(crate) fn completion_popup_height(state: &AppState) -> u16 {
+    let n = state.completion_candidates().len();
+    if n == 0 {
+        0
+    } else {
+        // +2 for the bordered block (top + bottom).
+        (n.min(COMPLETION_MAX_ROWS) as u16).saturating_add(2)
+    }
+}
+
+fn render_completion_popup(frame: &mut Frame, area: Rect, state: &AppState) {
+    if area.height == 0 {
+        return;
+    }
     let candidates = state.completion_candidates();
     if candidates.is_empty() {
         return;
     }
-    let max_rows = 8u16;
-    let height = candidates.len().min(max_rows as usize) as u16 + 2;
-    if input_area.y < height {
-        return;
-    }
-    let width = input_area.width.min(60);
-    let popup = Rect {
-        x: input_area.x,
-        y: input_area.y - height,
-        width,
-        height,
-    };
-
     let selected = state.completion_cursor.min(candidates.len() - 1);
     let items: Vec<ListItem<'_>> = candidates
         .iter()
@@ -145,8 +310,8 @@ fn render_completion_popup(frame: &mut Frame, input_area: Rect, state: &AppState
             .add_modifier(Modifier::BOLD),
     );
 
-    frame.render_widget(Clear, popup);
-    frame.render_stateful_widget(list, popup, &mut list_state);
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(list, area, &mut list_state);
 }
 
 fn render_approval_block(frame: &mut Frame, area: Rect, entry: &ApprovalChatEntry) {
@@ -160,94 +325,99 @@ fn render_approval_block(frame: &mut Frame, area: Rect, entry: &ApprovalChatEntr
 
 // ---- Line-rendering helpers (used by lib.rs for terminal.insert_before) ----
 
-pub(crate) fn render_user_lines(text: &str) -> Vec<Line<'static>> {
+/// Pale dot marking an assistant answer's first line (replaces the old
+/// `aura> ` prefix). Continuation lines indent under it by [`ANSWER_INDENT`].
+const ANSWER_DOT: &str = "●";
+/// Continuation indent for assistant answers — the display width of `"● "`,
+/// so wrapped/continued lines align under the text rather than the dot.
+const ANSWER_INDENT: &str = "  ";
+
+/// Leading span for an assistant answer line: a pale dot on the first line,
+/// a matching blank indent on continuations.
+fn answer_leader(is_continuation: bool) -> Span<'static> {
+    if is_continuation {
+        Span::raw(ANSWER_INDENT)
+    } else {
+        Span::styled(
+            format!("{ANSWER_DOT} "),
+            Style::default().fg(Color::DarkGray),
+        )
+    }
+}
+
+pub(crate) fn render_user_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    // The user's own messages render as a full-width highlighted bar: a `> `
+    // quote leader on the first line, then the row padded out with spaces so
+    // the background spans the whole line. `width` is the terminal width at
+    // commit time. Explicit bright-white bg + black fg (rather than
+    // `REVERSED`, which renders muted/grey on many terminals) keeps the bar
+    // bright and theme-independent.
+    let style = Style::default().bg(Color::White).fg(Color::Black);
+    let total = width as usize;
     let mut out = Vec::new();
-    let prefix = Span::styled(
-        "you> ",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
     let mut first = true;
-    for line_text in text.lines() {
-        let spans = if first {
-            vec![prefix.clone(), Span::raw(line_text.to_string())]
-        } else {
-            vec![Span::raw("     "), Span::raw(line_text.to_string())]
-        };
-        out.push(Line::from(spans));
+    for line in text.lines() {
+        let body = format!("{}{line}", if first { "> " } else { "  " });
+        out.push(Line::from(Span::styled(pad_to_width(body, total), style)));
         first = false;
     }
     if first {
-        out.push(Line::from(vec![prefix, Span::raw("")]));
+        out.push(Line::from(Span::styled(
+            pad_to_width("> ".to_string(), total),
+            style,
+        )));
     }
     out
 }
 
+/// Right-pad `s` with spaces so its display width fills `width` columns (a
+/// no-op when it already meets or exceeds it), so a styled background covers
+/// the whole row.
+fn pad_to_width(s: String, width: usize) -> String {
+    let w = s.width();
+    if w >= width {
+        s
+    } else {
+        format!("{s}{}", " ".repeat(width - w))
+    }
+}
+
 pub(crate) fn render_assistant_lines(blocks: &[ContentBlock]) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    let prefix = Span::styled(
-        "aura> ",
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-    );
     let mut first = true;
     for block in blocks {
         let Some(rendered) = render_block(block) else {
             continue;
         };
         for (i, text) in rendered.lines().enumerate() {
-            let spans = if first && i == 0 {
-                vec![prefix.clone(), Span::raw(text.to_string())]
-            } else {
-                vec![Span::raw("      "), Span::raw(text.to_string())]
-            };
-            out.push(Line::from(spans));
+            out.push(Line::from(vec![
+                answer_leader(!(first && i == 0)),
+                Span::raw(text.to_string()),
+            ]));
         }
         first = false;
     }
     out
 }
 
-/// One rendered line of a streaming agent response. The first line of
-/// the response uses the `aura> ` (bold green) prefix; every subsequent
-/// line uses the six-space continuation indent so the conversation
-/// reads as one coherent block. Callers set `is_continuation` based on
-/// `AppState::streaming_committed_any` — see [`crate::app`].
+/// One rendered line of a streaming agent response. The first line of the
+/// response carries the pale answer dot; every subsequent line uses the
+/// matching continuation indent so the answer reads as one coherent block.
+/// Callers set `is_continuation` based on `AppState::streaming_committed_any`
+/// — see [`crate::app`].
 pub(crate) fn render_stream_line(text: &str, is_continuation: bool) -> Vec<Line<'static>> {
-    let leader = if is_continuation {
-        Span::raw("      ")
-    } else {
-        Span::styled(
-            "aura> ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )
-    };
-    vec![Line::from(vec![leader, Span::raw(text.to_string())])]
-}
-
-/// One dim line of the agent's reasoning ("thinking") trace. The first
-/// line of a run gets a `✻ ` leader; continuations align under it. All
-/// `DarkGray` so it reads as background working, distinct from the
-/// `aura> ` answer. `is_continuation` mirrors
-/// `AppState::reasoning_committed_any`.
-pub(crate) fn render_reasoning_line(text: &str, is_continuation: bool) -> Vec<Line<'static>> {
-    let dim = Style::default().fg(Color::DarkGray);
-    let leader = if is_continuation { "  " } else { "✻ " };
     vec![Line::from(vec![
-        Span::styled(leader, dim),
-        Span::styled(text.to_string(), dim),
+        answer_leader(is_continuation),
+        Span::raw(text.to_string()),
     ])]
 }
 
-/// A `⏺ tool(label)` line committed the moment a tool call is dispatched.
-/// The bullet + name are cyan; the optional human label is dim in parens.
+/// A `● tool(label)` line committed the moment a tool call is dispatched.
+/// The bullet matches the assistant answer's dot (`●`, same size) but in
+/// cyan; the optional human label is dim in parens.
 pub(crate) fn render_tool_started(tool: &str, label: Option<&str>) -> Vec<Line<'static>> {
     let mut spans = vec![
-        Span::styled("⏺ ", Style::default().fg(Color::Cyan)),
+        Span::styled(format!("{ANSWER_DOT} "), Style::default().fg(Color::Cyan)),
         Span::styled(
             tool.to_string(),
             Style::default()
@@ -278,6 +448,25 @@ pub(crate) fn render_tool_completed(status: &str, summary: &str) -> Vec<Line<'st
     ])]
 }
 
+/// Footer committed when a turn (job) finishes: a "cooked for <duration>"
+/// stamp of the wall-clock the turn took.
+pub(crate) fn render_cooked_for_line(elapsed: Duration) -> Vec<Line<'static>> {
+    vec![Line::from(Span::styled(
+        format!("{ANSWER_DOT} cooked for {}", format_duration(elapsed)),
+        Style::default(),
+    ))]
+}
+
+/// Compact wall-clock rendering for the turn-done footer: `8s`, `1m 05s`.
+fn format_duration(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    }
+}
+
 /// A dim turn-status line (`⟳ …`) for a coarse phase transition — today
 /// context compaction start/end. Unknown phases render verbatim.
 pub(crate) fn render_status_line(phase: &str) -> Vec<Line<'static>> {
@@ -298,9 +487,9 @@ pub(crate) fn render_status_line(phase: &str) -> Vec<Line<'static>> {
 /// to scrollback; only blocks that aren't covered by the stream
 /// (currently just the CronCreate hint via [`render_block`]) need to be
 /// flushed at `Outgoing` time. `started` should mirror
-/// `AppState::streaming_committed_any` so the prefix is correct: if the
-/// response opened with no streamed text at all, the first non-text
-/// line still gets the `aura> ` prefix.
+/// `AppState::streaming_committed_any` so the leader is correct: if the
+/// response opened with no streamed text at all, the first non-text line
+/// still gets the pale answer dot.
 pub(crate) fn render_non_text_blocks(blocks: &[ContentBlock], started: bool) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let mut first = !started;
@@ -312,17 +501,10 @@ pub(crate) fn render_non_text_blocks(blocks: &[ContentBlock], started: bool) -> 
             continue;
         };
         for line in rendered.lines() {
-            let leader = if first {
-                Span::styled(
-                    "aura> ",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::raw("      ")
-            };
-            out.push(Line::from(vec![leader, Span::raw(line.to_string())]));
+            out.push(Line::from(vec![
+                answer_leader(!first),
+                Span::raw(line.to_string()),
+            ]));
             first = false;
         }
     }
@@ -386,12 +568,7 @@ pub(crate) fn render_approval_resolved_lines(entry: &ApprovalChatEntry) -> Vec<L
         ApprovalDecision::Deny => ("denied", Color::Red),
     };
     let mut spans = vec![
-        Span::styled(
-            "aura> ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
+        answer_leader(false),
         Span::styled(
             format!("{verb}: {}", entry.tool),
             Style::default().fg(color),
@@ -528,12 +705,7 @@ fn render_approval_pending_lines(entry: &ApprovalChatEntry) -> Vec<Line<'static>
     };
     let mut out: Vec<Line<'static>> = Vec::new();
     out.push(Line::from(vec![
-        Span::styled(
-            "aura> ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
+        answer_leader(false),
         Span::styled("wants to run ", Style::default().fg(Color::Yellow)),
         Span::styled(
             entry.tool.clone(),
@@ -690,19 +862,201 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    fn buffer_row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+            .collect()
+    }
+
     #[test]
     fn tool_started_line_shows_bullet_name_and_label() {
         let lines = render_tool_started("Read", Some("foo.rs"));
         let text = line_text(&lines[0]);
-        assert!(text.starts_with("⏺ "), "got {text:?}");
+        // Same dot as the assistant answer (`●`), so they line up in size.
+        assert!(text.starts_with("● "), "got {text:?}");
         assert!(text.contains("Read"));
         assert!(text.contains("(foo.rs)"));
     }
 
     #[test]
     fn tool_started_line_omits_empty_label() {
-        assert_eq!(line_text(&render_tool_started("now", None)[0]), "⏺ now");
-        assert_eq!(line_text(&render_tool_started("now", Some(""))[0]), "⏺ now");
+        assert_eq!(line_text(&render_tool_started("now", None)[0]), "● now");
+        assert_eq!(line_text(&render_tool_started("now", Some(""))[0]), "● now");
+    }
+
+    #[test]
+    fn working_indicator_shows_cooking_when_idle() {
+        let text = line_text(&working_indicator_line(0, 0));
+        assert!(text.starts_with("● "), "leads with the dot: {text:?}");
+        assert!(text.contains("Cooking…"), "got {text:?}");
+        assert!(text.contains("(0s · /stop to interrupt)"), "got {text:?}");
+    }
+
+    #[test]
+    fn working_indicator_dot_pulses_colour_with_tick() {
+        // The dot is the same glyph each tick (equal-width, no reflow) but a
+        // different colour — a repaint-driven pulse, not terminal blink.
+        let a = working_indicator_line(0, 0);
+        let b = working_indicator_line(1, 0);
+        assert_eq!(line_text(&a).chars().next(), line_text(&b).chars().next());
+        assert_ne!(a.spans[0].style.fg, b.spans[0].style.fg);
+    }
+
+    #[test]
+    fn working_indicator_stays_status_only() {
+        let text = line_text(&working_indicator_line(0, 3));
+        assert!(text.starts_with("● "), "leads with the dot: {text:?}");
+        assert!(text.contains("Cooking…"), "got {text:?}");
+        assert!(!text.contains("Read"), "tools render as messages: {text:?}");
+        assert!(text.contains("(3s · /stop to interrupt)"), "got {text:?}");
+    }
+
+    #[test]
+    fn render_keeps_blank_row_above_working_indicator() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = AppState::new();
+        app.note_response_pending();
+        let mut terminal = Terminal::new(TestBackend::new(48, 6)).unwrap();
+
+        terminal.draw(|f| render(f, f.area(), &mut app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let spacer = buffer_row_text(buf, 0);
+        let indicator = buffer_row_text(buf, 1);
+        assert!(
+            spacer.trim().is_empty(),
+            "spacer row must stay blank: {spacer:?}"
+        );
+        assert!(
+            indicator.trim_start().starts_with("● Cooking"),
+            "working indicator should render below spacer: {indicator:?}"
+        );
+    }
+
+    #[test]
+    fn render_idle_keeps_single_blank_row_above_input() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(48, 4)).unwrap();
+
+        terminal.draw(|f| render(f, f.area(), &mut app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let spacer = buffer_row_text(buf, 0);
+        let input_top = buffer_row_text(buf, 1);
+        assert!(
+            spacer.trim().is_empty(),
+            "idle spacer row must stay blank: {spacer:?}"
+        );
+        assert!(
+            input_top.contains("input"),
+            "input should start directly below one spacer row: {input_top:?}"
+        );
+    }
+
+    #[test]
+    fn render_model_footer_below_input_when_model_is_known() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = AppState::new();
+        app.set_model_label(Some("openai/gpt-5-codex".into()));
+        let mut terminal = Terminal::new(TestBackend::new(48, 5)).unwrap();
+
+        terminal.draw(|f| render(f, f.area(), &mut app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let footer = buffer_row_text(buf, 4);
+        assert_eq!(model_footer_height(&app), 1);
+        assert!(
+            footer.starts_with("  model: openai/gpt-5-codex"),
+            "model footer should render below input: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn completion_popup_height_counts_candidates_plus_border() {
+        let mut app = AppState::new();
+        app.set_commands(vec![
+            aura_channels::SlashCommand::new("/clear", "clear"),
+            aura_channels::SlashCommand::new("/quit", "quit"),
+        ]);
+        assert_eq!(completion_popup_height(&app), 0, "no popup on empty input");
+        app.insert_char('/');
+        assert_eq!(
+            completion_popup_height(&app),
+            4,
+            "2 candidates + 2 border rows"
+        );
+    }
+
+    #[test]
+    fn render_with_slash_completion_stays_in_bounds() {
+        // Regression: the completion popup is a layout section inside the
+        // viewport, not an out-of-bounds float above it, so rendering it must
+        // not panic even in a short area.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = AppState::new();
+        app.set_commands(vec![
+            aura_channels::SlashCommand::new("/clear", "clear"),
+            aura_channels::SlashCommand::new("/quit", "quit"),
+        ]);
+        app.insert_char('/');
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|f| render(f, f.area(), &mut app)).unwrap();
+    }
+
+    #[test]
+    fn cooked_for_line_has_dot_answer_text_colour_and_duration() {
+        let line = &render_cooked_for_line(std::time::Duration::from_secs(75))[0];
+        let text = line_text(line);
+        assert!(text.starts_with("● cooked for "), "got {text:?}");
+        assert!(text.contains("1m 15s"), "minutes formatting: {text:?}");
+        let answer = render_stream_line("answer", false);
+        let answer_text_fg = answer[0].spans[1].style.fg;
+        assert!(
+            line.spans.iter().all(|s| s.style.fg == answer_text_fg),
+            "footer should match answer text foreground"
+        );
+    }
+
+    #[test]
+    fn user_lines_are_full_width_highlighted_with_quote_prefix() {
+        let width = 20u16;
+        let lines = render_user_lines("hello\nworld", width);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            line_text(&lines[0]).starts_with("> hello"),
+            "first line quotes: {:?}",
+            line_text(&lines[0])
+        );
+        for l in &lines {
+            let text = line_text(l);
+            assert_eq!(text.width(), width as usize, "bar fills the row: {text:?}");
+            assert!(
+                l.spans.iter().all(|s| s.style.bg == Some(Color::White)),
+                "user line must carry the bright bar background: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_line_uses_answer_dot_then_indent() {
+        let first = line_text(&render_stream_line("hi", false)[0]);
+        let cont = line_text(&render_stream_line("more", true)[0]);
+        assert!(
+            first.starts_with("● "),
+            "first line gets the dot: {first:?}"
+        );
+        assert!(
+            cont.starts_with("  ") && !cont.contains('●'),
+            "continuation indents, no dot: {cont:?}"
+        );
     }
 
     #[test]
@@ -710,17 +1064,6 @@ mod tests {
         let text = line_text(&render_tool_completed("ok", "200 lines")[0]);
         assert!(text.contains('⎿'), "got {text:?}");
         assert!(text.contains("200 lines"));
-    }
-
-    #[test]
-    fn reasoning_line_leader_differs_by_continuation() {
-        let first = line_text(&render_reasoning_line("hmm", false)[0]);
-        let cont = line_text(&render_reasoning_line("more", true)[0]);
-        assert!(first.starts_with("✻ "), "got {first:?}");
-        assert!(
-            cont.starts_with("  ") && !cont.contains('✻'),
-            "got {cont:?}"
-        );
     }
 
     #[test]

@@ -49,16 +49,20 @@ progress is **opt-in per channel** — the TUI/web render it, sidecars ignore it
 | **Security** | `Reasoning`, `label`, and `summary` are model-/tool-derived text and pass the same sanitize + vault-reveal boundary as `AnswerDelta` (`stream_emit` / `sanitize_stream_fragment`). On a sanitize failure the summary is dropped (empty) rather than risk a leak. |
 | **Ordering / backpressure** | One ordered mpsc. Answer `AnswerDelta` and tool `ToolStarted/ToolCompleted` use `await` (load-bearing / display self-consistency); `Reasoning` uses `try_send` (ephemeral, droppable) — matching how `Notice` already drops on a full channel. The final `Message` is the reconciliation point that clears any in-flight progress UI. |
 | **No coalescing on the wire** | The gateway's `translator_loop` sends every `SessionEvent` 1:1 live — there is no Delta→Message coalescing (an earlier doc note claimed otherwise; it was stale). Clients without a partial surface simply ignore the streaming frames. |
-| **TUI dedup** | **None needed.** `render_block` only renders the CronCreate recurring-trigger hint for `ToolUse` blocks — never general tool calls — so the final `Message`'s `accumulated_tool_uses` were never a visible source of tool lines in the TUI. The live `ToolStarted`/`ToolCompleted` lines are the only tool display. |
+| **TUI dedup** | **None needed.** `render_block` only renders the CronCreate recurring-trigger hint for `ToolUse` blocks — never general tool calls — so the final `Message`'s `accumulated_tool_uses` were never a visible source of tool lines in the TUI. The scrollback `ToolStarted`/`ToolCompleted` lines are the only tool display. |
 | **Approval interleave** | `ToolStarted` (loop) precedes `ApprovalRequested` (emitted inside `execute` by the gate) precedes `ToolCompleted` — naturally reads as "started → waiting for approval → done". |
 
 ## Out of scope / future
 
 - **`Status` spinner — remaining phases.** `AgentEvent::Status(TurnStatus)` shipped
   for context compaction (`Compacting` / `Compacted`, see the table above). The other
-  phases the enum could carry — Thinking / Working / Responding — are still deferred;
-  much of that is inferable consumer-side from reasoning-vs-answer arrival, so it's
-  low priority.
+  phases the enum could carry — Thinking / Working / Responding — are still deferred on
+  the **wire**; they're inferable consumer-side from turn activity, which is exactly what
+  the TUI now does: it renders a **client-side animated "working" indicator** (gated on a
+  local turn-active flag) instead of the model's reasoning trace, and **drops `Reasoning`
+  frames entirely** rather than rendering them. So a server-side Working/Thinking status
+  remains low priority for the TUI. Other channels (e.g. the web UI) still consume
+  `Reasoning`. See [`docs/modules/tui.md`](modules/tui.md#working-indicator--mid-turn-steering).
 - **Subagent → parent progress** — subagents run with `delta_tx = None`. Surfacing
   their progress to the parent ties into the planned `SubagentNotification` redesign.
 - **Fine-grained in-tool events** — forward a curated subset of `ToolEventSink`

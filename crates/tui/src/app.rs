@@ -2,15 +2,20 @@
 //! view mode.
 //!
 //! State mutation is synchronous and side-effect-free. With the inline-viewport
-//! rendering model, chat history is *not* held here — it lives in the
-//! terminal's own scrollback buffer, written via [`ratatui::Terminal::insert_before`].
-//! This module only tracks what's currently *live* in the viewport: the input
-//! draft, the streaming-response preview, and the (single) pending approval.
+//! rendering model, the live chat history lives in the terminal's own
+//! scrollback buffer, written via [`ratatui::Terminal::insert_before`]. This
+//! module tracks what's currently *live* in the viewport (the input draft, the
+//! streaming-response preview, the single pending approval) plus a bounded
+//! [`TranscriptBlock`] log of what was committed, kept solely so the on-screen
+//! conversation can be re-rendered after a resize refresh wipes the terminal's
+//! scrollback — see [`AppState::record_block`].
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aura_channels::{DashboardSnapshot, SlashCommand, ViewKind};
+use aura_model::SessionId;
+use ratatui::text::Line;
 use ratatui::widgets::TableState;
 
 use aura_tools::{ApprovalDecision, ApprovalQueue, ResourceAccess};
@@ -47,8 +52,74 @@ pub(crate) enum ViewMode {
     },
 }
 
+/// A tool call in flight — started but not yet completed. Lives in
+/// [`AppState::running_tools`] so completion can be matched to the start.
+#[derive(Debug, Clone)]
+pub(crate) struct RunningTool {
+    pub call_id: String,
+}
+
+/// Kind of the last block committed to scrollback. Drives single-blank
+/// separation: consecutive `Answer` (or `Tool`) lines stack tight as one
+/// block, but a change of kind (or any `Other` block) gets one leading
+/// separator blank. There are no trailing blanks — the always-reserved
+/// working row separates the last block from the input box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockKind {
+    Answer,
+    Tool,
+    Other,
+}
+
+/// One committed scrollback block, retained (bounded) so the on-screen
+/// conversation can be re-rendered after a resize refresh wipes the terminal's
+/// scrollback. The inline-viewport model keeps no other transcript.
+///
+/// Width-dependent blocks store their *source* so replay re-renders them at the
+/// new width; the rest store their already-rendered lines, which re-wrap
+/// cleanly at any width. The banner isn't stored — replay reprints it from the
+/// session id.
+#[derive(Clone)]
+pub(crate) enum TranscriptBlock {
+    /// User message / mid-turn steer. Stored as text because its full-width
+    /// highlighted bar is width-dependent (rebuilt by `render_user_lines`).
+    User(String),
+    /// Assistant answer body (rendered lines; re-wraps on replay).
+    Answer(Vec<Line<'static>>),
+    /// Tool block — `● tool` + `⎿ summary`, or a resolved-approval summary.
+    Tool(Vec<Line<'static>>),
+    /// Standalone block: status / log / system note.
+    Other(Vec<Line<'static>>),
+    /// `cooked for …` footer (re-rendered from the elapsed duration).
+    Cooked(Duration),
+}
+
+/// Cap on retained transcript lines. The replay log is bounded so a long-lived
+/// session doesn't grow it without limit and a resize doesn't re-dump an
+/// unbounded history into scrollback; the oldest blocks are evicted past this.
+const TRANSCRIPT_MAX_LINES: usize = 4000;
+
+/// Rows a transcript block occupies, for the [`TRANSCRIPT_MAX_LINES`] cap.
+/// `User` counts its source newlines (the bar is one row per text line);
+/// `Cooked` is a single footer row.
+fn block_line_count(block: &TranscriptBlock) -> usize {
+    match block {
+        TranscriptBlock::User(text) => text.lines().count().max(1),
+        TranscriptBlock::Answer(lines)
+        | TranscriptBlock::Tool(lines)
+        | TranscriptBlock::Other(lines) => lines.len(),
+        TranscriptBlock::Cooked(_) => 1,
+    }
+}
+
 pub(crate) struct AppState {
     pub(crate) mode: ViewMode,
+    /// Session id shown in the banner. Tracked here (set at startup, updated
+    /// on `/new`) so the resize-refresh path can reprint the banner without a
+    /// reference to the transport.
+    pub(crate) session_id: SessionId,
+    /// Current active LLM shown below the input box. `None` hides the footer.
+    pub(crate) model_label: Option<String>,
     pub(crate) input: String,
     pub(crate) cursor: usize,
     pub(crate) history: VecDeque<String>,
@@ -66,15 +137,30 @@ pub(crate) struct AppState {
     /// the `      ` (six-space) continuation indent so the conversation
     /// reads as one coherent block.
     pub(crate) streaming_committed_any: bool,
-    /// Trailing partial line of the in-flight reasoning ("thinking")
-    /// trace, mirroring [`streaming`] but for dim reasoning lines. Each
-    /// `AppEvent::Reasoning` appends; complete lines commit dim as they
-    /// form, and the partial flushes before the answer / a tool line.
-    pub(crate) reasoning: Option<String>,
-    /// Whether the current reasoning run has committed any line — drives
-    /// the dim `✻ ` leader (first line) vs the continuation indent. Reset
-    /// once a non-reasoning line (tool / answer) ends the run.
-    pub(crate) reasoning_committed_any: bool,
+    /// When the current turn became active. Drives the animated
+    /// "working" indicator and its elapsed-seconds readout in the live
+    /// region; `None` whenever no turn we initiated is in flight. Set by
+    /// [`note_response_pending`], cleared by [`note_response_received`]
+    /// when the last outstanding response lands — or by
+    /// [`reset_working`] when `/stop` cancels the turn (which sends no
+    /// final response to clear it).
+    pub(crate) working_since: Option<Instant>,
+    /// Tools that have started but not yet completed. The start line commits
+    /// to scrollback immediately; the matching `ToolCompleted` (by `call_id`)
+    /// removes the entry before committing the result summary. Cleared at turn
+    /// end / on `/stop` via [`clear_stream`].
+    pub(crate) running_tools: Vec<RunningTool>,
+    /// Animation counter advanced once per working-indicator tick; the dot's
+    /// pulse colour is `frame % WORKING_PULSE.len()`. A redraw-driven colour
+    /// cycle (not terminal blink, which many terminals don't render).
+    pub(crate) spinner_tick: usize,
+    /// Kind of the last block committed to scrollback (`None` at start / after
+    /// a clear). Drives the leading-separator spacing — see [`BlockKind`].
+    pub(crate) last_block: Option<BlockKind>,
+    /// Whether the last row committed to scrollback is blank. Lets the
+    /// commit helpers emit *exactly one* separator blank between blocks —
+    /// never doubling up, never missing one.
+    pub(crate) last_row_blank: bool,
     /// Active inline approval prompt. At most one is live at a time; further
     /// queued requests stay on [`ApprovalQueue`] until the head is resolved.
     pub(crate) pending_approval: Option<ApprovalChatEntry>,
@@ -92,12 +178,22 @@ pub(crate) struct AppState {
     /// handlers can drain entries. `None` means approval gating is disabled
     /// for the test harness — production always wires this up.
     pub(crate) approval: Option<ApprovalQueue>,
-    /// User submissions parked while the agent is mid-response or a
-    /// resource approval is pending. Each `AppEvent::Outgoing` pops the
-    /// next one and dispatches it, so messages always commit to
-    /// scrollback in chronological send order
-    /// (`you>1 / aura>1 / you>2 / aura>2`) instead of interleaving with
-    /// in-flight streams.
+    /// Plain (non-slash) messages submitted while a turn is in flight.
+    /// Unlike [`outgoing_queue`], these are dispatched to the agent
+    /// **immediately** (mid-turn steering — the agent folds them in at
+    /// its next tool boundary) and only their *display* is deferred:
+    /// each shows as a `↳` line under the working indicator until the
+    /// next `ToolCompleted` commits it to scrollback as a `you>` line,
+    /// landing right after that tool block. A turn that ends with steers
+    /// still pending commits them at `Outgoing` (they fall to the next
+    /// turn server-side, so the order still reads correctly).
+    pub(crate) pending_interjections: VecDeque<String>,
+    /// Slash commands submitted while a turn is in flight. Held back —
+    /// not dispatched — and drained one-at-a-time on `AppEvent::Outgoing`
+    /// (see the run loop), so a `/skills` or unknown-skill slash runs
+    /// *after* the current turn rather than spawning a concurrent turn
+    /// that would interleave in scrollback. Plain messages no longer use
+    /// this path; they steer via [`pending_interjections`].
     pub(crate) outgoing_queue: VecDeque<String>,
     /// User messages that have been dispatched to the agent but whose
     /// `AppEvent::Outgoing` reply hasn't arrived yet. Tracked separately
@@ -106,6 +202,14 @@ pub(crate) struct AppState {
     /// this counter, a second submission inside that window would be
     /// dispatched concurrently and the two responses would interleave.
     pub(crate) outstanding_responses: usize,
+    /// Bounded log of committed scrollback blocks, in commit order, replayed
+    /// to re-render the conversation after a resize refresh wipes the
+    /// terminal's scrollback. Rebuilt as a side effect of replay; cleared on
+    /// `/clear` / `/new` / Ctrl-L. See [`TranscriptBlock`].
+    transcript: VecDeque<TranscriptBlock>,
+    /// Running line total of [`transcript`], maintained so eviction past
+    /// [`TRANSCRIPT_MAX_LINES`] doesn't have to re-sum the whole deque.
+    transcript_lines: usize,
 }
 
 /// How long the "press Ctrl-D again to exit" prompt stays armed. Matches
@@ -116,21 +220,29 @@ impl AppState {
     pub(crate) fn new() -> Self {
         Self {
             mode: ViewMode::Chat,
+            session_id: SessionId::from(""),
+            model_label: None,
             input: String::new(),
             cursor: 0,
             history: VecDeque::new(),
             history_cursor: None,
             streaming: None,
             streaming_committed_any: false,
-            reasoning: None,
-            reasoning_committed_any: false,
+            working_since: None,
+            running_tools: Vec::new(),
+            spinner_tick: 0,
+            last_block: None,
+            last_row_blank: true,
             pending_approval: None,
             commands: Vec::new(),
             completion_cursor: 0,
             confirm_exit_at: None,
             approval: None,
+            pending_interjections: VecDeque::new(),
             outgoing_queue: VecDeque::new(),
             outstanding_responses: 0,
+            transcript: VecDeque::new(),
+            transcript_lines: 0,
         }
     }
 
@@ -146,29 +258,117 @@ impl AppState {
     }
 
     /// Bump the outstanding-response counter — call right before
-    /// dispatching a real user message to the agent. The counter stays
-    /// elevated through the inevitable streaming phase and is cleared
-    /// by [`note_response_received`] when `AppEvent::Outgoing` lands.
+    /// dispatching a turn-initiating user message to the agent. The
+    /// counter stays elevated through the inevitable streaming phase and
+    /// is cleared by [`note_response_received`] when `AppEvent::Outgoing`
+    /// lands. Also arms the "working" clock on the leading edge (0 → 1)
+    /// so the animated indicator and its elapsed readout start ticking.
     pub(crate) fn note_response_pending(&mut self) {
+        if self.outstanding_responses == 0 {
+            self.working_since = Some(Instant::now());
+        }
         self.outstanding_responses += 1;
     }
 
     /// Decrement the outstanding-response counter. Idempotent at zero
     /// so spurious `Outgoing` events (e.g. an agent restart sending an
-    /// empty reply) don't underflow the counter.
+    /// empty reply) don't underflow the counter. Disarms the "working"
+    /// clock once the last response lands.
     pub(crate) fn note_response_received(&mut self) {
         self.outstanding_responses = self.outstanding_responses.saturating_sub(1);
+        if self.outstanding_responses == 0 {
+            self.working_since = None;
+        }
     }
 
-    /// Park a user submission until the agent finishes streaming and
-    /// any pending approval resolves. Cleared one-at-a-time by
-    /// [`AppState::dequeue_submission`].
+    /// Force the live "working" state back to idle. Used by `/stop`,
+    /// which cancels the in-flight turn server-side and so never delivers
+    /// the `Outgoing` that would otherwise clear the indicator.
+    pub(crate) fn reset_working(&mut self) {
+        self.outstanding_responses = 0;
+        self.working_since = None;
+        self.clear_stream();
+    }
+
+    /// Whether the animated working indicator should render right now: a
+    /// turn we initiated is in flight and no approval prompt is stealing
+    /// the live region (during an approval the agent is blocked on the
+    /// user, not working).
+    pub(crate) fn show_working(&self) -> bool {
+        self.working_since.is_some() && self.pending_approval.is_none()
+    }
+
+    /// Seconds elapsed since the working clock armed, for the indicator's
+    /// `(Ns · …)` readout. Zero when idle.
+    pub(crate) fn working_elapsed_secs(&self) -> u64 {
+        self.working_since
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Record a tool as started (in flight) until [`take_running_tool`]
+    /// removes it.
+    pub(crate) fn push_running_tool(&mut self, call_id: String) {
+        self.running_tools.push(RunningTool { call_id });
+    }
+
+    /// Remove the in-flight tool matching `call_id` (its completion arrived).
+    pub(crate) fn take_running_tool(&mut self, call_id: &str) -> Option<RunningTool> {
+        self.running_tools
+            .iter()
+            .position(|t| t.call_id == call_id)
+            .map(|i| self.running_tools.remove(i))
+    }
+
+    /// Advance the working-indicator pulse one frame.
+    pub(crate) fn tick_spinner(&mut self) {
+        self.spinner_tick = self.spinner_tick.wrapping_add(1);
+    }
+
+    /// Arm the working clock if it isn't already. Covers turn activity that
+    /// arrives without a local turn-initiating dispatch — a steer that fell
+    /// through to its own turn, or any externally-driven streaming turn on
+    /// this session — so the indicator tracks every streaming turn, not
+    /// just the ones this client started.
+    pub(crate) fn ensure_working_clock(&mut self) {
+        if self.working_since.is_none() {
+            self.working_since = Some(Instant::now());
+        }
+    }
+
+    /// Park a plain message as a mid-turn steer: it has already been
+    /// dispatched to the agent, and this only tracks the line shown under
+    /// the working indicator until a tool boundary commits it to
+    /// scrollback. See [`pending_interjections`].
+    pub(crate) fn queue_interjection(&mut self, text: String) {
+        self.pending_interjections.push_back(text);
+    }
+
+    /// Drain every pending steer line, in submission order. Called when a
+    /// tool block finishes (commit them right after it) or when the turn
+    /// finalises (fallback). Empties the queue.
+    pub(crate) fn take_pending_interjections(&mut self) -> Vec<String> {
+        self.pending_interjections.drain(..).collect()
+    }
+
+    /// Lines to render under the working indicator, in submission order:
+    /// pending steers first (dispatched, awaiting a tool boundary), then
+    /// deferred slash commands (awaiting turn end). Both read as "queued".
+    pub(crate) fn queued_display_lines(&self) -> impl Iterator<Item = &str> {
+        self.pending_interjections
+            .iter()
+            .chain(self.outgoing_queue.iter())
+            .map(String::as_str)
+    }
+
+    /// Park a slash command until the current turn ends. Cleared
+    /// one-at-a-time by [`AppState::dequeue_submission`].
     pub(crate) fn queue_submission(&mut self, text: String) {
         self.outgoing_queue.push_back(text);
     }
 
-    /// Pop the next parked submission, if any. Called by the run loop
-    /// after each `AppEvent::Outgoing` so queued messages dispatch in
+    /// Pop the next parked slash command, if any. Called by the run loop
+    /// after each `AppEvent::Outgoing` so deferred slashes run in
     /// chronological order.
     pub(crate) fn dequeue_submission(&mut self) -> Option<String> {
         self.outgoing_queue.pop_front()
@@ -249,6 +449,12 @@ impl AppState {
 
     pub(crate) fn set_commands(&mut self, commands: Vec<SlashCommand>) {
         self.commands = commands;
+    }
+
+    pub(crate) fn set_model_label(&mut self, label: Option<String>) {
+        self.model_label = label
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
     }
 
     /// Seed the input history from a previously-persisted snapshot. Entries
@@ -367,54 +573,46 @@ impl AppState {
         }
     }
 
-    /// Clear the streaming buffer + reset the "first line committed"
-    /// flag. Called after `Outgoing` finalises the response so the
-    /// next stream starts with `aura> ` again. Also clears any leftover
-    /// reasoning state (normally already flushed before finalize).
+    /// Clear the streaming buffer + reset the "first line committed" flag,
+    /// any open tool-run bracket, and any in-flight tool entries. Called
+    /// after `Outgoing` finalises the response (and by [`reset_working`] on
+    /// `/stop`) so the next answer starts clean.
     pub(crate) fn clear_stream(&mut self) {
         self.streaming = None;
         self.streaming_committed_any = false;
-        self.reasoning = None;
-        self.reasoning_committed_any = false;
+        self.running_tools.clear();
     }
 
-    /// Append a chunk to the in-flight reasoning trace. Mirrors
-    /// [`append_stream_delta`] for the dim reasoning buffer.
-    pub(crate) fn append_reasoning_delta(&mut self, delta: &str) {
-        self.reasoning
-            .get_or_insert_with(String::new)
-            .push_str(delta);
-    }
-
-    /// Drain every newline-terminated reasoning line, leaving the
-    /// trailing partial for the next chunk. Mirrors
-    /// [`drain_complete_stream_lines`].
-    pub(crate) fn drain_complete_reasoning_lines(&mut self) -> Vec<String> {
-        let Some(buf) = self.reasoning.as_mut() else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        while let Some(idx) = buf.find('\n') {
-            let mut line: String = buf.drain(..=idx).collect();
-            line.pop();
-            if line.ends_with('\r') {
-                line.pop();
+    /// Append a committed block to the resize-replay log, evicting the oldest
+    /// blocks once the retained line count exceeds [`TRANSCRIPT_MAX_LINES`]
+    /// (the most recent block is always kept). Called by the scrollback-commit
+    /// helpers right after they insert.
+    pub(crate) fn record_block(&mut self, block: TranscriptBlock) {
+        self.transcript_lines += block_line_count(&block);
+        self.transcript.push_back(block);
+        while self.transcript_lines > TRANSCRIPT_MAX_LINES && self.transcript.len() > 1 {
+            if let Some(evicted) = self.transcript.pop_front() {
+                self.transcript_lines = self
+                    .transcript_lines
+                    .saturating_sub(block_line_count(&evicted));
             }
-            out.push(line);
         }
-        out
     }
 
-    /// Take whatever partial reasoning line remains, leaving
-    /// `reasoning = None`. Returns `None` when empty. Called to flush the
-    /// reasoning run before a tool line / the answer / finalize.
-    pub(crate) fn take_reasoning_partial(&mut self) -> Option<String> {
-        let partial = self.reasoning.take()?;
-        if partial.is_empty() {
-            None
-        } else {
-            Some(partial)
-        }
+    /// Drop the replay log. Called on `/clear` / `/new` / Ctrl-L, where the
+    /// on-screen conversation is intentionally reset — a later resize must not
+    /// resurrect the cleared history.
+    pub(crate) fn clear_transcript(&mut self) {
+        self.transcript.clear();
+        self.transcript_lines = 0;
+    }
+
+    /// Take the replay log out for a resize refresh, leaving it empty. Replay
+    /// re-commits each block through the same helpers, which re-record it — so
+    /// the log rebuilds itself to the same content as a side effect.
+    pub(crate) fn take_transcript(&mut self) -> VecDeque<TranscriptBlock> {
+        self.transcript_lines = 0;
+        std::mem::take(&mut self.transcript)
     }
 
     pub(crate) fn take_input(&mut self) -> Option<String> {
@@ -850,5 +1048,114 @@ mod tests {
         assert_eq!(app.dashboard_kind(), Some(ViewKind::Skills));
         app.exit_dashboard();
         assert_eq!(app.dashboard_kind(), None);
+    }
+
+    #[test]
+    fn working_clock_arms_on_first_pending_and_clears_at_zero() {
+        let mut app = AppState::new();
+        assert!(!app.show_working());
+        app.note_response_pending();
+        assert!(app.show_working());
+        app.note_response_pending();
+        app.note_response_received();
+        assert!(app.show_working(), "still one outstanding response");
+        app.note_response_received();
+        assert!(!app.show_working(), "cleared once the last response lands");
+    }
+
+    #[test]
+    fn approval_hides_working_indicator() {
+        let mut app = AppState::new();
+        app.note_response_pending();
+        assert!(app.show_working());
+        app.set_pending_approval(ApprovalChatEntry {
+            tool: "Bash".into(),
+            accesses: Vec::new(),
+            params_preview: String::new(),
+            state: ApprovalChatState::Pending { selected: 0 },
+        });
+        assert!(
+            !app.show_working(),
+            "an approval prompt owns the live region instead"
+        );
+    }
+
+    #[test]
+    fn ensure_working_clock_is_idempotent() {
+        let mut app = AppState::new();
+        app.ensure_working_clock();
+        let armed = app.working_since;
+        assert!(armed.is_some());
+        app.ensure_working_clock();
+        assert_eq!(app.working_since, armed, "second call must not re-arm");
+    }
+
+    #[test]
+    fn steers_and_deferred_slashes_share_the_queued_display() {
+        let mut app = AppState::new();
+        app.queue_interjection("steer one".into());
+        app.queue_submission("/skills".into());
+        let shown: Vec<&str> = app.queued_display_lines().collect();
+        assert_eq!(shown, vec!["steer one", "/skills"]);
+
+        // A tool boundary drains only the steers; the deferred slash stays.
+        assert_eq!(app.take_pending_interjections(), vec!["steer one"]);
+        let shown: Vec<&str> = app.queued_display_lines().collect();
+        assert_eq!(shown, vec!["/skills"]);
+    }
+
+    #[test]
+    fn reset_working_returns_to_idle_without_dropping_steers() {
+        let mut app = AppState::new();
+        app.note_response_pending();
+        app.append_stream_delta("half a sentence");
+        app.queue_interjection("steer".into());
+        app.reset_working();
+        assert!(!app.show_working());
+        assert!(!app.is_busy());
+        assert!(app.streaming.is_none());
+        // The caller commits pending steers itself before resetting, so
+        // reset must not silently discard them.
+        assert_eq!(app.pending_interjections.len(), 1);
+    }
+
+    #[test]
+    fn transcript_evicts_oldest_past_cap_but_keeps_newest() {
+        let mut app = AppState::new();
+        // A lone oversized block is retained — the newest block is never
+        // evicted, however large.
+        app.record_block(TranscriptBlock::Answer(vec![
+            Line::from("x");
+            TRANSCRIPT_MAX_LINES + 50
+        ]));
+        assert_eq!(app.transcript.len(), 1);
+        assert_eq!(app.transcript_lines, TRANSCRIPT_MAX_LINES + 50);
+
+        // A newer block pushes the total over the cap, evicting the old one.
+        app.record_block(TranscriptBlock::User("hi".into()));
+        assert_eq!(app.transcript.len(), 1);
+        assert!(matches!(
+            app.transcript.front(),
+            Some(TranscriptBlock::User(_))
+        ));
+        assert_eq!(app.transcript_lines, 1);
+    }
+
+    #[test]
+    fn transcript_clear_and_take_empty_the_log() {
+        let mut app = AppState::new();
+        app.record_block(TranscriptBlock::User("a".into()));
+        app.record_block(TranscriptBlock::Tool(vec![Line::from("b")]));
+        assert_eq!(app.transcript.len(), 2);
+
+        let taken = app.take_transcript();
+        assert_eq!(taken.len(), 2, "take returns the blocks for replay");
+        assert!(app.transcript.is_empty(), "take leaves the log empty");
+        assert_eq!(app.transcript_lines, 0);
+
+        app.record_block(TranscriptBlock::Other(vec![Line::from("c")]));
+        app.clear_transcript();
+        assert!(app.transcript.is_empty());
+        assert_eq!(app.transcript_lines, 0);
     }
 }
