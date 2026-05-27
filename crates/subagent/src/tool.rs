@@ -480,6 +480,21 @@ impl Tool for SpawnSubagentTool {
         TOOL_WAIT_BACKSTOP
     }
 
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        let kind = params.get("subagent_type").and_then(Value::as_str)?;
+        let summary = params
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let label = if summary.is_empty() {
+            kind.to_string()
+        } else {
+            format!("{kind}: {summary}")
+        };
+        aura_tools::progress::preview_arg(&label)
+    }
+
     async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
         let ParsedSpawn { request } =
             parse_spawn_request(&params, &self.registry).map_err(ToolError::InvalidParams)?;

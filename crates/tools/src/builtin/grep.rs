@@ -106,6 +106,12 @@ impl Tool for GrepTool {
         Duration::from_secs(60)
     }
 
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        let pattern = params.get("pattern").and_then(Value::as_str)?;
+        let path = params.get("path").and_then(Value::as_str);
+        crate::progress::preview_search(pattern, path)
+    }
+
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
         params
             .get("path")

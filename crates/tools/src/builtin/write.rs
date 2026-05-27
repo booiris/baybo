@@ -60,6 +60,13 @@ impl Tool for WriteTool {
         })
     }
 
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        params
+            .get("file_path")
+            .and_then(Value::as_str)
+            .map(|s| crate::progress::preview_path(Path::new(s)))
+    }
+
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
         let Some(s) = params.get("file_path").and_then(|v| v.as_str()) else {
             return Vec::new();

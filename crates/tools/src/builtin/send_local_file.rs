@@ -92,6 +92,13 @@ impl Tool for SendFileTool {
         Duration::from_secs(60)
     }
 
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        params
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|s| crate::progress::preview_path(Path::new(s)))
+    }
+
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
         params
             .get("path")

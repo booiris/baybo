@@ -127,6 +127,13 @@ impl Tool for CronCreateTool {
         })
     }
 
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        params
+            .get("prompt")
+            .and_then(Value::as_str)
+            .and_then(aura_tools::progress::preview_arg)
+    }
+
     async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
         let p: CreateParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
@@ -210,6 +217,13 @@ impl Tool for CronDeleteTool {
             },
             "required": ["id"]
         })
+    }
+
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        params
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(aura_tools::progress::preview_arg)
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
