@@ -2048,10 +2048,11 @@ function roleFromString(role: string): 'user' | 'assistant' | 'system' {
 }
 
 interface HistoryWorkStepDto {
-  kind: string;
+  kind: 'reasoning' | 'prose' | 'tool';
   text?: string;
   tool?: string | null;
   tool_label?: string | null;
+  tool_status?: string | null;
   tool_summary?: string | null;
 }
 
@@ -2061,7 +2062,7 @@ interface HistoryRowDto {
   /** `'message'` (default) or `'work'` — see the gateway's
    *  `ChatTranscriptItem`. A `work` row is the server's reconstruction of
    *  a tool-using turn's collapsed work block. */
-  kind?: string;
+  kind?: 'message' | 'work';
   role: string;
   text: string;
   has_attachments: boolean;
@@ -2088,12 +2089,14 @@ function historyRowToTranscript(sessionId: string, row: HistoryRowDto): Transcri
       workEndedAt: row.work_ended_at ? Date.parse(row.work_ended_at) : undefined,
       steps: (row.steps ?? []).map((s, i) => ({
         key: `hist-${sessionId}-${row.ordinal}-${i}`,
-        kind: (s.kind as WorkStep['kind']) ?? 'prose',
+        kind: s.kind,
         text: s.text,
         tool: s.tool ?? undefined,
         toolLabel: s.tool_label ?? null,
+        // Backend sends `ok` / `error` / `denied` (or null when the result
+        // didn't land); `undefined` renders neutral, matching live.
+        toolStatus: (s.tool_status ?? undefined) as WorkStep['toolStatus'],
         toolSummary: s.tool_summary ?? undefined,
-        toolStatus: s.kind === 'tool' ? 'ok' : undefined,
       })),
     };
   }

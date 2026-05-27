@@ -149,11 +149,32 @@ pub struct ChatSessionCredential {
     pub channel_token_header: &'static str,
 }
 
+/// Discriminator for [`ChatTranscriptItem`] — serialized as
+/// `"message"` / `"work"`.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptItemKind {
+    /// A user or final-assistant bubble.
+    Message,
+    /// A reconstructed collapsed work block for a tool-using turn.
+    Work,
+}
+
+/// Kind of a reconstructed [`ChatWorkStep`] — serialized as
+/// `"reasoning"` / `"prose"` / `"tool"`.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkStepKind {
+    Reasoning,
+    Prose,
+    Tool,
+}
+
 /// One transcript row, flattened from `ChatMessage` into a shape the
 /// web client can render without re-implementing the content-block
 /// matcher. Two shapes ride this struct, discriminated by [`Self::kind`]:
-/// `"message"` (a user / final-assistant bubble) and `"work"` (a
-/// reconstructed collapsed work block for a tool-using turn — see
+/// a `Message` (user / final-assistant bubble) or a `Work` (reconstructed
+/// collapsed work block for a tool-using turn — see
 /// [`reconstruct_transcript`]).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatTranscriptItem {
@@ -163,8 +184,8 @@ pub struct ChatTranscriptItem {
     /// `work` item carries the ordinal of the turn's first intermediate
     /// message so it sorts just after the user turn that spawned it.
     pub ordinal: i64,
-    /// `"message"` or `"work"`.
-    pub kind: String,
+    /// Message bubble vs. reconstructed work block.
+    pub kind: TranscriptItemKind,
     /// `"user"` or `"assistant"` (or `"system"`). String rather than
     /// enum to keep the wire forgiving. Empty for `work` items.
     pub role: String,
@@ -203,22 +224,67 @@ pub struct ChatTranscriptItem {
 /// carries the call's name + a re-derived result summary.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatWorkStep {
-    /// `"reasoning"`, `"prose"`, or `"tool"`.
-    pub kind: String,
+    pub kind: WorkStepKind,
     /// Reasoning trace or mid-turn narration body. Empty for `tool` steps.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
-    /// Tool name, set when `kind == "tool"`.
+    /// Tool name, set when `kind == Tool`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
     /// Short, best-effort label for the call (a path / command / url
     /// pulled from the call input), absent the live `progress_label`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_label: Option<String>,
+    /// `"ok"` / `"error"` / `"denied"`, derived from the persisted result
+    /// so reload can color-code failures the way the live view did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_status: Option<String>,
     /// One-line summary re-derived from the persisted tool result. `None`
     /// when the result for this call didn't land in the fetched window.
+    ///
+    /// Deliberately a snippet of the actual result, not a content-light
+    /// count: this surface is the bearer-gated, operator-only chat reload
+    /// (never the live multi-channel fan-out), so it favors debugging
+    /// usefulness. Unlike the live `ToolCompleted.summary` it is NOT run
+    /// through `sanitize_stream_fragment`, so it can show raw tool output
+    /// the live UI withheld — acceptable for the operator's own view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_summary: Option<String>,
+}
+
+impl ChatWorkStep {
+    fn reasoning(text: String) -> Self {
+        Self {
+            kind: WorkStepKind::Reasoning,
+            text,
+            tool: None,
+            tool_label: None,
+            tool_status: None,
+            tool_summary: None,
+        }
+    }
+
+    fn prose(text: String) -> Self {
+        Self {
+            kind: WorkStepKind::Prose,
+            text,
+            tool: None,
+            tool_label: None,
+            tool_status: None,
+            tool_summary: None,
+        }
+    }
+
+    fn tool(tool: String, tool_label: Option<String>) -> Self {
+        Self {
+            kind: WorkStepKind::Tool,
+            text: String::new(),
+            tool: Some(tool),
+            tool_label,
+            tool_status: None,
+            tool_summary: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -915,7 +981,7 @@ impl WorkAccumulator {
             let started = self.started;
             items.push(ChatTranscriptItem {
                 ordinal: self.ordinal.unwrap_or_default(),
-                kind: "work".to_owned(),
+                kind: TranscriptItemKind::Work,
                 role: String::new(),
                 text: String::new(),
                 has_attachments: false,
@@ -966,35 +1032,18 @@ fn reconstruct_transcript(tail: Vec<(i64, DateTime<Utc>, ChatMessage)>) -> Vec<C
                         ContentBlock::Thinking { content, .. } => {
                             let text = thinking_text(content);
                             if !text.is_empty() {
-                                work.steps.push(ChatWorkStep {
-                                    kind: "reasoning".to_owned(),
-                                    text,
-                                    tool: None,
-                                    tool_label: None,
-                                    tool_summary: None,
-                                });
+                                work.steps.push(ChatWorkStep::reasoning(text));
                             }
                         }
                         ContentBlock::Text(t) if !t.trim().is_empty() => {
-                            work.steps.push(ChatWorkStep {
-                                kind: "prose".to_owned(),
-                                text: t.clone(),
-                                tool: None,
-                                tool_label: None,
-                                tool_summary: None,
-                            });
+                            work.steps.push(ChatWorkStep::prose(t.clone()));
                         }
                         ContentBlock::ToolUse {
                             id, name, input, ..
                         } => {
                             work.pending_tools.insert(id.clone(), work.steps.len());
-                            work.steps.push(ChatWorkStep {
-                                kind: "tool".to_owned(),
-                                text: String::new(),
-                                tool: Some(name.clone()),
-                                tool_label: tool_label(input),
-                                tool_summary: None,
-                            });
+                            work.steps
+                                .push(ChatWorkStep::tool(name.clone(), tool_label(input)));
                         }
                         _ => {}
                     }
@@ -1018,6 +1067,7 @@ fn reconstruct_transcript(tail: Vec<(i64, DateTime<Utc>, ChatMessage)>) -> Vec<C
                         && let Some(&idx) = work.pending_tools.get(tool_use_id)
                         && let Some(step) = work.steps.get_mut(idx)
                     {
+                        step.tool_status = Some(tool_result_status(content));
                         step.tool_summary = Some(summarize_tool_result(content));
                     }
                 }
@@ -1062,7 +1112,7 @@ fn message_item(
     }
     Some(ChatTranscriptItem {
         ordinal,
-        kind: "message".to_owned(),
+        kind: TranscriptItemKind::Message,
         role: role.to_owned(),
         text,
         has_attachments,
@@ -1119,6 +1169,24 @@ fn summarize_tool_result(content: &str) -> String {
     truncate(&collapse_ws(strip_tool_output_envelope(content)), 140)
 }
 
+/// Best-effort `ok` / `error` / `denied` status for a persisted tool
+/// result. The structured outcome isn't stored, so this keys off the
+/// agent's own result-formatting prefixes (`runtime::agent_loop` writes
+/// `Error: …` for failures and a fixed `The user explicitly denied
+/// permission …` message for denied calls) — enough for reload to
+/// color-code failures the way the live view did.
+fn tool_result_status(content: &str) -> String {
+    let inner = strip_tool_output_envelope(content);
+    let inner = inner.trim_start();
+    if inner.starts_with("The user explicitly denied permission") {
+        "denied".to_owned()
+    } else if inner.starts_with("Error:") {
+        "error".to_owned()
+    } else {
+        "ok".to_owned()
+    }
+}
+
 /// Strip the `<tool_output …> … </tool_output>` wrapper the agent puts
 /// around untrusted tool results before they enter the transcript. Returns
 /// the input unchanged when it isn't wrapped.
@@ -1146,4 +1214,220 @@ fn truncate(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(max_chars).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn ts(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(secs, 0)
+            .single()
+            .expect("valid timestamp")
+    }
+    fn text(s: &str) -> ContentBlock {
+        ContentBlock::Text(s.to_owned())
+    }
+    fn thinking(s: &str) -> ContentBlock {
+        ContentBlock::Thinking {
+            id: None,
+            content: vec![ThinkingContent::Text {
+                text: s.to_owned(),
+                signature: None,
+            }],
+        }
+    }
+    fn tool_use(id: &str, name: &str, input: serde_json::Value) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            input,
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn reconstruct_groups_tool_turn_into_work_block_before_answer() {
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("write hello")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![
+                    thinking("I'll write it"),
+                    text("let me try"),
+                    tool_use("c1", "Write", serde_json::json!({"path": "/tmp/x"})),
+                ]),
+            ),
+            (
+                4,
+                ts(7),
+                ChatMessage::tool_result(
+                    "c1".to_owned(),
+                    "<tool_output name=\"Write\">Error: nope</tool_output>".to_owned(),
+                ),
+            ),
+            (
+                5,
+                ts(9),
+                ChatMessage::assistant(vec![text("done, sort of")]),
+            ),
+        ];
+        let items = reconstruct_transcript(tail);
+        assert_eq!(items.len(), 3);
+
+        assert!(matches!(items[0].kind, TranscriptItemKind::Message));
+        assert_eq!(items[0].role, "user");
+        assert_eq!(items[0].text, "write hello");
+
+        let work = &items[1];
+        assert!(matches!(work.kind, TranscriptItemKind::Work));
+        assert_eq!(
+            work.ordinal, 3,
+            "work block inherits first intermediate ordinal"
+        );
+        assert_eq!(work.work_started_at, Some(ts(3)));
+        assert_eq!(work.work_ended_at, Some(ts(9)), "ends at the final reply");
+        assert_eq!(work.steps.len(), 3);
+        assert!(matches!(work.steps[0].kind, WorkStepKind::Reasoning));
+        assert_eq!(work.steps[0].text, "I'll write it");
+        assert!(matches!(work.steps[1].kind, WorkStepKind::Prose));
+        assert_eq!(work.steps[1].text, "let me try");
+        assert!(matches!(work.steps[2].kind, WorkStepKind::Tool));
+        assert_eq!(work.steps[2].tool.as_deref(), Some("Write"));
+        assert_eq!(work.steps[2].tool_label.as_deref(), Some("/tmp/x"));
+        assert_eq!(work.steps[2].tool_status.as_deref(), Some("error"));
+        assert_eq!(work.steps[2].tool_summary.as_deref(), Some("Error: nope"));
+
+        assert!(matches!(items[2].kind, TranscriptItemKind::Message));
+        assert_eq!(items[2].role, "assistant");
+        assert_eq!(items[2].text, "done, sort of");
+    }
+
+    #[test]
+    fn reconstruct_flushes_trailing_work_block_without_final_answer() {
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![tool_use(
+                    "c1",
+                    "Bash",
+                    serde_json::json!({"command": "ls"}),
+                )]),
+            ),
+            (
+                4,
+                ts(5),
+                ChatMessage::tool_result("c1".to_owned(), "ok output".to_owned()),
+            ),
+        ];
+        let items = reconstruct_transcript(tail);
+        assert_eq!(items.len(), 2);
+        let work = &items[1];
+        assert!(matches!(work.kind, TranscriptItemKind::Work));
+        assert_eq!(work.work_ended_at, Some(ts(5)), "ends at last seen row");
+        assert_eq!(work.steps.len(), 1);
+        assert_eq!(work.steps[0].tool_status.as_deref(), Some("ok"));
+        assert_eq!(work.steps[0].tool_summary.as_deref(), Some("ok output"));
+    }
+
+    #[test]
+    fn reconstruct_drops_internal_rows() {
+        let tail = vec![
+            (1, ts(1), ChatMessage::system(vec![text("system prompt")])),
+            (2, ts(2), ChatMessage::agent_context(vec![text("injected")])),
+            (3, ts(3), ChatMessage::user(vec![text("hi")])),
+            (4, ts(4), ChatMessage::assistant(vec![text("hello")])),
+        ];
+        let items = reconstruct_transcript(tail);
+        assert_eq!(items.len(), 2);
+        assert!(
+            items
+                .iter()
+                .all(|i| matches!(i.kind, TranscriptItemKind::Message))
+        );
+        assert_eq!(items[0].text, "hi");
+        assert_eq!(items[1].text, "hello");
+    }
+
+    #[test]
+    fn reconstruct_leaves_summary_none_when_tool_result_absent() {
+        let tail = vec![(
+            3,
+            ts(3),
+            ChatMessage::assistant(vec![tool_use(
+                "c1",
+                "Bash",
+                serde_json::json!({"command": "ls"}),
+            )]),
+        )];
+        let items = reconstruct_transcript(tail);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].steps[0].tool_summary.is_none());
+        assert!(items[0].steps[0].tool_status.is_none());
+    }
+
+    #[test]
+    fn message_item_skips_empty_keeps_text() {
+        let only_tool = ChatMessage::assistant(vec![tool_use("c1", "X", serde_json::json!({}))]);
+        assert!(message_item(1, ts(1), "assistant", &only_tool).is_none());
+
+        let multi = ChatMessage::assistant(vec![text("a"), text("b")]);
+        let item = message_item(1, ts(1), "assistant", &multi).expect("non-empty");
+        assert_eq!(item.text, "a\nb");
+        assert!(!item.has_attachments);
+    }
+
+    #[test]
+    fn thinking_text_joins_and_skips_redacted() {
+        let blocks = vec![
+            ThinkingContent::Text {
+                text: "step 1".to_owned(),
+                signature: None,
+            },
+            ThinkingContent::Redacted {
+                data: "opaque".to_owned(),
+            },
+            ThinkingContent::Summary {
+                text: "tl;dr".to_owned(),
+            },
+        ];
+        assert_eq!(thinking_text(&blocks), "step 1\ntl;dr");
+    }
+
+    #[test]
+    fn tool_label_pulls_first_known_key() {
+        assert_eq!(
+            tool_label(&serde_json::json!({"command": "ls -la"})).as_deref(),
+            Some("ls -la")
+        );
+        assert_eq!(
+            tool_label(&serde_json::json!({"path": "/a/b"})).as_deref(),
+            Some("/a/b")
+        );
+        assert_eq!(tool_label(&serde_json::json!({"other": "x"})), None);
+        assert_eq!(tool_label(&serde_json::json!("not an object")), None);
+    }
+
+    #[test]
+    fn strip_envelope_and_status() {
+        assert_eq!(
+            strip_tool_output_envelope("<tool_output name=\"Read\">200 lines</tool_output>"),
+            "200 lines"
+        );
+        assert_eq!(strip_tool_output_envelope("no envelope"), "no envelope");
+
+        assert_eq!(
+            tool_result_status("<tool_output name=\"x\">Error: boom</tool_output>"),
+            "error"
+        );
+        assert_eq!(
+            tool_result_status("The user explicitly denied permission for tool 'x'."),
+            "denied"
+        );
+        assert_eq!(tool_result_status("all good"), "ok");
+    }
 }

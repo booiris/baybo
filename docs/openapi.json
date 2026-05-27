@@ -2660,7 +2660,7 @@
       },
       "ChatTranscriptItem": {
         "type": "object",
-        "description": "One transcript row, flattened from `ChatMessage` into a shape the\nweb client can render without re-implementing the content-block\nmatcher. Two shapes ride this struct, discriminated by [`Self::kind`]:\n`\"message\"` (a user / final-assistant bubble) and `\"work\"` (a\nreconstructed collapsed work block for a tool-using turn — see\n[`reconstruct_transcript`]).",
+        "description": "One transcript row, flattened from `ChatMessage` into a shape the\nweb client can render without re-implementing the content-block\nmatcher. Two shapes ride this struct, discriminated by [`Self::kind`]:\na `Message` (user / final-assistant bubble) or a `Work` (reconstructed\ncollapsed work block for a tool-using turn — see\n[`reconstruct_transcript`]).",
         "required": [
           "ordinal",
           "kind",
@@ -2680,8 +2680,8 @@
             "description": "`true` when this row had non-text content (image / audio /\nfile). The web client currently shows a placeholder."
           },
           "kind": {
-            "type": "string",
-            "description": "`\"message\"` or `\"work\"`."
+            "$ref": "#/components/schemas/TranscriptItemKind",
+            "description": "Message bubble vs. reconstructed work block."
           },
           "ordinal": {
             "type": "integer",
@@ -2728,8 +2728,7 @@
         ],
         "properties": {
           "kind": {
-            "type": "string",
-            "description": "`\"reasoning\"`, `\"prose\"`, or `\"tool\"`."
+            "$ref": "#/components/schemas/WorkStepKind"
           },
           "text": {
             "type": "string",
@@ -2740,7 +2739,7 @@
               "string",
               "null"
             ],
-            "description": "Tool name, set when `kind == \"tool\"`."
+            "description": "Tool name, set when `kind == Tool`."
           },
           "tool_label": {
             "type": [
@@ -2749,12 +2748,19 @@
             ],
             "description": "Short, best-effort label for the call (a path / command / url\npulled from the call input), absent the live `progress_label`."
           },
+          "tool_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`\"ok\"` / `\"error\"` / `\"denied\"`, derived from the persisted result\nso reload can color-code failures the way the live view did."
+          },
           "tool_summary": {
             "type": [
               "string",
               "null"
             ],
-            "description": "One-line summary re-derived from the persisted tool result. `None`\nwhen the result for this call didn't land in the fetched window."
+            "description": "One-line summary re-derived from the persisted tool result. `None`\nwhen the result for this call didn't land in the fetched window.\n\nDeliberately a snippet of the actual result, not a content-light\ncount: this surface is the bearer-gated, operator-only chat reload\n(never the live multi-channel fan-out), so it favors debugging\nusefulness. Unlike the live `ToolCompleted.summary` it is NOT run\nthrough `sanitize_stream_fragment`, so it can show raw tool output\nthe live UI withheld — acceptable for the operator's own view."
           }
         }
       },
@@ -3807,6 +3813,14 @@
           }
         }
       },
+      "TranscriptItemKind": {
+        "type": "string",
+        "description": "Discriminator for [`ChatTranscriptItem`] — serialized as\n`\"message\"` / `\"work\"`.",
+        "enum": [
+          "message",
+          "work"
+        ]
+      },
       "UnsetConfigRequest": {
         "type": "object",
         "description": "`DELETE /v1/config` body.",
@@ -3892,6 +3906,15 @@
             "description": "`supports_vision` override, or `null` to clear."
           }
         }
+      },
+      "WorkStepKind": {
+        "type": "string",
+        "description": "Kind of a reconstructed [`ChatWorkStep`] — serialized as\n`\"reasoning\"` / `\"prose\"` / `\"tool\"`.",
+        "enum": [
+          "reasoning",
+          "prose",
+          "tool"
+        ]
       }
     }
   },

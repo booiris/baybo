@@ -696,8 +696,8 @@ export interface components {
          * @description One transcript row, flattened from `ChatMessage` into a shape the
          *     web client can render without re-implementing the content-block
          *     matcher. Two shapes ride this struct, discriminated by [`Self::kind`]:
-         *     `"message"` (a user / final-assistant bubble) and `"work"` (a
-         *     reconstructed collapsed work block for a tool-using turn — see
+         *     a `Message` (user / final-assistant bubble) or a `Work` (reconstructed
+         *     collapsed work block for a tool-using turn — see
          *     [`reconstruct_transcript`]).
          */
         ChatTranscriptItem: {
@@ -717,8 +717,8 @@ export interface components {
              *     file). The web client currently shows a placeholder.
              */
             has_attachments: boolean;
-            /** @description `"message"` or `"work"`. */
-            kind: string;
+            /** @description Message bubble vs. reconstructed work block. */
+            kind: components["schemas"]["TranscriptItemKind"];
             /**
              * Format: int64
              * @description Absolute `session_messages.ordinal` of this row. Stable for the
@@ -762,11 +762,10 @@ export interface components {
          *     carries the call's name + a re-derived result summary.
          */
         ChatWorkStep: {
-            /** @description `"reasoning"`, `"prose"`, or `"tool"`. */
-            kind: string;
+            kind: components["schemas"]["WorkStepKind"];
             /** @description Reasoning trace or mid-turn narration body. Empty for `tool` steps. */
             text?: string;
-            /** @description Tool name, set when `kind == "tool"`. */
+            /** @description Tool name, set when `kind == Tool`. */
             tool?: string | null;
             /**
              * @description Short, best-effort label for the call (a path / command / url
@@ -774,8 +773,20 @@ export interface components {
              */
             tool_label?: string | null;
             /**
+             * @description `"ok"` / `"error"` / `"denied"`, derived from the persisted result
+             *     so reload can color-code failures the way the live view did.
+             */
+            tool_status?: string | null;
+            /**
              * @description One-line summary re-derived from the persisted tool result. `None`
              *     when the result for this call didn't land in the fetched window.
+             *
+             *     Deliberately a snippet of the actual result, not a content-light
+             *     count: this surface is the bearer-gated, operator-only chat reload
+             *     (never the live multi-channel fan-out), so it favors debugging
+             *     usefulness. Unlike the live `ToolCompleted.summary` it is NOT run
+             *     through `sanitize_stream_fragment`, so it can show raw tool output
+             *     the live UI withheld — acceptable for the operator's own view.
              */
             tool_summary?: string | null;
         };
@@ -1185,6 +1196,12 @@ export interface components {
             items: components["schemas"]["TraceSessionSummary"][];
             total: number;
         };
+        /**
+         * @description Discriminator for [`ChatTranscriptItem`] — serialized as
+         *     `"message"` / `"work"`.
+         * @enum {string}
+         */
+        TranscriptItemKind: "message" | "work";
         /** @description `DELETE /v1/config` body. */
         UnsetConfigRequest: {
             path: string;
@@ -1219,6 +1236,12 @@ export interface components {
             /** @description `supports_vision` override, or `null` to clear. */
             supports_vision?: boolean | null;
         };
+        /**
+         * @description Kind of a reconstructed [`ChatWorkStep`] — serialized as
+         *     `"reasoning"` / `"prose"` / `"tool"`.
+         * @enum {string}
+         */
+        WorkStepKind: "reasoning" | "prose" | "tool";
     };
     responses: never;
     parameters: never;
