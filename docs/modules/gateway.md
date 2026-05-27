@@ -586,6 +586,20 @@ exchanges the bearer for a short-lived `web/` channel-token via `POST
 /v1/chat/sessions`, then opens `/v1/channel-ws` (co-hosted on this same
 admin listener) with that token.
 
+`GET /v1/chat/sessions/:id` returns a typed transcript: each
+`ChatTranscriptItem` is either a `message` (user / final-assistant bubble)
+or a `work` item — a reconstructed collapsed work block for a tool-using
+turn. `reconstruct_transcript` folds the turn's persisted intermediate rows
+(`Thinking` → reasoning, `ToolUse` + paired `ToolResult` → a tool step with
+a re-derived summary and `ok`/`error`/`denied` status, mid-turn `Text` →
+prose) into one item before the final answer, so a reload shows the same
+`Worked Xs ›` block the live view did even though turn-progress events are
+never persisted. The sidebar preview (`GET /v1/chat/sessions`) uses a single
+indexed `load_last_user_message` lookup, so a prompt buried under a long
+tool loop is still found. See `docs/turn-progress-events.md` for the
+operator-only raw-tool-output disclosure and the message-only WS catch-up
+caveat.
+
 **Channel listener (loopback TCP, vault-issued tokens)** —
 `auth::channel::require_channel_auth`:
 

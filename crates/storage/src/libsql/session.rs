@@ -988,6 +988,60 @@ impl SessionStore for LibsqlSessionStore {
         Ok(out)
     }
 
+    async fn load_last_user_message(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<(DateTime<Utc>, aura_model::ChatMessage)>> {
+        let conn = self.pool.conn();
+        // Newest human-authored row (source `user` / `user_interjection`,
+        // i.e. `from_user`). The partial active index makes `ORDER BY
+        // ordinal DESC LIMIT 1` a single back-of-index probe regardless of
+        // how many tool/agent rows the turn appended after the prompt.
+        let mut rows = conn
+            .query(
+                "SELECT created_at, role, content, source FROM session_messages \
+                 WHERE session_id = ?1 AND superseded_by IS NULL \
+                   AND source IN ('user', 'user_interjection') \
+                 ORDER BY ordinal DESC \
+                 LIMIT 1",
+                libsql::params![session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql query last user message: {e}"))
+            })?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let created_us: i64 = row
+            .get(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get created_at: {e}")))?;
+        let created_at = super::time::from_us(created_us).ok_or_else(|| {
+            StorageError::Storage(format!(
+                "session_messages.created_at out of range: {created_us}"
+            ))
+        })?;
+        let role: String = row
+            .get(1)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get role: {e}")))?;
+        let content_json: String = row
+            .get(2)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get content: {e}")))?;
+        let source_str: String = row
+            .get(3)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get source: {e}")))?;
+        let content = serde_json::from_str(&content_json)
+            .map_err(|e| StorageError::Storage(format!("deserialize message content: {e}")))?;
+        Ok(Some((
+            created_at,
+            rehydrate_message(&role, content, &source_str)?,
+        )))
+    }
+
     async fn load_session_messages_with_supersede(
         &self,
         session_id: &SessionId,
@@ -1306,6 +1360,109 @@ mod tests {
             .await
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_last_user_message_finds_freshest_human_turn_past_tool_churn() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+        let session = make_root_session("preview-me");
+        store.save(&session).await.unwrap();
+        let text = |s: &str| vec![aura_model::ContentBlock::Text(s.to_owned())];
+
+        // No user turn yet -> None.
+        assert!(
+            store
+                .load_last_user_message(&session.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        store
+            .append_session_message(
+                &session.id,
+                &aura_model::ChatMessage::user(text("first prompt")),
+            )
+            .await
+            .unwrap();
+        store
+            .append_session_message(
+                &session.id,
+                &aura_model::ChatMessage::assistant(text("first reply")),
+            )
+            .await
+            .unwrap();
+        store
+            .append_session_message(
+                &session.id,
+                &aura_model::ChatMessage::user(text("the freshest prompt")),
+            )
+            .await
+            .unwrap();
+        // A long tool loop after the prompt: agent-sourced rows that must
+        // not shadow the user's turn (the bug the targeted query fixes).
+        for i in 0..12 {
+            store
+                .append_session_message(
+                    &session.id,
+                    &aura_model::ChatMessage::assistant(text(&format!("tool churn {i}"))),
+                )
+                .await
+                .unwrap();
+        }
+
+        let (_, msg) = store
+            .load_last_user_message(&session.id)
+            .await
+            .unwrap()
+            .expect("a user turn");
+        assert!(msg.from_user());
+        assert_eq!(
+            msg.content,
+            text("the freshest prompt"),
+            "returns the newest human-authored turn, not the trailing agent rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_last_user_message_counts_interjections_not_agent_user_rows() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+        let session = make_root_session("interjection-me");
+        store.save(&session).await.unwrap();
+        let text = |s: &str| vec![aura_model::ContentBlock::Text(s.to_owned())];
+
+        store
+            .append_session_message(&session.id, &aura_model::ChatMessage::user(text("genuine")))
+            .await
+            .unwrap();
+        store
+            .append_session_message(
+                &session.id,
+                &aura_model::ChatMessage::user_interjection(text("interjected")),
+            )
+            .await
+            .unwrap();
+        // Agent-injected Role::User row (e.g. a skill reminder) must not count.
+        store
+            .append_session_message(
+                &session.id,
+                &aura_model::ChatMessage::agent_context(text("injected reminder")),
+            )
+            .await
+            .unwrap();
+
+        let (_, msg) = store
+            .load_last_user_message(&session.id)
+            .await
+            .unwrap()
+            .expect("a user turn");
+        assert_eq!(
+            msg.content,
+            text("interjected"),
+            "interjection is human-authored; agent_context is not"
+        );
     }
 
     #[tokio::test]

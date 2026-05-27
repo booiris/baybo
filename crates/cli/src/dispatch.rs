@@ -22,6 +22,9 @@ pub async fn run(ctx: &CommandContext, cmd: Commands) -> Result<CommandOutput> {
         Commands::Status { live } => commands::status::handle(ctx, live).await,
         Commands::Doctor => commands::doctor::handle(ctx).await,
         Commands::Completion { shell } => commands::completion::handle(shell),
+        Commands::Prompt { .. } => Err(crate::error::CliError::UnknownCommand(
+            "`prompt` runs a one-shot turn; main.rs handles it before dispatch".into(),
+        )),
         Commands::Tui { .. } => Err(crate::error::CliError::UnknownCommand(
             "`tui` is an interactive session; main.rs handles it before dispatch".into(),
         )),

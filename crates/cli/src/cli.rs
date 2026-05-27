@@ -172,6 +172,35 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: CostCmd,
     },
+    /// One-shot prompt: send PROMPT to Aura, stream the assistant's
+    /// answer to stdout, then exit — the non-interactive sibling of
+    /// `tui`. With no PROMPT argument the prompt is read from stdin, so
+    /// `git diff | aura prompt "review this"` and `cat task.md | aura
+    /// prompt` both work.
+    ///
+    /// Runs against a live `aura gateway` if one is up; otherwise builds
+    /// the agent runtime in-process for the single turn, so no separate
+    /// gateway is required.
+    Prompt {
+        /// The prompt text. Omit to read it from stdin.
+        prompt: Option<String>,
+        /// Resume an existing session by id: the agent keeps that
+        /// session's context and only the new answer is printed. Mirrors
+        /// `tui --session`.
+        #[arg(long, value_name = "SESSION_ID")]
+        session: Option<String>,
+        /// Auto-approve every tool-approval prompt instead of the default
+        /// auto-deny. DANGEROUS — file writes and shell commands run with
+        /// no confirmation; the headless equivalent of allowing everything.
+        #[arg(short = 'y', long = "dangerously-allow-all")]
+        dangerously_allow_all: bool,
+        /// Error out if the turn produces no reply within this many
+        /// seconds (`0` waits indefinitely). Bounds the wait so a turn the
+        /// runtime rejects *before* replying — budget, rate-limit or
+        /// security — can't hang the command.
+        #[arg(long, value_name = "SECONDS", default_value_t = 300)]
+        timeout: u64,
+    },
     /// Launch the interactive Ratatui chat session.
     ///
     /// Connects to an `aura gateway` over the `/v1/channel-ws`

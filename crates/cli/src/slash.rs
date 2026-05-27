@@ -245,6 +245,7 @@ enum DispatchError {
 fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
     match cmd {
         // Process-lifecycle: never slash.
+        Commands::Prompt { .. } => Err("`prompt` runs a one-shot turn; run it from a shell"),
         Commands::Tui { .. } => Err("`tui` opens an interactive process; run it from a shell"),
         Commands::Gateway { .. } => {
             Err("`gateway` controls the server process; run it from a shell")

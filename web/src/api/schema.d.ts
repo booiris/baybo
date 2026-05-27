@@ -695,7 +695,10 @@ export interface components {
         /**
          * @description One transcript row, flattened from `ChatMessage` into a shape the
          *     web client can render without re-implementing the content-block
-         *     matcher.
+         *     matcher. Two shapes ride this struct, discriminated by [`Self::kind`]:
+         *     a `Message` (user / final-assistant bubble) or a `Work` (reconstructed
+         *     collapsed work block for a tool-using turn — see
+         *     [`reconstruct_transcript`]).
          */
         ChatTranscriptItem: {
             /**
@@ -714,23 +717,78 @@ export interface components {
              *     file). The web client currently shows a placeholder.
              */
             has_attachments: boolean;
+            /** @description Message bubble vs. reconstructed work block. */
+            kind: components["schemas"]["TranscriptItemKind"];
             /**
              * Format: int64
              * @description Absolute `session_messages.ordinal` of this row. Stable for the
              *     lifetime of the session and used both as a React key and as
-             *     the `before_ordinal` cursor for the next-older page request.
+             *     the `before_ordinal` cursor for the next-older page request. A
+             *     `work` item carries the ordinal of the turn's first intermediate
+             *     message so it sorts just after the user turn that spawned it.
              */
             ordinal: number;
             /**
              * @description `"user"` or `"assistant"` (or `"system"`). String rather than
-             *     enum to keep the wire forgiving.
+             *     enum to keep the wire forgiving. Empty for `work` items.
              */
             role: string;
             /**
+             * @description Reconstructed progress steps for a `work` item (reasoning, tool
+             *     calls + results, mid-turn narration). Empty for `message` items.
+             */
+            steps?: components["schemas"]["ChatWorkStep"][];
+            /**
              * @description Plain text content, newline-joined when multiple text blocks
-             *     were present. Empty when the message was media-only.
+             *     were present. Empty when the message was media-only or for `work`
+             *     items.
              */
             text: string;
+            /** Format: date-time */
+            work_ended_at?: string | null;
+            /**
+             * Format: date-time
+             * @description Open / close wall-clock of a `work` item, derived from the turn's
+             *     message timestamps — drives the `Worked Xs` label. `None` for
+             *     `message` items.
+             */
+            work_started_at?: string | null;
+        };
+        /**
+         * @description One reconstructed step inside a `work` transcript item — the durable
+         *     shadow of a live turn-progress event, rebuilt from persisted content
+         *     blocks so a reloaded transcript shows the same collapsed work summary
+         *     the live view did. `reasoning` / `prose` carry [`Self::text`]; `tool`
+         *     carries the call's name + a re-derived result summary.
+         */
+        ChatWorkStep: {
+            kind: components["schemas"]["WorkStepKind"];
+            /** @description Reasoning trace or mid-turn narration body. Empty for `tool` steps. */
+            text?: string;
+            /** @description Tool name, set when `kind == Tool`. */
+            tool?: string | null;
+            /**
+             * @description Short, best-effort label for the call (a path / command / url
+             *     pulled from the call input), absent the live `progress_label`.
+             */
+            tool_label?: string | null;
+            /**
+             * @description `"ok"` / `"error"` / `"denied"`, derived from the persisted result
+             *     so reload can color-code failures the way the live view did.
+             */
+            tool_status?: string | null;
+            /**
+             * @description One-line summary re-derived from the persisted tool result. `None`
+             *     when the result for this call didn't land in the fetched window.
+             *
+             *     Deliberately a snippet of the actual result, not a content-light
+             *     count: this surface is the bearer-gated, operator-only chat reload
+             *     (never the live multi-channel fan-out), so it favors debugging
+             *     usefulness. Unlike the live `ToolCompleted.summary` it is NOT run
+             *     through `sanitize_stream_fragment`, so it can show raw tool output
+             *     the live UI withheld — acceptable for the operator's own view.
+             */
+            tool_summary?: string | null;
         };
         /**
          * @description `POST /v1/cron` body. Schedule format is the standard 5-field cron
@@ -1138,6 +1196,12 @@ export interface components {
             items: components["schemas"]["TraceSessionSummary"][];
             total: number;
         };
+        /**
+         * @description Discriminator for [`ChatTranscriptItem`] — serialized as
+         *     `"message"` / `"work"`.
+         * @enum {string}
+         */
+        TranscriptItemKind: "message" | "work";
         /** @description `DELETE /v1/config` body. */
         UnsetConfigRequest: {
             path: string;
@@ -1172,6 +1236,12 @@ export interface components {
             /** @description `supports_vision` override, or `null` to clear. */
             supports_vision?: boolean | null;
         };
+        /**
+         * @description Kind of a reconstructed [`ChatWorkStep`] — serialized as
+         *     `"reasoning"` / `"prose"` / `"tool"`.
+         * @enum {string}
+         */
+        WorkStepKind: "reasoning" | "prose" | "tool";
     };
     responses: never;
     parameters: never;

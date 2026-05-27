@@ -19,17 +19,20 @@
 //! one as a subprocess — compiled in only under
 //! `cfg(debug_assertions)`, so release builds never see it.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
 use aura_agent::service::ShutdownSignal;
 use aura_channels::ChannelError;
 use aura_config::AuraConfig;
-use aura_gateway::{AdminToken, TUI_TOKEN_VAULT_KEY};
-use aura_tui::client::{TuiDashboardProvider, TuiSlashHandler, WsTransport};
+use aura_gateway::AdminToken;
+use aura_tui::client::{TuiDashboardProvider, TuiSlashHandler};
 use aura_tui::{TuiAdapter, TuiLogSink};
 use tracing::info;
 
+use crate::gateway_client::{
+    admin_addr_from_config, read_tui_token, try_connect_with_token, unreachable_gateway_error,
+};
 use crate::runtime::force_exit_watchdog;
 use crate::runtime::install_signal_handler;
 use crate::tracing_init::{TracingMode, init_tracing};
@@ -148,56 +151,6 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the admin listener address from the loaded config. When
-/// the gateway is bound to a wildcard interface (`0.0.0.0` / `::`), a
-/// same-host TUI rewrites it to loopback — the wildcard is a server-
-/// side bind directive, not a dialable target.
-fn admin_addr_from_config(config: &AuraConfig) -> anyhow::Result<SocketAddr> {
-    let host = config.gateway.bind_address.as_str();
-    let ip: IpAddr = host
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid gateway.bind_address {host:?}: {e}"))?;
-    let dial_ip = match ip {
-        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        other => other,
-    };
-    Ok(SocketAddr::new(dial_ip, config.gateway.port))
-}
-
-/// Best-effort read of the per-start TUI token from the secret vault.
-/// Returns `None` if the vault can't be opened (no encryption key,
-/// libsql missing) or the key isn't present yet — both surface to the
-/// caller as the same "no live gateway" fallback path. A loud error
-/// would only mask the more specific port-file-missing message that
-/// the connect attempt produces a moment later.
-async fn read_tui_token(config: &AuraConfig) -> Option<String> {
-    let vault = match crate::runtime::build_secret_vault(config).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(error = %e, "tui token: open vault failed");
-            return None;
-        }
-    };
-    match vault.get_secret(TUI_TOKEN_VAULT_KEY).await {
-        Ok(Some(value)) => match std::str::from_utf8(value.as_bytes()) {
-            Ok(s) => Some(s.to_owned()),
-            Err(e) => {
-                tracing::warn!(error = %e, "tui token in vault is not valid utf-8");
-                None
-            }
-        },
-        Ok(None) => {
-            tracing::debug!("tui token: vault key absent (gateway not started yet)");
-            None
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "tui token: vault read failed");
-            None
-        }
-    }
-}
-
 async fn read_admin_token(config: &AuraConfig) -> Option<String> {
     let vault = match crate::runtime::build_secret_vault(config).await {
         Ok(v) => v,
@@ -280,30 +233,6 @@ fn current_model_label_from_payload(payload: &serde_json::Value) -> Option<Strin
         (false, true) => Some(provider.to_string()),
         (false, false) => Some(format!("{provider}/{model}")),
     }
-}
-
-/// Dial the gateway's admin listener with the supplied TUI token.
-/// A missing token (vault key absent / gateway not running yet) is
-/// surfaced as `NotReachable` so the caller's existing fallback paths
-/// (dev auto-gateway, user-facing error) cover it the same way as a
-/// `connect refused`.
-async fn try_connect_with_token(
-    admin_addr: SocketAddr,
-    tui_token: Option<&str>,
-    session_id: &aura_model::SessionId,
-) -> Result<WsTransport, ChannelError> {
-    let token = tui_token.ok_or_else(|| {
-        ChannelError::NotReachable(format!(
-            "no {TUI_TOKEN_VAULT_KEY} in vault (is the gateway running?)",
-        ))
-    })?;
-    WsTransport::connect(admin_addr, token.to_owned(), session_id.clone()).await
-}
-
-fn unreachable_gateway_error(admin_addr: SocketAddr, underlying: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "no aura gateway reachable at {admin_addr}\n  - start it with:       aura gateway start\n  (underlying error: {underlying})"
-    )
 }
 
 #[cfg(test)]

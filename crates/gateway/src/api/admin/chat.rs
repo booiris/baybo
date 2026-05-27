@@ -27,10 +27,12 @@
 //! The channel-auth middleware turns the token into
 //! [`crate::auth::AuthedClient::Web`].
 
+use std::collections::HashMap;
+
 use aura_channels::wire::{SessionPatch, SlashCommandSpec};
 use aura_model::{
-    ChannelType, ChatMessage, ContentBlock, MessageSource, Role, Session, SessionId, TriggerSource,
-    User,
+    ChannelType, ChatMessage, ContentBlock, MessageSource, Role, Session, SessionId,
+    ThinkingContent, TriggerSource, User,
 };
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -81,13 +83,6 @@ pub const DEFAULT_HISTORY_LIMIT: usize = 50;
 /// Hard cap so a misbehaving (or curious) client can't ask for the
 /// whole transcript by passing `limit=999999`.
 pub const MAX_HISTORY_LIMIT: usize = 200;
-
-/// How far back to scan when fetching each session's sidebar preview.
-/// A typical conversation alternates user / assistant, so the most-
-/// recent user row is usually within the last couple of messages — but
-/// trailing assistant tool-only turns can push it further. Ten rows
-/// covers realistic shapes without paying a deep walk on long sessions.
-const PREVIEW_SCAN_DEPTH: usize = 10;
 
 /// Maximum length of the truncated preview the sidebar shows for each
 /// session. Sized to fit a 260px-wide sidebar row at the web client's
@@ -147,20 +142,49 @@ pub struct ChatSessionCredential {
     pub channel_token_header: &'static str,
 }
 
+/// Discriminator for [`ChatTranscriptItem`] — serialized as
+/// `"message"` / `"work"`.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptItemKind {
+    /// A user or final-assistant bubble.
+    Message,
+    /// A reconstructed collapsed work block for a tool-using turn.
+    Work,
+}
+
+/// Kind of a reconstructed [`ChatWorkStep`] — serialized as
+/// `"reasoning"` / `"prose"` / `"tool"`.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkStepKind {
+    Reasoning,
+    Prose,
+    Tool,
+}
+
 /// One transcript row, flattened from `ChatMessage` into a shape the
 /// web client can render without re-implementing the content-block
-/// matcher.
+/// matcher. Two shapes ride this struct, discriminated by [`Self::kind`]:
+/// a `Message` (user / final-assistant bubble) or a `Work` (reconstructed
+/// collapsed work block for a tool-using turn — see
+/// [`reconstruct_transcript`]).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatTranscriptItem {
     /// Absolute `session_messages.ordinal` of this row. Stable for the
     /// lifetime of the session and used both as a React key and as
-    /// the `before_ordinal` cursor for the next-older page request.
+    /// the `before_ordinal` cursor for the next-older page request. A
+    /// `work` item carries the ordinal of the turn's first intermediate
+    /// message so it sorts just after the user turn that spawned it.
     pub ordinal: i64,
+    /// Message bubble vs. reconstructed work block.
+    pub kind: TranscriptItemKind,
     /// `"user"` or `"assistant"` (or `"system"`). String rather than
-    /// enum to keep the wire forgiving.
+    /// enum to keep the wire forgiving. Empty for `work` items.
     pub role: String,
     /// Plain text content, newline-joined when multiple text blocks
-    /// were present. Empty when the message was media-only.
+    /// were present. Empty when the message was media-only or for `work`
+    /// items.
     pub text: String,
     /// `true` when this row had non-text content (image / audio /
     /// file). The web client currently shows a placeholder.
@@ -173,6 +197,87 @@ pub struct ChatTranscriptItem {
     /// drifts only on catch-up replays (where the row is also
     /// reachable via the REST history surface with the real value).
     pub created_at: DateTime<Utc>,
+    /// Reconstructed progress steps for a `work` item (reasoning, tool
+    /// calls + results, mid-turn narration). Empty for `message` items.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<ChatWorkStep>,
+    /// Open / close wall-clock of a `work` item, derived from the turn's
+    /// message timestamps — drives the `Worked Xs` label. `None` for
+    /// `message` items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_ended_at: Option<DateTime<Utc>>,
+}
+
+/// One reconstructed step inside a `work` transcript item — the durable
+/// shadow of a live turn-progress event, rebuilt from persisted content
+/// blocks so a reloaded transcript shows the same collapsed work summary
+/// the live view did. `reasoning` / `prose` carry [`Self::text`]; `tool`
+/// carries the call's name + a re-derived result summary.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatWorkStep {
+    pub kind: WorkStepKind,
+    /// Reasoning trace or mid-turn narration body. Empty for `tool` steps.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// Tool name, set when `kind == Tool`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Short, best-effort label for the call (a path / command / url
+    /// pulled from the call input), absent the live `progress_label`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_label: Option<String>,
+    /// `"ok"` / `"error"` / `"denied"`, derived from the persisted result
+    /// so reload can color-code failures the way the live view did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_status: Option<String>,
+    /// One-line summary re-derived from the persisted tool result. `None`
+    /// when the result for this call didn't land in the fetched window.
+    ///
+    /// Deliberately a snippet of the actual result, not a content-light
+    /// count: this surface is the bearer-gated, operator-only chat reload
+    /// (never the live multi-channel fan-out), so it favors debugging
+    /// usefulness. Unlike the live `ToolCompleted.summary` it is NOT run
+    /// through `sanitize_stream_fragment`, so it can show raw tool output
+    /// the live UI withheld — acceptable for the operator's own view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_summary: Option<String>,
+}
+
+impl ChatWorkStep {
+    fn reasoning(text: String) -> Self {
+        Self {
+            kind: WorkStepKind::Reasoning,
+            text,
+            tool: None,
+            tool_label: None,
+            tool_status: None,
+            tool_summary: None,
+        }
+    }
+
+    fn prose(text: String) -> Self {
+        Self {
+            kind: WorkStepKind::Prose,
+            text,
+            tool: None,
+            tool_label: None,
+            tool_status: None,
+            tool_summary: None,
+        }
+    }
+
+    fn tool(tool: String, tool_label: Option<String>) -> Self {
+        Self {
+            kind: WorkStepKind::Tool,
+            text: String::new(),
+            tool: Some(tool),
+            tool_label,
+            tool_status: None,
+            tool_summary: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -360,11 +465,10 @@ async fn list_sessions(
         .filter(|s| query.include_hidden || !s.hidden)
         .filter(|s| query.include_cron || !is_cron_triggered(s))
         .collect();
-    // Fan out the per-session preview fetch — each row needs its own
-    // reverse-tail walk against `session_messages`, which is cheap
-    // individually (back-of-the-index walk capped at
-    // `PREVIEW_SCAN_DEPTH` rows) but adds up serially when a tab has
-    // dozens of conversations open. `join_all` runs the libsql queries
+    // Fan out the per-session preview fetch — each row is a single
+    // back-of-the-index lookup (`load_last_user_message`,
+    // `ORDER BY ordinal DESC LIMIT 1`) but they add up serially when a tab
+    // has dozens of conversations open. `join_all` runs the libsql queries
     // concurrently against the shared connection pool. A preview that
     // fails to load is dropped to `None` rather than failing the whole
     // list — the sidebar still renders the row, just without a
@@ -437,16 +541,16 @@ async fn get_session(
         // (it would be the start of the next-older page).
         tail.remove(0);
     }
-    // `filter_map` not `map` — internal turns (Role::System, agent-
-    // injected Role::User with `from_user=false`, tool-result rows,
-    // empty thinking blocks) don't belong on the /chat surface.
-    // Mirrors the WS catch-up replay filter in `channel::route::
-    // chat_to_visible_wire_message` so a REST-loaded transcript and a
-    // WS-replayed one agree on what's a user-visible bubble.
-    let transcript = tail
-        .into_iter()
-        .filter_map(|(ordinal, created_at, msg)| chat_to_transcript_item(ordinal, created_at, msg))
-        .collect();
+    // Rebuild user/assistant bubbles AND the collapsed per-turn work
+    // blocks (reasoning, tool calls + results, mid-turn narration) from
+    // the persisted messages. Internal turns (Role::System, agent-
+    // injected Role::User with `from_user=false`) are dropped; tool-use
+    // iterations are folded into a `work` item rather than surfaced as
+    // stray bubbles. The WS catch-up path
+    // (`channel::route::chat_to_visible_wire_message`) still replays only
+    // the message bubbles — a full reload through here is what restores
+    // the work blocks.
+    let transcript = reconstruct_transcript(tail);
     Ok(Json(ChatSessionDetail {
         session_id,
         created_at: session.created_at,
@@ -718,15 +822,9 @@ pub(crate) fn broadcast_session_patch(
     }
 }
 
-/// Fetch the most-recent user-authored text for `session_id` and shape
-/// it into the sidebar preview the list endpoint serves. Returns
-/// `None` when the session has no user turn yet, when the user turn's
-/// content is media-only, or when the underlying tail query fails —
-/// the sidebar treats all three as "no preview" rather than surfacing
-/// an error, so a single bad row never breaks the whole list. Walks
-/// at most [`PREVIEW_SCAN_DEPTH`] rows back; deeper user turns
-/// (e.g. a session whose recent activity is purely tool churn) fall
-/// off the window and are accepted as missing rather than chased.
+/// True when the session was spawned by a cron trigger rather than a user
+/// conversation. Cron sessions are filtered out of the chat list unless
+/// `include_cron` is set.
 fn is_cron_triggered(session: &Session) -> bool {
     matches!(session.trigger, TriggerSource::Cron { .. })
 }
@@ -798,28 +896,26 @@ fn extract_text(content: &[ContentBlock]) -> String {
     text
 }
 
+/// Fetch the most-recent user-authored text for `session_id` and shape it
+/// into the sidebar preview the list endpoint serves. Returns `None` when
+/// the session has no user turn, when that turn is media-only, or when the
+/// lookup fails — the sidebar treats all three as "no preview" rather than
+/// surfacing an error, so a single bad row never breaks the whole list.
+/// One indexed lookup ([`aura_session::SessionManager::last_user_message`]),
+/// so a prompt buried under a long tool loop is still found.
 async fn last_user_preview(
     manager: &aura_session::SessionManager,
     session_id: &SessionId,
 ) -> Option<String> {
-    let tail = manager
-        .history_tail(session_id, None, PREVIEW_SCAN_DEPTH)
-        .await
-        .ok()?;
-    // `history_tail` returns ascending; iterate in reverse so we hit
-    // the freshest user row first and stop scanning the moment we
-    // find it.
-    for (_ord, created_at, msg) in tail.into_iter().rev() {
-        if !matches!(msg.role, Role::User) || !msg.from_user() {
-            continue;
-        }
-        let item = chat_to_transcript_item(0, created_at, msg)?;
-        if item.text.is_empty() {
-            return None;
-        }
-        return Some(truncate_preview(&item.text));
-    }
-    None
+    // One indexed lookup for the freshest human-authored turn — no
+    // tail-walking, so a long tool loop can't bury the prompt past a fixed
+    // window (which used to make a tool-retry session show "New
+    // conversation" despite having a clear prompt). `message_item`
+    // extracts the display text the same way the transcript does; the
+    // ordinal it stamps is unused here.
+    let (created_at, msg) = manager.last_user_message(session_id).await.ok().flatten()?;
+    let item = message_item(0, created_at, "user", &msg)?;
+    (!item.text.is_empty()).then(|| truncate_preview(&item.text))
 }
 
 /// Collapse whitespace and clip to [`PREVIEW_MAX_CHARS`] for the
@@ -836,19 +932,142 @@ fn truncate_preview(text: &str) -> String {
     format!("{cut}…")
 }
 
-fn chat_to_transcript_item(
+/// Accumulator for one tool-using turn's reconstructed work block, drained
+/// by [`Self::flush`] just before the turn's final answer.
+#[derive(Default)]
+struct WorkAccumulator {
+    steps: Vec<ChatWorkStep>,
+    /// Ordinal of the turn's first intermediate message — the `work`
+    /// item inherits it so it sorts right after the user turn.
+    ordinal: Option<i64>,
+    started: Option<DateTime<Utc>>,
+    last: Option<DateTime<Utc>>,
+    /// `tool_use_id` → index into `steps`, so a later tool-result message
+    /// fills in the matching call's summary.
+    pending_tools: HashMap<String, usize>,
+}
+
+impl WorkAccumulator {
+    fn flush(&mut self, items: &mut Vec<ChatTranscriptItem>, ended_at: Option<DateTime<Utc>>) {
+        if !self.steps.is_empty() {
+            let started = self.started;
+            items.push(ChatTranscriptItem {
+                ordinal: self.ordinal.unwrap_or_default(),
+                kind: TranscriptItemKind::Work,
+                role: String::new(),
+                text: String::new(),
+                has_attachments: false,
+                created_at: started.unwrap_or_else(Utc::now),
+                steps: std::mem::take(&mut self.steps),
+                work_started_at: started,
+                work_ended_at: ended_at.or(self.last).or(started),
+            });
+        }
+        self.ordinal = None;
+        self.started = None;
+        self.last = None;
+        self.pending_tools.clear();
+    }
+}
+
+/// Rebuild the chat transcript from persisted messages. User turns and the
+/// final, tool-call-free assistant reply become `message` items; each
+/// tool-using turn's intermediate iterations (reasoning, tool calls +
+/// results, mid-turn narration) are folded into a single collapsed `work`
+/// item placed just before that turn's final answer. Internal rows
+/// (Role::System, agent-injected Role::User) are dropped. This restores on
+/// reload the same work-block-then-answer shape the live view shows —
+/// turn-progress is otherwise live-only, but every block it needs is
+/// durably persisted, so this is where it's reconstructed.
+fn reconstruct_transcript(tail: Vec<(i64, DateTime<Utc>, ChatMessage)>) -> Vec<ChatTranscriptItem> {
+    let mut items: Vec<ChatTranscriptItem> = Vec::new();
+    let mut work = WorkAccumulator::default();
+
+    for (ordinal, created_at, msg) in tail {
+        match msg.role {
+            Role::User if msg.from_user() => {
+                work.flush(&mut items, None);
+                if let Some(item) = message_item(ordinal, created_at, "user", &msg) {
+                    items.push(item);
+                }
+            }
+            // Intermediate iteration: fold reasoning / narration / tool
+            // calls into the open work block.
+            Role::Assistant if msg.has_tool_use() => {
+                if work.started.is_none() {
+                    work.started = Some(created_at);
+                    work.ordinal = Some(ordinal);
+                }
+                work.last = Some(created_at);
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Thinking { content, .. } => {
+                            let text = thinking_text(content);
+                            if !text.is_empty() {
+                                work.steps.push(ChatWorkStep::reasoning(text));
+                            }
+                        }
+                        ContentBlock::Text(t) if !t.trim().is_empty() => {
+                            work.steps.push(ChatWorkStep::prose(t.clone()));
+                        }
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
+                            work.pending_tools.insert(id.clone(), work.steps.len());
+                            work.steps
+                                .push(ChatWorkStep::tool(name.clone(), tool_label(input)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Final answer (no tool calls): close the work block, then the
+            // reply bubble lands below it.
+            Role::Assistant => {
+                work.flush(&mut items, Some(created_at));
+                if let Some(item) = message_item(ordinal, created_at, "assistant", &msg) {
+                    items.push(item);
+                }
+            }
+            Role::Tool => {
+                work.last = Some(created_at);
+                for block in &msg.content {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                    } = block
+                        && let Some(&idx) = work.pending_tools.get(tool_use_id)
+                        && let Some(step) = work.steps.get_mut(idx)
+                    {
+                        step.tool_status = Some(tool_result_status(content));
+                        step.tool_summary = Some(summarize_tool_result(content));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Trailing block: a turn whose final answer is beyond this page, or
+    // that ended on a tool with no narrated reply. The work item inherits
+    // its first intermediate row's ordinal, so when it lands as the very
+    // last item the client seeds its WS catch-up cursor slightly behind
+    // the true tail — harmless, since the re-replayed rows are dropped by
+    // the message-only catch-up filter. A turn straddling the page
+    // boundary likewise reconstructs partially until an older page loads.
+    work.flush(&mut items, None);
+    items
+}
+
+/// Flatten a user / final-assistant message into a `message` item, or
+/// `None` when it has neither text nor attachments (e.g. an assistant turn
+/// that produced only tool calls) — such a row would render as an empty
+/// bubble.
+fn message_item(
     ordinal: i64,
     created_at: DateTime<Utc>,
-    msg: ChatMessage,
+    role: &str,
+    msg: &ChatMessage,
 ) -> Option<ChatTranscriptItem> {
-    // Same gate as `channel::route::chat_to_visible_wire_message` —
-    // see that fn for why each excluded variant doesn't belong on the
-    // chat surface.
-    let role = match msg.role {
-        Role::User if msg.from_user() => "user",
-        Role::Assistant => "assistant",
-        _ => return None,
-    };
     let mut text = String::new();
     let mut has_attachments = false;
     for block in &msg.content {
@@ -862,22 +1081,330 @@ fn chat_to_transcript_item(
             ContentBlock::Image { .. } | ContentBlock::Audio { .. } | ContentBlock::File { .. } => {
                 has_attachments = true;
             }
-            ContentBlock::ToolUse { .. }
-            | ContentBlock::ToolResult { .. }
-            | ContentBlock::Thinking { .. } => {}
+            _ => {}
         }
     }
-    // A user/assistant row with neither text nor attachments is
-    // structurally valid (assistant turn that produced only tool calls,
-    // for instance) but would render as an empty bubble. Hide it.
     if text.is_empty() && !has_attachments {
         return None;
     }
     Some(ChatTranscriptItem {
         ordinal,
+        kind: TranscriptItemKind::Message,
         role: role.to_owned(),
         text,
         has_attachments,
         created_at,
+        steps: Vec::new(),
+        work_started_at: None,
+        work_ended_at: None,
     })
+}
+
+/// Concatenate the visible text of a model thinking block (redacted
+/// reasoning carries no display text and is skipped).
+fn thinking_text(content: &[ThinkingContent]) -> String {
+    let mut out = String::new();
+    for c in content {
+        let part = match c {
+            ThinkingContent::Text { text, .. } | ThinkingContent::Summary { text } => text.as_str(),
+            ThinkingContent::Redacted { .. } => continue,
+        };
+        if part.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(part);
+    }
+    out
+}
+
+/// Best-effort short label for a tool call, pulled from a common input key
+/// (path / command / url / query). Stands in for the live `progress_label`,
+/// which needs the tool registry that isn't on the read path. `None` when
+/// nothing recognizable is present.
+fn tool_label(input: &serde_json::Value) -> Option<String> {
+    const KEYS: [&str; 6] = ["command", "url", "path", "file_path", "query", "pattern"];
+    let obj = input.as_object()?;
+    for key in KEYS {
+        if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+            let label = collapse_ws(s);
+            if !label.is_empty() {
+                return Some(truncate(&label, 80));
+            }
+        }
+    }
+    None
+}
+
+/// Re-derive a one-line summary of a persisted tool result. The exact live
+/// summary (line counts, `exit 0`) isn't persisted, so this strips the
+/// `<tool_output>` envelope and returns a short, whitespace-collapsed
+/// snippet of the result body.
+fn summarize_tool_result(content: &str) -> String {
+    truncate(&collapse_ws(strip_tool_output_envelope(content)), 140)
+}
+
+/// Best-effort `ok` / `error` / `denied` status for a persisted tool
+/// result. The structured outcome isn't stored, so this keys off the
+/// agent's own result-formatting prefixes (`runtime::agent_loop` writes
+/// `Error: …` for failures and a fixed `The user explicitly denied
+/// permission …` message for denied calls) — enough for reload to
+/// color-code failures the way the live view did.
+fn tool_result_status(content: &str) -> String {
+    let inner = strip_tool_output_envelope(content);
+    let inner = inner.trim_start();
+    if inner.starts_with("The user explicitly denied permission") {
+        "denied".to_owned()
+    } else if inner.starts_with("Error:") {
+        "error".to_owned()
+    } else {
+        "ok".to_owned()
+    }
+}
+
+/// Strip the `<tool_output …> … </tool_output>` wrapper the agent puts
+/// around untrusted tool results before they enter the transcript. Returns
+/// the input unchanged when it isn't wrapped.
+fn strip_tool_output_envelope(content: &str) -> &str {
+    let Some(rest) = content.trim_start().strip_prefix("<tool_output") else {
+        return content;
+    };
+    let Some((_, body)) = rest.split_once('>') else {
+        return content;
+    };
+    match body.rfind("</tool_output") {
+        Some(close) => body[..close].trim(),
+        None => body.trim(),
+    }
+}
+
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn ts(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(secs, 0)
+            .single()
+            .expect("valid timestamp")
+    }
+    fn text(s: &str) -> ContentBlock {
+        ContentBlock::Text(s.to_owned())
+    }
+    fn thinking(s: &str) -> ContentBlock {
+        ContentBlock::Thinking {
+            id: None,
+            content: vec![ThinkingContent::Text {
+                text: s.to_owned(),
+                signature: None,
+            }],
+        }
+    }
+    fn tool_use(id: &str, name: &str, input: serde_json::Value) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            input,
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn reconstruct_groups_tool_turn_into_work_block_before_answer() {
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("write hello")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![
+                    thinking("I'll write it"),
+                    text("let me try"),
+                    tool_use("c1", "Write", serde_json::json!({"path": "/tmp/x"})),
+                ]),
+            ),
+            (
+                4,
+                ts(7),
+                ChatMessage::tool_result(
+                    "c1".to_owned(),
+                    "<tool_output name=\"Write\">Error: nope</tool_output>".to_owned(),
+                ),
+            ),
+            (
+                5,
+                ts(9),
+                ChatMessage::assistant(vec![text("done, sort of")]),
+            ),
+        ];
+        let items = reconstruct_transcript(tail);
+        assert_eq!(items.len(), 3);
+
+        assert!(matches!(items[0].kind, TranscriptItemKind::Message));
+        assert_eq!(items[0].role, "user");
+        assert_eq!(items[0].text, "write hello");
+
+        let work = &items[1];
+        assert!(matches!(work.kind, TranscriptItemKind::Work));
+        assert_eq!(
+            work.ordinal, 3,
+            "work block inherits first intermediate ordinal"
+        );
+        assert_eq!(work.work_started_at, Some(ts(3)));
+        assert_eq!(work.work_ended_at, Some(ts(9)), "ends at the final reply");
+        assert_eq!(work.steps.len(), 3);
+        assert!(matches!(work.steps[0].kind, WorkStepKind::Reasoning));
+        assert_eq!(work.steps[0].text, "I'll write it");
+        assert!(matches!(work.steps[1].kind, WorkStepKind::Prose));
+        assert_eq!(work.steps[1].text, "let me try");
+        assert!(matches!(work.steps[2].kind, WorkStepKind::Tool));
+        assert_eq!(work.steps[2].tool.as_deref(), Some("Write"));
+        assert_eq!(work.steps[2].tool_label.as_deref(), Some("/tmp/x"));
+        assert_eq!(work.steps[2].tool_status.as_deref(), Some("error"));
+        assert_eq!(work.steps[2].tool_summary.as_deref(), Some("Error: nope"));
+
+        assert!(matches!(items[2].kind, TranscriptItemKind::Message));
+        assert_eq!(items[2].role, "assistant");
+        assert_eq!(items[2].text, "done, sort of");
+    }
+
+    #[test]
+    fn reconstruct_flushes_trailing_work_block_without_final_answer() {
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![tool_use(
+                    "c1",
+                    "Bash",
+                    serde_json::json!({"command": "ls"}),
+                )]),
+            ),
+            (
+                4,
+                ts(5),
+                ChatMessage::tool_result("c1".to_owned(), "ok output".to_owned()),
+            ),
+        ];
+        let items = reconstruct_transcript(tail);
+        assert_eq!(items.len(), 2);
+        let work = &items[1];
+        assert!(matches!(work.kind, TranscriptItemKind::Work));
+        assert_eq!(work.work_ended_at, Some(ts(5)), "ends at last seen row");
+        assert_eq!(work.steps.len(), 1);
+        assert_eq!(work.steps[0].tool_status.as_deref(), Some("ok"));
+        assert_eq!(work.steps[0].tool_summary.as_deref(), Some("ok output"));
+    }
+
+    #[test]
+    fn reconstruct_drops_internal_rows() {
+        let tail = vec![
+            (1, ts(1), ChatMessage::system(vec![text("system prompt")])),
+            (2, ts(2), ChatMessage::agent_context(vec![text("injected")])),
+            (3, ts(3), ChatMessage::user(vec![text("hi")])),
+            (4, ts(4), ChatMessage::assistant(vec![text("hello")])),
+        ];
+        let items = reconstruct_transcript(tail);
+        assert_eq!(items.len(), 2);
+        assert!(
+            items
+                .iter()
+                .all(|i| matches!(i.kind, TranscriptItemKind::Message))
+        );
+        assert_eq!(items[0].text, "hi");
+        assert_eq!(items[1].text, "hello");
+    }
+
+    #[test]
+    fn reconstruct_leaves_summary_none_when_tool_result_absent() {
+        let tail = vec![(
+            3,
+            ts(3),
+            ChatMessage::assistant(vec![tool_use(
+                "c1",
+                "Bash",
+                serde_json::json!({"command": "ls"}),
+            )]),
+        )];
+        let items = reconstruct_transcript(tail);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].steps[0].tool_summary.is_none());
+        assert!(items[0].steps[0].tool_status.is_none());
+    }
+
+    #[test]
+    fn message_item_skips_empty_keeps_text() {
+        let only_tool = ChatMessage::assistant(vec![tool_use("c1", "X", serde_json::json!({}))]);
+        assert!(message_item(1, ts(1), "assistant", &only_tool).is_none());
+
+        let multi = ChatMessage::assistant(vec![text("a"), text("b")]);
+        let item = message_item(1, ts(1), "assistant", &multi).expect("non-empty");
+        assert_eq!(item.text, "a\nb");
+        assert!(!item.has_attachments);
+    }
+
+    #[test]
+    fn thinking_text_joins_and_skips_redacted() {
+        let blocks = vec![
+            ThinkingContent::Text {
+                text: "step 1".to_owned(),
+                signature: None,
+            },
+            ThinkingContent::Redacted {
+                data: "opaque".to_owned(),
+            },
+            ThinkingContent::Summary {
+                text: "tl;dr".to_owned(),
+            },
+        ];
+        assert_eq!(thinking_text(&blocks), "step 1\ntl;dr");
+    }
+
+    #[test]
+    fn tool_label_pulls_first_known_key() {
+        assert_eq!(
+            tool_label(&serde_json::json!({"command": "ls -la"})).as_deref(),
+            Some("ls -la")
+        );
+        assert_eq!(
+            tool_label(&serde_json::json!({"path": "/a/b"})).as_deref(),
+            Some("/a/b")
+        );
+        assert_eq!(tool_label(&serde_json::json!({"other": "x"})), None);
+        assert_eq!(tool_label(&serde_json::json!("not an object")), None);
+    }
+
+    #[test]
+    fn strip_envelope_and_status() {
+        assert_eq!(
+            strip_tool_output_envelope("<tool_output name=\"Read\">200 lines</tool_output>"),
+            "200 lines"
+        );
+        assert_eq!(strip_tool_output_envelope("no envelope"), "no envelope");
+
+        assert_eq!(
+            tool_result_status("<tool_output name=\"x\">Error: boom</tool_output>"),
+            "error"
+        );
+        assert_eq!(
+            tool_result_status("The user explicitly denied permission for tool 'x'."),
+            "denied"
+        );
+        assert_eq!(tool_result_status("all good"), "ok");
+    }
 }

@@ -52,6 +52,31 @@ progress is **opt-in per channel** — the TUI/web render it, sidecars ignore it
 | **TUI dedup** | **None needed.** `render_block` only renders the CronCreate recurring-trigger hint for `ToolUse` blocks — never general tool calls — so the final `Message`'s `accumulated_tool_uses` were never a visible source of tool lines in the TUI. The scrollback `ToolStarted`/`ToolCompleted` lines are the only tool display. |
 | **Approval interleave** | `ToolStarted` (loop) precedes `ApprovalRequested` (emitted inside `execute` by the gate) precedes `ToolCompleted` — naturally reads as "started → waiting for approval → done". |
 
+## Web: reconstructed on reload
+
+The progress **events** are live-only and never persisted — but the web chat
+still shows the collapsed `Worked Xs ›` work block after a page reload by
+**reconstructing** an equivalent view from the persisted *messages*. The
+gateway's `api::admin::chat::reconstruct_transcript` (REST `GET
+/v1/chat/sessions/:id`) folds each tool-using turn's intermediate rows
+(`Thinking` → reasoning, `ToolUse` + paired `ToolResult` → tool step, mid-turn
+`Text` → prose) into one `work` transcript item before the turn's final reply;
+the client maps it onto the same `WorkBlock` it builds live. Two consequences
+worth knowing:
+
+- **Reconstructed tool summaries are not content-light.** Unlike the live
+  `ToolCompleted.summary` (which is structural and passes
+  `sanitize_stream_fragment`), the reconstructed `tool_summary` is a short
+  snippet of the *raw persisted* `ToolResult`. This deliberately favors
+  debugging usefulness on the bearer-gated, operator-only chat reload (never the
+  live multi-channel fan-out), at the cost of possibly showing output bytes the
+  live UI withheld. `tool_status` (ok/error/denied) is best-effort, keyed off the
+  agent's result-formatting prefixes.
+- **WS catch-up replay is message-only.** A reconnect (`channel::route::
+  chat_to_visible_wire_message`) replays just the message bubbles, so work
+  blocks for turns missed during a brief disconnect don't reappear until a full
+  reload re-runs reconstruction.
+
 ## Out of scope / future
 
 - **`Status` spinner — remaining phases.** `AgentEvent::Status(TurnStatus)` shipped

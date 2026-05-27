@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+use tokio::sync::Notify;
 
 use aura_llm::ModelPricing;
 use aura_model::{JobId, MicroUsd, SessionId, SpanId};
@@ -58,6 +60,14 @@ pub struct CostManager {
     limits: RwLock<SpendingLimits>,
     state: Arc<RwLock<BudgetState>>,
     metrics: Arc<CostMetrics>,
+    /// Count of in-flight detached `persist` tasks. A long-running owner
+    /// (the gateway) ignores it; a one-shot owner drains it via
+    /// [`CostManager::drain`] before teardown so the writes aren't
+    /// aborted mid-flight.
+    inflight: AtomicUsize,
+    /// Notified each time an in-flight persist finishes so [`CostManager::drain`]
+    /// can wake and re-check the count.
+    inflight_done: Notify,
 }
 
 /// Lock-free counters for ops dashboards.
@@ -199,6 +209,8 @@ impl CostManager {
             limits: RwLock::new(limits),
             state: Arc::new(RwLock::new(BudgetState::default())),
             metrics,
+            inflight: AtomicUsize::new(0),
+            inflight_done: Notify::new(),
         })
     }
 
@@ -317,6 +329,34 @@ impl CostManager {
         }
     }
 
+    /// Spawn the detached `cost_records` write, tracking it so
+    /// [`Self::drain`] can wait for it. Both record entry points funnel
+    /// through here.
+    fn spawn_persist(self: &Arc<Self>, record: CostRecord) {
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            me.persist(record).await;
+            me.inflight.fetch_sub(1, Ordering::AcqRel);
+            me.inflight_done.notify_one();
+        });
+    }
+
+    /// Wait until every in-flight persist task has finished. The
+    /// long-running gateway never needs this (it outlives all writes),
+    /// but a one-shot owner (`aura prompt` running in-process) must call
+    /// it before tearing the runtime down, or the detached persist tasks
+    /// are aborted and the turn's spend never reaches `cost_records`.
+    /// Cheap no-op when nothing is in flight.
+    pub async fn drain(&self) {
+        // `notify_one` stores a permit when no waiter is registered, so a
+        // completion landing between the load and the await is not lost:
+        // the next `notified()` consumes the permit and we re-check.
+        while self.inflight.load(Ordering::Acquire) > 0 {
+            self.inflight_done.notified().await;
+        }
+    }
+
     /// Record one finished LLM call and return the cost that was
     /// billed against the budget. Memory first, disk second:
     /// 1. The in-memory budget state updates synchronously so the
@@ -374,10 +414,7 @@ impl CostManager {
             cost_usd: cost,
             timestamp: now,
         };
-        let me = Arc::clone(self);
-        tokio::spawn(async move {
-            me.persist(record).await;
-        });
+        self.spawn_persist(record);
         cost
     }
 
@@ -413,13 +450,10 @@ impl CostManager {
             cost_usd: MicroUsd::ZERO,
             timestamp: Utc::now(),
         };
-        let me = Arc::clone(self);
-        tokio::spawn(async move {
-            me.persist(record).await;
-        });
+        self.spawn_persist(record);
     }
 
-    async fn persist(self: Arc<Self>, record: CostRecord) {
+    async fn persist(&self, record: CostRecord) {
         if let Err(e) = self.store.record(&record).await {
             warn!(error = %e, "failed to write cost_record");
             self.metrics
@@ -728,17 +762,9 @@ mod tests {
             0,
             0,
         );
-        // record_call returns sync after updating in-memory state and
-        // spawning the persist task. Yield until the metrics counter
-        // ticks so persist-dependent assertions are deterministic.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-        let target = cm.metrics().recorded() + 1;
-        while cm.metrics().recorded() < target {
-            if std::time::Instant::now() >= deadline {
-                panic!("persist task never completed");
-            }
-            tokio::task::yield_now().await;
-        }
+        // `drain` waits for the fire-and-forget persist to land, so
+        // persist-dependent assertions below are deterministic.
+        cm.drain().await;
     }
 
     #[tokio::test]
