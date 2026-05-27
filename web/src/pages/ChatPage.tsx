@@ -15,6 +15,7 @@ import {
   RiAddLine,
   RiArrowDownLine,
   RiArrowLeftLine,
+  RiArrowRightSLine,
   RiCheckLine,
   RiClipboardLine,
   RiCloseLine,
@@ -32,6 +33,23 @@ import {
   type SessionPatch,
 } from '../api/chatWs';
 import { CronInbox } from '../components/CronInbox';
+
+/** One progress entry inside a turn's work block. `reasoning`, `status`
+ *  and `prose` carry `text`; `tool` carries the tool-call fields and is
+ *  keyed by `toolCallId` so the completion frame resolves the step its
+ *  start created. `prose` is mid-turn answer text the model emitted
+ *  before its final reply — folded in here rather than left as its own
+ *  bubble. */
+interface WorkStep {
+  key: string;
+  kind: 'reasoning' | 'tool' | 'status' | 'prose';
+  text?: string;
+  toolCallId?: string;
+  tool?: string;
+  toolLabel?: string | null;
+  toolStatus?: 'running' | 'ok' | 'error' | 'denied';
+  toolSummary?: string;
+}
 
 interface TranscriptRow {
   /** Stable key for React. Synthetic; not part of any server schema. */
@@ -61,19 +79,22 @@ interface TranscriptRow {
    *  replays — those rows are also reachable via the REST history
    *  surface with the real value once the page refetches. */
   createdAt?: string;
-  /** Discriminates ephemeral turn-progress rows from normal
-   *  message/notice rows: `'reasoning'` is a dim thinking trace,
-   *  `'tool'` is a tool-call chip. Both are live-only — never persisted,
-   *  so a REST history reload drops them. See
-   *  `docs/turn-progress-events.md`. */
-  kind?: 'reasoning' | 'tool' | 'status';
-  /** Tool-call fields, set when `kind === 'tool'`. `toolCallId` keys the
-   *  row so the completion frame updates the one its start created. */
-  toolCallId?: string;
-  tool?: string;
-  toolLabel?: string | null;
-  toolStatus?: 'running' | 'ok' | 'error' | 'denied';
-  toolSummary?: string;
+  /** Set on the single live-only "work" row that aggregates a turn's
+   *  intermediate progress — reasoning, tool calls, status, and mid-turn
+   *  prose — into one collapsible block. Live-only: never persisted, so a
+   *  REST history reload drops it. See `docs/turn-progress-events.md`. */
+  kind?: 'work';
+  /** Ordered progress steps inside a `kind === 'work'` row. */
+  steps?: WorkStep[];
+  /** True while the turn is still producing the block (animated
+   *  "Working…" header, steps shown). Cleared when the turn's final
+   *  message / notice lands, at which point the block collapses to a
+   *  `Worked Xs ›` summary above the answer. */
+  workActive?: boolean;
+  /** Epoch ms when the block opened / closed — drives the live elapsed
+   *  timer and the collapsed `Worked Xs` label. */
+  workStartedAt?: number;
+  workEndedAt?: number;
 }
 
 interface PendingApproval {
@@ -286,12 +307,17 @@ export function ChatPage() {
     delete streamPacersRef.current[sid];
   }, []);
 
-  // Settle the streaming answer bubble before an interrupting progress row
-  // (reasoning / tool) appends below it: reveal the pacer's full buffered
-  // text at once and finalize the bubble (`streaming: false`), so the row
-  // order matches the server stream and any post-interruption answer text
-  // starts a fresh bubble. No-op when no answer is mid-stream.
-  const flushPacer = useCallback((sid: string) => {
+  // Reveal the pacer's fully-buffered answer text at once and stop the
+  // rAF loop. A progress frame (reasoning / tool / status) is interrupting
+  // the answer stream, so flush the buffer to its destination via
+  // `writeStreamingAnswer`: into the open work block's trailing `prose`
+  // step when a block is active (it stays put as an earlier mid-turn line
+  // once the progress step lands after it), or into the standalone
+  // streaming bubble otherwise — left `streaming: true` so
+  // `routeInboundFrame`'s `ensureWork` can fold it into a fresh block. The
+  // final `Message` path (which finalizes the answer) goes through
+  // `cancelPacer` instead. No-op when no answer is mid-stream.
+  const flushPacerKeepStreaming = useCallback((sid: string) => {
     const pacer = streamPacersRef.current[sid];
     if (!pacer) return;
     if (pacer.rafId !== null) cancelAnimationFrame(pacer.rafId);
@@ -300,11 +326,9 @@ export function ChatPage() {
     setViews((prev) => {
       const view = prev[sid];
       if (!view) return prev;
-      const last = view.transcript[view.transcript.length - 1];
-      if (!last?.streaming || last.role !== 'assistant') return prev;
-      const next = view.transcript.slice();
-      next[next.length - 1] = { ...last, text: full, streaming: false };
-      return { ...prev, [sid]: { ...view, transcript: next } };
+      const nextTranscript = writeStreamingAnswer(view.transcript, full);
+      if (nextTranscript === view.transcript) return prev;
+      return { ...prev, [sid]: { ...view, transcript: nextTranscript } };
     });
   }, []);
 
@@ -329,7 +353,7 @@ export function ChatPage() {
     const visible = pacer.target.slice(0, pacer.rendered);
     setViews((prev) => {
       const view = prev[sid] ?? EMPTY_VIEW;
-      const nextTranscript = setStreamingText(view.transcript, visible);
+      const nextTranscript = writeStreamingAnswer(view.transcript, visible);
       if (nextTranscript === view.transcript && !view.awaitingReply) return prev;
       return {
         ...prev,
@@ -597,17 +621,17 @@ export function ChatPage() {
           enqueueDelta(frame.session_id, frame.text);
           return;
         }
-        // Progress frames (reasoning / tool lifecycle) interrupt the answer
-        // stream. Settle the paced answer bubble first so the progress row
-        // lands below the text the model emitted before it — otherwise the
-        // pacer's next rAF tick would append that text after the row.
+        // Progress frames (reasoning / tool lifecycle / status) interrupt
+        // the answer stream. Settle the paced answer bubble first — its
+        // buffered text was mid-turn prose, so `routeInboundFrame` folds
+        // it into the turn's work block ahead of this progress step.
         if (
           frame.kind === 'reasoning' ||
           frame.kind === 'tool_started' ||
           frame.kind === 'tool_completed' ||
           frame.kind === 'status'
         ) {
-          flushPacer(frame.session_id);
+          flushPacerKeepStreaming(frame.session_id);
         }
         // An assistant message frame is the authoritative final text
         // for the stream — drop any pacer state so its in-flight rAF
@@ -654,7 +678,7 @@ export function ChatPage() {
       ws.close();
       wsRef.current = null;
     };
-  }, [baseUrl, channelToken, releaseSessionView, enqueueDelta, cancelPacer, flushPacer]);
+  }, [baseUrl, channelToken, releaseSessionView, enqueueDelta, cancelPacer, flushPacerKeepStreaming]);
 
   // ── Active session: subscribe + lazy-load history ───────────────────
   // Subscribe stays sticky once added: when the user switches away,
@@ -935,7 +959,7 @@ export function ChatPage() {
           [sessionId]: {
             ...view,
             transcript: [
-              ...view.transcript,
+              ...closeActiveWork(view.transcript),
               {
                 key: `pending-${clientMsgId}`,
                 role: 'user',
@@ -1181,7 +1205,7 @@ export function ChatPage() {
               {currentView.transcript.map((row) => (
                 <MessageBubble key={row.key} row={row} />
               ))}
-              {currentView.awaitingReply ? <TypingIndicator /> : null}
+              {currentView.awaitingReply ? <WorkingIndicator /> : null}
               {currentView.pendingApproval ? (
                 <ApprovalCard
                   approval={currentView.pendingApproval}
@@ -1320,7 +1344,7 @@ function routeInboundFrame(
           ...prev,
           [sid]: {
             ...view,
-            transcript: appendReasoningDelta(view.transcript, frame.text),
+            transcript: appendReasoningStep(view.transcript, frame.text),
             awaitingReply: false,
           },
         };
@@ -1335,7 +1359,7 @@ function routeInboundFrame(
           ...prev,
           [sid]: {
             ...view,
-            transcript: pushToolStarted(
+            transcript: pushToolStartedStep(
               view.transcript,
               frame.call_id,
               frame.tool,
@@ -1355,7 +1379,7 @@ function routeInboundFrame(
           ...prev,
           [sid]: {
             ...view,
-            transcript: applyToolCompleted(
+            transcript: applyToolCompletedStep(
               view.transcript,
               frame.call_id,
               frame.status,
@@ -1380,15 +1404,7 @@ function routeInboundFrame(
           ...prev,
           [sid]: {
             ...view,
-            transcript: [
-              ...view.transcript,
-              {
-                key: `status-${view.transcript.length}-${Date.now()}`,
-                role: 'system',
-                kind: 'status',
-                text,
-              },
-            ],
+            transcript: pushStatusStep(view.transcript, text),
             awaitingReply: false,
           },
         };
@@ -1399,16 +1415,22 @@ function routeInboundFrame(
       const sid = frame.session_id;
       const role: 'user' | 'assistant' = frame.role === 'user' ? 'user' : 'assistant';
       // Any assistant message — replay or live, with or without prior
-      // streaming deltas — ends the "awaiting reply" window. React
-      // batches this with the transcript update below, so it's a single
-      // commit. Done as its own setViews rather than threading the flag
-      // through every replay-merge branch so the various return paths
-      // below don't all have to remember to carry it.
+      // streaming deltas — ends the "awaiting reply" window AND closes the
+      // turn's work block (collapsing it to its `Worked Xs` summary). Both
+      // are done here as their own setViews rather than threading them
+      // through every replay-merge branch below. The close must fire on
+      // the replay path too: the gateway stamps the persisted `ordinal`
+      // onto the LIVE final reply (see `OutgoingMessage::ordinal`), so it
+      // routes through the ordinal branch, not just the live fall-through.
+      // Turns are sequential per session, so the open block is always the
+      // one this reply ends.
       if (role === 'assistant') {
         setViews((prev) => {
           const view = prev[sid];
-          if (!view || !view.awaitingReply) return prev;
-          return { ...prev, [sid]: { ...view, awaitingReply: false } };
+          if (!view) return prev;
+          const transcript = closeWorkForFinalReply(view.transcript);
+          if (transcript === view.transcript && !view.awaitingReply) return prev;
+          return { ...prev, [sid]: { ...view, transcript, awaitingReply: false } };
         });
       }
       // Catch-up replay (ordinal set): key by ordinal so React
@@ -1602,14 +1624,18 @@ function routeInboundFrame(
       const sid = frame.session_id;
       setViews((prev) => {
         const view = prev[sid] ?? EMPTY_VIEW;
+        // A notice is terminal for the turn (slash-command reply,
+        // refusal, compaction confirmation, …) — close any open work
+        // block so it collapses above the notice instead of dangling.
+        const base = closeActiveWork(view.transcript);
         return {
           ...prev,
           [sid]: {
             ...view,
             transcript: [
-              ...view.transcript,
+              ...base,
               {
-                key: `notice-${sid}-${view.transcript.length}-${Date.now()}`,
+                key: `notice-${sid}-${base.length}-${Date.now()}`,
                 role: 'system',
                 text: '',
                 notice: { level: noticeLevel(frame.level), text: frame.text },
@@ -1617,8 +1643,8 @@ function routeInboundFrame(
             ],
             // Some turns reply with `AgentOutput::Notice` and never
             // emit a Delta/Message — slash commands like `/compact`,
-            // refusal / error paths, etc. Without this, the typing
-            // dots would hang forever for those sends. The notice
+            // refusal / error paths, etc. Without this, the working
+            // indicator would hang forever for those sends. The notice
             // itself is now the reply, so awaitingReply ends here.
             awaitingReply: false,
           },
@@ -1712,11 +1738,38 @@ function mergeView(
   return { ...prev, [sessionId]: { ...view, ...patch } };
 }
 
-// Like `appendStreamingDelta` but the second arg is the *full* visible
-// text, not an increment. Used by the rAF pacer to write the smoothed
-// reveal output where each tick already knows the cumulative slice.
-function setStreamingText(prev: TranscriptRow[], text: string): TranscriptRow[] {
+// Write the pacer's cumulative visible answer slice into the right place.
+// The second arg is the *full* visible text (not an increment), so each
+// rAF tick replaces rather than appends.
+//
+// While a turn's work block is open, the answer streams **inside** it as
+// its trailing `prose` step — that's what keeps mid-turn output (and the
+// final answer as it types out) from popping out below the working bubble.
+// When the terminal `Frame::Message` lands, `closeWorkForFinalReply` peels
+// that prose step back off into the standalone answer bubble. With no open
+// block (a direct answer, no reasoning/tools) it streams straight into a
+// standalone bubble, finalized by the message path as today.
+function writeStreamingAnswer(prev: TranscriptRow[], text: string): TranscriptRow[] {
   const last = prev[prev.length - 1];
+  if (last?.kind === 'work' && last.workActive) {
+    const steps = last.steps ?? [];
+    const lastStep = steps[steps.length - 1];
+    if (lastStep?.kind === 'prose') {
+      if (lastStep.text === text) return prev;
+      const next = prev.slice();
+      next[next.length - 1] = {
+        ...last,
+        steps: [...steps.slice(0, -1), { ...lastStep, text }],
+      };
+      return next;
+    }
+    const next = prev.slice();
+    next[next.length - 1] = {
+      ...last,
+      steps: [...steps, { key: `prose-${steps.length}-${Date.now()}`, kind: 'prose', text }],
+    };
+    return next;
+  }
   if (last?.streaming && last.role === 'assistant') {
     if (last.text === text) return prev;
     return [...prev.slice(0, -1), { ...last, text }];
@@ -1755,75 +1808,198 @@ function appendStreamingDelta(prev: TranscriptRow[], text: string): TranscriptRo
   ];
 }
 
-/** Append a reasoning chunk to the trailing reasoning row, or start a
- *  new one. Reasoning rows are `role: 'system'` so they never collide
- *  with the assistant-streaming reconciliation in `finalizeMessage` /
- *  the Message-replay path. */
-function appendReasoningDelta(prev: TranscriptRow[], text: string): TranscriptRow[] {
-  const last = prev[prev.length - 1];
-  if (last?.kind === 'reasoning') {
-    return [...prev.slice(0, -1), { ...last, text: last.text + text }];
+/** Locate the turn's open work block — creating one at the tail if
+ *  absent — and fold any trailing streaming answer bubble into it as a
+ *  `prose` step first. Returns the next rows plus the block's index.
+ *
+ *  The fold is what makes "mid-turn prose lives in the work block" work:
+ *  a progress frame interrupting the answer stream means the text
+ *  streamed so far was intermediate, not the final reply, so it moves
+ *  inside the block ahead of the step the caller is about to push. The
+ *  final answer never reaches here — it's capped by `Frame::Message`,
+ *  which finalizes its bubble through `finalizeMessage` instead. Callers
+ *  own the returned `rows` (they slice before writing), so `prev` is
+ *  never mutated. The work block is `role: 'system'` so it never collides
+ *  with the assistant-streaming / replay reconciliation paths. */
+function ensureWork(prev: TranscriptRow[]): { rows: TranscriptRow[]; idx: number } {
+  let rows = prev;
+  let proseStep: WorkStep | null = null;
+  const last = rows[rows.length - 1];
+  if (last && last.kind !== 'work' && last.role === 'assistant' && last.streaming) {
+    if (last.text.trim().length > 0) {
+      proseStep = { key: `prose-${last.key}`, kind: 'prose', text: last.text };
+    }
+    rows = rows.slice(0, -1);
   }
-  return [
-    ...prev,
-    { key: `reason-${prev.length}-${Date.now()}`, role: 'system', kind: 'reasoning', text },
-  ];
+  const tail = rows[rows.length - 1];
+  let idx: number;
+  if (tail?.kind === 'work' && tail.workActive) {
+    idx = rows.length - 1;
+  } else {
+    const now = Date.now();
+    rows = [
+      ...rows,
+      {
+        key: `work-${now}-${rows.length}`,
+        role: 'system',
+        text: '',
+        kind: 'work',
+        steps: [],
+        workActive: true,
+        workStartedAt: now,
+      },
+    ];
+    idx = rows.length - 1;
+  }
+  if (proseStep) {
+    const block = rows[idx];
+    rows = rows.slice();
+    rows[idx] = { ...block, steps: [...(block.steps ?? []), proseStep] };
+  }
+  return { rows, idx };
 }
 
-/** Push a running tool-call chip, keyed by `callId`. Idempotent on a
- *  re-delivered start. */
-function pushToolStarted(
+/** Append one step to the turn's open work block. */
+function pushWorkStep(prev: TranscriptRow[], step: WorkStep): TranscriptRow[] {
+  const { rows, idx } = ensureWork(prev);
+  const block = rows[idx];
+  const next = rows.slice();
+  next[idx] = { ...block, steps: [...(block.steps ?? []), step] };
+  return next;
+}
+
+/** Append a reasoning chunk, merging into a trailing reasoning step so
+ *  the streamed thinking reads as one paragraph. */
+function appendReasoningStep(prev: TranscriptRow[], text: string): TranscriptRow[] {
+  const { rows, idx } = ensureWork(prev);
+  const block = rows[idx];
+  const steps = block.steps ?? [];
+  const lastStep = steps[steps.length - 1];
+  const next = rows.slice();
+  if (lastStep?.kind === 'reasoning') {
+    next[idx] = {
+      ...block,
+      steps: [...steps.slice(0, -1), { ...lastStep, text: (lastStep.text ?? '') + text }],
+    };
+  } else {
+    next[idx] = {
+      ...block,
+      steps: [...steps, { key: `reason-${steps.length}-${Date.now()}`, kind: 'reasoning', text }],
+    };
+  }
+  return next;
+}
+
+/** Push a running tool step, keyed by `callId`. Idempotent on a
+ *  re-delivered start within the open block. */
+function pushToolStartedStep(
   prev: TranscriptRow[],
   callId: string,
   tool: string,
   label: string | null,
 ): TranscriptRow[] {
-  if (prev.some((r) => r.kind === 'tool' && r.toolCallId === callId)) return prev;
-  return [
-    ...prev,
-    {
-      key: `tool-${callId}`,
-      role: 'system',
-      kind: 'tool',
-      text: '',
-      toolCallId: callId,
-      tool,
-      toolLabel: label,
-      toolStatus: 'running',
-    },
-  ];
+  const { rows, idx } = ensureWork(prev);
+  const block = rows[idx];
+  const steps = block.steps ?? [];
+  if (steps.some((s) => s.kind === 'tool' && s.toolCallId === callId)) return rows;
+  const next = rows.slice();
+  next[idx] = {
+    ...block,
+    steps: [
+      ...steps,
+      { key: `tool-${callId}`, kind: 'tool', toolCallId: callId, tool, toolLabel: label, toolStatus: 'running' },
+    ],
+  };
+  return next;
 }
 
-/** Resolve a tool chip by `callId` with its final status + summary. If
- *  the start was never seen (dropped), synthesize a completed row so the
+/** Resolve a tool step by `callId` with its final status + summary. If
+ *  the start was never seen (dropped), synthesize a completed step so the
  *  result still shows. */
-function applyToolCompleted(
+function applyToolCompletedStep(
   prev: TranscriptRow[],
   callId: string,
   status: string,
   summary: string,
 ): TranscriptRow[] {
-  const toolStatus: TranscriptRow['toolStatus'] =
+  const toolStatus: WorkStep['toolStatus'] =
     status === 'error' ? 'error' : status === 'denied' ? 'denied' : 'ok';
-  const idx = prev.findIndex((r) => r.kind === 'tool' && r.toolCallId === callId);
-  if (idx < 0) {
-    return [
-      ...prev,
-      {
-        key: `tool-${callId}`,
-        role: 'system',
-        kind: 'tool',
-        text: '',
-        toolCallId: callId,
-        tool: 'tool',
-        toolStatus,
-        toolSummary: summary,
-      },
-    ];
+  for (let i = prev.length - 1; i >= 0; i--) {
+    const row = prev[i];
+    if (row.kind !== 'work') continue;
+    const steps = row.steps ?? [];
+    const sIdx = steps.findIndex((s) => s.kind === 'tool' && s.toolCallId === callId);
+    if (sIdx < 0) continue;
+    const nextSteps = steps.slice();
+    nextSteps[sIdx] = { ...nextSteps[sIdx], toolStatus, toolSummary: summary };
+    const next = prev.slice();
+    next[i] = { ...row, steps: nextSteps };
+    return next;
   }
-  const next = prev.slice();
-  next[idx] = { ...next[idx], toolStatus, toolSummary: summary };
+  return pushWorkStep(prev, {
+    key: `tool-${callId}`,
+    kind: 'tool',
+    toolCallId: callId,
+    tool: 'tool',
+    toolStatus,
+    toolSummary: summary,
+  });
+}
+
+/** Push a status step (compaction, …) into the turn's open work block. */
+function pushStatusStep(prev: TranscriptRow[], text: string): TranscriptRow[] {
+  const { rows, idx } = ensureWork(prev);
+  const block = rows[idx];
+  const steps = block.steps ?? [];
+  const next = rows.slice();
+  next[idx] = {
+    ...block,
+    steps: [...steps, { key: `status-${steps.length}-${Date.now()}`, kind: 'status', text }],
+  };
   return next;
+}
+
+/** Close the turn's open work block: stamp `workEndedAt` and clear
+ *  `workActive` so it collapses to a `Worked Xs ›` summary. An empty
+ *  block (the turn produced no intermediate steps — a direct answer) is
+ *  dropped entirely so no summary line / arrow appears. */
+function closeActiveWork(prev: TranscriptRow[]): TranscriptRow[] {
+  for (let i = prev.length - 1; i >= 0; i--) {
+    const row = prev[i];
+    if (row.kind !== 'work' || !row.workActive) continue;
+    if (!row.steps || row.steps.length === 0) {
+      return [...prev.slice(0, i), ...prev.slice(i + 1)];
+    }
+    const next = prev.slice();
+    next[i] = { ...row, workActive: false, workEndedAt: Date.now() };
+    return next;
+  }
+  return prev;
+}
+
+/** Close the open work block at the turn's terminal reply, peeling off a
+ *  trailing `prose` step — that's the final answer the model streamed
+ *  into the block — so the caller renders it as the standalone answer
+ *  bubble below (from the authoritative `Frame::Message` content, so the
+ *  peeled step's own text is just discarded). If peeling empties the
+ *  block (a direct answer that only opened a block to stream into, e.g.
+ *  reasoning-less), the block is dropped so no `Worked Xs` line shows. */
+function closeWorkForFinalReply(prev: TranscriptRow[]): TranscriptRow[] {
+  for (let i = prev.length - 1; i >= 0; i--) {
+    const row = prev[i];
+    if (row.kind !== 'work' || !row.workActive) continue;
+    let steps = row.steps ?? [];
+    if (steps.length > 0 && steps[steps.length - 1].kind === 'prose') {
+      steps = steps.slice(0, -1);
+    }
+    if (steps.length === 0) {
+      return [...prev.slice(0, i), ...prev.slice(i + 1)];
+    }
+    const next = prev.slice();
+    next[i] = { ...row, steps, workActive: false, workEndedAt: Date.now() };
+    return next;
+  }
+  return prev;
 }
 
 function finalizeMessage(
@@ -1871,19 +2047,59 @@ function roleFromString(role: string): 'user' | 'assistant' | 'system' {
   return 'assistant';
 }
 
+interface HistoryWorkStepDto {
+  kind: 'reasoning' | 'prose' | 'tool';
+  text?: string;
+  tool?: string | null;
+  tool_label?: string | null;
+  tool_status?: string | null;
+  tool_summary?: string | null;
+}
+
 interface HistoryRowDto {
   created_at: string;
   ordinal: number;
+  /** `'message'` (default) or `'work'` — see the gateway's
+   *  `ChatTranscriptItem`. A `work` row is the server's reconstruction of
+   *  a tool-using turn's collapsed work block. */
+  kind?: 'message' | 'work';
   role: string;
   text: string;
   has_attachments: boolean;
+  steps?: HistoryWorkStepDto[];
+  work_started_at?: string | null;
+  work_ended_at?: string | null;
 }
 
 /** Translate one server-side transcript row into the local
  *  [`TranscriptRow`] shape, keying on the absolute ordinal so the
  *  same logical message coming back from another page-fetch (or a
- *  hot-reload during dev) reuses the same React node identity. */
+ *  hot-reload during dev) reuses the same React node identity. A
+ *  `work` row maps to a finished (collapsed) work block, rendered by
+ *  the same `WorkBlock` the live path produces. */
 function historyRowToTranscript(sessionId: string, row: HistoryRowDto): TranscriptRow {
+  if (row.kind === 'work') {
+    return {
+      key: `hist-${sessionId}-${row.ordinal}`,
+      role: 'system',
+      text: '',
+      kind: 'work',
+      workActive: false,
+      workStartedAt: row.work_started_at ? Date.parse(row.work_started_at) : undefined,
+      workEndedAt: row.work_ended_at ? Date.parse(row.work_ended_at) : undefined,
+      steps: (row.steps ?? []).map((s, i) => ({
+        key: `hist-${sessionId}-${row.ordinal}-${i}`,
+        kind: s.kind,
+        text: s.text,
+        tool: s.tool ?? undefined,
+        toolLabel: s.tool_label ?? null,
+        // Backend sends `ok` / `error` / `denied` (or null when the result
+        // didn't land); `undefined` renders neutral, matching live.
+        toolStatus: (s.tool_status ?? undefined) as WorkStep['toolStatus'],
+        toolSummary: s.tool_summary ?? undefined,
+      })),
+    };
+  }
   return {
     key: `hist-${sessionId}-${row.ordinal}`,
     role: roleFromString(row.role),
@@ -2121,7 +2337,7 @@ function SessionRow({
         ) : null}
         {hasPending ? (
           <span
-            className={`w-2 h-2 rounded-full shrink-0 ${active ? 'bg-white' : 'bg-warning'}`}
+            className={`w-2 h-2 rounded-full shrink-0 ${active ? 'bg-white' : 'bg-warn'}`}
             title="Approval pending"
           />
         ) : null}
@@ -2258,54 +2474,15 @@ function MarkdownBody({ text }: { text: string }) {
 }
 
 function MessageBubble({ row }: { row: TranscriptRow }) {
-  if (row.kind === 'reasoning') {
-    return (
-      <div className="flex items-start gap-2 px-1 font-mono text-xs text-ink-soft whitespace-pre-wrap">
-        <span className="select-none">✻</span>
-        <span className="italic">{row.text}</span>
-      </div>
-    );
-  }
-  if (row.kind === 'status') {
-    return (
-      <div className="flex items-center gap-2 px-1 font-mono text-xs text-ink-soft">
-        <span className="select-none">⟳</span>
-        <span>{row.text}</span>
-      </div>
-    );
-  }
-  if (row.kind === 'tool') {
-    const statusColor =
-      row.toolStatus === 'error'
-        ? 'text-error'
-        : row.toolStatus === 'denied'
-          ? 'text-warning'
-          : 'text-ink-soft';
-    return (
-      <div className="flex flex-col gap-0.5 px-1 font-mono text-xs">
-        <div className="flex items-center gap-1.5">
-          <span className="text-info">⏺</span>
-          <span className="font-bold text-ink">{row.tool}</span>
-          {row.toolLabel ? <span className="text-ink-soft">({row.toolLabel})</span> : null}
-          {row.toolStatus === 'running' ? (
-            <RiLoader4Line className="text-ink-soft animate-spin" title="Running…" />
-          ) : null}
-        </div>
-        {row.toolSummary ? (
-          <div className={`flex items-start gap-1.5 pl-1 ${statusColor}`}>
-            <span className="select-none">⎿</span>
-            <span className="whitespace-pre-wrap">{row.toolSummary}</span>
-          </div>
-        ) : null}
-      </div>
-    );
+  if (row.kind === 'work') {
+    return <WorkBlock row={row} />;
   }
   if (row.notice) {
     const palette =
       row.notice.level === 'error'
-        ? 'bg-error/10 border-error text-error'
+        ? 'bg-err/10 border-err text-err'
         : row.notice.level === 'warn'
-          ? 'bg-warning/10 border-warning text-warning'
+          ? 'bg-warn/10 border-warn text-warn'
           : 'bg-info/10 border-info text-info';
     return (
       <div
@@ -2367,33 +2544,189 @@ function MessageBubble({ row }: { row: TranscriptRow }) {
   );
 }
 
-// Three brand-colored dots inside an assistant-style bubble, bouncing
-// in sequence. Rendered while `SessionView.awaitingReply` is true —
-// i.e. the user has sent a turn and the agent's first delta hasn't
-// arrived yet. The bubble is intentionally left-aligned and shaped
-// like a real assistant message so the eye reads it as "the assistant
-// is composing here". Staggered `animationDelay` produces the
-// canonical typing-dot cascade.
-function TypingIndicator() {
+// One rendered step inside a work block — mirrors the old inline
+// reasoning / tool / status visuals, plus `prose` for folded mid-turn
+// answer text. Reused by both the live (active) panel and the expanded
+// collapsed view.
+function WorkStepView({ step }: { step: WorkStep }) {
+  if (step.kind === 'reasoning') {
+    return (
+      <div className="flex items-start gap-2 font-mono text-xs text-ink-soft whitespace-pre-wrap">
+        <span className="select-none">✻</span>
+        <span className="italic">{step.text}</span>
+      </div>
+    );
+  }
+  if (step.kind === 'status') {
+    return (
+      <div className="flex items-center gap-2 font-mono text-xs text-ink-soft">
+        <span className="select-none">⟳</span>
+        <span>{step.text}</span>
+      </div>
+    );
+  }
+  if (step.kind === 'prose') {
+    return (
+      <div className="font-mono text-xs text-ink-soft leading-relaxed">
+        <MarkdownBody text={step.text ?? ''} />
+      </div>
+    );
+  }
+  const statusColor =
+    step.toolStatus === 'error'
+      ? 'text-err'
+      : step.toolStatus === 'denied'
+        ? 'text-warn'
+        : 'text-ink-soft';
+  return (
+    <div className="flex flex-col gap-0.5 font-mono text-xs">
+      <div className="flex items-center gap-1.5">
+        <span className="text-info">⏺</span>
+        <span className="font-bold text-ink">{step.tool}</span>
+        {step.toolLabel ? <span className="text-ink-soft">({step.toolLabel})</span> : null}
+        {step.toolStatus === 'running' ? (
+          <RiLoader4Line className="text-ink-soft animate-spin" title="Running…" />
+        ) : null}
+      </div>
+      {step.toolSummary ? (
+        <div className={`flex items-start gap-1.5 pl-1 ${statusColor}`}>
+          <span className="select-none">⎿</span>
+          <span className="whitespace-pre-wrap">{step.toolSummary}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// The turn's aggregated progress. While `workActive`, it's an expanded
+// assistant-side bubble with an animated "Working" header + live elapsed
+// timer and the steps revealed underneath. On completion it collapses to
+// a dim `Worked Xs ›` line (click to re-expand the work) that sits above
+// the final answer bubble. A turn that produced no steps is dropped on
+// close (see `closeActiveWork`), so a collapsed block always has work to
+// show and the arrow is always meaningful.
+function WorkBlock({ row }: { row: TranscriptRow }) {
+  const active = !!row.workActive;
+  const steps = row.steps ?? [];
+  // `expanded` is the user's explicit toggle for the *finished* block and
+  // defaults closed; while the turn is still active the block is forced
+  // open. Deriving `open` this way — rather than an effect that flips
+  // `expanded` on completion — keeps the active→done collapse a single
+  // render, so the body animates 1fr→0fr cleanly with no intermediate
+  // flash.
+  const [expanded, setExpanded] = useState(false);
+  const open = active || expanded;
+
+  if (!active && steps.length === 0) return null;
+
+  const secs =
+    row.workEndedAt && row.workStartedAt
+      ? Math.max(0, Math.round((row.workEndedAt - row.workStartedAt) / 1000))
+      : 0;
+  // A *collapsed* finished block sits directly above its turn's answer
+  // bubble — pull the row gap in (the transcript's `gap-3`) so the
+  // `Worked Xs ›` summary reads as attached to that answer. Only when
+  // collapsed: while active there's nothing below it, and once expanded
+  // the steps panel becomes its own box that needs the normal gap to the
+  // answer. Transitioned so expand/collapse eases the gap rather than
+  // snapping it.
+  const tighten = open ? '' : '-mb-3';
+
+  // One persistent element tree across active / collapsed / expanded so
+  // the transitions actually animate (a branch swap would just hard-cut).
+  // The chrome (border + bg + shadow) fades via `transition-all`; the
+  // steps panel grows/shrinks via the grid-rows 0fr↔1fr trick — the
+  // dependable way to animate to/from content height. Border *width*
+  // stays 2px in every state (only its color fades) so nothing reflows.
+  return (
+    <div
+      className={`group flex flex-col items-start w-full transition-[margin-bottom] duration-300 ease-out ${tighten}`}
+    >
+      <div
+        className={`w-full max-w-2xl rounded-md overflow-hidden border-2 transition-all duration-300 ease-out ${
+          open
+            ? 'border-black bg-white shadow-brutal-sm'
+            : // Collapsed: pull left by the 2px transparent border so the
+              // `Worked Xs ›` line sits flush with the answer bubble's edge.
+              'border-transparent bg-transparent shadow-none -ml-0.5'
+        }`}
+      >
+        <button
+          type="button"
+          onClick={() => {
+            if (!active) setExpanded((e) => !e);
+          }}
+          className={`w-full flex items-center gap-2 py-2 font-mono text-xs text-left border-b-2 transition-all duration-300 ease-out ${
+            // Drop the horizontal padding when collapsed so the summary
+            // aligns to the bubble's left edge, not its (indented) text.
+            open ? 'px-3 border-black bg-canvas' : 'px-0 border-transparent bg-transparent'
+          } ${active ? 'cursor-default' : 'cursor-pointer hover:bg-canvas'}`}
+        >
+          {active ? (
+            <>
+              <RiLoader4Line className="text-sm text-brand animate-spin shrink-0" />
+              <span className="font-bold uppercase tracking-wider text-ink">Working</span>
+              {row.workStartedAt ? (
+                <span className="text-ink-soft tabular-nums">
+                  <LiveElapsed startedAt={row.workStartedAt} />
+                </span>
+              ) : null}
+            </>
+          ) : (
+            <>
+              <span className="text-ink-soft">Worked {secs}s</span>
+              <RiArrowRightSLine
+                className={`text-sm text-ink-soft shrink-0 transition-transform duration-300 ease-out ${
+                  expanded ? 'rotate-90' : ''
+                }`}
+              />
+            </>
+          )}
+        </button>
+        <div
+          className={`grid transition-[grid-template-rows] duration-300 ease-out ${
+            open ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'
+          }`}
+        >
+          <div className="overflow-hidden min-h-0">
+            <div className="flex flex-col gap-1.5 px-3 py-2">
+              {steps.map((s) => (
+                <WorkStepView key={s.key} step={s} />
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Live-ticking elapsed seconds for the active work header. Self-contained
+// 1s interval so the rest of the transcript doesn't re-render on the tick.
+function LiveElapsed({ startedAt }: { startedAt: number }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  const secs = Math.max(0, Math.floor((now - startedAt) / 1000));
+  return <>{secs}s</>;
+}
+
+// The initial "working" affordance, shown between sending a turn and the
+// agent's first output frame (`SessionView.awaitingReply`). Replaces the
+// old typing-dots bubble; its header matches the active work block so the
+// two read as one continuous element once steps start landing.
+function WorkingIndicator() {
   return (
     <div className="group flex flex-col items-start">
       <div
-        className="border-2 border-black rounded-md bg-white px-3 py-2.5 shadow-brutal-sm flex items-end gap-1"
-        aria-label="Assistant is composing a reply"
+        className="border-2 border-black rounded-md bg-white px-3 py-2 shadow-brutal-sm flex items-center gap-2 font-mono text-xs"
+        aria-label="Assistant is working"
         role="status"
       >
-        <span
-          className="block w-1.5 h-1.5 rounded-full bg-brand animate-bounce"
-          style={{ animationDelay: '0ms' }}
-        />
-        <span
-          className="block w-1.5 h-1.5 rounded-full bg-brand animate-bounce"
-          style={{ animationDelay: '150ms' }}
-        />
-        <span
-          className="block w-1.5 h-1.5 rounded-full bg-brand animate-bounce"
-          style={{ animationDelay: '300ms' }}
-        />
+        <RiLoader4Line className="text-sm text-brand animate-spin" />
+        <span className="font-bold uppercase tracking-wider text-ink-soft">Working…</span>
       </div>
     </div>
   );
@@ -2514,7 +2847,7 @@ function ApprovalCard({
         </pre>
       </details>
       {!connected ? (
-        <div className="text-[0.7rem] font-mono uppercase tracking-wider text-warning">
+        <div className="text-[0.7rem] font-mono uppercase tracking-wider text-warn">
           Waiting for connection — buttons disabled until the WS is back.
         </div>
       ) : null}
@@ -2539,7 +2872,7 @@ function ApprovalCard({
           type="button"
           onClick={() => decide('deny')}
           disabled={buttonsDisabled}
-          className="px-3 py-1.5 bg-error text-white border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:opacity-90 active:translate-x-[2px] active:translate-y-[2px] active:shadow-none cursor-pointer flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed disabled:active:translate-x-0 disabled:active:translate-y-0 disabled:active:shadow-brutal-sm"
+          className="px-3 py-1.5 bg-err text-white border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:opacity-90 active:translate-x-[2px] active:translate-y-[2px] active:shadow-none cursor-pointer flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed disabled:active:translate-x-0 disabled:active:translate-y-0 disabled:active:shadow-brutal-sm"
         >
           <RiCloseLine /> Deny
         </button>
@@ -2550,8 +2883,8 @@ function ApprovalCard({
 
 const CONNECTION_BADGE_COLOR: Record<ConnectionStatus['state'], string> = {
   connected: 'bg-ok',
-  connecting: 'bg-warning',
-  disconnected: 'bg-error',
+  connecting: 'bg-warn',
+  disconnected: 'bg-err',
 };
 
 function connectionBadgeLabel(status: ConnectionStatus): string {

@@ -259,6 +259,17 @@ impl ChatMessage {
             MessageSource::User | MessageSource::UserInterjection
         )
     }
+
+    /// True when this message carries any [`ContentBlock::ToolUse`]. For an
+    /// assistant turn that marks it as an *intermediate* agentic iteration
+    /// (it issued tool calls, so the loop continued) rather than the final
+    /// reply — the chat surface treats such a turn's narration as live-only
+    /// work progress, not a durable answer bubble.
+    pub fn has_tool_use(&self) -> bool {
+        self.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

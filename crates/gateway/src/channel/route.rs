@@ -657,6 +657,15 @@ async fn chat_to_visible_wire_message(
         // Role::Tool rows are tool results — internal.
         _ => return None,
     };
+    // Intermediate agentic iterations (assistant turns that issued tool
+    // calls) carry the model's working narration, which is live-only work
+    // progress — not a durable answer bubble. Drop them on catch-up replay
+    // so a reconnect agrees with the REST reload path (`api::admin::chat::
+    // chat_to_transcript_item`); only the final, tool-call-free reply
+    // surfaces.
+    if msg.role == Role::Assistant && msg.has_tool_use() {
+        return None;
+    }
     // Mirror `adapter::split_content`'s text+attachments shape so a
     // row with only Image/Audio/File blocks still surfaces as a wire
     // Message — the REST transcript path keeps such rows visible via
