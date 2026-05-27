@@ -530,9 +530,24 @@ pub enum ExternalAgentCmd {
     /// read — the running daemon's registry is unaffected.
     Status,
     /// Interactive wizard: pick a kind, prompt binary path (empty
-    /// = $PATH), run the probe, persist `external_agents.<kind>
-    /// .binary_path` to `aura.json` on success.
+    /// = $PATH), run the probe, then persist the *resolved absolute*
+    /// path to `external_agents.<kind>.binary_path` in `aura.json` —
+    /// even an empty answer records the concrete location PATH
+    /// resolved to, so the gateway service pins the same binary.
     Setup,
+    /// Interactive multi-select: check the currently-enabled kinds to
+    /// turn off (`external_agents.<kind>.enabled = false`) in
+    /// `aura.json`. If a disabled kind was `default_external_agent`,
+    /// the default is re-resolved (cleared when ≤1 kind remains, else
+    /// re-prompted). When nothing is enabled it's a no-op success — the
+    /// feature is already off.
+    Disable,
+    /// Interactive picker that sets `default_external_agent` to one of
+    /// the currently-enabled kinds and persists it to `aura.json`. The
+    /// default is an operator-facing designation (the spawn protocol
+    /// still needs an explicit `backend`), so it only matters once more
+    /// than one kind is enabled.
+    Default,
 }
 
 #[derive(Debug, Subcommand)]

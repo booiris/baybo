@@ -266,8 +266,10 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
             cmd: LlmCmd::Add | LlmCmd::Edit | LlmCmd::Remove | LlmCmd::Default,
         } => Err("interactive LLM editor; run it from a shell"),
         Commands::ExternalAgent {
-            cmd: ExternalAgentCmd::Setup,
-        } => Err("`external-agent setup` is interactive; run it from a shell"),
+            cmd: ExternalAgentCmd::Setup | ExternalAgentCmd::Disable | ExternalAgentCmd::Default,
+        } => {
+            Err("`external-agent setup`/`disable`/`default` are interactive; run them from a shell")
+        }
 
         // Bounded reads + opt-in mutations: allowed.
         Commands::Config { cmd } => match cmd {
