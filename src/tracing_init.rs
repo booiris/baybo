@@ -15,6 +15,7 @@
 //! when one exists — the caller must keep it alive for the process
 //! lifetime, otherwise the background writer stops flushing.
 
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
@@ -43,6 +44,10 @@ impl FormatTime for SecondPrecisionTimer {
 pub enum TracingMode<'a> {
     /// One-shot argv path: fmt layer to stdout, no file, no TUI mirror.
     Stdout,
+    /// One-shot `-p` prompt path: fmt layer to stderr (stdout is reserved
+    /// for the assistant's answer), defaulting to `warn` so a piped
+    /// `aura -p` stays quiet unless `RUST_LOG` opts into more.
+    Stderr,
     /// Gateway server path: writes rolling daily logs to
     /// `<log_dir>/aura.log` through a [`RedactingMakeWriter`] so
     /// secrets matching any detector rule are masked on disk.
@@ -98,11 +103,13 @@ pub fn init_tracing(mode: TracingMode<'_>) -> TracingGuards {
     // text and break downstream parsers. `RUST_LOG` always wins if
     // explicitly set.
     let agent_mode = std::env::var_os(aura_cli::cli::ENV_HELP_AGENT).is_some_and(|v| !v.is_empty());
-    let default_filter = if agent_mode && matches!(mode, TracingMode::Stdout) {
-        "aura=warn"
-    } else {
-        "aura=info"
-    };
+    // Keep routine boot chatter out of the way when the payload is the
+    // point: agent-driven argv (stdout is captured as JSON) and the `-p`
+    // prompt path (stderr is a sidebar to the streamed answer) both
+    // default to `warn`. `RUST_LOG` always wins.
+    let quiet =
+        matches!(mode, TracingMode::Stderr) || (agent_mode && matches!(mode, TracingMode::Stdout));
+    let default_filter = if quiet { "aura=warn" } else { "aura=info" };
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
     let json = std::env::var("AURA_LOG_FORMAT").unwrap_or_default() == "json";
@@ -113,6 +120,35 @@ pub fn init_tracing(mode: TracingMode<'_>) -> TracingGuards {
         TracingMode::Stdout => {
             let fmt_layer = fmt::layer()
                 .with_ansi(!agent_mode)
+                .with_timer(SecondPrecisionTimer)
+                .with_target(true)
+                .with_file(true)
+                .with_line_number(true);
+            let result = if json {
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(buffer_layer)
+                    .with(fmt_layer.json().with_span_list(true))
+                    .try_init()
+            } else {
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(buffer_layer)
+                    .with(fmt_layer)
+                    .try_init()
+            };
+            if let Err(e) = result {
+                eprintln!("warning: tracing subscriber already initialized: {e}");
+            }
+            TracingGuards {
+                _worker: None,
+                log_buffer,
+            }
+        }
+        TracingMode::Stderr => {
+            let fmt_layer = fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(std::io::stderr().is_terminal())
                 .with_timer(SecondPrecisionTimer)
                 .with_target(true)
                 .with_file(true)
