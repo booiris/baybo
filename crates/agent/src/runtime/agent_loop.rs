@@ -11,8 +11,7 @@ use aura_llm::{
 };
 use aura_memory::{Memory, MemoryContext};
 use aura_model::{
-    ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SpanId, SystemSpawnRequest,
-    ThinkingContent,
+    ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SystemSpawnRequest, ThinkingContent,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -1262,20 +1261,14 @@ impl AgentLoop {
         let user_id = session.user.id.clone();
         let session_id = session.id.clone();
         let query = query.to_vec();
+        let recorder = Arc::clone(span_recorder);
         let recalled = crate::runtime::scope::with_step(
             span_recorder.as_ref(),
             job_id,
             StepKind::MemoryRecall,
             Some((cancel_token, aura_job::CancelReason::ParentCancelled)),
-            |_step| async move {
-                let ctx = MemoryContext {
-                    attribution: Attribution {
-                        user_id,
-                        session_id,
-                        job_id,
-                        span_id: SpanId::new(),
-                    },
-                };
+            move |step| async move {
+                let ctx = MemoryContext::new(user_id, session_id, job_id, recorder, step);
                 match memory.recall(&ctx, &query).await {
                     Ok(mems) => Ok((LifecycleOutcome::Ok, mems)),
                     Err(e) => Err(anyhow::Error::new(e)),
@@ -1317,20 +1310,14 @@ impl AgentLoop {
         let user_id = session.user.id.clone();
         let session_id = session.id.clone();
         tokio::spawn(async move {
+            let ctx_recorder = Arc::clone(&recorder);
             let result = crate::runtime::scope::with_step(
                 recorder.as_ref(),
                 job_id,
                 StepKind::MemoryWrite,
                 None,
-                |_step| async move {
-                    let ctx = MemoryContext {
-                        attribution: Attribution {
-                            user_id,
-                            session_id,
-                            job_id,
-                            span_id: SpanId::new(),
-                        },
-                    };
+                move |step| async move {
+                    let ctx = MemoryContext::new(user_id, session_id, job_id, ctx_recorder, step);
                     match memory
                         .on_job_complete(&ctx, &user_input, &final_output)
                         .await

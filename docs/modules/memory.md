@@ -28,8 +28,12 @@ reason to forbid the whole shape.
 
 ```rust
 // crates/memory/src/lib.rs
-pub struct MemoryContext { pub attribution: aura_llm::Attribution }
 pub struct RecalledMemory { pub content: String }
+
+// Carries the real (user, session, job) + the trace recorder + the enclosing
+// memory step. `scoped_llm_call(begin, body)` opens an LlmCall span under that
+// step and hands `body` an Attribution bound to it, for billed sub-calls.
+pub struct MemoryContext { /* user_id, session_id, job_id, recorder, step */ }
 
 #[async_trait]
 pub trait Memory: Send + Sync {
@@ -59,21 +63,24 @@ pub trait Memory: Send + Sync {
 ## Clients & billing
 
 The implementation holds the **unbound** `Arc<BillableLlm>` and a billed
-embedding handle, constructor-injected. Each call gets a `MemoryContext` whose
-`Attribution` the core mints when it opens the `MemoryRecall` / `MemoryWrite`
-trace step; the impl binds its handles per call, so spend bills to the **real**
-user/session (mirrors `compression.rs`, not `Attribution::system`).
+embedding handle, constructor-injected. The core hands each call a
+`MemoryContext` carrying the real `(user, session, job)` + the trace recorder +
+the enclosing `MemoryRecall` / `MemoryWrite` step; the impl binds its handles per
+billed sub-call via `MemoryContext::scoped_llm_call` (below), so spend bills to
+the **real** user/session under a real span (mirrors `compression.rs`, not
+`Attribution::system`).
 
-**Span-attribution caveat.** That `Attribution` carries the real
-user/session/job but a freshly-minted `span_id` that does **not** back a recorded
-span: the core opens the `MemoryRecall` / `MemoryWrite` *step* but not a span,
-because the billed sub-calls are the opaque impl's, not the core's (the only
-`SpanKind`s are `LlmCall` / `ToolCall`, neither of which the core can populate for
-a call it doesn't make). So an impl's memory spend lands in the job's cost total
-under a per-operation id with no span row — the same shape as
-`Attribution::system`. Giving those sub-calls real spans needs a future
-`MemoryContext` extension (hand the impl a recorder + step, or add a `MemoryCall`
-span kind); deferred with the rest of the backend.
+**Span attribution.** `cost_records.span_id` is written by `record_call` keyed
+off `attribution.span_id`, so a billed sub-call needs a *real* span or its cost
+row is orphaned. `MemoryContext::scoped_llm_call(begin, body)` provides one: it
+opens an `LlmCall` span **under the memory step**, hands `body` an `Attribution`
+bound to that span (built from the real user/session/job + the span id), and
+closes the span with the call's token usage. The impl binds its `BillableLlm` /
+billed embedding handle with that attribution and makes the call — so the cost
+row lands on a recorded span, attributed to the real user/session/job. Embedding
+calls record as `LlmCall` spans too (a model call is a model call for cost/trace
+purposes). The impl never constructs a bare `Attribution`, so it can't bill
+against an orphaned id.
 
 A new **`EmbeddingClient`** trait lives in `aura-llm` beside `BilledChat`:
 batch `embed(&[String]) -> EmbeddingResponse` + `dimensions()`, sealed behind

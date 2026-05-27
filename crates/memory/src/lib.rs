@@ -28,28 +28,119 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aura_llm::Attribution;
-use aura_model::{ChatMessage, ContentBlock};
+use aura_model::{ChatMessage, ContentBlock, JobId, SessionId};
 use aura_tools::{Tool, ToolManifest};
+use aura_trace::{
+    LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanKind, SpanRecorder, StepHandle,
+};
 
 pub use error::MemoryError;
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
 
-/// Per-call context the core mints for every [`Memory`] call. Carries the
-/// [`Attribution`] the impl binds its LLM + embedding handles with, so memory
-/// spend bills to the real user/session and joins the `MemoryRecall` /
-/// `MemoryWrite` trace step (mirrors compression's attribution binding). The
-/// attribution also carries the user/session/job/span ids an impl needs to
-/// scope its own per-session or per-job de-duplication.
+/// Per-call context the core builds for every [`Memory`] call. Carries the
+/// real `(user, session, job)` this operation belongs to, plus the trace
+/// recorder and the enclosing `MemoryRecall` / `MemoryWrite` step.
 ///
-/// Caveat: the `Attribution.span_id` is minted per call and does **not** (yet)
-/// back a recorded span — the core opens the `MemoryRecall` / `MemoryWrite`
-/// *step*, but the billed sub-calls are the impl's, so their spend attributes to
-/// the real user/session/job under an unattached span id (same shape as
-/// `Attribution::system`). See the span-attribution caveat in
-/// `docs/modules/memory.md`.
+/// An impl that makes billed LLM / embedding sub-calls runs each through
+/// [`MemoryContext::scoped_llm_call`], which opens an `LlmCall` span **under the
+/// memory step** and hands back an [`Attribution`] bound to that span — so the
+/// spend the call records lands on a real span attributed to the real
+/// user/session/job, never an orphaned id. The same `(user, session, job)` ids
+/// (via [`Self::session_id`] / [`Self::job_id`]) are what an impl keys its own
+/// per-session / per-job de-duplication off.
 pub struct MemoryContext {
-    pub attribution: Attribution,
+    user_id: String,
+    session_id: SessionId,
+    job_id: JobId,
+    recorder: Arc<SpanRecorder>,
+    step: StepHandle,
+}
+
+impl MemoryContext {
+    /// Build the context for one memory call. The core calls this **inside** the
+    /// `MemoryRecall` / `MemoryWrite` trace step, so `step` is that step and
+    /// every [`Self::scoped_llm_call`] span nests under it.
+    pub fn new(
+        user_id: String,
+        session_id: SessionId,
+        job_id: JobId,
+        recorder: Arc<SpanRecorder>,
+        step: StepHandle,
+    ) -> Self {
+        Self {
+            user_id,
+            session_id,
+            job_id,
+            recorder,
+            step,
+        }
+    }
+
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn job_id(&self) -> JobId {
+        self.job_id
+    }
+
+    /// Record a billed model sub-call (LLM or embedding) as an `LlmCall` span
+    /// under this operation's memory step, so the spend it records attributes to
+    /// a **real** span (and the real user/session/job), not an orphaned id. The
+    /// closure receives the [`Attribution`] bound to that span — bind your
+    /// billed client with it, make the call, and return its [`LlmCallResult`]
+    /// (token usage, for the span) alongside your value. Mirrors the agent
+    /// loop's own LLM-span discipline. Embedding calls are recorded as `LlmCall`
+    /// spans too — a model call is a model call for cost and trace purposes.
+    pub async fn scoped_llm_call<F, Fut, T>(&self, begin: LlmCallBegin, body: F) -> Result<T>
+    where
+        F: FnOnce(Attribution) -> Fut,
+        Fut: std::future::Future<Output = (LlmCallResult, Result<T>)>,
+    {
+        let span = self
+            .recorder
+            .begin_span(
+                &self.step,
+                SpanKind::LlmCall {
+                    begin,
+                    result: None,
+                },
+                None,
+            )
+            .await
+            .map_err(|e| MemoryError::Internal(anyhow::Error::new(e)))?;
+        let attribution = Attribution {
+            user_id: self.user_id.clone(),
+            session_id: self.session_id.clone(),
+            job_id: self.job_id,
+            span_id: span.span_id,
+        };
+        let (call_result, value) = body(attribution).await;
+        let outcome = match &value {
+            Ok(_) => LifecycleOutcome::Ok,
+            Err(e) => LifecycleOutcome::Failed {
+                reason: e.to_string(),
+            },
+        };
+        if let Err(e) = self
+            .recorder
+            .end_span(
+                span,
+                self.job_id,
+                SpanFinalize::LlmCall(call_result),
+                outcome,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "memory: end_span failed; span left half-open");
+        }
+        value
+    }
 }
 
 /// One memory the core injects into the `<recalled_memory>` envelope. A struct

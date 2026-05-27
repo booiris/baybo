@@ -583,9 +583,11 @@ dependencies = [
  "aura-llm",
  "aura-model",
  "aura-tools",
+ "aura-trace",
  "parking_lot",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
