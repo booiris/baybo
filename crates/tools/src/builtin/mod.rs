@@ -71,6 +71,7 @@ pub use write::WriteTool;
 pub fn default_tools(
     blob_store: Arc<dyn BlobStore>,
     workspace_paths: WorkspacePaths,
+    proxy: Option<reqwest::Proxy>,
 ) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     #[allow(unused_mut)]
     let mut tools: Vec<(Arc<dyn Tool>, ToolManifest)> = vec![
@@ -90,7 +91,7 @@ pub fn default_tools(
         trusted(GlobTool, vec![ToolCapability::ReadFile]),
         trusted(GrepTool, vec![ToolCapability::ReadFile]),
         trusted(
-            WebFetchTool::new(blob_store.clone()),
+            WebFetchTool::new(blob_store.clone(), proxy),
             vec![ToolCapability::Http],
         ),
         send_local_file::tool(blob_store.clone()),

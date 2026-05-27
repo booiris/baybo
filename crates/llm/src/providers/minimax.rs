@@ -46,6 +46,7 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
         let client = anthropic::Client::builder()
             .api_key(api_key)
             .base_url(base_url)
+            .http_client(crate::proxied_client(config.proxy.as_ref())?)
             .build()
             .map_err(|e| {
                 crate::LlmError::Config(format!("failed to create MiniMax client: {e}"))
@@ -87,7 +88,7 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
         let base = std::env::var("MINIMAX_MODELS_BASE")
             .unwrap_or_else(|_| derive_models_base(config.base_url.as_deref()));
         let url = format!("{}/models", base.trim_end_matches('/'));
-        let resp = reqwest::Client::new()
+        let resp = crate::proxied_client(config.proxy.as_ref())?
             .get(&url)
             .bearer_auth(api_key)
             .send()
@@ -238,6 +239,7 @@ mod tests {
             pricing: None,
             reasoning_effort: None,
             vault: None,
+            proxy: None,
         };
         assert!(factory.create(&config).is_err());
     }
@@ -255,6 +257,7 @@ mod tests {
             pricing: None,
             reasoning_effort: None,
             vault: None,
+            proxy: None,
         };
         let client = factory.create(&config).expect("client builds with api key");
         assert_eq!(client.model_info().provider, "minimax");
@@ -278,6 +281,7 @@ mod tests {
             pricing: None,
             reasoning_effort: None,
             vault: None,
+            proxy: None,
         };
         let client = factory.create(&config).unwrap();
         assert!(!client.model_info().supports_vision);
@@ -300,6 +304,7 @@ mod tests {
                 pricing: None,
                 reasoning_effort: None,
                 vault: None,
+                proxy: None,
             })
             .unwrap();
         assert!(client.model_info().supports_vision);
@@ -322,6 +327,7 @@ mod tests {
                 pricing: None,
                 reasoning_effort: None,
                 vault: None,
+                proxy: None,
             })
             .unwrap();
         assert!(!client.model_info().supports_vision);

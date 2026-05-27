@@ -41,6 +41,9 @@ const INSTALL_HINT: &str = "Install Claude Code (npm install -g @anthropic-ai/cl
 pub struct ClaudeCliAgent {
     binary_path: PathBuf,
     model: String,
+    /// Egress proxy injected into the child's env so the external CLI's
+    /// own LLM calls route through it. `None` = inherit the parent env.
+    proxy: Option<aura_security::http::ProxySettings>,
 }
 
 impl ClaudeCliAgent {
@@ -49,7 +52,10 @@ impl ClaudeCliAgent {
     /// executes. Failure surfaces as `ExternalAgentError::Config`
     /// with operator-actionable text — callers (the boot path) use
     /// this for fail-fast registration.
-    pub fn probe_and_build(binary_path: Option<&str>) -> Result<Arc<Self>> {
+    pub fn probe_and_build(
+        binary_path: Option<&str>,
+        proxy: Option<aura_security::http::ProxySettings>,
+    ) -> Result<Arc<Self>> {
         let resolved = resolve_binary(
             binary_path,
             ExternalAgentKind::Claude.binary_name(),
@@ -59,6 +65,7 @@ impl ClaudeCliAgent {
         Ok(Arc::new(Self {
             binary_path: resolved,
             model: DEFAULT_MODEL_FLAG.to_string(),
+            proxy,
         }))
     }
 
@@ -122,6 +129,11 @@ impl ClaudeCliAgent {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        if let Some(proxy) = &self.proxy {
+            for (k, v) in proxy.env_vars() {
+                cmd.env(k, v);
+            }
+        }
 
         let mut child = cmd.spawn().map_err(|e| {
             ExternalAgentError::Config(format!(
@@ -542,14 +554,14 @@ mod tests {
     #[test]
     fn probe_succeeds_with_working_binary() {
         let (_dir, bin) = fake_claude("claude 1.2.3");
-        let agent = ClaudeCliAgent::probe_and_build(Some(bin.to_str().unwrap()))
+        let agent = ClaudeCliAgent::probe_and_build(Some(bin.to_str().unwrap()), None)
             .expect("probe should succeed");
         assert_eq!(agent.kind(), ExternalAgentKind::Claude);
     }
 
     #[test]
     fn probe_fails_when_binary_path_missing() {
-        let err = ClaudeCliAgent::probe_and_build(Some("/nonexistent/claude-binary-xyzzy"))
+        let err = ClaudeCliAgent::probe_and_build(Some("/nonexistent/claude-binary-xyzzy"), None)
             .expect_err("expected error for missing binary path");
         match err {
             ExternalAgentError::NotInstalled(msg) => {
@@ -562,7 +574,7 @@ mod tests {
 
     #[test]
     fn probe_rejects_relative_binary_path() {
-        let err = ClaudeCliAgent::probe_and_build(Some("./claude"))
+        let err = ClaudeCliAgent::probe_and_build(Some("./claude"), None)
             .expect_err("expected error for relative binary path");
         match err {
             ExternalAgentError::Config(msg) => {
@@ -582,8 +594,8 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
 
-        let err =
-            ClaudeCliAgent::probe_and_build(Some(bin.to_str().unwrap())).expect_err("must fail");
+        let err = ClaudeCliAgent::probe_and_build(Some(bin.to_str().unwrap()), None)
+            .expect_err("must fail");
         match err {
             ExternalAgentError::Config(msg) => {
                 assert!(msg.contains("printed nothing"), "msg: {msg}")
@@ -601,8 +613,8 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
 
-        let err =
-            ClaudeCliAgent::probe_and_build(Some(bin.to_str().unwrap())).expect_err("must fail");
+        let err = ClaudeCliAgent::probe_and_build(Some(bin.to_str().unwrap()), None)
+            .expect_err("must fail");
         match err {
             ExternalAgentError::Config(msg) => {
                 assert!(msg.contains("exited"), "msg: {msg}");

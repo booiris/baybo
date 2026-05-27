@@ -171,9 +171,15 @@ async fn main() -> anyhow::Result<()> {
     // …) don't drive WebFetch through an agent loop; the per-call
     // `ToolContext::llm` is left `None` in those paths, so WebFetch
     // silently falls back to raw markdown.
+    let tool_proxy = boot::proxy_settings(&config)
+        .as_ref()
+        .map(|p| p.to_proxy())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("invalid proxy.url: {e}"))?;
     let tool_registry = Arc::new(aura_tools::ToolRegistry::with_defaults(
         stores.blob.clone(),
         workspace_paths.clone(),
+        tool_proxy,
     ));
     let workspace = Arc::new(aura_workspace::WorkspaceManager::new(
         workspace_root.clone(),

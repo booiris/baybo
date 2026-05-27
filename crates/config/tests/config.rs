@@ -1,6 +1,6 @@
 use aura_config::{
     AuraConfig, ClaudeConfig, CodexConfig, ConfigError, DiscordChannelConfig, ExternalAgentsConfig,
-    GeminiConfig, LlmEntry, LlmEntryName, TelegramChannelConfig,
+    GeminiConfig, LlmEntry, LlmEntryName, ProxyConfig, TelegramChannelConfig,
 };
 use aura_model::{ExternalAgentKind, ModelTier};
 
@@ -77,6 +77,38 @@ fn bad_base_url_fails_validation() {
     c.llm[0].base_url = Some("ftp://x".into());
     let errors = unwrap_validation(c.validate().unwrap_err());
     assert!(has_field(&errors, "llm[0].base_url"));
+}
+
+#[test]
+fn valid_proxy_passes_validation() {
+    let mut c = config_with_default_entry();
+    c.proxy = Some(ProxyConfig {
+        url: "socks5://127.0.0.1:1080".into(),
+        no_proxy: Some(vec![".internal".into()]),
+    });
+    assert!(c.validate().is_ok());
+}
+
+#[test]
+fn proxy_unsupported_scheme_fails_validation() {
+    let mut c = config_with_default_entry();
+    c.proxy = Some(ProxyConfig {
+        url: "ftp://proxy:21".into(),
+        no_proxy: None,
+    });
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "proxy.url"));
+}
+
+#[test]
+fn proxy_empty_url_fails_validation() {
+    let mut c = config_with_default_entry();
+    c.proxy = Some(ProxyConfig {
+        url: "  ".into(),
+        no_proxy: None,
+    });
+    let errors = unwrap_validation(c.validate().unwrap_err());
+    assert!(has_field(&errors, "proxy.url"));
 }
 
 #[test]

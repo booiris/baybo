@@ -63,7 +63,11 @@ impl ProbeStatus {
     }
 }
 
-pub async fn probe(entry: &McpServerEntry, vault: &Arc<SecretVault>) -> ProbeStatus {
+pub async fn probe(
+    entry: &McpServerEntry,
+    vault: &Arc<SecretVault>,
+    proxy: Option<&aura_security::http::ProxySettings>,
+) -> ProbeStatus {
     // Fast path: for an HTTP server with no stored access token, a single
     // unauthenticated GET tells us whether the server requires auth far
     // more reliably than letting rmcp swallow the response into an opaque
@@ -71,12 +75,12 @@ pub async fn probe(entry: &McpServerEntry, vault: &Arc<SecretVault>) -> ProbeSta
     // there is no equivalent cheap probe.
     if let McpTransportConfig::Http { url } = &entry.transport
         && !has_access_token(vault, &entry.name).await
-        && let Some(status) = http_auth_precheck(url).await
+        && let Some(status) = http_auth_precheck(url, proxy).await
     {
         return status;
     }
 
-    match tokio::time::timeout(PROBE_TIMEOUT, connect(entry, vault)).await {
+    match tokio::time::timeout(PROBE_TIMEOUT, connect(entry, vault, proxy)).await {
         Err(_) => ProbeStatus::Timeout,
         Ok(Err(e)) => classify(e.to_string()),
         Ok(Ok(session)) => {
@@ -110,10 +114,12 @@ async fn has_access_token(vault: &Arc<SecretVault>, server_name: &str) -> bool {
 ///
 /// We retry once on connect failures because the first hit against a
 /// cold host occasionally aborts mid-TLS-handshake.
-pub(super) async fn http_auth_precheck(url: &str) -> Option<ProbeStatus> {
-    let client = match reqwest::Client::builder()
-        .timeout(HTTP_PRECHECK_TIMEOUT)
-        .build()
+pub(super) async fn http_auth_precheck(
+    url: &str,
+    proxy: Option<&aura_security::http::ProxySettings>,
+) -> Option<ProbeStatus> {
+    let client = match aura_security::http::client_builder(proxy)
+        .and_then(|b| b.timeout(HTTP_PRECHECK_TIMEOUT).build())
     {
         Ok(c) => c,
         Err(_) => return None,

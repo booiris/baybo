@@ -23,11 +23,13 @@ pub async fn run(ctx: &CommandContext, do_probe: bool) -> Result<CommandOutput> 
 
     let results: Vec<(McpServerEntry, ProbeStatus)> = if do_probe {
         let vault = Arc::clone(require_vault(ctx)?);
+        let proxy = ctx.proxy_settings();
         let probes = file.servers.iter().map(|entry| {
             let entry = entry.clone();
             let vault = Arc::clone(&vault);
+            let proxy = proxy.clone();
             async move {
-                let status = probe(&entry, &vault).await;
+                let status = probe(&entry, &vault, proxy.as_ref()).await;
                 (entry, status)
             }
         });

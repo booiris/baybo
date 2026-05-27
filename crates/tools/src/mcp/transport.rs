@@ -43,8 +43,18 @@ impl McpServerSession {
 pub async fn connect(
     entry: &McpServerEntry,
     vault: &Arc<SecretVault>,
+    proxy: Option<&aura_security::http::ProxySettings>,
 ) -> McpResult<McpServerSession> {
-    connect_with_extra_env(entry, vault, &HashMap::new()).await
+    connect_with_extra_env(entry, vault, &HashMap::new(), proxy).await
+}
+
+/// Build a `reqwest::Client` for an HTTP MCP transport, honoring the optional
+/// egress proxy.
+fn proxied_http_client(
+    proxy: Option<&aura_security::http::ProxySettings>,
+) -> McpResult<reqwest::Client> {
+    aura_security::http::client(proxy)
+        .map_err(|e| McpError::Transport(format!("build proxied http client: {e}")))
 }
 
 /// Like [`connect`] but merges `extra_env` onto the stdio child's env
@@ -58,12 +68,13 @@ pub async fn connect_with_extra_env(
     entry: &McpServerEntry,
     vault: &Arc<SecretVault>,
     extra_env: &HashMap<String, String>,
+    proxy: Option<&aura_security::http::ProxySettings>,
 ) -> McpResult<McpServerSession> {
     let running = match &entry.transport {
         McpTransportConfig::Stdio { command, args } => {
-            connect_stdio(&entry.name, command, args, vault, extra_env).await?
+            connect_stdio(&entry.name, command, args, vault, extra_env, proxy).await?
         }
-        McpTransportConfig::Http { url } => connect_http(&entry.name, url, vault).await?,
+        McpTransportConfig::Http { url } => connect_http(&entry.name, url, vault, proxy).await?,
     };
 
     let tools = running
@@ -81,6 +92,7 @@ async fn connect_stdio(
     args: &[String],
     vault: &Arc<SecretVault>,
     extra_env: &HashMap<String, String>,
+    proxy: Option<&aura_security::http::ProxySettings>,
 ) -> McpResult<RunningService<RoleClient, ()>> {
     let env = load_string_map(vault, &vault_keys::env_bag(server_name)).await?;
 
@@ -97,6 +109,15 @@ async fn connect_stdio(
     }
     for (k, v) in std::env::vars() {
         if k.starts_with("LC_") {
+            tokio_cmd.env(k, v);
+        }
+    }
+    // Egress proxy (if configured). The env_clear above wiped any inherited
+    // *_PROXY vars, so inject the standard ones explicitly; loopback stays
+    // direct (see `ProxySettings::env_vars`) so a local-CDP browser server
+    // isn't routed through the proxy. extra_env / vault still override below.
+    if let Some(proxy) = proxy {
+        for (k, v) in proxy.env_vars() {
             tokio_cmd.env(k, v);
         }
     }
@@ -160,6 +181,7 @@ async fn connect_http(
     server_name: &str,
     url: &str,
     vault: &Arc<SecretVault>,
+    proxy: Option<&aura_security::http::ProxySettings>,
 ) -> McpResult<RunningService<RoleClient, ()>> {
     let headers = load_string_map(vault, &vault_keys::header_bag(server_name)).await?;
 
@@ -225,7 +247,7 @@ async fn connect_http(
                 .map_err(|e| McpError::OAuth(format!("attach client secret for refresh: {e}")))?;
         }
 
-        let auth_client = AuthClient::new(reqwest::Client::new(), manager);
+        let auth_client = AuthClient::new(proxied_http_client(proxy)?, manager);
         let transport = StreamableHttpClientTransport::with_client(auth_client, config);
         ().serve(transport)
             .await
@@ -234,7 +256,7 @@ async fn connect_http(
         // No OAuth: plain reqwest client. Static-bearer / API-key servers
         // get their auth via the `--header` bag, which is already in
         // `config.custom_headers`.
-        let client = reqwest::Client::new();
+        let client = proxied_http_client(proxy)?;
         let transport = StreamableHttpClientTransport::with_client(client, config);
         ().serve(transport)
             .await

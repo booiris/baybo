@@ -21,6 +21,7 @@ pub mod error;
 pub mod external_agents;
 pub mod gateway;
 pub mod llm;
+pub mod proxy;
 pub mod reload;
 pub mod security;
 pub mod skills;
@@ -42,6 +43,7 @@ pub use crate::error::{ConfigError, Result, ValidationError};
 pub use crate::external_agents::{ClaudeConfig, CodexConfig, ExternalAgentsConfig, GeminiConfig};
 pub use crate::gateway::GatewayConfig;
 pub use crate::llm::{LlmEntry, LlmPricingOverride};
+pub use crate::proxy::ProxyConfig;
 pub use crate::reload::{ConfigHandle, hot_reload_diff};
 pub use crate::security::SecurityConfig;
 pub use crate::skills::{RiskCheckConfig, SkillsConfig};
@@ -72,6 +74,11 @@ pub struct AuraConfig {
     pub gateway: GatewayConfig,
     pub browser: BrowserConfig,
     pub external_agents: ExternalAgentsConfig,
+    /// Optional egress proxy. When set, every outbound HTTP call (and every
+    /// spawned child that makes its own HTTP) routes through it. Absent →
+    /// direct connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<ProxyConfig>,
 }
 
 impl AuraConfig {

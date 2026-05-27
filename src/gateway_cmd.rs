@@ -524,7 +524,11 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
             .map(String::from)
             .collect();
         if !channel_only.is_empty() {
-            let spawner = ChannelSpawner::new(channel_url.clone(), channel_tokens.clone());
+            let spawner = ChannelSpawner::new(
+                channel_url.clone(),
+                channel_tokens.clone(),
+                boot::proxy_settings(&config),
+            );
             let supervisor = SidecarSupervisor::new(
                 Arc::clone(runtime),
                 spawner,

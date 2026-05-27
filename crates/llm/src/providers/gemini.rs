@@ -31,14 +31,16 @@ impl LlmProviderFactory for GeminiProviderFactory {
             .as_deref()
             .ok_or_else(|| crate::LlmError::Config("Gemini requires an API key".into()))?;
 
-        let client = match config.base_url {
-            Some(ref base_url) => gemini::Client::builder()
-                .api_key(api_key)
-                .base_url(base_url)
-                .build(),
-            None => gemini::Client::new(api_key),
-        }
-        .map_err(|e| crate::LlmError::Config(format!("failed to create Gemini client: {e}")))?;
+        let base_url = config
+            .base_url
+            .as_deref()
+            .unwrap_or(GEMINI_DEFAULT_BASE_URL);
+        let client = gemini::Client::builder()
+            .api_key(api_key)
+            .base_url(base_url)
+            .http_client(crate::proxied_client(config.proxy.as_ref())?)
+            .build()
+            .map_err(|e| crate::LlmError::Config(format!("failed to create Gemini client: {e}")))?;
 
         let model = client.completion_model(&config.model);
 
@@ -80,7 +82,7 @@ impl LlmProviderFactory for GeminiProviderFactory {
         // it doesn't land in URL access logs. The header form is
         // documented at <https://ai.google.dev/gemini-api/docs/api-key>.
         let url = format!("{host_root}/v1beta/models?pageSize=1000");
-        let resp = reqwest::Client::new()
+        let resp = crate::proxied_client(config.proxy.as_ref())?
             .get(&url)
             .header("x-goog-api-key", api_key)
             .send()
