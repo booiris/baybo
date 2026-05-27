@@ -64,6 +64,17 @@ embedding handle, constructor-injected. Each call gets a `MemoryContext` whose
 trace step; the impl binds its handles per call, so spend bills to the **real**
 user/session (mirrors `compression.rs`, not `Attribution::system`).
 
+**Span-attribution caveat.** That `Attribution` carries the real
+user/session/job but a freshly-minted `span_id` that does **not** back a recorded
+span: the core opens the `MemoryRecall` / `MemoryWrite` *step* but not a span,
+because the billed sub-calls are the opaque impl's, not the core's (the only
+`SpanKind`s are `LlmCall` / `ToolCall`, neither of which the core can populate for
+a call it doesn't make). So an impl's memory spend lands in the job's cost total
+under a per-operation id with no span row — the same shape as
+`Attribution::system`. Giving those sub-calls real spans needs a future
+`MemoryContext` extension (hand the impl a recorder + step, or add a `MemoryCall`
+span kind); deferred with the rest of the backend.
+
 A new **`EmbeddingClient`** trait lives in `aura-llm` beside `BilledChat`:
 batch `embed(&[String]) -> EmbeddingResponse` + `dimensions()`, sealed behind
 `BillableEmbedding` / `BoundBilledEmbedding` so embedding spend flows through the
@@ -103,6 +114,9 @@ otherwise (forces classification when a `JobInput` variant is added).
 3. **`on_job_complete` — background, job end.** At `IterationOutcome::Final`,
    `spawn_job_complete_write` detaches a task (so the actor returns the answer
    without waiting) that opens a `MemoryWrite` step and calls `on_job_complete`.
+   **Only on a clean `Final`** — a max-iterations, cancelled, or errored turn
+   writes nothing (those paths return before this point), so memory only ever
+   sees completed exchanges.
 4. **`on_session_end` — interface only; caller deferred.** The trait method
    exists and `NoopMemory` implements it, but the idle-timeout **trigger is not
    wired yet** (see Deferred). A real backend currently relies on the per-job

@@ -703,7 +703,10 @@ impl AgentLoop {
         // Max-iterations fallback. No assistant row was persisted at
         // the loop end — the early-return path inside `run_iteration`
         // is the only one that calls `append_context_message`, so
-        // there's no ordinal to stamp here.
+        // there's no ordinal to stamp here. `on_job_complete` is also
+        // deliberately NOT fired on this path: memory writes only on a clean
+        // `IterationOutcome::Final`, so a budget-exhausted (or cancelled /
+        // errored, which `?`-return earlier) turn is never memorized.
         Ok(OutgoingMessage {
             session_id: session.id.clone(),
             user_id: session.user.id.clone(),
@@ -1247,6 +1250,12 @@ impl AgentLoop {
         job_id: JobId,
         cancel_token: &CancellationToken,
     ) {
+        // A prompt-less trigger (e.g. a tool-only cron fire whose payload has no
+        // `prompt`) yields an empty query — skip recall so a real backend never
+        // opens a `MemoryRecall` step or embeds the empty string.
+        if query.is_empty() {
+            return;
+        }
         let Some(memory) = self.memory.clone() else {
             return;
         };

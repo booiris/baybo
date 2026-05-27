@@ -41,6 +41,13 @@ pub type Result<T> = std::result::Result<T, MemoryError>;
 /// `MemoryWrite` trace step (mirrors compression's attribution binding). The
 /// attribution also carries the user/session/job/span ids an impl needs to
 /// scope its own per-session or per-job de-duplication.
+///
+/// Caveat: the `Attribution.span_id` is minted per call and does **not** (yet)
+/// back a recorded span — the core opens the `MemoryRecall` / `MemoryWrite`
+/// *step*, but the billed sub-calls are the impl's, so their spend attributes to
+/// the real user/session/job under an unattached span id (same shape as
+/// `Attribution::system`). See the span-attribution caveat in
+/// `docs/modules/memory.md`.
 pub struct MemoryContext {
     pub attribution: Attribution,
 }

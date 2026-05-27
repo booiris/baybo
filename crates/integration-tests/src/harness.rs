@@ -180,6 +180,9 @@ pub struct AgentTestHarnessBuilder {
     /// compression stay under it with the stub's default 8_192-token
     /// window.
     compression_threshold: Option<f64>,
+    /// Pluggable memory wired into the loop. Defaults to `None` (inert); tests
+    /// assert the recall / write hooks by wiring a `RecordingMemory`.
+    memory: Option<Arc<dyn aura_memory::Memory>>,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -196,6 +199,7 @@ impl Default for AgentTestHarnessBuilder {
             keep_recent: None,
             model_context_window: None,
             compression_threshold: None,
+            memory: None,
         }
     }
 }
@@ -278,6 +282,13 @@ impl AgentTestHarnessBuilder {
 
     /// Wire everything and spawn the `AgentActor`. The returned harness
     /// owns the mailbox sender and the response receiver.
+    /// Wire a [`aura_memory::Memory`] impl into the loop so a test can assert
+    /// the recall / `on_job_complete` hooks fire. Defaults to `None` (inert).
+    pub fn with_memory(mut self, memory: Arc<dyn aura_memory::Memory>) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
     pub fn build(self) -> AgentTestHarness {
         let session = self
             .session
@@ -431,7 +442,7 @@ impl AgentTestHarnessBuilder {
             system_spawn_tx: None,
             workspace_paths: None,
             sessions: None,
-            memory: None,
+            memory: self.memory,
         });
         let (mailbox_tx, mailbox_rx) = aura_agent::mailbox::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
