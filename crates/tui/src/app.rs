@@ -26,6 +26,7 @@ const HISTORY_CAP: usize = 500;
 /// committed as a one-line summary to scrollback (once resolved).
 #[derive(Debug, Clone)]
 pub(crate) struct ApprovalChatEntry {
+    pub call_id: String,
     pub tool: String,
     pub accesses: Vec<ResourceAccess>,
     pub params_preview: String,
@@ -53,10 +54,20 @@ pub(crate) enum ViewMode {
 }
 
 /// A tool call in flight — started but not yet completed. Lives in
-/// [`AppState::running_tools`] so completion can be matched to the start.
+/// [`AppState::running_tools`], which the working zone renders as live
+/// `● tool(label)` rows. The `● tool` line is **not** committed to scrollback
+/// at start: with append-only native scrollback that would detach a concurrent
+/// sibling's result from its tool. Instead the whole block — this line, any
+/// `approval_lines` resolved mid-call, then the `⎿` result — commits as a unit
+/// when the matching `ToolCompleted` arrives, so the result sits under its tool.
 #[derive(Debug, Clone)]
 pub(crate) struct RunningTool {
     pub call_id: String,
+    pub tool: String,
+    pub label: Option<String>,
+    /// Resolved-approval summary line(s) for this call, buffered so they land
+    /// between the tool's `●` and `⎿` when the block commits on completion.
+    pub approval_lines: Vec<Line<'static>>,
 }
 
 /// Kind of the last block committed to scrollback. Drives single-blank
@@ -180,11 +191,12 @@ pub(crate) struct AppState {
     pub(crate) approval: Option<ApprovalQueue>,
     /// Plain (non-slash) messages submitted while a turn is in flight.
     /// Unlike [`outgoing_queue`], these are dispatched to the agent
-    /// **immediately** (mid-turn steering — the agent folds them in at
-    /// its next tool boundary) and only their *display* is deferred:
-    /// each shows as a `↳` line under the working indicator until the
-    /// next `ToolCompleted` commits it to scrollback as a `you>` line,
-    /// landing right after that tool block. A turn that ends with steers
+    /// **immediately** (mid-turn steering — the agent folds them in once
+    /// its current tool batch finishes) and only their *display* is
+    /// deferred: each shows as a `↳` line under the working indicator
+    /// until the running tool batch fully drains, then commits to
+    /// scrollback as a `you>` line below that batch's results — matching
+    /// the order the agent actually saw them. A turn that ends with steers
     /// still pending commits them at `Outgoing` (they fall to the next
     /// turn server-side, so the order still reads correctly).
     pub(crate) pending_interjections: VecDeque<String>,
@@ -307,9 +319,21 @@ impl AppState {
     }
 
     /// Record a tool as started (in flight) until [`take_running_tool`]
-    /// removes it.
-    pub(crate) fn push_running_tool(&mut self, call_id: String) {
-        self.running_tools.push(RunningTool { call_id });
+    /// removes it on completion. The working zone renders it as a live
+    /// `● tool(label)` row meanwhile; its scrollback block is deferred to
+    /// completion. See [`RunningTool`].
+    pub(crate) fn push_running_tool(
+        &mut self,
+        call_id: String,
+        tool: String,
+        label: Option<String>,
+    ) {
+        self.running_tools.push(RunningTool {
+            call_id,
+            tool,
+            label,
+            approval_lines: Vec::new(),
+        });
     }
 
     /// Remove the in-flight tool matching `call_id` (its completion arrived).
@@ -318,6 +342,29 @@ impl AppState {
             .iter()
             .position(|t| t.call_id == call_id)
             .map(|i| self.running_tools.remove(i))
+    }
+
+    /// The in-flight tools, oldest first — rendered as live `● tool` rows.
+    pub(crate) fn running_tools(&self) -> &[RunningTool] {
+        &self.running_tools
+    }
+
+    /// Buffer a resolved-approval summary onto its in-flight tool (matched by
+    /// `call_id`) so it commits between that tool's `●` and `⎿`. Returns the
+    /// lines back as `Err` when no such tool is tracked, so the caller can
+    /// commit them standalone instead.
+    pub(crate) fn buffer_approval_line(
+        &mut self,
+        call_id: &str,
+        lines: Vec<Line<'static>>,
+    ) -> Result<(), Vec<Line<'static>>> {
+        match self.running_tools.iter_mut().find(|t| t.call_id == call_id) {
+            Some(rt) => {
+                rt.approval_lines.extend(lines);
+                Ok(())
+            }
+            None => Err(lines),
+        }
     }
 
     /// Advance the working-indicator pulse one frame.
@@ -338,22 +385,22 @@ impl AppState {
 
     /// Park a plain message as a mid-turn steer: it has already been
     /// dispatched to the agent, and this only tracks the line shown under
-    /// the working indicator until a tool boundary commits it to
-    /// scrollback. See [`pending_interjections`].
+    /// the working indicator until the running tool batch drains and
+    /// commits it to scrollback. See [`pending_interjections`].
     pub(crate) fn queue_interjection(&mut self, text: String) {
         self.pending_interjections.push_back(text);
     }
 
     /// Drain every pending steer line, in submission order. Called when a
-    /// tool block finishes (commit them right after it) or when the turn
-    /// finalises (fallback). Empties the queue.
+    /// tool batch fully drains (commit them below its results) or when the
+    /// turn finalises (fallback). Empties the queue.
     pub(crate) fn take_pending_interjections(&mut self) -> Vec<String> {
         self.pending_interjections.drain(..).collect()
     }
 
     /// Lines to render under the working indicator, in submission order:
-    /// pending steers first (dispatched, awaiting a tool boundary), then
-    /// deferred slash commands (awaiting turn end). Both read as "queued".
+    /// pending steers first (dispatched, awaiting a tool-batch boundary),
+    /// then deferred slash commands (awaiting turn end). Both read as "queued".
     pub(crate) fn queued_display_lines(&self) -> impl Iterator<Item = &str> {
         self.pending_interjections
             .iter()
@@ -372,6 +419,15 @@ impl AppState {
     /// chronological order.
     pub(crate) fn dequeue_submission(&mut self) -> Option<String> {
         self.outgoing_queue.pop_front()
+    }
+
+    /// Discard every deferred slash command without running it. Called by
+    /// `/stop`: the interrupt returns the session to idle, and a slash parked
+    /// for "after this turn" has no turn to follow (the cancelled turn sends
+    /// no `Outgoing` to drain it), so it would otherwise linger as a `↳` line
+    /// and later fire after an unrelated turn.
+    pub(crate) fn clear_deferred_submissions(&mut self) {
+        self.outgoing_queue.clear();
     }
 
     pub(crate) fn with_approval(mut self, shared: ApprovalQueue) -> Self {
@@ -437,6 +493,7 @@ impl AppState {
             queue.resolve_head(decision);
             if let Some(req) = queue.peek_head() {
                 self.pending_approval = Some(ApprovalChatEntry {
+                    call_id: req.call_id,
                     tool: req.tool,
                     accesses: req.accesses,
                     params_preview: req.params_preview,
@@ -1069,6 +1126,7 @@ mod tests {
         app.note_response_pending();
         assert!(app.show_working());
         app.set_pending_approval(ApprovalChatEntry {
+            call_id: "call-1".into(),
             tool: "Bash".into(),
             accesses: Vec::new(),
             params_preview: String::new(),
@@ -1105,6 +1163,25 @@ mod tests {
     }
 
     #[test]
+    fn clear_deferred_submissions_drops_parked_slashes_but_keeps_steers() {
+        let mut app = AppState::new();
+        app.queue_submission("/skills".into());
+        app.queue_submission("/clear".into());
+        app.queue_interjection("steer".into());
+
+        // `/stop` discards parked slashes (no turn left to drain them)…
+        app.clear_deferred_submissions();
+        assert!(
+            app.dequeue_submission().is_none(),
+            "deferred slashes are dropped, not just hidden"
+        );
+        // …but a steer is server-side state the interrupt commits itself, so
+        // clearing the slash queue must leave the interjection queue alone.
+        let shown: Vec<&str> = app.queued_display_lines().collect();
+        assert_eq!(shown, vec!["steer"]);
+    }
+
+    #[test]
     fn reset_working_returns_to_idle_without_dropping_steers() {
         let mut app = AppState::new();
         app.note_response_pending();
@@ -1117,6 +1194,53 @@ mod tests {
         // The caller commits pending steers itself before resetting, so
         // reset must not silently discard them.
         assert_eq!(app.pending_interjections.len(), 1);
+    }
+
+    #[test]
+    fn push_and_take_running_tool_round_trip() {
+        let mut app = AppState::new();
+        app.push_running_tool("c1".into(), "Bash".into(), Some("ls".into()));
+        app.push_running_tool("c2".into(), "Read".into(), None);
+        assert_eq!(app.running_tools().len(), 2);
+
+        let taken = app.take_running_tool("c1").expect("c1 was in flight");
+        assert_eq!(taken.tool, "Bash");
+        assert_eq!(taken.label.as_deref(), Some("ls"));
+        assert_eq!(app.running_tools().len(), 1, "only c1 removed");
+        assert!(app.take_running_tool("missing").is_none());
+    }
+
+    #[test]
+    fn buffer_approval_line_attaches_to_its_tool_else_hands_lines_back() {
+        let mut app = AppState::new();
+        app.push_running_tool("c1".into(), "Bash".into(), None);
+
+        assert!(
+            app.buffer_approval_line("c1", vec![Line::from("● approved: Bash")])
+                .is_ok()
+        );
+        assert_eq!(
+            app.take_running_tool("c1").unwrap().approval_lines.len(),
+            1,
+            "the decision rides the tool's deferred block"
+        );
+
+        // No matching in-flight tool: the lines come back so the caller can
+        // commit them standalone rather than lose the decision.
+        let back = app.buffer_approval_line("gone", vec![Line::from("x")]);
+        assert!(back.is_err());
+    }
+
+    #[test]
+    fn reset_working_clears_in_flight_tools() {
+        let mut app = AppState::new();
+        app.note_response_pending();
+        app.push_running_tool("c1".into(), "Bash".into(), None);
+        app.reset_working();
+        assert!(
+            app.running_tools().is_empty(),
+            "/stop drops the live tool list (no completion will arrive)"
+        );
     }
 
     #[test]

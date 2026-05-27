@@ -24,7 +24,7 @@ use ratatui::widgets::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{AppState, ApprovalChatEntry, ApprovalChatState};
+use crate::app::{AppState, ApprovalChatEntry, ApprovalChatState, RunningTool};
 use crate::event::{LogLevel, LogRecord};
 
 /// Maximum rows the input box grows to before it clips. Beyond this, the
@@ -36,9 +36,10 @@ pub(crate) const INPUT_MAX_ROWS: u16 = 10;
 /// input + optional model footer). Streaming text is committed to scrollback
 /// line-by-line (Codex style) rather than buffered into a viewport preview.
 pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    // Build the live region top→bottom: a blank spacer, the working indicator
-    // row only while busy, then any queued lines, a pending approval block,
-    // the slash-completion popup, the input box, and the model footer.
+    // Build the live region top→bottom: the working zone (blank spacer +, while
+    // busy, the in-flight tool list or the Cooking indicator), then any queued
+    // lines, a pending approval block, the slash-completion popup, the input
+    // box, and the model footer.
     let queued: Vec<&str> = state.queued_display_lines().collect();
     let approval = state.pending_approval.as_ref();
     // The slash-completion popup is a real section just above the input box,
@@ -69,7 +70,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
         .constraints(constraints)
         .split(area);
 
-    render_working_line(frame, chunks[0], state);
+    render_working_zone(frame, chunks[0], state);
     let mut next = 1;
     for line in &queued {
         render_queued_line(frame, chunks[next], line);
@@ -93,15 +94,21 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
 const WORKING_SPACER_ROWS: u16 = 1;
 const WORKING_INDICATOR_ROWS: u16 = 1;
 
-/// Rows the working zone occupies: one spacer row while idle, and spacer plus
-/// indicator row while a turn is actively working.
+/// Rows the working zone occupies: always one spacer row, plus its content
+/// (below) while a turn is in flight.
 pub(crate) fn working_zone_height(state: &AppState) -> u16 {
-    WORKING_SPACER_ROWS
-        + if state.show_working() {
-            WORKING_INDICATOR_ROWS
-        } else {
-            0
-        }
+    WORKING_SPACER_ROWS + working_content_height(state)
+}
+
+/// Rows the working zone's content (below the spacer) occupies while a turn is
+/// in flight: one row per in-flight tool, stacked above the always-present
+/// `Cooking…` indicator row (which carries the overall elapsed + `/stop` hint).
+/// Zero when idle or while an approval owns the live region.
+fn working_content_height(state: &AppState) -> u16 {
+    if !state.show_working() {
+        return 0;
+    }
+    state.running_tools().len() as u16 + WORKING_INDICATOR_ROWS
 }
 
 /// Colours the working dot pulses through, one step per animation tick — a
@@ -122,30 +129,46 @@ const WORKING_WORD: &str = "Cooking";
 /// Hint appended to the working line; `/stop` cancels the in-flight turn.
 const STOP_HINT: &str = "/stop to interrupt";
 
-/// The animated working indicator, rendered on the **bottom** row of the
-/// reserved working zone while a turn is in flight (the row(s) above stay
-/// blank — the breathing room the indicator sits below). A colour-pulsing `●`
-/// — same glyph/size as the answer dot, so it never reflows — followed by
-/// `Cooking…`, then the live elapsed counter + `/stop` hint. Renders nothing
-/// when idle (the whole zone stays blank).
-fn render_working_line(frame: &mut Frame, area: Rect, state: &AppState) {
+/// The live working zone, bottom-aligned in its reserved area (the row(s) above
+/// stay blank — the breathing room it sits below). While a turn is in flight it
+/// lists each **in-flight tool** as a colour-pulsing `● tool(label)` row, with
+/// the `Cooking…` indicator (overall elapsed + `/stop` hint) as the bottom row
+/// below them; with no tool running it's just that one `Cooking…` row. Renders
+/// nothing when idle (the whole zone stays blank).
+fn render_working_zone(frame: &mut Frame, area: Rect, state: &AppState) {
     if area.height == 0 {
         return;
     }
-    // Paint the reserved spacer row explicitly; relying on the default buffer
-    // can leave the live indicator visually attached to the scrollback tail.
+    // Paint the reserved spacer row(s) explicitly; relying on the default buffer
+    // can leave the live content visually attached to the scrollback tail.
     frame.render_widget(Clear, area);
     if !state.show_working() {
         return;
     }
-    let line = working_indicator_line(state.spinner_tick, state.working_elapsed_secs());
-    let indicator_row = Rect {
+    let content_h = working_content_height(state);
+    if content_h == 0 || content_h > area.height {
+        return;
+    }
+    // Bottom-align the content; the rows above it are the reserved spacer.
+    let top = area.y + area.height - content_h;
+    let row = |i: u16| Rect {
         x: area.x,
-        y: area.y + area.height - 1,
+        y: top + i,
         width: area.width,
         height: 1,
     };
-    frame.render_widget(Paragraph::new(line), indicator_row);
+    // In-flight tools stack above the Cooking… indicator, their dots pulsing in
+    // unison with it (same `WORKING_PULSE` step) so the whole list reads as
+    // actively working. The indicator owns the elapsed + `/stop`, so the tool
+    // rows stay name-only.
+    let running = state.running_tools();
+    let pulse = WORKING_PULSE[state.spinner_tick % WORKING_PULSE.len()];
+    for (i, t) in running.iter().enumerate() {
+        let line = running_tool_line(&t.tool, t.label.as_deref(), pulse);
+        frame.render_widget(Paragraph::new(line), row(i as u16));
+    }
+    let indicator = working_indicator_line(state.spinner_tick, state.working_elapsed_secs());
+    frame.render_widget(Paragraph::new(indicator), row(running.len() as u16));
 }
 
 /// Build the working line. Pure so the colour pulse and `(Ns · …)` readout can
@@ -167,6 +190,34 @@ pub(crate) fn working_indicator_line(spinner_tick: usize, elapsed_secs: u64) -> 
         format!(" ({elapsed_secs}s · {STOP_HINT})"),
         dim,
     ));
+    Line::from(spans)
+}
+
+/// One live row for an in-flight tool: a `●` pulsing in unison with the working
+/// clock (same `WORKING_PULSE` step as the Cooking… indicator, so the dot
+/// breathes and the list reads as actively working), the cyan tool name, and the
+/// dim label in parens. Otherwise mirrors [`render_tool_started`] (same glyph)
+/// so the row settles into place when the block commits to scrollback — only the
+/// dot's pulse stops. Pure so the styling is unit-testable without a frame.
+pub(crate) fn running_tool_line(tool: &str, label: Option<&str>, pulse: Color) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(
+            format!("{ANSWER_DOT} "),
+            Style::default().fg(pulse).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            tool.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(label) = label.filter(|l| !l.is_empty()) {
+        spans.push(Span::styled(
+            format!("({label})"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     Line::from(spans)
 }
 
@@ -412,9 +463,11 @@ pub(crate) fn render_stream_line(text: &str, is_continuation: bool) -> Vec<Line<
     ])]
 }
 
-/// A `● tool(label)` line committed the moment a tool call is dispatched.
-/// The bullet matches the assistant answer's dot (`●`, same size) but in
-/// cyan; the optional human label is dim in parens.
+/// The `● tool(label)` head line of a tool block. The bullet matches the
+/// assistant answer's dot (`●`, same size) but in cyan; the optional human
+/// label is dim in parens. While the call is in flight this same shape renders
+/// live (via [`running_tool_line`]); it commits to scrollback as part of
+/// [`tool_completed_block`] when the call finishes.
 pub(crate) fn render_tool_started(tool: &str, label: Option<&str>) -> Vec<Line<'static>> {
     let mut spans = vec![
         Span::styled(format!("{ANSWER_DOT} "), Style::default().fg(Color::Cyan)),
@@ -446,6 +499,27 @@ pub(crate) fn render_tool_completed(status: &str, summary: &str) -> Vec<Line<'st
         Span::styled("  ⎿ ", Style::default().fg(Color::DarkGray)),
         Span::styled(summary.to_string(), Style::default().fg(color)),
     ])]
+}
+
+/// Assemble a completed tool's full scrollback block, committed as one unit when
+/// `ToolCompleted` lands: the deferred `● tool` head line (from the in-flight
+/// [`RunningTool`]), any approval resolved mid-call, then the `⎿` result. This
+/// pairing is what keeps a result directly under its own tool even when sibling
+/// tools in the same response ran concurrently (the agent emits every
+/// `ToolStarted` up front, then every `ToolCompleted`, so committing the head
+/// line at start would strand the results below all the heads in append-only
+/// scrollback). The caller only builds this for a completion whose `call_id`
+/// still matches a tracked tool; a stale completion (e.g. after `/stop` cleared
+/// the running set) is dropped at the call site rather than rendered headless.
+pub(crate) fn tool_completed_block(
+    running: &RunningTool,
+    status: &str,
+    summary: &str,
+) -> Vec<Line<'static>> {
+    let mut lines = render_tool_started(&running.tool, running.label.as_deref());
+    lines.extend(running.approval_lines.iter().cloned());
+    lines.extend(render_tool_completed(status, summary));
+    lines
 }
 
 /// Footer committed when a turn (job) finishes: a "cooked for <duration>"
@@ -591,7 +665,6 @@ pub(crate) fn render_approval_resolved_lines(entry: &ApprovalChatEntry) -> Vec<L
 /// typically pass `terminal.size()?.width`.
 pub(crate) fn render_banner_lines(
     session_id: &str,
-    cwd: &str,
     version: &str,
     max_width: u16,
 ) -> Vec<Line<'static>> {
@@ -600,10 +673,8 @@ pub(crate) fn render_banner_lines(
     let edge = Style::default().fg(Color::DarkGray);
 
     let header_full = format!("Aura TUI (v{version})");
-    let session_text = clip_for_box(&format!("session:   {session_id}"), usable);
+    let session_text = clip_for_box(&format!("session: {session_id}"), usable);
     let session_w = session_text.width();
-    let dir_text = clip_for_box(&format!("directory: {cwd}"), usable);
-    let dir_w = dir_text.width();
     // Width of the header is "> " + product+version; computed from the
     // composed string so the box sizes itself correctly.
     let header_visible = format!(">_ {header_full}");
@@ -623,7 +694,6 @@ pub(crate) fn render_banner_lines(
         (header_spans, header_w),
         (vec![Span::raw("")], 0),
         (vec![Span::raw(session_text)], session_w),
-        (vec![Span::raw(dir_text)], dir_w),
     ];
 
     let inner_w = rows.iter().map(|(_, w)| *w).max().unwrap_or(0);
@@ -654,10 +724,10 @@ pub(crate) fn render_banner_lines(
     out
 }
 
-/// Truncate `text` so its display width fits `max_w`. When clipping a path
-/// or session id, prefer to keep the tail (the most identifying part) and
-/// elide the head with `…`. For other text we clip from the right with `…`
-/// — this is a structural fallback for very narrow terminals.
+/// Truncate `text` so its display width fits `max_w`. When clipping a session
+/// id, prefer to keep the tail (the most identifying part) and elide the head
+/// with `…`. For other text we clip from the right with `…` — this is a
+/// structural fallback for very narrow terminals.
 fn clip_for_box(text: &str, max_w: usize) -> String {
     if text.width() <= max_w {
         return text.to_string();
@@ -904,11 +974,71 @@ mod tests {
 
     #[test]
     fn working_indicator_stays_status_only() {
+        // The `Cooking…` line is the no-tool-running indicator; in-flight tools
+        // get their own `running_tool_line` rows instead.
         let text = line_text(&working_indicator_line(0, 3));
         assert!(text.starts_with("● "), "leads with the dot: {text:?}");
         assert!(text.contains("Cooking…"), "got {text:?}");
-        assert!(!text.contains("Read"), "tools render as messages: {text:?}");
+        assert!(
+            !text.contains("Read"),
+            "no tool name on the status line: {text:?}"
+        );
         assert!(text.contains("(3s · /stop to interrupt)"), "got {text:?}");
+    }
+
+    #[test]
+    fn running_tool_line_pulses_dot_and_shows_name_label() {
+        // Same glyphs each tick (name-only `● tool(label)`), but the dot takes
+        // the passed pulse colour so it breathes with the Cooking… indicator.
+        let a = running_tool_line("Read", Some("foo.rs"), Color::DarkGray);
+        let b = running_tool_line("Read", Some("foo.rs"), Color::White);
+        assert_eq!(line_text(&a), "● Read(foo.rs)");
+        assert_eq!(
+            line_text(&a),
+            line_text(&b),
+            "glyphs are stable across ticks"
+        );
+        assert_ne!(
+            a.spans[0].style.fg, b.spans[0].style.fg,
+            "only the dot colour pulses"
+        );
+    }
+
+    #[test]
+    fn tool_completed_block_pairs_result_directly_under_its_tool() {
+        let rt = RunningTool {
+            call_id: "c1".into(),
+            tool: "Bash".into(),
+            label: Some("ls".into()),
+            approval_lines: Vec::new(),
+        };
+        let block = tool_completed_block(&rt, "ok", "5 lines");
+        assert_eq!(block.len(), 2, "head + result");
+        assert!(
+            line_text(&block[0]).starts_with("● Bash"),
+            "{:?}",
+            line_text(&block[0])
+        );
+        assert!(
+            line_text(&block[1]).contains("⎿ 5 lines"),
+            "{:?}",
+            line_text(&block[1])
+        );
+    }
+
+    #[test]
+    fn tool_completed_block_puts_resolved_approval_between_head_and_result() {
+        let rt = RunningTool {
+            call_id: "c1".into(),
+            tool: "Bash".into(),
+            label: None,
+            approval_lines: vec![Line::from("● approved: Bash")],
+        };
+        let block = tool_completed_block(&rt, "ok", "done");
+        assert_eq!(block.len(), 3, "head + approval + result");
+        assert!(line_text(&block[0]).starts_with("● Bash"));
+        assert_eq!(line_text(&block[1]), "● approved: Bash");
+        assert!(line_text(&block[2]).contains("⎿ done"));
     }
 
     #[test]
@@ -932,6 +1062,44 @@ mod tests {
         assert!(
             indicator.trim_start().starts_with("● Cooking"),
             "working indicator should render below spacer: {indicator:?}"
+        );
+    }
+
+    #[test]
+    fn working_zone_lists_running_tools_above_cooking_indicator() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = AppState::new();
+        app.note_response_pending();
+        app.push_running_tool("c1".into(), "Bash".into(), Some("ls -la".into()));
+        app.push_running_tool("c2".into(), "Read".into(), Some("hosts".into()));
+
+        // spacer + one row per running tool + the Cooking… indicator row.
+        assert_eq!(working_zone_height(&app), 4);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal.draw(|f| render(f, f.area(), &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(
+            buffer_row_text(buf, 0).trim().is_empty(),
+            "spacer row stays blank: {:?}",
+            buffer_row_text(buf, 0)
+        );
+        assert!(
+            buffer_row_text(buf, 1).contains("Bash"),
+            "first in-flight tool: {:?}",
+            buffer_row_text(buf, 1)
+        );
+        assert!(
+            buffer_row_text(buf, 2).contains("Read"),
+            "second in-flight tool: {:?}",
+            buffer_row_text(buf, 2)
+        );
+        let indicator = buffer_row_text(buf, 3);
+        assert!(
+            indicator.contains("Cooking…") && indicator.contains("/stop to interrupt"),
+            "Cooking indicator (elapsed + /stop) sits below the list: {indicator:?}"
         );
     }
 
@@ -1068,19 +1236,22 @@ mod tests {
 
     #[test]
     fn banner_renders_top_bottom_and_aligned_content() {
-        let out = render_banner_lines("sess-abc-12345", "/data/aura", "0.1.0", 80);
-        // Structure: top edge, 4 content rows, bottom edge, hint = 7 lines.
-        assert_eq!(out.len(), 7, "{:#?}", out);
+        let out = render_banner_lines("sess-abc-12345", "0.1.0", 80);
+        // Structure: top edge, 3 content rows (header, blank, session), bottom
+        // edge, hint = 6 lines. The directory row is intentionally omitted.
+        assert_eq!(out.len(), 6, "{:#?}", out);
         let texts: Vec<String> = out.iter().map(line_text).collect();
         assert!(texts[0].starts_with('╭') && texts[0].ends_with('╮'));
-        assert!(texts[6].contains("Ctrl-D"));
+        assert!(texts[5].contains("Ctrl-D"));
         assert!(texts[1].contains(">_ Aura TUI (v0.1.0)"));
         assert!(texts[3].contains("session:"));
         assert!(texts[3].contains("sess-abc-12345"));
-        assert!(texts[4].contains("directory:"));
-        assert!(texts[4].contains("/data/aura"));
+        assert!(
+            !texts.iter().any(|t| t.contains("directory:")),
+            "directory row must not be rendered: {texts:#?}"
+        );
         let top_w = texts[0].chars().count();
-        for (idx, t) in texts.iter().enumerate().take(6) {
+        for (idx, t) in texts.iter().enumerate().take(5) {
             // Every framed row should have the same visual width as the top
             // edge so the right border lines up vertically.
             assert_eq!(t.chars().count(), top_w, "row {idx} width drifts: {t:?}");
@@ -1088,14 +1259,14 @@ mod tests {
     }
 
     #[test]
-    fn banner_clips_long_directory_with_left_ellipsis() {
-        let long = "/some/very/very/very/very/deep/path/that/will/overflow/the/box";
-        let out = render_banner_lines("s", long, "0.1.0", 50);
+    fn banner_clips_long_session_with_left_ellipsis() {
+        let long = "session-id-that-is-far-too-long-to-fit-inside-the-narrow-banner-box";
+        let out = render_banner_lines(long, "0.1.0", 50);
         let texts: Vec<String> = out.iter().map(line_text).collect();
-        let dir_row = texts.iter().find(|t| t.contains("directory:")).unwrap();
+        let session_row = texts.iter().find(|t| t.contains("session:")).unwrap();
         assert!(
-            dir_row.contains('…'),
-            "expected ellipsis in clipped directory row: {dir_row}"
+            session_row.contains('…'),
+            "expected ellipsis in clipped session row: {session_row}"
         );
     }
 }

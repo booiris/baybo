@@ -559,13 +559,12 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                             // invoking the tool, so it lands above the tool
                             // block.
                             flush_stream_partial(&mut state, &mut terminal)?;
-                            commit_tool_lines(
-                                &mut state,
-                                &mut terminal,
-                                chat::render_tool_started(&tool, label.as_deref()),
-                            )?;
                         }
-                        state.push_running_tool(call_id);
+                        // The `● tool` line is deferred: it renders live in the
+                        // working zone now and commits to scrollback paired with
+                        // its `⎿` result only on completion, so concurrent tools
+                        // never detach their results. See docs/modules/tui.md.
+                        state.push_running_tool(call_id, tool, label);
                         term_events = redraw_after_event(
                             term_events,
                             &mut terminal,
@@ -579,8 +578,15 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         status,
                         summary,
                     } => {
-                        let _ = state.take_running_tool(&call_id);
-                        if matches!(state.mode, ViewMode::Chat) {
+                        // Drop completions for a call we're no longer tracking:
+                        // after `/stop`, `reset_working` clears the running set,
+                        // but a tool that observes cancellation can still emit a
+                        // late `ToolCompleted` before the agent loop unwinds.
+                        // Committing it would strand a stray `⎿` result in the
+                        // now-idle scrollback, so a non-matching id is ignored.
+                        if let Some(running) = state.take_running_tool(&call_id)
+                            && matches!(state.mode, ViewMode::Chat)
+                        {
                             term_events = resize_chat_viewport_before_scrollback(
                                 term_events,
                                 &mut terminal,
@@ -588,18 +594,22 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                                 &mut current_viewport_h,
                             )?;
                             flush_stream_partial(&mut state, &mut terminal)?;
-                            // The tool line was committed at dispatch; completion
-                            // appends only the result summary to that tool block.
-                            commit_tool_lines(
-                                &mut state,
-                                &mut terminal,
-                                chat::render_tool_completed(&status, &summary),
-                            )?;
-                            // A tool block just closed — this is the boundary
-                            // where the agent drains the mailbox and folds in
-                            // any mid-turn steer, so commit the queued user
-                            // line(s) right here, after the tool block.
-                            commit_pending_interjections(&mut state, &mut terminal)?;
+                            // Commit the whole tool block as one unit now that it
+                            // is done — the deferred `● tool` head, any approval
+                            // resolved mid-call, then the `⎿` result — so the
+                            // result sits under its own tool even when siblings
+                            // ran concurrently. See `chat::tool_completed_block`.
+                            let block = chat::tool_completed_block(&running, &status, &summary);
+                            commit_tool_lines(&mut state, &mut terminal, block)?;
+                            // The agent runs each tool batch concurrently and only
+                            // folds a mid-turn steer in once the whole batch
+                            // drains, so hold the queued `you>` line until the
+                            // last tool completes (`running_tools` empties).
+                            // Committing it after an earlier sibling would place
+                            // it above results the model actually saw first.
+                            if state.running_tools().is_empty() {
+                                commit_pending_interjections(&mut state, &mut terminal)?;
+                            }
                         }
                         term_events = redraw_after_event(
                             term_events,
@@ -660,6 +670,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                             && let Some(req) = queue.peek_head()
                         {
                             state.set_pending_approval(ApprovalChatEntry {
+                                call_id: req.call_id,
                                 tool: req.tool,
                                 accesses: req.accesses,
                                 params_preview: req.params_preview,
@@ -986,9 +997,9 @@ fn flush_complete_stream_lines(state: &mut AppState, terminal: &mut Term) -> io:
 }
 
 /// Commit every pending mid-turn steer to scrollback as a user block,
-/// emptying the pending queue. Called the moment a tool block closes (so
-/// the steer lands right after it, where the agent picks it up) and again
-/// as the turn-end fallback for a steer that never met a tool boundary.
+/// emptying the pending queue. Called once a tool batch fully drains (so the
+/// steer lands below the batch's results, where the agent picks it up) and
+/// again as the turn-end fallback for a steer that never met a batch boundary.
 fn commit_pending_interjections(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
     let pending = state.take_pending_interjections();
     if pending.is_empty() {
@@ -1206,12 +1217,7 @@ fn commit_banner(
     session_id: &SessionId,
 ) -> io::Result<()> {
     let width = terminal.size()?.width.max(20);
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "?".to_string());
-    let lines =
-        chat::render_banner_lines(session_id.as_str(), &cwd, env!("CARGO_PKG_VERSION"), width);
+    let lines = chat::render_banner_lines(session_id.as_str(), env!("CARGO_PKG_VERSION"), width);
     // The banner lands just above the inline viewport (no top padding).
     // As the conversation grows, each `insert_before` call inserts a
     // message just above the viewport too, which pushes the banner
@@ -1465,8 +1471,11 @@ fn is_stop_command(text: &str) -> bool {
 /// return the live region to idle. The cancel is out-of-band server-side
 /// and delivers no `Outgoing`, so we flush the partial answer, commit any
 /// pending steer (it stays queued server-side and runs as its own turn),
-/// and reset the working/streaming state here. The gateway's stop `Notice`
-/// then lands as the confirmation line.
+/// reset the working/streaming state, and discard any deferred slash
+/// commands here. Those slashes were parked for "after this turn"; the
+/// cancelled turn sends no `Outgoing` to drain them, so without this they'd
+/// linger as `↳` lines and later fire after an unrelated turn. The gateway's
+/// stop `Notice` then lands as the confirmation line.
 async fn interrupt_turn(
     state: &mut AppState,
     ctx: &LoopCtx,
@@ -1475,13 +1484,16 @@ async fn interrupt_turn(
     flush_stream_partial(state, terminal)?;
     commit_pending_interjections(state, terminal)?;
     state.reset_working();
+    state.clear_deferred_submissions();
     dispatch_user_message(ctx, STOP_COMMAND.to_string()).await;
     Ok(())
 }
 
-/// Commit the resolved approval summary to scrollback and clear (or roll
-/// over) the live entry. The approval sits between a tool's `●` and `⎿`, so
-/// it commits as part of the tool run (tight, no surrounding blank).
+/// Record the resolved approval. The decision sits between its tool's `●` and
+/// `⎿`, but that block is deferred until `ToolCompleted`, so buffer the line
+/// onto the in-flight tool (matched by `call_id`) and let it commit with the
+/// block. If the tool isn't tracked (shouldn't happen), commit it standalone so
+/// the decision isn't lost.
 fn resolve_approval(
     state: &mut AppState,
     terminal: &mut Term,
@@ -1490,11 +1502,10 @@ fn resolve_approval(
     let Some(outcome) = state.resolve_active_approval(decision) else {
         return Ok(());
     };
-    commit_tool_lines(
-        state,
-        terminal,
-        chat::render_approval_resolved_lines(&outcome.resolved),
-    )?;
+    let lines = chat::render_approval_resolved_lines(&outcome.resolved);
+    if let Err(lines) = state.buffer_approval_line(&outcome.resolved.call_id, lines) {
+        commit_tool_lines(state, terminal, lines)?;
+    }
     Ok(())
 }
 
