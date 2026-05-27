@@ -1,5 +1,7 @@
 mod boot;
+mod gateway_client;
 mod gateway_cmd;
+mod prompt_cmd;
 mod reload;
 mod runtime;
 mod setup_cmd;
@@ -11,6 +13,7 @@ mod tui_log;
 use aura_cli::cli::ShellKind;
 use aura_cli::{Cli, Commands, ContextBuilder, Invocation, OutputFormat, dispatch};
 use clap::CommandFactory;
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -73,8 +76,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Bare `aura` (no subcommand) prints help and exits. The interactive
-    // chat loop is reached via the explicit `aura tui` subcommand so the
-    // default invocation doesn't surprise users with a full-screen app.
+    // chat loop is reached via the explicit `aura tui` subcommand, and
+    // one-shot answering via `aura prompt`, so the default invocation
+    // doesn't surprise users with a full-screen app.
     if cli.command.is_none() {
         Cli::command().print_help()?;
         println!();
@@ -91,6 +95,27 @@ async fn main() -> anyhow::Result<()> {
     aura_workspace::WorkspaceManager::new(workspace_root.clone())
         .ensure_layout()
         .await?;
+
+    // One-shot `aura prompt`: stream a single answer and exit. Sits
+    // beside the `tui` early-return because both drive the agent runtime
+    // (via a live gateway or in-process) rather than going through the
+    // generic argv dispatch.
+    if let Some(Commands::Prompt {
+        prompt,
+        session,
+        dangerously_allow_all,
+        timeout,
+    }) = cli.command.as_ref()
+    {
+        let opts = prompt_cmd::Options {
+            prompt: resolve_prompt(prompt.clone().unwrap_or_default())?,
+            session: session.clone(),
+            allow_all: *dangerously_allow_all,
+            json: cli.global.json,
+            timeout: (*timeout != 0).then(|| std::time::Duration::from_secs(*timeout)),
+        };
+        return prompt_cmd::run(config, opts).await;
+    }
 
     // TUI: ratatui owns stdout, so tracing goes to a rolling file under
     // `<workspace>/logs/` (redacted through the shared `LeakDetector`)
@@ -301,6 +326,35 @@ fn pick_format(cli: &Cli) -> OutputFormat {
     } else {
         OutputFormat::Human
     }
+}
+
+/// Resolve the effective `aura prompt` text: the positional argument,
+/// optionally merged with piped stdin. `aura prompt` with no argument
+/// reads the prompt entirely from stdin (`cat task.md | aura prompt`); an
+/// argument *plus* piped stdin appends the stdin as extra context
+/// (`git diff | aura prompt "review this"`). Stdin is read only when it
+/// isn't a terminal, so an interactive `aura prompt` with no argument
+/// can't hang waiting on a human.
+fn resolve_prompt(arg: String) -> anyhow::Result<String> {
+    let mut prompt = arg;
+    if !std::io::stdin().is_terminal() {
+        let mut piped = String::new();
+        std::io::stdin().lock().read_to_string(&mut piped)?;
+        let piped = piped.trim_end();
+        if !piped.is_empty() {
+            if prompt.trim().is_empty() {
+                prompt = piped.to_owned();
+            } else {
+                prompt = format!("{prompt}\n\n{piped}");
+            }
+        }
+    }
+    if prompt.trim().is_empty() {
+        anyhow::bail!(
+            "no prompt provided — pass it as an argument (`aura prompt \"...\"`) or pipe it via stdin"
+        );
+    }
+    Ok(prompt)
 }
 
 /// Emit a shell completion script without running the rest of the boot chain.

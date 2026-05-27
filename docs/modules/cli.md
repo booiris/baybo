@@ -145,10 +145,85 @@ variables and ignore them, so a false-positive injection is a no-op.
 | `status`     | `[--live]`                                                                                                | Static: registries + `LlmClient`. Live: `JobLifecycle::list` + `QueryApi::cost_summary` | `--live` adds in-flight job count, failed-jobs-last-24h, and today's spend (USD + token counts). Each live counter degrades to `(unavailable)` when its manager isn't wired in the current invocation. | shipped (live block populated where managers are wired)  |
 | `gateway`    | `start` · `install [--system] [--exec-start <p>]` · `enable` · `disable` · `uninstall` · `status` · `token {show, rotate}` | `aura-gateway` installer + `AdminToken`                                      | `start` runs the long-lived server; `install`/`enable`/`disable`/`uninstall` and `token rotate` mutate; `status`/`token show` are read-only | shipped (intercepted in `src/main.rs` before dispatch, runs in `src/gateway_cmd.rs`) |
 | `pair`       | `list [--pending\|--approved]` · `approve <code>` · `revoke <channel-type> <bot-id> <user-id>`            | `aura-pair` store via `ChannelPairingStore`                                  | `approve`/`revoke` mutate                                                                          | shipped                                           |
+| `prompt`     | `[PROMPT] [--session <id>] [-y/--dangerously-allow-all] [--timeout <secs>]`                               | Hybrid: WS into a live gateway, else in-process `runtime::build_managers` + `wire_router` | runs one agent turn — persists the session row + transcript + traces + cost like any conversation | shipped (intercepted before dispatch, runs in `src/prompt_cmd.rs`) |
 | `tui`        | `[--session <id>]`                                                                                        | WS client into the gateway's channel listener                                | read-only                                                                                          | shipped (intercepted before dispatch, runs in `src/tui_cmd.rs`) |
 | `setup`      | —                                                                                                         | Interactive first-run wizard (`aura-setup`)                                  | bootstraps workspace + master key + default `aura.json`                                            | shipped (intercepted before dispatch, runs in `src/setup_cmd.rs`) |
 | `doctor`     | —                                                                                                         | Aggregates `AuraConfig::validate`, storage ping, `llm::probe`, env-var audit | read-only                                                                                          | shipped (LLM probe gated on `llm probe` landing)  |
 | `completion` | `<shell>`                                                                                                 | `clap_complete`                                                              | stdout only                                                                                        | shipped                                           |
+
+### `prompt` — headless one-shot turns
+
+`aura prompt [PROMPT]` runs a single agent turn non-interactively: stream
+the assistant's answer to stdout, then exit. It is the non-interactive
+sibling of `tui` — same agent, no UI. With no `PROMPT` argument the text
+is read from stdin (`git diff | aura prompt "review this"`, `cat task.md |
+aura prompt`); an argument *plus* piped stdin are concatenated. Lives in
+`src/prompt_cmd.rs`, intercepted in `main.rs` before the generic argv
+dispatch (same as `tui`).
+
+**Hybrid runtime, keyed off the singleton lock.** A running gateway holds
+the `<workspace>/state/aura.lock` flock for its lifetime (`src/singleton.rs`),
+so `prompt` uses lock acquisition as a gateway-presence probe:
+
+- **Lock held** (a gateway is up) → connect over the same `/v1/channel-ws`
+  + `WsTransport` path the TUI uses and run the turn through the existing
+  gateway. One owner of the session state, no contention.
+- **Lock free** (no gateway) → acquire it and build the agent runtime
+  in-process for the single turn via `runtime::build_managers` +
+  `wire_router`, then tear it down. This is what lets `aura prompt` work
+  standalone with no separate `aura gateway` process. The lock is held for
+  the whole turn, so a concurrent `prompt` or a gateway start can't race
+  the same workspace (the "session data has a single owner" invariant).
+  Output is collected by attaching an in-process `ConnectionSink` to the
+  `tui` channel and subscribing it to the session — the in-process mirror
+  of the gateway's WS sink.
+
+**Output.** stdout carries only the assistant's answer (streamed as it
+generates); reasoning / tool / status events are dropped and notices go to
+stderr, so `aura prompt … > out.txt` captures just the answer. Tracing
+goes to stderr too (`TracingMode::Stderr`, default `warn`). `--json`
+instead buffers and emits one object on stdout: `{"session_id",
+"response"}` on success, or `{"session_id", "error"}` (with a non-zero
+exit and nothing on stderr) on failure — so a JSON consumer always gets a
+parseable result *and* the session id, whichever way the turn goes.
+
+**Session id & resume.** The *client* pins the session id — either an
+explicit `--session <id>` (pick a memorable one up front) or a fresh UUID
+minted per run. A run started without `--session` exposes its id **only**
+via `--json` (`sid=$(aura prompt "…" --json | jq -r .session_id)`);
+plain-text output is just the answer, so capture the id with `--json` (or
+choose your own up front with `--session`) when you intend to resume.
+
+Resume with `aura prompt --session <id> "next turn"`: the agent rehydrates
+that session's context (server-side under a gateway, from the durable row
+in-process) and only the new turn's output is printed — the prior
+transcript is not replayed (the client subscribes with `since_ordinal:
+None`). This mirrors Claude Code's `claude -p --output-format json` →
+`--resume <id>`, except Aura's client (not the server) assigns the id.
+
+**Tool approvals** have no human to answer them. Default is `Deny`
+(fail-closed — the turn continues and the model adapts to the denial);
+`-y`/`--dangerously-allow-all` switches to `Approve`. The WS path
+auto-resolves the gateway's approval prompt over the wire; the in-process
+path installs a session-scoped auto gate that resolves instantly without
+fanning a prompt out to a UI that isn't there.
+
+**Persistence.** A `prompt` turn persists exactly like any conversation:
+the session row (created lazily on the first message), the user +
+assistant transcript, trace steps/spans, and cost records. Per the
+"session data is core data — never delete" rule, each `prompt` without
+`--session` leaves a permanent session row. Because the in-process path
+exits seconds after the answer, it awaits `CostManager::drain` before
+teardown to flush the fire-and-forget `cost_records` write that the
+long-running gateway would otherwise outlive.
+
+**Bounding the wait.** A rejected `handle_incoming` — rate-limit, budget
+(`CostManager::check`), or security — returns an error the router only
+*logs* (`router/mod.rs`); nothing is dispatched to the client, so the
+consume loop would otherwise block forever waiting for a reply that never
+comes. `--timeout <secs>` (default 300; `0` = wait indefinitely) caps the
+wait for the turn's reply: on expiry the turn errors out (surfaced as the
+`error` field under `--json`). Raise it for genuinely long agentic turns.
 
 ### Deferred command families
 
