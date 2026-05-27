@@ -23,17 +23,20 @@ pub(crate) enum AppEvent {
     /// Appended to the live streaming buffer shown at the tail of the
     /// scrollback until `Outgoing` finalises it.
     StreamDelta(String),
-    /// Incremental model reasoning ("thinking") chunk. Buffered into a
-    /// dim reasoning line-buffer and committed to scrollback as complete
-    /// lines form — the agent's visible "working" trace ahead of tools
-    /// and the answer.
-    Reasoning(String),
-    /// A tool call started. Commits a `⏺ tool(label)` progress line to
-    /// scrollback the moment the agent dispatches the call.
-    ToolStarted { tool: String, label: Option<String> },
-    /// A tool call finished. Commits a `⎿ summary` line, coloured by
-    /// `status` (`"ok"` / `"error"` / `"denied"`).
-    ToolCompleted { status: String, summary: String },
+    /// A tool call started. Committed to scrollback immediately; `call_id`
+    /// keys the match to its eventual completion.
+    ToolStarted {
+        call_id: String,
+        tool: String,
+        label: Option<String>,
+    },
+    /// A tool call finished. Appends the `⎿ summary` line to scrollback,
+    /// coloured by `status` (`"ok"` / `"error"` / `"denied"`).
+    ToolCompleted {
+        call_id: String,
+        status: String,
+        summary: String,
+    },
     /// A coarse turn-phase transition (today context compaction
     /// start/end). Commits a dim `⟳ …` status line.
     Status { phase: String },

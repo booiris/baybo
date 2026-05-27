@@ -214,8 +214,7 @@ async fn consume_ws_turn(
                 note_approval(decision, &tool);
             }
             TransportEvent::Notice { level, text } => eprint_notice(level, &text),
-            TransportEvent::Reasoning(_)
-            | TransportEvent::ToolStarted { .. }
+            TransportEvent::ToolStarted { .. }
             | TransportEvent::ToolCompleted { .. }
             | TransportEvent::Status { .. }
             | TransportEvent::ApprovalResolved { .. } => {}

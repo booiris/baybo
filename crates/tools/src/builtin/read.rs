@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
@@ -65,6 +65,13 @@ impl Tool for ReadTool {
             },
             "required": ["file_path"]
         })
+    }
+
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        params
+            .get("file_path")
+            .and_then(Value::as_str)
+            .map(|s| crate::progress::preview_path(Path::new(s)))
     }
 
     fn accessed_resources(&self, params: &Value) -> Vec<ResourceAccess> {
@@ -250,5 +257,17 @@ mod tests {
             panic!();
         };
         assert!(s.contains("truncated"), "expected truncation marker: {s}");
+    }
+
+    #[test]
+    fn progress_label_previews_file_path() {
+        assert_eq!(
+            ReadTool
+                .progress_label(&json!({
+                    "file_path": "/data/aura/crates/tools/src/builtin/read.rs"
+                }))
+                .as_deref(),
+            Some("/data/aura/crates/tools/src/builtin/read.rs"),
+        );
     }
 }

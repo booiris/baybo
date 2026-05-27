@@ -106,6 +106,21 @@ impl Tool for SkillTool {
         })
     }
 
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        let skill = params.get(SKILL_INPUT_NAME_FIELD).and_then(Value::as_str)?;
+        let args = params
+            .get("args")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let label = if args.is_empty() {
+            skill.to_string()
+        } else {
+            format!("{skill} {args}")
+        };
+        aura_tools::progress::preview_arg(&label)
+    }
+
     fn max_timeout(&self) -> Duration {
         // The risk assessor is an LLM call on every invocation and
         // routinely takes 10-20 s; the trait-default 30 s leaves no
@@ -508,6 +523,13 @@ impl Tool for SkillInstallTool {
         })
     }
 
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        params
+            .get("source_dir")
+            .and_then(Value::as_str)
+            .map(|s| aura_tools::progress::preview_path(Path::new(s)))
+    }
+
     fn max_timeout(&self) -> Duration {
         // The pipeline is risk-assessor LLM call + recursive directory
         // copy + registry hot-reload. A bigger skill bundle (templates
@@ -675,6 +697,13 @@ impl Tool for SkillUninstallTool {
             },
             "required": ["name"]
         })
+    }
+
+    fn progress_label(&self, params: &Value) -> Option<String> {
+        params
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(aura_tools::progress::preview_arg)
     }
 
     async fn execute(&self, params: Value, _ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {

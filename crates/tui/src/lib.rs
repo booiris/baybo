@@ -37,8 +37,8 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use aura_channels::{
-    ChannelError, DashboardProvider, IncomingMessage, Message, NoticeLevel, Result, SlashHandler,
-    SlashOutcome, ViewKind,
+    ChannelError, DashboardProvider, IncomingMessage, Message, NoticeLevel, Result, STOP_COMMAND,
+    STOP_COMMAND_NAME, SlashHandler, SlashOutcome, ViewKind,
 };
 use aura_model::{ChannelType, SessionId, User};
 use aura_model::{ContentBlock, MessageMetadata};
@@ -64,9 +64,12 @@ use tokio::time::Instant as TokioInstant;
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::app::{AppState, ApprovalChatEntry, ApprovalChatState, CONFIRM_EXIT_WINDOW, ViewMode};
+use crate::app::{
+    AppState, ApprovalChatEntry, ApprovalChatState, BlockKind, CONFIRM_EXIT_WINDOW,
+    TranscriptBlock, ViewMode,
+};
 use crate::client::WsTransport;
 use crate::event::AppEvent;
 use crate::keymap::{Action, KeyContext, translate};
@@ -86,6 +89,7 @@ pub struct TuiAdapter {
     shutdown: Arc<Notify>,
     slash_handler: Option<Arc<dyn SlashHandler>>,
     dashboard_provider: Option<Arc<dyn DashboardProvider>>,
+    model_label: Option<String>,
     on_exit: Option<OnExit>,
     event_tx: mpsc::Sender<AppEvent>,
     event_rx: Arc<Mutex<Option<mpsc::Receiver<AppEvent>>>>,
@@ -111,6 +115,7 @@ impl TuiAdapter {
             shutdown: Arc::new(Notify::new()),
             slash_handler: None,
             dashboard_provider: None,
+            model_label: None,
             on_exit: None,
             event_tx,
             event_rx: Arc::new(Mutex::new(Some(event_rx))),
@@ -131,6 +136,13 @@ impl TuiAdapter {
 
     pub fn with_dashboard_provider(mut self, provider: Arc<dyn DashboardProvider>) -> Self {
         self.dashboard_provider = Some(provider);
+        self
+    }
+
+    pub fn with_model_label(mut self, label: Option<String>) -> Self {
+        self.model_label = label
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         self
     }
 
@@ -158,6 +170,7 @@ impl TuiAdapter {
             event_rx,
             slash_handler: self.slash_handler.clone(),
             dashboard_provider: self.dashboard_provider.clone(),
+            model_label: self.model_label.clone(),
             on_exit: self.on_exit.clone(),
             approval_queue: self.approval_queue.clone(),
         };
@@ -181,6 +194,7 @@ struct LoopCtx {
     event_rx: mpsc::Receiver<AppEvent>,
     slash_handler: Option<Arc<dyn SlashHandler>>,
     dashboard_provider: Option<Arc<dyn DashboardProvider>>,
+    model_label: Option<String>,
     on_exit: Option<OnExit>,
     approval_queue: ApprovalQueue,
 }
@@ -217,13 +231,24 @@ async fn spawn_transport_pump(transport: Arc<WsTransport>, event_tx: mpsc::Sende
             };
             let forwarded = match event {
                 TransportEvent::StreamDelta(text) => Some(AppEvent::StreamDelta(text)),
-                TransportEvent::Reasoning(text) => Some(AppEvent::Reasoning(text)),
-                TransportEvent::ToolStarted { tool, label } => {
-                    Some(AppEvent::ToolStarted { tool, label })
-                }
-                TransportEvent::ToolCompleted { status, summary } => {
-                    Some(AppEvent::ToolCompleted { status, summary })
-                }
+                TransportEvent::ToolStarted {
+                    call_id,
+                    tool,
+                    label,
+                } => Some(AppEvent::ToolStarted {
+                    call_id,
+                    tool,
+                    label,
+                }),
+                TransportEvent::ToolCompleted {
+                    call_id,
+                    status,
+                    summary,
+                } => Some(AppEvent::ToolCompleted {
+                    call_id,
+                    status,
+                    summary,
+                }),
                 TransportEvent::Status { phase } => Some(AppEvent::Status { phase }),
                 TransportEvent::Response(blocks) => Some(AppEvent::Outgoing(blocks)),
                 TransportEvent::Notice { level, text } => Some(AppEvent::Log(LogRecord {
@@ -286,10 +311,9 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Build a fresh `Terminal` configured for chat mode (inline viewport)
 /// at the given height. The viewport is sized to exactly fit the live
-/// content (`input_h + approval_h`), so there's no empty gap between
-/// the latest scrollback message and the input box. The cursor is left
-/// wherever the shell put it — ratatui's `compute_inline_size` anchors
-/// the viewport at that row.
+/// content, so there's no empty gap between the latest scrollback message
+/// and the live region. The cursor is left wherever the shell put it —
+/// ratatui's `compute_inline_size` anchors the viewport at that row.
 fn new_chat_terminal(viewport_h: u16) -> io::Result<Term> {
     let backend = CrosstermBackend::new(io::stdout());
     Terminal::with_options(
@@ -300,14 +324,18 @@ fn new_chat_terminal(viewport_h: u16) -> io::Result<Term> {
     )
 }
 
-/// Desired inline-viewport height for the current state: input box +
-/// pending-approval prompt (if any). Streaming text doesn't add to this
-/// because we commit each completed line directly into scrollback.
+/// Desired inline-viewport height for the current state. The working zone keeps
+/// one spacer row while idle and adds the indicator row only while busy.
+/// Streaming/tool text commits straight into scrollback, so it doesn't add
+/// here.
 fn desired_viewport_height(state: &AppState) -> u16 {
-    let mut h = chat::input_box_height(state);
+    let mut h = chat::input_box_height(state).saturating_add(chat::working_zone_height(state));
+    h = h.saturating_add(chat::model_footer_height(state));
+    h = h.saturating_add(state.queued_display_lines().count() as u16);
     if let Some(entry) = state.pending_approval.as_ref() {
         h = h.saturating_add(chat::approval_pending_height(entry));
     }
+    h = h.saturating_add(chat::completion_popup_height(state));
     h.max(1)
 }
 
@@ -327,6 +355,13 @@ fn new_dashboard_terminal() -> io::Result<Term> {
 /// cadence so a continuous drag never fires it mid-gesture, yet it feels instant
 /// on release.
 const RESIZE_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Tick cadence for the live "working" indicator: each tick advances the
+/// dot's colour pulse and repaints (which also refreshes the elapsed
+/// counter). ~300ms is a calm pulse — slower than the original 100ms shape
+/// spinner — while keeping the counter within its 1s granularity. The select
+/// arm is gated on [`AppState::show_working`], so an idle TUI never wakes.
+const WORKING_TICK: std::time::Duration = std::time::Duration::from_millis(300);
 
 async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     install_panic_hook();
@@ -356,18 +391,24 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     };
 
     let mut state = AppState::new().with_approval(ctx.approval_queue.clone());
+    state.session_id = ctx.initial_session_id.clone();
+    state.set_model_label(ctx.model_label.clone());
     if let Some(handler) = ctx.slash_handler.as_ref() {
         state.set_commands(handler.commands());
     }
     if let Some(entries) = ctx.input.take_history_snapshot().await {
         state.set_history(entries);
     }
+    // Clear the screen on entry so the TUI starts on a clean slate (cursor
+    // home) rather than below whatever was in the shell. Done before the
+    // inline terminal is created so its viewport anchors at the top.
+    home_and_clear_screen()?;
     let mut current_viewport_h = desired_viewport_height(&state);
     let mut terminal = new_chat_terminal(current_viewport_h)
         .map_err(|e| anyhow::anyhow!("new_chat_terminal: {e}"))?;
     let mut term_events = EventStream::new();
 
-    commit_banner(&mut terminal, &ctx.initial_session_id)?;
+    commit_banner(&mut state, &mut terminal, &ctx.initial_session_id)?;
     terminal.draw(|f| render_chat(f, &mut state))?;
 
     // Debounce timer for coalescing terminal-resize bursts. Parked far in the
@@ -377,7 +418,18 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
     tokio::pin!(resize_debounce);
     let mut resize_pending = false;
 
+    // Refresh clock for the working indicator's elapsed counter. Only polled
+    // while a turn is in flight (its select arm is gated on `working`), so an
+    // idle loop never wakes on it. Skip missed ticks so resuming after an
+    // idle stretch doesn't fire a burst.
+    let mut working_refresh = tokio::time::interval(WORKING_TICK);
+    working_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
+        // Recomputed each iteration so the refresh arm enables/disables as
+        // turns start and end. Cheap (Copy bool); the borrow ends before any
+        // arm body mutably borrows `state`.
+        let working = state.show_working();
         tokio::select! {
             biased;
             _ = ctx.shutdown.notified() => break Ok(()),
@@ -385,7 +437,13 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                 match term {
                     Some(Ok(CrosstermEvent::Key(key))) => {
                         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                            match handle_key(&mut state, &mut ctx, &mut terminal, key).await? {
+                            match handle_key(
+                                &mut state,
+                                &mut ctx,
+                                &mut terminal,
+                                &mut current_viewport_h,
+                                key,
+                            ).await? {
                                 KeyOutcome::Exit => break Ok(()),
                                 KeyOutcome::Continue => {}
                                 KeyOutcome::DashboardExit => {
@@ -425,21 +483,31 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                 match ev {
                     AppEvent::Outgoing(blocks) => {
                         if matches!(state.mode, ViewMode::Chat) {
-                            flush_reasoning_partial(&mut state, &mut terminal)?;
                             finalize_stream(&mut state, &mut terminal, &blocks)?;
+                            // Any steer still pending never met a tool
+                            // boundary this turn, so it fell to the next turn
+                            // server-side — commit its `you>` line now, after
+                            // this turn's reply and before that turn arrives.
+                            commit_pending_interjections(&mut state, &mut terminal)?;
                         }
                         state.clear_stream();
                         state.note_response_received();
-                        // Drain as many queued items as possible while
-                        // the loop stays idle. A queued plain message
-                        // re-arms `outstanding_responses` and breaks
-                        // out; a queued slash like `/skills` or
-                        // `/clear` doesn't touch the agent and lets the
-                        // next item run in the same cycle.
+                        // Drain deferred slash commands now that the turn has
+                        // ended. A passthrough slash re-arms
+                        // `outstanding_responses` (busy) and breaks out; a
+                        // client-side slash like `/skills` or `/clear` doesn't
+                        // touch the agent and lets the next item run in the
+                        // same cycle.
                         while !state.is_busy()
                             && let Some(next) = state.dequeue_submission()
                         {
-                            dispatch_submission(&mut state, &ctx, &mut terminal, next).await?;
+                            dispatch_submission(
+                                &mut state,
+                                &ctx,
+                                &mut terminal,
+                                &mut current_viewport_h,
+                                next,
+                            ).await?;
                         }
                         // This redraw can rebuild the inline terminal (a pending
                         // resize, or a viewport-height change as an approval
@@ -455,11 +523,15 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                         )?;
                     }
                     AppEvent::StreamDelta(delta) => {
+                        state.ensure_working_clock();
                         state.append_stream_delta(&delta);
                         if matches!(state.mode, ViewMode::Chat) {
-                            // Reasoning precedes the answer — flush its partial
-                            // so the dim trace lands above the `aura> ` reply.
-                            flush_reasoning_partial(&mut state, &mut terminal)?;
+                            term_events = resize_chat_viewport_before_scrollback(
+                                term_events,
+                                &mut terminal,
+                                &mut state,
+                                &mut current_viewport_h,
+                            )?;
                             flush_complete_stream_lines(&mut state, &mut terminal)?;
                         }
                         term_events = redraw_after_event(
@@ -470,14 +542,29 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                             &mut resize_pending,
                         )?;
                     }
-                    AppEvent::Reasoning(text) => {
-                        state.append_reasoning_delta(&text);
+                    AppEvent::ToolStarted {
+                        call_id,
+                        tool,
+                        label,
+                    } => {
+                        state.ensure_working_clock();
                         if matches!(state.mode, ViewMode::Chat) {
-                            // Any answer text streamed before this reasoning chunk
-                            // must land above it.
+                            term_events = resize_chat_viewport_before_scrollback(
+                                term_events,
+                                &mut terminal,
+                                &mut state,
+                                &mut current_viewport_h,
+                            )?;
+                            // Flush any answer text the model emitted before
+                            // invoking the tool, so it lands above the tool
+                            // block.
                             flush_stream_partial(&mut state, &mut terminal)?;
-                            flush_complete_reasoning_lines(&mut state, &mut terminal)?;
                         }
+                        // The `● tool` line is deferred: it renders live in the
+                        // working zone now and commits to scrollback paired with
+                        // its `⎿` result only on completion, so concurrent tools
+                        // never detach their results. See docs/modules/tui.md.
+                        state.push_running_tool(call_id, tool, label);
                         term_events = redraw_after_event(
                             term_events,
                             &mut terminal,
@@ -486,34 +573,43 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                             &mut resize_pending,
                         )?;
                     }
-                    AppEvent::ToolStarted { tool, label } => {
-                        if matches!(state.mode, ViewMode::Chat) {
-                            // Land below whatever streamed ahead of the call: the
-                            // dim reasoning trace and any answer text the model
-                            // emitted before invoking the tool.
-                            flush_reasoning_partial(&mut state, &mut terminal)?;
-                            flush_stream_partial(&mut state, &mut terminal)?;
-                            commit_lines_compact(
+                    AppEvent::ToolCompleted {
+                        call_id,
+                        status,
+                        summary,
+                    } => {
+                        // Drop completions for a call we're no longer tracking:
+                        // after `/stop`, `reset_working` clears the running set,
+                        // but a tool that observes cancellation can still emit a
+                        // late `ToolCompleted` before the agent loop unwinds.
+                        // Committing it would strand a stray `⎿` result in the
+                        // now-idle scrollback, so a non-matching id is ignored.
+                        if let Some(running) = state.take_running_tool(&call_id)
+                            && matches!(state.mode, ViewMode::Chat)
+                        {
+                            term_events = resize_chat_viewport_before_scrollback(
+                                term_events,
                                 &mut terminal,
-                                chat::render_tool_started(&tool, label.as_deref()),
+                                &mut state,
+                                &mut current_viewport_h,
                             )?;
-                        }
-                        term_events = redraw_after_event(
-                            term_events,
-                            &mut terminal,
-                            &mut state,
-                            &mut current_viewport_h,
-                            &mut resize_pending,
-                        )?;
-                    }
-                    AppEvent::ToolCompleted { status, summary } => {
-                        if matches!(state.mode, ViewMode::Chat) {
-                            flush_reasoning_partial(&mut state, &mut terminal)?;
                             flush_stream_partial(&mut state, &mut terminal)?;
-                            commit_lines_compact(
-                                &mut terminal,
-                                chat::render_tool_completed(&status, &summary),
-                            )?;
+                            // Commit the whole tool block as one unit now that it
+                            // is done — the deferred `● tool` head, any approval
+                            // resolved mid-call, then the `⎿` result — so the
+                            // result sits under its own tool even when siblings
+                            // ran concurrently. See `chat::tool_completed_block`.
+                            let block = chat::tool_completed_block(&running, &status, &summary);
+                            commit_tool_lines(&mut state, &mut terminal, block)?;
+                            // The agent runs each tool batch concurrently and only
+                            // folds a mid-turn steer in once the whole batch
+                            // drains, so hold the queued `you>` line until the
+                            // last tool completes (`running_tools` empties).
+                            // Committing it after an earlier sibling would place
+                            // it above results the model actually saw first.
+                            if state.running_tools().is_empty() {
+                                commit_pending_interjections(&mut state, &mut terminal)?;
+                            }
                         }
                         term_events = redraw_after_event(
                             term_events,
@@ -525,9 +621,8 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                     }
                     AppEvent::Status { phase } => {
                         if matches!(state.mode, ViewMode::Chat) {
-                            flush_reasoning_partial(&mut state, &mut terminal)?;
                             flush_stream_partial(&mut state, &mut terminal)?;
-                            commit_lines_compact(&mut terminal, chat::render_status_line(&phase))?;
+                            commit_lines(&mut state, &mut terminal, chat::render_status_line(&phase))?;
                         }
                         term_events = redraw_after_event(
                             term_events,
@@ -559,7 +654,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                     }
                     AppEvent::Log(record) => {
                         if matches!(state.mode, ViewMode::Chat) {
-                            commit_lines(&mut terminal, chat::render_log_lines(&record))?;
+                            commit_lines(&mut state, &mut terminal, chat::render_log_lines(&record))?;
                         }
                         term_events = redraw_after_event(
                             term_events,
@@ -575,6 +670,7 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                             && let Some(req) = queue.peek_head()
                         {
                             state.set_pending_approval(ApprovalChatEntry {
+                                call_id: req.call_id,
                                 tool: req.tool,
                                 accesses: req.accesses,
                                 params_preview: req.params_preview,
@@ -609,6 +705,20 @@ async fn run_loop(mut ctx: LoopCtx) -> anyhow::Result<()> {
                     &mut resize_pending,
                 )?;
             }
+            _ = working_refresh.tick(), if working => {
+                // Advance the dot's colour pulse and repaint (also refreshes
+                // the elapsed counter). No scrollback commit and (steady
+                // state) no height change, so `redraw_after_event` does a
+                // cheap in-place draw without a cursor query.
+                state.tick_spinner();
+                term_events = redraw_after_event(
+                    term_events,
+                    &mut terminal,
+                    &mut state,
+                    &mut current_viewport_h,
+                    &mut resize_pending,
+                )?;
+            }
         }
     }
 }
@@ -631,12 +741,12 @@ fn draw_active(
     }
 }
 
-/// Resize the inline chat viewport when the live content's footprint
-/// changes (input grew a line, approval popped/resolved). ratatui's
-/// `Viewport::Inline(_)` height is fixed at construction, so this drops
-/// the existing terminal and rebuilds one with the new height. We
-/// clear the old viewport first so its tail content doesn't linger
-/// beyond the new (potentially smaller) viewport area.
+/// Resize the inline chat viewport when the live content's footprint changes
+/// (input grew a line, approval popped/resolved, working indicator toggled).
+/// ratatui's `Viewport::Inline(_)` height is fixed at construction, so this
+/// drops the existing terminal and rebuilds one with the new height. We clear
+/// the old viewport first so its tail content doesn't linger beyond the new
+/// (potentially smaller) viewport area.
 fn resize_chat_viewport_if_needed(
     state: &AppState,
     terminal: &mut Term,
@@ -652,34 +762,94 @@ fn resize_chat_viewport_if_needed(
     Ok(())
 }
 
-/// Rebuild the inline chat terminal after a terminal-resize burst settles.
+/// Ensure the inline viewport has its current height before writing historical
+/// lines above it. With a dynamic working row, inserting into scrollback before
+/// growing the viewport can put the new line where the live region is about to
+/// be, making tool/status text appear to overwrite the working indicator.
+fn resize_chat_viewport_before_scrollback(
+    term_events: EventStream,
+    terminal: &mut Term,
+    state: &mut AppState,
+    current_viewport_h: &mut u16,
+) -> anyhow::Result<EventStream> {
+    if desired_viewport_height(state) == *current_viewport_h {
+        return Ok(term_events);
+    }
+    drop(term_events);
+    resize_chat_viewport_if_needed(state, terminal, current_viewport_h)?;
+    terminal.draw(|f| render_chat(f, state))?;
+    Ok(EventStream::new())
+}
+
+/// Refresh the screen after a terminal-resize burst settles.
 ///
-/// A resize makes the terminal reflow its native scrollback (both the user's
-/// pre-launch shell history and our committed chat lines) — that part is
-/// correct and we leave it alone. What breaks is ratatui's inline viewport:
-/// its in-place `resize()` re-derives the viewport top from a *pre-reflow*
-/// cursor offset, so the live region lands at the wrong row and every later
-/// `insert_before` compounds the drift. Reconstructing the terminal re-queries
-/// the live cursor and anchors a fresh viewport with consistent internal state.
+/// A width change makes the terminal reflow its native scrollback (shell
+/// history + our committed lines), and the old full-width live region (input
+/// box border, message bars) reflows into stale fragment rows that the inline
+/// viewport can't precisely erase — `insert_before` scrolls rather than
+/// overwrites, so they drift upward as ghosting. The post-reflow physical
+/// layout isn't exposed by stock ratatui/crossterm, so there's no surgical
+/// clear (that's Codex `custom_terminal` fork territory).
 ///
-/// We deliberately do not clear or replay history: clearing would wipe the
-/// reflowed shell history above, and the terminal already reflowed our lines.
-/// The known artifact is that the old input box (a full-width bordered box the
-/// terminal just reflowed, its border line wrapping into extra rows) leaves
-/// stale fragment rows just above the new input. `insert_before` scrolls rather
-/// than overwrites, so these drift upward as new output arrives and only vanish
-/// once they scroll off the top — they are NOT overwritten by the next line.
-/// Fully removing them needs the post-reflow physical layout, which stock
-/// ratatui/crossterm doesn't expose (blind clearing would risk erasing the
-/// history line just above); that's the Codex `custom_terminal` fork territory.
+/// Instead we **refresh**: clear the screen + scrollback for a clean slate,
+/// anchor a fresh viewport, reprint the banner, then replay the retained
+/// [`TranscriptBlock`] log so the conversation re-renders cleanly at the new
+/// width (width-dependent blocks like the user bar are rebuilt to fit). The
+/// session itself is untouched; only the bounded replay log is reprinted, so
+/// history beyond [`crate::app`]'s cap — and any shell output above the
+/// original launch point — does not come back.
 fn rebuild_chat_terminal_after_resize(
     terminal: &mut Term,
-    state: &AppState,
+    state: &mut AppState,
     current: &mut u16,
 ) -> io::Result<()> {
+    // Home the cursor + wipe, then drop the old terminal for a fresh one whose
+    // viewport anchors at the homed cursor (row 0) — so the banner lands at the
+    // top. Calling `Terminal::clear` here would move the cursor off home before
+    // the new viewport anchors. See [`home_and_clear_screen`].
+    home_and_clear_screen()?;
     let desired = desired_viewport_height(state);
     *terminal = new_chat_terminal(desired)?;
     *current = desired;
+    let session_id = state.session_id.clone();
+    commit_banner(state, terminal, &session_id)?;
+    replay_transcript(state, terminal)?;
+    Ok(())
+}
+
+/// Clear the visible screen + scrollback for an intentional chat reset
+/// (`/clear`, `/new`, Ctrl-L), then recreate the inline terminal so the next
+/// banner anchors at row 0 instead of the previous bottom viewport.
+fn reset_chat_scrollback(
+    state: &mut AppState,
+    terminal: &mut Term,
+    current: &mut u16,
+    session_id: &SessionId,
+) -> io::Result<()> {
+    home_and_clear_screen()?;
+    let desired = desired_viewport_height(state);
+    *terminal = new_chat_terminal(desired)?;
+    *current = desired;
+    state.clear_transcript();
+    commit_banner(state, terminal, session_id)?;
+    Ok(())
+}
+
+/// Re-commit the retained transcript after a resize refresh wiped the screen.
+/// Blocks replay in commit order through the same commit helpers, so the
+/// leading-separator spacing is reproduced exactly and the helpers re-record
+/// each block — rebuilding `state.transcript` to the same content (taking it
+/// out first avoids a borrow clash and double-counting against the cap).
+fn replay_transcript(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
+    for block in state.take_transcript() {
+        match block {
+            TranscriptBlock::User(text) => commit_user_message(state, terminal, &text)?,
+            TranscriptBlock::Answer(lines) => commit_answer_lines(state, terminal, lines)?,
+            TranscriptBlock::Tool(lines) => commit_tool_lines(state, terminal, lines)?,
+            TranscriptBlock::Other(lines) => commit_lines(state, terminal, lines)?,
+            TranscriptBlock::Cooked(elapsed) => commit_cooked(state, terminal, elapsed)?,
+        }
+    }
     Ok(())
 }
 
@@ -732,55 +902,128 @@ fn redraw_after_event(
     Ok(stream)
 }
 
+/// Commit a single blank scrollback row.
+fn commit_blank(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
+    commit_lines_compact(state, terminal, vec![Line::from("")])
+}
+
+/// Emit one separator blank row *unless* the last committed row is already
+/// blank — so consecutive blocks are always single-spaced, never doubled.
+fn commit_separator(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
+    if !state.last_row_blank {
+        commit_blank(state, terminal)?;
+    }
+    Ok(())
+}
+
+/// Open a scrollback block of the given kind, emitting a single leading
+/// separator blank when the kind changes (and always for an `Other` block).
+/// Same-kind `Answer`/`Tool` lines stack tight as one block; the separator
+/// dedups against `last_row_blank`. There are no trailing blanks — the
+/// reserved working row separates the final block from the input box.
+fn begin_block(state: &mut AppState, terminal: &mut Term, kind: BlockKind) -> io::Result<()> {
+    let continues = kind != BlockKind::Other && state.last_block == Some(kind);
+    if !continues {
+        commit_separator(state, terminal)?;
+    }
+    state.last_block = Some(kind);
+    Ok(())
+}
+
+/// Commit a tool-block line (`●` / `⎿` / a resolved-approval summary) as part
+/// of the current tool block (opening it with a leading separator if the
+/// previous block was a different kind) and record it for resize replay.
+fn commit_tool_lines(
+    state: &mut AppState,
+    terminal: &mut Term,
+    lines: Vec<Line<'static>>,
+) -> io::Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let recorded = lines.clone();
+    begin_block(state, terminal, BlockKind::Tool)?;
+    commit_lines_compact(state, terminal, lines)?;
+    state.record_block(TranscriptBlock::Tool(recorded));
+    Ok(())
+}
+
+/// Commit an assistant-answer block (opening it with a leading separator if the
+/// previous block was a different kind) and record it for resize replay. The
+/// `● `/indent leader is already baked into `lines`, so replay needs no
+/// `streaming_committed_any` state.
+fn commit_answer_lines(
+    state: &mut AppState,
+    terminal: &mut Term,
+    lines: Vec<Line<'static>>,
+) -> io::Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let recorded = lines.clone();
+    begin_block(state, terminal, BlockKind::Answer)?;
+    commit_lines_compact(state, terminal, lines)?;
+    state.record_block(TranscriptBlock::Answer(recorded));
+    Ok(())
+}
+
+/// Commit the `cooked for …` footer — its own deduped separator blank above it,
+/// so it sits one blank below the answer/tool block regardless of which
+/// preceded — and record it for resize replay (re-rendered from `elapsed`).
+fn commit_cooked(state: &mut AppState, terminal: &mut Term, elapsed: Duration) -> io::Result<()> {
+    commit_separator(state, terminal)?;
+    commit_lines_compact(state, terminal, chat::render_cooked_for_line(elapsed))?;
+    state.record_block(TranscriptBlock::Cooked(elapsed));
+    Ok(())
+}
+
 /// Stream-mode helpers — see [`AppState::streaming`] / `streaming_committed_any`.
 fn flush_complete_stream_lines(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
-    let lines = state.drain_complete_stream_lines();
-    for line in lines {
-        let leader_is_continuation = state.streaming_committed_any;
-        commit_lines_compact(
-            terminal,
-            chat::render_stream_line(&line, leader_is_continuation),
-        )?;
-        state.streaming_committed_any = true;
+    let drained = state.drain_complete_stream_lines();
+    if drained.is_empty() {
+        return Ok(());
     }
+    // Render every newly-completed line in one Answer block: the first uses the
+    // `● ` leader iff nothing committed yet, the rest the continuation indent.
+    let mut continuation = state.streaming_committed_any;
+    let mut rendered = Vec::new();
+    for line in &drained {
+        rendered.extend(chat::render_stream_line(line, continuation));
+        continuation = true;
+    }
+    commit_answer_lines(state, terminal, rendered)?;
+    state.streaming_committed_any = true;
     Ok(())
 }
 
-/// Commit any complete reasoning lines buffered in `state` to scrollback
-/// as dim lines, leaving the trailing partial for the next chunk.
-fn flush_complete_reasoning_lines(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
-    for line in state.drain_complete_reasoning_lines() {
-        let continuation = state.reasoning_committed_any;
-        commit_lines_compact(terminal, chat::render_reasoning_line(&line, continuation))?;
-        state.reasoning_committed_any = true;
+/// Commit every pending mid-turn steer to scrollback as a user block,
+/// emptying the pending queue. Called once a tool batch fully drains (so the
+/// steer lands below the batch's results, where the agent picks it up) and
+/// again as the turn-end fallback for a steer that never met a batch boundary.
+fn commit_pending_interjections(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
+    let pending = state.take_pending_interjections();
+    if pending.is_empty() {
+        return Ok(());
     }
-    Ok(())
-}
-
-/// Flush the trailing reasoning partial and end the reasoning run, so the
-/// next scrollback commit (a tool line, the streamed answer, or finalize)
-/// lands below a complete reasoning block.
-fn flush_reasoning_partial(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
-    if let Some(partial) = state.take_reasoning_partial() {
-        let continuation = state.reasoning_committed_any;
-        commit_lines_compact(
-            terminal,
-            chat::render_reasoning_line(&partial, continuation),
-        )?;
+    for text in pending {
+        commit_user_message(state, terminal, &text)?;
     }
-    state.reasoning_committed_any = false;
     Ok(())
 }
 
 /// Commit the trailing answer partial (text streamed without a closing
-/// newline) so the next scrollback commit — a tool line, a reasoning line,
-/// or finalize — lands *below* it. Without this, answer text the model
-/// emitted before a tool call would sit in `state.streaming` and only
-/// surface at finalize, i.e. *under* the tool line, reordering the turn.
+/// newline) so the next scrollback commit — a tool line or finalize —
+/// lands *below* it. Without this, answer text the model emitted before a
+/// tool call would sit in `state.streaming` and only surface at finalize,
+/// i.e. *under* the tool line, reordering the turn.
 fn flush_stream_partial(state: &mut AppState, terminal: &mut Term) -> io::Result<()> {
     if let Some(partial) = state.take_stream_partial() {
         let continuation = state.streaming_committed_any;
-        commit_lines_compact(terminal, chat::render_stream_line(&partial, continuation))?;
+        commit_answer_lines(
+            state,
+            terminal,
+            chat::render_stream_line(&partial, continuation),
+        )?;
         state.streaming_committed_any = true;
     }
     Ok(())
@@ -799,9 +1042,8 @@ fn flush_stream_partial(state: &mut AppState, terminal: &mut Term) -> io::Result
 /// was `None`: cron fires and subagent-notification turns (see
 /// `AgentActor::run_agent_loop` callers) deliver only a final Message,
 /// no deltas — the body never reached the scrollback, so the full
-/// message is rendered from `blocks`. A trailing blank separates this
-/// response from the next, emitted only when something was committed (an
-/// empty Outgoing is a no-op).
+/// message is rendered from `blocks`. The `cooked for` footer is committed
+/// separately by [`finalize_stream`] (with its own separator), not here.
 fn finalize_lines(
     blocks: &[ContentBlock],
     started: bool,
@@ -816,14 +1058,7 @@ fn finalize_lines(
     if committed {
         out.extend(chat::render_non_text_blocks(blocks, true));
     } else {
-        let body = chat::render_assistant_lines(blocks);
-        if !body.is_empty() {
-            committed = true;
-            out.extend(body);
-        }
-    }
-    if committed {
-        out.push(Line::from(""));
+        out.extend(chat::render_assistant_lines(blocks));
     }
     out
 }
@@ -839,10 +1074,19 @@ fn finalize_stream(
 ) -> io::Result<()> {
     let started = state.streaming_committed_any;
     let partial = state.take_stream_partial();
-    let lines = finalize_lines(blocks, started, partial);
-    if !lines.is_empty() {
+    // Stamp the elapsed turn time only when we actually clocked this turn
+    // (a local dispatch / streaming turn). Cron / non-streaming deliveries
+    // leave `working_since` unset and get no footer.
+    let cooked = state.working_since.map(|since| since.elapsed());
+    let body = finalize_lines(blocks, started, partial);
+    if !body.is_empty() {
+        // Part of the answer block: continues tight after a streamed answer,
+        // or gets a leading separator after a tool / fresh (non-streamed) body.
         state.streaming_committed_any = true;
-        commit_lines_compact(terminal, lines)?;
+        commit_answer_lines(state, terminal, body)?;
+    }
+    if let Some(elapsed) = cooked {
+        commit_cooked(state, terminal, elapsed)?;
     }
     Ok(())
 }
@@ -855,44 +1099,81 @@ fn render_dashboard(frame: &mut ratatui::Frame, state: &mut AppState) {
     dashboard::render(frame, frame.area(), state);
 }
 
-/// Number of blank rows appended after each scrollback commit (user
-/// message, assistant reply, log line, resolved approval, banner…) to
-/// visually separate consecutive entries. Bumping this widens the
-/// breathing room between messages.
-const ENTRY_SPACING_ROWS: u16 = 1;
+/// Whether a rendered line is visually blank (no non-whitespace content) —
+/// used to keep [`AppState::last_row_blank`] accurate so separators dedup.
+fn is_blank_line(line: &Line<'_>) -> bool {
+    line.spans.iter().all(|s| s.content.trim().is_empty())
+}
 
-/// Push lines into the terminal's native scrollback (above the inline
-/// viewport). No-op if `lines` is empty. The buffer height passed to
-/// `insert_before` is computed from wrapped width so long lines don't
-/// get clipped. A trailing blank row is appended for visual separation
-/// from whatever gets committed next.
-fn commit_lines(terminal: &mut Term, mut lines: Vec<Line<'static>>) -> io::Result<()> {
+/// Push a self-contained "Other" block (log, status, system note) into
+/// scrollback: a deduplicated leading separator blank, then the content. No
+/// trailing blank — the next block adds its own leading separator, and the
+/// reserved working row separates the last block from the input. No-op if
+/// `lines` is empty. Records the block for resize replay; user messages use
+/// [`commit_user_message`] instead so they replay from text at the new width.
+fn commit_lines(
+    state: &mut AppState,
+    terminal: &mut Term,
+    lines: Vec<Line<'static>>,
+) -> io::Result<()> {
     if lines.is_empty() {
         return Ok(());
     }
-    for _ in 0..ENTRY_SPACING_ROWS {
-        lines.push(Line::from(""));
-    }
-    commit_lines_compact(terminal, lines)
+    let recorded = lines.clone();
+    commit_other_core(state, terminal, lines)?;
+    state.record_block(TranscriptBlock::Other(recorded));
+    Ok(())
 }
 
-/// Like [`commit_lines`] but skips the trailing blank-row separator.
-/// Used by the per-line streaming committer so consecutive stream
-/// lines stack tightly together (one assistant response reads as one
-/// block); the trailing blank is emitted exactly once by
-/// `finalize_stream` after the response completes.
-fn commit_lines_compact(terminal: &mut Term, lines: Vec<Line<'static>>) -> io::Result<()> {
+/// The "Other" block commit without the transcript record — shared by
+/// [`commit_lines`] and [`commit_user_message`] so the latter records a `User`
+/// entry (text, re-rendered at replay width) rather than a width-baked `Other`.
+fn commit_other_core(
+    state: &mut AppState,
+    terminal: &mut Term,
+    lines: Vec<Line<'static>>,
+) -> io::Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    begin_block(state, terminal, BlockKind::Other)?;
+    commit_lines_compact(state, terminal, lines)
+}
+
+/// Commit a user message / mid-turn steer as an "Other" block and record it for
+/// resize replay. Stored as raw text (not rendered lines) because its
+/// full-width highlighted bar is width-dependent — replay rebuilds it at the
+/// current width via `render_user_lines`.
+fn commit_user_message(state: &mut AppState, terminal: &mut Term, text: &str) -> io::Result<()> {
+    let width = terminal.size()?.width;
+    commit_other_core(state, terminal, chat::render_user_lines(text, width))?;
+    state.record_block(TranscriptBlock::User(text.to_string()));
+    Ok(())
+}
+
+/// Like [`commit_lines`] but with no separator and no trailing blank — the
+/// raw scrollback insert. Used by the per-line streaming committer (so an
+/// answer reads as one tight block) and by the tool-run / separator helpers
+/// that manage their own blanks. Tracks whether the last row landed blank so
+/// [`commit_separator`] can dedup.
+fn commit_lines_compact(
+    state: &mut AppState,
+    terminal: &mut Term,
+    lines: Vec<Line<'static>>,
+) -> io::Result<()> {
     if lines.is_empty() {
         return Ok(());
     }
     let width = terminal.size()?.width.max(1);
     let height = chat::wrapped_height(&lines, width);
+    let last_blank = lines.last().is_some_and(is_blank_line);
     terminal.insert_before(height, |buf| {
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .render(buf.area, buf);
         elide_wide_char_continuations(buf);
     })?;
+    state.last_row_blank = last_blank;
     Ok(())
 }
 
@@ -930,14 +1211,13 @@ fn elide_wide_char_continuations(buf: &mut ratatui::buffer::Buffer) {
     }
 }
 
-fn commit_banner(terminal: &mut Term, session_id: &SessionId) -> io::Result<()> {
+fn commit_banner(
+    state: &mut AppState,
+    terminal: &mut Term,
+    session_id: &SessionId,
+) -> io::Result<()> {
     let width = terminal.size()?.width.max(20);
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "?".to_string());
-    let lines =
-        chat::render_banner_lines(session_id.as_str(), &cwd, env!("CARGO_PKG_VERSION"), width);
+    let lines = chat::render_banner_lines(session_id.as_str(), env!("CARGO_PKG_VERSION"), width);
     // The banner lands just above the inline viewport (no top padding).
     // As the conversation grows, each `insert_before` call inserts a
     // message just above the viewport too, which pushes the banner
@@ -948,25 +1228,33 @@ fn commit_banner(terminal: &mut Term, session_id: &SessionId) -> io::Result<()> 
     //
     // No-wrap commit so the box-drawing chars don't get word-wrapped on
     // narrow terminals (the banner already clipped its content to fit).
-    commit_lines_no_wrap(terminal, lines)
+    commit_lines_no_wrap(state, terminal, lines)?;
+    // The banner is a fresh start (startup / `/clear` / `/new`); reset the
+    // block context so the next block separates cleanly from it.
+    state.last_block = None;
+    Ok(())
 }
 
 /// Insert lines into scrollback without word-wrapping. Used for content
-/// like the framed banner where line lengths are pre-computed and any
-/// wrap would mangle box-drawing characters. Trailing blank rows match
-/// `commit_lines` so the banner is separated from the first message.
-fn commit_lines_no_wrap(terminal: &mut Term, mut lines: Vec<Line<'static>>) -> io::Result<()> {
+/// like the framed banner where line lengths are pre-computed and any wrap
+/// would mangle box-drawing characters. No trailing blank — the reserved
+/// working row separates the banner from the input, and the first message
+/// adds its own leading separator.
+fn commit_lines_no_wrap(
+    state: &mut AppState,
+    terminal: &mut Term,
+    lines: Vec<Line<'static>>,
+) -> io::Result<()> {
     if lines.is_empty() {
         return Ok(());
     }
-    for _ in 0..ENTRY_SPACING_ROWS {
-        lines.push(Line::from(""));
-    }
     let height = lines.len() as u16;
+    let last_blank = lines.last().is_some_and(is_blank_line);
     terminal.insert_before(height, |buf| {
         Paragraph::new(lines).render(buf.area, buf);
         elide_wide_char_continuations(buf);
     })?;
+    state.last_row_blank = last_blank;
     Ok(())
 }
 
@@ -983,6 +1271,7 @@ async fn handle_key(
     state: &mut AppState,
     ctx: &mut LoopCtx,
     terminal: &mut Term,
+    current_viewport_h: &mut u16,
     key: KeyEvent,
 ) -> anyhow::Result<KeyOutcome> {
     let completion_open = !state.completion_candidates().is_empty();
@@ -1027,8 +1316,12 @@ async fn handle_key(
             }
         }
         Action::ClearScrollback => {
-            wipe_terminal_scrollback(terminal)?;
-            commit_banner(terminal, &ctx.input.current_session_id())?;
+            reset_chat_scrollback(
+                state,
+                terminal,
+                current_viewport_h,
+                &ctx.input.current_session_id(),
+            )?;
         }
         Action::CompletionPrev => state.completion_select_prev(),
         Action::CompletionNext => state.completion_select_next(),
@@ -1052,7 +1345,7 @@ async fn handle_key(
                         "Press Ctrl-D again within {}s to exit.",
                         CONFIRM_EXIT_WINDOW.as_secs()
                     );
-                    commit_lines(terminal, chat::render_system_lines(&msg))?;
+                    commit_lines(state, terminal, chat::render_system_lines(&msg))?;
                 }
             }
         }
@@ -1102,15 +1395,30 @@ async fn handle_key(
                 if text == "/quit" || text == "/exit" {
                     return Ok(KeyOutcome::Exit);
                 }
-                // Park submissions while a stream is in flight or an
-                // approval is pending so they commit + dispatch *after*
-                // the current response finalises. Otherwise the
-                // scrollback order would interleave (`you>1 / you>2 /
-                // aura>1 …`) which looks like message corruption.
-                if state.is_busy() {
+                if is_stop_command(&text) {
+                    // `/stop` is the interrupt: dispatch it immediately so
+                    // the Router cancels the in-flight turn, and reset our
+                    // live state ourselves — a cancelled turn delivers no
+                    // `Outgoing` that would otherwise clear the indicator.
+                    // A no-op on an idle session.
+                    interrupt_turn(state, ctx, terminal).await?;
+                } else if !state.is_busy() {
+                    dispatch_submission(state, ctx, terminal, current_viewport_h, text).await?;
+                } else if text.starts_with('/') {
+                    // A slash mid-turn would either disrupt the live region
+                    // (client-side `/clear`, `/new`, dashboards) or spawn a
+                    // concurrent turn (passthrough), so defer it until the
+                    // current turn ends and the `Outgoing` arm drains it.
                     state.queue_submission(text);
                 } else {
-                    dispatch_submission(state, ctx, terminal, text).await?;
+                    // A plain message mid-turn steers the running turn:
+                    // dispatch it now so the agent folds it in at its next
+                    // tool boundary, and show it as a pending `↳` line until
+                    // that boundary commits it to scrollback. No
+                    // `note_response_pending` — the steer rides the current
+                    // turn's single `Outgoing`, it doesn't add one.
+                    state.queue_interjection(text.clone());
+                    dispatch_user_message(ctx, text).await;
                 }
             }
         }
@@ -1119,33 +1427,73 @@ async fn handle_key(
     Ok(KeyOutcome::Continue)
 }
 
-/// Commit + dispatch a single user submission. Used both by the Submit
-/// key handler (when not busy) and by the `Outgoing` arm of the run
-/// loop when draining a previously-queued submission. Slash commands
-/// route through the same path so `/clear`, `/new`, etc. still work
-/// when entered while the agent is busy.
+/// Commit + dispatch a single user submission. Used by the Submit key
+/// handler when the agent is idle, and by the `Outgoing` arm when draining
+/// a slash command that was deferred while the agent was busy. Plain
+/// mid-turn messages do **not** come here — they steer via
+/// [`AppState::queue_interjection`] and an immediate `dispatch_user_message`.
 async fn dispatch_submission(
     state: &mut AppState,
     ctx: &LoopCtx,
     terminal: &mut Term,
+    current_viewport_h: &mut u16,
     text: String,
 ) -> io::Result<()> {
     if text == "/clear" {
-        wipe_terminal_scrollback(terminal)?;
-        commit_banner(terminal, &ctx.input.current_session_id())?;
+        reset_chat_scrollback(
+            state,
+            terminal,
+            current_viewport_h,
+            &ctx.input.current_session_id(),
+        )?;
     } else if text.starts_with('/') {
-        handle_slash(state, ctx, terminal, text).await?;
+        handle_slash(state, ctx, terminal, current_viewport_h, text).await?;
     } else {
-        commit_lines(terminal, chat::render_user_lines(&text))?;
+        commit_user_message(state, terminal, &text)?;
         state.note_response_pending();
         dispatch_user_message(ctx, text).await;
     }
     Ok(())
 }
 
-/// Commit the resolved approval summary to scrollback and clear (or roll
-/// over) the live entry. Mirrors the previous in-scrollback collapse —
-/// the user sees a one-line audit trail.
+/// Whether `text` is the `/stop` interrupt command (case-insensitive,
+/// trailing args ignored). Mirrors the gateway's own recognizer so the TUI
+/// can short-circuit it locally and reset the live region without waiting
+/// for a reply the cancelled turn never sends.
+fn is_stop_command(text: &str) -> bool {
+    text.trim()
+        .strip_prefix('/')
+        .and_then(|rest| rest.split_whitespace().next())
+        .is_some_and(|tok| tok.eq_ignore_ascii_case(STOP_COMMAND_NAME))
+}
+
+/// Run `/stop`: dispatch it so the Router cancels the in-flight turn, then
+/// return the live region to idle. The cancel is out-of-band server-side
+/// and delivers no `Outgoing`, so we flush the partial answer, commit any
+/// pending steer (it stays queued server-side and runs as its own turn),
+/// reset the working/streaming state, and discard any deferred slash
+/// commands here. Those slashes were parked for "after this turn"; the
+/// cancelled turn sends no `Outgoing` to drain them, so without this they'd
+/// linger as `↳` lines and later fire after an unrelated turn. The gateway's
+/// stop `Notice` then lands as the confirmation line.
+async fn interrupt_turn(
+    state: &mut AppState,
+    ctx: &LoopCtx,
+    terminal: &mut Term,
+) -> io::Result<()> {
+    flush_stream_partial(state, terminal)?;
+    commit_pending_interjections(state, terminal)?;
+    state.reset_working();
+    state.clear_deferred_submissions();
+    dispatch_user_message(ctx, STOP_COMMAND.to_string()).await;
+    Ok(())
+}
+
+/// Record the resolved approval. The decision sits between its tool's `●` and
+/// `⎿`, but that block is deferred until `ToolCompleted`, so buffer the line
+/// onto the in-flight tool (matched by `call_id`) and let it commit with the
+/// block. If the tool isn't tracked (shouldn't happen), commit it standalone so
+/// the decision isn't lost.
 fn resolve_approval(
     state: &mut AppState,
     terminal: &mut Term,
@@ -1154,10 +1502,10 @@ fn resolve_approval(
     let Some(outcome) = state.resolve_active_approval(decision) else {
         return Ok(());
     };
-    commit_lines(
-        terminal,
-        chat::render_approval_resolved_lines(&outcome.resolved),
-    )?;
+    let lines = chat::render_approval_resolved_lines(&outcome.resolved);
+    if let Err(lines) = state.buffer_approval_line(&outcome.resolved.call_id, lines) {
+        commit_tool_lines(state, terminal, lines)?;
+    }
     Ok(())
 }
 
@@ -1165,16 +1513,17 @@ async fn handle_slash(
     state: &mut AppState,
     ctx: &LoopCtx,
     terminal: &mut Term,
+    current_viewport_h: &mut u16,
     text: String,
 ) -> io::Result<()> {
     let Some(handler) = ctx.slash_handler.as_ref() else {
         let msg = format!("(no slash handler; ignored: {text})");
-        commit_lines(terminal, chat::render_system_lines(&msg))?;
+        commit_lines(state, terminal, chat::render_system_lines(&msg))?;
         return Ok(());
     };
     match handler.handle(&text).await {
         SlashOutcome::Handled(blocks) => {
-            commit_lines(terminal, chat::render_assistant_lines(&blocks))?;
+            commit_lines(state, terminal, chat::render_assistant_lines(&blocks))?;
         }
         SlashOutcome::OpenView(kind) => match ctx.dashboard_provider.as_ref() {
             Some(provider) => {
@@ -1182,11 +1531,11 @@ async fn handle_slash(
             }
             None => {
                 let msg = format!("(no dashboard provider; cannot open view: {kind:?})");
-                commit_lines(terminal, chat::render_system_lines(&msg))?;
+                commit_lines(state, terminal, chat::render_system_lines(&msg))?;
             }
         },
         SlashOutcome::PassThrough => {
-            commit_lines(terminal, chat::render_user_lines(&text))?;
+            commit_user_message(state, terminal, &text)?;
             state.note_response_pending();
             dispatch_user_message(ctx, text).await;
         }
@@ -1197,14 +1546,14 @@ async fn handle_slash(
             let new_id = mint_new_session_id();
             match ctx.input.switch_session(new_id.clone()).await {
                 Ok(()) => {
-                    wipe_terminal_scrollback(terminal)?;
-                    commit_banner(terminal, &new_id)?;
+                    state.session_id = new_id.clone();
+                    reset_chat_scrollback(state, terminal, current_viewport_h, &new_id)?;
                     let msg = format!("Started a fresh session: {new_id}");
-                    commit_lines(terminal, chat::render_system_lines(&msg))?;
+                    commit_lines(state, terminal, chat::render_system_lines(&msg))?;
                 }
                 Err(e) => {
                     let msg = format!("/new failed: {e}");
-                    commit_lines(terminal, chat::render_system_lines(&msg))?;
+                    commit_lines(state, terminal, chat::render_system_lines(&msg))?;
                 }
             }
         }
@@ -1212,15 +1561,22 @@ async fn handle_slash(
     Ok(())
 }
 
-/// Send the escape sequences that wipe the visible screen + scrollback
-/// buffer, then reset ratatui's internal buffer so the next draw repaints
-/// the live viewport cleanly. Used by Ctrl-L and `/clear`.
-fn wipe_terminal_scrollback(terminal: &mut Term) -> io::Result<()> {
+/// Escape sequence that wipes the visible screen + scrollback and homes the
+/// cursor: `H` = cursor home, `2J` = erase visible screen, `3J` = erase
+/// scrollback. Written on entry, on `/clear` / Ctrl-L, and on resize-refresh.
+const CLEAR_SCREEN_AND_SCROLLBACK: &str = "\x1b[H\x1b[2J\x1b[3J";
+
+/// Write the screen + scrollback wipe escape (which homes the cursor) and
+/// flush. Used on entry and on resize-refresh — both then construct a *fresh*
+/// inline terminal, whose viewport anchors at the current cursor row, so the
+/// homed cursor lands the banner at the very top. It deliberately does **not**
+/// call [`ratatui::Terminal::clear`]: for an inline viewport that re-homes the
+/// cursor to the *old* viewport's row (near the screen bottom), which would
+/// anchor the new viewport — and the banner — mid-screen with a blank gap above.
+fn home_and_clear_screen() -> io::Result<()> {
     let mut stdout = io::stdout();
-    // 2J = erase visible screen, 3J = erase scrollback, H = cursor home.
-    write!(stdout, "\x1b[H\x1b[2J\x1b[3J")?;
+    write!(stdout, "{CLEAR_SCREEN_AND_SCROLLBACK}")?;
     stdout.flush()?;
-    terminal.clear()?;
     Ok(())
 }
 
@@ -1377,8 +1733,8 @@ mod tests {
         assert!(
             lines
                 .first()
-                .is_some_and(|l| line_text(l).starts_with("aura> ")),
-            "first line carries the aura> leader: {joined:?}"
+                .is_some_and(|l| line_text(l).starts_with("● ")),
+            "first line carries the answer-dot leader: {joined:?}"
         );
     }
 
@@ -1412,8 +1768,26 @@ mod tests {
 
     #[test]
     fn finalize_empty_message_is_noop() {
-        // Nothing streamed and no renderable blocks → no lines, not even
-        // a stray trailing blank.
+        // Nothing streamed and no renderable blocks → no body lines. The
+        // `cooked for` footer is committed separately by `finalize_stream`,
+        // not part of `finalize_lines`.
         assert!(finalize_lines(&[], false, None).is_empty());
+        let body = finalize_lines(&[ContentBlock::Text("x".into())], true, None);
+        let joined = body.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !joined.contains("cooked for"),
+            "footer is not in the body: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn is_stop_command_matches_stop_variants_only() {
+        assert!(is_stop_command("/stop"));
+        assert!(is_stop_command("  /Stop  "));
+        assert!(is_stop_command("/STOP everything"));
+        assert!(!is_stop_command("/stopwatch"));
+        assert!(!is_stop_command("/compact"));
+        assert!(!is_stop_command("stop"));
+        assert!(!is_stop_command("please /stop"));
     }
 }

@@ -284,25 +284,15 @@ impl Tool for BashTool {
         }
     }
 
-    /// Progress preview = the command itself (whitespace-collapsed to one
-    /// line, length-capped), so the live `⏺ Bash(<cmd>)` line is useful
-    /// for *every* call — `call_label` above is a destructive-command
+    /// Progress preview = the command itself (whitespace-collapsed, length-
+    /// capped via the shared helper), so the live `● Bash(<cmd>)` line is
+    /// useful for *every* call — `call_label` above is a destructive-command
     /// warning, not a preview, so we don't inherit it here.
     fn progress_label(&self, params: &Value) -> Option<String> {
-        const MAX: usize = 60;
-        let cmd = params.get("command").and_then(|v| v.as_str())?;
-        let one_line = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
-        if one_line.is_empty() {
-            return None;
-        }
-        if one_line.chars().count() > MAX {
-            Some(format!(
-                "{}…",
-                one_line.chars().take(MAX).collect::<String>()
-            ))
-        } else {
-            Some(one_line)
-        }
+        params
+            .get("command")
+            .and_then(|v| v.as_str())
+            .and_then(crate::progress::preview_arg)
     }
 
     fn max_timeout(&self) -> Duration {

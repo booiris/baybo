@@ -342,16 +342,16 @@ fn map_frame(
             let _ = queue.drop_call(&call_id);
             Some(TransportEvent::ApprovalResolved { call_id, decision })
         }
-        Frame::Reasoning {
-            session_id, text, ..
-        } => {
-            if &session_id != target_session {
-                return None;
-            }
-            Some(TransportEvent::Reasoning(text))
+        Frame::Reasoning { .. } => {
+            // The TUI surfaces an animated "working" indicator instead of
+            // the model's reasoning trace, so reasoning frames are dropped
+            // here regardless of session. Other channels (e.g. the web UI)
+            // still render them off the same wire frame.
+            None
         }
         Frame::ToolStarted {
             session_id,
+            call_id,
             tool,
             label,
             ..
@@ -359,10 +359,15 @@ fn map_frame(
             if &session_id != target_session {
                 return None;
             }
-            Some(TransportEvent::ToolStarted { tool, label })
+            Some(TransportEvent::ToolStarted {
+                call_id,
+                tool,
+                label,
+            })
         }
         Frame::ToolCompleted {
             session_id,
+            call_id,
             status,
             summary,
             ..
@@ -370,7 +375,11 @@ fn map_frame(
             if &session_id != target_session {
                 return None;
             }
-            Some(TransportEvent::ToolCompleted { status, summary })
+            Some(TransportEvent::ToolCompleted {
+                call_id,
+                status,
+                summary,
+            })
         }
         Frame::Status {
             session_id, phase, ..
@@ -501,7 +510,12 @@ mod tests {
             &target,
             &queue,
         ) {
-            Some(TransportEvent::ToolStarted { tool, label }) => {
+            Some(TransportEvent::ToolStarted {
+                call_id,
+                tool,
+                label,
+            }) => {
+                assert_eq!(call_id, "c1");
                 assert_eq!(tool, "Read");
                 assert_eq!(label.as_deref(), Some("foo.rs"));
             }
@@ -518,7 +532,12 @@ mod tests {
             &target,
             &queue,
         ) {
-            Some(TransportEvent::ToolCompleted { status, summary }) => {
+            Some(TransportEvent::ToolCompleted {
+                call_id,
+                status,
+                summary,
+            }) => {
+                assert_eq!(call_id, "c1");
                 assert_eq!(status, "ok");
                 assert_eq!(summary, "200 lines");
             }
@@ -527,13 +546,16 @@ mod tests {
     }
 
     #[test]
-    fn map_frame_drops_reasoning_for_other_session() {
+    fn map_frame_drops_reasoning_even_for_pinned_session() {
+        // The TUI renders an animated working indicator instead of the
+        // reasoning trace, so a Reasoning frame is dropped unconditionally
+        // — including one addressed to the pinned session.
         let queue = ApprovalQueue::new();
-        let target = sid("beta");
+        let target = sid("alpha");
         let frame = Frame::Reasoning {
-            session_id: sid("alpha"),
+            session_id: target.clone(),
             user_id: String::new(),
-            text: "stale thought".into(),
+            text: "a thought".into(),
         };
         assert!(map_frame(frame, &target, &queue).is_none());
     }

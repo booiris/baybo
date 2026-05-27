@@ -2,6 +2,7 @@ pub mod approval;
 pub mod builtin;
 pub mod error;
 pub mod mcp;
+pub mod progress;
 pub mod registry;
 
 #[cfg(any(test, feature = "test-support"))]

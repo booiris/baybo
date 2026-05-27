@@ -19,11 +19,13 @@
 //! one as a subprocess — compiled in only under
 //! `cfg(debug_assertions)`, so release builds never see it.
 
+use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
 use aura_agent::service::ShutdownSignal;
 use aura_channels::ChannelError;
 use aura_config::AuraConfig;
+use aura_gateway::AdminToken;
 use aura_tui::client::{TuiDashboardProvider, TuiSlashHandler};
 use aura_tui::{TuiAdapter, TuiLogSink};
 use tracing::info;
@@ -69,11 +71,14 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
 
     // Read the per-start TUI token from the vault. Done once up front
     // so a missing token (gateway not running yet) flows into the same
-    // `NotReachable`-style fallback as an unreachable admin port. In
-    // `--dev-auto-gateway` mode the spawned child writes the token
+    // `NotReachable`-style fallback as an unreachable admin port. The
+    // admin bearer token is read from the same vault so the TUI can query
+    // the gateway's active LLM metadata for the input footer. In
+    // `--dev-auto-gateway` mode the spawned child writes the TUI token
     // before the admin listener accepts connections; we re-read after
     // spawn to pick up the freshly-rotated value.
     let mut tui_token = read_tui_token(&config).await;
+    let mut admin_token = read_admin_token(&config).await;
 
     let transport =
         match try_connect_with_token(admin_addr, tui_token.as_deref(), &session_id).await {
@@ -95,6 +100,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
                     // Reread the freshly-rotated token the spawned gateway
                     // just published.
                     tui_token = read_tui_token(&config).await;
+                    admin_token = read_admin_token(&config).await;
                     Arc::new(
                         try_connect_with_token(admin_addr, tui_token.as_deref(), &session_id)
                             .await
@@ -111,6 +117,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
         };
     info!(%admin_addr, "connected to gateway");
 
+    let model_label = fetch_current_model_label(admin_addr, admin_token.as_deref()).await;
     let slash_handler = Arc::new(TuiSlashHandler::new());
     let dashboard_provider = Arc::new(TuiDashboardProvider::new());
 
@@ -119,6 +126,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     let tui = TuiAdapter::new(transport)
         .with_slash_handler(slash_handler)
         .with_dashboard_provider(dashboard_provider)
+        .with_model_label(model_label)
         .with_on_exit(Arc::new(move || tui_shutdown.trigger()));
 
     let _ = tui_log_sink.set(tui.log_sink());
@@ -141,6 +149,121 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
 
     task_tracker.shutdown().await;
     Ok(())
+}
+
+async fn read_admin_token(config: &AuraConfig) -> Option<String> {
+    let vault = match crate::runtime::build_secret_vault(config).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, "admin token: open vault failed");
+            return None;
+        }
+    };
+    match AdminToken::new(vault).get().await {
+        Ok(Some(token)) => Some(token),
+        Ok(None) => {
+            tracing::debug!("admin token: vault key absent");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "admin token: vault read failed");
+            None
+        }
+    }
+}
+
+const ACTIVE_LLM_PATH: &str = "/v1/llm";
+const ACTIVE_LLM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn fetch_current_model_label(
+    admin_addr: SocketAddr,
+    admin_token: Option<&str>,
+) -> Option<String> {
+    let Some(token) = admin_token else {
+        tracing::debug!("active model footer: no admin token available");
+        return None;
+    };
+    let url = format!("http://{admin_addr}{ACTIVE_LLM_PATH}");
+    let client = match reqwest::Client::builder()
+        .timeout(ACTIVE_LLM_REQUEST_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::debug!(error = %e, "active model footer: client build failed");
+            return None;
+        }
+    };
+    let response = match client.get(&url).bearer_auth(token).send().await {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::debug!(error = %e, "active model footer: request failed");
+            return None;
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        tracing::debug!(%status, "active model footer: gateway returned non-success status");
+        return None;
+    }
+    let payload = match response.json::<serde_json::Value>().await {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::debug!(error = %e, "active model footer: invalid response body");
+            return None;
+        }
+    };
+    current_model_label_from_payload(&payload)
+}
+
+fn current_model_label_from_payload(payload: &serde_json::Value) -> Option<String> {
+    let provider = payload
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let model = payload
+        .get("model_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    match (provider.is_empty(), model.is_empty()) {
+        (true, true) => None,
+        (true, false) => Some(model.to_string()),
+        (false, true) => Some(provider.to_string()),
+        (false, false) => Some(format!("{provider}/{model}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn current_model_label_formats_provider_and_model() {
+        let payload = json!({
+            "provider": "openai",
+            "model_id": "gpt-5-codex",
+        });
+
+        assert_eq!(
+            current_model_label_from_payload(&payload).as_deref(),
+            Some("openai/gpt-5-codex")
+        );
+    }
+
+    #[test]
+    fn current_model_label_handles_missing_provider() {
+        let payload = json!({
+            "model_id": "local-model",
+        });
+
+        assert_eq!(
+            current_model_label_from_payload(&payload).as_deref(),
+            Some("local-model")
+        );
+    }
 }
 
 #[cfg(debug_assertions)]

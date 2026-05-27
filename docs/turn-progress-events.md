@@ -44,12 +44,12 @@ progress is **opt-in per channel** — the TUI/web render it, sidecars ignore it
 | **Scope** | `Reasoning` (streamed thinking) + tool lifecycle (`ToolStarted` / `ToolCompleted`) + compaction status (`Status(Compacting/Compacted)`). Remaining `Status` phases (Thinking/Responding) deferred — see below. |
 | **Compaction status** | `compress_if_needed` reports `Status(Compacting)` before a pass and `Status(Compacted)` after, gated by a new `ContextManager::needs_compression` so the line shows **only when a pass actually runs** and the end always follows the start (emitted even on a compress error, so it never dangles). `maybe_compress` now calls `needs_compression` for its own threshold gate too (one source of truth). No token-delta summary — matches the plain `/compact` confirmation. Delivered with `await` (low-frequency; the end-clear is load-bearing). |
 | **Tool-lifecycle emission point** | The **agent loop** (`run_iteration`), not the executor: `ToolStarted` for every call before `join_all`, `ToolCompleted` per result after. For the common single-call iteration this is indistinguishable from per-tool timing; concurrent multi-tool batches "start together / finish together" — accepted. Per-tool real-time interleaving is a later upgrade that would move emission into `ToolExecutor::execute`. |
-| **Tool label** | A dedicated `Tool::progress_label(params)` (defaults to `call_label`, exposed to the loop via `ToolRegistry::progress_label`). Kept distinct from `call_label` because that one is an *approval warning* on some tools, not a preview: Bash's `call_label` only fires on destructive commands, so Bash overrides `progress_label` to return the (whitespace-collapsed, length-capped) command — otherwise the headline `⏺ Bash(ls -la)` never materialises. WebFetch's URL label is inherited as-is. Tools with neither render a bare `⏺ tool`. |
+| **Tool label** | A dedicated `Tool::progress_label(params)` (defaults to `call_label`, exposed to the loop via `ToolRegistry::progress_label`). Kept distinct from `call_label` because that one is an *approval warning* on some tools, not a preview (Bash's `call_label` only fires on destructive commands). Tools surface their most identifying argument through the shared `aura_tools::progress` helpers — `preview_path` (full path, left-truncated on a `/` boundary so the file name survives), `preview_arg` (whitespace-collapsed, capped at `PROGRESS_LABEL_MAX`), and `preview_search` (`<pattern> · in <path>`): Read/Write/Edit/SendFile → the path, Bash → the command, Grep/Glob → pattern + search root, WebFetch → the URL (inherited from `call_label`), spawn_subagent → `type: summary`, CronCreate → the prompt, CronDelete → the id, Skill(Install/Uninstall) → the skill name/dir. Tools with no identifying argument (Now, CronList, dynamic MCP tools) render a bare `● tool`. |
 | **Tool result summary** | Content-**light** by design (line counts, attachment/image counts, `error`/`denied`), never raw output bytes — so a leak can't ride the summary. Derived generically from `ToolOutput`; a tool-authored `Tool::result_summary` is a later refinement. |
 | **Security** | `Reasoning`, `label`, and `summary` are model-/tool-derived text and pass the same sanitize + vault-reveal boundary as `AnswerDelta` (`stream_emit` / `sanitize_stream_fragment`). On a sanitize failure the summary is dropped (empty) rather than risk a leak. |
 | **Ordering / backpressure** | One ordered mpsc. Answer `AnswerDelta` and tool `ToolStarted/ToolCompleted` use `await` (load-bearing / display self-consistency); `Reasoning` uses `try_send` (ephemeral, droppable) — matching how `Notice` already drops on a full channel. The final `Message` is the reconciliation point that clears any in-flight progress UI. |
 | **No coalescing on the wire** | The gateway's `translator_loop` sends every `SessionEvent` 1:1 live — there is no Delta→Message coalescing (an earlier doc note claimed otherwise; it was stale). Clients without a partial surface simply ignore the streaming frames. |
-| **TUI dedup** | **None needed.** `render_block` only renders the CronCreate recurring-trigger hint for `ToolUse` blocks — never general tool calls — so the final `Message`'s `accumulated_tool_uses` were never a visible source of tool lines in the TUI. The live `ToolStarted`/`ToolCompleted` lines are the only tool display. |
+| **TUI dedup** | **None needed.** `render_block` only renders the CronCreate recurring-trigger hint for `ToolUse` blocks — never general tool calls — so the final `Message`'s `accumulated_tool_uses` were never a visible source of tool lines in the TUI. The scrollback `ToolStarted`/`ToolCompleted` lines are the only tool display. |
 | **Approval interleave** | `ToolStarted` (loop) precedes `ApprovalRequested` (emitted inside `execute` by the gate) precedes `ToolCompleted` — naturally reads as "started → waiting for approval → done". |
 
 ## Web: reconstructed on reload
@@ -81,9 +81,13 @@ worth knowing:
 
 - **`Status` spinner — remaining phases.** `AgentEvent::Status(TurnStatus)` shipped
   for context compaction (`Compacting` / `Compacted`, see the table above). The other
-  phases the enum could carry — Thinking / Working / Responding — are still deferred;
-  much of that is inferable consumer-side from reasoning-vs-answer arrival, so it's
-  low priority.
+  phases the enum could carry — Thinking / Working / Responding — are still deferred on
+  the **wire**; they're inferable consumer-side from turn activity, which is exactly what
+  the TUI now does: it renders a **client-side animated "working" indicator** (gated on a
+  local turn-active flag) instead of the model's reasoning trace, and **drops `Reasoning`
+  frames entirely** rather than rendering them. So a server-side Working/Thinking status
+  remains low priority for the TUI. Other channels (e.g. the web UI) still consume
+  `Reasoning`. See [`docs/modules/tui.md`](modules/tui.md#working-indicator--mid-turn-steering).
 - **Subagent → parent progress** — subagents run with `delta_tx = None`. Surfacing
   their progress to the parent ties into the planned `SubagentNotification` redesign.
 - **Fine-grained in-tool events** — forward a curated subset of `ToolEventSink`
