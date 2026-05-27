@@ -419,9 +419,29 @@ may resolve it.
   registry isn't affected.
 - `aura external-agent setup` — interactive wizard: single-select
   one kind, prompt binary path (empty = PATH lookup), run the
-  probe, persist on success. If the write would leave multiple
-  kinds configured without a default, the wizard also prompts for
-  `default_external_agent`. Restarts the gateway to take effect.
+  probe, then persist the **resolved absolute path** to
+  `external_agents.<kind>.binary_path` on success. Even an empty
+  answer records the concrete location PATH resolved to, so the
+  gateway service (different cwd, possibly a narrower PATH) pins
+  the same binary instead of re-walking PATH at boot. If the write
+  would leave multiple kinds configured without a default, the
+  wizard also prompts for `default_external_agent`. Restarts the
+  gateway to take effect.
+- `aura external-agent disable` — interactive multi-select: check the
+  currently-enabled kinds to turn off and set each
+  `external_agents.<kind>.enabled = false`. If a disabled kind was
+  `default_external_agent`, the default is re-resolved (cleared when
+  ≤1 kind remains, else the wizard prompts for a new one). Each
+  recorded `binary_path` is left intact for an easy re-enable. When
+  nothing is enabled it's a no-op success — the feature is already
+  off. Restarts the gateway to take effect.
+- `aura external-agent default` — interactive picker that sets
+  `external_agents.default_external_agent` to one of the
+  currently-enabled kinds. Errors when nothing is enabled. The
+  default is an operator-facing designation (the spawn protocol
+  still requires an explicit `backend`), so it only matters once
+  more than one kind is enabled; nothing in the boot/spawn path
+  reads it yet, so **no gateway restart** is needed.
 - `aura setup` (quick mode) probes every kind on PATH after the
   other setup steps. Each detected binary triggers a y/n confirm;
   the operator picks which to enable. If multiple end up enabled,
