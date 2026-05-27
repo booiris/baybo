@@ -27,10 +27,12 @@
 //! The channel-auth middleware turns the token into
 //! [`crate::auth::AuthedClient::Web`].
 
+use std::collections::HashMap;
+
 use aura_channels::wire::{SessionPatch, SlashCommandSpec};
 use aura_model::{
-    ChannelType, ChatMessage, ContentBlock, MessageSource, Role, Session, SessionId, TriggerSource,
-    User,
+    ChannelType, ChatMessage, ContentBlock, MessageSource, Role, Session, SessionId,
+    ThinkingContent, TriggerSource, User,
 };
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -149,18 +151,26 @@ pub struct ChatSessionCredential {
 
 /// One transcript row, flattened from `ChatMessage` into a shape the
 /// web client can render without re-implementing the content-block
-/// matcher.
+/// matcher. Two shapes ride this struct, discriminated by [`Self::kind`]:
+/// `"message"` (a user / final-assistant bubble) and `"work"` (a
+/// reconstructed collapsed work block for a tool-using turn — see
+/// [`reconstruct_transcript`]).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatTranscriptItem {
     /// Absolute `session_messages.ordinal` of this row. Stable for the
     /// lifetime of the session and used both as a React key and as
-    /// the `before_ordinal` cursor for the next-older page request.
+    /// the `before_ordinal` cursor for the next-older page request. A
+    /// `work` item carries the ordinal of the turn's first intermediate
+    /// message so it sorts just after the user turn that spawned it.
     pub ordinal: i64,
+    /// `"message"` or `"work"`.
+    pub kind: String,
     /// `"user"` or `"assistant"` (or `"system"`). String rather than
-    /// enum to keep the wire forgiving.
+    /// enum to keep the wire forgiving. Empty for `work` items.
     pub role: String,
     /// Plain text content, newline-joined when multiple text blocks
-    /// were present. Empty when the message was media-only.
+    /// were present. Empty when the message was media-only or for `work`
+    /// items.
     pub text: String,
     /// `true` when this row had non-text content (image / audio /
     /// file). The web client currently shows a placeholder.
@@ -173,6 +183,42 @@ pub struct ChatTranscriptItem {
     /// drifts only on catch-up replays (where the row is also
     /// reachable via the REST history surface with the real value).
     pub created_at: DateTime<Utc>,
+    /// Reconstructed progress steps for a `work` item (reasoning, tool
+    /// calls + results, mid-turn narration). Empty for `message` items.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<ChatWorkStep>,
+    /// Open / close wall-clock of a `work` item, derived from the turn's
+    /// message timestamps — drives the `Worked Xs` label. `None` for
+    /// `message` items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_ended_at: Option<DateTime<Utc>>,
+}
+
+/// One reconstructed step inside a `work` transcript item — the durable
+/// shadow of a live turn-progress event, rebuilt from persisted content
+/// blocks so a reloaded transcript shows the same collapsed work summary
+/// the live view did. `reasoning` / `prose` carry [`Self::text`]; `tool`
+/// carries the call's name + a re-derived result summary.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatWorkStep {
+    /// `"reasoning"`, `"prose"`, or `"tool"`.
+    pub kind: String,
+    /// Reasoning trace or mid-turn narration body. Empty for `tool` steps.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// Tool name, set when `kind == "tool"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Short, best-effort label for the call (a path / command / url
+    /// pulled from the call input), absent the live `progress_label`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_label: Option<String>,
+    /// One-line summary re-derived from the persisted tool result. `None`
+    /// when the result for this call didn't land in the fetched window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_summary: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -437,16 +483,16 @@ async fn get_session(
         // (it would be the start of the next-older page).
         tail.remove(0);
     }
-    // `filter_map` not `map` — internal turns (Role::System, agent-
-    // injected Role::User with `from_user=false`, tool-result rows,
-    // empty thinking blocks) don't belong on the /chat surface.
-    // Mirrors the WS catch-up replay filter in `channel::route::
-    // chat_to_visible_wire_message` so a REST-loaded transcript and a
-    // WS-replayed one agree on what's a user-visible bubble.
-    let transcript = tail
-        .into_iter()
-        .filter_map(|(ordinal, created_at, msg)| chat_to_transcript_item(ordinal, created_at, msg))
-        .collect();
+    // Rebuild user/assistant bubbles AND the collapsed per-turn work
+    // blocks (reasoning, tool calls + results, mid-turn narration) from
+    // the persisted messages. Internal turns (Role::System, agent-
+    // injected Role::User with `from_user=false`) are dropped; tool-use
+    // iterations are folded into a `work` item rather than surfaced as
+    // stray bubbles. The WS catch-up path
+    // (`channel::route::chat_to_visible_wire_message`) still replays only
+    // the message bubbles — a full reload through here is what restores
+    // the work blocks.
+    let transcript = reconstruct_transcript(tail);
     Ok(Json(ChatSessionDetail {
         session_id,
         created_at: session.created_at,
@@ -802,24 +848,36 @@ async fn last_user_preview(
     manager: &aura_session::SessionManager,
     session_id: &SessionId,
 ) -> Option<String> {
-    let tail = manager
-        .history_tail(session_id, None, PREVIEW_SCAN_DEPTH)
-        .await
-        .ok()?;
-    // `history_tail` returns ascending; iterate in reverse so we hit
-    // the freshest user row first and stop scanning the moment we
-    // find it.
-    for (_ord, created_at, msg) in tail.into_iter().rev() {
-        if !matches!(msg.role, Role::User) || !msg.from_user() {
-            continue;
+    // Walk the transcript newest-first in `PREVIEW_SCAN_DEPTH`-sized
+    // batches until the freshest genuine user turn turns up. Paging
+    // (rather than a single capped scan) matters because a tool-heavy
+    // turn appends many agent/tool rows after the user's message — a long
+    // agentic loop can push it well past any fixed window, which is why a
+    // tool-retry session would otherwise show "New conversation" in the
+    // sidebar despite having a clear prompt. Each batch's oldest ordinal
+    // seeds the next `before_ordinal`; the DB stops as soon as a user row
+    // is found, so the common (recent prompt) case is still one query.
+    let mut before: Option<i64> = None;
+    loop {
+        let batch = manager
+            .history_tail(session_id, before, PREVIEW_SCAN_DEPTH)
+            .await
+            .ok()?;
+        let oldest = batch.first().map(|(ordinal, _, _)| *ordinal);
+        for (_ord, created_at, msg) in batch.iter().rev() {
+            if !matches!(msg.role, Role::User) || !msg.from_user() {
+                continue;
+            }
+            let item = message_item(0, *created_at, "user", msg)?;
+            return (!item.text.is_empty()).then(|| truncate_preview(&item.text));
         }
-        let item = chat_to_transcript_item(0, created_at, msg)?;
-        if item.text.is_empty() {
-            return None;
+        // No user turn in this batch — page older, or stop once the batch
+        // came back short (we've reached the session's first message).
+        match oldest {
+            Some(ordinal) if batch.len() >= PREVIEW_SCAN_DEPTH => before = Some(ordinal),
+            _ => return None,
         }
-        return Some(truncate_preview(&item.text));
     }
-    None
 }
 
 /// Collapse whitespace and clip to [`PREVIEW_MAX_CHARS`] for the
@@ -836,19 +894,153 @@ fn truncate_preview(text: &str) -> String {
     format!("{cut}…")
 }
 
-fn chat_to_transcript_item(
+/// Accumulator for one tool-using turn's reconstructed work block, drained
+/// by [`Self::flush`] just before the turn's final answer.
+#[derive(Default)]
+struct WorkAccumulator {
+    steps: Vec<ChatWorkStep>,
+    /// Ordinal of the turn's first intermediate message — the `work`
+    /// item inherits it so it sorts right after the user turn.
+    ordinal: Option<i64>,
+    started: Option<DateTime<Utc>>,
+    last: Option<DateTime<Utc>>,
+    /// `tool_use_id` → index into `steps`, so a later tool-result message
+    /// fills in the matching call's summary.
+    pending_tools: HashMap<String, usize>,
+}
+
+impl WorkAccumulator {
+    fn flush(&mut self, items: &mut Vec<ChatTranscriptItem>, ended_at: Option<DateTime<Utc>>) {
+        if !self.steps.is_empty() {
+            let started = self.started;
+            items.push(ChatTranscriptItem {
+                ordinal: self.ordinal.unwrap_or_default(),
+                kind: "work".to_owned(),
+                role: String::new(),
+                text: String::new(),
+                has_attachments: false,
+                created_at: started.unwrap_or_else(Utc::now),
+                steps: std::mem::take(&mut self.steps),
+                work_started_at: started,
+                work_ended_at: ended_at.or(self.last).or(started),
+            });
+        }
+        self.ordinal = None;
+        self.started = None;
+        self.last = None;
+        self.pending_tools.clear();
+    }
+}
+
+/// Rebuild the chat transcript from persisted messages. User turns and the
+/// final, tool-call-free assistant reply become `message` items; each
+/// tool-using turn's intermediate iterations (reasoning, tool calls +
+/// results, mid-turn narration) are folded into a single collapsed `work`
+/// item placed just before that turn's final answer. Internal rows
+/// (Role::System, agent-injected Role::User) are dropped. This restores on
+/// reload the same work-block-then-answer shape the live view shows —
+/// turn-progress is otherwise live-only, but every block it needs is
+/// durably persisted, so this is where it's reconstructed.
+fn reconstruct_transcript(tail: Vec<(i64, DateTime<Utc>, ChatMessage)>) -> Vec<ChatTranscriptItem> {
+    let mut items: Vec<ChatTranscriptItem> = Vec::new();
+    let mut work = WorkAccumulator::default();
+
+    for (ordinal, created_at, msg) in tail {
+        match msg.role {
+            Role::User if msg.from_user() => {
+                work.flush(&mut items, None);
+                if let Some(item) = message_item(ordinal, created_at, "user", &msg) {
+                    items.push(item);
+                }
+            }
+            // Intermediate iteration: fold reasoning / narration / tool
+            // calls into the open work block.
+            Role::Assistant if msg.has_tool_use() => {
+                if work.started.is_none() {
+                    work.started = Some(created_at);
+                    work.ordinal = Some(ordinal);
+                }
+                work.last = Some(created_at);
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Thinking { content, .. } => {
+                            let text = thinking_text(content);
+                            if !text.is_empty() {
+                                work.steps.push(ChatWorkStep {
+                                    kind: "reasoning".to_owned(),
+                                    text,
+                                    tool: None,
+                                    tool_label: None,
+                                    tool_summary: None,
+                                });
+                            }
+                        }
+                        ContentBlock::Text(t) if !t.trim().is_empty() => {
+                            work.steps.push(ChatWorkStep {
+                                kind: "prose".to_owned(),
+                                text: t.clone(),
+                                tool: None,
+                                tool_label: None,
+                                tool_summary: None,
+                            });
+                        }
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
+                            work.pending_tools.insert(id.clone(), work.steps.len());
+                            work.steps.push(ChatWorkStep {
+                                kind: "tool".to_owned(),
+                                text: String::new(),
+                                tool: Some(name.clone()),
+                                tool_label: tool_label(input),
+                                tool_summary: None,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Final answer (no tool calls): close the work block, then the
+            // reply bubble lands below it.
+            Role::Assistant => {
+                work.flush(&mut items, Some(created_at));
+                if let Some(item) = message_item(ordinal, created_at, "assistant", &msg) {
+                    items.push(item);
+                }
+            }
+            Role::Tool => {
+                work.last = Some(created_at);
+                for block in &msg.content {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                    } = block
+                        && let Some(&idx) = work.pending_tools.get(tool_use_id)
+                        && let Some(step) = work.steps.get_mut(idx)
+                    {
+                        step.tool_summary = Some(summarize_tool_result(content));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Trailing block: a turn whose final answer is beyond this page, or
+    // that ended on a tool with no narrated reply.
+    work.flush(&mut items, None);
+    items
+}
+
+/// Flatten a user / final-assistant message into a `message` item, or
+/// `None` when it has neither text nor attachments (e.g. an assistant turn
+/// that produced only tool calls) — such a row would render as an empty
+/// bubble.
+fn message_item(
     ordinal: i64,
     created_at: DateTime<Utc>,
-    msg: ChatMessage,
+    role: &str,
+    msg: &ChatMessage,
 ) -> Option<ChatTranscriptItem> {
-    // Same gate as `channel::route::chat_to_visible_wire_message` —
-    // see that fn for why each excluded variant doesn't belong on the
-    // chat surface.
-    let role = match msg.role {
-        Role::User if msg.from_user() => "user",
-        Role::Assistant => "assistant",
-        _ => return None,
-    };
     let mut text = String::new();
     let mut has_attachments = false;
     for block in &msg.content {
@@ -862,22 +1054,96 @@ fn chat_to_transcript_item(
             ContentBlock::Image { .. } | ContentBlock::Audio { .. } | ContentBlock::File { .. } => {
                 has_attachments = true;
             }
-            ContentBlock::ToolUse { .. }
-            | ContentBlock::ToolResult { .. }
-            | ContentBlock::Thinking { .. } => {}
+            _ => {}
         }
     }
-    // A user/assistant row with neither text nor attachments is
-    // structurally valid (assistant turn that produced only tool calls,
-    // for instance) but would render as an empty bubble. Hide it.
     if text.is_empty() && !has_attachments {
         return None;
     }
     Some(ChatTranscriptItem {
         ordinal,
+        kind: "message".to_owned(),
         role: role.to_owned(),
         text,
         has_attachments,
         created_at,
+        steps: Vec::new(),
+        work_started_at: None,
+        work_ended_at: None,
     })
+}
+
+/// Concatenate the visible text of a model thinking block (redacted
+/// reasoning carries no display text and is skipped).
+fn thinking_text(content: &[ThinkingContent]) -> String {
+    let mut out = String::new();
+    for c in content {
+        let part = match c {
+            ThinkingContent::Text { text, .. } | ThinkingContent::Summary { text } => text.as_str(),
+            ThinkingContent::Redacted { .. } => continue,
+        };
+        if part.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(part);
+    }
+    out
+}
+
+/// Best-effort short label for a tool call, pulled from a common input key
+/// (path / command / url / query). Stands in for the live `progress_label`,
+/// which needs the tool registry that isn't on the read path. `None` when
+/// nothing recognizable is present.
+fn tool_label(input: &serde_json::Value) -> Option<String> {
+    const KEYS: [&str; 6] = ["command", "url", "path", "file_path", "query", "pattern"];
+    let obj = input.as_object()?;
+    for key in KEYS {
+        if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+            let label = collapse_ws(s);
+            if !label.is_empty() {
+                return Some(truncate(&label, 80));
+            }
+        }
+    }
+    None
+}
+
+/// Re-derive a one-line summary of a persisted tool result. The exact live
+/// summary (line counts, `exit 0`) isn't persisted, so this strips the
+/// `<tool_output>` envelope and returns a short, whitespace-collapsed
+/// snippet of the result body.
+fn summarize_tool_result(content: &str) -> String {
+    truncate(&collapse_ws(strip_tool_output_envelope(content)), 140)
+}
+
+/// Strip the `<tool_output …> … </tool_output>` wrapper the agent puts
+/// around untrusted tool results before they enter the transcript. Returns
+/// the input unchanged when it isn't wrapped.
+fn strip_tool_output_envelope(content: &str) -> &str {
+    let Some(rest) = content.trim_start().strip_prefix("<tool_output") else {
+        return content;
+    };
+    let Some((_, body)) = rest.split_once('>') else {
+        return content;
+    };
+    match body.rfind("</tool_output") {
+        Some(close) => body[..close].trim(),
+        None => body.trim(),
+    }
+}
+
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
 }
