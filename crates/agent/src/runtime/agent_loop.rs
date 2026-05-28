@@ -16,7 +16,7 @@ use aura_model::{
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use aura_model::Session;
+use aura_model::{LineageKind, Session, TriggerSource};
 use aura_tools::{ToolOutput, ToolRegistry};
 use aura_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
@@ -269,6 +269,28 @@ fn cron_prompt_blocks(action_payload: &serde_json::Value) -> Vec<ContentBlock> {
         Some(p) if !p.is_empty() => vec![ContentBlock::Text(p.to_string())],
         _ => Vec::new(),
     }
+}
+
+/// Whether the `on_session_end` memory hook should fire for this session.
+/// The session-level analogue of [`memory_recall_query`]: only sessions a person
+/// would call "theirs" — root `User`/`Cron` sessions and `UserFork` branches.
+/// Subagent, `SystemMaintenance`, and `System`-triggered (background
+/// compression) actors all send `ActorStop` when they finish, but their
+/// shutdown is not a user-session ending. Exhaustive arms force a
+/// classification when a new `TriggerSource` / `LineageKind` variant is added.
+fn should_fire_session_end(session: &Session) -> bool {
+    let user_trigger = match &session.trigger {
+        TriggerSource::User | TriggerSource::Cron { .. } => true,
+        TriggerSource::System { .. } => false,
+    };
+    let user_lineage = match &session.lineage {
+        None => true,
+        Some(l) => match &l.kind {
+            LineageKind::UserFork { .. } => true,
+            LineageKind::Subagent | LineageKind::SystemMaintenance => false,
+        },
+    };
+    user_trigger && user_lineage
 }
 
 pub struct AgentLoop {
@@ -1287,6 +1309,76 @@ impl AgentLoop {
                 .append_recalled_memory(vec![ContentBlock::Text(mem.content)])
                 .await;
         }
+    }
+
+    /// Fire-and-forget the [`Memory::on_session_end`] consolidation write at
+    /// actor shutdown. Detached on the tokio runtime root (not bound to the
+    /// actor's cancellation token, which the caller cancels immediately after
+    /// this returns), so the write survives the actor's teardown.
+    ///
+    /// Pulls the FULL durable transcript via [`SessionManager::history`] —
+    /// the actor's in-memory view may have been compressed, and
+    /// `on_session_end`'s contract is to see raw turns.
+    ///
+    /// No-op when memory is unwired, when `sessions` is unwired (test
+    /// harnesses with no cross-session store), or when the session isn't
+    /// user-facing per [`should_fire_session_end`] (subagents, maintenance,
+    /// system-triggered actors all send `ActorStop` too, but their shutdown
+    /// is not a user-session ending).
+    ///
+    /// [`SessionManager::history`]: crate::SessionManager::history
+    pub fn spawn_session_end_write(&self, span_recorder: &Arc<SpanRecorder>, session: &Session) {
+        let Some(memory) = self.memory.clone() else {
+            return;
+        };
+        let Some(sessions) = self.sessions.clone() else {
+            return;
+        };
+        if !should_fire_session_end(session) {
+            return;
+        }
+        let user_id = session.user.id.clone();
+        let session_id = session.id.clone();
+        let recorder = Arc::clone(span_recorder);
+        tokio::spawn(async move {
+            let transcript = match sessions.history(&session_id).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        session_id = %session_id,
+                        "memory on_session_end: failed to load durable transcript; skipping write",
+                    );
+                    return;
+                }
+            };
+            if transcript.is_empty() {
+                return;
+            }
+            // Synthetic JobId — `on_session_end` isn't tied to a user job; this
+            // id only exists so the trace step + any billed sub-call records
+            // share one key. Mirrors how compression mints its own ids for
+            // maintenance work.
+            let job_id = JobId::new();
+            let ctx_recorder = Arc::clone(&recorder);
+            let result = crate::runtime::scope::with_step(
+                recorder.as_ref(),
+                job_id,
+                StepKind::MemoryWrite,
+                None,
+                move |step| async move {
+                    let ctx = MemoryContext::new(user_id, session_id, job_id, ctx_recorder, step);
+                    match memory.on_session_end(&ctx, &transcript).await {
+                        Ok(()) => Ok((LifecycleOutcome::Ok, ())),
+                        Err(e) => Err(anyhow::Error::new(e)),
+                    }
+                },
+            )
+            .await;
+            if let Err(e) = result {
+                warn!(error = %e, "memory on_session_end write failed");
+            }
+        });
     }
 
     /// Fire-and-forget the [`Memory::on_job_complete`] write for a finished
@@ -2382,5 +2474,126 @@ mod trim_response_text_edges_tests {
             ContentBlock::Text(t) => assert_eq!(t, body),
             other => panic!("expected text, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod session_end_gate_tests {
+    //! `should_fire_session_end` decides whether `Memory::on_session_end`
+    //! runs when an actor processes `ActorStop`. Subagent /
+    //! `SystemMaintenance` actors and `System`-triggered (background
+    //! compression) sessions also stop, but their teardown is not a
+    //! user-session ending — firing the hook for them would write
+    //! garbage memory.
+    use super::should_fire_session_end;
+    use aura_model::{
+        ChannelType, JobId, Lineage, LineageKind, Session, SessionId, SessionState, SystemReason,
+        TriggerSource, User,
+    };
+    use chrono::Utc;
+
+    fn session_with(trigger: TriggerSource, lineage: Option<Lineage>) -> Session {
+        let now = Utc::now();
+        let id = SessionId::from("sess-gate");
+        Session {
+            id: id.clone(),
+            user: User {
+                id: "user-gate".into(),
+                name: None,
+                channel: ChannelType::tui(),
+            },
+            channel: ChannelType::tui(),
+            created_at: now,
+            last_active: now,
+            state: SessionState::default(),
+            root_session_id: id,
+            trigger,
+            lineage,
+            bound_soul_version: "soul-gate".into(),
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn fires_for_root_user_session() {
+        assert!(should_fire_session_end(&session_with(
+            TriggerSource::User,
+            None
+        )));
+    }
+
+    #[test]
+    fn fires_for_root_cron_session() {
+        let s = session_with(
+            TriggerSource::Cron {
+                cron_job_id: "c-1".into(),
+            },
+            None,
+        );
+        assert!(should_fire_session_end(&s));
+    }
+
+    #[test]
+    fn fires_for_user_fork_branch() {
+        let lineage = Lineage {
+            parent_session_id: SessionId::from("parent"),
+            parent_job_id: JobId::new(),
+            parent_span_id: None,
+            kind: LineageKind::UserFork {
+                fork_at_job_id: JobId::new(),
+                prefix_state_hash: "deadbeef".into(),
+            },
+        };
+        assert!(should_fire_session_end(&session_with(
+            TriggerSource::User,
+            Some(lineage)
+        )));
+    }
+
+    #[test]
+    fn skips_subagent_session() {
+        let lineage = Lineage {
+            parent_session_id: SessionId::from("parent"),
+            parent_job_id: JobId::new(),
+            parent_span_id: None,
+            kind: LineageKind::Subagent,
+        };
+        // Subagents inherit their parent's trigger, so the User flag alone
+        // shouldn't unlock the hook for them.
+        assert!(!should_fire_session_end(&session_with(
+            TriggerSource::User,
+            Some(lineage),
+        )));
+    }
+
+    #[test]
+    fn skips_system_maintenance_session() {
+        let lineage = Lineage {
+            parent_session_id: SessionId::from("parent"),
+            parent_job_id: JobId::new(),
+            parent_span_id: None,
+            kind: LineageKind::SystemMaintenance,
+        };
+        let s = session_with(
+            TriggerSource::System {
+                reason: SystemReason::BackgroundCompression,
+            },
+            Some(lineage),
+        );
+        assert!(!should_fire_session_end(&s));
+    }
+
+    #[test]
+    fn skips_root_system_session() {
+        // No lineage but System trigger → still a maintenance-class actor
+        // (a hypothetical future System variant without SystemMaintenance
+        // lineage), not a user session.
+        let s = session_with(
+            TriggerSource::System {
+                reason: SystemReason::BackgroundCompression,
+            },
+            None,
+        );
+        assert!(!should_fire_session_end(&s));
     }
 }

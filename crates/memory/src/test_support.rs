@@ -62,6 +62,11 @@ impl RecordingMemory {
     pub fn session_end_count(&self) -> usize {
         self.session_ends.lock().len()
     }
+
+    /// The transcript passed to each `on_session_end` call, in order.
+    pub fn session_ends(&self) -> Vec<Vec<ChatMessage>> {
+        self.session_ends.lock().clone()
+    }
 }
 
 #[async_trait]

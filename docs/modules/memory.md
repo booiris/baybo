@@ -95,13 +95,21 @@ Recalled memories enter the prompt as a **persisted, framed** block — never
   (`from_user() == false`), so it never renders as a user turn.
 - The core does **no** dedup — it injects exactly what `recall` returns.
 
-## Flow & hook points (scope: `UserChat` + `Cron` jobs only)
+## Flow & hook points
 
-The agent loop (`agent_loop.rs`) drives memory; `System`, `Spawned` (subagent),
-and `SubagentNotification` jobs are excluded (no direct user input → would
-pollute / double-write). `memory_recall_query(&JobInput)` is the gate — an
-exhaustive match that returns the query for `UserChat`/`Cron` and `None`
-otherwise (forces classification when a `JobInput` variant is added).
+Two gates run independently:
+
+- **`memory_recall_query(&JobInput)`** — per-job gate for the read/write hooks
+  on a turn. Exhaustive match: returns the query for `UserChat` / `Cron`, `None`
+  for `System`, `Spawned` (subagent), and `SubagentNotification` (no direct
+  user input → would pollute / double-write).
+- **`should_fire_session_end(&Session)`** — session-level gate for the
+  shutdown hook. Returns true for root `User` / `Cron` sessions and `UserFork`
+  branches; false for `Subagent`, `SystemMaintenance`, and `System`-triggered
+  actors (they send `ActorStop` too but are not user-session endings).
+
+The agent loop (`agent_loop.rs`) owns the first three hooks; the actor's
+`AgentMessage::ActorStop` handler (`actor/mod.rs`) owns the fourth.
 
 1. **Recall — inline, job start.** After the user message is in context and
    before the first LLM call, `recall_and_inject` opens a `MemoryRecall` step,
@@ -116,10 +124,16 @@ otherwise (forces classification when a `JobInput` variant is added).
    **Only on a clean `Final`** — a max-iterations, cancelled, or errored turn
    writes nothing (those paths return before this point), so memory only ever
    sees completed exchanges.
-4. **`on_session_end` — interface only; caller deferred.** The trait method
-   exists and `NoopMemory` implements it, but the idle-timeout **trigger is not
-   wired yet** (see Deferred). A real backend currently relies on the per-job
-   write for durability.
+4. **`on_session_end` — background, actor shutdown.** When the actor processes
+   `AgentMessage::ActorStop` (idle reap, supervised shutdown, …),
+   `spawn_session_end_write` detaches a task on the runtime root **before**
+   cancelling `actor_token`, so the write survives the actor's teardown. The
+   task loads the FULL durable transcript via `SessionManager::history`
+   (the in-memory view may have been compressed), opens a `MemoryWrite` step,
+   mints a synthetic `JobId` for trace/cost keying, and calls
+   `on_session_end`. The session-level gate skips subagent / maintenance /
+   system actors (whose `ActorStop` is not a user-session ending). A missing
+   session row or empty transcript skips silently.
 
 With `memory == None` every hook above is skipped entirely — no trace step is
 opened and nothing is billed, so the no-op path is genuinely inert.
@@ -149,13 +163,6 @@ These are the implementation's contract.
 
 ## Deferred
 
-- **`on_session_end` caller wiring.** Triggering whole-session consolidation at
-  idle-timeout means emitting from / extending the supervisor's `reap_idle`
-  (which today only sends `ActorStop` and holds no `SpanRecorder`). It is inert
-  under the no-op default (production behaviour is identical whether or not it is
-  wired), so it was left as a follow-up to keep this change focused. The trait
-  method + `NoopMemory` impl are in place; `on_job_complete` already captures
-  incremental facts.
 - **The first real `Memory` impl.** Out of scope — the trait + all wiring are
   ready for one to drop in at the single construction point in
   `runtime.rs::build_managers`. If/when a backend needs an embedding handle,

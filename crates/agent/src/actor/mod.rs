@@ -264,6 +264,17 @@ impl AgentActor {
             match msg {
                 AgentMessage::ActorStop => {
                     debug!(session_id = %session_id, "actor stopping");
+                    // Session-end memory consolidation. Detached on the
+                    // runtime root so it survives the `actor_token.cancel()`
+                    // below; gated to user-facing sessions only (subagents,
+                    // maintenance, system-triggered actors send `ActorStop`
+                    // too but are not user-session endings — see
+                    // `should_fire_session_end`). No-op when no memory is
+                    // wired (default in production today).
+                    self.volatile.agent_loop.spawn_session_end_write(
+                        &self.volatile.span_recorder,
+                        &self.durable.session,
+                    );
                     // Cancelling our `actor_token` cascades into every
                     // child we spawned — including maintenance actors,
                     // whose `actor_token` is a grandchild of ours via
