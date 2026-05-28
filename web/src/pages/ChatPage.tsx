@@ -1183,7 +1183,7 @@ export function ChatPage() {
         <div
           ref={transcriptScrollRef}
           onScroll={handleTranscriptScroll}
-          className="relative w-full max-w-6xl overflow-auto px-6 py-4"
+          className="chat-scroll relative w-full max-w-6xl overflow-y-auto overflow-x-hidden px-6 py-4"
         >
           {currentView.historyLoading ? (
             <div className="flex justify-center py-12 text-ink-soft">
@@ -1202,9 +1202,24 @@ export function ChatPage() {
                   scroll up to load older messages
                 </div>
               ) : null}
-              {currentView.transcript.map((row) => (
-                <MessageBubble key={row.key} row={row} />
-              ))}
+              {currentView.transcript.flatMap((row, i, arr) => {
+                const nodes: React.ReactNode[] = [
+                  <MessageBubble key={row.key} row={row} />,
+                ];
+                if (
+                  isCancelledWorkAt(
+                    arr,
+                    i,
+                    currentView.awaitingReply,
+                    currentView.pendingApproval,
+                  )
+                ) {
+                  nodes.push(
+                    <CancelledTurnIndicator key={`${row.key}-cancelled`} />,
+                  );
+                }
+                return nodes;
+              })}
               {currentView.awaitingReply ? <WorkingIndicator /> : null}
               {currentView.pendingApproval ? (
                 <ApprovalCard
@@ -2504,10 +2519,10 @@ function MessageBubble({ row }: { row: TranscriptRow }) {
   // element when the last token is a code fence or list, looking off.
   const showMarkdown = !isUser && !row.notice && body.length > 0;
   return (
-    <div className={`group flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
-      <div className="relative max-w-2xl">
+    <div className={`group flex flex-col min-w-0 ${isUser ? 'items-end' : 'items-start'}`}>
+      <div className={`relative min-w-0 ${isUser ? 'max-w-2xl' : 'max-w-4xl'}`}>
         <div
-          className={`border-2 border-black rounded-md px-3 py-2 text-sm transition-opacity ${
+          className={`border-2 border-black rounded-md px-3 py-2 text-sm transition-opacity break-words [overflow-wrap:anywhere] ${
             showMarkdown ? 'font-mono' : 'font-mono whitespace-pre-wrap'
           } ${isUser ? 'bg-brand text-white' : 'bg-white text-ink'} ${
             row.pending ? 'opacity-60' : ''
@@ -2617,6 +2632,19 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
   const [expanded, setExpanded] = useState(false);
   const open = active || expanded;
 
+  // Pin the steps panel to its tail while the turn is producing so a long
+  // tool loop reveals the newest reasoning/tool line at the bottom instead
+  // of stranding the user at the top. Fires on each step list mutation —
+  // new step, status update, prose append — and is layout-effect-scoped so
+  // the catch-up happens pre-paint, no visible flash.
+  const stepsContainerRef = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    if (!active) return;
+    const el = stepsContainerRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [active, steps]);
+
   if (!active && steps.length === 0) return null;
 
   const secs =
@@ -2643,7 +2671,7 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
       className={`group flex flex-col items-start w-full transition-[margin-bottom] duration-300 ease-out ${tighten}`}
     >
       <div
-        className={`w-full max-w-2xl rounded-md overflow-hidden border-2 transition-all duration-300 ease-out ${
+        className={`w-full max-w-4xl rounded-md overflow-hidden border-2 transition-all duration-300 ease-out ${
           open
             ? 'border-black bg-white shadow-brutal-sm'
             : // Collapsed: pull left by the 2px transparent border so the
@@ -2688,7 +2716,14 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
             open ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'
           }`}
         >
-          <div className="overflow-hidden min-h-0">
+          <div
+            ref={stepsContainerRef}
+            className={`min-h-0 ${
+              open
+                ? 'chat-scroll max-h-[calc((100vh-12rem)*3/5)] overflow-y-auto'
+                : 'overflow-hidden'
+            }`}
+          >
             <div className="flex flex-col gap-1.5 px-3 py-2">
               {steps.map((s) => (
                 <WorkStepView key={s.key} step={s} />
@@ -2711,6 +2746,46 @@ function LiveElapsed({ startedAt }: { startedAt: number }) {
   }, []);
   const secs = Math.max(0, Math.floor((now - startedAt) / 1000));
   return <>{secs}s</>;
+}
+
+// True when the trailing closed `work` block at position `i` represents
+// a turn that ended without producing the final assistant reply —
+// typically a cancellation (user stop, agent loop abort, gateway
+// shutdown mid-turn). Only the very last transcript row is considered:
+// a mid-transcript work block followed by a user message is ambiguous
+// — it could be a real cancel, OR a race where the user typed during a
+// long-running turn (e.g. a transient LLM SSE failure that retries for
+// >1min) whose reply is still in flight. We can't distinguish those
+// from the transcript alone, so we stay quiet rather than mis-label a
+// recovering turn as cancelled. Live turns still in flight
+// (`awaitingReply` / `pendingApproval`) are also excluded so the
+// indicator doesn't flash mid-stream.
+function isCancelledWorkAt(
+  transcript: TranscriptRow[],
+  i: number,
+  awaitingReply: boolean,
+  pendingApproval: PendingApproval | null,
+): boolean {
+  if (i !== transcript.length - 1) return false;
+  if (awaitingReply || pendingApproval) return false;
+  const row = transcript[i];
+  if (row.kind !== 'work' || row.workActive) return false;
+  return true;
+}
+
+function CancelledTurnIndicator() {
+  return (
+    <div className="flex">
+      <span
+        className="inline-flex items-center gap-1 px-2 py-0.5 border-2 border-warn/40 bg-warn/10 text-warn rounded-md font-mono text-[0.7rem] font-bold uppercase tracking-wider"
+        role="status"
+        title="The turn stopped before a reply landed."
+      >
+        <RiCloseLine className="text-xs shrink-0" />
+        Cancelled
+      </span>
+    </div>
+  );
 }
 
 // The initial "working" affordance, shown between sending a turn and the
