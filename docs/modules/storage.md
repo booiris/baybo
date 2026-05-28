@@ -22,7 +22,7 @@ Every `*Store` trait contract lives in `aura-store`; `aura-storage` only *implem
 libsql/session.rs         → impl SessionStore + SessionSummaryStore   (traits + StoredMessage / SessionSummaryRow from aura-store)
 libsql/memory.rs          → impl MemoryStore                          (trait from aura-store)
 libsql/trace.rs           → impl TraceStore                           (trait from aura-store; rows ↔ Step/Span/SpanEvent via aura-trace)
-libsql/secret.rs          → impl SecretStore                          (trait from aura-store)
+libsql/secret.rs          → impl SecretStore                          (trait from aura-store; one secrets table shared by minted placeholders, mcp.* creds, and user_env.* user secrets)
 libsql/job.rs             → impl JobStore                             (trait from aura-store; rows ↔ Job via aura-job)
 libsql/cost.rs            → impl CostStore                            (trait from aura-store)
 libsql/cron.rs            → impl CronStore                            (trait from aura-store; libsql adapter handles JSON serialization)

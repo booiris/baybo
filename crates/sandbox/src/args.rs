@@ -181,6 +181,9 @@ pub(crate) fn resolve_env(spec: &SandboxSpec) -> Vec<(String, String)> {
             }
         }
     }
+    if let EnvPolicy::BaselineWithExtra { extra } = &spec.env {
+        out.extend(extra.iter().cloned());
+    }
     out.push(("PWD".into(), effective_pwd(spec)));
     out
 }

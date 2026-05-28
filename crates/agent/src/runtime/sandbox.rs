@@ -1,14 +1,13 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_sandbox::{
     EnvPolicy, FilesystemPolicy, NetworkPolicy, ResourceLimits, SandboxRunner, SandboxSpec,
     StdinSource,
 };
-use aura_tools::{ExecSandbox, SandboxedOutput, ToolError};
+use aura_tools::{ExecSandbox, SandboxedOutput, SpawnOpts, ToolError};
 
 pub struct SandboxAdapter {
     runner: Arc<dyn SandboxRunner>,
@@ -89,11 +88,9 @@ impl ExecSandbox for SandboxAdapter {
         &self,
         program: &Path,
         args: &[String],
-        cwd: Option<&Path>,
-        stdin: Option<&[u8]>,
-        timeout: Duration,
+        opts: SpawnOpts,
     ) -> Result<SandboxedOutput, ToolError> {
-        if let Some(requested) = cwd
+        if let Some(requested) = opts.cwd.as_deref()
             && self.cwd_must_be_in_workspace
         {
             // Resolve symlinks on both sides before comparing — on macOS
@@ -119,21 +116,28 @@ impl ExecSandbox for SandboxAdapter {
             }
         }
 
+        let env = if opts.extra_env.is_empty() {
+            EnvPolicy::Baseline
+        } else {
+            EnvPolicy::BaselineWithExtra {
+                extra: opts.extra_env,
+            }
+        };
         let spec = SandboxSpec {
             program: program.to_path_buf(),
             args: args.to_vec(),
-            cwd: cwd.map(Path::to_path_buf),
+            cwd: opts.cwd,
             workspace_root: self.workspace_root.clone(),
             readable_paths: Vec::new(),
             writable_paths: Vec::new(),
             allowed_hosts: self.allowed_hosts.clone(),
             network_policy: self.network_policy,
-            env: EnvPolicy::Baseline,
-            stdin: match stdin {
-                Some(b) => StdinSource::Bytes(b.to_vec()),
+            env,
+            stdin: match opts.stdin {
+                Some(b) => StdinSource::Bytes(b),
                 None => StdinSource::Null,
             },
-            timeout,
+            timeout: opts.timeout,
             resource_limits: self.resource_limits,
             filesystem_policy: self.filesystem_policy.clone(),
         };
@@ -161,6 +165,7 @@ mod tests {
     use super::*;
     use aura_sandbox::{Backend, SandboxError, SandboxOutput};
     use parking_lot::Mutex;
+    use std::time::Duration;
 
     struct PanicRunner;
 
@@ -209,9 +214,11 @@ mod tests {
             .spawn_command(
                 Path::new("/bin/echo"),
                 &["hi".into()],
-                Some(outside.path()),
-                None,
-                Duration::from_secs(1),
+                SpawnOpts {
+                    cwd: Some(outside.path().to_path_buf()),
+                    timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
             )
             .await;
         assert!(
@@ -235,9 +242,11 @@ mod tests {
             .spawn_command(
                 Path::new("/bin/echo"),
                 &["hi".into()],
-                Some(&sub),
-                None,
-                Duration::from_secs(1),
+                SpawnOpts {
+                    cwd: Some(sub.clone()),
+                    timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
             )
             .await
             .expect("cwd inside workspace must be accepted");
@@ -265,9 +274,10 @@ mod tests {
             .spawn_command(
                 Path::new("/bin/echo"),
                 &["hi".into()],
-                None,
-                None,
-                Duration::from_secs(1),
+                SpawnOpts {
+                    timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
             )
             .await
             .expect("recording runner accepts");
@@ -289,9 +299,11 @@ mod tests {
             .spawn_command(
                 Path::new("/bin/echo"),
                 &["hi".into()],
-                Some(&missing),
-                None,
-                Duration::from_secs(1),
+                SpawnOpts {
+                    cwd: Some(missing.clone()),
+                    timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
             )
             .await;
         assert!(

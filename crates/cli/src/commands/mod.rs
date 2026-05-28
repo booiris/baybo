@@ -11,6 +11,7 @@ pub mod log;
 pub mod mcp;
 pub mod pair;
 pub(crate) mod prompt;
+pub mod secret;
 pub(crate) mod secret_input;
 pub(crate) mod select;
 pub mod session;

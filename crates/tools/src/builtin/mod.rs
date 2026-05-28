@@ -36,6 +36,7 @@ pub mod grep;
 pub mod now;
 pub(crate) mod paths;
 pub mod read;
+pub mod secret;
 pub mod send_local_file;
 pub mod todo;
 pub mod web_fetch;
@@ -96,6 +97,9 @@ pub fn default_tools(
         ),
         send_local_file::tool(blob_store.clone()),
         trusted(NowTool, vec![]),
+        trusted(secret::SecretAddTool, vec![]),
+        trusted(secret::SecretListTool, vec![]),
+        trusted(secret::SecretCheckTool, vec![]),
     ];
     #[cfg(debug_assertions)]
     tools.push(trusted(echo::EchoTool, vec![]));

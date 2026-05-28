@@ -109,6 +109,11 @@ impl SandboxRunner for SandboxExecRunner {
                 }
             }
         }
+        if let EnvPolicy::BaselineWithExtra { extra } = &spec.env {
+            for (k, v) in extra {
+                cmd.arg(format!("{k}={v}"));
+            }
+        }
         cmd.arg("--").arg(&spec.program);
         for a in &spec.args {
             cmd.arg(a);

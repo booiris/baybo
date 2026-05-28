@@ -144,6 +144,13 @@ pub struct ToolContext {
     /// exercise the side LLM); tools must fail-closed by ignoring
     /// their LLM-dependent code path.
     pub llm: Option<Arc<dyn aura_llm::BilledChat>>,
+    /// Tool-side access to user-managed secrets, bound by the agent layer
+    /// (mirrors [`Self::llm`]). `BashTool` uses it to resolve `secret_env`
+    /// names to plaintext for child-process injection and to redact those
+    /// values from the output; the `secret_*` tools use it to add / list /
+    /// check. `None` when not wired (argv-mode boots, tests that don't
+    /// exercise secrets); consumers must fail-closed.
+    pub secrets: Option<Arc<dyn SecretAccess>>,
 }
 
 /// Severity of a [`SessionNotifier`] event. Matches
@@ -364,6 +371,18 @@ impl ApprovalHandle {
     }
 }
 
+/// Per-call options for [`ExecSandbox::spawn_command`]. `extra_env` injects
+/// `KEY=value` pairs into ONLY this child process (e.g. secrets resolved for a
+/// Bash `secret_env`) without ever putting them in the command string. NOTE:
+/// `timeout` defaults to zero — every caller must set it explicitly.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnOpts {
+    pub cwd: Option<PathBuf>,
+    pub stdin: Option<Vec<u8>>,
+    pub extra_env: Vec<(String, String)>,
+    pub timeout: Duration,
+}
+
 /// OS-level sandbox runner exposed to tools that need to spawn an
 /// external process. The `aura-agent` crate adapts a real
 /// `aura_sandbox::SandboxRunner` into this trait so `aura-tools` does
@@ -374,9 +393,7 @@ pub trait ExecSandbox: Send + Sync {
         &self,
         program: &Path,
         args: &[String],
-        cwd: Option<&Path>,
-        stdin: Option<&[u8]>,
-        timeout: Duration,
+        opts: SpawnOpts,
     ) -> crate::Result<SandboxedOutput>;
 }
 
@@ -386,6 +403,39 @@ pub struct SandboxedOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub timed_out: bool,
+}
+
+/// Tool-side access to user-managed secrets, injected by the agent layer
+/// through [`ToolContext::secrets`]. The concrete impl wraps the security
+/// gateway + `UserSecretManager`; `aura-tools` sees only this trait, so the
+/// reveal/mint pipeline and storage details stay in the agent layer (the
+/// trait is implemented "from above" — see `docs/secret-management.md`).
+#[async_trait]
+pub trait SecretAccess: Send + Sync {
+    /// Resolve named user secrets to plaintext for child-process env
+    /// injection. Errors if any requested name is missing, so a bash run
+    /// fails loudly rather than silently running with an unset variable.
+    async fn resolve_env(&self, names: &[String]) -> crate::Result<Vec<(String, String)>>;
+
+    /// Mint and vault a deterministic placeholder for each known plaintext
+    /// `value` and literal-replace its occurrences in `text`. Reuses the
+    /// gateway's mint/vault pipeline, so the placeholder stays reveal-able.
+    /// Values too short to redact safely are skipped by the implementation.
+    async fn redact(&self, text: &str, values: &[String]) -> crate::Result<String>;
+
+    /// Store a user secret. Returns whether it was newly created or replaced.
+    async fn add(
+        &self,
+        name: &str,
+        value: &[u8],
+        overwrite: bool,
+    ) -> crate::Result<aura_security::AddOutcome>;
+
+    /// All user-secret names (no values).
+    async fn list_names(&self) -> crate::Result<Vec<String>>;
+
+    /// Per-name existence for a batch, preserving input order.
+    async fn exists(&self, names: &[String]) -> crate::Result<Vec<(String, bool)>>;
 }
 
 /// Output from a tool execution.

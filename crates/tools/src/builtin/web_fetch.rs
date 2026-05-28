@@ -810,6 +810,7 @@ mod tests {
             notifier: None,
             events: crate::noop_event_sink(),
             llm: None,
+            secrets: None,
         }
     }
 

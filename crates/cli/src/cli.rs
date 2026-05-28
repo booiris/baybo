@@ -93,6 +93,14 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: McpCmd,
     },
+    /// Manage user secrets — env-var-style tokens the Bash tool can inject
+    /// via `secret_env` (`add` / `list` / `delete`). Values are entered with
+    /// masked terminal input and stored encrypted in the vault; only a
+    /// masked preview is ever shown.
+    Secret {
+        #[command(subcommand)]
+        cmd: SecretCmd,
+    },
     /// Manage per-user channel pairings (the approval gate that lets
     /// a new sender talk to the agent): `list` (pending/approved),
     /// `approve <code>`, `revoke <channel> <bot> <user>`.
@@ -349,6 +357,30 @@ pub enum ChannelCmd {
     /// running gateway's reconciler pushes a `StopBot` to the sidecar
     /// on the next tick.
     Remove,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretCmd {
+    /// Store a secret. Prompts for the value with masked input (never an
+    /// argument, which would leak into shell history). With no NAME the name
+    /// is prompted too. Use --force to replace an existing name without the
+    /// overwrite confirmation.
+    Add {
+        /// Secret name (env-var style, `[A-Za-z_][A-Za-z0-9_]*`). Prompted if omitted.
+        name: Option<String>,
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
+    /// List stored secret names, each with a masked value preview.
+    List,
+    /// Delete a secret. With no NAME, shows an interactive single-select
+    /// picker (terminal-only); in slash mode pass a NAME and `--yes`.
+    Delete {
+        /// Secret name. Omit for an interactive picker.
+        name: Option<String>,
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

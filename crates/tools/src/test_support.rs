@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use aura_llm::{BilledChat, BilledChatResponse};
 
 use crate::{
-    ApprovalDecision, ApprovalGate, ApprovalRequest, ExecSandbox, SandboxedOutput, Tool,
+    ApprovalDecision, ApprovalGate, ApprovalRequest, ExecSandbox, SandboxedOutput, SpawnOpts, Tool,
     ToolContext, ToolManifest, ToolOutput,
 };
 
@@ -166,6 +166,7 @@ pub struct FakeSandboxCall {
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub stdin: Option<Vec<u8>>,
+    pub extra_env: Vec<(String, String)>,
     pub timeout: Duration,
 }
 
@@ -197,16 +198,15 @@ impl ExecSandbox for FakeExecSandbox {
         &self,
         program: &Path,
         args: &[String],
-        cwd: Option<&Path>,
-        stdin: Option<&[u8]>,
-        timeout: Duration,
+        opts: SpawnOpts,
     ) -> crate::Result<SandboxedOutput> {
         self.calls.lock().push(FakeSandboxCall {
             program: program.to_path_buf(),
             args: args.to_vec(),
-            cwd: cwd.map(Path::to_path_buf),
-            stdin: stdin.map(<[u8]>::to_vec),
-            timeout,
+            cwd: opts.cwd.clone(),
+            stdin: opts.stdin.clone(),
+            extra_env: opts.extra_env.clone(),
+            timeout: opts.timeout,
         });
         Ok(self.response.lock().clone())
     }
@@ -269,6 +269,7 @@ mod tests {
             notifier: None,
             events: crate::noop_event_sink(),
             llm: None,
+            secrets: None,
         }
     }
 

@@ -55,6 +55,15 @@ impl SecretVault {
             .map_err(|e| SecurityError::Storage(e.to_string()))
     }
 
+    /// All vault entry names, without decrypting any value. Higher layers that
+    /// namespace their keys (e.g. `UserSecretManager`) filter by prefix.
+    pub async fn list_names(&self) -> Result<Vec<String>> {
+        self.store
+            .list()
+            .await
+            .map_err(|e| SecurityError::Storage(e.to_string()))
+    }
+
     /// Store any `serde::Serialize` value as JSON inside an encrypted vault
     /// entry. Same AES-GCM encryption as `store_secret`; just adds a JSON
     /// envelope so callers don't have to hand-roll bytes for typed payloads
