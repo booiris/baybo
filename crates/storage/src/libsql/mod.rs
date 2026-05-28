@@ -244,13 +244,6 @@ impl LibsqlPool {
                     in_flight_owner TEXT
                 );
 
-                -- The `memories` table backed the retired CRUD memory facade.
-                -- Memory is now a pluggable, storage-opaque trait (`aura-memory`)
-                -- that owns its own persistence, so this table is dropped here.
-                -- Destructive and irreversible: any rows (and the index) are
-                -- discarded. `IF EXISTS` keeps the open path idempotent.
-                DROP TABLE IF EXISTS memories;
-
                 CREATE TABLE IF NOT EXISTS secrets (
                     name            TEXT PRIMARY KEY,
                     encrypted_value BLOB NOT NULL
