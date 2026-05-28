@@ -26,17 +26,6 @@ pub struct MemoryConfig {
     #[serde(rename = "llm", skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmEntryName>,
 
-    /// Embedding provider id used for recall similarity (e.g. `"openai"`).
-    /// `None` → the implementation's own default. Paired with
-    /// [`embedding_model`](Self::embedding_model).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_provider: Option<String>,
-
-    /// Embedding model id (e.g. `"text-embedding-3-small"`). `None` → the
-    /// implementation's own default.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_model: Option<String>,
-
     /// Opaque, implementation-defined settings forwarded verbatim to the
     /// registered memory plug-in. A deliberate, documented exception to the
     /// "typed over `Value`" rule: the plug-in's own configuration is genuinely
@@ -57,8 +46,6 @@ mod tests {
             "memory defaults off (opt-in like browser.enable)"
         );
         assert!(c.llm.is_none());
-        assert!(c.embedding_provider.is_none());
-        assert!(c.embedding_model.is_none());
         assert!(c.extra.is_null());
     }
 
@@ -72,7 +59,6 @@ mod tests {
     fn default_omits_optional_fields_when_serialized() {
         let json = serde_json::to_string(&MemoryConfig::default()).unwrap();
         assert!(!json.contains("llm"), "None llm elided");
-        assert!(!json.contains("embedding"), "None embedding fields elided");
         assert!(!json.contains("extra"), "null extra elided");
         assert!(json.contains("enabled"));
     }
@@ -82,8 +68,6 @@ mod tests {
         let c = MemoryConfig {
             enabled: true,
             llm: Some(LlmEntryName::from("cheap-model")),
-            embedding_provider: Some("openai".into()),
-            embedding_model: Some("text-embedding-3-small".into()),
             extra: serde_json::json!({ "max_entries": 5000, "namespace": "team-a" }),
         };
         let json = serde_json::to_string(&c).unwrap();

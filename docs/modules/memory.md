@@ -7,7 +7,7 @@ system knows memory only through one `Arc<dyn Memory>` slot (not a many-registry
 like tools/channels): at most one implementation is registered at startup. The
 trait is intentionally thin and **storage-opaque** — an implementation owns its
 own persistence (libsql, a vector DB, an external service) and receives its LLM
-+ embedding handles and config in its own constructor.
+handle and config in its own constructor.
 
 The core ships the trait, its value types (`MemoryContext`, `RecalledMemory`,
 `MemoryError`), and a **`NoopMemory`** reference default. **No real backend ships
@@ -62,12 +62,12 @@ pub trait Memory: Send + Sync {
 
 ## Clients & billing
 
-The implementation holds the **unbound** `Arc<BillableLlm>` and a billed
-embedding handle, constructor-injected. The core hands each call a
-`MemoryContext` carrying the real `(user, session, job)` + the trace recorder +
-the enclosing `MemoryRecall` / `MemoryWrite` step; the impl binds its handles per
-billed sub-call via `MemoryContext::scoped_llm_call` (below), so spend bills to
-the **real** user/session under a real span (mirrors `compression.rs`, not
+The implementation holds the **unbound** `Arc<BillableLlm>`, constructor-injected.
+The core hands each call a `MemoryContext` carrying the real `(user, session,
+job)` + the trace recorder + the enclosing `MemoryRecall` / `MemoryWrite` step;
+the impl binds its handle per billed sub-call via
+`MemoryContext::scoped_llm_call` (below), so spend bills to the **real**
+user/session under a real span (mirrors `compression.rs`, not
 `Attribution::system`).
 
 **Span attribution.** `cost_records.span_id` is written by `record_call` keyed
@@ -75,18 +75,10 @@ off `attribution.span_id`, so a billed sub-call needs a *real* span or its cost
 row is orphaned. `MemoryContext::scoped_llm_call(begin, body)` provides one: it
 opens an `LlmCall` span **under the memory step**, hands `body` an `Attribution`
 bound to that span (built from the real user/session/job + the span id), and
-closes the span with the call's token usage. The impl binds its `BillableLlm` /
-billed embedding handle with that attribution and makes the call — so the cost
-row lands on a recorded span, attributed to the real user/session/job. Embedding
-calls record as `LlmCall` spans too (a model call is a model call for cost/trace
-purposes). The impl never constructs a bare `Attribution`, so it can't bill
-against an orphaned id.
-
-A new **`EmbeddingClient`** trait lives in `aura-llm` beside `BilledChat`:
-batch `embed(&[String]) -> EmbeddingResponse` + `dimensions()`, sealed behind
-`BillableEmbedding` / `BoundBilledEmbedding` so embedding spend flows through the
-identical micro-USD guard→record chokepoint as chat. Trait + billed wrapper only;
-no concrete provider ships yet.
+closes the span with the call's token usage. The impl binds its `BillableLlm`
+with that attribution and makes the call — so the cost row lands on a recorded
+span, attributed to the real user/session/job. The impl never constructs a bare
+`Attribution`, so it can't bill against an orphaned id.
 
 ## Recall injection (enforces hard constraint #3)
 
@@ -135,16 +127,18 @@ opened and nothing is billed, so the no-op path is genuinely inert.
 ## Config
 
 `MemoryConfig` on `AuraConfig` (`crates/config/src/memory.rs`): typed
-core-wiring knobs (`enabled`, `llm` entry name, `embedding_provider`,
-`embedding_model`) **plus** an opaque `extra: serde_json::Value` passed through
-verbatim to the plug-in. The `extra` bag is a deliberate, documented exception to
-the "typed over `Value`" rule — plug-in config is genuinely opaque to the core.
-Memory config is **not** hot-reloadable (`reload.rs` classifies it non-hot).
+core-wiring knobs (`enabled`, `llm` entry name) **plus** an opaque
+`extra: serde_json::Value` passed through verbatim to the plug-in. The `extra`
+bag is a deliberate, documented exception to the "typed over `Value`" rule —
+plug-in config is genuinely opaque to the core. Memory config is **not**
+hot-reloadable (`reload.rs` classifies it non-hot). Embedding provider/model
+settings, if a backend needs them, ride in `extra` rather than a typed core
+field — the core has no opinion on whether a backend embeds at all.
 
 ## Hard constraints (carried forward from the retired pipeline)
 
-1. **No substring recall.** Recall is embedding/LLM-judged relevance, never
-   substring match against free-form text.
+1. **No substring recall.** Recall is LLM- (or embedding-) judged relevance,
+   never substring match against free-form text.
 2. **No whole-output storage.** The write path must judge salience, never treat
    an entire assistant output as a memory.
 3. **No `Role::System` re-injection.** Recalled memories use the persisted,
@@ -162,9 +156,11 @@ These are the implementation's contract.
   wired), so it was left as a follow-up to keep this change focused. The trait
   method + `NoopMemory` impl are in place; `on_job_complete` already captures
   incremental facts.
-- **Concrete embedding provider + the first real `Memory` impl.** Out of scope —
-  the trait + billed wrapper + all wiring are ready for one to drop in at the
-  single construction point in `runtime.rs::build_managers`.
+- **The first real `Memory` impl.** Out of scope — the trait + all wiring are
+  ready for one to drop in at the single construction point in
+  `runtime.rs::build_managers`. If/when a backend needs an embedding handle,
+  it constructs its own embedding client and threads it through `extra` (no
+  embedding scaffolding lives in the core).
 - Operator/GDPR wipe of memory rows: re-add behind a user-triggered command if a
   future backend needs it (no background sweeper — see CLAUDE.md).
 
@@ -173,7 +169,7 @@ These are the implementation's contract.
 | Module      | Role                                                                            |
 | ----------- | ------------------------------------------------------------------------------- |
 | `model`     | `MessageSource::RecalledMemory`, `ChatMessage::recalled_memory`                 |
-| `llm`       | `Attribution`; `EmbeddingClient` + `BillableEmbedding`/`BoundBilledEmbedding`   |
+| `llm`       | `Attribution`; `BillableLlm`/`BoundBilledLlm` (memory's billed chat handle)     |
 | `tools`     | `Tool` / `ToolManifest` for `Memory::tools()`                                   |
 | `context`   | `<recalled_memory>` framing + `append_recalled_memory` + budget                 |
 | `agent`     | Drives `recall` / `on_job_complete`; `AgentLoopConfig.memory`                   |

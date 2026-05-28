@@ -4,8 +4,8 @@
 //! (`Arc<dyn Memory>`), not a many-registry: at most one implementation is
 //! registered at startup. The trait is intentionally thin and
 //! **storage-opaque** — an implementation owns its own persistence (libsql, a
-//! vector DB, an external service) and receives its LLM + embedding handles and
-//! config in its own constructor.
+//! vector DB, an external service) and receives its LLM handle and config in
+//! its own constructor.
 //!
 //! Core ships the trait, its value types, and a [`NoopMemory`] default that
 //! does nothing; there is no real implementation here. The agent loop drives it
@@ -42,7 +42,7 @@ pub type Result<T> = std::result::Result<T, MemoryError>;
 /// real `(user, session, job)` this operation belongs to, plus the trace
 /// recorder and the enclosing `MemoryRecall` / `MemoryWrite` step.
 ///
-/// An impl that makes billed LLM / embedding sub-calls runs each through
+/// An impl that makes billed LLM sub-calls runs each through
 /// [`MemoryContext::scoped_llm_call`], which opens an `LlmCall` span **under the
 /// memory step** and hands back an [`Attribution`] bound to that span — so the
 /// spend the call records lands on a real span attributed to the real
@@ -89,14 +89,13 @@ impl MemoryContext {
         self.job_id
     }
 
-    /// Record a billed model sub-call (LLM or embedding) as an `LlmCall` span
-    /// under this operation's memory step, so the spend it records attributes to
-    /// a **real** span (and the real user/session/job), not an orphaned id. The
-    /// closure receives the [`Attribution`] bound to that span — bind your
-    /// billed client with it, make the call, and return its [`LlmCallResult`]
-    /// (token usage, for the span) alongside your value. Mirrors the agent
-    /// loop's own LLM-span discipline. Embedding calls are recorded as `LlmCall`
-    /// spans too — a model call is a model call for cost and trace purposes.
+    /// Record a billed LLM sub-call as an `LlmCall` span under this operation's
+    /// memory step, so the spend it records attributes to a **real** span (and
+    /// the real user/session/job), not an orphaned id. The closure receives the
+    /// [`Attribution`] bound to that span — bind your billed client with it,
+    /// make the call, and return its [`LlmCallResult`] (token usage, for the
+    /// span) alongside your value. Mirrors the agent loop's own LLM-span
+    /// discipline.
     pub async fn scoped_llm_call<F, Fut, T>(&self, begin: LlmCallBegin, body: F) -> Result<T>
     where
         F: FnOnce(Attribution) -> Fut,

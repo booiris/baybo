@@ -1,6 +1,5 @@
 pub mod billed;
 pub mod credentials;
-pub mod embedding;
 mod error;
 pub mod guard;
 pub mod multimodal;
@@ -38,10 +37,6 @@ use tracing::debug;
 pub use crate::billed::{
     Attribution, BilledChat, BilledChatResponse, BoundBilledLlm, CostHooks, LlmCostRecorder,
     SYSTEM_USER_ID,
-};
-pub use crate::embedding::{
-    BillableEmbedding, BilledEmbeddingResponse, BoundBilledEmbedding, EmbeddingClient,
-    EmbeddingResponse,
 };
 pub use crate::error::LlmError;
 pub(crate) use crate::error::{
