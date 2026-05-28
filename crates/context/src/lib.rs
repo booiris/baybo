@@ -1624,6 +1624,111 @@ mod frame_interjections_tests {
 }
 
 #[cfg(test)]
+mod frame_recalled_memories_tests {
+    //! Mirrors [`frame_interjections_tests`] for the recalled-memory
+    //! framing. Both wrappers delegate to one [`frame_source_runs`] helper,
+    //! but the framing body differs (recalled memory carries a "treat as
+    //! background you already know" preamble, not "the user just sent");
+    //! pinning each independently means a refactor to one envelope can't
+    //! silently regress the other.
+    use super::frame_recalled_memories;
+    use aura_model::{BlobRef, ChatMessage, ContentBlock, Role};
+
+    fn txt(s: &str) -> Vec<ContentBlock> {
+        vec![ContentBlock::Text(s.into())]
+    }
+
+    #[test]
+    fn non_recalled_rows_pass_through() {
+        let msgs = vec![
+            ChatMessage::user(txt("prompt")),
+            ChatMessage::assistant(txt("reply")),
+        ];
+        assert_eq!(frame_recalled_memories(&msgs), msgs);
+    }
+
+    #[test]
+    fn collapses_a_run_into_one_envelope() {
+        let msgs = vec![
+            ChatMessage::recalled_memory(txt("the user prefers Rust")),
+            ChatMessage::recalled_memory(txt("they dislike YAML")),
+        ];
+        let out = frame_recalled_memories(&msgs);
+        assert_eq!(out.len(), 1);
+        // Wire-only framing — the framed row lands as `Role::User` so the
+        // LLM payload converter (which doesn't understand
+        // `MessageSource::RecalledMemory`) accepts it.
+        assert_eq!(out[0].role, Role::User);
+        let ContentBlock::Text(t) = &out[0].content[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(t.matches("<recalled_memory>").count(), 1);
+        assert!(t.contains("the user prefers Rust\n\nthey dislike YAML"));
+    }
+
+    #[test]
+    fn recalled_after_tool_does_not_fold_into_prompt() {
+        // Mid-turn recall (e.g. a follow-up interjection triggered another
+        // recall pass) lands after a tool row: it should still get its own
+        // envelope rather than merging into the original prompt.
+        let msgs = vec![
+            ChatMessage::user(txt("do X")),
+            ChatMessage::assistant(txt("working")),
+            ChatMessage::tool(txt("result")),
+            ChatMessage::recalled_memory(txt("user is on macOS")),
+        ];
+        let out = frame_recalled_memories(&msgs);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], msgs[0]);
+        let ContentBlock::Text(t) = &out[3].content[0] else {
+            panic!("expected text block");
+        };
+        assert!(t.contains("<recalled_memory>") && t.contains("user is on macOS"));
+    }
+
+    #[test]
+    fn separate_runs_get_separate_envelopes() {
+        let msgs = vec![
+            ChatMessage::recalled_memory(txt("a")),
+            ChatMessage::assistant(txt("mid")),
+            ChatMessage::recalled_memory(txt("b")),
+        ];
+        let out = frame_recalled_memories(&msgs);
+        assert_eq!(out.len(), 3);
+        for idx in [0usize, 2] {
+            let ContentBlock::Text(t) = &out[idx].content[0] else {
+                panic!("expected text block");
+            };
+            assert_eq!(t.matches("<recalled_memory>").count(), 1);
+        }
+    }
+
+    #[test]
+    fn non_text_blocks_ride_after_envelope() {
+        // RecalledMemory rows are produced from `RecalledMemory.content`
+        // (text only today), but the framing helper is content-agnostic —
+        // mirror the interjection test to lock that contract.
+        let img = ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: "sha256:y".into(),
+            },
+            mime_type: "image/png".into(),
+        };
+        let msgs = vec![ChatMessage::recalled_memory(vec![
+            ContentBlock::Text("snippet about X".into()),
+            img.clone(),
+        ])];
+        let out = frame_recalled_memories(&msgs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content.len(), 2);
+        assert!(
+            matches!(&out[0].content[0], ContentBlock::Text(t) if t.contains("snippet about X"))
+        );
+        assert_eq!(out[0].content[1], img);
+    }
+}
+
+#[cfg(test)]
 mod merge_for_llm_tests {
     use super::merge_for_llm;
     use aura_model::{BlobRef, ChatMessage, ContentBlock, Role};
