@@ -201,14 +201,32 @@ pub(crate) use rig_provider_factory;
 // `api_key_env` follows each provider's documented convention where one
 // exists; `zai` / `xiaomimimo` don't have an established public env-var
 // name, so we adopt `<NAME>_API_KEY` as Aura's convention — operators
-// can override via `api_key_env` on the entry.
+// can override via `api_key_env` on the entry. `base_url` mirrors rig's
+// own baked-in `ProviderBuilder::BASE_URL` so the setup wizard prefills it
+// (without it operators saw an empty `Base URL: ` prompt and had to know
+// the canonical endpoint themselves); runtime forwarding is unchanged —
+// rig only sees the URL when the operator overrides it on the entry.
+
+// DeepSeek routes through rig's dedicated provider (not the generic OpenAI
+// client): it round-trips `reasoning_content` on assistant tool-call turns,
+// which DeepSeek's thinking mode requires echoed back.
+rig_provider_factory!(
+    DeepSeekProviderFactory,
+    "deepseek",
+    deepseek,
+    DeepSeek,
+    priced = catalog::DEEPSEEK_FLAT_DEFAULT_PRICING,
+    api_key_env = "DEEPSEEK_API_KEY",
+    base_url = "https://api.deepseek.com"
+);
 rig_provider_factory!(
     XaiProviderFactory,
     "xai",
     xai,
     Xai,
     priced = catalog::XAI_FLAT_DEFAULT_PRICING,
-    api_key_env = "XAI_API_KEY"
+    api_key_env = "XAI_API_KEY",
+    base_url = "https://api.x.ai"
 );
 rig_provider_factory!(
     MistralProviderFactory,
@@ -216,7 +234,8 @@ rig_provider_factory!(
     mistral,
     Mistral,
     priced = catalog::MISTRAL_FLAT_DEFAULT_PRICING,
-    api_key_env = "MISTRAL_API_KEY"
+    api_key_env = "MISTRAL_API_KEY",
+    base_url = "https://api.mistral.ai"
 );
 rig_provider_factory!(
     CohereProviderFactory,
@@ -224,7 +243,8 @@ rig_provider_factory!(
     cohere,
     Cohere,
     priced = catalog::COHERE_FLAT_DEFAULT_PRICING,
-    api_key_env = "COHERE_API_KEY"
+    api_key_env = "COHERE_API_KEY",
+    base_url = "https://api.cohere.ai"
 );
 rig_provider_factory!(
     PerplexityProviderFactory,
@@ -232,7 +252,8 @@ rig_provider_factory!(
     perplexity,
     Perplexity,
     priced = catalog::PERPLEXITY_FLAT_DEFAULT_PRICING,
-    api_key_env = "PERPLEXITY_API_KEY"
+    api_key_env = "PERPLEXITY_API_KEY",
+    base_url = "https://api.perplexity.ai"
 );
 rig_provider_factory!(
     MoonshotProviderFactory,
@@ -240,7 +261,8 @@ rig_provider_factory!(
     moonshot,
     Moonshot,
     priced = catalog::MOONSHOT_FLAT_DEFAULT_PRICING,
-    api_key_env = "MOONSHOT_API_KEY"
+    api_key_env = "MOONSHOT_API_KEY",
+    base_url = "https://api.moonshot.ai/v1"
 );
 rig_provider_factory!(
     ZaiProviderFactory,
@@ -248,7 +270,8 @@ rig_provider_factory!(
     zai,
     Zai,
     priced = catalog::ZAI_FLAT_DEFAULT_PRICING,
-    api_key_env = "ZAI_API_KEY"
+    api_key_env = "ZAI_API_KEY",
+    base_url = "https://api.z.ai/api/paas/v4"
 );
 rig_provider_factory!(
     XiaomiMimoProviderFactory,
@@ -256,57 +279,62 @@ rig_provider_factory!(
     xiaomimimo,
     XiaomiMimo,
     priced = catalog::XIAOMIMIMO_FLAT_DEFAULT_PRICING,
-    api_key_env = "XIAOMIMIMO_API_KEY"
+    api_key_env = "XIAOMIMIMO_API_KEY",
+    base_url = "https://api.xiaomimimo.com/v1"
 );
 
 // Inference hosts: they serve many models at varying rates and aren't a
-// single OpenRouter author prefix, so they ship no flat-default pricing (the
-// trait default of zero). Operators set per-token rates via `LlmConfig.pricing`
-// for budget accounting; without it these providers' usage records at zero cost.
-// `base_url` is intentionally omitted on rig hosts — rig's client already
-// knows the canonical endpoint, and the setup wizard's empty default
-// prompt accepts an enter-to-confirm.
+// single OpenRouter author prefix, so they ship no flat-default pricing
+// (the trait default of zero). Operators set per-token rates via
+// `LlmConfig.pricing` for budget accounting; without it these providers'
+// usage records at zero cost.
 rig_provider_factory!(
     GroqProviderFactory,
     "groq",
     groq,
     Groq,
-    api_key_env = "GROQ_API_KEY"
+    api_key_env = "GROQ_API_KEY",
+    base_url = "https://api.groq.com/openai/v1"
 );
 rig_provider_factory!(
     TogetherProviderFactory,
     "together",
     together,
     Together,
-    api_key_env = "TOGETHER_API_KEY"
+    api_key_env = "TOGETHER_API_KEY",
+    base_url = "https://api.together.xyz"
 );
 rig_provider_factory!(
     HyperbolicProviderFactory,
     "hyperbolic",
     hyperbolic,
     Hyperbolic,
-    api_key_env = "HYPERBOLIC_API_KEY"
+    api_key_env = "HYPERBOLIC_API_KEY",
+    base_url = "https://api.hyperbolic.xyz"
 );
 rig_provider_factory!(
     HuggingFaceProviderFactory,
     "huggingface",
     huggingface,
     HuggingFace,
-    api_key_env = "HF_TOKEN"
+    api_key_env = "HF_TOKEN",
+    base_url = "https://router.huggingface.co"
 );
 rig_provider_factory!(
     OllamaProviderFactory,
     "ollama",
     ollama,
     Ollama,
-    optional_key
+    optional_key,
+    base_url = "http://localhost:11434"
 );
 rig_provider_factory!(
     LlamafileProviderFactory,
     "llamafile",
     llamafile,
     Llamafile,
-    keyless
+    keyless,
+    base_url = "http://localhost:8080"
 );
 
 #[cfg(test)]
@@ -366,6 +394,7 @@ mod tests {
 
     #[test]
     fn model_author_factories_pin_provider_and_have_nonzero_flat_pricing() {
+        assert_priced_factory!(DeepSeekProviderFactory, "deepseek");
         assert_priced_factory!(XaiProviderFactory, "xai");
         assert_priced_factory!(MistralProviderFactory, "mistral");
         assert_priced_factory!(CohereProviderFactory, "cohere");

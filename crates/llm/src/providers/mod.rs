@@ -1,7 +1,6 @@
 // Internal: rig-backed providers stay crate-private — they're consumed
 // only through `LlmProviderRegistry::with_default_providers()`.
 pub(crate) mod anthropic;
-pub(crate) mod deepseek;
 pub(crate) mod gemini;
 pub(crate) mod minimax;
 pub(crate) mod openai;

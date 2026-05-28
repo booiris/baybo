@@ -1412,17 +1412,35 @@ mod provider_metadata_helpers_tests {
     }
 
     #[test]
-    fn macro_factories_advertise_api_key_env_without_base_url() {
-        // Macro-generated rig provider that supplied `api_key_env` but
-        // not `base_url`: env round-trips, URL stays None (rig client's
-        // baked-in default is what runs).
+    fn macro_factories_advertise_api_key_env_and_base_url() {
+        // Macro-generated rig providers mirror rig's baked-in
+        // `ProviderBuilder::BASE_URL` so the setup wizard prefills it
+        // instead of showing an empty `Base URL: ` prompt; the env-var
+        // convention also round-trips.
         assert_eq!(default_api_key_env_for_provider("xai"), Some("XAI_API_KEY"));
-        assert!(default_base_url_for_provider("xai").is_none());
+        assert_eq!(
+            default_base_url_for_provider("xai"),
+            Some("https://api.x.ai"),
+        );
 
         // HuggingFace's convention is `HF_TOKEN`, not `*_API_KEY`.
         assert_eq!(
             default_api_key_env_for_provider("huggingface"),
             Some("HF_TOKEN"),
+        );
+        assert_eq!(
+            default_base_url_for_provider("huggingface"),
+            Some("https://router.huggingface.co"),
+        );
+
+        // Keyless/optional-key hosts still surface their default endpoint.
+        assert_eq!(
+            default_base_url_for_provider("ollama"),
+            Some("http://localhost:11434"),
+        );
+        assert_eq!(
+            default_base_url_for_provider("llamafile"),
+            Some("http://localhost:8080"),
         );
 
         // Macro-converted gemini supplies both kwargs.

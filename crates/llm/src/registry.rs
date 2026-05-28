@@ -6,16 +6,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::providers::{
     anthropic::AnthropicProviderFactory,
-    deepseek::DeepSeekProviderFactory,
     gemini::GeminiProviderFactory,
     minimax::MiniMaxProviderFactory,
     openai::OpenAIProviderFactory,
     openai_subscription::OpenAiSubscriptionProviderFactory,
     rig_providers::{
-        CohereProviderFactory, GroqProviderFactory, HuggingFaceProviderFactory,
-        HyperbolicProviderFactory, LlamafileProviderFactory, MistralProviderFactory,
-        MoonshotProviderFactory, OllamaProviderFactory, PerplexityProviderFactory,
-        TogetherProviderFactory, XaiProviderFactory, XiaomiMimoProviderFactory, ZaiProviderFactory,
+        CohereProviderFactory, DeepSeekProviderFactory, GroqProviderFactory,
+        HuggingFaceProviderFactory, HyperbolicProviderFactory, LlamafileProviderFactory,
+        MistralProviderFactory, MoonshotProviderFactory, OllamaProviderFactory,
+        PerplexityProviderFactory, TogetherProviderFactory, XaiProviderFactory,
+        XiaomiMimoProviderFactory, ZaiProviderFactory,
     },
 };
 use crate::{BillableLlm, BlobFetcher, CostHooks, LlmClient, LlmCompletion};
