@@ -280,8 +280,6 @@ impl AgentTestHarnessBuilder {
         self
     }
 
-    /// Wire everything and spawn the `AgentActor`. The returned harness
-    /// owns the mailbox sender and the response receiver.
     /// Wire a [`aura_memory::Memory`] impl into the loop so a test can assert
     /// the recall / `on_job_complete` hooks fire. Defaults to `None` (inert).
     pub fn with_memory(mut self, memory: Arc<dyn aura_memory::Memory>) -> Self {
@@ -289,6 +287,8 @@ impl AgentTestHarnessBuilder {
         self
     }
 
+    /// Wire everything and spawn the `AgentActor`. The returned harness
+    /// owns the mailbox sender and the response receiver.
     pub fn build(self) -> AgentTestHarness {
         let session = self
             .session

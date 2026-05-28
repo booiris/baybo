@@ -515,7 +515,6 @@ impl AgentLoop {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn run_inner(
         &mut self,
         session: &mut Session,
