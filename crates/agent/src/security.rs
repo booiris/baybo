@@ -680,9 +680,7 @@ impl aura_tools::SecretAccess for SecurityGateway {
                 .await
                 .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?
                 .ok_or_else(|| {
-                    aura_tools::ToolError::InvalidParams(format!(
-                        "secret '{name}' not found; add it with `aura secret add` first"
-                    ))
+                    aura_tools::ToolError::InvalidParams(format!("secret '{name}' not found"))
                 })?;
             let plaintext = value
                 .as_str()
