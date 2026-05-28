@@ -73,6 +73,16 @@ impl LlmProviderFactory for OpenAiSubscriptionProviderFactory {
         PROVIDER_NAME
     }
 
+    fn default_base_url(&self) -> Option<&'static str> {
+        Some(super::DEFAULT_BASE_URL)
+    }
+
+    // No `default_api_key_env` override: this provider's credential is
+    // an OAuth bearer in the secret vault, not an env-var-backed API
+    // key. Leaving the trait default (`None`) keeps `resolve_api_key`'s
+    // env fallback from accidentally treating an unrelated env var as
+    // the bearer.
+
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let model = build_model(config, BackgroundRefresh::Enabled)?;
         let defaults = crate::providers::factory_defaults_for(PROVIDER_NAME);

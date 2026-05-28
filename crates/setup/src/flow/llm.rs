@@ -17,15 +17,6 @@ use aura_security::SecretVault;
 use crate::error::{Result, SetupError};
 use crate::prompt::Prompter;
 
-const BUILTIN_PROVIDERS: &[&str] = &[
-    "openai",
-    "anthropic",
-    "gemini",
-    "minimax",
-    "deepseek",
-    SUB_PROVIDER_NAME,
-];
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum LlmStepOutcome {
     Added(Box<LlmEntry>),
@@ -76,8 +67,13 @@ async fn add_entry<P: Prompter>(
             url: p.url.clone(),
             no_proxy: p.no_proxy.clone(),
         });
-    let provider_idx = prompter.select("Provider:", BUILTIN_PROVIDERS)?;
-    let provider = BUILTIN_PROVIDERS[provider_idx].to_string();
+    // Drive the picker from the default registry — adding a provider
+    // (via `with_default_providers`) is enough to make it appear here,
+    // in registration order.
+    let registry = LlmProviderRegistry::with_default_providers();
+    let provider_names = registry.provider_names();
+    let provider_idx = prompter.select("Provider:", &provider_names)?;
+    let provider = provider_names[provider_idx].to_string();
 
     let default_name = unique_default_name(&provider, &config.llm);
     let name = prompter.text("Entry name", &default_name)?;

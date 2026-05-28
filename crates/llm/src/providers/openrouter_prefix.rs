@@ -14,6 +14,13 @@ pub(crate) const OPENROUTER_PROVIDER_PREFIXES: &[(&str, &str)] = &[
     ("minimax", "minimax"),
     ("deepseek", "deepseek"),
     ("gemini", "google"),
+    ("xai", "x-ai"),
+    ("mistral", "mistralai"),
+    ("cohere", "cohere"),
+    ("perplexity", "perplexity"),
+    ("moonshot", "moonshotai"),
+    ("zai", "z-ai"),
+    ("xiaomimimo", "xiaomi"),
 ];
 
 // OpenRouter catalog prefix for an Aura provider, or `None` when the

@@ -12,6 +12,7 @@ mod tool_name;
 pub mod test_support;
 
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 
 use futures::stream::{Stream, StreamExt};
@@ -25,7 +26,10 @@ use rig::completion::{
     ToolDefinition,
 };
 use rig::message::{Message, Text, UserContent};
-use rig::providers::{anthropic, deepseek, gemini, openai};
+use rig::providers::{
+    anthropic, cohere, deepseek, gemini, groq, huggingface, hyperbolic, llamafile, minimax,
+    mistral, moonshot, ollama, openai, perplexity, together, xai, xiaomimimo, zai,
+};
 use rig::streaming::{self, StreamedAssistantContent};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -44,20 +48,36 @@ pub use crate::registry::{
     LiveModelInfo, LlmPricingOverride, LlmProviderConfig, LlmProviderRegistry,
 };
 
-/// Default chat-completion base URL for each built-in provider id.
-/// `None` for unknown providers — the operator must supply one.
+/// Process-wide handle to the default provider registry. Lazily
+/// constructed on first lookup, shared by the metadata-helper fns
+/// below. The default registry is pure (registers stack-built unit
+/// factories, no I/O) so first-touch latency is negligible.
+fn default_registry() -> &'static LlmProviderRegistry {
+    static REGISTRY: OnceLock<LlmProviderRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(LlmProviderRegistry::with_default_providers)
+}
+
+/// Default chat-completion base URL each built-in factory advertises.
+/// Resolves through the default registry so a new provider only has to
+/// declare its URL via [`crate::registry::LlmProviderFactory::default_base_url`]
+/// (or the `base_url = …` macro kwarg) — no separate match arm here.
+/// `None` for providers that don't advertise a canonical default; the
+/// runtime falls through to whatever the underlying rig client bakes
+/// in, and the setup wizard shows an empty default prompt.
 pub fn default_base_url_for_provider(provider: &str) -> Option<&'static str> {
-    match provider {
-        "openai" => Some(crate::providers::openai::OPENAI_DEFAULT_BASE_URL),
-        "anthropic" => Some(crate::providers::anthropic::ANTHROPIC_DEFAULT_BASE_URL),
-        "gemini" => Some(crate::providers::gemini::GEMINI_DEFAULT_BASE_URL),
-        "minimax" => Some(crate::providers::minimax::MINIMAX_DEFAULT_BASE_URL),
-        "deepseek" => Some(crate::providers::deepseek::DEEPSEEK_DEFAULT_BASE_URL),
-        crate::providers::openai_subscription::PROVIDER_NAME => {
-            Some(crate::providers::openai_subscription::DEFAULT_BASE_URL)
-        }
-        _ => None,
-    }
+    default_registry().factory_for(provider)?.default_base_url()
+}
+
+/// Conventional env var each built-in factory advertises for its API
+/// key. Resolves through the default registry; the last-resort fallback
+/// in [`crate::credentials::resolve_api_key`] consults this when neither
+/// an explicit `api_key_env` nor the per-entry vault key is set.
+/// `None` for keyless / OAuth providers and for providers without a
+/// well-known env-var convention.
+pub fn default_api_key_env_for_provider(provider: &str) -> Option<&'static str> {
+    default_registry()
+        .factory_for(provider)?
+        .default_api_key_env()
 }
 
 /// Strip `; charset=…` and lowercase, then map common MIME strings to
@@ -420,10 +440,46 @@ pub(crate) enum AnyCompletionModel {
     /// DeepSeek's dedicated provider — round-trips `reasoning_content`
     /// on assistant tool-call turns, which thinking mode requires.
     DeepSeek(deepseek::CompletionModel),
+    /// Additional rig-backed providers (see `providers::rig_providers`).
+    /// All speak through rig's uniform completion model, so they share the
+    /// generic `from_rig_stream` path.
+    Xai(xai::completion::CompletionModel),
+    Mistral(mistral::completion::CompletionModel),
+    Cohere(cohere::CompletionModel),
+    Perplexity(perplexity::CompletionModel),
+    Moonshot(moonshot::CompletionModel),
+    Zai(openai::completion::GenericCompletionModel<zai::ZAiExt>),
+    XiaomiMimo(openai::completion::GenericCompletionModel<xiaomimimo::XiaomiMimoExt>),
+    /// MiniMax via rig's dedicated provider on its Anthropic-compatible
+    /// surface — shares Anthropic's cache-bucket folding and stream path.
+    Minimax(anthropic::completion::GenericCompletionModel<minimax::MiniMaxAnthropicExt>),
+    /// Inference hosts (see `providers::rig_providers`). Also rig-backed,
+    /// so they share the generic `from_rig_stream` path.
+    Groq(groq::CompletionModel),
+    Together(together::completion::CompletionModel),
+    Ollama(ollama::CompletionModel),
+    Llamafile(llamafile::CompletionModel),
+    Hyperbolic(hyperbolic::CompletionModel),
+    HuggingFace(huggingface::completion::CompletionModel),
     /// ChatGPT/Codex OAuth subscription path. Doesn't go through rig — the
     /// Codex Responses API uses a different request shape and needs custom
     /// auth + 401-refresh handling. See `providers::openai_subscription`.
     OpenAiSubscription(crate::providers::openai_subscription::OpenAiSubscriptionCompletionModel),
+}
+
+/// Erase a provider `CompletionResponse<R>`'s raw-response payload for the
+/// agent loop. For OpenAI-compatible rig providers that need no per-field
+/// usage massaging (unlike Anthropic's cache folding / Gemini's cache
+/// re-derivation).
+fn repack_completion<R>(
+    resp: completion::CompletionResponse<R>,
+) -> completion::CompletionResponse<()> {
+    completion::CompletionResponse {
+        choice: resp.choice,
+        usage: resp.usage,
+        raw_response: (),
+        message_id: resp.message_id,
+    }
 }
 
 impl AnyCompletionModel {
@@ -470,15 +526,31 @@ impl AnyCompletionModel {
                     message_id: resp.message_id,
                 })
             }
-            Self::DeepSeek(m) => {
+            Self::DeepSeek(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Xai(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Mistral(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Cohere(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Perplexity(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Moonshot(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Zai(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::XiaomiMimo(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Minimax(m) => {
                 let resp = m.completion(request).await?;
+                let mut usage = resp.usage;
+                fold_anthropic_cache_into_total(&mut usage);
                 Ok(completion::CompletionResponse {
                     choice: resp.choice,
-                    usage: resp.usage,
+                    usage,
                     raw_response: (),
                     message_id: resp.message_id,
                 })
             }
+            Self::Groq(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Together(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Ollama(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Llamafile(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Hyperbolic(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::HuggingFace(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::OpenAiSubscription(m) => m.completion(request).await,
         }
     }
@@ -500,10 +572,21 @@ impl AnyCompletionModel {
                 let stream = m.stream(request).await?;
                 Ok(LlmStream::from_gemini_stream(stream))
             }
-            Self::DeepSeek(m) => {
-                let stream = m.stream(request).await?;
-                Ok(LlmStream::from_rig_stream(stream))
-            }
+            Self::DeepSeek(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Xai(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Mistral(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Cohere(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Perplexity(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Moonshot(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Zai(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::XiaomiMimo(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Minimax(m) => Ok(LlmStream::from_anthropic_stream(m.stream(request).await?)),
+            Self::Groq(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Together(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Ollama(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Llamafile(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Hyperbolic(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::HuggingFace(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::OpenAiSubscription(m) => m.stream(request).await,
         }
     }
@@ -1301,5 +1384,100 @@ mod cost_normalization_tests {
         };
         fold_token_usage_cache_into_total(&mut u);
         assert_eq!(u.input_tokens, 100);
+    }
+}
+
+#[cfg(test)]
+mod provider_metadata_helpers_tests {
+    //! Pin: the setup wizard's "Base URL" prompt and `resolve_api_key`'s
+    //! last-resort env fallback both read from these helpers. If the
+    //! registry walk regresses, a new provider added via the macro
+    //! would silently lose its env-var fallback / URL hint and the
+    //! wizard would show empty prompts for it.
+
+    use super::*;
+
+    #[test]
+    fn hand_written_factories_advertise_their_metadata() {
+        // Hand-written `priced=`-style provider (anthropic): URL +
+        // canonical env both round-trip.
+        assert_eq!(
+            default_base_url_for_provider("anthropic"),
+            Some("https://api.anthropic.com"),
+        );
+        assert_eq!(
+            default_api_key_env_for_provider("anthropic"),
+            Some("ANTHROPIC_API_KEY"),
+        );
+    }
+
+    #[test]
+    fn macro_factories_advertise_api_key_env_and_base_url() {
+        // Macro-generated rig providers mirror rig's baked-in
+        // `ProviderBuilder::BASE_URL` so the setup wizard prefills it
+        // instead of showing an empty `Base URL: ` prompt; the env-var
+        // convention also round-trips.
+        assert_eq!(default_api_key_env_for_provider("xai"), Some("XAI_API_KEY"));
+        assert_eq!(
+            default_base_url_for_provider("xai"),
+            Some("https://api.x.ai"),
+        );
+
+        // HuggingFace's convention is `HF_TOKEN`, not `*_API_KEY`.
+        assert_eq!(
+            default_api_key_env_for_provider("huggingface"),
+            Some("HF_TOKEN"),
+        );
+        assert_eq!(
+            default_base_url_for_provider("huggingface"),
+            Some("https://router.huggingface.co"),
+        );
+
+        // Keyless/optional-key hosts still surface their default endpoint.
+        assert_eq!(
+            default_base_url_for_provider("ollama"),
+            Some("http://localhost:11434"),
+        );
+        assert_eq!(
+            default_base_url_for_provider("llamafile"),
+            Some("http://localhost:8080"),
+        );
+
+        // Macro-converted gemini supplies both kwargs.
+        assert_eq!(
+            default_api_key_env_for_provider("gemini"),
+            Some("GEMINI_API_KEY"),
+        );
+        assert_eq!(
+            default_base_url_for_provider("gemini"),
+            Some("https://generativelanguage.googleapis.com"),
+        );
+    }
+
+    #[test]
+    fn oauth_and_keyless_providers_expose_no_env_var() {
+        // Subscription provider is OAuth-only — must NOT advertise an
+        // env var (would mislead `resolve_api_key` into reading some
+        // unrelated env). Base URL is still present for the wizard.
+        assert!(default_api_key_env_for_provider("openai-subscription").is_none());
+        assert_eq!(
+            default_base_url_for_provider("openai-subscription"),
+            Some("https://chatgpt.com/backend-api"),
+        );
+
+        // llamafile is keyless, ollama has an optional key — both
+        // leave env empty (operators wire `api_key_env` per-entry if
+        // their deployment needs one).
+        assert!(default_api_key_env_for_provider("llamafile").is_none());
+        assert!(default_api_key_env_for_provider("ollama").is_none());
+    }
+
+    #[test]
+    fn unregistered_provider_yields_none_for_both() {
+        // Sanity: lookup for an unknown name short-circuits at
+        // `factory_for`, so neither helper accidentally falls back to
+        // some unrelated factory's metadata.
+        assert!(default_api_key_env_for_provider("not-a-real-provider").is_none());
+        assert!(default_base_url_for_provider("not-a-real-provider").is_none());
     }
 }

@@ -1,10 +1,10 @@
 // Internal: rig-backed providers stay crate-private — they're consumed
 // only through `LlmProviderRegistry::with_default_providers()`.
 pub(crate) mod anthropic;
-pub(crate) mod deepseek;
 pub(crate) mod gemini;
 pub(crate) mod minimax;
 pub(crate) mod openai;
+pub(crate) mod rig_providers;
 
 // Public: the subscription provider's OAuth surface (PKCE / device-code
 // flows, vault token store) is consumed by `aura-cli` for the OAuth

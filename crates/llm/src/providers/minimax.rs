@@ -1,5 +1,5 @@
 use rig::client::CompletionClient;
-use rig::providers::anthropic;
+use rig::providers::minimax;
 use serde::Deserialize;
 
 use crate::registry::{LiveModelInfo, LlmProviderConfig, LlmProviderFactory};
@@ -13,10 +13,11 @@ const MINIMAX_DEFAULT_MODELS_BASE: &str = "https://api.minimaxi.com/v1";
 
 /// Factory that creates `LlmClient` instances configured for MiniMax models.
 ///
-/// MiniMax exposes an Anthropic-compatible Messages API, so we route
-/// through rig's Anthropic client with the MiniMax base URL pinned by
-/// default. Operators can override `base_url` (e.g. the international
-/// `https://api.minimax.io/anthropic` endpoint) via `LlmConfig.base_url`.
+/// Routes through rig's dedicated MiniMax provider on its
+/// Anthropic-compatible Messages surface (`AnthropicClient`), with the
+/// China-cluster base URL pinned by default. Operators can override
+/// `base_url` (e.g. the international `https://api.minimax.io/anthropic`
+/// endpoint) via `LlmConfig.base_url`.
 pub struct MiniMaxProviderFactory;
 
 #[async_trait::async_trait]
@@ -32,6 +33,14 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
         crate::providers::catalog::MINIMAX_FLAT_DEFAULT_PRICING
     }
 
+    fn default_base_url(&self) -> Option<&'static str> {
+        Some(MINIMAX_DEFAULT_BASE_URL)
+    }
+
+    fn default_api_key_env(&self) -> Option<&'static str> {
+        Some("MINIMAX_API_KEY")
+    }
+
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let api_key = config
             .api_key
@@ -43,7 +52,7 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
             .as_deref()
             .unwrap_or(MINIMAX_DEFAULT_BASE_URL);
 
-        let client = anthropic::Client::builder()
+        let client = minimax::AnthropicClient::builder()
             .api_key(api_key)
             .base_url(base_url)
             .http_client(crate::proxied_client(config.proxy.as_ref())?)
@@ -71,7 +80,7 @@ impl LlmProviderFactory for MiniMaxProviderFactory {
 
         Ok(LlmClient::new(
             model_info,
-            AnyCompletionModel::Anthropic(model),
+            AnyCompletionModel::Minimax(model),
         ))
     }
 

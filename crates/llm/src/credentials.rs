@@ -39,14 +39,11 @@ pub async fn resolve_api_key(
             return Some(s.to_string());
         }
     }
-    match provider {
-        "openai" => std::env::var("OPENAI_API_KEY").ok(),
-        "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
-        "gemini" => std::env::var("GEMINI_API_KEY").ok(),
-        "minimax" => std::env::var("MINIMAX_API_KEY").ok(),
-        "deepseek" => std::env::var("DEEPSEEK_API_KEY").ok(),
-        _ => None,
-    }
+    // Last-resort fallback: the provider's factory advertises its
+    // conventional env var (e.g. `OPENAI_API_KEY`); we read it from
+    // the process env if present. Adding a new provider is enough to
+    // extend the fallback — no list to update here.
+    crate::default_api_key_env_for_provider(provider).and_then(|env| std::env::var(env).ok())
 }
 
 #[cfg(test)]

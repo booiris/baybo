@@ -23,6 +23,14 @@ impl LlmProviderFactory for OpenAIProviderFactory {
         crate::providers::catalog::OPENAI_FLAT_DEFAULT_PRICING
     }
 
+    fn default_base_url(&self) -> Option<&'static str> {
+        Some(OPENAI_DEFAULT_BASE_URL)
+    }
+
+    fn default_api_key_env(&self) -> Option<&'static str> {
+        Some("OPENAI_API_KEY")
+    }
+
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let api_key = config
             .api_key
