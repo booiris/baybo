@@ -5,9 +5,18 @@ use aura_security::SecretVault;
 use serde::{Deserialize, Serialize};
 
 use crate::providers::{
-    anthropic::AnthropicProviderFactory, deepseek::DeepSeekProviderFactory,
-    gemini::GeminiProviderFactory, minimax::MiniMaxProviderFactory, openai::OpenAIProviderFactory,
+    anthropic::AnthropicProviderFactory,
+    deepseek::DeepSeekProviderFactory,
+    gemini::GeminiProviderFactory,
+    minimax::MiniMaxProviderFactory,
+    openai::OpenAIProviderFactory,
     openai_subscription::OpenAiSubscriptionProviderFactory,
+    rig_providers::{
+        CohereProviderFactory, GroqProviderFactory, HuggingFaceProviderFactory,
+        HyperbolicProviderFactory, LlamafileProviderFactory, MistralProviderFactory,
+        MoonshotProviderFactory, OllamaProviderFactory, PerplexityProviderFactory,
+        TogetherProviderFactory, XaiProviderFactory, XiaomiMimoProviderFactory, ZaiProviderFactory,
+    },
 };
 use crate::{BillableLlm, BlobFetcher, CostHooks, LlmClient, LlmCompletion};
 
@@ -178,6 +187,19 @@ impl LlmProviderRegistry {
         registry.register(GeminiProviderFactory);
         registry.register(MiniMaxProviderFactory);
         registry.register(DeepSeekProviderFactory);
+        registry.register(XaiProviderFactory);
+        registry.register(MistralProviderFactory);
+        registry.register(CohereProviderFactory);
+        registry.register(PerplexityProviderFactory);
+        registry.register(MoonshotProviderFactory);
+        registry.register(ZaiProviderFactory);
+        registry.register(XiaomiMimoProviderFactory);
+        registry.register(GroqProviderFactory);
+        registry.register(TogetherProviderFactory);
+        registry.register(OllamaProviderFactory);
+        registry.register(LlamafileProviderFactory);
+        registry.register(HyperbolicProviderFactory);
+        registry.register(HuggingFaceProviderFactory);
         registry.register(OpenAiSubscriptionProviderFactory);
         registry
     }

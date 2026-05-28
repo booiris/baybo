@@ -25,7 +25,10 @@ use rig::completion::{
     ToolDefinition,
 };
 use rig::message::{Message, Text, UserContent};
-use rig::providers::{anthropic, deepseek, gemini, openai};
+use rig::providers::{
+    anthropic, cohere, deepseek, gemini, groq, huggingface, hyperbolic, llamafile, mistral,
+    moonshot, ollama, openai, perplexity, together, xai, xiaomimimo, zai,
+};
 use rig::streaming::{self, StreamedAssistantContent};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -420,10 +423,43 @@ pub(crate) enum AnyCompletionModel {
     /// DeepSeek's dedicated provider — round-trips `reasoning_content`
     /// on assistant tool-call turns, which thinking mode requires.
     DeepSeek(deepseek::CompletionModel),
+    /// Additional rig-backed providers (see `providers::rig_providers`).
+    /// All speak through rig's uniform completion model, so they share the
+    /// generic `from_rig_stream` path.
+    Xai(xai::completion::CompletionModel),
+    Mistral(mistral::completion::CompletionModel),
+    Cohere(cohere::CompletionModel),
+    Perplexity(perplexity::CompletionModel),
+    Moonshot(moonshot::CompletionModel),
+    Zai(openai::completion::GenericCompletionModel<zai::ZAiExt>),
+    XiaomiMimo(openai::completion::GenericCompletionModel<xiaomimimo::XiaomiMimoExt>),
+    /// Inference hosts (see `providers::rig_providers`). Also rig-backed,
+    /// so they share the generic `from_rig_stream` path.
+    Groq(groq::CompletionModel),
+    Together(together::completion::CompletionModel),
+    Ollama(ollama::CompletionModel),
+    Llamafile(llamafile::CompletionModel),
+    Hyperbolic(hyperbolic::CompletionModel),
+    HuggingFace(huggingface::completion::CompletionModel),
     /// ChatGPT/Codex OAuth subscription path. Doesn't go through rig — the
     /// Codex Responses API uses a different request shape and needs custom
     /// auth + 401-refresh handling. See `providers::openai_subscription`.
     OpenAiSubscription(crate::providers::openai_subscription::OpenAiSubscriptionCompletionModel),
+}
+
+/// Erase a provider `CompletionResponse<R>`'s raw-response payload for the
+/// agent loop. For OpenAI-compatible rig providers that need no per-field
+/// usage massaging (unlike Anthropic's cache folding / Gemini's cache
+/// re-derivation).
+fn repack_completion<R>(
+    resp: completion::CompletionResponse<R>,
+) -> completion::CompletionResponse<()> {
+    completion::CompletionResponse {
+        choice: resp.choice,
+        usage: resp.usage,
+        raw_response: (),
+        message_id: resp.message_id,
+    }
 }
 
 impl AnyCompletionModel {
@@ -470,15 +506,20 @@ impl AnyCompletionModel {
                     message_id: resp.message_id,
                 })
             }
-            Self::DeepSeek(m) => {
-                let resp = m.completion(request).await?;
-                Ok(completion::CompletionResponse {
-                    choice: resp.choice,
-                    usage: resp.usage,
-                    raw_response: (),
-                    message_id: resp.message_id,
-                })
-            }
+            Self::DeepSeek(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Xai(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Mistral(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Cohere(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Perplexity(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Moonshot(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Zai(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::XiaomiMimo(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Groq(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Together(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Ollama(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Llamafile(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Hyperbolic(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::HuggingFace(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::OpenAiSubscription(m) => m.completion(request).await,
         }
     }
@@ -500,10 +541,20 @@ impl AnyCompletionModel {
                 let stream = m.stream(request).await?;
                 Ok(LlmStream::from_gemini_stream(stream))
             }
-            Self::DeepSeek(m) => {
-                let stream = m.stream(request).await?;
-                Ok(LlmStream::from_rig_stream(stream))
-            }
+            Self::DeepSeek(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Xai(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Mistral(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Cohere(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Perplexity(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Moonshot(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Zai(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::XiaomiMimo(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Groq(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Together(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Ollama(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Llamafile(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Hyperbolic(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::HuggingFace(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::OpenAiSubscription(m) => m.stream(request).await,
         }
     }
