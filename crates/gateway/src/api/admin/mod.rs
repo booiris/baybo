@@ -1,5 +1,5 @@
 //! Admin surface (TCP + bearer token). Hosts config/status/jobs/cron/
-//! memory/traces/skills/tools/llm and a read-only channel list. No chat
+//! traces/skills/tools/llm and a read-only channel list. No chat
 //! content flows through these endpoints.
 
 pub mod analytics;
@@ -10,7 +10,6 @@ pub mod cron;
 pub mod jobs;
 pub mod llm;
 pub mod logs;
-pub mod memory;
 pub mod skills;
 pub mod status;
 pub mod tools;
@@ -31,14 +30,13 @@ use crate::server::AdminState;
 #[openapi(
     info(
         title = "Aura Admin API",
-        description = "TCP + bearer-token surface: config, jobs, cron, memory, traces, skills, tools, channels, LLM."
+        description = "TCP + bearer-token surface: config, jobs, cron, traces, skills, tools, channels, LLM."
     ),
     tags(
         (name = "status", description = "Gateway process status"),
         (name = "config", description = "Read and mutate on-disk AuraConfig"),
         (name = "jobs", description = "Async operation tracking"),
         (name = "cron", description = "Scheduled prompts / tool calls"),
-        (name = "memory", description = "Long-term memory entries"),
         (name = "traces", description = "Per-session trace export"),
         (name = "analytics", description = "Aggregated cost / session activity dashboards"),
         (name = "skills", description = "Registered skills"),
@@ -63,7 +61,6 @@ pub fn v1_router_and_spec() -> (Router<AdminState>, OpenApiDoc) {
         .merge(config::routes())
         .merge(jobs::routes())
         .merge(cron::routes())
-        .merge(memory::routes())
         .merge(traces::routes())
         .merge(analytics::routes())
         .merge(skills::routes())

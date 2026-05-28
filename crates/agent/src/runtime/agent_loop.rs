@@ -9,13 +9,15 @@ use aura_llm::{
     Attribution, BillableLlm, BoundBilledLlm, ChatRequest, LlmResponse, StreamEvent, TokenUsage,
     ToolDefinitionForLlm,
 };
+use aura_memory::{Memory, MemoryContext};
 use aura_model::{
-    ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SystemSpawnRequest, ThinkingContent,
+    ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SessionId, SystemSpawnRequest,
+    ThinkingContent,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use aura_model::Session;
+use aura_model::{LineageKind, Session, TriggerSource};
 use aura_tools::{ToolOutput, ToolRegistry};
 use aura_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
@@ -223,9 +225,29 @@ impl aura_tools::SessionNotifier for DeltaTxNotifier {
 /// and closes the step before the parent loop runs the next thing.
 enum IterationOutcome {
     /// Final assistant response — caller returns this from `run_inner`.
-    Final(OutgoingMessage),
+    /// `outgoing` is the channel-bound message (may include intermediate
+    /// `ToolUse` blocks + channel-only attachments concatenated after the
+    /// reply); `assistant_reply` is the actual persisted assistant turn
+    /// (text / thinking blocks only — what `ChatMessage::assistant(...)`
+    /// was constructed with). The split exists so `Memory::on_job_complete`
+    /// can see the assistant's last turn per its trait contract instead of
+    /// the channel-augmented view.
+    Final {
+        outgoing: OutgoingMessage,
+        assistant_reply: Vec<ContentBlock>,
+    },
     /// LLM emitted tool calls; loop continues.
     Continue,
+}
+
+/// Captured inputs for the deferred `Memory::on_job_complete` write. Built
+/// inside `with_job`'s body at the Final-iteration boundary and returned up
+/// so `run()` can fire `spawn_job_complete_write` **after** `with_job`
+/// commits the job — otherwise a cancel-race in `with_job`'s post-body
+/// window could let a memorized turn outlive a `Cancelled` job row.
+struct PendingMemoryWrite {
+    user_input: Vec<ContentBlock>,
+    final_output: Vec<ContentBlock>,
 }
 
 /// Source of mid-turn user messages ("interjections") that arrived while the
@@ -243,6 +265,55 @@ pub trait InterjectionSource: Send {
 }
 
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
+/// The recall query for a job, or `None` for job kinds that don't recall.
+/// Memory recall/write run only for `UserChat` and `Cron` jobs — `System`,
+/// `Spawned` (subagent), and `SubagentNotification` have no direct user input
+/// and would pollute or double-write. The exhaustive match forces a
+/// classification when a new `JobInput` variant is added.
+fn memory_recall_query(input: &JobInput) -> Option<Vec<ContentBlock>> {
+    match input {
+        JobInput::UserChat { content } => Some(content.clone()),
+        JobInput::Cron { action_payload } => Some(cron_prompt_blocks(action_payload)),
+        JobInput::System { .. }
+        | JobInput::Spawned { .. }
+        | JobInput::SubagentNotification { .. } => None,
+    }
+}
+
+/// Best-effort extraction of a cron fire's prompt text for the recall query.
+/// The cron router writes `action_payload` as `{cron_job_id, prompt}` (an
+/// opaque trace blob — see `aura_job::JobInput::Cron`); a missing or non-string
+/// `prompt` yields an empty query, so recall degrades to a no-op rather than
+/// coupling hard to that shape.
+fn cron_prompt_blocks(action_payload: &serde_json::Value) -> Vec<ContentBlock> {
+    match action_payload.get("prompt").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => vec![ContentBlock::Text(p.to_string())],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether the `on_session_end` memory hook should fire for this session.
+/// The session-level analogue of [`memory_recall_query`]: only sessions a person
+/// would call "theirs" — root `User`/`Cron` sessions and `UserFork` branches.
+/// Subagent, `SystemMaintenance`, and `System`-triggered (background
+/// compression) actors all send `ActorStop` when they finish, but their
+/// shutdown is not a user-session ending. Exhaustive arms force a
+/// classification when a new `TriggerSource` / `LineageKind` variant is added.
+fn should_fire_session_end(session: &Session) -> bool {
+    let user_trigger = match &session.trigger {
+        TriggerSource::User | TriggerSource::Cron { .. } => true,
+        TriggerSource::System { .. } => false,
+    };
+    let user_lineage = match &session.lineage {
+        None => true,
+        Some(l) => match &l.kind {
+            LineageKind::UserFork { .. } => true,
+            LineageKind::Subagent | LineageKind::SystemMaintenance => false,
+        },
+    };
+    user_trigger && user_lineage
+}
+
 pub struct AgentLoop {
     /// Currently-active client, re-resolved from `llm_pool` at the
     /// start of each turn ([`Self::refresh_active_llm`]) so a config
@@ -284,6 +355,10 @@ pub struct AgentLoop {
     /// Distinct from the `SessionManager` plumbed inside
     /// `ContextManager` because that one is per-session-bound.
     sessions: Option<Arc<crate::SessionManager>>,
+    /// Pluggable long-term memory. `None` disables every memory hook (recall,
+    /// `on_job_complete`) — the runtime wires `None` until a real
+    /// implementation is registered.
+    memory: Option<Arc<dyn Memory>>,
 }
 
 /// Construction bundle for [`AgentLoop`]. Every field maps 1:1 to a
@@ -314,6 +389,9 @@ pub struct AgentLoopConfig {
     /// Cross-session manager. Used by system handlers that operate
     /// across sessions.
     pub sessions: Option<Arc<crate::SessionManager>>,
+    /// Pluggable long-term memory handle — one registered implementation, or
+    /// `None` to disable the memory hooks (recall / `on_job_complete`).
+    pub memory: Option<Arc<dyn Memory>>,
 }
 
 impl AgentLoop {
@@ -330,6 +408,7 @@ impl AgentLoop {
             system_spawn_tx,
             workspace_paths,
             sessions,
+            memory,
         } = config;
         let (llm_client, _effective_name) = llm_pool.read().resolve(initial_llm.as_ref());
         let mut context_manager = context_manager;
@@ -349,6 +428,7 @@ impl AgentLoop {
             system_spawn_tx,
             workspace_paths,
             sessions,
+            memory,
         }
     }
 
@@ -441,6 +521,9 @@ impl AgentLoop {
         interjections: Option<&mut dyn InterjectionSource>,
     ) -> anyhow::Result<OutgoingMessage> {
         self.refresh_active_llm();
+        // Memory recall query (and write eligibility) for this job — `None`
+        // for kinds that don't participate (System / Spawned / notification).
+        let memory_query = memory_recall_query(&job_input);
         let spec = JobSpec {
             session_id: session.id.clone(),
             session_trigger_kind: session.trigger.kind(),
@@ -448,12 +531,26 @@ impl AgentLoop {
             effective_soul_version: session.bound_soul_version.clone(),
             parent_job_id,
         };
-        crate::runtime::scope::with_job(
+        // Capture what the post-`with_job` memory spawn needs from `self`
+        // and `session` before the closure takes `&mut self` + `&mut session`
+        // by move — once `with_job`'s body runs we can no longer touch either
+        // directly out here.
+        let memory_handle = self.memory.clone();
+        let memory_user_id = session.user.id.clone();
+        let memory_session_id = session.id.clone();
+        // The `on_job_complete` spawn is intentionally OUTSIDE `with_job`'s
+        // body: `with_job`'s post-body window can still mark the job
+        // `Cancelled` (cancel-race case 3 in `scope.rs`), in which case the
+        // body's Ok is suppressed and `with_job` returns Err — so a spawn
+        // launched inside the body would persist memory for a turn the
+        // runtime later treats as cancelled. Carry `PendingMemoryWrite` up
+        // through `with_job`'s `T` and fire only once it has returned Ok.
+        let (outgoing, pending_write) = crate::runtime::scope::with_job(
             job_lifecycle,
             cancel_token.clone(),
             spec,
             |job_id| async move {
-                let outgoing = self
+                let (outgoing, pending) = self
                     .run_inner(
                         session,
                         job_lifecycle,
@@ -462,15 +559,31 @@ impl AgentLoop {
                         delta_tx,
                         cancel_token,
                         interjections,
+                        memory_query,
                     )
                     .await?;
                 let output = JobOutput::Message {
                     content: outgoing.content.clone(),
                 };
-                Ok((output, outgoing))
+                let pending_with_id = pending.map(|p| (job_id, p));
+                Ok((output, (outgoing, pending_with_id)))
             },
         )
-        .await
+        .await?;
+        // Past the cancel-race window — `with_job` returned Ok, so the job
+        // row is `Complete`. Safe to bill the memory write against it.
+        if let Some((job_id, write)) = pending_write {
+            Self::spawn_job_complete_write(
+                memory_handle,
+                memory_user_id,
+                memory_session_id,
+                job_id,
+                span_recorder,
+                write.user_input,
+                write.final_output,
+            );
+        }
+        Ok(outgoing)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -483,7 +596,8 @@ impl AgentLoop {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         cancel_token: CancellationToken,
         mut interjections: Option<&mut dyn InterjectionSource>,
-    ) -> anyhow::Result<OutgoingMessage> {
+        memory_query: Option<Vec<ContentBlock>>,
+    ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
         let _ = job_lifecycle;
         self.context_manager.ensure_seeded().await;
 
@@ -505,6 +619,17 @@ impl AgentLoop {
         // context reads the matching skill's body and appends it (persisted +
         // JSONL-logged) as a hidden agent-context row for the loop to act on.
         self.context_manager.expand_slash_command().await;
+
+        // Recall relevant long-term memories for the triggering input and
+        // inject them (framed) before the first LLM call. No-op without a
+        // memory impl or for ineligible job kinds (`memory_query` is `None`).
+        if let Some(query) = memory_query.as_deref() {
+            self.recall_and_inject(query, session, span_recorder, job_id, &cancel_token)
+                .await;
+        }
+        // Accumulates this job's user-authored input (initial prompt + any
+        // mid-turn interjections) for the `on_job_complete` write at turn end.
+        let mut job_user_input: Vec<ContentBlock> = memory_query.clone().unwrap_or_default();
 
         // Iterative LLM loop
         let mut iterations = 0;
@@ -545,7 +670,23 @@ impl AgentLoop {
                 // so the user can steer an in-progress turn. Messages that don't
                 // make a boundary fall through to the next turn. See
                 // docs/mid-turn-user-interjection.md.
-                self.drain_user_interjections(&mut interjections).await;
+                let drained = self.drain_user_interjections(&mut interjections).await;
+                // Recall against each freshly-drained interjection so the next
+                // LLM call also sees memory relevant to the steering message,
+                // and fold it into this job's input for the end-of-turn write.
+                if memory_query.is_some() {
+                    for content in &drained {
+                        self.recall_and_inject(
+                            content,
+                            session,
+                            span_recorder,
+                            job_id,
+                            &cancel_token,
+                        )
+                        .await;
+                        job_user_input.extend(content.iter().cloned());
+                    }
+                }
                 // Iteration-boundary summary-refresh check.
                 self.maybe_spawn_background_compression(job_id, /* job_done */ false)
                     .await;
@@ -595,13 +736,27 @@ impl AgentLoop {
             .await?;
 
             match outcome {
-                IterationOutcome::Final(msg) => {
+                IterationOutcome::Final {
+                    outgoing,
+                    assistant_reply,
+                } => {
                     // End-of-job summary-refresh check. The activity
                     // disjunct is satisfied by `job_done = true`;
                     // the tokens / diff conjuncts still apply.
                     self.maybe_spawn_background_compression(job_id, /* job_done */ true)
                         .await;
-                    return Ok(msg);
+                    // Capture the memory write inputs and return them up to
+                    // `run()` — the actual `spawn_job_complete_write` fires
+                    // **after** `with_job` accepts the job, so a cancel-race
+                    // in `with_job`'s post-body window can't memorize a
+                    // cancelled turn. `assistant_reply` (not `outgoing.content`)
+                    // is what gets persisted as the assistant row, matching
+                    // the trait contract.
+                    let pending = memory_query.is_some().then(|| PendingMemoryWrite {
+                        user_input: std::mem::take(&mut job_user_input),
+                        final_output: assistant_reply,
+                    });
+                    return Ok((outgoing, pending));
                 }
                 IterationOutcome::Continue => {
                     // Continue to the next LLM iteration; `run_iteration`
@@ -621,16 +776,23 @@ impl AgentLoop {
         // Max-iterations fallback. No assistant row was persisted at
         // the loop end — the early-return path inside `run_iteration`
         // is the only one that calls `append_context_message`, so
-        // there's no ordinal to stamp here.
-        Ok(OutgoingMessage {
-            session_id: session.id.clone(),
-            user_id: session.user.id.clone(),
-            channel: session.channel.clone(),
-            content,
-            reply_to: None,
-            metadata: Default::default(),
-            ordinal: None,
-        })
+        // there's no ordinal to stamp here. `on_job_complete` is also
+        // deliberately NOT fired on this path (`PendingMemoryWrite` is
+        // `None`): memory writes only on a clean `IterationOutcome::Final`,
+        // so a budget-exhausted (or cancelled / errored, which `?`-return
+        // earlier) turn is never memorized.
+        Ok((
+            OutgoingMessage {
+                session_id: session.id.clone(),
+                user_id: session.user.id.clone(),
+                channel: session.channel.clone(),
+                content,
+                reply_to: None,
+                metadata: Default::default(),
+                ordinal: None,
+            },
+            None,
+        ))
     }
 
     /// One iteration of the agentic loop, scoped to a single
@@ -694,18 +856,25 @@ impl AgentLoop {
             // prior iterations. Capture the persisted ordinal so the
             // channel adapter can stamp it onto the live `Frame::Message`
             // and reconnecting clients advance their cursor past it.
+            // Also keep a copy for `IterationOutcome::Final.assistant_reply`
+            // so `Memory::on_job_complete` sees the same shape that hits
+            // the transcript, not the channel-augmented `final_blocks`.
+            let assistant_reply = response_blocks.clone();
             let assistant_msg = ChatMessage::assistant(response_blocks);
             let ordinal = self.context_manager.append(&assistant_msg).await;
 
-            return Ok(IterationOutcome::Final(OutgoingMessage {
-                session_id: session.id.clone(),
-                user_id: session.user.id.clone(),
-                channel: session.channel.clone(),
-                content: final_blocks,
-                reply_to: None,
-                metadata: Default::default(),
-                ordinal,
-            }));
+            return Ok(IterationOutcome::Final {
+                outgoing: OutgoingMessage {
+                    session_id: session.id.clone(),
+                    user_id: session.user.id.clone(),
+                    channel: session.channel.clone(),
+                    content: final_blocks,
+                    reply_to: None,
+                    metadata: Default::default(),
+                    ordinal,
+                },
+                assistant_reply,
+            });
         }
 
         // Append assistant message including thinking and tool-call
@@ -1126,23 +1295,221 @@ impl AgentLoop {
     /// cancellation. A `None` source (cron / subagent / notification turns) is a
     /// no-op — this is a UserChat-turn affordance.
     /// See `docs/mid-turn-user-interjection.md`.
-    async fn drain_user_interjections(&mut self, src: &mut Option<&mut dyn InterjectionSource>) {
+    async fn drain_user_interjections(
+        &mut self,
+        src: &mut Option<&mut dyn InterjectionSource>,
+    ) -> Vec<Vec<ContentBlock>> {
         let Some(src) = src.as_deref_mut() else {
-            return;
+            return Vec::new();
         };
         let drained = src.drain_injectable();
         if drained.is_empty() {
-            return;
+            return Vec::new();
         }
         let count = drained.len();
-        for content in drained {
+        for content in &drained {
             // Budgeted at the framed wire size; see `append_user_interjection`.
-            self.context_manager.append_user_interjection(content).await;
+            self.context_manager
+                .append_user_interjection(content.clone())
+                .await;
         }
         info!(
             interjections = count,
             "injected mid-turn user interjection(s) before the next LLM call"
         );
+        drained
+    }
+
+    /// Recall memories relevant to `query` and inject each as a framed
+    /// [`aura_model::MessageSource::RecalledMemory`] row before the next LLM
+    /// call. No-op when no memory is wired. Recall failure is logged and
+    /// swallowed — it must never fail the turn. The impl bills its own
+    /// embedding/LLM work against the minted [`Attribution`]; a `MemoryRecall`
+    /// trace step marks the operation.
+    async fn recall_and_inject(
+        &mut self,
+        query: &[ContentBlock],
+        session: &Session,
+        span_recorder: &Arc<SpanRecorder>,
+        job_id: JobId,
+        cancel_token: &CancellationToken,
+    ) {
+        // A prompt-less trigger (e.g. a tool-only cron fire whose payload has no
+        // `prompt`) yields an empty query — skip recall so a real backend never
+        // opens a `MemoryRecall` step or embeds the empty string.
+        if query.is_empty() {
+            return;
+        }
+        // If cancellation already tripped before we even called the backend,
+        // there's no turn to enrich — skip without opening a step or billing.
+        if cancel_token.is_cancelled() {
+            return;
+        }
+        let Some(memory) = self.memory.clone() else {
+            return;
+        };
+        let user_id = session.user.id.clone();
+        let session_id = session.id.clone();
+        let query = query.to_vec();
+        let recorder = Arc::clone(span_recorder);
+        let recalled = crate::runtime::scope::with_step(
+            span_recorder.as_ref(),
+            job_id,
+            StepKind::MemoryRecall,
+            Some((cancel_token, aura_job::CancelReason::ParentCancelled)),
+            move |step| async move {
+                let ctx = MemoryContext::new(user_id, session_id, job_id, recorder, step);
+                match memory.recall(&ctx, &query).await {
+                    Ok(mems) => Ok((LifecycleOutcome::Ok, mems)),
+                    Err(e) => Err(anyhow::Error::new(e)),
+                }
+            },
+        )
+        .await;
+        let recalled = match recalled {
+            Ok(mems) => mems,
+            Err(e) => {
+                warn!(error = %e, "memory recall failed; continuing without recalled context");
+                return;
+            }
+        };
+        // Re-check: cancellation may have tripped while `memory.recall` was
+        // in flight. Don't persist recalled rows for a turn we're about to
+        // abort — the next iteration-boundary cancel check would return Err
+        // immediately and leave dangling memory rows on the transcript.
+        if cancel_token.is_cancelled() {
+            return;
+        }
+        for mem in recalled {
+            self.context_manager
+                .append_recalled_memory(vec![ContentBlock::Text(mem.content)])
+                .await;
+        }
+    }
+
+    /// Fire-and-forget the [`Memory::on_session_end`] consolidation write at
+    /// actor shutdown. Detached on the tokio runtime root (not bound to the
+    /// actor's cancellation token, which the caller cancels immediately after
+    /// this returns), so the write survives the actor's teardown.
+    ///
+    /// Pulls the FULL durable transcript via [`SessionManager::history`] —
+    /// the actor's in-memory view may have been compressed, and
+    /// `on_session_end`'s contract is to see raw turns.
+    ///
+    /// No-op when memory is unwired, when `sessions` is unwired (test
+    /// harnesses with no cross-session store), or when the session isn't
+    /// user-facing per [`should_fire_session_end`] (subagents, maintenance,
+    /// system-triggered actors all send `ActorStop` too, but their shutdown
+    /// is not a user-session ending).
+    ///
+    /// [`SessionManager::history`]: crate::SessionManager::history
+    pub fn spawn_session_end_write(&self, span_recorder: &Arc<SpanRecorder>, session: &Session) {
+        let Some(memory) = self.memory.clone() else {
+            return;
+        };
+        let Some(sessions) = self.sessions.clone() else {
+            return;
+        };
+        if !should_fire_session_end(session) {
+            return;
+        }
+        let user_id = session.user.id.clone();
+        let session_id = session.id.clone();
+        let recorder = Arc::clone(span_recorder);
+        tokio::spawn(async move {
+            // `full_transcript` (not `history`) so the impl sees the raw
+            // turns per `on_session_end`'s contract — `history` filters out
+            // rows marked `superseded_by`, so a session that has been
+            // compressed would otherwise lose all the user / assistant turns
+            // that the compaction folded into a summary.
+            let transcript = match sessions.full_transcript(&session_id).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        session_id = %session_id,
+                        "memory on_session_end: failed to load durable transcript; skipping write",
+                    );
+                    return;
+                }
+            };
+            if transcript.is_empty() {
+                return;
+            }
+            // Synthetic JobId — `on_session_end` isn't tied to a user job; this
+            // id only exists so the trace step + any billed sub-call records
+            // share one key. Mirrors how compression mints its own ids for
+            // maintenance work.
+            let job_id = JobId::new();
+            let ctx_recorder = Arc::clone(&recorder);
+            let result = crate::runtime::scope::with_step(
+                recorder.as_ref(),
+                job_id,
+                StepKind::MemoryWrite,
+                None,
+                move |step| async move {
+                    let ctx = MemoryContext::new(user_id, session_id, job_id, ctx_recorder, step);
+                    match memory.on_session_end(&ctx, &transcript).await {
+                        Ok(()) => Ok((LifecycleOutcome::Ok, ())),
+                        Err(e) => Err(anyhow::Error::new(e)),
+                    }
+                },
+            )
+            .await;
+            if let Err(e) = result {
+                warn!(error = %e, "memory on_session_end write failed");
+            }
+        });
+    }
+
+    /// Fire-and-forget the [`Memory::on_job_complete`] write for a finished
+    /// exchange. Detached so the actor returns the answer without waiting on
+    /// the memory write; the impl bills its work against the minted
+    /// [`Attribution`] under a `MemoryWrite` trace step. No-op when no memory
+    /// is wired (`memory == None`).
+    ///
+    /// Free-standing (no `&self`) and takes owned `user_id` / `session_id`
+    /// so `run()` can call it AFTER `with_job` returns — the closure that
+    /// drives the iteration loop moves `&mut self` + `&mut session` into
+    /// `with_job`'s body, so the borrow checker won't let us touch either
+    /// from `run()` afterwards. Pre-extract `self.memory.clone()` and the
+    /// two ids before the closure, then call this with the owned values.
+    fn spawn_job_complete_write(
+        memory: Option<Arc<dyn Memory>>,
+        user_id: String,
+        session_id: SessionId,
+        job_id: JobId,
+        span_recorder: &Arc<SpanRecorder>,
+        user_input: Vec<ContentBlock>,
+        final_output: Vec<ContentBlock>,
+    ) {
+        let Some(memory) = memory else {
+            return;
+        };
+        let recorder = Arc::clone(span_recorder);
+        tokio::spawn(async move {
+            let ctx_recorder = Arc::clone(&recorder);
+            let result = crate::runtime::scope::with_step(
+                recorder.as_ref(),
+                job_id,
+                StepKind::MemoryWrite,
+                None,
+                move |step| async move {
+                    let ctx = MemoryContext::new(user_id, session_id, job_id, ctx_recorder, step);
+                    match memory
+                        .on_job_complete(&ctx, &user_input, &final_output)
+                        .await
+                    {
+                        Ok(()) => Ok((LifecycleOutcome::Ok, ())),
+                        Err(e) => Err(anyhow::Error::new(e)),
+                    }
+                },
+            )
+            .await;
+            if let Err(e) = result {
+                warn!(error = %e, "memory on_job_complete write failed");
+            }
+        });
     }
 
     /// Append a user-authored message to this session's transcript — both the
@@ -2194,5 +2561,126 @@ mod trim_response_text_edges_tests {
             ContentBlock::Text(t) => assert_eq!(t, body),
             other => panic!("expected text, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod session_end_gate_tests {
+    //! `should_fire_session_end` decides whether `Memory::on_session_end`
+    //! runs when an actor processes `ActorStop`. Subagent /
+    //! `SystemMaintenance` actors and `System`-triggered (background
+    //! compression) sessions also stop, but their teardown is not a
+    //! user-session ending — firing the hook for them would write
+    //! garbage memory.
+    use super::should_fire_session_end;
+    use aura_model::{
+        ChannelType, JobId, Lineage, LineageKind, Session, SessionId, SessionState, SystemReason,
+        TriggerSource, User,
+    };
+    use chrono::Utc;
+
+    fn session_with(trigger: TriggerSource, lineage: Option<Lineage>) -> Session {
+        let now = Utc::now();
+        let id = SessionId::from("sess-gate");
+        Session {
+            id: id.clone(),
+            user: User {
+                id: "user-gate".into(),
+                name: None,
+                channel: ChannelType::tui(),
+            },
+            channel: ChannelType::tui(),
+            created_at: now,
+            last_active: now,
+            state: SessionState::default(),
+            root_session_id: id,
+            trigger,
+            lineage,
+            bound_soul_version: "soul-gate".into(),
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn fires_for_root_user_session() {
+        assert!(should_fire_session_end(&session_with(
+            TriggerSource::User,
+            None
+        )));
+    }
+
+    #[test]
+    fn fires_for_root_cron_session() {
+        let s = session_with(
+            TriggerSource::Cron {
+                cron_job_id: "c-1".into(),
+            },
+            None,
+        );
+        assert!(should_fire_session_end(&s));
+    }
+
+    #[test]
+    fn fires_for_user_fork_branch() {
+        let lineage = Lineage {
+            parent_session_id: SessionId::from("parent"),
+            parent_job_id: JobId::new(),
+            parent_span_id: None,
+            kind: LineageKind::UserFork {
+                fork_at_job_id: JobId::new(),
+                prefix_state_hash: "deadbeef".into(),
+            },
+        };
+        assert!(should_fire_session_end(&session_with(
+            TriggerSource::User,
+            Some(lineage)
+        )));
+    }
+
+    #[test]
+    fn skips_subagent_session() {
+        let lineage = Lineage {
+            parent_session_id: SessionId::from("parent"),
+            parent_job_id: JobId::new(),
+            parent_span_id: None,
+            kind: LineageKind::Subagent,
+        };
+        // Subagents inherit their parent's trigger, so the User flag alone
+        // shouldn't unlock the hook for them.
+        assert!(!should_fire_session_end(&session_with(
+            TriggerSource::User,
+            Some(lineage),
+        )));
+    }
+
+    #[test]
+    fn skips_system_maintenance_session() {
+        let lineage = Lineage {
+            parent_session_id: SessionId::from("parent"),
+            parent_job_id: JobId::new(),
+            parent_span_id: None,
+            kind: LineageKind::SystemMaintenance,
+        };
+        let s = session_with(
+            TriggerSource::System {
+                reason: SystemReason::BackgroundCompression,
+            },
+            Some(lineage),
+        );
+        assert!(!should_fire_session_end(&s));
+    }
+
+    #[test]
+    fn skips_root_system_session() {
+        // No lineage but System trigger → still a maintenance-class actor
+        // (a hypothetical future System variant without SystemMaintenance
+        // lineage), not a user session.
+        let s = session_with(
+            TriggerSource::System {
+                reason: SystemReason::BackgroundCompression,
+            },
+            None,
+        );
+        assert!(!should_fire_session_end(&s));
     }
 }

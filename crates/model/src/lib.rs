@@ -5,7 +5,6 @@ mod external_agent;
 mod governance;
 mod ids;
 mod llm_entry_name;
-mod memory;
 mod message;
 mod model_tier;
 mod money;
@@ -23,7 +22,6 @@ pub use external_agent::{
 pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLevel};
 pub use ids::{CostRecordId, JobId, ParallelGroup, SessionId, SpanId, StepId};
 pub use llm_entry_name::LlmEntryName;
-pub use memory::{MemoryCategory, MemoryEntry};
 pub use message::{
     BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role,
     TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX, ThinkingContent,

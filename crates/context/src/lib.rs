@@ -308,22 +308,28 @@ impl ContextManager {
         &self.messages
     }
 
-    /// The transcript shaped for an LLM request: mid-turn user interjections
-    /// wrapped in their steering envelope ([`frame_interjections`]), then
-    /// adjacent same-role user/assistant rows coalesced ([`merge_for_llm`]) so
-    /// providers that require strict alternation accept it. An owned snapshot —
-    /// the stored transcript keeps each row separate and unframed.
+    /// The transcript shaped for an LLM request: mid-turn user interjections and
+    /// recalled-memory rows wrapped in their steering envelopes
+    /// ([`frame_interjections`] / [`frame_recalled_memories`]), then adjacent
+    /// same-role user/assistant rows coalesced ([`merge_for_llm`]) so providers
+    /// that require strict alternation accept it. An owned snapshot — the stored
+    /// transcript keeps each row separate and unframed.
     pub fn messages_for_llm(&self) -> Vec<ChatMessage> {
-        // Skip the interjection-framing pass (and its full clone) unless the
-        // transcript actually holds an interjection — the common case. The scan
-        // is O(n) with no allocation; `frame_interjections` would otherwise
-        // clone every row before `merge_for_llm` clones again.
-        if self
-            .messages
-            .iter()
-            .any(|m| m.source() == aura_model::MessageSource::UserInterjection)
-        {
-            merge_for_llm(&frame_interjections(&self.messages))
+        // Skip the framing passes (and their full clones) unless the transcript
+        // actually holds a row that needs framing — the common case. The scan is
+        // O(n) with no allocation; each framing pass would otherwise clone every
+        // row before `merge_for_llm` clones again.
+        let needs_framing = self.messages.iter().any(|m| {
+            matches!(
+                m.source(),
+                aura_model::MessageSource::UserInterjection
+                    | aura_model::MessageSource::RecalledMemory
+            )
+        });
+        if needs_framing {
+            merge_for_llm(&frame_recalled_memories(&frame_interjections(
+                &self.messages,
+            )))
         } else {
             merge_for_llm(&self.messages)
         }
@@ -674,12 +680,22 @@ impl ContextManager {
         self.append(&ChatMessage::user_interjection(content)).await
     }
 
-    /// Tokens to charge the budget for `msg`. A `UserInterjection` row is sent
-    /// wrapped in the `<user_interjection>` envelope (`messages_for_llm` /
-    /// [`frame_interjections`]), so the budget must count the **framed** size or
-    /// it under-counts the request and the compression gate may skip a pass it
-    /// should run. This is the single place that knows the framed cost, so it
-    /// applies on the live [`Self::append`] path **and** every cache-rebuild path
+    /// Append a recalled-memory row as a persisted, framed context entry. The
+    /// budget is charged the framed wire size (the row is sent wrapped in the
+    /// `<recalled_memory>` envelope by [`Self::messages_for_llm`] /
+    /// [`frame_recalled_memories`]); this thin wrapper exists for call-site
+    /// clarity, mirroring [`Self::append_user_interjection`].
+    pub async fn append_recalled_memory(&mut self, content: Vec<ContentBlock>) -> Option<i64> {
+        self.append(&ChatMessage::recalled_memory(content)).await
+    }
+
+    /// Tokens to charge the budget for `msg`. A `UserInterjection` or
+    /// `RecalledMemory` row is sent wrapped in its steering envelope
+    /// (`messages_for_llm` / [`frame_interjections`] / [`frame_recalled_memories`]),
+    /// so the budget must count the **framed** size or it under-counts the
+    /// request and the compression gate may skip a pass it should run. This is
+    /// the single place that knows the framed cost, so it applies on the live
+    /// [`Self::append`] path **and** every cache-rebuild path
     /// ([`Self::restore_messages`], the compaction apply) — otherwise a row
     /// preserved across restart/compaction would silently revert to the raw
     /// count. Non-text blocks (images) are preserved; a multi-row run over-counts
@@ -687,13 +703,17 @@ impl ContextManager {
     /// anyway (`record_call_actual` resets the baseline after the next call).
     /// Everything else is the plain message count.
     fn message_budget_tokens(&self, msg: &ChatMessage) -> usize {
-        if msg.source() != aura_model::MessageSource::UserInterjection {
-            return self.tokenizer.count_message(msg);
-        }
         let text = aura_llm::multimodal::extract_text(&msg.content);
-        let mut framed = vec![ContentBlock::Text(
-            crate::prompts::interjection::wrap_interjections(&[text]),
-        )];
+        let framed_text = match msg.source() {
+            aura_model::MessageSource::UserInterjection => {
+                crate::prompts::interjection::wrap_interjections(&[text])
+            }
+            aura_model::MessageSource::RecalledMemory => {
+                crate::prompts::recalled_memory::wrap_recalled_memories(&[text])
+            }
+            _ => return self.tokenizer.count_message(msg),
+        };
+        let mut framed = vec![ContentBlock::Text(framed_text)];
         framed.extend(
             msg.content
                 .iter()
@@ -1422,20 +1442,50 @@ pub fn scan_skill_calls(messages: &[ChatMessage]) -> Vec<String> {
 /// envelope text in the same message. Non-interjection rows pass through
 /// untouched.
 fn frame_interjections(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-    use aura_model::MessageSource;
+    frame_source_runs(
+        messages,
+        aura_model::MessageSource::UserInterjection,
+        crate::prompts::interjection::wrap_interjections,
+    )
+}
+
+/// Wire-only twin of [`frame_interjections`] for
+/// [`aura_model::MessageSource::RecalledMemory`] rows: collapses each maximal run
+/// into one `Role::User` message wrapped in the `<recalled_memory>` envelope
+/// ([`crate::prompts::recalled_memory`]). Run alongside [`frame_interjections`];
+/// the two passes touch disjoint sources, so order is irrelevant.
+fn frame_recalled_memories(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    frame_source_runs(
+        messages,
+        aura_model::MessageSource::RecalledMemory,
+        crate::prompts::recalled_memory::wrap_recalled_memories,
+    )
+}
+
+/// Collapse each maximal run of consecutive rows whose provenance is `source`
+/// into a single `Role::User` message whose joined text is wrapped by `wrap`.
+/// Non-text blocks ride after the envelope text in the same message; rows of any
+/// other source pass through untouched. Shared by [`frame_interjections`] and
+/// [`frame_recalled_memories`] — the only difference between the two framings is
+/// the source matched and the envelope applied.
+fn frame_source_runs(
+    messages: &[ChatMessage],
+    source: aura_model::MessageSource,
+    wrap: fn(&[String]) -> String,
+) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
     let mut i = 0;
     while i < messages.len() {
-        if messages[i].source() != MessageSource::UserInterjection {
+        if messages[i].source() != source {
             out.push(messages[i].clone());
             i += 1;
             continue;
         }
-        // Gather the maximal run of consecutive interjection rows so a batch
-        // injected at one boundary becomes one envelope, not N merged ones.
+        // Gather the maximal run of consecutive rows so a batch injected at one
+        // boundary becomes one envelope, not N merged ones.
         let mut texts: Vec<String> = Vec::new();
         let mut extra_blocks: Vec<ContentBlock> = Vec::new();
-        while i < messages.len() && messages[i].source() == MessageSource::UserInterjection {
+        while i < messages.len() && messages[i].source() == source {
             let text = aura_llm::multimodal::extract_text(&messages[i].content);
             if !text.is_empty() {
                 texts.push(text);
@@ -1447,9 +1497,7 @@ fn frame_interjections(messages: &[ChatMessage]) -> Vec<ChatMessage> {
             }
             i += 1;
         }
-        let mut content = vec![ContentBlock::Text(
-            crate::prompts::interjection::wrap_interjections(&texts),
-        )];
+        let mut content = vec![ContentBlock::Text(wrap(&texts))];
         content.append(&mut extra_blocks);
         out.push(ChatMessage::user(content));
     }
@@ -1571,6 +1619,111 @@ mod frame_interjections_tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].content.len(), 2);
         assert!(matches!(&out[0].content[0], ContentBlock::Text(t) if t.contains("see this")));
+        assert_eq!(out[0].content[1], img);
+    }
+}
+
+#[cfg(test)]
+mod frame_recalled_memories_tests {
+    //! Mirrors [`frame_interjections_tests`] for the recalled-memory
+    //! framing. Both wrappers delegate to one [`frame_source_runs`] helper,
+    //! but the framing body differs (recalled memory carries a "treat as
+    //! background you already know" preamble, not "the user just sent");
+    //! pinning each independently means a refactor to one envelope can't
+    //! silently regress the other.
+    use super::frame_recalled_memories;
+    use aura_model::{BlobRef, ChatMessage, ContentBlock, Role};
+
+    fn txt(s: &str) -> Vec<ContentBlock> {
+        vec![ContentBlock::Text(s.into())]
+    }
+
+    #[test]
+    fn non_recalled_rows_pass_through() {
+        let msgs = vec![
+            ChatMessage::user(txt("prompt")),
+            ChatMessage::assistant(txt("reply")),
+        ];
+        assert_eq!(frame_recalled_memories(&msgs), msgs);
+    }
+
+    #[test]
+    fn collapses_a_run_into_one_envelope() {
+        let msgs = vec![
+            ChatMessage::recalled_memory(txt("the user prefers Rust")),
+            ChatMessage::recalled_memory(txt("they dislike YAML")),
+        ];
+        let out = frame_recalled_memories(&msgs);
+        assert_eq!(out.len(), 1);
+        // Wire-only framing — the framed row lands as `Role::User` so the
+        // LLM payload converter (which doesn't understand
+        // `MessageSource::RecalledMemory`) accepts it.
+        assert_eq!(out[0].role, Role::User);
+        let ContentBlock::Text(t) = &out[0].content[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(t.matches("<recalled_memory>").count(), 1);
+        assert!(t.contains("the user prefers Rust\n\nthey dislike YAML"));
+    }
+
+    #[test]
+    fn recalled_after_tool_does_not_fold_into_prompt() {
+        // Mid-turn recall (e.g. a follow-up interjection triggered another
+        // recall pass) lands after a tool row: it should still get its own
+        // envelope rather than merging into the original prompt.
+        let msgs = vec![
+            ChatMessage::user(txt("do X")),
+            ChatMessage::assistant(txt("working")),
+            ChatMessage::tool(txt("result")),
+            ChatMessage::recalled_memory(txt("user is on macOS")),
+        ];
+        let out = frame_recalled_memories(&msgs);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], msgs[0]);
+        let ContentBlock::Text(t) = &out[3].content[0] else {
+            panic!("expected text block");
+        };
+        assert!(t.contains("<recalled_memory>") && t.contains("user is on macOS"));
+    }
+
+    #[test]
+    fn separate_runs_get_separate_envelopes() {
+        let msgs = vec![
+            ChatMessage::recalled_memory(txt("a")),
+            ChatMessage::assistant(txt("mid")),
+            ChatMessage::recalled_memory(txt("b")),
+        ];
+        let out = frame_recalled_memories(&msgs);
+        assert_eq!(out.len(), 3);
+        for idx in [0usize, 2] {
+            let ContentBlock::Text(t) = &out[idx].content[0] else {
+                panic!("expected text block");
+            };
+            assert_eq!(t.matches("<recalled_memory>").count(), 1);
+        }
+    }
+
+    #[test]
+    fn non_text_blocks_ride_after_envelope() {
+        // RecalledMemory rows are produced from `RecalledMemory.content`
+        // (text only today), but the framing helper is content-agnostic —
+        // mirror the interjection test to lock that contract.
+        let img = ContentBlock::Image {
+            blob: BlobRef {
+                blob_id: "sha256:y".into(),
+            },
+            mime_type: "image/png".into(),
+        };
+        let msgs = vec![ChatMessage::recalled_memory(vec![
+            ContentBlock::Text("snippet about X".into()),
+            img.clone(),
+        ])];
+        let out = frame_recalled_memories(&msgs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content.len(), 2);
+        assert!(
+            matches!(&out[0].content[0], ContentBlock::Text(t) if t.contains("snippet about X"))
+        );
         assert_eq!(out[0].content[1], img);
     }
 }

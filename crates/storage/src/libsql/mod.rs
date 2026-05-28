@@ -5,7 +5,6 @@ mod channel_session;
 mod cost;
 mod cron;
 mod job;
-mod memory;
 mod secret;
 mod session;
 mod session_summary;
@@ -20,7 +19,6 @@ pub use channel_session::LibsqlChannelSessionStore;
 pub use cost::LibsqlCostStore;
 pub use cron::LibsqlCronStore;
 pub use job::LibsqlJobStore;
-pub use memory::LibsqlMemoryStore;
 pub use secret::LibsqlSecretStore;
 pub use session::LibsqlSessionStore;
 pub use session_summary::LibsqlSessionSummaryStore;
@@ -245,14 +243,6 @@ impl LibsqlPool {
                     -- newly-started pass starts from a clean slate.
                     in_flight_owner TEXT
                 );
-
-                CREATE TABLE IF NOT EXISTS memories (
-                    id         TEXT PRIMARY KEY,
-                    user_id    TEXT NOT NULL,
-                    content    TEXT NOT NULL,
-                    data       TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories(user_id);
 
                 CREATE TABLE IF NOT EXISTS secrets (
                     name            TEXT PRIMARY KEY,

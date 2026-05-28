@@ -6,7 +6,7 @@
 by side against the same manager graph:
 
 1. **Admin listener** — TCP, bearer-token authenticated. Surfaces the
-   operator controls (config, jobs, cron, memory, traces, skills, tools,
+   operator controls (config, jobs, cron, traces, skills, tools,
    channels-list, llm, status) that mirror the CLI command families, plus
    the `/v1/chat/*` web-chat family that backs the embedded React
    dashboard. The admin listener also **co-hosts** the channel-token-
@@ -273,7 +273,7 @@ handler).
 ### Gateway owns its own DTOs — utoipa stays in the gateway
 
 Route handlers call the manager `pub async fn` methods directly
-(`SessionManager`, `JobLifecycle`, `CronScheduler`, `MemoryManager`,
+(`SessionManager`, `JobLifecycle`, `CronScheduler`,
 `TraceStore`, `SkillRegistry`, `ToolRegistry`) and serialise into DTOs
 defined in `crates/gateway/src/api/dto.rs`. CLI handler output is not
 reused — those are built around `CommandContext` + `OutputFormat` and
@@ -288,18 +288,11 @@ no `#[schema(...)]` attributes leaking into them. The gateway defines
 a mirror type for every domain type that appears on the wire and
 provides `From<Domain>` conversions; handlers build DTOs at the seam
 via `.map(DomainDto::from)`. Mirror types keep their bare name
-(`Job`, `CronJob`, `MemoryEntry`, `ChannelType`, …) so the generated
+(`Job`, `CronJob`, `ChannelType`, …) so the generated
 OpenAPI schemas — and the TypeScript types downstream — are stable
 across the refactor. Adding a field to a domain type now requires an
 explicit edit in `dto.rs` to surface it on HTTP; that's a feature, not
 a bug, because the drift test below will force the question.
-
-A small exception: `MemoryCategory` is an adjacent-tagged unit-variant
-enum (`#[serde(tag = "type", content = "value")]`), which the utoipa
-derive macro currently can't generate. The mirror has a hand-rolled
-`PartialSchema + ToSchema` impl inline in `dto.rs`. Any similar enum
-shape added later should follow the same pattern rather than
-regressing the domain crate to depend on utoipa.
 
 ### OpenAPI spec generation and the TypeScript client
 
@@ -543,10 +536,6 @@ POST   /v1/cron                         { schedule, user_id, channel?, text, tim
 GET    /v1/cron/:id
 DELETE /v1/cron/:id
 
-GET    /v1/memory                       ?q=&user_id=&limit=
-POST   /v1/memory                       { content, user_id?, importance? }  (category is always KeyFact)
-DELETE /v1/memory/:id
-
 GET    /v1/traces                       ?status=&since=&until=&limit=&cursor=  filtered session-summary list
 GET    /v1/traces/:session_id           session overview (message log + job summaries)
 GET    /v1/traces/:session_id/jobs/:job_id   per-job step/span tree
@@ -708,7 +697,7 @@ a `ReloadOutcome`. If the gateway was booted without a config path
 ## Runtime Assembly
 
 `start` builds the full manager graph — `SessionManager`,
-`JobLifecycle`, `CronScheduler`, `MemoryManager`, `TraceStore`,
+`JobLifecycle`, `CronScheduler`, `TraceStore`,
 `SecurityGateway`, `SkillRegistry`, `ToolRegistry`, `ToolExecutor`,
 `SkillAssessor`, the LLM stack (`llm_client: Arc<BillableLlm>` plus the
 `llm_pool: LlmPoolHandle` it's the default client of), `WorkspaceManager`,
@@ -779,7 +768,7 @@ subcommands use it for the same reason.
   is honoured. Request spans carry a `listener` field (`admin` /
   `channel`) so the origin of each request is obvious in logs.
 - **Every mutation goes through a manager.** Route handlers call
-  `SessionManager`, `JobLifecycle`, `CronScheduler`, `MemoryManager` and
+  `SessionManager`, `JobLifecycle`, `CronScheduler` and
   friends directly; there are no side-channel writes that bypass
   Trace/Job observability.
 - **Singleton lock applies only to the gateway.** `start` acquires
@@ -841,7 +830,7 @@ crates/gateway/
 │   │   ├── health.rs        # /healthz + /readyz (shared between listeners)
 │   │   ├── webui.rs         # admin-fallback handler; include!s $OUT_DIR/webui_assets.rs
 │   │   └── admin/           # mod.rs: v1_router_and_spec() → (Router, OpenApi), mounted on admin TCP
-│   │       └── {status,config,jobs,cron,memory,traces,analytics,skills,tools,channels,chat,llm,logs}.rs
+│   │       └── {status,config,jobs,cron,traces,analytics,skills,tools,channels,chat,llm,logs}.rs
 │   └── installer/
 │       ├── mod.rs           # ServiceInstaller trait, InstallContext, ServiceStatus,
 │       │                    # for_current_platform, resolve_exec_start
@@ -878,7 +867,7 @@ at runtime and stored in the per-workspace vault.
 ## Collaboration
 
 - **agent** — provides `SessionManager`, `JobLifecycle`, `CronScheduler`,
-  `MemoryManager`, `SecurityGateway`, `service::{ShutdownSignal,
+  `SecurityGateway`, `service::{ShutdownSignal,
   TaskTracker}` used by the server's graceful shutdown path.
 - **channels** — the `Channel` / `Connection` / `SessionEvent` handles,
   `IncomingMessage`, `NoticeLevel`, `ChannelRegistry`, and the

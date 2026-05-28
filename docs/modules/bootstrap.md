@@ -77,7 +77,7 @@ init_tracing(File { log_dir, leak_detector })
   ▼
 runtime::build_managers(config, shutdown, leak_detector, embedded_mcp_servers)
   │   ── Store::open at <workspace>/state/storage.db
-  │   ── SessionManager / JobLifecycle / MemoryManager / CronScheduler / SecurityGateway
+  │   ── SessionManager / JobLifecycle / CronScheduler / SecurityGateway
   │   ── SkillRegistry / SkillAssessor / ToolRegistry / ToolExecutor / BillableLlm / CostManager
   │   ── McpReconciler::spawn (re-reads <workspace>/config/.mcp.json on a tick)
   │

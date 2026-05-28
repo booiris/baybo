@@ -470,7 +470,6 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         session_manager: Arc::clone(&graph.session_manager),
         job_lifecycle: Arc::clone(&graph.job_lifecycle),
         cron_scheduler: Arc::clone(&graph.cron_scheduler),
-        memory_manager: Arc::clone(&graph.memory_manager),
         skill_registry: Arc::clone(&graph.skill_registry),
         tool_registry: Arc::clone(&graph.tool_registry),
         channel_registry: Arc::clone(&graph.channels_registry),

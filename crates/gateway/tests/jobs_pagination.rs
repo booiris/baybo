@@ -59,7 +59,6 @@ async fn build_router_with_seeded_jobs(sessions: &[(&str, TriggerKind, usize)]) 
         session_manager: std::sync::Arc::clone(&tg.deps.session_manager),
         job_lifecycle: std::sync::Arc::clone(&tg.deps.job_lifecycle),
         cron_scheduler: std::sync::Arc::clone(&tg.deps.cron_scheduler),
-        memory_manager: std::sync::Arc::clone(&tg.deps.memory_manager),
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
         query_api: std::sync::Arc::new(aura_query::QueryApi::new(

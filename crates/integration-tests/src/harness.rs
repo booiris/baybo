@@ -180,6 +180,9 @@ pub struct AgentTestHarnessBuilder {
     /// compression stay under it with the stub's default 8_192-token
     /// window.
     compression_threshold: Option<f64>,
+    /// Pluggable memory wired into the loop. Defaults to `None` (inert); tests
+    /// assert the recall / write hooks by wiring a `RecordingMemory`.
+    memory: Option<Arc<dyn aura_memory::Memory>>,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -196,6 +199,7 @@ impl Default for AgentTestHarnessBuilder {
             keep_recent: None,
             model_context_window: None,
             compression_threshold: None,
+            memory: None,
         }
     }
 }
@@ -273,6 +277,13 @@ impl AgentTestHarnessBuilder {
     /// `ContextManager` budget. Defaults to `0.95`.
     pub fn with_compression_threshold(mut self, threshold: f64) -> Self {
         self.compression_threshold = Some(threshold);
+        self
+    }
+
+    /// Wire a [`aura_memory::Memory`] impl into the loop so a test can assert
+    /// the recall / `on_job_complete` hooks fire. Defaults to `None` (inert).
+    pub fn with_memory(mut self, memory: Arc<dyn aura_memory::Memory>) -> Self {
+        self.memory = Some(memory);
         self
     }
 
@@ -361,8 +372,13 @@ impl AgentTestHarnessBuilder {
         let keep_recent = self.keep_recent.unwrap_or(50);
         let compression_threshold = self.compression_threshold.unwrap_or(0.95);
         let token_calibration = Arc::new(aura_context::TokenCalibration::new());
-        let session_store = Arc::new(aura_session::test_support::MemorySessionStore::new())
-            as Arc<dyn aura_session::SessionStore>;
+        let memory_session_store = Arc::new(aura_session::test_support::MemorySessionStore::new());
+        // Mirror production's "session row exists before the actor spawns"
+        // shape so cross-session lookups (today: `on_session_end` →
+        // `SessionManager::history`) find the row instead of NotFound-ing.
+        memory_session_store.seed_session(&session);
+        let session_store =
+            Arc::clone(&memory_session_store) as Arc<dyn aura_session::SessionStore>;
         let summary_store = Arc::new(aura_session::test_support::MemorySessionSummaryStore::new())
             as Arc<dyn aura_session::SessionSummaryStore>;
         let session_manager = Arc::new(aura_agent::SessionManager::new(
@@ -430,7 +446,12 @@ impl AgentTestHarnessBuilder {
             actor_token: actor_token.clone(),
             system_spawn_tx: None,
             workspace_paths: None,
-            sessions: None,
+            // Mirror what production wires so the `on_session_end` hook
+            // (which loads the durable transcript via `SessionManager`) is
+            // exercisable from tests instead of bailing at the `sessions`
+            // guard.
+            sessions: Some(Arc::clone(&session_manager)),
+            memory: self.memory,
         });
         let (mailbox_tx, mailbox_rx) = aura_agent::mailbox::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);

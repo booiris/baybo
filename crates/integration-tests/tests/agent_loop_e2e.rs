@@ -29,6 +29,8 @@ use aura_cost::SpendingLimits;
 use aura_integration_tests::{AgentTestHarness, SessionBuilder, capture_tracing};
 use aura_llm::test_support::StubLlm;
 use aura_llm::{LlmError, LlmResponse, ModelPricing, StreamEvent, TokenUsage, ToolCallInfo};
+use aura_memory::test_support::RecordingMemory;
+use aura_memory::{Memory, RecalledMemory};
 use aura_model::{
     ContentBlock, MessageMetadata, MicroUsd, PendingSubagentResult, Role, SessionId,
     SubagentExitStatus, ThinkingContent, TriggerSource,
@@ -1557,4 +1559,215 @@ async fn drained_interjection_survives_a_failed_turn() {
     );
 
     harness.shutdown().await;
+}
+
+/// Wait up to ~500ms for the detached `on_job_complete` write (a fire-and-forget
+/// task spawned at turn end) to land, so the assertion isn't racy.
+async fn await_job_complete(memory: &RecordingMemory, expected: usize) {
+    for _ in 0..50 {
+        if memory.job_complete_count() >= expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Same idea for the `on_session_end` write — detached on the runtime root from
+/// the actor's `ActorStop` handler, so it can land after the actor's join.
+async fn await_session_end(memory: &RecordingMemory, expected: usize) {
+    for _ in 0..50 {
+        if memory.session_end_count() >= expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn memory_hooks_fire_on_user_chat_turn() {
+    // The loop drives `recall` inline at job start (with the user input) and
+    // `on_job_complete` (detached) at turn end (with input + final output) for a
+    // UserChat job. Exercises the wiring the `RecordingMemory` fixture exists for.
+    let memory = Arc::new(RecordingMemory::new());
+    let mut harness = AgentTestHarness::builder()
+        .with_memory(memory.clone() as Arc<dyn Memory>)
+        .build();
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("noted".into())]);
+
+    harness.send_text("remember I like Rust").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    // recall is inline, so it's deterministic right after the drain.
+    assert_eq!(memory.recall_count(), 1, "recall runs once at job start");
+    let queries = memory.recall_queries();
+    assert!(
+        queries[0]
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("remember I like Rust"))),
+        "recall query carries the user input: {queries:?}"
+    );
+
+    // on_job_complete is detached — wait for it to land.
+    await_job_complete(&memory, 1).await;
+    assert_eq!(
+        memory.job_complete_count(),
+        1,
+        "on_job_complete runs once at turn end"
+    );
+    let completions = memory.job_completions();
+    let (user_input, final_output) = &completions[0];
+    assert!(
+        user_input
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("remember I like Rust"))),
+        "on_job_complete sees the user input: {user_input:?}"
+    );
+    assert!(
+        final_output
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("noted"))),
+        "on_job_complete sees the final output: {final_output:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn recalled_memory_is_injected_as_framed_block() {
+    // A memory the backend returns from `recall` reaches the LLM as a framed
+    // `<recalled_memory>` block — never a `Role::System` row (hard constraint #3).
+    let memory = Arc::new(RecordingMemory::new().with_recall(vec![RecalledMemory {
+        content: "the user's name is Ada".into(),
+    }]));
+    let mut harness = AgentTestHarness::builder()
+        .with_memory(memory.clone() as Arc<dyn Memory>)
+        .build();
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("hi Ada".into())]);
+
+    harness.send_text("who am I?").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let captured = harness.stub_llm.captured_requests();
+    let user_text: String = captured[0]
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        user_text.contains("<recalled_memory>") && user_text.contains("the user's name is Ada"),
+        "recalled memory must reach the LLM as a framed block: {user_text}"
+    );
+    assert!(
+        !captured[0].messages.iter().any(|m| m.role == Role::System
+            && m.content.iter().any(
+                |b| matches!(b, ContentBlock::Text(t) if t.contains("the user's name is Ada"))
+            )),
+        "recalled memory must never be a Role::System row"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn memory_hooks_skip_subagent_notification_turn() {
+    // `SubagentNotification` is an ineligible job kind — the gate
+    // (`memory_recall_query` → `None`) means neither `recall` nor
+    // `on_job_complete` fires, even though the turn itself runs.
+    let memory = Arc::new(RecordingMemory::new());
+    let mut harness = AgentTestHarness::builder()
+        .with_memory(memory.clone() as Arc<dyn Memory>)
+        .build();
+    harness.stub_llm.push_response(LlmResponse {
+        content: "ack".into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage::default(),
+        thinking: None,
+    });
+
+    harness
+        .mailbox
+        .send(AgentMessage::SubagentFinished(Box::new(
+            PendingSubagentResult {
+                handle_id: "bg-1".into(),
+                subagent_type: "explorer".into(),
+                task_summary: "find X".into(),
+                child_session_id: SessionId::from("child-X"),
+                final_text: "found X".into(),
+                images: vec![],
+                status: SubagentExitStatus::Completed,
+            },
+        )))
+        .await
+        .expect("inject SubagentFinished");
+
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    // Give any (wrongly-spawned) detached write a chance to land before asserting 0.
+    await_job_complete(&memory, 1).await;
+
+    assert!(
+        !harness.stub_llm.captured_requests().is_empty(),
+        "the notification turn must still run"
+    );
+    assert_eq!(
+        memory.recall_count(),
+        0,
+        "recall must not fire for a SubagentNotification turn"
+    );
+    assert_eq!(
+        memory.job_complete_count(),
+        0,
+        "on_job_complete must not fire for a SubagentNotification turn"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn memory_on_session_end_fires_on_actor_stop_with_durable_transcript() {
+    // ActorStop is the session-end signal: a `Memory` impl gets one
+    // `on_session_end` call with the FULL durable transcript when the
+    // actor shuts down (idle reap, supervised shutdown, …). Detached on
+    // the runtime root so it lands after the actor's join handle resolves.
+    let memory = Arc::new(RecordingMemory::new());
+    let mut harness = AgentTestHarness::builder()
+        .with_memory(memory.clone() as Arc<dyn Memory>)
+        .build();
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("ack".into())]);
+
+    harness.send_text("note me down").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    // ActorStop triggers the detached `on_session_end` write.
+    harness.shutdown().await;
+
+    await_session_end(&memory, 1).await;
+    assert_eq!(
+        memory.session_end_count(),
+        1,
+        "on_session_end fires exactly once on ActorStop",
+    );
+
+    // The transcript handed to the hook is the durable one (what
+    // `SessionManager::history` returns), which includes the user's turn.
+    let transcripts = memory.session_ends();
+    assert!(
+        transcripts[0].iter().any(|m| m.role == Role::User
+            && m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("note me down")))),
+        "on_session_end sees the user turn from the durable transcript: {:?}",
+        transcripts[0],
+    );
 }

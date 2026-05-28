@@ -37,7 +37,6 @@ use aura_config::AuraConfig;
 use aura_job::JobLifecycle;
 
 use crate::reload::ConfigReloader;
-use aura_memory::MemoryManager;
 use aura_security::SecretVault;
 use aura_skills::SkillRegistry;
 use aura_storage::Store;
@@ -77,7 +76,6 @@ pub struct GatewayDeps {
     pub session_manager: Arc<SessionManager>,
     pub job_lifecycle: Arc<JobLifecycle>,
     pub cron_scheduler: Arc<CronScheduler>,
-    pub memory_manager: Arc<MemoryManager>,
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
     pub channel_registry: Arc<ChannelRegistry>,
@@ -139,7 +137,6 @@ pub struct AdminState {
     pub session_manager: Arc<SessionManager>,
     pub job_lifecycle: Arc<JobLifecycle>,
     pub cron_scheduler: Arc<CronScheduler>,
-    pub memory_manager: Arc<MemoryManager>,
     pub trace_store: Arc<dyn TraceStore>,
     pub cost_store: Arc<dyn aura_cost::CostStore>,
     /// Pre-built `QueryApi` so `/v1/traces/{id}` and any future
@@ -200,7 +197,6 @@ impl AdminState {
             session_manager: Arc::clone(&deps.session_manager),
             job_lifecycle: Arc::clone(&deps.job_lifecycle),
             cron_scheduler: Arc::clone(&deps.cron_scheduler),
-            memory_manager: Arc::clone(&deps.memory_manager),
             trace_store: Arc::clone(&deps.stores.trace),
             cost_store: Arc::clone(&deps.stores.cost),
             query_api,

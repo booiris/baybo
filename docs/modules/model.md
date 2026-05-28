@@ -8,7 +8,7 @@ Contents:
 
 - **Content models**: `ContentBlock`, `BlobRef`, `ChatMessage`, `Role`, `MessageSource`, `ThinkingContent`, `MessageMetadata` (now an empty struct), plus the `TOOL_OUTPUT_OPEN_PREFIX` / `TOOL_OUTPUT_CLOSE_PREFIX` marker constants
 - **Session types**: `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `SystemReason`, `Lineage`, `LineageKind`, `BackgroundCompressionPayload`
-- **Memory types**: `MemoryEntry`, `MemoryCategory`
+- **Memory types**: `MessageSource::RecalledMemory` (the framed recall-injection marker) + the `ChatMessage::recalled_memory` constructor
 - **Governance types**: `TrustLevel`, `ArtifactSource`, `ExtensionManifest`, `ExtensionKind`
 - **Cost & money types**: `CostRecord`, `CostSummary`, `TimeRange`, `MicroUsd` (integer micro-USD; the project never uses floats for money)
 - **Cron types**: `CronJob`, `CronExecution`, `CronSchedule`, `CronStatus`, `ExecutionStatus`
@@ -34,15 +34,7 @@ All `model` types are `Send + Sync + Serialize + Deserialize + Clone`.
 
 ### Memory types
 
-`model` houses the memory domain types (`MemoryEntry`, `MemoryCategory`). These are pure data definitions consumed by `storage` (for `MemoryStore`) and `aura-memory` (for `MemoryManager`). Storage failures surface through `StorageError`; `MemoryManager` only exposes operator-facing CRUD (list / search / store / delete / importance) and per-user eviction — there is no automatic recall or auto-store path.
-
-#### Eviction
-
-`MemoryEntry` carries an `expires_at: Option<DateTime<Utc>>` slot, but no time-based sweeper is wired today. The active policy is count-based: `MemoryManager::enforce_user_limit` clamps each user to `max_entries_per_user` (default 1000), evicting by lowest importance and then oldest `last_accessed`. Eviction runs after every `store()`.
-
-#### Memory categories
-
-`UserPreference`, `KeyFact` — left in place as categorisation hints for operator-stored entries.
+`model` no longer houses memory domain records — the old `MemoryEntry` / `MemoryCategory` CRUD types were removed with the `MemoryManager` facade. What `model` contributes to the new pluggable `Memory` trait (see [`memory.md`](memory.md)) is the recall-injection marker: the `MessageSource::RecalledMemory` variant plus the `ChatMessage::recalled_memory` constructor, so recalled memories ride the transcript as a framed, persisted block rather than a `Role::System` message. The trait, its value types (`MemoryContext`, `RecalledMemory`), and any backend storage live in `aura-memory`, not here.
 
 ## Constraints
 
@@ -55,6 +47,5 @@ All `model` types are `Send + Sync + Serialize + Deserialize + Clone`.
 
 | Module | Role |
 |--------|------|
-| `memory` | Owns the `MemoryManager` facade (list/search/store/delete/importance, per-user eviction); consumed by the admin REST surface. The `MemoryStore` trait lives in `aura-store` |
-| `storage` | Provides the libsql implementation of `MemoryStore` (trait from `aura-store`) |
+| `memory` | Owns the pluggable `Memory` trait + `NoopMemory`; consumes `MessageSource::RecalledMemory` / `ChatMessage::recalled_memory` for framed recall injection |
 | `workspace` | Complements with identity/strategy files (no overlap) |

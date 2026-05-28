@@ -422,6 +422,26 @@ impl SessionManager {
             .map_err(SessionError::from)
     }
 
+    /// Return EVERY message ever appended to the session — including rows
+    /// later marked `superseded_by` (i.e. rewritten by compaction), in
+    /// original ordinal order. Use this when a caller needs the raw
+    /// user/assistant turns instead of the compressed active view that
+    /// [`Self::history`] returns: today the only consumer is
+    /// `Memory::on_session_end`, whose contract is the full transcript
+    /// before any compression folded earlier turns into a summary. Errors
+    /// with `SessionError::NotFound` if the session row is missing.
+    pub async fn full_transcript(&self, session_id: &SessionId) -> Result<Vec<ChatMessage>> {
+        if self.store.get(session_id).await?.is_none() {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        let rows = self
+            .store
+            .load_session_messages_with_supersede(session_id)
+            .await
+            .map_err(SessionError::from)?;
+        Ok(rows.into_iter().map(|r| r.message).collect())
+    }
+
     /// Reverse-paginated slice of the active transcript: the
     /// most-recent `limit` rows whose `ordinal` is strictly below
     /// `before_ordinal` (or the tail when `before_ordinal` is `None`),
@@ -846,6 +866,75 @@ mod tests {
 
         let err = mgr
             .history(&SessionId::from("nonexistent"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn full_transcript_surfaces_superseded_rows_that_history_hides() {
+        // The whole reason `full_transcript` exists separately from
+        // `history`: `Memory::on_session_end` needs the raw user/assistant
+        // turns even after compaction has folded them into a summary.
+        // `history` filters by `superseded_by IS NULL` and would hide
+        // the original three turns; `full_transcript` returns every row
+        // ever appended.
+        use aura_model::{ChatMessage, ContentBlock};
+
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionSummaryStore::new()));
+        let session = mgr
+            .create_session(test_user(), ChannelType::tui())
+            .await
+            .unwrap();
+
+        // Three original turns get appended at ordinals 0/1/2.
+        for text in ["one", "two", "three"] {
+            let msg = ChatMessage::user(vec![ContentBlock::Text(text.into())]);
+            store
+                .append_session_message(&session.id, &msg)
+                .await
+                .unwrap();
+        }
+        // Compact: marks the three originals as superseded and appends a
+        // single summary row at ordinal 3.
+        let summary = ChatMessage::system(vec![ContentBlock::Text("summary".into())]);
+        store
+            .apply_session_compaction(&session.id, &[summary])
+            .await
+            .unwrap();
+
+        let active = mgr.history(&session.id).await.unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "history filters to the active (post-compaction) row",
+        );
+
+        let full = mgr.full_transcript(&session.id).await.unwrap();
+        assert_eq!(
+            full.len(),
+            4,
+            "full_transcript returns 3 superseded originals + 1 active summary",
+        );
+        assert_eq!(
+            full.iter()
+                .filter_map(|m| match m.content.first() {
+                    Some(ContentBlock::Text(t)) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["one", "two", "three", "summary"],
+        );
+    }
+
+    #[tokio::test]
+    async fn full_transcript_errors_for_missing_session() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
+
+        let err = mgr
+            .full_transcript(&SessionId::from("nonexistent"))
             .await
             .unwrap_err();
         assert!(matches!(err, SessionError::NotFound(_)));

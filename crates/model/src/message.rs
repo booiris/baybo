@@ -101,6 +101,16 @@ pub enum MessageSource {
     /// operator cron inbox (which finds it by this variant rather than by
     /// sniffing the framing tag out of the content).
     Cron,
+    /// A block of memories recalled from long-term storage and injected to
+    /// inform the current turn. Synthesized by the agent (so hidden from the
+    /// chat transcript like [`MessageSource::Agent`]), but tracked distinctly
+    /// so the wire layer frames it with a `<recalled_memory>` steering envelope
+    /// (`aura_context::prompts::recalled_memory`) and operator surfaces can tell
+    /// recalled context apart from a genuine turn. Always rides as a framed
+    /// `Role::User` row — never `Role::System`, which would re-assert itself on
+    /// every later turn (the failure mode that retired the prior memory
+    /// pipeline).
+    RecalledMemory,
     /// Any other agent-originated row: skill reminders, a spawned/subagent task
     /// prompt, the subagent-finished notification, summary instructions, the
     /// system prompt, assistant output, tool results. Hidden from chat surfaces.
@@ -115,6 +125,7 @@ impl MessageSource {
             MessageSource::User => "user",
             MessageSource::UserInterjection => "user_interjection",
             MessageSource::Cron => "cron",
+            MessageSource::RecalledMemory => "recalled_memory",
             MessageSource::Agent => "agent",
         }
     }
@@ -128,6 +139,7 @@ impl std::str::FromStr for MessageSource {
             "user" => Ok(MessageSource::User),
             "user_interjection" => Ok(MessageSource::UserInterjection),
             "cron" => Ok(MessageSource::Cron),
+            "recalled_memory" => Ok(MessageSource::RecalledMemory),
             "agent" => Ok(MessageSource::Agent),
             other => Err(format!("unknown message source: {other}")),
         }
@@ -188,6 +200,21 @@ impl ChatMessage {
             role: Role::User,
             content,
             source: MessageSource::Cron,
+        }
+    }
+
+    /// A block of memories recalled from long-term storage, injected as a framed
+    /// `Role::User` row to inform the current turn — the **only** constructor
+    /// that marks a row [`MessageSource::RecalledMemory`]. Never `Role::System`
+    /// (which would pollute every later turn); the wire layer wraps it in a
+    /// `<recalled_memory>` envelope (`aura_context::prompts::recalled_memory`)
+    /// re-derived per call. Carries [`MessageSource::RecalledMemory`] so it never
+    /// surfaces as a user bubble.
+    pub fn recalled_memory(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content,
+            source: MessageSource::RecalledMemory,
         }
     }
 
@@ -326,6 +353,7 @@ mod tests {
                 MessageSource::User
                 | MessageSource::UserInterjection
                 | MessageSource::Cron
+                | MessageSource::RecalledMemory
                 | MessageSource::Agent => {}
             }
         }
@@ -333,6 +361,7 @@ mod tests {
             MessageSource::User,
             MessageSource::UserInterjection,
             MessageSource::Cron,
+            MessageSource::RecalledMemory,
             MessageSource::Agent,
         ]
     }
@@ -396,5 +425,15 @@ mod tests {
         // Role::User rows.
         assert!(m.from_user());
         assert!(!ChatMessage::agent_context(vec![ContentBlock::Text("x".into())]).from_user());
+    }
+
+    #[test]
+    fn recalled_memory_is_hidden_user_role_with_distinct_source() {
+        let m = ChatMessage::recalled_memory(vec![ContentBlock::Text("user prefers Rust".into())]);
+        assert_eq!(m.role, Role::User);
+        assert_eq!(m.source(), MessageSource::RecalledMemory);
+        // Injected context, not human input: must NOT render as a user bubble
+        // and must never be treated as a genuine prompt / slash command.
+        assert!(!m.from_user());
     }
 }

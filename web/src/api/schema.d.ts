@@ -372,38 +372,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/memory": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_memory"];
-        put?: never;
-        post: operations["store_memory"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/memory/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post?: never;
-        delete: operations["delete_memory"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/skills": {
         parameters: {
             query?: never;
@@ -1085,27 +1053,6 @@ export interface components {
              */
             total: number;
         };
-        MemoryCategory: {
-            /** @enum {string} */
-            type: "UserPreference" | "KeyFact";
-        };
-        /** @description Mirror of [`aura_model::MemoryEntry`]. */
-        MemoryEntry: {
-            category: components["schemas"]["MemoryCategory"];
-            content: string;
-            /** Format: date-time */
-            created_at: string;
-            embedding?: number[] | null;
-            /** Format: date-time */
-            expires_at?: string | null;
-            id: string;
-            /** Format: float */
-            importance: number;
-            /** Format: date-time */
-            last_accessed: string;
-            source_session_id?: string | null;
-            user_id: string;
-        };
         /** @description Response body for `PUT` / `DELETE /v1/config`. */
         MutateResponse: {
             path: string;
@@ -1161,13 +1108,6 @@ export interface components {
             jobs_in_flight: number;
             sessions: number;
             version: string;
-        };
-        /** @description `POST /v1/memory` body. */
-        StoreMemoryRequest: {
-            content: string;
-            /** Format: float */
-            importance?: number | null;
-            user_id?: string | null;
         };
         /**
          * @description One row of the trace browser list view. Mirrors
@@ -2489,147 +2429,6 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    list_memory: {
-        parameters: {
-            query?: {
-                user_id?: string;
-                q?: string;
-                limit?: number;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Matching memory entries */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        items: {
-                            category: components["schemas"]["MemoryCategory"];
-                            content: string;
-                            /** Format: date-time */
-                            created_at: string;
-                            embedding?: number[] | null;
-                            /** Format: date-time */
-                            expires_at?: string | null;
-                            id: string;
-                            /** Format: float */
-                            importance: number;
-                            /** Format: date-time */
-                            last_accessed: string;
-                            source_session_id?: string | null;
-                            user_id: string;
-                        }[];
-                        next_cursor?: string | null;
-                    };
-                };
-            };
-            /** @description Unauthorized */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Memory store error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    store_memory: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["StoreMemoryRequest"];
-            };
-        };
-        responses: {
-            /** @description Stored memory entry */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MemoryEntry"];
-                };
-            };
-            /** @description Unauthorized */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Memory store error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    delete_memory: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Memory entry id */
-                id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Memory entry deleted */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Unauthorized */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            /** @description Memory store error */
-            500: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -7,7 +7,7 @@ The `aura-cli` crate is the **operator-facing command layer** for Aura. It does 
 1. **Argv mode** — `aura <command>` executes a one-shot command against the running (or freshly-loaded) domain graph and exits. Example: `aura config show`, `aura job list`, `aura session export <id>`.
 2. **Slash mode** — while a user is chatting over any channel, lines starting with `/` (e.g. `/config show`, `/cron list`) are intercepted by the channel adapter, dispatched through the same parser and handlers as Argv mode, and their output returned to the user as a normal response. Slash commands **do not** enter the agent's conversation context.
 
-`aura-cli` adds no business logic. Every command is a thin adapter that turns parsed flags into an existing manager call (`SessionManager`, `JobLifecycle`, `ToolRegistry`, `SkillRegistry`, `CronScheduler`, `SecretVault`, `MemoryManager`, `WorkspaceManager`, `AuraConfig`). When a subsystem is not yet implemented, its command family is omitted — the CLI never surfaces a "zombie" command that prints `not implemented`.
+`aura-cli` adds no business logic. Every command is a thin adapter that turns parsed flags into an existing manager call (`SessionManager`, `JobLifecycle`, `ToolRegistry`, `SkillRegistry`, `CronScheduler`, `SecretVault`, `WorkspaceManager`, `AuraConfig`). When a subsystem is not yet implemented, its command family is omitted — the CLI never surfaces a "zombie" command that prints `not implemented`.
 
 The command taxonomy is organized by subsystem: one family per manager exposed in `src/main.rs`. Subsystems that do not yet exist in Aura (e.g. service-mode gateway, device pairing, browser control) get no command family at all.
 
