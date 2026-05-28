@@ -26,8 +26,8 @@ use rig::completion::{
 };
 use rig::message::{Message, Text, UserContent};
 use rig::providers::{
-    anthropic, cohere, deepseek, gemini, groq, huggingface, hyperbolic, llamafile, mistral,
-    moonshot, ollama, openai, perplexity, together, xai, xiaomimimo, zai,
+    anthropic, cohere, deepseek, gemini, groq, huggingface, hyperbolic, llamafile, minimax,
+    mistral, moonshot, ollama, openai, perplexity, together, xai, xiaomimimo, zai,
 };
 use rig::streaming::{self, StreamedAssistantContent};
 use serde::{Deserialize, Serialize};
@@ -433,6 +433,9 @@ pub(crate) enum AnyCompletionModel {
     Moonshot(moonshot::CompletionModel),
     Zai(openai::completion::GenericCompletionModel<zai::ZAiExt>),
     XiaomiMimo(openai::completion::GenericCompletionModel<xiaomimimo::XiaomiMimoExt>),
+    /// MiniMax via rig's dedicated provider on its Anthropic-compatible
+    /// surface — shares Anthropic's cache-bucket folding and stream path.
+    Minimax(anthropic::completion::GenericCompletionModel<minimax::MiniMaxAnthropicExt>),
     /// Inference hosts (see `providers::rig_providers`). Also rig-backed,
     /// so they share the generic `from_rig_stream` path.
     Groq(groq::CompletionModel),
@@ -514,6 +517,17 @@ impl AnyCompletionModel {
             Self::Moonshot(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::Zai(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::XiaomiMimo(m) => Ok(repack_completion(m.completion(request).await?)),
+            Self::Minimax(m) => {
+                let resp = m.completion(request).await?;
+                let mut usage = resp.usage;
+                fold_anthropic_cache_into_total(&mut usage);
+                Ok(completion::CompletionResponse {
+                    choice: resp.choice,
+                    usage,
+                    raw_response: (),
+                    message_id: resp.message_id,
+                })
+            }
             Self::Groq(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::Together(m) => Ok(repack_completion(m.completion(request).await?)),
             Self::Ollama(m) => Ok(repack_completion(m.completion(request).await?)),
@@ -549,6 +563,7 @@ impl AnyCompletionModel {
             Self::Moonshot(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::Zai(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::XiaomiMimo(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
+            Self::Minimax(m) => Ok(LlmStream::from_anthropic_stream(m.stream(request).await?)),
             Self::Groq(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::Together(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
             Self::Ollama(m) => Ok(LlmStream::from_rig_stream(m.stream(request).await?)),
