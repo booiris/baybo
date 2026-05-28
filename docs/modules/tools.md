@@ -74,7 +74,7 @@ only the trait.
   injected names (never values) are recorded via `tracing` for audit (no approval
   prompt — the user already chose to store the secret).
 
-Full design + rationale: [`../todo/secret-management.md`](../todo/secret-management.md).
+Full design + rationale: [`../secret-management.md`](../secret-management.md).
 
 ### MCP client support
 

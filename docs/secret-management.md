@@ -6,9 +6,9 @@
 `aura-agent` (gateway impl + executor wiring), `aura-sandbox`
 (`EnvPolicy::BaselineWithExtra`), and `aura-cli` (`secret add/list/delete`). The
 per-module source-of-truth docs (`security.md`, `tools.md`, `cli.md`,
-`sandbox.md`, `storage.md`) now reflect it. This file stays in `docs/todo/`
-(rather than moving to a top-level shipped doc) so the in-code
-`docs/todo/secret-management.md` pointers stay valid; it is the design rationale.
+`sandbox.md`, `storage.md`) carry the *what*; this doc is the design
+**rationale** (the *why* — the forks below, rejected alternatives, threat
+model), mirroring [`mid-turn-user-interjection.md`](mid-turn-user-interjection.md).
 One deviation from the spec below: the audit (D6) records injected secret names
 via `tracing`, not a `ToolEventPayload` span event, because that enum is closed.
 

@@ -4,7 +4,7 @@
 //! or slash argument, which would leak into shell history / the transcript),
 //! so `add` is terminal-only. `list` shows a masked preview; the full value is
 //! never printed. Deletion is operator-only here — there is deliberately no
-//! agent-facing delete tool. See `docs/todo/secret-management.md`.
+//! agent-facing delete tool. See `docs/secret-management.md`.
 
 use std::io::{BufReader, stderr, stdin};
 use std::sync::Arc;

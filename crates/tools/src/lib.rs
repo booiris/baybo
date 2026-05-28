@@ -409,7 +409,7 @@ pub struct SandboxedOutput {
 /// through [`ToolContext::secrets`]. The concrete impl wraps the security
 /// gateway + `UserSecretManager`; `aura-tools` sees only this trait, so the
 /// reveal/mint pipeline and storage details stay in the agent layer (the
-/// trait is implemented "from above" — see `docs/todo/secret-management.md`).
+/// trait is implemented "from above" — see `docs/secret-management.md`).
 #[async_trait]
 pub trait SecretAccess: Send + Sync {
     /// Resolve named user secrets to plaintext for child-process env

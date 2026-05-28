@@ -5,7 +5,7 @@
 //! value-blind: `SecretAdd` writes a value but never echoes it, and neither
 //! `SecretList` nor `SecretCheck` returns any secret material — only names and
 //! booleans. Deleting a secret is intentionally CLI-only (no agent tool); see
-//! `docs/todo/secret-management.md`.
+//! `docs/secret-management.md`.
 
 use async_trait::async_trait;
 use serde::Deserialize;

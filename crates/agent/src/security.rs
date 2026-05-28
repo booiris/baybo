@@ -665,7 +665,7 @@ pub struct SecretVaultSummary {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Tool-side secret access (see `docs/todo/secret-management.md`). The gateway
+/// Tool-side secret access (see `docs/secret-management.md`). The gateway
 /// is the single secret authority, so this impl reuses its `minter` + vault for
 /// redaction and its `UserSecretManager` for add/list/check — guaranteeing the
 /// same mint/vault pipeline as input sanitization.

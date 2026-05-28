@@ -389,7 +389,7 @@ impl Tool for BashTool {
         // Resolve any requested user secrets to plaintext for env injection.
         // Fail closed if requested but the secret store isn't wired. The names
         // (never the values) are recorded for audit; the values are scrubbed
-        // back out of the output below. See docs/todo/secret-management.md.
+        // back out of the output below. See docs/secret-management.md.
         let extra_env = if p.secret_env.is_empty() {
             Vec::new()
         } else {
