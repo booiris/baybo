@@ -240,6 +240,13 @@ async fn test_model(
         pricing: entry.pricing,
         reasoning_effort: entry.reasoning_effort.clone(),
         vault: Some(state.secret_vault.clone()),
+        proxy: cfg
+            .proxy
+            .as_ref()
+            .map(|p| aura_security::http::ProxySettings {
+                url: p.url.clone(),
+                no_proxy: p.no_proxy.clone(),
+            }),
     };
 
     let client = match registry.create_client(&provider_cfg, None, CostHooks::passthrough()) {

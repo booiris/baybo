@@ -6,7 +6,19 @@ The `config` crate owns the root `AuraConfig` struct, JSON loading, and the `val
 
 A single JSON file — typically `aura.json` — maps 1:1 to `AuraConfig`. Consumers (`main.rs` and `aura-agent`) map each section into the corresponding domain type.
 
-Top-level sections: `llm` (a `Vec<LlmEntry>`) plus `default-llm: LlmEntryName`, `agent`, `channels`, `security`, `skills`, `cost`, `workspace`, `gateway`, `browser`, `external_agents`.
+Top-level sections: `llm` (a `Vec<LlmEntry>`) plus `default-llm: LlmEntryName`, `agent`, `channels`, `security`, `skills`, `cost`, `workspace`, `gateway`, `browser`, `external_agents`, and an optional `proxy`.
+
+> **Proxy.** `proxy` is an optional `{ url, no_proxy? }` block (omitted ⇒ direct
+> connections). When set, every outbound HTTP call — LLM providers, model
+> discovery, OpenRouter pricing, ChatGPT-subscription + OAuth, HTTP MCP,
+> WebFetch, CLI `mcp probe` — routes through `url` (`http`/`https`/`socks5`,
+> with optional inline `user:pass@` creds), and the standard `*_PROXY` env vars
+> are injected into spawned children (bun channel sidecars, node MCP/browser
+> stdio servers, external-agent CLIs). Loopback (`localhost`/`127.0.0.1`/`::1`)
+> is always kept direct so the local gateway and loopback MCP/CDP endpoints keep
+> working; add more bypass entries via `no_proxy`. The boot layer maps
+> `ProxyConfig` into the runtime `aura_security::http::ProxySettings`. `proxy` is
+> **not** hot-reloadable — changing it rejects the reload (restart required).
 
 > **MCP status note.** MCP server records do **not** live in `aura.json`.
 > They live in `<workspace>/config/.mcp.json`, owned by `aura-tools::mcp`

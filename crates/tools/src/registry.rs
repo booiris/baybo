@@ -43,9 +43,13 @@ impl ToolRegistry {
     /// tool-call's context. `workspace_paths` is forwarded to `Edit`
     /// so its approval-gate bypass for `profile/` writes can bind to
     /// the real workspace rather than a heuristic on the path string.
-    pub fn with_defaults(blob_store: Arc<dyn BlobStore>, workspace_paths: WorkspacePaths) -> Self {
+    pub fn with_defaults(
+        blob_store: Arc<dyn BlobStore>,
+        workspace_paths: WorkspacePaths,
+        proxy: Option<reqwest::Proxy>,
+    ) -> Self {
         let mut registry = Self::new();
-        for (tool, manifest) in crate::builtin::default_tools(blob_store, workspace_paths) {
+        for (tool, manifest) in crate::builtin::default_tools(blob_store, workspace_paths, proxy) {
             registry.register(tool, manifest);
         }
         registry
@@ -202,8 +206,11 @@ mod tests {
     #[test]
     fn defaults_register_send_file() {
         let blob_store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
-        let registry =
-            ToolRegistry::with_defaults(blob_store, aura_workspace::WorkspacePaths::new("/tmp"));
+        let registry = ToolRegistry::with_defaults(
+            blob_store,
+            aura_workspace::WorkspacePaths::new("/tmp"),
+            None,
+        );
 
         assert!(registry.get("SendFile").is_some());
         assert!(registry.get_manifest("SendFile").is_some());

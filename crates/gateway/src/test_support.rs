@@ -188,6 +188,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
                 pricing: None,
                 reasoning_effort: None,
                 vault: None,
+                proxy: None,
             },
             None,
             aura_llm::CostHooks::passthrough(),

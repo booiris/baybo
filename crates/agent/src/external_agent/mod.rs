@@ -137,7 +137,10 @@ impl ExternalAgentRegistry {
 /// Tuple form `(kind, enabled, binary_path)` is the lingua franca
 /// between this crate and `aura-config` since the two don't depend on
 /// each other.
-pub fn build_registry<'a, I>(entries: I) -> ExternalAgentRegistry
+pub fn build_registry<'a, I>(
+    entries: I,
+    proxy: Option<aura_security::http::ProxySettings>,
+) -> ExternalAgentRegistry
 where
     I: IntoIterator<Item = (ExternalAgentKind, bool, Option<&'a str>)>,
 {
@@ -151,12 +154,18 @@ where
             continue;
         }
         let result: Result<Arc<dyn ExternalAgent>> = match kind {
-            ExternalAgentKind::Claude => claude_cli::ClaudeCliAgent::probe_and_build(binary_path)
-                .map(|a| a as Arc<dyn ExternalAgent>),
-            ExternalAgentKind::Codex => codex_cli::CodexCliAgent::probe_and_build(binary_path)
-                .map(|a| a as Arc<dyn ExternalAgent>),
-            ExternalAgentKind::Gemini => gemini_cli::GeminiCliAgent::probe_and_build(binary_path)
-                .map(|a| a as Arc<dyn ExternalAgent>),
+            ExternalAgentKind::Claude => {
+                claude_cli::ClaudeCliAgent::probe_and_build(binary_path, proxy.clone())
+                    .map(|a| a as Arc<dyn ExternalAgent>)
+            }
+            ExternalAgentKind::Codex => {
+                codex_cli::CodexCliAgent::probe_and_build(binary_path, proxy.clone())
+                    .map(|a| a as Arc<dyn ExternalAgent>)
+            }
+            ExternalAgentKind::Gemini => {
+                gemini_cli::GeminiCliAgent::probe_and_build(binary_path, proxy.clone())
+                    .map(|a| a as Arc<dyn ExternalAgent>)
+            }
         };
         match result {
             Ok(agent) => {

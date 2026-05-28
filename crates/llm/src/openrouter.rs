@@ -378,6 +378,7 @@ impl ApiEntry {
 /// providers) are silently skipped.
 pub async fn fetch_overlay_for(
     entries: &[(&str, &str)],
+    proxy: Option<&aura_security::http::ProxySettings>,
 ) -> HashMap<String, (ModelPricing, ModelCapabilities)> {
     let mut wanted: Vec<(String, String)> = Vec::new();
     for (provider, model) in entries {
@@ -389,7 +390,7 @@ pub async fn fetch_overlay_for(
     if wanted.is_empty() {
         return HashMap::new();
     }
-    let catalog = match fetch_catalog().await {
+    let catalog = match fetch_catalog(proxy).await {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!(
@@ -416,8 +417,10 @@ pub async fn fetch_overlay_for(
 /// Bounded by [`LIVE_FETCH_TIMEOUT`] so a sluggish OpenRouter doesn't
 /// extend boot. Failures are caller-tolerant; the overlay paths
 /// swallow them and keep the bundled snapshot.
-async fn fetch_catalog() -> crate::Result<HashMap<String, SnapshotEntry>> {
-    let body = fetch_models_response().await?;
+async fn fetch_catalog(
+    proxy: Option<&aura_security::http::ProxySettings>,
+) -> crate::Result<HashMap<String, SnapshotEntry>> {
+    let body = fetch_models_response(proxy).await?;
     Ok(body
         .data
         .into_iter()
@@ -435,10 +438,11 @@ async fn fetch_catalog() -> crate::Result<HashMap<String, SnapshotEntry>> {
         .collect())
 }
 
-async fn fetch_models_response() -> crate::Result<ApiResponse> {
-    let client = reqwest::Client::builder()
-        .timeout(LIVE_FETCH_TIMEOUT)
-        .build()
+async fn fetch_models_response(
+    proxy: Option<&aura_security::http::ProxySettings>,
+) -> crate::Result<ApiResponse> {
+    let client = aura_security::http::client_builder(proxy)
+        .and_then(|b| b.timeout(LIVE_FETCH_TIMEOUT).build())
         .map_err(|e| crate::LlmError::Config(format!("openrouter http client: {e}")))?;
 
     let resp = client

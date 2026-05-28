@@ -1,20 +1,17 @@
 use rig::client::CompletionClient;
-use rig::providers::openai;
+use rig::providers::deepseek;
 
 use crate::registry::{LlmProviderConfig, LlmProviderFactory};
 use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
 
-/// DeepSeek's OpenAI-compatible base. The platform speaks the OpenAI
-/// Chat Completions wire format (function calling + streaming
-/// included), so we route through rig's OpenAI client with this base
-/// URL pinned. Operators can override via `LlmConfig.base_url`.
+/// DeepSeek's API base. Operators can override via `LlmConfig.base_url`.
 pub(crate) const DEEPSEEK_DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 
 /// Factory that creates `LlmClient` instances configured for DeepSeek models.
 ///
-/// DeepSeek exposes an OpenAI-compatible Chat Completions API, so this
-/// mirrors `OpenAIProviderFactory` but pins the DeepSeek base URL by
-/// default and dispatches through [`AnyCompletionModel::OpenAI`].
+/// Routes through rig's dedicated DeepSeek provider (not the generic
+/// OpenAI client): it round-trips `reasoning_content` on assistant
+/// tool-call turns, which DeepSeek's thinking mode requires echoed back.
 pub struct DeepSeekProviderFactory;
 
 #[async_trait::async_trait]
@@ -42,15 +39,16 @@ impl LlmProviderFactory for DeepSeekProviderFactory {
             .as_deref()
             .unwrap_or(DEEPSEEK_DEFAULT_BASE_URL);
 
-        let client = openai::Client::builder()
+        let client = deepseek::Client::builder()
             .api_key(api_key)
             .base_url(base_url)
+            .http_client(crate::proxied_client(config.proxy.as_ref())?)
             .build()
             .map_err(|e| {
                 crate::LlmError::Config(format!("failed to create DeepSeek client: {e}"))
             })?;
 
-        let model = client.completions_api().completion_model(&config.model);
+        let model = client.completion_model(&config.model);
 
         let caps = crate::openrouter::capabilities_for(self.provider_name(), &config.model);
         let defaults = crate::providers::factory_defaults_for(self.provider_name());
@@ -69,7 +67,7 @@ impl LlmProviderFactory for DeepSeekProviderFactory {
 
         Ok(LlmClient::new(
             model_info,
-            AnyCompletionModel::OpenAI(model),
+            AnyCompletionModel::DeepSeek(model),
         ))
     }
 }
@@ -91,6 +89,7 @@ mod tests {
             pricing: None,
             reasoning_effort: None,
             vault: None,
+            proxy: None,
         }
     }
 

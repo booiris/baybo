@@ -49,7 +49,7 @@ pub async fn run(ctx: &CommandContext, name: String, do_probe: bool) -> Result<C
 
     let status = if do_probe {
         let vault_arc = Arc::clone(vault);
-        probe(&entry, &vault_arc).await
+        probe(&entry, &vault_arc, ctx.proxy_settings().as_ref()).await
     } else {
         ProbeStatus::Skipped
     };

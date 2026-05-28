@@ -40,7 +40,12 @@ pub const ENV_CHANNEL_TOKEN: &str = "AURA_CHANNEL_TOKEN";
 /// the gateway. Anything else (`OPENAI_API_KEY`, every `AURA_*` from
 /// the operator's shell, cloud / proxy creds, …) is scrubbed before
 /// `execve` so a compromised JS bundle can't read the gateway's
-/// secret env. Mirrors the registration-mode allowlist in
+/// secret env. The one exception is the operator-configured egress
+/// proxy (`aura.json`'s `proxy`): `ChannelSpawner::spawn` re-injects
+/// the standard `*_PROXY` vars from it after the scrub, since shell-
+/// inherited proxy env is wiped but sidecars still need to reach the
+/// network through the configured proxy. Mirrors the registration-mode
+/// allowlist in
 /// `cli::commands::channel::register::scrubbed_env`. Tool-domain
 /// sidecars (the embedded browser MCP server today) flow through
 /// `aura_tools::mcp::transport::connect_with_extra_env`, which
@@ -73,11 +78,19 @@ pub const SIDECAR_ENV_ALLOWLIST: &[&str] = &[
 pub struct ChannelSpawner {
     url: String,
     tokens: ChannelTokenTable,
+    /// Egress proxy injected into each sidecar's env. `env_clear` below
+    /// wipes any inherited `*_PROXY`, so we re-add the standard vars
+    /// explicitly when configured. `None` = sidecars run direct.
+    proxy: Option<aura_security::http::ProxySettings>,
 }
 
 impl ChannelSpawner {
-    pub fn new(url: String, tokens: ChannelTokenTable) -> Self {
-        Self { url, tokens }
+    pub fn new(
+        url: String,
+        tokens: ChannelTokenTable,
+        proxy: Option<aura_security::http::ProxySettings>,
+    ) -> Self {
+        Self { url, tokens, proxy }
     }
 
     pub fn url(&self) -> &str {
@@ -117,6 +130,13 @@ impl ChannelSpawner {
         for key in SIDECAR_ENV_ALLOWLIST {
             if let Ok(v) = std::env::var(key) {
                 cmd.env(key, v);
+            }
+        }
+        // Re-add the egress proxy (env_clear wiped any inherited one).
+        // Loopback stays direct (see `ProxySettings::env_vars`).
+        if let Some(proxy) = &self.proxy {
+            for (k, v) in proxy.env_vars() {
+                cmd.env(k, v);
             }
         }
         cmd.env(ENV_CHANNEL_URL, &self.url);
@@ -222,8 +242,11 @@ mod tests {
         let _cleanup = EnvCleanup(secret_var);
 
         let tokens = ChannelTokenTable::new();
-        let spawner =
-            ChannelSpawner::new("ws://127.0.0.1:1/v1/channel-ws".to_owned(), tokens.clone());
+        let spawner = ChannelSpawner::new(
+            "ws://127.0.0.1:1/v1/channel-ws".to_owned(),
+            tokens.clone(),
+            None,
+        );
 
         let mut cmd = Command::new("/usr/bin/env");
         cmd.stdout(std::process::Stdio::piped());
@@ -252,8 +275,11 @@ mod tests {
     async fn spawn_registers_token_with_child_pid() {
         // `true` exits zero immediately — enough to sample its PID.
         let tokens = ChannelTokenTable::new();
-        let spawner =
-            ChannelSpawner::new("ws://127.0.0.1:1/v1/channel-ws".to_owned(), tokens.clone());
+        let spawner = ChannelSpawner::new(
+            "ws://127.0.0.1:1/v1/channel-ws".to_owned(),
+            tokens.clone(),
+            None,
+        );
         let handle = spawner
             .spawn(Command::new("true"), "test", "test-channel")
             .unwrap();

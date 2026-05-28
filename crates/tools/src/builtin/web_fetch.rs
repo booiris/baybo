@@ -194,17 +194,18 @@ pub struct WebFetchTool {
 }
 
 impl WebFetchTool {
-    pub fn new(blob_store: Arc<dyn BlobStore>) -> Self {
-        Self::build(blob_store, false, false)
+    pub fn new(blob_store: Arc<dyn BlobStore>, proxy: Option<reqwest::Proxy>) -> Self {
+        Self::build(blob_store, false, false, proxy)
     }
 
     fn build(
         blob_store: Arc<dyn BlobStore>,
         validator_allow_loopback: bool,
         resolver_allow_loopback: bool,
+        proxy: Option<reqwest::Proxy>,
     ) -> Self {
         let validator_lax = validator_allow_loopback;
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .user_agent(concat!("aura-webfetch/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(CONNECT_TIMEOUT)
             .dns_resolver(Arc::new(SafeResolver {
@@ -232,7 +233,15 @@ impl WebFetchTool {
                     ));
                 }
                 attempt.follow()
-            }))
+            }));
+        // When an egress proxy is configured the proxy resolves the hostname,
+        // so the SafeResolver IP-block above only guards direct connections —
+        // the proxy becomes the trusted egress (operator's choice). The URL
+        // validator and cross-host redirect block still apply either way.
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(proxy);
+        }
+        let client = builder
             .build()
             .expect("reqwest::Client builder accepts only static config");
         Self {
@@ -246,14 +255,14 @@ impl WebFetchTool {
     fn for_testing() -> Self {
         let blob_store: Arc<dyn BlobStore> =
             Arc::new(aura_storage::test_support::MemoryBlobStore::new());
-        Self::build(blob_store, true, true)
+        Self::build(blob_store, true, true, None)
     }
 
     #[cfg(test)]
     fn for_testing_strict_resolver() -> Self {
         let blob_store: Arc<dyn BlobStore> =
             Arc::new(aura_storage::test_support::MemoryBlobStore::new());
-        Self::build(blob_store, true, false)
+        Self::build(blob_store, true, false, None)
     }
 
     /// Strict validator + strict resolver — mirrors the production
@@ -265,7 +274,7 @@ impl WebFetchTool {
     fn for_testing_default() -> Self {
         let blob_store: Arc<dyn BlobStore> =
             Arc::new(aura_storage::test_support::MemoryBlobStore::new());
-        Self::build(blob_store, false, false)
+        Self::build(blob_store, false, false, None)
     }
 }
 
@@ -1219,7 +1228,7 @@ mod tests {
         .await;
 
         let blob_store = Arc::new(MemoryBlobStore::new());
-        let tool = WebFetchTool::build(blob_store.clone() as Arc<dyn BlobStore>, true, true);
+        let tool = WebFetchTool::build(blob_store.clone() as Arc<dyn BlobStore>, true, true, None);
 
         let llm = billed(stub.clone() as Arc<dyn LlmCompletion>);
         let mut tctx = ctx();

@@ -69,7 +69,8 @@ pub async fn run(ctx: &CommandContext, args: AddArgs) -> Result<CommandOutput> {
     if !oauth_intent
         && let McpTransportConfig::Http { url } = &transport
         && header_pairs.is_empty()
-        && let Some(ProbeStatus::AuthRequired(realm)) = http_auth_precheck(url).await
+        && let Some(ProbeStatus::AuthRequired(realm)) =
+            http_auth_precheck(url, ctx.proxy_settings().as_ref()).await
     {
         // Only the unambiguous "401/403 + WWW-Authenticate" signal triggers
         // the auto-OAuth path. Connection errors, timeouts, and other

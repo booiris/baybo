@@ -42,6 +42,12 @@ pub struct LlmProviderConfig {
     /// during serialization — vault is process-local state, not config.
     #[serde(skip)]
     pub vault: Option<Arc<SecretVault>>,
+    /// Egress proxy for this provider's HTTP — both the rig completion
+    /// client and live model discovery. `None` = direct. Process-local
+    /// runtime state derived from the global `proxy` config, not part of
+    /// the serialized config shape.
+    #[serde(skip)]
+    pub proxy: Option<aura_security::http::ProxySettings>,
 }
 
 pub use aura_model::LlmPricingOverride;
@@ -62,6 +68,7 @@ impl std::fmt::Debug for LlmProviderConfig {
             .field("pricing", &self.pricing)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("vault", &self.vault.as_ref().map(|_| "<vault>"))
+            .field("proxy", &self.proxy)
             .finish()
     }
 }
@@ -319,6 +326,7 @@ mod tests {
             pricing: None,
             reasoning_effort: None,
             vault: None,
+            proxy: None,
         }
     }
 
@@ -391,6 +399,7 @@ mod tests {
             pricing: None,
             reasoning_effort: None,
             vault: None,
+            proxy: None,
         };
         let entries = registry.list_live_models(&cfg).await.unwrap();
         assert!(
@@ -446,6 +455,7 @@ mod tests {
             pricing: None,
             reasoning_effort: None,
             vault: None,
+            proxy: None,
         };
         let entries = registry.list_live_models(&cfg).await.unwrap();
         assert_eq!(entries.len(), 1);

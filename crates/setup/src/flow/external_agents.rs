@@ -118,13 +118,13 @@ fn detect_on_path() -> Vec<Detected> {
 
 fn probe(kind: ExternalAgentKind) -> Option<String> {
     match kind {
-        ExternalAgentKind::Claude => ClaudeCliAgent::probe_and_build(None)
+        ExternalAgentKind::Claude => ClaudeCliAgent::probe_and_build(None, None)
             .ok()
             .map(|a| a.binary_path().display().to_string()),
-        ExternalAgentKind::Codex => CodexCliAgent::probe_and_build(None)
+        ExternalAgentKind::Codex => CodexCliAgent::probe_and_build(None, None)
             .ok()
             .map(|a| a.binary_path().display().to_string()),
-        ExternalAgentKind::Gemini => GeminiCliAgent::probe_and_build(None)
+        ExternalAgentKind::Gemini => GeminiCliAgent::probe_and_build(None, None)
             .ok()
             .map(|a| a.binary_path().display().to_string()),
     }

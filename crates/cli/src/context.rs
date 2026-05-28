@@ -72,6 +72,18 @@ pub struct CommandContext {
 }
 
 impl CommandContext {
+    /// The optional egress proxy in runtime form, mapped from `config.proxy`.
+    /// Every HTTP client a command builds threads this through.
+    pub fn proxy_settings(&self) -> Option<aura_security::http::ProxySettings> {
+        self.config
+            .proxy
+            .as_ref()
+            .map(|p| aura_security::http::ProxySettings {
+                url: p.url.clone(),
+                no_proxy: p.no_proxy.clone(),
+            })
+    }
+
     pub fn with_format(mut self, format: OutputFormat) -> Self {
         self.format = format;
         self

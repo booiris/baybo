@@ -41,14 +41,22 @@ pub(crate) async fn build_pool_clients(
     vault: Arc<SecretVault>,
     cost_manager: &Arc<CostManager>,
 ) -> anyhow::Result<(HashMap<LlmEntryName, Arc<BillableLlm>>, Vec<LlmEntryName>)> {
+    let proxy = boot::proxy_settings(config);
     let results = futures::future::join_all(config.llm.iter().map(|entry| {
         let blob = blob.clone();
         let vault = Arc::clone(&vault);
         let billing = cost_hooks(cost_manager);
+        let proxy = proxy.clone();
         async move {
-            let r =
-                boot::build_llm_client_for_entry(entry, registry, Some(blob), Some(vault), billing)
-                    .await;
+            let r = boot::build_llm_client_for_entry(
+                entry,
+                registry,
+                Some(blob),
+                Some(vault),
+                billing,
+                proxy,
+            )
+            .await;
             (entry.name.clone(), r)
         }
     }))
@@ -109,6 +117,7 @@ pub(crate) fn refresh_pairs(config: &AuraConfig) -> Vec<(String, String)> {
 pub(crate) fn spawn_pricing_refresh(
     cost_manager: &Arc<CostManager>,
     pairs: Vec<(String, String)>,
+    proxy: Option<aura_security::http::ProxySettings>,
     shutdown: &ShutdownSignal,
 ) -> CancellationToken {
     let token = CancellationToken::new();
@@ -128,7 +137,7 @@ pub(crate) fn spawn_pricing_refresh(
                 .iter()
                 .map(|(p, m)| (p.as_str(), m.as_str()))
                 .collect();
-            let overlay = aura_llm::openrouter::fetch_overlay_for(&entries).await;
+            let overlay = aura_llm::openrouter::fetch_overlay_for(&entries, proxy.as_ref()).await;
             let pricings = overlay
                 .into_iter()
                 .map(|(model, (pricing, _caps))| (model, pricing))
@@ -153,6 +162,10 @@ pub(crate) struct LlmReloader {
     blob: Arc<dyn BlobStore>,
     vault: Arc<SecretVault>,
     shutdown: ShutdownSignal,
+    /// Egress proxy for the pricing-refresh loop. Fixed at boot — `proxy`
+    /// is not hot-reloadable (a change rejects the reload), so the reloader
+    /// keeps the boot value across pool swaps.
+    proxy: Option<aura_security::http::ProxySettings>,
     refresh_cancel: Mutex<CancellationToken>,
 }
 
@@ -174,14 +187,16 @@ impl LlmReloader {
         vault: Arc<SecretVault>,
         shutdown: ShutdownSignal,
         initial_pairs: Vec<(String, String)>,
+        proxy: Option<aura_security::http::ProxySettings>,
     ) -> Self {
-        let token = spawn_pricing_refresh(&cost_manager, initial_pairs, &shutdown);
+        let token = spawn_pricing_refresh(&cost_manager, initial_pairs, proxy.clone(), &shutdown);
         Self {
             pool_handle,
             cost_manager,
             blob,
             vault,
             shutdown,
+            proxy,
             refresh_cancel: Mutex::new(token),
         }
     }
@@ -233,7 +248,12 @@ impl LlmReloader {
         *self.pool_handle.write() = Arc::new(prepared.pool);
         let mut guard = self.refresh_cancel.lock();
         guard.cancel();
-        *guard = spawn_pricing_refresh(&self.cost_manager, prepared.pairs, &self.shutdown);
+        *guard = spawn_pricing_refresh(
+            &self.cost_manager,
+            prepared.pairs,
+            self.proxy.clone(),
+            &self.shutdown,
+        );
         prepared.outcome
     }
 }

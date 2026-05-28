@@ -73,6 +73,7 @@ pub fn hot_reload_diff(old: &AuraConfig, new: &AuraConfig) -> Result<()> {
         gateway,
         browser,
         external_agents,
+        proxy,
     } = new;
 
     if &old.channels != channels {
@@ -95,6 +96,11 @@ pub fn hot_reload_diff(old: &AuraConfig, new: &AuraConfig) -> Result<()> {
     }
     if &old.external_agents != external_agents {
         return Err(not_hot("external_agents"));
+    }
+    // Changing the proxy means re-creating every HTTP client (LLM, tools,
+    // MCP) and re-spawning sidecars with new env — not safe live.
+    if &old.proxy != proxy {
+        return Err(not_hot("proxy"));
     }
 
     let AgentConfig {

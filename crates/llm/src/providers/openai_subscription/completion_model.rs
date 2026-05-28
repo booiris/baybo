@@ -94,6 +94,7 @@ impl OpenAiSubscriptionCompletionModel {
         base_url: Option<String>,
         reasoning_effort: Option<&str>,
         token_store: VaultTokenStore,
+        http: reqwest::Client,
         background: BackgroundRefresh,
     ) -> Self {
         let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
@@ -102,7 +103,7 @@ impl OpenAiSubscriptionCompletionModel {
             model,
             base_url,
             reasoning_effort,
-            http: reqwest::Client::new(),
+            http: http.clone(),
             token_store: token_store.clone(),
             cache: Arc::new(Mutex::new(None)),
             refresh_flight: Arc::new(Mutex::new(())),
@@ -112,6 +113,7 @@ impl OpenAiSubscriptionCompletionModel {
                 token_store,
                 Arc::clone(&model.cache),
                 Arc::clone(&model.refresh_flight),
+                http,
             );
         }
         model
@@ -189,6 +191,7 @@ impl OpenAiSubscriptionCompletionModel {
                 total_tokens: (usage.input_tokens + usage.output_tokens) as u64,
                 cached_input_tokens: usage.cached_input_tokens as u64,
                 cache_creation_input_tokens: usage.cache_creation_input_tokens as u64,
+                reasoning_tokens: 0,
             },
             raw_response: (),
             message_id: None,
@@ -285,6 +288,7 @@ impl OpenAiSubscriptionCompletionModel {
             &self.cache,
             &self.token_store,
             &candidate.refresh_token,
+            &self.http,
         )
         .await
     }
@@ -335,6 +339,7 @@ impl OpenAiSubscriptionCompletionModel {
             &self.cache,
             &self.token_store,
             &current.refresh_token,
+            &self.http,
         )
         .await
     }
@@ -1056,6 +1061,7 @@ async fn do_single_flight_refresh(
     cache: &Mutex<Option<CachedBundle>>,
     token_store: &VaultTokenStore,
     expected_refresh_token: &str,
+    http: &reqwest::Client,
 ) -> crate::Result<Arc<OAuthTokenBundle>> {
     let _flight_guard = refresh_flight.lock().await;
     let now = chrono::Utc::now().timestamp();
@@ -1097,7 +1103,7 @@ async fn do_single_flight_refresh(
         return Ok(Arc::clone(&cached.bundle));
     }
 
-    let refreshed = match refresh(expected_refresh_token).await {
+    let refreshed = match refresh(expected_refresh_token, http).await {
         Ok(b) => b,
         Err(RefreshError::Permanent(msg)) => {
             token_store.clear().await.ok();
@@ -1179,6 +1185,7 @@ fn spawn_background_refresh_loop(
     token_store: VaultTokenStore,
     cache: Arc<Mutex<Option<CachedBundle>>>,
     refresh_flight: Arc<Mutex<()>>,
+    http: reqwest::Client,
 ) {
     use std::time::Duration;
 
@@ -1222,6 +1229,7 @@ fn spawn_background_refresh_loop(
                         &cache,
                         &token_store,
                         &b.refresh_token,
+                        &http,
                     )
                     .await
                     {
@@ -1703,10 +1711,15 @@ mod tests {
         };
         let cache: Mutex<Option<CachedBundle>> = Mutex::new(Some(cached(bundle.clone(), false)));
         let refresh_flight: Mutex<()> = Mutex::new(());
-        let result =
-            do_single_flight_refresh(&refresh_flight, &cache, &store, "different-rt-from-caller")
-                .await
-                .expect("self-heal then dedup must succeed");
+        let result = do_single_flight_refresh(
+            &refresh_flight,
+            &cache,
+            &store,
+            "different-rt-from-caller",
+            &reqwest::Client::new(),
+        )
+        .await
+        .expect("self-heal then dedup must succeed");
         assert_eq!(result.refresh_token, "rotated-rt");
         let final_state = cache.lock().await.clone().unwrap();
         assert!(final_state.persisted);
@@ -1740,6 +1753,7 @@ mod tests {
             None,
             None,
             token_store.clone(),
+            reqwest::Client::new(),
             BackgroundRefresh::Disabled,
         );
 
@@ -1787,6 +1801,7 @@ mod tests {
             None,
             None,
             token_store.clone(),
+            reqwest::Client::new(),
             BackgroundRefresh::Disabled,
         );
         let _ = model.ensure_fresh_bundle().await.unwrap();
@@ -1814,10 +1829,15 @@ mod tests {
         };
         let cache: Mutex<Option<CachedBundle>> = Mutex::new(Some(cached(bundle, false)));
         let refresh_flight: Mutex<()> = Mutex::new(());
-        let err =
-            do_single_flight_refresh(&refresh_flight, &cache, &store, "different-rt-from-caller")
-                .await
-                .expect_err("should refuse to rotate while disk is broken");
+        let err = do_single_flight_refresh(
+            &refresh_flight,
+            &cache,
+            &store,
+            "different-rt-from-caller",
+            &reqwest::Client::new(),
+        )
+        .await
+        .expect_err("should refuse to rotate while disk is broken");
         match err {
             LlmError::Internal(e) => assert!(e.to_string().contains("vault save still failing")),
             other => panic!("expected Internal, got {other:?}"),
@@ -1852,9 +1872,15 @@ mod tests {
         let cache: Mutex<Option<CachedBundle>> =
             Mutex::new(Some(cached(already_rotated.clone(), true)));
 
-        let result = do_single_flight_refresh(&refresh_flight, &cache, &token_store, "old-rt")
-            .await
-            .expect("dedup path must succeed without a network call");
+        let result = do_single_flight_refresh(
+            &refresh_flight,
+            &cache,
+            &token_store,
+            "old-rt",
+            &reqwest::Client::new(),
+        )
+        .await
+        .expect("dedup path must succeed without a network call");
         assert_eq!(result.refresh_token, "new-rt");
         assert_eq!(result.access_token, "new-at");
         let still_cached = cache.lock().await.clone().unwrap();
