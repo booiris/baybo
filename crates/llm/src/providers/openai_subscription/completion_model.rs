@@ -191,6 +191,7 @@ impl OpenAiSubscriptionCompletionModel {
                 total_tokens: (usage.input_tokens + usage.output_tokens) as u64,
                 cached_input_tokens: usage.cached_input_tokens as u64,
                 cache_creation_input_tokens: usage.cache_creation_input_tokens as u64,
+                reasoning_tokens: 0,
             },
             raw_response: (),
             message_id: None,
