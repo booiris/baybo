@@ -183,7 +183,7 @@ export function CronInbox({ refreshSignal }: CronInboxProps) {
         </button>
       </header>
 
-      <div className="flex-1 overflow-auto">
+      <div className="chat-scroll flex-1 overflow-y-auto overflow-x-hidden">
         {error ? (
           <div className="m-3 p-3 border-[2px] border-err text-err rounded-md text-[0.75rem] font-mono">
             {error}
