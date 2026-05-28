@@ -28,6 +28,14 @@ impl LlmProviderFactory for DeepSeekProviderFactory {
         crate::providers::catalog::DEEPSEEK_FLAT_DEFAULT_PRICING
     }
 
+    fn default_base_url(&self) -> Option<&'static str> {
+        Some(DEEPSEEK_DEFAULT_BASE_URL)
+    }
+
+    fn default_api_key_env(&self) -> Option<&'static str> {
+        Some("DEEPSEEK_API_KEY")
+    }
+
     fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
         let api_key = config
             .api_key

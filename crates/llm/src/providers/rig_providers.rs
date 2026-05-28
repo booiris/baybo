@@ -19,8 +19,10 @@ use crate::{AnyCompletionModel, LlmClient, ModelInfo, ModelPricing};
 
 /// Build the `ModelInfo` for a rig-backed model: OpenRouter snapshot
 /// capabilities → per-provider defaults, with the factory's resolved
-/// pricing. Shared by every arm of [`rig_provider_factory`].
-fn rig_model_info(name: &str, model_id: &str, pricing: ModelPricing) -> ModelInfo {
+/// pricing. Shared by every arm of [`rig_provider_factory`]; `pub(crate)`
+/// so sibling provider modules invoking the macro can resolve it through
+/// the `$crate::...` path the macro emits.
+pub(crate) fn rig_model_info(name: &str, model_id: &str, pricing: ModelPricing) -> ModelInfo {
     let caps = crate::openrouter::capabilities_for(name, model_id);
     let defaults = crate::providers::factory_defaults_for(name);
     ModelInfo {
@@ -45,9 +47,30 @@ fn rig_model_info(name: &str, model_id: &str, pricing: ModelPricing) -> ModelInf
 /// * `optional_key` — API key optional (e.g. a local Ollama that may or
 ///   may not sit behind auth).
 /// * `keyless` — provider takes no API key at all (e.g. llamafile).
+///
+/// Optional trailing kwargs (must appear in this order; any may be
+/// omitted):
+/// * `live_models = path::to::fn` — overrides the default
+///   (OpenRouter-snapshot) discovery with a real catalog endpoint. The
+///   fn must be `async fn(&LlmProviderConfig) -> crate::Result<Vec<LiveModelInfo>>`.
+/// * `api_key_env = "FOO_API_KEY"` — conventional env var holding the
+///   API key. Surfaces in [`crate::default_api_key_env_for_provider`]
+///   and feeds `resolve_api_key`'s last-resort fallback.
+/// * `base_url = "https://…"` — default endpoint surfaced to the setup
+///   wizard. Rig providers usually leave this off since rig's client
+///   has its own baked-in default — Aura doesn't need to mirror it.
+///
+/// Cross-module callers also need `rig::client::CompletionClient` in scope
+/// (the macro calls `.completion_model(..)`); `optional_key` / `keyless`
+/// callers additionally need `rig::client::Nothing`.
 macro_rules! rig_provider_factory {
     // --- shared skeleton: $build yields the configured rig client ---
-    (@factory $factory:ident, $name:literal, $variant:ident, $build:expr $(, pricing = $pricing:expr)?) => {
+    (@factory $factory:ident, $name:literal, $variant:ident, $build:expr
+        $(, pricing = $pricing:expr)?
+        $(, live_models = $live:path)?
+        $(, api_key_env = $env:expr)?
+        $(, base_url = $url:expr)?
+    ) => {
         pub struct $factory;
 
         #[async_trait::async_trait]
@@ -57,20 +80,38 @@ macro_rules! rig_provider_factory {
             }
 
             $(fn flat_default_pricing(&self) -> ModelPricing { $pricing })?
+            $(fn default_api_key_env(&self) -> Option<&'static str> { Some($env) })?
+            $(fn default_base_url(&self) -> Option<&'static str> { Some($url) })?
 
             fn create(&self, config: &LlmProviderConfig) -> crate::Result<LlmClient> {
                 let build = $build;
                 let client = build(config)?;
                 let model = client.completion_model(&config.model);
-                let model_info =
-                    rig_model_info($name, &config.model, self.pricing_for_model(&config.model));
+                let model_info = $crate::providers::rig_providers::rig_model_info(
+                    $name,
+                    &config.model,
+                    self.pricing_for_model(&config.model),
+                );
                 Ok(LlmClient::new(model_info, AnyCompletionModel::$variant(model)))
             }
+
+            $(
+                async fn live_models(
+                    &self,
+                    config: &LlmProviderConfig,
+                ) -> crate::Result<Vec<LiveModelInfo>> {
+                    $live(config).await
+                }
+            )?
         }
     };
 
     // require an API key, snapshot-backed pricing
-    ($factory:ident, $name:literal, $module:ident, $variant:ident, priced = $pricing:expr) => {
+    ($factory:ident, $name:literal, $module:ident, $variant:ident, priced = $pricing:expr
+        $(, live_models = $live:path)?
+        $(, api_key_env = $env:expr)?
+        $(, base_url = $url:expr)?
+    ) => {
         rig_provider_factory!(@factory $factory, $name, $variant,
             |config: &LlmProviderConfig| -> crate::Result<rig::providers::$module::Client> {
                 let api_key = config.api_key.as_deref().ok_or_else(|| {
@@ -82,11 +123,18 @@ macro_rules! rig_provider_factory {
                     .build()
                     .map_err(|e| crate::LlmError::Config(format!("failed to create {} client: {e}", $name)))
             },
-            pricing = $pricing);
+            pricing = $pricing
+            $(, live_models = $live)?
+            $(, api_key_env = $env)?
+            $(, base_url = $url)?);
     };
 
     // require an API key, zero default pricing
-    ($factory:ident, $name:literal, $module:ident, $variant:ident) => {
+    ($factory:ident, $name:literal, $module:ident, $variant:ident
+        $(, live_models = $live:path)?
+        $(, api_key_env = $env:expr)?
+        $(, base_url = $url:expr)?
+    ) => {
         rig_provider_factory!(@factory $factory, $name, $variant,
             |config: &LlmProviderConfig| -> crate::Result<rig::providers::$module::Client> {
                 let api_key = config.api_key.as_deref().ok_or_else(|| {
@@ -97,11 +145,18 @@ macro_rules! rig_provider_factory {
                 b.http_client(crate::proxied_client(config.proxy.as_ref())?)
                     .build()
                     .map_err(|e| crate::LlmError::Config(format!("failed to create {} client: {e}", $name)))
-            });
+            }
+            $(, live_models = $live)?
+            $(, api_key_env = $env)?
+            $(, base_url = $url)?);
     };
 
     // API key optional (local providers that may sit behind auth)
-    ($factory:ident, $name:literal, $module:ident, $variant:ident, optional_key) => {
+    ($factory:ident, $name:literal, $module:ident, $variant:ident, optional_key
+        $(, live_models = $live:path)?
+        $(, api_key_env = $env:expr)?
+        $(, base_url = $url:expr)?
+    ) => {
         rig_provider_factory!(@factory $factory, $name, $variant,
             |config: &LlmProviderConfig| -> crate::Result<rig::providers::$module::Client> {
                 let b = rig::providers::$module::Client::builder();
@@ -113,11 +168,18 @@ macro_rules! rig_provider_factory {
                 b.http_client(crate::proxied_client(config.proxy.as_ref())?)
                     .build()
                     .map_err(|e| crate::LlmError::Config(format!("failed to create {} client: {e}", $name)))
-            });
+            }
+            $(, live_models = $live)?
+            $(, api_key_env = $env)?
+            $(, base_url = $url)?);
     };
 
     // provider takes no API key
-    ($factory:ident, $name:literal, $module:ident, $variant:ident, keyless) => {
+    ($factory:ident, $name:literal, $module:ident, $variant:ident, keyless
+        $(, live_models = $live:path)?
+        $(, api_key_env = $env:expr)?
+        $(, base_url = $url:expr)?
+    ) => {
         rig_provider_factory!(@factory $factory, $name, $variant,
             |config: &LlmProviderConfig| -> crate::Result<rig::providers::$module::Client> {
                 let b = rig::providers::$module::Client::builder().api_key(Nothing);
@@ -125,79 +187,112 @@ macro_rules! rig_provider_factory {
                 b.http_client(crate::proxied_client(config.proxy.as_ref())?)
                     .build()
                     .map_err(|e| crate::LlmError::Config(format!("failed to create {} client: {e}", $name)))
-            });
+            }
+            $(, live_models = $live)?
+            $(, api_key_env = $env)?
+            $(, base_url = $url)?);
     };
 }
 
+pub(crate) use rig_provider_factory;
+
 // Model-author providers: routable through OpenRouter, so they carry a
 // snapshot-backed flat-default pricing (see `openrouter_prefix.rs` + build.rs).
+// `api_key_env` follows each provider's documented convention where one
+// exists; `zai` / `xiaomimimo` don't have an established public env-var
+// name, so we adopt `<NAME>_API_KEY` as Aura's convention — operators
+// can override via `api_key_env` on the entry.
 rig_provider_factory!(
     XaiProviderFactory,
     "xai",
     xai,
     Xai,
-    priced = catalog::XAI_FLAT_DEFAULT_PRICING
+    priced = catalog::XAI_FLAT_DEFAULT_PRICING,
+    api_key_env = "XAI_API_KEY"
 );
 rig_provider_factory!(
     MistralProviderFactory,
     "mistral",
     mistral,
     Mistral,
-    priced = catalog::MISTRAL_FLAT_DEFAULT_PRICING
+    priced = catalog::MISTRAL_FLAT_DEFAULT_PRICING,
+    api_key_env = "MISTRAL_API_KEY"
 );
 rig_provider_factory!(
     CohereProviderFactory,
     "cohere",
     cohere,
     Cohere,
-    priced = catalog::COHERE_FLAT_DEFAULT_PRICING
+    priced = catalog::COHERE_FLAT_DEFAULT_PRICING,
+    api_key_env = "COHERE_API_KEY"
 );
 rig_provider_factory!(
     PerplexityProviderFactory,
     "perplexity",
     perplexity,
     Perplexity,
-    priced = catalog::PERPLEXITY_FLAT_DEFAULT_PRICING
+    priced = catalog::PERPLEXITY_FLAT_DEFAULT_PRICING,
+    api_key_env = "PERPLEXITY_API_KEY"
 );
 rig_provider_factory!(
     MoonshotProviderFactory,
     "moonshot",
     moonshot,
     Moonshot,
-    priced = catalog::MOONSHOT_FLAT_DEFAULT_PRICING
+    priced = catalog::MOONSHOT_FLAT_DEFAULT_PRICING,
+    api_key_env = "MOONSHOT_API_KEY"
 );
 rig_provider_factory!(
     ZaiProviderFactory,
     "zai",
     zai,
     Zai,
-    priced = catalog::ZAI_FLAT_DEFAULT_PRICING
+    priced = catalog::ZAI_FLAT_DEFAULT_PRICING,
+    api_key_env = "ZAI_API_KEY"
 );
 rig_provider_factory!(
     XiaomiMimoProviderFactory,
     "xiaomimimo",
     xiaomimimo,
     XiaomiMimo,
-    priced = catalog::XIAOMIMIMO_FLAT_DEFAULT_PRICING
+    priced = catalog::XIAOMIMIMO_FLAT_DEFAULT_PRICING,
+    api_key_env = "XIAOMIMIMO_API_KEY"
 );
 
 // Inference hosts: they serve many models at varying rates and aren't a
 // single OpenRouter author prefix, so they ship no flat-default pricing (the
 // trait default of zero). Operators set per-token rates via `LlmConfig.pricing`
 // for budget accounting; without it these providers' usage records at zero cost.
-rig_provider_factory!(GroqProviderFactory, "groq", groq, Groq);
-rig_provider_factory!(TogetherProviderFactory, "together", together, Together);
+// `base_url` is intentionally omitted on rig hosts — rig's client already
+// knows the canonical endpoint, and the setup wizard's empty default
+// prompt accepts an enter-to-confirm.
+rig_provider_factory!(
+    GroqProviderFactory,
+    "groq",
+    groq,
+    Groq,
+    api_key_env = "GROQ_API_KEY"
+);
+rig_provider_factory!(
+    TogetherProviderFactory,
+    "together",
+    together,
+    Together,
+    api_key_env = "TOGETHER_API_KEY"
+);
 rig_provider_factory!(
     HyperbolicProviderFactory,
     "hyperbolic",
     hyperbolic,
-    Hyperbolic
+    Hyperbolic,
+    api_key_env = "HYPERBOLIC_API_KEY"
 );
 rig_provider_factory!(
     HuggingFaceProviderFactory,
     "huggingface",
     huggingface,
-    HuggingFace
+    HuggingFace,
+    api_key_env = "HF_TOKEN"
 );
 rig_provider_factory!(
     OllamaProviderFactory,
@@ -217,6 +312,7 @@ rig_provider_factory!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::gemini::GeminiProviderFactory;
     use aura_model::MicroUsd;
 
     fn config(provider: &str) -> LlmProviderConfig {
@@ -277,6 +373,7 @@ mod tests {
         assert_priced_factory!(MoonshotProviderFactory, "moonshot");
         assert_priced_factory!(ZaiProviderFactory, "zai");
         assert_priced_factory!(XiaomiMimoProviderFactory, "xiaomimimo");
+        assert_priced_factory!(GeminiProviderFactory, "gemini");
     }
 
     #[test]

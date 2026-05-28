@@ -110,6 +110,29 @@ pub trait LlmProviderFactory: Send + Sync {
         crate::ModelPricing::default()
     }
 
+    /// Default API endpoint this factory advertises. Surfaces in the
+    /// setup wizard's "Base URL" prompt as the prefilled value, and is
+    /// consulted by [`crate::default_base_url_for_provider`]. `None`
+    /// means no canonical default — operators must supply one
+    /// themselves, or the runtime falls back to whatever the underlying
+    /// rig client bakes in (rig providers leave this `None` for that
+    /// reason).
+    fn default_base_url(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Conventional environment variable this provider's API key lives
+    /// under. The last-resort fallback in
+    /// [`crate::credentials::resolve_api_key`] when neither
+    /// `api_key_env` on the entry nor the per-entry vault key resolves.
+    /// `None` for keyless / OAuth providers (`llamafile`,
+    /// `openai-subscription`) and for providers without an established
+    /// env-var convention (operators must wire `api_key_env` explicitly
+    /// on the entry).
+    fn default_api_key_env(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Live discovery: ask the provider's catalog endpoint what models the
     /// caller actually has access to **right now**.
     ///
@@ -167,8 +190,15 @@ pub struct LiveModelInfo {
 ///
 /// Provider factories are registered by name, and clients are created
 /// by looking up the factory matching the config's `provider` field.
+///
+/// `order` tracks insertion order so [`Self::provider_names`] returns a
+/// stable list — what the setup wizard renders and what cross-process
+/// surfaces (TS bindings, logs) iterate. `register` keeps `order` in
+/// sync (and de-dupes on re-registration so a replaced factory doesn't
+/// duplicate its name).
 pub struct LlmProviderRegistry {
     factories: HashMap<String, Box<dyn LlmProviderFactory>>,
+    order: Vec<String>,
 }
 
 impl LlmProviderRegistry {
@@ -176,6 +206,7 @@ impl LlmProviderRegistry {
     pub fn new() -> Self {
         Self {
             factories: HashMap::new(),
+            order: Vec::new(),
         }
     }
 
@@ -205,10 +236,30 @@ impl LlmProviderRegistry {
     }
 
     /// Registers a provider factory. If a factory with the same name already
-    /// exists, it is replaced.
+    /// exists, it is replaced; insertion order is preserved (the existing
+    /// slot keeps its position, no duplicate entry is appended).
     pub(crate) fn register(&mut self, factory: impl LlmProviderFactory + 'static) {
-        self.factories
-            .insert(factory.provider_name().to_string(), Box::new(factory));
+        let name = factory.provider_name().to_string();
+        if !self.factories.contains_key(&name) {
+            self.order.push(name.clone());
+        }
+        self.factories.insert(name, Box::new(factory));
+    }
+
+    /// Names of every registered provider, in registration order. The
+    /// setup wizard renders this directly; downstream surfaces that
+    /// want an ordered list (CLI completions, logs) should use it too.
+    pub fn provider_names(&self) -> Vec<&str> {
+        self.order.iter().map(String::as_str).collect()
+    }
+
+    /// Look up a registered factory by provider name. Returned as a
+    /// trait reference so callers can ask the factory for its
+    /// per-provider metadata (default base URL, default env var, etc.)
+    /// without needing the concrete type. The default-registry-walking
+    /// free fns in [`crate`] use this to resolve setup-wizard prompts.
+    pub fn factory_for(&self, name: &str) -> Option<&(dyn LlmProviderFactory + 'static)> {
+        self.factories.get(name).map(|b| b.as_ref())
     }
 
     /// Ask one named provider's factory for its current catalog.

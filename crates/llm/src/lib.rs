@@ -12,6 +12,7 @@ mod tool_name;
 pub mod test_support;
 
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 
 use futures::stream::{Stream, StreamExt};
@@ -47,20 +48,36 @@ pub use crate::registry::{
     LiveModelInfo, LlmPricingOverride, LlmProviderConfig, LlmProviderRegistry,
 };
 
-/// Default chat-completion base URL for each built-in provider id.
-/// `None` for unknown providers — the operator must supply one.
+/// Process-wide handle to the default provider registry. Lazily
+/// constructed on first lookup, shared by the metadata-helper fns
+/// below. The default registry is pure (registers stack-built unit
+/// factories, no I/O) so first-touch latency is negligible.
+fn default_registry() -> &'static LlmProviderRegistry {
+    static REGISTRY: OnceLock<LlmProviderRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(LlmProviderRegistry::with_default_providers)
+}
+
+/// Default chat-completion base URL each built-in factory advertises.
+/// Resolves through the default registry so a new provider only has to
+/// declare its URL via [`crate::registry::LlmProviderFactory::default_base_url`]
+/// (or the `base_url = …` macro kwarg) — no separate match arm here.
+/// `None` for providers that don't advertise a canonical default; the
+/// runtime falls through to whatever the underlying rig client bakes
+/// in, and the setup wizard shows an empty default prompt.
 pub fn default_base_url_for_provider(provider: &str) -> Option<&'static str> {
-    match provider {
-        "openai" => Some(crate::providers::openai::OPENAI_DEFAULT_BASE_URL),
-        "anthropic" => Some(crate::providers::anthropic::ANTHROPIC_DEFAULT_BASE_URL),
-        "gemini" => Some(crate::providers::gemini::GEMINI_DEFAULT_BASE_URL),
-        "minimax" => Some(crate::providers::minimax::MINIMAX_DEFAULT_BASE_URL),
-        "deepseek" => Some(crate::providers::deepseek::DEEPSEEK_DEFAULT_BASE_URL),
-        crate::providers::openai_subscription::PROVIDER_NAME => {
-            Some(crate::providers::openai_subscription::DEFAULT_BASE_URL)
-        }
-        _ => None,
-    }
+    default_registry().factory_for(provider)?.default_base_url()
+}
+
+/// Conventional env var each built-in factory advertises for its API
+/// key. Resolves through the default registry; the last-resort fallback
+/// in [`crate::credentials::resolve_api_key`] consults this when neither
+/// an explicit `api_key_env` nor the per-entry vault key is set.
+/// `None` for keyless / OAuth providers and for providers without a
+/// well-known env-var convention.
+pub fn default_api_key_env_for_provider(provider: &str) -> Option<&'static str> {
+    default_registry()
+        .factory_for(provider)?
+        .default_api_key_env()
 }
 
 /// Strip `; charset=…` and lowercase, then map common MIME strings to
@@ -1367,5 +1384,82 @@ mod cost_normalization_tests {
         };
         fold_token_usage_cache_into_total(&mut u);
         assert_eq!(u.input_tokens, 100);
+    }
+}
+
+#[cfg(test)]
+mod provider_metadata_helpers_tests {
+    //! Pin: the setup wizard's "Base URL" prompt and `resolve_api_key`'s
+    //! last-resort env fallback both read from these helpers. If the
+    //! registry walk regresses, a new provider added via the macro
+    //! would silently lose its env-var fallback / URL hint and the
+    //! wizard would show empty prompts for it.
+
+    use super::*;
+
+    #[test]
+    fn hand_written_factories_advertise_their_metadata() {
+        // Hand-written `priced=`-style provider (anthropic): URL +
+        // canonical env both round-trip.
+        assert_eq!(
+            default_base_url_for_provider("anthropic"),
+            Some("https://api.anthropic.com"),
+        );
+        assert_eq!(
+            default_api_key_env_for_provider("anthropic"),
+            Some("ANTHROPIC_API_KEY"),
+        );
+    }
+
+    #[test]
+    fn macro_factories_advertise_api_key_env_without_base_url() {
+        // Macro-generated rig provider that supplied `api_key_env` but
+        // not `base_url`: env round-trips, URL stays None (rig client's
+        // baked-in default is what runs).
+        assert_eq!(default_api_key_env_for_provider("xai"), Some("XAI_API_KEY"));
+        assert!(default_base_url_for_provider("xai").is_none());
+
+        // HuggingFace's convention is `HF_TOKEN`, not `*_API_KEY`.
+        assert_eq!(
+            default_api_key_env_for_provider("huggingface"),
+            Some("HF_TOKEN"),
+        );
+
+        // Macro-converted gemini supplies both kwargs.
+        assert_eq!(
+            default_api_key_env_for_provider("gemini"),
+            Some("GEMINI_API_KEY"),
+        );
+        assert_eq!(
+            default_base_url_for_provider("gemini"),
+            Some("https://generativelanguage.googleapis.com"),
+        );
+    }
+
+    #[test]
+    fn oauth_and_keyless_providers_expose_no_env_var() {
+        // Subscription provider is OAuth-only — must NOT advertise an
+        // env var (would mislead `resolve_api_key` into reading some
+        // unrelated env). Base URL is still present for the wizard.
+        assert!(default_api_key_env_for_provider("openai-subscription").is_none());
+        assert_eq!(
+            default_base_url_for_provider("openai-subscription"),
+            Some("https://chatgpt.com/backend-api"),
+        );
+
+        // llamafile is keyless, ollama has an optional key — both
+        // leave env empty (operators wire `api_key_env` per-entry if
+        // their deployment needs one).
+        assert!(default_api_key_env_for_provider("llamafile").is_none());
+        assert!(default_api_key_env_for_provider("ollama").is_none());
+    }
+
+    #[test]
+    fn unregistered_provider_yields_none_for_both() {
+        // Sanity: lookup for an unknown name short-circuits at
+        // `factory_for`, so neither helper accidentally falls back to
+        // some unrelated factory's metadata.
+        assert!(default_api_key_env_for_provider("not-a-real-provider").is_none());
+        assert!(default_base_url_for_provider("not-a-real-provider").is_none());
     }
 }
