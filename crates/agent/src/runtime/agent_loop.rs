@@ -11,7 +11,8 @@ use aura_llm::{
 };
 use aura_memory::{Memory, MemoryContext};
 use aura_model::{
-    ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SystemSpawnRequest, ThinkingContent,
+    ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SessionId, SystemSpawnRequest,
+    ThinkingContent,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -224,9 +225,29 @@ impl aura_tools::SessionNotifier for DeltaTxNotifier {
 /// and closes the step before the parent loop runs the next thing.
 enum IterationOutcome {
     /// Final assistant response — caller returns this from `run_inner`.
-    Final(OutgoingMessage),
+    /// `outgoing` is the channel-bound message (may include intermediate
+    /// `ToolUse` blocks + channel-only attachments concatenated after the
+    /// reply); `assistant_reply` is the actual persisted assistant turn
+    /// (text / thinking blocks only — what `ChatMessage::assistant(...)`
+    /// was constructed with). The split exists so `Memory::on_job_complete`
+    /// can see the assistant's last turn per its trait contract instead of
+    /// the channel-augmented view.
+    Final {
+        outgoing: OutgoingMessage,
+        assistant_reply: Vec<ContentBlock>,
+    },
     /// LLM emitted tool calls; loop continues.
     Continue,
+}
+
+/// Captured inputs for the deferred `Memory::on_job_complete` write. Built
+/// inside `with_job`'s body at the Final-iteration boundary and returned up
+/// so `run()` can fire `spawn_job_complete_write` **after** `with_job`
+/// commits the job — otherwise a cancel-race in `with_job`'s post-body
+/// window could let a memorized turn outlive a `Cancelled` job row.
+struct PendingMemoryWrite {
+    user_input: Vec<ContentBlock>,
+    final_output: Vec<ContentBlock>,
 }
 
 /// Source of mid-turn user messages ("interjections") that arrived while the
@@ -510,12 +531,26 @@ impl AgentLoop {
             effective_soul_version: session.bound_soul_version.clone(),
             parent_job_id,
         };
-        crate::runtime::scope::with_job(
+        // Capture what the post-`with_job` memory spawn needs from `self`
+        // and `session` before the closure takes `&mut self` + `&mut session`
+        // by move — once `with_job`'s body runs we can no longer touch either
+        // directly out here.
+        let memory_handle = self.memory.clone();
+        let memory_user_id = session.user.id.clone();
+        let memory_session_id = session.id.clone();
+        // The `on_job_complete` spawn is intentionally OUTSIDE `with_job`'s
+        // body: `with_job`'s post-body window can still mark the job
+        // `Cancelled` (cancel-race case 3 in `scope.rs`), in which case the
+        // body's Ok is suppressed and `with_job` returns Err — so a spawn
+        // launched inside the body would persist memory for a turn the
+        // runtime later treats as cancelled. Carry `PendingMemoryWrite` up
+        // through `with_job`'s `T` and fire only once it has returned Ok.
+        let (outgoing, pending_write) = crate::runtime::scope::with_job(
             job_lifecycle,
             cancel_token.clone(),
             spec,
             |job_id| async move {
-                let outgoing = self
+                let (outgoing, pending) = self
                     .run_inner(
                         session,
                         job_lifecycle,
@@ -530,10 +565,25 @@ impl AgentLoop {
                 let output = JobOutput::Message {
                     content: outgoing.content.clone(),
                 };
-                Ok((output, outgoing))
+                let pending_with_id = pending.map(|p| (job_id, p));
+                Ok((output, (outgoing, pending_with_id)))
             },
         )
-        .await
+        .await?;
+        // Past the cancel-race window — `with_job` returned Ok, so the job
+        // row is `Complete`. Safe to bill the memory write against it.
+        if let Some((job_id, write)) = pending_write {
+            Self::spawn_job_complete_write(
+                memory_handle,
+                memory_user_id,
+                memory_session_id,
+                job_id,
+                span_recorder,
+                write.user_input,
+                write.final_output,
+            );
+        }
+        Ok(outgoing)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -547,7 +597,7 @@ impl AgentLoop {
         cancel_token: CancellationToken,
         mut interjections: Option<&mut dyn InterjectionSource>,
         memory_query: Option<Vec<ContentBlock>>,
-    ) -> anyhow::Result<OutgoingMessage> {
+    ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
         let _ = job_lifecycle;
         self.context_manager.ensure_seeded().await;
 
@@ -686,24 +736,27 @@ impl AgentLoop {
             .await?;
 
             match outcome {
-                IterationOutcome::Final(msg) => {
+                IterationOutcome::Final {
+                    outgoing,
+                    assistant_reply,
+                } => {
                     // End-of-job summary-refresh check. The activity
                     // disjunct is satisfied by `job_done = true`;
                     // the tokens / diff conjuncts still apply.
                     self.maybe_spawn_background_compression(job_id, /* job_done */ true)
                         .await;
-                    // Fire-and-forget the memory write for this finished
-                    // exchange (initial input + interjections, final output).
-                    if memory_query.is_some() {
-                        self.spawn_job_complete_write(
-                            session,
-                            job_id,
-                            span_recorder,
-                            std::mem::take(&mut job_user_input),
-                            msg.content.clone(),
-                        );
-                    }
-                    return Ok(msg);
+                    // Capture the memory write inputs and return them up to
+                    // `run()` — the actual `spawn_job_complete_write` fires
+                    // **after** `with_job` accepts the job, so a cancel-race
+                    // in `with_job`'s post-body window can't memorize a
+                    // cancelled turn. `assistant_reply` (not `outgoing.content`)
+                    // is what gets persisted as the assistant row, matching
+                    // the trait contract.
+                    let pending = memory_query.is_some().then(|| PendingMemoryWrite {
+                        user_input: std::mem::take(&mut job_user_input),
+                        final_output: assistant_reply,
+                    });
+                    return Ok((outgoing, pending));
                 }
                 IterationOutcome::Continue => {
                     // Continue to the next LLM iteration; `run_iteration`
@@ -724,18 +777,22 @@ impl AgentLoop {
         // the loop end — the early-return path inside `run_iteration`
         // is the only one that calls `append_context_message`, so
         // there's no ordinal to stamp here. `on_job_complete` is also
-        // deliberately NOT fired on this path: memory writes only on a clean
-        // `IterationOutcome::Final`, so a budget-exhausted (or cancelled /
-        // errored, which `?`-return earlier) turn is never memorized.
-        Ok(OutgoingMessage {
-            session_id: session.id.clone(),
-            user_id: session.user.id.clone(),
-            channel: session.channel.clone(),
-            content,
-            reply_to: None,
-            metadata: Default::default(),
-            ordinal: None,
-        })
+        // deliberately NOT fired on this path (`PendingMemoryWrite` is
+        // `None`): memory writes only on a clean `IterationOutcome::Final`,
+        // so a budget-exhausted (or cancelled / errored, which `?`-return
+        // earlier) turn is never memorized.
+        Ok((
+            OutgoingMessage {
+                session_id: session.id.clone(),
+                user_id: session.user.id.clone(),
+                channel: session.channel.clone(),
+                content,
+                reply_to: None,
+                metadata: Default::default(),
+                ordinal: None,
+            },
+            None,
+        ))
     }
 
     /// One iteration of the agentic loop, scoped to a single
@@ -799,18 +856,25 @@ impl AgentLoop {
             // prior iterations. Capture the persisted ordinal so the
             // channel adapter can stamp it onto the live `Frame::Message`
             // and reconnecting clients advance their cursor past it.
+            // Also keep a copy for `IterationOutcome::Final.assistant_reply`
+            // so `Memory::on_job_complete` sees the same shape that hits
+            // the transcript, not the channel-augmented `final_blocks`.
+            let assistant_reply = response_blocks.clone();
             let assistant_msg = ChatMessage::assistant(response_blocks);
             let ordinal = self.context_manager.append(&assistant_msg).await;
 
-            return Ok(IterationOutcome::Final(OutgoingMessage {
-                session_id: session.id.clone(),
-                user_id: session.user.id.clone(),
-                channel: session.channel.clone(),
-                content: final_blocks,
-                reply_to: None,
-                metadata: Default::default(),
-                ordinal,
-            }));
+            return Ok(IterationOutcome::Final {
+                outgoing: OutgoingMessage {
+                    session_id: session.id.clone(),
+                    user_id: session.user.id.clone(),
+                    channel: session.channel.clone(),
+                    content: final_blocks,
+                    reply_to: None,
+                    metadata: Default::default(),
+                    ordinal,
+                },
+                assistant_reply,
+            });
         }
 
         // Append assistant message including thinking and tool-call
@@ -1276,6 +1340,11 @@ impl AgentLoop {
         if query.is_empty() {
             return;
         }
+        // If cancellation already tripped before we even called the backend,
+        // there's no turn to enrich — skip without opening a step or billing.
+        if cancel_token.is_cancelled() {
+            return;
+        }
         let Some(memory) = self.memory.clone() else {
             return;
         };
@@ -1304,6 +1373,13 @@ impl AgentLoop {
                 return;
             }
         };
+        // Re-check: cancellation may have tripped while `memory.recall` was
+        // in flight. Don't persist recalled rows for a turn we're about to
+        // abort — the next iteration-boundary cancel check would return Err
+        // immediately and leave dangling memory rows on the transcript.
+        if cancel_token.is_cancelled() {
+            return;
+        }
         for mem in recalled {
             self.context_manager
                 .append_recalled_memory(vec![ContentBlock::Text(mem.content)])
@@ -1341,7 +1417,12 @@ impl AgentLoop {
         let session_id = session.id.clone();
         let recorder = Arc::clone(span_recorder);
         tokio::spawn(async move {
-            let transcript = match sessions.history(&session_id).await {
+            // `full_transcript` (not `history`) so the impl sees the raw
+            // turns per `on_session_end`'s contract — `history` filters out
+            // rows marked `superseded_by`, so a session that has been
+            // compressed would otherwise lose all the user / assistant turns
+            // that the compaction folded into a summary.
+            let transcript = match sessions.full_transcript(&session_id).await {
                 Ok(t) => t,
                 Err(e) => {
                     warn!(
@@ -1385,21 +1466,27 @@ impl AgentLoop {
     /// exchange. Detached so the actor returns the answer without waiting on
     /// the memory write; the impl bills its work against the minted
     /// [`Attribution`] under a `MemoryWrite` trace step. No-op when no memory
-    /// is wired.
+    /// is wired (`memory == None`).
+    ///
+    /// Free-standing (no `&self`) and takes owned `user_id` / `session_id`
+    /// so `run()` can call it AFTER `with_job` returns — the closure that
+    /// drives the iteration loop moves `&mut self` + `&mut session` into
+    /// `with_job`'s body, so the borrow checker won't let us touch either
+    /// from `run()` afterwards. Pre-extract `self.memory.clone()` and the
+    /// two ids before the closure, then call this with the owned values.
     fn spawn_job_complete_write(
-        &self,
-        session: &Session,
+        memory: Option<Arc<dyn Memory>>,
+        user_id: String,
+        session_id: SessionId,
         job_id: JobId,
         span_recorder: &Arc<SpanRecorder>,
         user_input: Vec<ContentBlock>,
         final_output: Vec<ContentBlock>,
     ) {
-        let Some(memory) = self.memory.clone() else {
+        let Some(memory) = memory else {
             return;
         };
         let recorder = Arc::clone(span_recorder);
-        let user_id = session.user.id.clone();
-        let session_id = session.id.clone();
         tokio::spawn(async move {
             let ctx_recorder = Arc::clone(&recorder);
             let result = crate::runtime::scope::with_step(
