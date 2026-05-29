@@ -167,9 +167,19 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     let picked = select_one("Provider:", &label_refs)?;
     let provider = PROVIDER_CHOICES[picked].0;
+    let previous_provider = new_config.memory.provider;
 
     new_config.memory.provider = provider;
     new_config.memory.enabled = provider != MemoryProvider::Noop;
+
+    // Provider switch wipes `extra`. Mem0Config and OpenVikingConfig share
+    // field names (`api_key_name`, `top_k`) — leaving the old JSON in
+    // place would let the previous provider's values silently bleed into
+    // the new one's parse_extra. Same provider keeps it (re-running setup
+    // preserves prior choices).
+    if previous_provider != provider {
+        new_config.memory.extra = Value::Null;
+    }
 
     // Detailed wizard: walk every typed field with the existing value as
     // the bracketed default, so the operator can blow through with Enter
