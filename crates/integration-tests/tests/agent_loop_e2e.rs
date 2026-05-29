@@ -1678,6 +1678,61 @@ async fn recalled_memory_is_injected_as_framed_block() {
 }
 
 #[tokio::test]
+async fn recall_dedup_skips_memory_already_in_transcript() {
+    // Belt-and-braces dedup at the agent loop: when the backend returns
+    // the same memory string on a later turn (mem0 / openviking do this
+    // today — same query → same hit), the framed `<recalled_memory>`
+    // block in the existing transcript should keep the second
+    // injection from going through. The LLM ends up seeing one copy,
+    // not two.
+    let memory = Arc::new(RecordingMemory::new().with_recall(vec![RecalledMemory {
+        content: "the user lives in Berlin".into(),
+    }]));
+    let mut harness = AgentTestHarness::builder()
+        .with_memory(memory.clone() as Arc<dyn Memory>)
+        .build();
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("ack 1".into())]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("ack 2".into())]);
+
+    harness.send_text("where do I live?").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    harness.send_text("remind me again").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    // Both turns ran recall (the harness uses UserChat = eligible job
+    // kind), so the backend was called twice and returned the same memory
+    // each time.
+    assert_eq!(memory.recall_count(), 2);
+
+    // But the second LLM request must NOT carry two copies of the same
+    // `<recalled_memory>` block. Count occurrences of the literal memory
+    // text across every Role::User block.
+    let captured = harness.stub_llm.captured_requests();
+    let second_user_text: String = captured[1]
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    let occurrences = second_user_text.matches("the user lives in Berlin").count();
+    assert_eq!(
+        occurrences, 1,
+        "second turn's prompt should contain exactly one copy of the recalled \
+         memory (the persisted row from turn 1); got {occurrences} in:\n{second_user_text}"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn memory_hooks_skip_subagent_notification_turn() {
     // `SubagentNotification` is an ineligible job kind — the gate
     // (`memory_recall_query` → `None`) means neither `recall` nor
