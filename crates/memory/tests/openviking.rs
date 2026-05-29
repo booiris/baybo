@@ -6,17 +6,15 @@ use std::sync::Arc;
 
 use aura_memory::Memory;
 use aura_memory::backends::openviking::{
-    OpenVikingConfig, OpenVikingMemory, TOOL_ADD_RESOURCE, TOOL_BROWSE, TOOL_READ, TOOL_REMEMBER,
-    TOOL_SEARCH,
+    OpenVikingConfig, OpenVikingMemory, TOOL_ARCHIVE_EXPAND, TOOL_FORGET, TOOL_RECALL, TOOL_STORE,
 };
 use aura_model::{ChatMessage, ContentBlock};
 use aura_trace::StepKind;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::HeaderMap;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use parking_lot::Mutex;
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use common::{base_url, memory_context, spawn, tool_context};
@@ -27,11 +25,6 @@ struct Captured {
     bodies: Arc<Mutex<Vec<Value>>>,
     paths: Arc<Mutex<Vec<String>>>,
     queries: Arc<Mutex<Vec<String>>>,
-}
-
-#[derive(Deserialize)]
-struct UriQuery {
-    uri: String,
 }
 
 fn cfg(server_url: &str) -> OpenVikingConfig {
@@ -47,8 +40,23 @@ fn build(server_url: &str) -> OpenVikingMemory {
     OpenVikingMemory::new(cfg(server_url), "test-key".into(), None).unwrap()
 }
 
+fn tool(m: &OpenVikingMemory, name: &str) -> Arc<dyn aura_tools::Tool> {
+    m.tools()
+        .into_iter()
+        .find(|(t, _)| t.name() == name)
+        .map(|(t, _)| t)
+        .unwrap_or_else(|| panic!("tool {name} not found"))
+}
+
+fn expect_json(out: aura_tools::ToolOutput) -> Value {
+    match out {
+        aura_tools::ToolOutput::Json(v) => v,
+        other => panic!("expected Json, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
-// recall
+// recall (hook — unchanged: single /search/find with {query, top_k})
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -254,11 +262,11 @@ async fn on_session_end_skips_commit_for_empty_transcript() {
 }
 
 // ---------------------------------------------------------------------------
-// tool: viking_search
+// tool: viking_recall
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tool_search_passes_mode_and_scope() {
+async fn tool_recall_queries_both_roots_merges_and_leaf_filters() {
     let captured = Captured::default();
     let app = Router::new()
         .route(
@@ -266,7 +274,12 @@ async fn tool_search_passes_mode_and_scope() {
             post(
                 |State(c): State<Captured>, Json(body): Json<Value>| async move {
                     c.bodies.lock().push(body);
-                    Json(json!({"result": {"memories": [], "resources": []}}))
+                    // Each leg returns one leaf + one non-leaf, same URIs across
+                    // legs — exercises merge, dedup, and leaf-only filtering.
+                    Json(json!({"result": {"memories": [
+                        {"uri": "viking://user/memories/leaf.md", "abstract": "leaf fact", "score": 0.9, "level": 2},
+                        {"uri": "viking://user/memories/dir", "abstract": "a dir", "score": 0.95, "level": 1}
+                    ]}}))
                 },
             ),
         )
@@ -274,40 +287,34 @@ async fn tool_search_passes_mode_and_scope() {
     let server = spawn(app).await;
     let m = build(&base_url(&server));
 
-    let (tool, _) = m
-        .tools()
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_SEARCH)
-        .unwrap();
-    let ctx = tool_context("alice");
-    let _ = tool
-        .execute(
-            json!({"query": "x", "mode": "deep", "scope": "viking://docs/", "limit": 7}),
-            &ctx,
-        )
+    let out = tool(&m, TOOL_RECALL)
+        .execute(json!({"query": "rust"}), &tool_context("alice"))
         .await
         .unwrap();
-    let body = captured.bodies.lock().last().unwrap().clone();
-    assert_eq!(body["query"], "x");
-    assert_eq!(body["mode"], "deep");
-    assert_eq!(body["target_uri"], "viking://docs/");
-    assert_eq!(body["top_k"], 7);
+    let v = expect_json(out);
+    assert_eq!(v["count"], 1, "non-leaf dropped, duplicate leaf deduped");
+    assert_eq!(v["results"][0]["uri"], "viking://user/memories/leaf.md");
+
+    let bodies = captured.bodies.lock().clone();
+    assert_eq!(bodies.len(), 2, "queries user + agent roots");
+    let targets: Vec<&str> = bodies
+        .iter()
+        .map(|b| b["target_uri"].as_str().unwrap())
+        .collect();
+    assert!(targets.contains(&"viking://user/memories"));
+    assert!(targets.contains(&"viking://agent/memories"));
 }
 
-// ---------------------------------------------------------------------------
-// tool: viking_read
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
-async fn tool_read_uses_abstract_endpoint_for_pseudo_dir_uri() {
+async fn tool_recall_single_target_uri_hits_one_leg() {
     let captured = Captured::default();
     let app = Router::new()
         .route(
-            "/api/v1/content/abstract",
-            get(
-                |State(c): State<Captured>, Query(q): Query<UriQuery>| async move {
-                    c.queries.lock().push(q.uri);
-                    Json(json!({"content": "short summary"}))
+            "/api/v1/search/find",
+            post(
+                |State(c): State<Captured>, Json(body): Json<Value>| async move {
+                    c.bodies.lock().push(body);
+                    Json(json!({"result": {"memories": []}}))
                 },
             ),
         )
@@ -315,309 +322,262 @@ async fn tool_read_uses_abstract_endpoint_for_pseudo_dir_uri() {
     let server = spawn(app).await;
     let m = build(&base_url(&server));
 
-    let (tool, _) = m
-        .tools()
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_READ)
-        .unwrap();
-    let ctx = tool_context("alice");
-    let out = tool
+    let _ = tool(&m, TOOL_RECALL)
         .execute(
-            json!({"uri": "viking://user/alice/.abstract.md", "level": "abstract"}),
-            &ctx,
+            json!({"query": "x", "targetUri": "viking://user/memories/notes"}),
+            &tool_context("alice"),
         )
         .await
         .unwrap();
-    let payload = match out {
-        aura_tools::ToolOutput::Json(v) => v,
-        _ => panic!("expected Json"),
-    };
-    assert_eq!(payload["resolved_uri"], "viking://user/alice");
-    assert_eq!(payload["content"], "short summary");
-    let queried = captured.queries.lock().last().cloned().unwrap();
-    assert_eq!(queried, "viking://user/alice");
+    let bodies = captured.bodies.lock().clone();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["target_uri"], "viking://user/memories/notes");
+}
+
+#[tokio::test]
+async fn tool_recall_rejects_missing_query() {
+    let server = spawn(Router::new()).await;
+    let m = build(&base_url(&server));
+    let err = tool(&m, TOOL_RECALL)
+        .execute(json!({}), &tool_context("alice"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("query"), "got: {err}");
 }
 
 // ---------------------------------------------------------------------------
-// tool: viking_browse
+// tool: viking_store
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tool_browse_lists_and_normalises_entries() {
+async fn tool_store_writes_message_then_commits() {
+    let captured = Captured::default();
+    let app =
+        Router::new()
+            .route(
+                "/api/v1/sessions/{sid}/messages",
+                post(
+                    |State(c): State<Captured>,
+                     Path(sid): Path<String>,
+                     Json(body): Json<Value>| async move {
+                        c.paths.lock().push(sid);
+                        c.bodies.lock().push(body);
+                        Json(json!({}))
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/sessions/{sid}/commit",
+                // Synchronous completion (no task_id) → no polling.
+                post(|Path(_sid): Path<String>| async {
+                    Json(json!({"status": "completed", "memories_extracted": {"preferences": 2}}))
+                }),
+            )
+            .with_state(captured.clone());
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let out = tool(&m, TOOL_STORE)
+        .execute(
+            json!({"text": "user prefers TypeScript", "sessionId": "sess-x"}),
+            &tool_context("alice"),
+        )
+        .await
+        .unwrap();
+    let v = expect_json(out);
+    assert_eq!(v["session_id"], "sess-x");
+    assert_eq!(v["status"], "completed");
+    assert_eq!(v["memories_extracted"], 2);
+
+    assert_eq!(captured.paths.lock().clone(), vec!["sess-x".to_string()]);
+    let msg = captured.bodies.lock().last().unwrap().clone();
+    assert_eq!(msg["role"], "user");
+    assert_eq!(msg["content"], "user prefers TypeScript");
+}
+
+#[tokio::test]
+async fn tool_store_polls_extraction_task_to_completion() {
+    let app = Router::new()
+        .route(
+            "/api/v1/sessions/{sid}/messages",
+            post(|Path(_sid): Path<String>, Json(_b): Json<Value>| async { Json(json!({})) }),
+        )
+        .route(
+            "/api/v1/sessions/{sid}/commit",
+            // Phase 1 returns a task id; Phase 2 finishes in the background.
+            post(|Path(_sid): Path<String>| async {
+                Json(json!({"status": "running", "task_id": "task-7"}))
+            }),
+        )
+        .route(
+            "/api/v1/tasks/task-7",
+            get(|| async {
+                Json(
+                    json!({"status": "completed", "result": {"memories_extracted": {"events": 3}}}),
+                )
+            }),
+        );
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let out = tool(&m, TOOL_STORE)
+        .execute(
+            json!({"text": "remember this", "sessionId": "sess-y"}),
+            &tool_context("alice"),
+        )
+        .await
+        .unwrap();
+    let v = expect_json(out);
+    assert_eq!(v["status"], "completed");
+    assert_eq!(v["memories_extracted"], 3);
+}
+
+#[tokio::test]
+async fn tool_store_rejects_empty_text() {
+    let server = spawn(Router::new()).await;
+    let m = build(&base_url(&server));
+    let err = tool(&m, TOOL_STORE)
+        .execute(json!({"text": ""}), &tool_context("alice"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("text"), "got: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// tool: viking_forget
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tool_forget_deletes_memory_uri() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/api/v1/fs",
+            delete(
+                |State(c): State<Captured>, RawQuery(q): RawQuery| async move {
+                    c.queries.lock().push(q.unwrap_or_default());
+                    Json(json!({}))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let out = tool(&m, TOOL_FORGET)
+        .execute(
+            json!({"uri": "viking://user/memories/preferences/mem_x.md"}),
+            &tool_context("alice"),
+        )
+        .await
+        .unwrap();
+    let v = expect_json(out);
+    assert_eq!(v["action"], "deleted");
+
+    let q = captured.queries.lock().last().cloned().unwrap();
+    assert!(q.contains("recursive=false"), "query was: {q}");
+    assert!(q.contains("memories"), "query was: {q}");
+}
+
+#[tokio::test]
+async fn tool_forget_refuses_non_memory_uri() {
+    // No server: the safety gate must short-circuit before any HTTP.
+    let server = spawn(Router::new()).await;
+    let m = build(&base_url(&server));
+    let out = tool(&m, TOOL_FORGET)
+        .execute(
+            json!({"uri": "viking://user/resources/doc.md"}),
+            &tool_context("alice"),
+        )
+        .await
+        .unwrap();
+    match out {
+        aura_tools::ToolOutput::Error(e) => assert!(e.contains("non-memory"), "got: {e}"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn tool_forget_by_query_auto_deletes_strong_single_match() {
+    let app = Router::new()
+        .route(
+            "/api/v1/search/find",
+            post(|Json(_b): Json<Value>| async {
+                Json(json!({"result": {"memories": [
+                    {"uri": "viking://user/memories/only.md", "abstract": "the one", "score": 0.95, "level": 2}
+                ]}}))
+            }),
+        )
+        .route("/api/v1/fs", delete(|RawQuery(_q): RawQuery| async { Json(json!({})) }));
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let out = tool(&m, TOOL_FORGET)
+        .execute(json!({"query": "the one"}), &tool_context("alice"))
+        .await
+        .unwrap();
+    let v = expect_json(out);
+    assert_eq!(v["action"], "deleted");
+    assert_eq!(v["uri"], "viking://user/memories/only.md");
+}
+
+#[tokio::test]
+async fn tool_forget_rejects_missing_params() {
+    let server = spawn(Router::new()).await;
+    let m = build(&base_url(&server));
+    let err = tool(&m, TOOL_FORGET)
+        .execute(json!({}), &tool_context("alice"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("uri or query"), "got: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// tool: viking_archive_expand
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tool_archive_expand_returns_original_messages() {
+    // tool_context() sets session_id = "test-session".
     let app = Router::new().route(
-        "/api/v1/fs/ls",
-        get(|Query(_q): Query<UriQuery>| async {
-            Json(json!({
-                "result": {
-                    "entries": [
-                        {"uri": "viking://a", "name": "a", "isDir": true},
-                        {"uri": "viking://b", "name": "b.md", "is_dir": false}
-                    ]
-                }
-            }))
+        "/api/v1/sessions/{sid}/archives/{aid}",
+        get(|Path((sid, aid)): Path<(String, String)>| async move {
+            assert_eq!(sid, "test-session");
+            Json(json!({"result": {
+                "archive_id": aid,
+                "abstract": "did some setup",
+                "messages": [
+                    {"role": "user", "content": "run the migration"},
+                    {"role": "assistant", "content": "migration done"}
+                ]
+            }}))
         }),
     );
     let server = spawn(app).await;
     let m = build(&base_url(&server));
 
-    let (tool, _) = m
-        .tools()
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_BROWSE)
-        .unwrap();
-    let ctx = tool_context("alice");
-    let out = tool
-        .execute(json!({"action": "list", "path": "viking://"}), &ctx)
+    let out = tool(&m, TOOL_ARCHIVE_EXPAND)
+        .execute(json!({"archiveId": "archive_002"}), &tool_context("alice"))
         .await
         .unwrap();
-    let payload = match out {
-        aura_tools::ToolOutput::Json(v) => v,
-        _ => panic!("expected Json"),
-    };
-    let entries = payload["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0]["type"], "dir");
-    assert_eq!(entries[1]["type"], "file");
-}
-
-// ---------------------------------------------------------------------------
-// tool: viking_remember
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn tool_remember_writes_under_user_subdir() {
-    let captured = Captured::default();
-    let app = Router::new()
-        .route(
-            "/api/v1/content/write",
-            post(
-                |State(c): State<Captured>, Json(body): Json<Value>| async move {
-                    c.bodies.lock().push(body);
-                    Json(json!({"result": {"written_bytes": 42}}))
-                },
-            ),
-        )
-        .with_state(captured.clone());
-    let server = spawn(app).await;
-    let m = build(&base_url(&server));
-
-    let (tool, _) = m
-        .tools()
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_REMEMBER)
-        .unwrap();
-    let ctx = tool_context("alice");
-    let _ = tool
-        .execute(
-            json!({"content": "user prefers TypeScript", "category": "preference"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-    let body = captured.bodies.lock().last().unwrap().clone();
-    let uri = body["uri"].as_str().unwrap();
-    assert!(
-        uri.starts_with("viking://user/alice/memories/preferences/mem_"),
-        "got URI: {uri}"
-    );
-    assert!(uri.ends_with(".md"));
-    assert_eq!(body["mode"], "create");
-    assert_eq!(body["content"], "user prefers TypeScript");
+    let v = expect_json(out);
+    assert_eq!(v["action"], "expanded");
+    assert_eq!(v["archive_id"], "archive_002");
+    assert_eq!(v["message_count"], 2);
+    let content = v["content"].as_str().unwrap();
+    assert!(content.contains("run the migration"), "got: {content}");
+    assert!(content.contains("migration done"), "got: {content}");
 }
 
 #[tokio::test]
-async fn tool_remember_defaults_unknown_category_to_preferences() {
-    let captured = Captured::default();
-    let app = Router::new()
-        .route(
-            "/api/v1/content/write",
-            post(
-                |State(c): State<Captured>, Json(body): Json<Value>| async move {
-                    c.bodies.lock().push(body);
-                    Json(json!({"result": {"written_bytes": 0}}))
-                },
-            ),
-        )
-        .with_state(captured.clone());
-    let server = spawn(app).await;
+async fn tool_archive_expand_rejects_missing_id() {
+    let server = spawn(Router::new()).await;
     let m = build(&base_url(&server));
-
-    let (tool, _) = m
-        .tools()
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_REMEMBER)
-        .unwrap();
-    let ctx = tool_context("alice");
-    let _ = tool.execute(json!({"content": "x"}), &ctx).await.unwrap();
-    let uri = captured.bodies.lock().last().unwrap()["uri"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(uri.contains("/preferences/"), "got URI: {uri}");
-}
-
-// ---------------------------------------------------------------------------
-// tool: viking_add_resource
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn tool_add_resource_passes_remote_url_as_path() {
-    let captured = Captured::default();
-    let app = Router::new()
-        .route(
-            "/api/v1/resources",
-            post(
-                |State(c): State<Captured>, Json(body): Json<Value>| async move {
-                    c.bodies.lock().push(body);
-                    Json(json!({"result": {"root_uri": "viking://resources/r-1"}}))
-                },
-            ),
-        )
-        .with_state(captured.clone());
-    let server = spawn(app).await;
-    let m = build(&base_url(&server));
-
-    let (tool, _) = m
-        .tools()
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_ADD_RESOURCE)
-        .unwrap();
-    let ctx = tool_context("alice");
-    let out = tool
-        .execute(
-            json!({"url": "https://example.com/doc.md", "reason": "Reference"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-    match out {
-        aura_tools::ToolOutput::Json(v) => {
-            assert_eq!(v["root_uri"], "viking://resources/r-1");
-        }
-        other => panic!("expected Json, got {other:?}"),
-    }
-    let body = captured.bodies.lock().last().unwrap().clone();
-    assert_eq!(body["path"], "https://example.com/doc.md");
-    assert_eq!(body["reason"], "Reference");
-}
-
-#[tokio::test]
-async fn tool_add_resource_refuses_sensitive_local_path() {
-    let app = Router::new();
-    let server = spawn(app).await;
-    let m = build(&base_url(&server));
-    let (tool, _) = m
-        .tools()
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_ADD_RESOURCE)
-        .unwrap();
-    let ctx = tool_context("alice");
-    // Pick a path that `is_sensitive_path` matches regardless of host
-    // layout — the function uses suffix / directory matching on canonical
-    // names, so a home-dir-style `~/.ssh/id_rsa` triggers it.
-    let err = tool
-        .execute(json!({"url": "~/.ssh/id_rsa"}), &ctx)
+    let err = tool(&m, TOOL_ARCHIVE_EXPAND)
+        .execute(json!({"archiveId": "  "}), &tool_context("alice"))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("sensitive"), "got: {err}");
-}
-
-#[tokio::test]
-async fn tool_add_resource_refuses_loopback_remote_url() {
-    let app = Router::new();
-    let server = spawn(app).await;
-    let m = build(&base_url(&server));
-    let (tool, _) = m
-        .tools()
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_ADD_RESOURCE)
-        .unwrap();
-    let ctx = tool_context("alice");
-    // Loopback literal IP must be blocked even via the OpenViking server
-    // (the server would otherwise become an SSRF fetcher onto our box).
-    let err = tool
-        .execute(json!({"url": "http://127.0.0.1:9000/x"}), &ctx)
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("blocked"), "got: {err}");
-
-    // Loopback hostname names also blocked.
-    let err = tool
-        .execute(json!({"url": "http://localhost/x"}), &ctx)
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("blocked"), "got: {err}");
-
-    // RFC1918 literal IP blocked.
-    let err = tool
-        .execute(json!({"url": "http://10.0.0.5/x"}), &ctx)
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("blocked"), "got: {err}");
-}
-
-#[tokio::test]
-async fn tool_add_resource_rejects_both_to_and_parent() {
-    let app = Router::new();
-    let server = spawn(app).await;
-    let m = build(&base_url(&server));
-    let (tool, _) = m
-        .tools()
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_ADD_RESOURCE)
-        .unwrap();
-    let ctx = tool_context("alice");
-    let err = tool
-        .execute(
-            json!({"url": "https://x", "to": "viking://a", "parent": "viking://b"}),
-            &ctx,
-        )
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("Cannot specify both"));
-}
-
-#[tokio::test]
-async fn tool_add_resource_uploads_local_file() {
-    let captured = Captured::default();
-    let app = Router::new()
-        .route(
-            "/api/v1/resources/temp_upload",
-            post(
-                |State(c): State<Captured>, _body: axum::body::Bytes| async move {
-                    c.bodies.lock().push(json!({"_marker": "uploaded"}));
-                    Json(json!({"result": {"temp_file_id": "tf-123"}}))
-                },
-            ),
-        )
-        .route(
-            "/api/v1/resources",
-            post(
-                |State(c): State<Captured>, Json(body): Json<Value>| async move {
-                    c.bodies.lock().push(body);
-                    Json(json!({"result": {"root_uri": "viking://resources/r-2"}}))
-                },
-            ),
-        )
-        .with_state(captured.clone());
-    let server = spawn(app).await;
-    let m = build(&base_url(&server));
-
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), b"hello world").unwrap();
-    let path = tmp.path().to_string_lossy().to_string();
-
-    let (tool, _) = m
-        .tools()
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_ADD_RESOURCE)
-        .unwrap();
-    let ctx = tool_context("alice");
-    let _ = tool.execute(json!({"url": path}), &ctx).await.unwrap();
-    let bodies = captured.bodies.lock().clone();
-    assert_eq!(bodies[0]["_marker"], "uploaded");
-    assert_eq!(bodies[1]["temp_file_id"], "tf-123");
-    assert!(bodies[1]["source_name"].is_string());
+    assert!(err.to_string().contains("archiveId"), "got: {err}");
 }
 
 // ---------------------------------------------------------------------------
@@ -626,18 +586,11 @@ async fn tool_add_resource_uploads_local_file() {
 
 #[tokio::test]
 async fn tools_each_carry_a_matching_manifest() {
-    let app = Router::new();
-    let server = spawn(app).await;
+    let server = spawn(Router::new()).await;
     let m = build(&base_url(&server));
     let tools = m.tools();
     let names: Vec<String> = tools.iter().map(|(t, _)| t.name().to_string()).collect();
-    for required in [
-        TOOL_SEARCH,
-        TOOL_READ,
-        TOOL_BROWSE,
-        TOOL_REMEMBER,
-        TOOL_ADD_RESOURCE,
-    ] {
+    for required in [TOOL_RECALL, TOOL_STORE, TOOL_FORGET, TOOL_ARCHIVE_EXPAND] {
         assert!(names.contains(&required.to_string()), "missing: {required}");
     }
     for (tool, manifest) in &tools {
@@ -650,13 +603,5 @@ async fn tools_each_carry_a_matching_manifest() {
             "{} should declare Http",
             tool.name()
         );
-        if tool.name() == TOOL_ADD_RESOURCE {
-            assert!(
-                manifest
-                    .capabilities
-                    .contains(&aura_tools::ToolCapability::ReadFile),
-                "viking_add_resource must declare ReadFile (it reads local paths)"
-            );
-        }
     }
 }

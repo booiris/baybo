@@ -216,10 +216,20 @@ session id; `X-OpenViking-Account` (config) and `X-OpenViking-Agent`
 
 | Hook | Behaviour |
 | --- | --- |
-| `recall` | `POST /api/v1/search/find` with `{query, top_k}`; returns `"{abstract} (viking://uri)"` so the model can drill in with `viking_read`. |
+| `recall` | `POST /api/v1/search/find` with `{query, top_k}`; returns `"{abstract} (viking://uri)"`. |
 | `on_job_complete` | `POST /api/v1/sessions/{ctx.session_id}/messages` ×2 (user, assistant). |
 | `on_session_end` | `POST /api/v1/sessions/{ctx.session_id}/commit` — triggers the 6-category server-side extraction (preferences / entities / events / cases / patterns / profile). Skipped if `transcript.is_empty()`. |
-| `tools()` | `viking_search`, `viking_read`, `viking_browse`, `viking_remember`, `viking_add_resource`. `viking_add_resource` includes zip-of-directory upload. |
+| `tools()` | Four `viking_*` tools (see below). |
+
+The tool surface mirrors the official OpenViking `openclaw-plugin`, each
+`viking_`-prefixed:
+
+| Tool | Endpoint(s) | Purpose |
+| --- | --- | --- |
+| `viking_recall` | `POST /api/v1/search/find` | Search memories; without `targetUri`, queries `viking://user/memories` + `viking://agent/memories` concurrently, then merges / dedups / leaf-filters. |
+| `viking_store` | `POST …/messages` + `…/commit` | Write one session message, commit, and poll the extraction task to a memory count. |
+| `viking_forget` | `DELETE /api/v1/fs` | Delete by memory URI, or search-and-delete on a strong single match (`is_memory_uri` guards against deleting non-memory paths). |
+| `viking_archive_expand` | `GET /api/v1/sessions/{sid}/archives/{id}` | Fetch the original messages from a compressed session archive. |
 
 API key is optional (local dev mode runs unauthenticated). Resolution:
 vault entry `user_env.<api_key_name>` (`aura secret add <name>`) → process

@@ -5,6 +5,7 @@
 //! context loading (abstract / overview / full) and server-side memory
 //! extraction.
 //!
+//! **Automatic hooks** (the core's recall / write path):
 //! - **`recall`**: `POST /api/v1/search/find` with `{query, top_k}`.
 //! - **`on_job_complete`**: `POST /api/v1/sessions/{ctx.session_id}/messages`
 //!   ×2 (user + assistant). The server accumulates session state for the
@@ -13,20 +14,25 @@
 //!   skipped when `transcript.is_empty()`. Triggers the 6-category server-side
 //!   extraction (preferences / entities / events / cases / patterns / profile).
 //!
-//! Five tools: `viking_search`, `viking_read`, `viking_browse`,
-//! `viking_remember`, `viking_add_resource`.
+//! **Tools** (the model's explicit-signal path) — four `viking_`-prefixed tools
+//! ported from the official OpenViking `openclaw-plugin`:
+//!
+//! | Tool | Mechanism |
+//! | --- | --- |
+//! | `viking_recall` | `find` across `viking://user/memories` + `viking://agent/memories`, merge / dedup / leaf-filter. |
+//! | `viking_store` | write one session message, `commit`, then poll the extraction task. |
+//! | `viking_forget` | delete by URI (`DELETE /api/v1/fs`), or search-and-delete on a strong single match. |
+//! | `viking_archive_expand` | fetch original messages from a compressed session archive. |
 //!
 //! # References
 //!
-//! - OpenViking project: <https://github.com/volcengine/openviking>
-//! - Reference Python implementation (hermes-agent plugin, pinned):
-//!   <https://github.com/NousResearch/hermes-agent/blob/d617858896788aaddce77746e3bd890b3e75124c/plugins/memory/openviking/__init__.py>
-//! - Original hermes-agent PR (OpenViking integration): <https://github.com/NousResearch/hermes-agent/pull/3369>
+//! - OpenViking project: <https://github.com/volcengine/OpenViking>
+//! - Tool surface ported from the official OpenViking `openclaw-plugin`
+//!   (`examples/openclaw-plugin`): tools `memory_recall` / `memory_store` /
+//!   `memory_forget` / `ov_archive_expand` (here `viking_`-prefixed) and the
+//!   REST endpoint map in its `client.ts`.
 
-use std::fs::File;
-use std::io::Write as _;
-use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,16 +41,15 @@ use async_trait::async_trait;
 use aura_model::{ChatMessage, ContentBlock, TrustLevel};
 use aura_security::http::ProxySettings;
 use aura_security::{SecretVault, USER_SECRET_PREFIX};
-use aura_tools::{Tool, ToolCapability, ToolContext, ToolEventSink, ToolManifest, ToolOutput};
+use aura_tools::{
+    Tool, ToolCapability, ToolContext, ToolError, ToolEventSink, ToolManifest, ToolOutput,
+};
 use aura_trace::ToolEventPayload;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use walkdir::WalkDir;
-use zip::CompressionMethod;
-use zip::write::{SimpleFileOptions, ZipWriter};
 
 use crate::{Memory, MemoryContext, MemoryError, RecalledMemory, Result};
 
@@ -69,12 +74,27 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(600);
 /// when nothing is set the backend runs unauthenticated (local-dev mode).
 const DEFAULT_API_KEY_NAME: &str = "OPENVIKING_API_KEY";
 
-const REMOTE_PREFIXES: &[&str] = &["http://", "https://", "git@", "ssh://", "git://"];
+pub const TOOL_RECALL: &str = "viking_recall";
+pub const TOOL_STORE: &str = "viking_store";
+pub const TOOL_FORGET: &str = "viking_forget";
+pub const TOOL_ARCHIVE_EXPAND: &str = "viking_archive_expand";
 
-/// Cap on a single local upload — matches `aura_tools::builtin::send_local_file`
-/// (the only other tool that ships local bytes to a remote endpoint). Applies
-/// to both single-file uploads and the zipped-directory path (post-deflation).
-const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+/// The two memory roots `viking_recall` queries when no `targetUri` is given —
+/// mirrors the official plugin's dual user + agent recall.
+const USER_MEMORIES_URI: &str = "viking://user/memories";
+const AGENT_MEMORIES_URI: &str = "viking://agent/memories";
+/// Default minimum score for `viking_recall` / `viking_forget` candidate
+/// filtering (mirrors the plugin's `recallScoreThreshold`).
+const DEFAULT_SCORE_THRESHOLD: f64 = 0.15;
+/// `viking_forget` search-and-delete: how many candidates to pull, and the
+/// single-match score above which deletion happens without confirmation.
+const FORGET_DEFAULT_LIMIT: usize = 5;
+const FORGET_AUTO_DELETE_SCORE: f64 = 0.85;
+/// `viking_store` polls the commit's Phase-2 extraction task at this cadence
+/// up to this ceiling; `STORE_MAX_TIMEOUT` is the tool's declared wall-clock.
+const STORE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const STORE_POLL_TIMEOUT: Duration = Duration::from_secs(110);
+const STORE_MAX_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Body preview cap shared by the tracing logs and the `HttpFetch`
 /// trace event payload. Wide enough to be useful for debugging, short
@@ -97,14 +117,6 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{}…[{} bytes truncated]", &s[..end], s.len() - end)
     }
 }
-
-pub const TOOL_SEARCH: &str = "viking_search";
-pub const TOOL_READ: &str = "viking_read";
-pub const TOOL_BROWSE: &str = "viking_browse";
-pub const TOOL_REMEMBER: &str = "viking_remember";
-pub const TOOL_ADD_RESOURCE: &str = "viking_add_resource";
-
-const DEFAULT_MEMORY_SUBDIR: &str = "preferences";
 
 /// Per-backend config deserialized from `MemoryConfig.extra`. Unset fields
 /// elide from JSON via `skip_serializing_if`, so a freshly-written `extra`
@@ -361,52 +373,28 @@ impl OpenVikingInner {
             .await
     }
 
-    async fn upload_temp_file(
+    async fn delete(
         &self,
+        path: &str,
         user_id: &str,
-        file_path: &Path,
+        query: &[(&str, &str)],
+        timeout: Duration,
         events: Option<&Arc<dyn ToolEventSink>>,
-    ) -> Result<String> {
-        let bytes = tokio::fs::read(file_path)
-            .await
-            .map_err(|e| MemoryError::Backend(format!("read upload file failed: {e}")))?;
-        let upload_bytes = bytes.len() as u64;
-        let file_name = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("upload.bin")
-            .to_string();
-        let mime = mime_for(&file_name);
-        let part = reqwest::multipart::Part::bytes(bytes)
-            .file_name(file_name.clone())
-            .mime_str(&mime)
-            .map_err(|e| MemoryError::Backend(format!("mime: {e}")))?;
-        let form = reqwest::multipart::Form::new().part("file", part);
-
+    ) -> Result<Value> {
+        let url = build_url(&self.endpoint, path, query)
+            .map_err(|e| MemoryError::Backend(format!("openviking url build failed: {e}")))?;
         let builder = self
             .client
-            .post(self.url("/api/v1/resources/temp_upload"))
+            .delete(url)
             .headers(self.base_headers(user_id))
-            .multipart(form);
-        // Multipart request preview: just the metadata (filename + mime
-        // + size). The raw bytes themselves are not useful in a trace.
-        let preview = Some(format!("multipart {file_name} ({mime}, {upload_bytes}b)"));
-        let body = self
-            .run_request(
-                "POST",
-                "/api/v1/resources/temp_upload",
-                builder,
-                preview,
-                events,
-            )
-            .await?;
-        body.get("result")
-            .and_then(|r| r.get("temp_file_id"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| {
-                MemoryError::Backend("openviking temp_upload missing temp_file_id".into())
-            })
+            .timeout(timeout);
+        let preview = if query.is_empty() {
+            None
+        } else {
+            Some(format!("{query:?}"))
+        };
+        self.run_request("DELETE", path, builder, preview, events)
+            .await
     }
 }
 
@@ -424,25 +412,9 @@ fn build_url(endpoint: &str, path: &str, query: &[(&str, &str)]) -> Result<url::
     Ok(url)
 }
 
-fn mime_for(name: &str) -> String {
-    let lower = name.to_lowercase();
-    let ext = lower.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
-    match ext {
-        "json" => "application/json",
-        "zip" => "application/zip",
-        "txt" | "md" | "log" | "rs" | "py" | "ts" | "js" | "rb" | "go" | "sh" => "text/plain",
-        "pdf" => "application/pdf",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "html" | "htm" => "text/html",
-        _ => "application/octet-stream",
-    }
-    .into()
-}
-
 /// OpenViking memory backend. Construct via [`OpenVikingMemory::new`].
 ///
-/// Unlike `mem0` this backend ships no circuit breaker (matches the Python
+/// Unlike `mem0` this backend ships no circuit breaker (matches the original
 /// reference) — the default endpoint is loopback / local dev, where a
 /// dropped server during iteration would otherwise pin the breaker open for
 /// the cooldown window. Failures are logged at `warn`/`debug` and swallowed
@@ -525,21 +497,89 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
-fn build_memory_uri(user_id: &str, subdir: &str) -> String {
-    let slug = Uuid::new_v4().simple().to_string();
-    let slug = &slug[..slug.len().min(12)];
-    format!("viking://user/{user_id}/memories/{subdir}/mem_{slug}.md")
+/// Whether `uri` points into a deletable memory tree — `viking://user/…/memories`
+/// or `viking://agent/…/memories` (an optional single space segment before
+/// `memories`). Mirrors the official plugin's `MEMORY_URI_PATTERNS`; the
+/// load-bearing guard that stops `viking_forget` deleting resources / skills /
+/// arbitrary paths.
+fn is_memory_uri(uri: &str) -> bool {
+    let rest = match uri
+        .strip_prefix("viking://user/")
+        .or_else(|| uri.strip_prefix("viking://agent/"))
+    {
+        Some(r) => r,
+        None => return false,
+    };
+    let mut segs = rest.split('/');
+    match (segs.next(), segs.next()) {
+        (Some("memories"), _) => true,
+        (Some(space), Some("memories")) if !space.is_empty() => true,
+        _ => false,
+    }
 }
 
-fn category_to_subdir(category: &str) -> &'static str {
-    match category {
-        "preference" => "preferences",
-        "entity" => "entities",
-        "event" => "events",
-        "case" => "cases",
-        "pattern" => "patterns",
-        _ => DEFAULT_MEMORY_SUBDIR,
+fn clamp_score(v: f64) -> f64 {
+    v.clamp(0.0, 1.0)
+}
+
+fn item_score(item: &Value) -> f64 {
+    clamp_score(item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0))
+}
+
+fn item_uri(item: &Value) -> &str {
+    item.get("uri").and_then(|v| v.as_str()).unwrap_or("")
+}
+
+/// Memories from a `find` response: `result.memories` (server wraps the hit
+/// list under `result`).
+fn find_memories(resp: &Value) -> Vec<Value> {
+    resp.get("result")
+        .and_then(|r| r.get("memories"))
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Sort by score desc, drop sub-threshold (and non-leaf when `leaf_only`),
+/// dedup by URI, cap at `limit`. Mirrors the plugin's `postProcessMemories`.
+fn postprocess_memories(
+    mut items: Vec<Value>,
+    limit: usize,
+    score_threshold: f64,
+    leaf_only: bool,
+) -> Vec<Value> {
+    items.sort_by(|a, b| {
+        item_score(b)
+            .partial_cmp(&item_score(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        if leaf_only && item.get("level").and_then(|v| v.as_i64()) != Some(2) {
+            continue;
+        }
+        if item_score(&item) < score_threshold {
+            continue;
+        }
+        let uri = item_uri(&item).to_string();
+        if !uri.is_empty() && !seen.insert(uri) {
+            continue;
+        }
+        out.push(item);
+        if out.len() >= limit {
+            break;
+        }
     }
+    out
+}
+
+/// Total memories extracted across the 6 categories in a commit / task result.
+fn count_extracted(v: &Value) -> u64 {
+    v.get("memories_extracted")
+        .and_then(|m| m.as_object())
+        .map(|o| o.values().filter_map(|x| x.as_u64()).sum())
+        .unwrap_or(0)
 }
 
 #[async_trait]
@@ -627,26 +667,20 @@ impl Memory for OpenVikingMemory {
     }
 
     fn tools(&self) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
-        let inner = Arc::clone(&self.inner);
+        let inner = &self.inner;
         vec![
-            tool_pair(Arc::new(VikingSearchTool {
-                inner: Arc::clone(&inner),
+            tool_pair(Arc::new(VikingRecallTool {
+                inner: Arc::clone(inner),
             })),
-            tool_pair(Arc::new(VikingReadTool {
-                inner: Arc::clone(&inner),
+            tool_pair(Arc::new(VikingStoreTool {
+                inner: Arc::clone(inner),
             })),
-            tool_pair(Arc::new(VikingBrowseTool {
-                inner: Arc::clone(&inner),
+            tool_pair(Arc::new(VikingForgetTool {
+                inner: Arc::clone(inner),
             })),
-            tool_pair(Arc::new(VikingRememberTool {
-                inner: Arc::clone(&inner),
+            tool_pair(Arc::new(VikingArchiveExpandTool {
+                inner: Arc::clone(inner),
             })),
-            // `viking_add_resource` also reads the local filesystem when handed
-            // a local URL; declare both capabilities for governance accuracy.
-            tool_pair_with_caps(
-                Arc::new(VikingAddResourceTool { inner }),
-                vec![ToolCapability::Http, ToolCapability::ReadFile],
-            ),
         ]
     }
 }
@@ -681,40 +715,78 @@ fn parse_search_results(resp: &Value) -> Vec<RecalledMemory> {
 }
 
 fn tool_pair(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
-    tool_pair_with_caps(tool, vec![ToolCapability::Http])
-}
-
-fn tool_pair_with_caps(
-    tool: Arc<dyn Tool>,
-    capabilities: Vec<ToolCapability>,
-) -> (Arc<dyn Tool>, ToolManifest) {
     let manifest = ToolManifest {
         name: tool.name().to_string(),
         description: tool.description(),
         trust_level: TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
-        capabilities,
+        capabilities: vec![ToolCapability::Http],
     };
     (tool, manifest)
 }
 
+/// Project a `find` hit into the compact shape the tools surface.
+fn format_hit(item: &Value) -> Value {
+    json!({
+        "uri": item_uri(item),
+        "abstract": item.get("abstract").and_then(|v| v.as_str()).unwrap_or(""),
+        "score": (item_score(item) * 1000.0).round() / 1000.0,
+    })
+}
+
 // ---------------------------------------------------------------------------
-// Tool implementations
+// Tools — the four `viking_*` tools (recall / store / forget / archive_expand),
+// ported from the official OpenViking `openclaw-plugin`.
 // ---------------------------------------------------------------------------
 
-struct VikingSearchTool {
+struct VikingRecallTool {
     inner: Arc<OpenVikingInner>,
 }
 
+impl VikingRecallTool {
+    async fn find(
+        &self,
+        query: &str,
+        target_uri: &str,
+        request_limit: usize,
+        user_id: &str,
+        events: &Arc<dyn ToolEventSink>,
+    ) -> Vec<Value> {
+        let body = json!({
+            "query": query,
+            "target_uri": target_uri,
+            "top_k": request_limit,
+            "score_threshold": 0,
+        });
+        match self
+            .inner
+            .post_json(
+                "/api/v1/search/find",
+                user_id,
+                &body,
+                HTTP_TIMEOUT,
+                Some(events),
+            )
+            .await
+        {
+            Ok(resp) => find_memories(&resp),
+            Err(e) => {
+                debug!(error = %e, target_uri, "openviking recall find leg failed");
+                Vec::new()
+            }
+        }
+    }
+}
+
 #[async_trait]
-impl Tool for VikingSearchTool {
+impl Tool for VikingRecallTool {
     fn name(&self) -> &str {
-        TOOL_SEARCH
+        TOOL_RECALL
     }
     fn description(&self) -> String {
-        "Semantic search over the OpenViking knowledge base. Returns ranked results with \
-         viking:// URIs for deeper reading. Use mode='deep' for complex queries that need \
-         reasoning across multiple sources, 'fast' for simple lookups."
+        "Search long-term memories from OpenViking. Use when you need past user preferences, \
+         facts, or decisions. Without a targetUri this searches both the user and agent memory \
+         roots and merges the results."
             .into()
     }
     fn parameters_schema(&self) -> Value {
@@ -722,15 +794,9 @@ impl Tool for VikingSearchTool {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query."},
-                "mode": {
-                    "type": "string", "enum": ["auto", "fast", "deep"],
-                    "description": "Search depth (default: auto)."
-                },
-                "scope": {
-                    "type": "string",
-                    "description": "Viking URI prefix to scope search (e.g. 'viking://resources/docs/')."
-                },
-                "limit": {"type": "integer", "description": "Max results (default: 10)."}
+                "limit": {"type": "integer", "description": "Max results (default: configured top_k)."},
+                "scoreThreshold": {"type": "number", "description": "Minimum score 0-1 (default: 0.15)."},
+                "targetUri": {"type": "string", "description": "Restrict search to a single viking:// root (default: user + agent memories)."}
             },
             "required": ["query"]
         })
@@ -740,20 +806,268 @@ impl Tool for VikingSearchTool {
         let query = params
             .get("query")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| aura_tools::ToolError::InvalidParams("query is required".into()))?;
-        let mut body = json!({"query": query});
-        if let Some(mode) = params.get("mode").and_then(|v| v.as_str())
-            && mode != "auto"
+            .ok_or_else(|| ToolError::InvalidParams("query is required".into()))?;
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.max(1) as usize)
+            .unwrap_or(self.inner.top_k);
+        let score_threshold = params
+            .get("scoreThreshold")
+            .and_then(|v| v.as_f64())
+            .map(clamp_score)
+            .unwrap_or(DEFAULT_SCORE_THRESHOLD);
+        // Over-fetch then post-filter to leaves, like the official plugin.
+        let request_limit = (limit * 4).max(20);
+        let user_id = ctx.user.id.as_str();
+
+        let merged = if let Some(target_uri) = params.get("targetUri").and_then(|v| v.as_str()) {
+            self.find(query, target_uri, request_limit, user_id, &ctx.events)
+                .await
+        } else {
+            // Both roots concurrently; a failed leg contributes nothing.
+            let (user_hits, agent_hits) = tokio::join!(
+                self.find(
+                    query,
+                    USER_MEMORIES_URI,
+                    request_limit,
+                    user_id,
+                    &ctx.events
+                ),
+                self.find(
+                    query,
+                    AGENT_MEMORIES_URI,
+                    request_limit,
+                    user_id,
+                    &ctx.events
+                ),
+            );
+            let mut all = user_hits;
+            all.extend(agent_hits);
+            all
+        };
+
+        let memories = postprocess_memories(merged, limit, score_threshold, true);
+        if memories.is_empty() {
+            return Ok(ToolOutput::Json(json!({
+                "result": "No relevant OpenViking memories found.",
+                "count": 0,
+            })));
+        }
+        let results: Vec<Value> = memories.iter().map(format_hit).collect();
+        Ok(ToolOutput::Json(json!({
+            "results": results,
+            "count": results.len(),
+        })))
+    }
+}
+
+struct VikingStoreTool {
+    inner: Arc<OpenVikingInner>,
+}
+
+#[async_trait]
+impl Tool for VikingStoreTool {
+    fn name(&self) -> &str {
+        TOOL_STORE
+    }
+    fn max_timeout(&self) -> Duration {
+        STORE_MAX_TIMEOUT
+    }
+    fn description(&self) -> String {
+        "Store text in the OpenViking memory pipeline: write it to a session and run server-side \
+         memory extraction. Use for important information the agent should remember long-term."
+            .into()
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Information to store as memory source text."},
+                "role": {"type": "string", "description": "Session message role (default: user)."},
+                "sessionId": {"type": "string", "description": "Existing OpenViking session ID (default: a fresh temporary session)."}
+            },
+            "required": ["text"]
+        })
+    }
+
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+        let text = params
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidParams("text is required".into()))?;
+        if text.is_empty() {
+            return Err(ToolError::InvalidParams("text cannot be empty".into()));
+        }
+        let role = params
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("user");
+        let user_id = ctx.user.id.as_str();
+        let session_id = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| format!("aura-store-{}", Uuid::new_v4().simple()));
+
+        let msg_path = format!("/api/v1/sessions/{session_id}/messages");
+        let body = json!({"role": role, "content": text});
+        self.inner
+            .post_json(&msg_path, user_id, &body, HTTP_TIMEOUT, Some(&ctx.events))
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+
+        let commit_path = format!("/api/v1/sessions/{session_id}/commit");
+        let commit = self
+            .inner
+            .post_empty(&commit_path, user_id, HTTP_TIMEOUT, Some(&ctx.events))
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+
+        let mut status = commit
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut memories = count_extracted(&commit);
+
+        // Phase 2 (extraction) runs as a background task; poll it to completion
+        // so the model gets a real count, bounded by STORE_POLL_TIMEOUT and the
+        // user's cancellation.
+        if let Some(task_id) = commit.get("task_id").and_then(|v| v.as_str())
+            && status != "completed"
+            && status != "failed"
         {
-            body["mode"] = json!(mode);
-        }
-        if let Some(scope) = params.get("scope").and_then(|v| v.as_str()) {
-            body["target_uri"] = json!(scope);
-        }
-        if let Some(limit) = params.get("limit").and_then(|v| v.as_u64()) {
-            body["top_k"] = json!(limit);
+            let task_path = format!("/api/v1/tasks/{task_id}");
+            let deadline = Instant::now() + STORE_POLL_TIMEOUT;
+            loop {
+                if ctx.cancellation_token.is_cancelled() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    status = "timeout".into();
+                    break;
+                }
+                tokio::time::sleep(STORE_POLL_INTERVAL).await;
+                match self
+                    .inner
+                    .get(&task_path, user_id, &[], HTTP_TIMEOUT, Some(&ctx.events))
+                    .await
+                {
+                    Ok(task) => match task.get("status").and_then(|v| v.as_str()) {
+                        Some("completed") => {
+                            status = "completed".into();
+                            if let Some(result) = task.get("result") {
+                                memories = count_extracted(result);
+                            }
+                            break;
+                        }
+                        Some("failed") => {
+                            status = "failed".into();
+                            break;
+                        }
+                        _ => {}
+                    },
+                    Err(e) => {
+                        debug!(error = %e, "openviking store task poll failed");
+                        break;
+                    }
+                }
+            }
         }
 
+        Ok(ToolOutput::Json(json!({
+            "action": "stored",
+            "session_id": session_id,
+            "status": status,
+            "memories_extracted": memories,
+        })))
+    }
+}
+
+struct VikingForgetTool {
+    inner: Arc<OpenVikingInner>,
+}
+
+impl VikingForgetTool {
+    async fn delete_uri(&self, uri: &str, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+        self.inner
+            .delete(
+                "/api/v1/fs",
+                ctx.user.id.as_str(),
+                &[("uri", uri), ("recursive", "false")],
+                HTTP_TIMEOUT,
+                Some(&ctx.events),
+            )
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+        Ok(ToolOutput::Json(json!({
+            "action": "deleted",
+            "uri": uri,
+        })))
+    }
+}
+
+#[async_trait]
+impl Tool for VikingForgetTool {
+    fn name(&self) -> &str {
+        TOOL_FORGET
+    }
+    fn description(&self) -> String {
+        "Forget a memory by exact viking:// URI, or pass a query to search-and-delete when a \
+         single strong match is found. Only memory URIs are deletable."
+            .into()
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "uri": {"type": "string", "description": "Exact memory URI to delete."},
+                "query": {"type": "string", "description": "Search query to find a memory to delete."},
+                "targetUri": {"type": "string", "description": "Search scope URI (default: user memories)."},
+                "limit": {"type": "integer", "description": "Search candidate count (default: 5)."},
+                "scoreThreshold": {"type": "number", "description": "Minimum candidate score 0-1 (default: 0.15)."}
+            },
+            "required": []
+        })
+    }
+
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+        if let Some(uri) = params.get("uri").and_then(|v| v.as_str()) {
+            if !is_memory_uri(uri) {
+                return Ok(ToolOutput::Error(format!(
+                    "Refusing to delete non-memory URI: {uri}"
+                )));
+            }
+            return self.delete_uri(uri, ctx).await;
+        }
+
+        let Some(query) = params.get("query").and_then(|v| v.as_str()) else {
+            return Err(ToolError::InvalidParams("provide uri or query".into()));
+        };
+
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.max(1) as usize)
+            .unwrap_or(FORGET_DEFAULT_LIMIT);
+        let score_threshold = params
+            .get("scoreThreshold")
+            .and_then(|v| v.as_f64())
+            .map(clamp_score)
+            .unwrap_or(DEFAULT_SCORE_THRESHOLD);
+        let target_uri = params
+            .get("targetUri")
+            .and_then(|v| v.as_str())
+            .unwrap_or(USER_MEMORIES_URI);
+        let request_limit = (limit * 4).max(20);
+
+        let body = json!({
+            "query": query,
+            "target_uri": target_uri,
+            "top_k": request_limit,
+            "score_threshold": 0,
+        });
         let resp = self
             .inner
             .post_json(
@@ -764,652 +1078,123 @@ impl Tool for VikingSearchTool {
                 Some(&ctx.events),
             )
             .await
-            .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
-        let result = resp.get("result").cloned().unwrap_or(Value::Null);
-        let mut scored: Vec<(f64, Value)> = Vec::new();
-        for ctx_type in ["memories", "resources", "skills"] {
-            if let Some(items) = result.get(ctx_type).and_then(|v| v.as_array()) {
-                for item in items {
-                    let score = item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let entry = json!({
-                        "uri": item.get("uri").and_then(|v| v.as_str()).unwrap_or(""),
-                        "type": ctx_type.trim_end_matches('s'),
-                        "score": (score * 1000.0).round() / 1000.0,
-                        "abstract": item.get("abstract").and_then(|v| v.as_str()).unwrap_or(""),
-                    });
-                    scored.push((score, entry));
-                }
-            }
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+
+        let candidates: Vec<Value> =
+            postprocess_memories(find_memories(&resp), request_limit, score_threshold, true)
+                .into_iter()
+                .filter(|item| is_memory_uri(item_uri(item)))
+                .collect();
+
+        if candidates.is_empty() {
+            return Ok(ToolOutput::Json(json!({
+                "action": "none",
+                "result": "No matching leaf memory candidates found. Try a more specific query.",
+            })));
         }
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let formatted: Vec<Value> = scored.into_iter().map(|(_, v)| v).collect();
-        let total = result
-            .get("total")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(formatted.len() as u64);
-        Ok(ToolOutput::Json(
-            json!({"results": formatted, "total": total}),
-        ))
+
+        let top = &candidates[0];
+        if candidates.len() == 1 && item_score(top) >= FORGET_AUTO_DELETE_SCORE {
+            let uri = item_uri(top).to_string();
+            return self.delete_uri(&uri, ctx).await;
+        }
+
+        let listed: Vec<Value> = candidates.iter().take(limit).map(format_hit).collect();
+        Ok(ToolOutput::Json(json!({
+            "action": "candidates",
+            "result": format!("Found {} candidates; pass uri to delete one.", listed.len()),
+            "candidates": listed,
+        })))
     }
 }
 
-struct VikingReadTool {
+struct VikingArchiveExpandTool {
     inner: Arc<OpenVikingInner>,
 }
 
 #[async_trait]
-impl Tool for VikingReadTool {
+impl Tool for VikingArchiveExpandTool {
     fn name(&self) -> &str {
-        TOOL_READ
+        TOOL_ARCHIVE_EXPAND
     }
     fn description(&self) -> String {
-        "Read content at a viking:// URI. Three detail levels:\n\
-         abstract — ~100 token summary (L0)\n\
-         overview — ~2k token key points (L1)\n\
-         full — complete content (L2)\n\
-         Start with abstract/overview, only use full when you need details."
+        "Retrieve the original messages from a compressed session archive. Use when a session \
+         summary lacks specific details such as exact commands, file paths, code snippets, or \
+         config values. Check the archive index for the right archive ID."
             .into()
     }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "uri": {"type": "string", "description": "viking:// URI to read."},
-                "level": {
-                    "type": "string", "enum": ["abstract", "overview", "full"],
-                    "description": "Detail level (default: overview)."
-                }
+                "archiveId": {"type": "string", "description": "Archive ID from the archive index (e.g. \"archive_002\")."}
             },
-            "required": ["uri"]
+            "required": ["archiveId"]
         })
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
-        let uri = params
-            .get("uri")
+        let archive_id = params
+            .get("archiveId")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| aura_tools::ToolError::InvalidParams("uri is required".into()))?
-            .to_string();
-        let level = params
-            .get("level")
-            .and_then(|v| v.as_str())
-            .unwrap_or("overview")
-            .to_string();
-        let summary_level = level == "abstract" || level == "overview";
-        let resolved = if summary_level {
-            normalize_summary_uri(&uri)
-        } else {
-            uri.clone()
-        };
-
-        let endpoint = match level.as_str() {
-            "abstract" => "/api/v1/content/abstract",
-            "overview" => "/api/v1/content/overview",
-            _ => "/api/v1/content/read",
-        };
-
-        let user_id = ctx.user.id.as_str();
-        let mut used_fallback = false;
-        let resp = match self
-            .inner
-            .get(
-                endpoint,
-                user_id,
-                &[("uri", &resolved)],
-                HTTP_TIMEOUT,
-                Some(&ctx.events),
-            )
-            .await
-        {
-            Ok(v) => v,
-            Err(e) if summary_level => {
-                used_fallback = true;
-                debug!(error = %e, "openviking summary endpoint failed; falling back to /content/read");
-                self.inner
-                    .get(
-                        "/api/v1/content/read",
-                        user_id,
-                        &[("uri", &uri)],
-                        HTTP_TIMEOUT,
-                        Some(&ctx.events),
-                    )
-                    .await
-                    .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?
-            }
-            Err(e) => return Err(aura_tools::ToolError::Execution(e.to_string())),
-        };
-
-        let result = resp.get("result").cloned().unwrap_or(resp);
-        let content = match &result {
-            Value::String(s) => s.clone(),
-            Value::Object(_) => result
-                .get("content")
-                .and_then(|v| v.as_str())
-                .or_else(|| result.get("text").and_then(|v| v.as_str()))
-                .unwrap_or_default()
-                .to_string(),
-            _ => String::new(),
-        };
-
-        let max_len = match level.as_str() {
-            "abstract" => 1200,
-            "overview" => 4000,
-            _ => 8000,
-        };
-        let trimmed = if content.len() > max_len {
-            let mut t = truncate_str(&content, max_len);
-            t.push_str("\n\n[... truncated, use a more specific URI or full level]");
-            t
-        } else {
-            content
-        };
-
-        let mut payload = json!({
-            "uri": uri,
-            "resolved_uri": resolved,
-            "level": level,
-            "content": trimmed,
-        });
-        if used_fallback {
-            payload["fallback"] = json!("content/read");
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ToolError::InvalidParams("archiveId is required".into()))?;
+        let sid = ctx.session_id.as_str();
+        if sid.is_empty() {
+            return Ok(ToolOutput::Error("no active session".into()));
         }
-        Ok(ToolOutput::Json(payload))
-    }
-}
 
-fn normalize_summary_uri(uri: &str) -> String {
-    for suffix in ["/.abstract.md", "/.overview.md", "/.read.md", "/.full.md"] {
-        if let Some(stripped) = uri.strip_suffix(suffix) {
-            return if stripped.is_empty() {
-                "viking://".to_string()
-            } else {
-                stripped.to_string()
-            };
-        }
-    }
-    uri.to_string()
-}
-
-struct VikingBrowseTool {
-    inner: Arc<OpenVikingInner>,
-}
-
-#[async_trait]
-impl Tool for VikingBrowseTool {
-    fn name(&self) -> &str {
-        TOOL_BROWSE
-    }
-    fn description(&self) -> String {
-        "Browse the OpenViking knowledge store like a filesystem.\n\
-         list — show directory contents\n\
-         tree — show hierarchy\n\
-         stat — show metadata for a URI"
-            .into()
-    }
-    fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string", "enum": ["tree", "list", "stat"],
-                    "description": "Browse action."
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Viking URI path (default: viking://)."
-                }
-            },
-            "required": ["action"]
-        })
-    }
-
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
-        let action = params
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("list")
-            .to_string();
-        let path = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("viking://")
-            .to_string();
-        let endpoint = match action.as_str() {
-            "tree" => "/api/v1/fs/tree",
-            "stat" => "/api/v1/fs/stat",
-            _ => "/api/v1/fs/ls",
-        };
+        let path = format!("/api/v1/sessions/{sid}/archives/{archive_id}");
         let resp = self
             .inner
             .get(
-                endpoint,
+                &path,
                 ctx.user.id.as_str(),
-                &[("uri", &path)],
+                &[],
                 HTTP_TIMEOUT,
                 Some(&ctx.events),
             )
             .await
-            .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
-        let result = resp.get("result").cloned().unwrap_or(resp);
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+        let detail = resp.get("result").unwrap_or(&resp);
 
-        if action == "list" || action == "tree" {
-            let raw_entries = if result.is_array() {
-                Some(result.clone())
-            } else if let Some(obj) = result.as_object() {
-                obj.get("entries")
-                    .or_else(|| obj.get("items"))
-                    .or_else(|| obj.get("children"))
-                    .cloned()
-            } else {
-                None
-            };
-            if let Some(Value::Array(arr)) = raw_entries {
-                let entries: Vec<Value> = arr
-                    .into_iter()
-                    .take(50)
-                    .map(|e| {
-                        let uri = e.get("uri").and_then(|v| v.as_str()).unwrap_or("");
-                        let name = e
-                            .get("rel_path")
-                            .or_else(|| e.get("name"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| {
-                                uri.rsplit_once('/')
-                                    .map(|(_, n)| n.to_string())
-                                    .unwrap_or_default()
-                            });
-                        let is_dir = e.get("isDir").and_then(|v| v.as_bool()).unwrap_or(false)
-                            || e.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false)
-                            || e.get("type").and_then(|v| v.as_str()) == Some("dir");
-                        json!({
-                            "name": name,
-                            "uri": uri,
-                            "type": if is_dir { "dir" } else { "file" },
-                            "abstract": e.get("abstract").and_then(|v| v.as_str()).unwrap_or(""),
-                        })
-                    })
-                    .collect();
-                return Ok(ToolOutput::Json(json!({"path": path, "entries": entries})));
-            }
-        }
-        Ok(ToolOutput::Json(result))
-    }
-}
-
-struct VikingRememberTool {
-    inner: Arc<OpenVikingInner>,
-}
-
-#[async_trait]
-impl Tool for VikingRememberTool {
-    fn name(&self) -> &str {
-        TOOL_REMEMBER
-    }
-    fn description(&self) -> String {
-        "Explicitly store a fact or memory in the OpenViking knowledge base. Use for \
-         important information the agent should remember long-term. The system \
-         automatically categorizes and indexes the memory."
-            .into()
-    }
-    fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "content": {"type": "string", "description": "The information to remember."},
-                "category": {
-                    "type": "string",
-                    "enum": ["preference", "entity", "event", "case", "pattern"],
-                    "description": "Memory category (default: auto-detected)."
-                }
-            },
-            "required": ["content"]
-        })
-    }
-
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
-        let content = params
-            .get("content")
+        let messages = detail
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let body: String = messages
+            .iter()
+            .map(|m| {
+                let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                format!("{role}: {content}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let resolved_id = detail
+            .get("archive_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| aura_tools::ToolError::InvalidParams("content is required".into()))?;
-        if content.is_empty() {
-            return Err(aura_tools::ToolError::InvalidParams(
-                "content cannot be empty".into(),
-            ));
-        }
-        let category = params
-            .get("category")
+            .unwrap_or(archive_id);
+        let abstract_text = detail
+            .get("abstract")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let subdir = category_to_subdir(category);
-        let uri = build_memory_uri(ctx.user.id.as_str(), subdir);
-        let body = json!({"uri": uri, "content": content, "mode": "create"});
-        let resp = self
-            .inner
-            .post_json(
-                "/api/v1/content/write",
-                ctx.user.id.as_str(),
-                &body,
-                HTTP_TIMEOUT,
-                Some(&ctx.events),
-            )
-            .await
-            .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
-        let written = resp
-            .get("result")
-            .and_then(|r| r.get("written_bytes"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        Ok(ToolOutput::Json(json!({
-            "status": "stored",
-            "uri": uri,
-            "message": format!("Memory stored ({written}b) and queued for vector indexing."),
-        })))
-    }
-}
-
-struct VikingAddResourceTool {
-    inner: Arc<OpenVikingInner>,
-}
-
-#[async_trait]
-impl Tool for VikingAddResourceTool {
-    fn name(&self) -> &str {
-        TOOL_ADD_RESOURCE
-    }
-    fn description(&self) -> String {
-        "Add a remote URL or local file/directory to the OpenViking knowledge base. \
-         Remote resources must be public http(s), git, or ssh URLs. Local files and \
-         directories are uploaded via temp_upload; directories are zipped first."
-            .into()
-    }
-    fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "Remote URL or local file/directory path to add."},
-                "reason": {"type": "string", "description": "Why this resource is relevant (improves search)."},
-                "to": {"type": "string", "description": "Optional target viking:// URI for the resource."},
-                "parent": {"type": "string", "description": "Optional parent viking:// URI. Cannot be used with `to`."},
-                "instruction": {"type": "string", "description": "Optional processing instruction for semantic extraction."},
-                "wait": {"type": "boolean", "description": "Whether to wait for processing to complete."},
-                "timeout": {"type": "number", "description": "Timeout in seconds when `wait` is true."}
-            },
-            "required": ["url"]
-        })
-    }
-
-    /// Declare ReadFile access for any local URL — the executor's approval
-    /// gate skips ReadFile in this codebase, so this is more about the
-    /// governance contract than per-call prompting. The sensitive-path +
-    /// size + SSRF gates inside `execute` are the load-bearing checks.
-    fn accessed_resources(&self, params: &Value) -> Vec<aura_model::ResourceAccess> {
-        let Some(url) = params.get("url").and_then(|v| v.as_str()) else {
-            return Vec::new();
-        };
-        match classify_resource(url) {
-            ResourceSource::Local(p) => vec![aura_model::ResourceAccess::ReadFile { path: p }],
-            ResourceSource::Remote => Vec::new(),
-        }
-    }
-
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
-        let url = params
-            .get("url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| aura_tools::ToolError::InvalidParams("url is required".into()))?
-            .to_string();
-        if params.get("to").is_some() && params.get("parent").is_some() {
-            return Err(aura_tools::ToolError::InvalidParams(
-                "Cannot specify both 'to' and 'parent'".into(),
-            ));
-        }
-
-        let mut payload = serde_json::Map::new();
-        for key in ["reason", "to", "parent", "instruction", "wait", "timeout"] {
-            if let Some(v) = params.get(key)
-                && !v.is_null()
-                && v.as_str() != Some("")
-            {
-                payload.insert(key.into(), v.clone());
-            }
-        }
-
-        let user_id = ctx.user.id.as_str();
-        let source = classify_resource(&url);
-        let mut cleanup: Option<PathBuf> = None;
-        let result = match source {
-            ResourceSource::Remote => {
-                // The model can hand us an arbitrary http(s) URL that the
-                // OpenViking server will fetch on our behalf — without this
-                // guard the server becomes an SSRF proxy onto loopback /
-                // RFC1918 / link-local. Mirrors WebFetch's `validate_url_with`
-                // for the http(s) subset; git/ssh URLs are allowed through
-                // since they are not arbitrary HTTP and the credential model
-                // is upstream.
-                reject_private_remote_url(&url)?;
-                payload.insert("path".into(), json!(url));
-                self.inner
-                    .post_json(
-                        "/api/v1/resources",
-                        user_id,
-                        &Value::Object(payload),
-                        HTTP_TIMEOUT,
-                        Some(&ctx.events),
-                    )
-                    .await
-            }
-            ResourceSource::Local(path) => {
-                // Sensitive-path guard mirrors `send_local_file`: this is the
-                // only other tool that ships local bytes to a remote endpoint,
-                // and the executor's approval gate skips ReadFile entirely
-                // (see `tool_executor` / `feedback_read_no_confirm`), so
-                // `is_sensitive_path` is the load-bearing check.
-                if aura_security::is_sensitive_path(&path) {
-                    return Err(aura_tools::ToolError::Execution(format!(
-                        "Refusing to upload sensitive path: {url}"
-                    )));
-                }
-                if !path.exists() {
-                    return Err(aura_tools::ToolError::Execution(format!(
-                        "Local resource path does not exist: {url}"
-                    )));
-                }
-                let upload_path = if path.is_dir() {
-                    payload.insert(
-                        "source_name".into(),
-                        json!(
-                            path.file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("upload")
-                        ),
-                    );
-                    let dir = path.clone();
-                    // WalkDir + read + deflate is fully synchronous; running
-                    // it on the tokio worker would stall other tasks for big
-                    // trees. spawn_blocking releases the worker.
-                    let zip = tokio::task::spawn_blocking(move || zip_directory(&dir))
-                        .await
-                        .map_err(|e| {
-                            aura_tools::ToolError::Execution(format!("zip join failed: {e}"))
-                        })?
-                        .map_err(|e| {
-                            aura_tools::ToolError::Execution(format!("zip directory failed: {e}"))
-                        })?;
-                    cleanup = Some(zip.clone());
-                    zip
-                } else if path.is_file() {
-                    payload.insert(
-                        "source_name".into(),
-                        json!(
-                            path.file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("upload.bin")
-                        ),
-                    );
-                    path.clone()
-                } else {
-                    return Err(aura_tools::ToolError::Execution(format!(
-                        "Unsupported local resource path: {url}"
-                    )));
-                };
-                // Size cap (matches `send_local_file::MAX_BYTES`). Applies
-                // to the zipped archive too, so a model can't point at /
-                // and force a multi-gig upload.
-                let size = tokio::fs::metadata(&upload_path)
-                    .await
-                    .map_err(|e| {
-                        aura_tools::ToolError::Execution(format!("stat upload path: {e}"))
-                    })?
-                    .len();
-                if size > MAX_UPLOAD_BYTES {
-                    let _ = cleanup.take().map(|p| std::fs::remove_file(p).ok());
-                    return Err(aura_tools::ToolError::Execution(format!(
-                        "{url} is {size} bytes, exceeds the {MAX_UPLOAD_BYTES}-byte cap"
-                    )));
-                }
-                let temp_file_id = self
-                    .inner
-                    .upload_temp_file(user_id, &upload_path, Some(&ctx.events))
-                    .await
-                    .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
-                payload.insert("temp_file_id".into(), json!(temp_file_id));
-                self.inner
-                    .post_json(
-                        "/api/v1/resources",
-                        user_id,
-                        &Value::Object(payload),
-                        HTTP_TIMEOUT,
-                        Some(&ctx.events),
-                    )
-                    .await
-            }
-        };
-
-        if let Some(p) = cleanup
-            && let Err(e) = std::fs::remove_file(&p)
-        {
-            debug!(path = %p.display(), error = %e, "openviking add_resource: zip cleanup failed");
-        }
-
-        let resp = result.map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
-        let root_uri = resp
-            .get("result")
-            .and_then(|r| r.get("root_uri"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        Ok(ToolOutput::Json(json!({
-            "status": "added",
-            "root_uri": root_uri,
-            "message": "Resource queued for processing. Use viking_search after a moment to find it.",
-        })))
-    }
-}
-
-/// Reject http(s) URLs whose host is `localhost` (or `*.localhost`) or whose
-/// literal IP falls into a blocked SSRF range (loopback / RFC1918 /
-/// link-local / unspecified / CGNAT / multicast / reserved). Hostname-target
-/// SSRF on a non-loopback name is left to the OpenViking server's network
-/// boundary — same trade-off as WebFetch's URL pre-check.
-fn reject_private_remote_url(url: &str) -> aura_tools::Result<()> {
-    let lower = url.to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-        return Ok(());
-    }
-    let parsed = url::Url::parse(url)
-        .map_err(|e| aura_tools::ToolError::InvalidParams(format!("invalid url `{url}`: {e}")))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| aura_tools::ToolError::InvalidParams("url has no host".into()))?;
-    let host_lc = host.to_ascii_lowercase();
-    if host_lc == "localhost"
-        || host_lc == "localhost.localdomain"
-        || host_lc.ends_with(".localhost")
-    {
-        return Err(aura_tools::ToolError::Execution(format!(
-            "host `{host}` blocked (loopback-like name)"
-        )));
-    }
-    let stripped = host_lc
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(&host_lc);
-    if let Ok(addr) = stripped.parse::<IpAddr>()
-        && aura_security::is_blocked_ip(&addr, false)
-    {
-        return Err(aura_tools::ToolError::Execution(format!(
-            "ip `{addr}` blocked"
-        )));
-    }
-    Ok(())
-}
-
-enum ResourceSource {
-    Remote,
-    Local(PathBuf),
-}
-
-fn classify_resource(value: &str) -> ResourceSource {
-    if REMOTE_PREFIXES.iter().any(|p| value.starts_with(p)) {
-        return ResourceSource::Remote;
-    }
-    if let Some(rest) = value.strip_prefix("file://") {
-        return ResourceSource::Local(PathBuf::from(rest));
-    }
-    if value.starts_with('/')
-        || value.starts_with("./")
-        || value.starts_with("../")
-        || value.starts_with("~/")
-    {
-        let expanded = if let Some(rest) = value.strip_prefix("~/")
-            && let Some(home) = std::env::var_os("HOME")
-        {
-            let mut p = PathBuf::from(home);
-            p.push(rest);
-            p
+        let header = format!("## {resolved_id}\n**Messages**: {}", messages.len());
+        let content = if abstract_text.is_empty() {
+            format!("{header}\n\n{body}")
         } else {
-            PathBuf::from(value)
+            format!("{header}\n**Summary**: {abstract_text}\n\n{body}")
         };
-        return ResourceSource::Local(expanded);
-    }
-    if value.contains('/') {
-        return ResourceSource::Local(PathBuf::from(value));
-    }
-    ResourceSource::Remote
-}
 
-fn zip_directory(dir: &Path) -> std::io::Result<PathBuf> {
-    let tmp = std::env::temp_dir();
-    let zip_name = format!("openviking_upload_{}.zip", Uuid::new_v4().simple());
-    let zip_path = tmp.join(zip_name);
-    let file = File::create(&zip_path)?;
-    let mut writer = ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    let dir = dir.to_path_buf();
-    for entry in WalkDir::new(&dir).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_symlink() || path.is_dir() {
-            continue;
-        }
-        if !path.is_file() {
-            continue;
-        }
-        let arcname = path
-            .strip_prefix(&dir)
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| {
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into()
-            });
-        writer.start_file(arcname, options)?;
-        let bytes = std::fs::read(path)?;
-        writer.write_all(&bytes)?;
+        Ok(ToolOutput::Json(json!({
+            "action": "expanded",
+            "archive_id": resolved_id,
+            "message_count": messages.len(),
+            "content": content,
+        })))
     }
-    writer.finish()?;
-    Ok(zip_path)
 }
 
 /// Parse `MemoryConfig.extra` into a typed [`OpenVikingConfig`].
@@ -1481,70 +1266,53 @@ mod tests {
     }
 
     #[test]
-    fn normalize_summary_uri_strips_pseudo_suffixes() {
-        assert_eq!(
-            normalize_summary_uri("viking://user/x/.abstract.md"),
-            "viking://user/x"
+    fn is_memory_uri_matches_user_and_agent_memory_trees() {
+        assert!(is_memory_uri("viking://user/memories"));
+        assert!(is_memory_uri("viking://user/memories/preferences/mem_x.md"));
+        assert!(is_memory_uri("viking://user/space7/memories/x.md"));
+        assert!(is_memory_uri("viking://agent/memories/cases/c.md"));
+        // Not a memory tree.
+        assert!(!is_memory_uri("viking://user/resources/doc.md"));
+        assert!(!is_memory_uri("viking://agent/skills/s.md"));
+        assert!(!is_memory_uri("viking://resources/x"));
+        assert!(!is_memory_uri("https://example.com"));
+        // `memories` must be a full path segment, not a prefix.
+        assert!(!is_memory_uri("viking://user/memoriesX/y"));
+    }
+
+    #[test]
+    fn postprocess_filters_sorts_dedups_and_caps() {
+        let items = vec![
+            json!({"uri": "a", "score": 0.5, "level": 2}),
+            json!({"uri": "b", "score": 0.9, "level": 2}),
+            json!({"uri": "a", "score": 0.8, "level": 2}), // dup uri
+            json!({"uri": "c", "score": 0.95, "level": 1}), // non-leaf
+            json!({"uri": "d", "score": 0.1, "level": 2}), // sub-threshold
+        ];
+        let out = postprocess_memories(items, 10, 0.3, true);
+        let uris: Vec<&str> = out.iter().map(item_uri).collect();
+        // b (0.9) then a (0.8, first kept beats the 0.5 dup); c filtered (non-leaf),
+        // d filtered (sub-threshold).
+        assert_eq!(uris, vec!["b", "a"]);
+
+        let capped = postprocess_memories(
+            vec![
+                json!({"uri": "x", "score": 0.9, "level": 2}),
+                json!({"uri": "y", "score": 0.8, "level": 2}),
+            ],
+            1,
+            0.0,
+            true,
         );
-        assert_eq!(
-            normalize_summary_uri("viking://user/x/.overview.md"),
-            "viking://user/x"
-        );
-        assert_eq!(
-            normalize_summary_uri("viking://user/x"),
-            "viking://user/x",
-            "non-pseudo URI unchanged"
-        );
+        assert_eq!(capped.len(), 1);
+        assert_eq!(item_uri(&capped[0]), "x");
     }
 
     #[test]
-    fn category_to_subdir_maps_or_defaults() {
-        assert_eq!(category_to_subdir("preference"), "preferences");
-        assert_eq!(category_to_subdir("entity"), "entities");
-        assert_eq!(category_to_subdir("unknown"), DEFAULT_MEMORY_SUBDIR);
-        assert_eq!(category_to_subdir(""), DEFAULT_MEMORY_SUBDIR);
-    }
-
-    #[test]
-    fn classify_resource_distinguishes_remote_and_local() {
-        assert!(matches!(
-            classify_resource("https://example.com/x"),
-            ResourceSource::Remote
-        ));
-        assert!(matches!(
-            classify_resource("git@github.com:user/repo.git"),
-            ResourceSource::Remote
-        ));
-        assert!(matches!(
-            classify_resource("/abs/path"),
-            ResourceSource::Local(_)
-        ));
-        assert!(matches!(
-            classify_resource("./rel/path"),
-            ResourceSource::Local(_)
-        ));
-    }
-
-    #[test]
-    fn build_memory_uri_includes_user_and_subdir() {
-        let uri = build_memory_uri("booiris", "preferences");
-        assert!(uri.starts_with("viking://user/booiris/memories/preferences/mem_"));
-        assert!(uri.ends_with(".md"));
-    }
-
-    #[test]
-    fn zip_directory_produces_readable_archive() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
-        std::fs::create_dir(tmp.path().join("sub")).unwrap();
-        std::fs::write(tmp.path().join("sub").join("b.txt"), b"world").unwrap();
-        let zip = zip_directory(tmp.path()).unwrap();
-        let f = File::open(&zip).unwrap();
-        let archive = zip::ZipArchive::new(f).unwrap();
-        let names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
-        assert!(names.contains(&"a.txt".to_string()));
-        assert!(names.iter().any(|n| n.ends_with("b.txt")));
-        std::fs::remove_file(&zip).ok();
+    fn count_extracted_sums_categories() {
+        let commit = json!({"memories_extracted": {"preferences": 2, "events": 3, "cases": 0}});
+        assert_eq!(count_extracted(&commit), 5);
+        assert_eq!(count_extracted(&json!({})), 0);
     }
 
     #[test]
