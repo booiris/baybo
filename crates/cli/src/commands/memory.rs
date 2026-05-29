@@ -186,14 +186,6 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
         MemoryProvider::Mem0 => {
             let mut cfg = mem0::parse_extra(&new_config.memory.extra).unwrap_or_default();
 
-            let name = prompt_optional(
-                "API key secret name",
-                "MEM0_API_KEY",
-                cfg.api_key_name.as_deref(),
-            )?;
-            cfg.api_key_name = name.clone();
-            let key_name = name.unwrap_or_else(|| "MEM0_API_KEY".into());
-
             cfg.base_url = prompt_optional(
                 "base_url (blank for https://api.mem0.ai)",
                 "",
@@ -206,6 +198,16 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
             )?;
 
             cfg.top_k = prompt_usize("top_k — max memories per recall", cfg.top_k.unwrap_or(5))?;
+
+            // The user-secret name is intentionally not asked: the default
+            // `MEM0_API_KEY` matches the Mem0 docs' env-var convention and
+            // covers every realistic deployment. Power users that need a
+            // different secret name can edit `extra.api_key_name` in
+            // `aura.json` directly.
+            let key_name = cfg
+                .api_key_name
+                .clone()
+                .unwrap_or_else(|| "MEM0_API_KEY".into());
 
             new_config.memory.extra = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Config(format!("serialise mem0 extra: {e}")))?;
@@ -229,14 +231,6 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
                 Some(endpoint.clone())
             };
 
-            let name = prompt_optional(
-                "API key secret name (blank to skip — local dev runs unauthenticated)",
-                "OPENVIKING_API_KEY",
-                cfg.api_key_name.as_deref(),
-            )?;
-            cfg.api_key_name = name.clone();
-            let key_name = name.unwrap_or_else(|| "OPENVIKING_API_KEY".into());
-
             cfg.account = prompt_optional(
                 "X-OpenViking-Account header (tenant identity)",
                 "default",
@@ -244,6 +238,14 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
             )?;
 
             cfg.top_k = prompt_usize("top_k — max memories per recall", cfg.top_k.unwrap_or(5))?;
+
+            // Default user-secret name `OPENVIKING_API_KEY`; not asked
+            // (same rationale as Mem0). Power users override via
+            // `extra.api_key_name` in `aura.json`.
+            let key_name = cfg
+                .api_key_name
+                .clone()
+                .unwrap_or_else(|| "OPENVIKING_API_KEY".into());
 
             new_config.memory.extra = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Config(format!("serialise openviking extra: {e}")))?;
