@@ -205,13 +205,17 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
 
             // The user-secret name is intentionally not asked: the default
             // `MEM0_API_KEY` matches the Mem0 docs' env-var convention and
-            // covers every realistic deployment. Power users that need a
-            // different secret name can edit `extra.api_key_name` in
-            // `aura.json` directly.
+            // covers every realistic deployment. We DO persist the resolved
+            // name into `extra.api_key_name` even when it equals the
+            // built-in default — so opening `aura.json` shows the operator
+            // exactly which vault entry (`user_env.<NAME>`) and which env
+            // var the runtime will resolve at startup. Power users edit
+            // this field to use a different name.
             let key_name = cfg
                 .api_key_name
                 .clone()
                 .unwrap_or_else(|| "MEM0_API_KEY".into());
+            cfg.api_key_name = Some(key_name.clone());
 
             new_config.memory.extra = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Config(format!("serialise mem0 extra: {e}")))?;
@@ -244,13 +248,15 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
 
             cfg.top_k = prompt_usize("top_k — max memories per recall", cfg.top_k.unwrap_or(5))?;
 
-            // Default user-secret name `OPENVIKING_API_KEY`; not asked
-            // (same rationale as Mem0). Power users override via
-            // `extra.api_key_name` in `aura.json`.
+            // Default user-secret name `OPENVIKING_API_KEY`; not asked.
+            // Persist the resolved name even when it equals the default
+            // so opening `aura.json` shows where the key lives (same
+            // rationale as Mem0 above).
             let key_name = cfg
                 .api_key_name
                 .clone()
                 .unwrap_or_else(|| "OPENVIKING_API_KEY".into());
+            cfg.api_key_name = Some(key_name.clone());
 
             new_config.memory.extra = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Config(format!("serialise openviking extra: {e}")))?;
