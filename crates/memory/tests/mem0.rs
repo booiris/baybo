@@ -9,14 +9,15 @@ mod common;
 use std::sync::Arc;
 
 use aura_memory::backends::mem0::{
-    Mem0Config, Mem0Memory, TOOL_CONCLUDE, TOOL_PROFILE, TOOL_SEARCH,
+    Mem0Config, Mem0Memory, TOOL_ADD, TOOL_DELETE, TOOL_EVENT_LIST, TOOL_EVENT_STATUS, TOOL_GET,
+    TOOL_LIST, TOOL_SEARCH, TOOL_UPDATE,
 };
 use aura_memory::{Memory, RecalledMemory};
 use aura_model::ContentBlock;
 use aura_trace::StepKind;
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -27,6 +28,7 @@ use common::{base_url, memory_context, spawn, tool_context};
 struct Captured {
     auth: Arc<Mutex<Option<String>>>,
     bodies: Arc<Mutex<Vec<Value>>>,
+    queries: Arc<Mutex<Vec<String>>>,
 }
 
 fn cfg(server_url: &str, top_k: usize) -> Mem0Config {
@@ -40,6 +42,22 @@ fn cfg(server_url: &str, top_k: usize) -> Mem0Config {
 
 fn build(server_url: &str) -> Mem0Memory {
     Mem0Memory::new(cfg(server_url, 5), "test-key".into(), None).unwrap()
+}
+
+/// Find a tool by name in the backend's contributed tool set.
+fn tool_by_name(m: &Mem0Memory, name: &str) -> Arc<dyn aura_tools::Tool> {
+    m.tools()
+        .into_iter()
+        .find(|(t, _)| t.name() == name)
+        .map(|(t, _)| t)
+        .unwrap_or_else(|| panic!("tool {name} not found"))
+}
+
+fn expect_json(out: aura_tools::ToolOutput) -> Value {
+    match out {
+        aura_tools::ToolOutput::Json(v) => v,
+        other => panic!("expected Json, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,53 +240,11 @@ async fn on_session_end_is_a_noop() {
 }
 
 // ---------------------------------------------------------------------------
-// tool: mem0_profile
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn tool_profile_fetches_all_memories() {
-    let captured = Captured::default();
-    let app = Router::new()
-        .route(
-            "/v2/memories/",
-            post(
-                |State(c): State<Captured>, Json(body): Json<Value>| async move {
-                    c.bodies.lock().push(body.clone());
-                    Json(json!([
-                        {"memory": "fact A"},
-                        {"memory": "fact B"},
-                    ]))
-                },
-            ),
-        )
-        .with_state(captured.clone());
-    let server = spawn(app).await;
-    let m = build(&base_url(&server));
-
-    let tools = m.tools();
-    let (profile, _manifest) = tools
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_PROFILE)
-        .unwrap();
-
-    let ctx = tool_context("u-4");
-    let out = profile.execute(json!({}), &ctx).await.unwrap();
-    let json_val = match out {
-        aura_tools::ToolOutput::Json(v) => v,
-        other => panic!("expected Json, got {other:?}"),
-    };
-    assert_eq!(json_val["count"], 2);
-    assert!(json_val["result"].as_str().unwrap().contains("fact A"));
-    let body = captured.bodies.lock().last().unwrap().clone();
-    assert_eq!(body["filters"]["AND"][0]["user_id"], "u-4");
-}
-
-// ---------------------------------------------------------------------------
 // tool: mem0_search
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tool_search_passes_query_and_rerank() {
+async fn tool_search_builds_scoped_filter_and_caps_limit() {
     let captured = Captured::default();
     let app = Router::new()
         .route(
@@ -276,7 +252,7 @@ async fn tool_search_passes_query_and_rerank() {
             post(
                 |State(c): State<Captured>, Json(body): Json<Value>| async move {
                     c.bodies.lock().push(body.clone());
-                    Json(json!([{"memory": "x", "score": 0.5}]))
+                    Json(json!([{"id": "m1", "memory": "x", "score": 0.5}]))
                 },
             ),
         )
@@ -284,22 +260,35 @@ async fn tool_search_passes_query_and_rerank() {
     let server = spawn(app).await;
     let m = build(&base_url(&server));
 
-    let (tool, _) = m
-        .tools()
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_SEARCH)
-        .unwrap();
+    let tool = tool_by_name(&m, TOOL_SEARCH);
     let ctx = tool_context("u-5");
     let out = tool
-        .execute(json!({"query": "rust", "rerank": true, "top_k": 3}), &ctx)
+        .execute(
+            json!({
+                "query": "rust",
+                "limit": 3,
+                "scope": "session",
+                "categories": ["preference"],
+            }),
+            &ctx,
+        )
         .await
         .unwrap();
-    assert!(matches!(out, aura_tools::ToolOutput::Json(_)));
+    let v = expect_json(out);
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["results"][0]["id"], "m1");
+
     let body = captured.bodies.lock().last().unwrap().clone();
     assert_eq!(body["query"], "rust");
-    assert_eq!(body["rerank"], true);
     assert_eq!(body["top_k"], 3);
+    assert_eq!(body["rerank"], true);
+    assert_eq!(body["threshold"], 0.3);
     assert_eq!(body["filters"]["AND"][0]["user_id"], "u-5");
+    assert_eq!(body["filters"]["AND"][1]["run_id"], "test-session");
+    assert_eq!(
+        body["filters"]["AND"][2]["categories"]["in"][0],
+        "preference"
+    );
 }
 
 #[tokio::test]
@@ -308,53 +297,18 @@ async fn tool_search_rejects_missing_query() {
     let server = spawn(app).await;
     let m = build(&base_url(&server));
 
-    let (tool, _) = m
-        .tools()
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_SEARCH)
-        .unwrap();
+    let tool = tool_by_name(&m, TOOL_SEARCH);
     let ctx = tool_context("u-5");
     let err = tool.execute(json!({}), &ctx).await.unwrap_err();
     assert!(err.to_string().contains("query"), "got: {err}");
 }
 
-#[tokio::test]
-async fn tool_search_caps_top_k_at_fifty() {
-    let captured = Captured::default();
-    let app = Router::new()
-        .route(
-            "/v2/memories/search/",
-            post(
-                |State(c): State<Captured>, Json(body): Json<Value>| async move {
-                    c.bodies.lock().push(body.clone());
-                    Json(json!([]))
-                },
-            ),
-        )
-        .with_state(captured.clone());
-    let server = spawn(app).await;
-    let m = build(&base_url(&server));
-
-    let (tool, _) = m
-        .tools()
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_SEARCH)
-        .unwrap();
-    let ctx = tool_context("u-5");
-    let _ = tool
-        .execute(json!({"query": "x", "top_k": 9999}), &ctx)
-        .await
-        .unwrap();
-    let body = captured.bodies.lock().last().unwrap().clone();
-    assert_eq!(body["top_k"], 50);
-}
-
 // ---------------------------------------------------------------------------
-// tool: mem0_conclude
+// tool: mem0_add
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tool_conclude_posts_verbatim_with_infer_false() {
+async fn tool_add_stores_facts_verbatim_with_metadata_and_session_scope() {
     let captured = Captured::default();
     let app = Router::new()
         .route(
@@ -370,22 +324,304 @@ async fn tool_conclude_posts_verbatim_with_infer_false() {
     let server = spawn(app).await;
     let m = build(&base_url(&server));
 
-    let (tool, _) = m
-        .tools()
-        .into_iter()
-        .find(|(t, _)| t.name() == TOOL_CONCLUDE)
-        .unwrap();
+    let tool = tool_by_name(&m, TOOL_ADD);
     let ctx = tool_context("u-6");
     let _ = tool
-        .execute(json!({"conclusion": "user is left-handed"}), &ctx)
+        .execute(
+            json!({
+                "facts": ["fact a", "fact b"],
+                "category": "preference",
+                "importance": 0.8,
+                "longTerm": false,
+            }),
+            &ctx,
+        )
         .await
         .unwrap();
+
     let body = captured.bodies.lock().last().unwrap().clone();
     assert_eq!(body["infer"], false);
     assert_eq!(body["user_id"], "u-6");
     assert_eq!(body["agent_id"], "aura");
-    assert_eq!(body["messages"][0]["content"], "user is left-handed");
-    assert_eq!(body["messages"][0]["role"], "user");
+    assert_eq!(body["run_id"], "test-session");
+    assert_eq!(body["categories"][0], "preference");
+    assert_eq!(body["metadata"]["importance"], 0.8);
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "fact a");
+    assert_eq!(messages[1]["content"], "fact b");
+}
+
+#[tokio::test]
+async fn tool_add_rejects_empty_input() {
+    let app = Router::new();
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let tool = tool_by_name(&m, TOOL_ADD);
+    let ctx = tool_context("u-6");
+    let err = tool.execute(json!({}), &ctx).await.unwrap_err();
+    assert!(err.to_string().contains("facts"), "got: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// tool: mem0_get
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tool_get_fetches_by_id() {
+    // The tool calls GET /v1/memories/<id>/ — register the exact path.
+    let app = Router::new().route(
+        "/v1/memories/mem-123/",
+        get(|| async {
+            Json(json!({"id": "mem-123", "memory": "hello", "created_at": "2026-01-01"}))
+        }),
+    );
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let tool = tool_by_name(&m, TOOL_GET);
+    let ctx = tool_context("u-7");
+    let out = tool
+        .execute(json!({"memoryId": "mem-123"}), &ctx)
+        .await
+        .unwrap();
+    let v = expect_json(out);
+    assert_eq!(v["id"], "mem-123");
+    assert_eq!(v["memory"], "hello");
+    assert_eq!(v["created_at"], "2026-01-01");
+}
+
+#[tokio::test]
+async fn tool_get_rejects_missing_id() {
+    let app = Router::new();
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let tool = tool_by_name(&m, TOOL_GET);
+    let ctx = tool_context("u-7");
+    let err = tool.execute(json!({}), &ctx).await.unwrap_err();
+    assert!(err.to_string().contains("memoryId"), "got: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// tool: mem0_list
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tool_list_returns_all_memories() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v2/memories/",
+            post(
+                |State(c): State<Captured>,
+                 RawQuery(q): RawQuery,
+                 Json(body): Json<Value>| async move {
+                    c.bodies.lock().push(body);
+                    c.queries.lock().push(q.unwrap_or_default());
+                    Json(json!([
+                        {"id": "m1", "memory": "fact A"},
+                        {"id": "m2", "memory": "fact B"},
+                    ]))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let tool = tool_by_name(&m, TOOL_LIST);
+    let ctx = tool_context("u-8");
+    let out = tool.execute(json!({}), &ctx).await.unwrap();
+    let v = expect_json(out);
+    assert_eq!(v["count"], 2);
+    assert!(v["result"].as_str().unwrap().contains("fact A"));
+
+    let body = captured.bodies.lock().last().unwrap().clone();
+    assert_eq!(body["filters"]["AND"][0]["user_id"], "u-8");
+    let q = captured.queries.lock().last().unwrap().clone();
+    assert!(q.contains("page_size=100"), "query was: {q}");
+}
+
+// ---------------------------------------------------------------------------
+// tool: mem0_update
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tool_update_puts_new_text() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v1/memories/mem-1/",
+            put(
+                |State(c): State<Captured>, Json(body): Json<Value>| async move {
+                    c.bodies.lock().push(body);
+                    Json(json!({"message": "updated"}))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let tool = tool_by_name(&m, TOOL_UPDATE);
+    let ctx = tool_context("u-9");
+    let out = tool
+        .execute(json!({"memoryId": "mem-1", "text": "new text"}), &ctx)
+        .await
+        .unwrap();
+    let v = expect_json(out);
+    assert!(v["result"].as_str().unwrap().contains("Updated"));
+
+    let body = captured.bodies.lock().last().unwrap().clone();
+    assert_eq!(body["text"], "new text");
+}
+
+// ---------------------------------------------------------------------------
+// tool: mem0_delete
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tool_delete_by_id_hits_delete_endpoint() {
+    // 204 No Content exercises the empty-body → success path in `request`.
+    let app = Router::new().route(
+        "/v1/memories/mem-1/",
+        delete(|| async { StatusCode::NO_CONTENT }),
+    );
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let tool = tool_by_name(&m, TOOL_DELETE);
+    let ctx = tool_context("u-10");
+    let out = tool
+        .execute(json!({"memoryId": "mem-1"}), &ctx)
+        .await
+        .unwrap();
+    let v = expect_json(out);
+    assert!(v["result"].as_str().unwrap().contains("deleted"));
+}
+
+#[tokio::test]
+async fn tool_delete_all_requires_confirm() {
+    // No server: the confirm guard must short-circuit before any HTTP.
+    let app = Router::new();
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let tool = tool_by_name(&m, TOOL_DELETE);
+    let ctx = tool_context("u-10");
+    let out = tool.execute(json!({"all": true}), &ctx).await.unwrap();
+    match out {
+        aura_tools::ToolOutput::Error(e) => assert!(e.contains("confirm"), "got: {e}"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn tool_delete_all_with_confirm_scopes_to_user() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v1/memories/",
+            delete(
+                |State(c): State<Captured>, RawQuery(q): RawQuery| async move {
+                    c.queries.lock().push(q.unwrap_or_default());
+                    Json(json!({"message": "deleted"}))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let tool = tool_by_name(&m, TOOL_DELETE);
+    let ctx = tool_context("u-11");
+    let out = tool
+        .execute(json!({"all": true, "confirm": true}), &ctx)
+        .await
+        .unwrap();
+    let v = expect_json(out);
+    assert!(v["result"].as_str().unwrap().contains("u-11"));
+
+    let q = captured.queries.lock().last().unwrap().clone();
+    assert!(q.contains("user_id=u-11"), "query was: {q}");
+}
+
+#[tokio::test]
+async fn tool_delete_by_query_auto_deletes_single_hit() {
+    let app = Router::new()
+        .route(
+            "/v2/memories/search/",
+            post(|Json(_b): Json<Value>| async {
+                Json(json!([{"id": "mem-9", "memory": "the only match", "score": 0.4}]))
+            }),
+        )
+        .route(
+            "/v1/memories/mem-9/",
+            delete(|| async { StatusCode::NO_CONTENT }),
+        );
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let tool = tool_by_name(&m, TOOL_DELETE);
+    let ctx = tool_context("u-12");
+    let out = tool.execute(json!({"query": "match"}), &ctx).await.unwrap();
+    let v = expect_json(out);
+    assert!(v["result"].as_str().unwrap().contains("deleted"));
+}
+
+// ---------------------------------------------------------------------------
+// tools: mem0_event_list / mem0_event_status
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tool_event_list_returns_events() {
+    let app = Router::new().route(
+        "/v1/events/",
+        get(|| async {
+            Json(json!({"results": [
+                {"id": "e1", "event_type": "ADD", "status": "completed", "latency": 12.3, "created_at": "2026-01-01T00:00:00Z"}
+            ]}))
+        }),
+    );
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let tool = tool_by_name(&m, TOOL_EVENT_LIST);
+    let ctx = tool_context("u-13");
+    let out = tool.execute(json!({}), &ctx).await.unwrap();
+    let v = expect_json(out);
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["events"][0]["id"], "e1");
+    assert_eq!(v["events"][0]["status"], "completed");
+}
+
+#[tokio::test]
+async fn tool_event_status_returns_detail() {
+    let app = Router::new().route(
+        "/v1/event/ev-1/",
+        get(|| async {
+            Json(json!({
+                "id": "ev-1", "event_type": "ADD", "status": "completed", "latency": 5,
+                "results": [{"event": "ADD", "data": {"memory": "x"}}]
+            }))
+        }),
+    );
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    let tool = tool_by_name(&m, TOOL_EVENT_STATUS);
+    let ctx = tool_context("u-14");
+    let out = tool
+        .execute(json!({"event_id": "ev-1"}), &ctx)
+        .await
+        .unwrap();
+    let v = expect_json(out);
+    assert_eq!(v["status"], "completed");
+    assert_eq!(v["event_type"], "ADD");
+    assert_eq!(v["results"][0]["event"], "ADD");
 }
 
 // ---------------------------------------------------------------------------
@@ -427,9 +663,21 @@ async fn tools_each_carry_a_matching_manifest() {
     let m = build(&base_url(&server));
     let tools = m.tools();
     let names: Vec<String> = tools.iter().map(|(t, _)| t.name().to_string()).collect();
-    assert!(names.contains(&TOOL_PROFILE.to_string()));
-    assert!(names.contains(&TOOL_SEARCH.to_string()));
-    assert!(names.contains(&TOOL_CONCLUDE.to_string()));
+    for expected in [
+        TOOL_SEARCH,
+        TOOL_ADD,
+        TOOL_GET,
+        TOOL_LIST,
+        TOOL_UPDATE,
+        TOOL_DELETE,
+        TOOL_EVENT_LIST,
+        TOOL_EVENT_STATUS,
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "missing tool: {expected}"
+        );
+    }
     for (tool, manifest) in &tools {
         assert_eq!(tool.name(), manifest.name);
         assert!(!manifest.description.is_empty());

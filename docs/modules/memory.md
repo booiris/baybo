@@ -172,20 +172,36 @@ the typed config for future backends.
 
 ### `mem0` (`aura_memory::mem0`)
 
-Hosted SaaS via the Mem0 Platform REST API. Per-user scope comes from
-`MemoryContext::user_id()`; `agent_id` is hardcoded to `"aura"` (deployment
-identity). Multi-agent support is deferred and would extend `MemoryContext`
-with a per-call `agent_id` rather than a config knob.
+Hosted SaaS via the Mem0 Platform REST API. Per-user scope comes from the
+caller's `user_id` at every call; `agent_id` defaults to `"aura"` (deployment
+identity) on writes and is overridable per tool call. Tool reads accept an
+optional `scope: "session"` that narrows to the current session via Mem0's
+`run_id` (sourced from `ToolContext::session_id`).
 
 | Hook | Behaviour |
 | --- | --- |
-| `recall` | `POST /v2/memories/search` with `{query, filters: {AND: [{user_id}]}, rerank, top_k}`; returns the `memory` text verbatim. |
-| `on_job_complete` | `POST /v1/memories` with `{messages: [{user,assistant}], user_id, agent_id}`; the Mem0 server runs LLM-based fact extraction. |
+| `recall` | `POST /v2/memories/search/` with `{query, filters: {AND: [{user_id}]}, rerank, top_k}`; returns the `memory` text verbatim. |
+| `on_job_complete` | `POST /v1/memories/` with `{messages: [{user,assistant}], user_id, agent_id}`; the Mem0 server runs LLM-based fact extraction. |
 | `on_session_end` | No-op (Mem0 has no session concept; extraction is per-`add`). |
-| `tools()` | `mem0_profile`, `mem0_search`, `mem0_conclude`. |
+| `tools()` | Eight `mem0_*` tools — the model's explicit-signal path (see below). |
+
+The tool surface mirrors the Mem0 `openclaw` plugin (each `mem0_`-prefixed),
+mapped onto Mem0 REST endpoints. Unlike `on_job_complete`, `mem0_add` stores
+verbatim (`infer: false`) — the model already decided what is worth keeping.
+
+| Tool | Endpoint | Purpose |
+| --- | --- | --- |
+| `mem0_search` | `POST /v2/memories/search/` | Semantic search; optional `scope` / `categories` / advanced `filters`. |
+| `mem0_add` | `POST /v1/memories/` (`infer: false`) | Store fact(s) verbatim; `category` / `importance` / `metadata`; `longTerm: false` → session-scoped. |
+| `mem0_get` | `GET /v1/memories/{id}/` | Fetch one memory by id. |
+| `mem0_list` | `POST /v2/memories/` | List the user's memories (paginated). |
+| `mem0_update` | `PUT /v1/memories/{id}/` | Replace a memory's text in place. |
+| `mem0_delete` | `DELETE /v1/memories/{id}/` or `?user_id=` | Delete by id, search-and-delete by `query`, or `all: true` + `confirm: true`. |
+| `mem0_event_list` | `GET /v1/events/` | List recent background processing events. |
+| `mem0_event_status` | `GET /v1/event/{id}/` | Status / latency / results of one event. |
 
 Failure handling: 5-failure / 120 s circuit breaker shared by every API call
-(matches the hermes-agent reference implementation). Recall failures are
+(pauses API calls after sustained outages). Recall failures are
 swallowed and logged at `warn`. API key resolution: vault entry
 `user_env.<api_key_name>` (managed via `aura secret add <name>`) → process
 env `<api_key_name>`. `<name>` defaults to `MEM0_API_KEY` when

@@ -1,29 +1,45 @@
 //! Mem0 Platform memory backend.
 //!
 //! Hosted SaaS memory with server-side LLM fact extraction, semantic search,
-//! and reranking via the Mem0 REST API.
+//! and reranking via the Mem0 REST API. Two coexisting surfaces:
 //!
-//! - **`recall`**: `POST /v2/memories/search` with `{filters, rerank, top_k}`.
-//! - **`on_job_complete`**: `POST /v1/memories` with `{messages, user_id, agent_id}`.
+//! **Automatic hooks** (the core's recall / write path):
+//! - **`recall`**: `POST /v2/memories/search/` with `{filters, rerank, top_k}`.
+//! - **`on_job_complete`**: `POST /v1/memories/` with `{messages, user_id, agent_id}`.
 //! - **`on_session_end`**: no-op (Mem0 has no session concept; extraction is
 //!   immediate on `add`).
 //!
-//! Per-user scoping comes from `MemoryContext::user_id()` at every call;
-//! `agent_id` is hardcoded to `"aura"` (deployment identity) — multi-agent
-//! support would extend `MemoryContext` with a per-call `agent_id` rather
-//! than a config knob.
+//! **Tools** (the model's explicit-signal path) — the eight-tool surface ported
+//! from the Mem0 `openclaw` plugin, each `mem0_`-prefixed to namespace this
+//! backend and mapped onto a Mem0 REST endpoint:
+//!
+//! | Tool | Method + path |
+//! | --- | --- |
+//! | `mem0_search` | `POST /v2/memories/search/` |
+//! | `mem0_add` | `POST /v1/memories/` (`infer: false` — stored verbatim) |
+//! | `mem0_get` | `GET /v1/memories/{id}/` |
+//! | `mem0_list` | `POST /v2/memories/` (`?page&page_size`) |
+//! | `mem0_update` | `PUT /v1/memories/{id}/` |
+//! | `mem0_delete` | `DELETE /v1/memories/{id}/` or `DELETE /v1/memories/?user_id=` |
+//! | `mem0_event_list` | `GET /v1/events/` |
+//! | `mem0_event_status` | `GET /v1/event/{id}/` |
+//!
+//! Per-user scoping comes from the caller's `user_id` at every call; an optional
+//! `scope: "session"` narrows reads to the current session via Mem0's `run_id`
+//! (sourced from `ToolContext::session_id`). `agent_id` defaults to `"aura"`
+//! (deployment identity) on writes and is overridable per tool call.
 //!
 //! Failures are routed through a 5-failure / 120 s circuit breaker that pauses
-//! API calls after sustained outages (port from the Python `_record_failure` /
-//! `_breaker_open_until` logic).
+//! API calls after sustained outages.
 //!
 //! # References
 //!
 //! - Mem0 project: <https://github.com/mem0ai/mem0>
 //! - Mem0 Platform API docs: <https://docs.mem0.ai/api-reference>
-//! - Reference Python implementation (hermes-agent plugin, pinned):
-//!   <https://github.com/NousResearch/hermes-agent/blob/678a87c47753a98ab2320def830c7ae24cda4c0e/plugins/memory/mem0/__init__.py>
-//! - Original hermes-agent PR (Mem0 integration): <https://github.com/NousResearch/hermes-agent/pull/2933>
+//! - Tool surface + REST endpoint map ported from the Mem0 `openclaw` plugin's
+//!   `PlatformBackend` (`openclaw/backend/platform.ts`) and its per-tool
+//!   definitions (`openclaw/tools/*.ts`): `memory_search` / `add` / `get` /
+//!   `list` / `update` / `delete` / `event_list` / `event_status`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,10 +49,12 @@ use async_trait::async_trait;
 use aura_model::{ContentBlock, TrustLevel};
 use aura_security::http::ProxySettings;
 use aura_security::{SecretVault, USER_SECRET_PREFIX};
-use aura_tools::{Tool, ToolCapability, ToolContext, ToolEventSink, ToolManifest, ToolOutput};
+use aura_tools::{
+    Tool, ToolCapability, ToolContext, ToolError, ToolEventSink, ToolManifest, ToolOutput,
+};
 use aura_trace::ToolEventPayload;
 use parking_lot::Mutex;
-use reqwest::header;
+use reqwest::{Method, header};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
@@ -46,6 +64,9 @@ use crate::{Memory, MemoryContext, MemoryError, RecalledMemory, Result};
 const DEFAULT_BASE_URL: &str = "https://api.mem0.ai";
 const DEFAULT_AGENT_ID: &str = "aura";
 const DEFAULT_TOP_K: usize = 5;
+/// Default minimum similarity for `mem0_search` / search-and-delete. Mirrors
+/// the openclaw plugin's `searchThreshold` default.
+const DEFAULT_SEARCH_THRESHOLD: f64 = 0.3;
 /// Default per-request budget for tool calls (model is already waiting).
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Probe is best-effort and runs inline during `build_managers`; keep the
@@ -68,15 +89,29 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(600);
 const DEFAULT_API_KEY_NAME: &str = "MEM0_API_KEY";
 
 /// Tool names. Exposed as constants so the runtime / tests can reference them
-/// without literal-typo risk.
-pub const TOOL_PROFILE: &str = "mem0_profile";
+/// without literal-typo risk. The set mirrors the Mem0 `openclaw` plugin's
+/// eight-tool surface, `mem0_`-prefixed to namespace this backend.
 pub const TOOL_SEARCH: &str = "mem0_search";
-pub const TOOL_CONCLUDE: &str = "mem0_conclude";
+pub const TOOL_ADD: &str = "mem0_add";
+pub const TOOL_GET: &str = "mem0_get";
+pub const TOOL_LIST: &str = "mem0_list";
+pub const TOOL_UPDATE: &str = "mem0_update";
+pub const TOOL_DELETE: &str = "mem0_delete";
+pub const TOOL_EVENT_LIST: &str = "mem0_event_list";
+pub const TOOL_EVENT_STATUS: &str = "mem0_event_status";
 
 const BREAKER_THRESHOLD: u32 = 5;
 const BREAKER_COOLDOWN: Duration = Duration::from_secs(120);
 
-const MAX_PROFILE_ENTRIES: usize = 100;
+/// Page size for `mem0_list` (and the bulk fetch behind it). Mem0's list
+/// endpoint paginates; one page of 100 is plenty for an agent-facing dump.
+const MAX_LIST_ENTRIES: usize = 100;
+/// Search depth for `mem0_delete`'s search-and-delete path before it falls
+/// back to returning candidate ids for the model to disambiguate.
+const DELETE_SEARCH_TOP_K: usize = 5;
+/// A search-and-delete match this confident is deleted outright even when it
+/// is not the only hit (mirrors the openclaw plugin's 0.9 gate).
+const DELETE_AUTO_SCORE: f64 = 0.9;
 
 /// Per-backend config deserialized from `MemoryConfig.extra`. Unset fields
 /// elide from JSON via `skip_serializing_if`, so a freshly-written `extra`
@@ -210,42 +245,62 @@ impl Mem0Inner {
         format!("Token {}", self.api_key)
     }
 
-    /// Run one POST + emit observability:
+    /// Run one HTTP request + emit observability (same shape for every verb):
     /// - `tracing::debug!` with the request preview before the call.
     /// - `tracing::info!` with elapsed / status / response preview after.
     /// - When `events` is `Some` (the tool-call path), a `HttpFetch`
     ///   trace event lands on the surrounding `ToolCall` span so it
     ///   shows up in the trace UI alongside the tool's own activity.
-    async fn post_json(
+    ///
+    /// `body` is the JSON payload (`None` for GET / DELETE); `params` are query
+    /// pairs (Mem0's bulk delete keys the scope off the query string). A 2xx
+    /// with an empty body (e.g. `204 No Content` from DELETE) decodes to
+    /// [`Value::Null`] rather than erroring.
+    async fn request(
         &self,
+        method: Method,
         path: &str,
-        body: &Value,
+        body: Option<&Value>,
+        params: &[(&str, String)],
         timeout: Duration,
         events: Option<&Arc<dyn ToolEventSink>>,
     ) -> Result<Value> {
         let started = Instant::now();
-        let request_preview = preview_value(body);
+        let request_preview = body.map(preview_value).unwrap_or_default();
         debug!(
             backend = "mem0",
+            method = %method,
             path,
             request = %request_preview,
             "mem0 outbound request"
         );
 
-        let send_result = self
+        let mut url = match reqwest::Url::parse(&self.url(path)) {
+            Ok(u) => u,
+            Err(e) => return Err(MemoryError::Backend(format!("mem0 bad url {path}: {e}"))),
+        };
+        if !params.is_empty() {
+            let mut pairs = url.query_pairs_mut();
+            for (k, v) in params {
+                pairs.append_pair(k, v);
+            }
+        }
+        let mut req = self
             .client
-            .post(self.url(path))
+            .request(method.clone(), url)
             .header(header::AUTHORIZATION, self.auth_header())
-            .json(body)
-            .timeout(timeout)
-            .send()
-            .await;
-        let resp = match send_result {
+            .timeout(timeout);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+
+        let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 info!(
                     backend = "mem0",
+                    method = %method,
                     path,
                     elapsed_ms,
                     error = %e,
@@ -267,6 +322,7 @@ impl Mem0Inner {
 
         info!(
             backend = "mem0",
+            method = %method,
             path,
             status = %status,
             elapsed_ms,
@@ -292,8 +348,24 @@ impl Mem0Inner {
                 truncate(&body_text, HTTP_PREVIEW_BYTES)
             )));
         }
+        if body_text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
         serde_json::from_str::<Value>(&body_text)
             .map_err(|e| MemoryError::Backend(format!("mem0 response parse failed: {e}")))
+    }
+
+    /// POST a JSON body. Thin wrapper over [`Self::request`] for the
+    /// recall / write / probe paths that only ever POST.
+    async fn post_json(
+        &self,
+        path: &str,
+        body: &Value,
+        timeout: Duration,
+        events: Option<&Arc<dyn ToolEventSink>>,
+    ) -> Result<Value> {
+        self.request(Method::POST, path, Some(body), &[], timeout, events)
+            .await
     }
 }
 
@@ -389,8 +461,88 @@ fn concat_text(blocks: &[ContentBlock]) -> String {
     out
 }
 
+/// Build a Mem0 v2 filter object for the tool paths. Always wraps the
+/// conditions in `AND` (Mem0 accepts a single-element `AND`, and recall
+/// already relies on that shape). A caller-supplied `extra` that itself
+/// contains `AND` / `OR` is used verbatim; otherwise its top-level keys are
+/// folded in as additional conditions (mirrors the openclaw plugin's
+/// `_buildFilters`).
+fn build_filters(
+    user_id: &str,
+    agent_id: Option<&str>,
+    run_id: Option<&str>,
+    categories: Option<&[String]>,
+    extra: Option<&Value>,
+) -> Value {
+    if let Some(extra) = extra
+        && (extra.get("AND").is_some() || extra.get("OR").is_some())
+    {
+        return extra.clone();
+    }
+    let mut conds: Vec<Value> = vec![json!({"user_id": user_id})];
+    if let Some(agent_id) = agent_id {
+        conds.push(json!({"agent_id": agent_id}));
+    }
+    if let Some(run_id) = run_id {
+        conds.push(json!({"run_id": run_id}));
+    }
+    if let Some(cats) = categories.filter(|c| !c.is_empty()) {
+        conds.push(json!({"categories": {"in": cats}}));
+    }
+    if let Some(obj) = extra.and_then(|e| e.as_object()) {
+        for (k, v) in obj {
+            conds.push(json!({ k: v }));
+        }
+    }
+    json!({ "AND": conds })
+}
+
+/// The user-only filter the recall hot path uses (`{AND: [{user_id}]}`).
 fn read_filters(user_id: &str) -> Value {
-    json!({"AND": [{"user_id": user_id}]})
+    build_filters(user_id, None, None, None, None)
+}
+
+/// Resolve the optional `scope` param into a run-id filter. `"session"`
+/// narrows to the current session (Mem0 `run_id`); `"long-term"` / `"all"` /
+/// absent leave it unscoped — Mem0 returns the user's full set, which already
+/// includes session-scoped memories.
+fn scope_run_id<'a>(scope: Option<&str>, session_id: &'a str) -> Option<&'a str> {
+    match scope {
+        Some("session") => Some(session_id),
+        _ => None,
+    }
+}
+
+/// The user-facing user id for a tool call: an explicit `userId` param
+/// overrides the session's own user.
+fn caller_user_id<'a>(params: &'a Value, ctx: &'a ToolContext) -> &'a str {
+    params
+        .get("userId")
+        .and_then(|v| v.as_str())
+        .unwrap_or(ctx.user.id.as_str())
+}
+
+/// Flatten a Mem0 list/search response into its items, accepting a bare
+/// array or a `{results: [...]}` / `{memories: [...]}` wrapper.
+fn result_items(resp: &Value) -> Vec<Value> {
+    if let Some(arr) = resp.as_array() {
+        return arr.clone();
+    }
+    for key in ["results", "memories"] {
+        if let Some(arr) = resp.get(key).and_then(|v| v.as_array()) {
+            return arr.clone();
+        }
+    }
+    Vec::new()
+}
+
+/// The standard tool-output when the breaker is open: surfaced to the model
+/// as a recoverable error rather than a hard failure.
+fn breaker_unavailable() -> ToolOutput {
+    ToolOutput::Error(
+        "Mem0 API temporarily unavailable (circuit breaker tripped). Will retry automatically."
+            .into(),
+    )
 }
 
 #[async_trait]
@@ -478,28 +630,38 @@ impl Memory for Mem0Memory {
     }
 
     fn tools(&self) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
-        let inner = Arc::clone(&self.inner);
+        let inner = &self.inner;
         vec![
-            tool_pair(Arc::new(Mem0ProfileTool {
-                inner: Arc::clone(&inner),
-            })),
             tool_pair(Arc::new(Mem0SearchTool {
-                inner: Arc::clone(&inner),
+                inner: Arc::clone(inner),
             })),
-            tool_pair(Arc::new(Mem0ConcludeTool { inner })),
+            tool_pair(Arc::new(Mem0AddTool {
+                inner: Arc::clone(inner),
+            })),
+            tool_pair(Arc::new(Mem0GetTool {
+                inner: Arc::clone(inner),
+            })),
+            tool_pair(Arc::new(Mem0ListTool {
+                inner: Arc::clone(inner),
+            })),
+            tool_pair(Arc::new(Mem0UpdateTool {
+                inner: Arc::clone(inner),
+            })),
+            tool_pair(Arc::new(Mem0DeleteTool {
+                inner: Arc::clone(inner),
+            })),
+            tool_pair(Arc::new(Mem0EventListTool {
+                inner: Arc::clone(inner),
+            })),
+            tool_pair(Arc::new(Mem0EventStatusTool {
+                inner: Arc::clone(inner),
+            })),
         ]
     }
 }
 
 fn parse_search_results(resp: &Value) -> Vec<RecalledMemory> {
-    let items: &[Value] = if let Some(arr) = resp.as_array() {
-        arr
-    } else if let Some(arr) = resp.get("results").and_then(|v| v.as_array()) {
-        arr
-    } else {
-        return Vec::new();
-    };
-    items
+    result_items(resp)
         .iter()
         .filter_map(|item| {
             let text = item.get("memory").and_then(|v| v.as_str())?;
@@ -526,72 +688,10 @@ fn tool_pair(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
 }
 
 // ---------------------------------------------------------------------------
-// Tools — `mem0_profile`, `mem0_search`, `mem0_conclude`.
+// Tools — the eight-tool `mem0_*` surface (search / add / get / list /
+// update / delete / event_list / event_status), each mapped onto a Mem0
+// REST endpoint. Ported from the Mem0 `openclaw` plugin's `tools/*.ts`.
 // ---------------------------------------------------------------------------
-
-struct Mem0ProfileTool {
-    inner: Arc<Mem0Inner>,
-}
-
-#[async_trait]
-impl Tool for Mem0ProfileTool {
-    fn name(&self) -> &str {
-        TOOL_PROFILE
-    }
-
-    fn description(&self) -> String {
-        "Retrieve all stored memories about the user — preferences, facts, project context. \
-         Fast, no reranking. Use at conversation start."
-            .into()
-    }
-
-    fn parameters_schema(&self) -> Value {
-        json!({"type": "object", "properties": {}, "required": []})
-    }
-
-    async fn execute(&self, _params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
-        if self.inner.breaker_open() {
-            return Ok(ToolOutput::Error(
-                "Mem0 API temporarily unavailable (circuit breaker tripped). \
-                 Will retry automatically."
-                    .into(),
-            ));
-        }
-        let body = json!({
-            "filters": read_filters(ctx.user.id.as_str()),
-            "page": 1,
-            "page_size": MAX_PROFILE_ENTRIES,
-        });
-        match self
-            .inner
-            .post_json("/v2/memories/", &body, HTTP_TIMEOUT, Some(&ctx.events))
-            .await
-        {
-            Ok(resp) => {
-                self.inner.record_success();
-                let memories = parse_search_results(&resp);
-                if memories.is_empty() {
-                    Ok(ToolOutput::Json(
-                        json!({"result": "No memories stored yet."}),
-                    ))
-                } else {
-                    let lines: Vec<&str> = memories.iter().map(|m| m.content.as_str()).collect();
-                    let more = lines.len() == MAX_PROFILE_ENTRIES;
-                    Ok(ToolOutput::Json(json!({
-                        "result": lines.join("\n"),
-                        "count": lines.len(),
-                        "truncated": more,
-                        "hint": if more { "More available — use mem0_search to query." } else { "" },
-                    })))
-                }
-            }
-            Err(e) => {
-                self.inner.record_failure();
-                Ok(ToolOutput::Error(format!("mem0_profile failed: {e}")))
-            }
-        }
-    }
-}
 
 struct Mem0SearchTool {
     inner: Arc<Mem0Inner>,
@@ -604,8 +704,8 @@ impl Tool for Mem0SearchTool {
     }
 
     fn description(&self) -> String {
-        "Search memories by meaning. Returns relevant facts ranked by similarity. \
-         Set rerank=true for higher accuracy on important queries."
+        "Search long-term memories by meaning. Returns relevant facts ranked by similarity. \
+         Optionally scope to the current session, filter by category, or pass an advanced filter."
             .into()
     }
 
@@ -614,8 +714,12 @@ impl Tool for Mem0SearchTool {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "What to search for."},
-                "rerank": {"type": "boolean", "description": "Enable reranking for precision (default: false)."},
-                "top_k": {"type": "integer", "description": "Max results (default: 10, max: 50)."}
+                "limit": {"type": "integer", "description": "Max results (default: configured top_k, max 50)."},
+                "scope": {"type": "string", "enum": ["session", "long-term", "all"], "description": "\"all\" (default), \"session\" (current session only), or \"long-term\"."},
+                "categories": {"type": "array", "items": {"type": "string"}, "description": "Filter by category."},
+                "filters": {"type": "object", "description": "Advanced Mem0 filter object (AND/OR/operators)."},
+                "userId": {"type": "string", "description": "Override the user scope."},
+                "agentId": {"type": "string", "description": "Filter to a specific agent namespace."}
             },
             "required": ["query"]
         })
@@ -623,35 +727,45 @@ impl Tool for Mem0SearchTool {
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
         if self.inner.breaker_open() {
-            return Ok(ToolOutput::Error(
-                "Mem0 API temporarily unavailable (circuit breaker tripped).".into(),
-            ));
+            return Ok(breaker_unavailable());
         }
         let query = params
             .get("query")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| aura_tools::ToolError::InvalidParams("query is required".into()))?;
-        let rerank = params
-            .get("rerank")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let top_k = params
-            .get("top_k")
+            .ok_or_else(|| ToolError::InvalidParams("query is required".into()))?;
+        let limit = params
+            .get("limit")
             .and_then(|v| v.as_u64())
             .map(|n| n.min(50) as usize)
-            .unwrap_or(10);
-
+            .unwrap_or(self.inner.top_k);
+        let user_id = caller_user_id(&params, ctx);
+        let agent_id = params.get("agentId").and_then(|v| v.as_str());
+        let run_id = scope_run_id(
+            params.get("scope").and_then(|v| v.as_str()),
+            ctx.session_id.as_str(),
+        );
+        let categories: Option<Vec<String>> = params
+            .get("categories")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            });
         let body = json!({
             "query": query,
-            "filters": read_filters(ctx.user.id.as_str()),
-            "rerank": rerank,
-            "top_k": top_k,
+            "top_k": limit,
+            "threshold": DEFAULT_SEARCH_THRESHOLD,
+            "rerank": self.inner.rerank,
+            "filters": build_filters(user_id, agent_id, run_id, categories.as_deref(), params.get("filters")),
         });
         match self
             .inner
-            .post_json(
+            .request(
+                Method::POST,
                 "/v2/memories/search/",
-                &body,
+                Some(&body),
+                &[],
                 HTTP_TIMEOUT,
                 Some(&ctx.events),
             )
@@ -659,11 +773,7 @@ impl Tool for Mem0SearchTool {
         {
             Ok(resp) => {
                 self.inner.record_success();
-                let items: Vec<Value> = resp
-                    .as_array()
-                    .cloned()
-                    .or_else(|| resp.get("results").and_then(|v| v.as_array()).cloned())
-                    .unwrap_or_default();
+                let items = result_items(&resp);
                 if items.is_empty() {
                     return Ok(ToolOutput::Json(
                         json!({"result": "No relevant memories found."}),
@@ -673,6 +783,7 @@ impl Tool for Mem0SearchTool {
                     .iter()
                     .map(|m| {
                         json!({
+                            "id": m.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
                             "memory": m.get("memory").and_then(|v| v.as_str()).unwrap_or_default(),
                             "score": m.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0),
                         })
@@ -685,25 +796,26 @@ impl Tool for Mem0SearchTool {
             }
             Err(e) => {
                 self.inner.record_failure();
-                Ok(ToolOutput::Error(format!("mem0_search failed: {e}")))
+                Ok(ToolOutput::Error(format!("{TOOL_SEARCH} failed: {e}")))
             }
         }
     }
 }
 
-struct Mem0ConcludeTool {
+struct Mem0AddTool {
     inner: Arc<Mem0Inner>,
 }
 
 #[async_trait]
-impl Tool for Mem0ConcludeTool {
+impl Tool for Mem0AddTool {
     fn name(&self) -> &str {
-        TOOL_CONCLUDE
+        TOOL_ADD
     }
 
     fn description(&self) -> String {
-        "Store a durable fact about the user. Stored verbatim (no LLM extraction). \
-         Use for explicit preferences, corrections, or decisions."
+        "Store durable fact(s) about the user in long-term memory, verbatim (no server-side \
+         re-extraction). Pass `text` for one fact or `facts` for several sharing one `category`. \
+         Set longTerm=false to scope a fact to the current session."
             .into()
     }
 
@@ -711,48 +823,627 @@ impl Tool for Mem0ConcludeTool {
         json!({
             "type": "object",
             "properties": {
-                "conclusion": {"type": "string", "description": "The fact to store."}
+                "text": {"type": "string", "description": "A single fact to remember."},
+                "facts": {"type": "array", "items": {"type": "string"}, "description": "Several facts to store; all share one category."},
+                "category": {"type": "string", "description": "e.g. identity, preference, decision, rule, project, configuration, technical, relationship."},
+                "importance": {"type": "number", "description": "Importance 0.0–1.0 (stored as metadata)."},
+                "metadata": {"type": "object", "description": "Additional metadata to attach."},
+                "longTerm": {"type": "boolean", "description": "Long-term (default true). false → session-scoped."},
+                "userId": {"type": "string", "description": "Override the user scope."},
+                "agentId": {"type": "string", "description": "Agent namespace (default: aura)."}
             },
-            "required": ["conclusion"]
+            "required": []
         })
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
         if self.inner.breaker_open() {
-            return Ok(ToolOutput::Error(
-                "Mem0 API temporarily unavailable (circuit breaker tripped).".into(),
+            return Ok(breaker_unavailable());
+        }
+        let facts: Vec<String> = match params.get("facts").and_then(|v| v.as_array()) {
+            Some(arr) => arr
+                .iter()
+                .filter_map(|x| x.as_str())
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| vec![s.to_string()])
+                .unwrap_or_default(),
+        };
+        if facts.is_empty() {
+            return Err(ToolError::InvalidParams(
+                "provide `text` or a non-empty `facts` array".into(),
             ));
         }
-        let conclusion = params
-            .get("conclusion")
+        let user_id = caller_user_id(&params, ctx);
+        let agent_id = params
+            .get("agentId")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| aura_tools::ToolError::InvalidParams("conclusion is required".into()))?;
-        if conclusion.is_empty() {
-            return Err(aura_tools::ToolError::InvalidParams(
-                "conclusion cannot be empty".into(),
-            ));
-        }
-        let body = json!({
-            "messages": [{"role": "user", "content": conclusion}],
-            "user_id": ctx.user.id.as_str(),
-            "agent_id": DEFAULT_AGENT_ID,
+            .unwrap_or(DEFAULT_AGENT_ID);
+        let long_term = params
+            .get("longTerm")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let messages: Vec<Value> = facts
+            .iter()
+            .map(|f| json!({"role": "user", "content": f}))
+            .collect();
+        let mut body = json!({
+            "messages": messages,
+            "user_id": user_id,
+            "agent_id": agent_id,
             "infer": false,
         });
+        if !long_term {
+            body["run_id"] = json!(ctx.session_id.as_str());
+        }
+        if let Some(cat) = params.get("category").and_then(|v| v.as_str()) {
+            body["categories"] = json!([cat]);
+        }
+        let mut metadata = params
+            .get("metadata")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        if let Some(importance) = params.get("importance").and_then(|v| v.as_f64()) {
+            metadata.insert("importance".into(), json!(importance));
+        }
+        if !metadata.is_empty() {
+            body["metadata"] = Value::Object(metadata);
+        }
         match self
             .inner
-            .post_json("/v1/memories/", &body, HTTP_TIMEOUT, Some(&ctx.events))
+            .request(
+                Method::POST,
+                "/v1/memories/",
+                Some(&body),
+                &[],
+                HTTP_TIMEOUT,
+                Some(&ctx.events),
+            )
             .await
         {
             Ok(_) => {
                 self.inner.record_success();
-                Ok(ToolOutput::Json(json!({"result": "Fact stored."})))
+                Ok(ToolOutput::Json(json!({
+                    "result": format!("Stored {} fact(s).", facts.len()),
+                    "count": facts.len(),
+                })))
             }
             Err(e) => {
                 self.inner.record_failure();
-                Ok(ToolOutput::Error(format!("mem0_conclude failed: {e}")))
+                Ok(ToolOutput::Error(format!("{TOOL_ADD} failed: {e}")))
             }
         }
     }
+}
+
+struct Mem0GetTool {
+    inner: Arc<Mem0Inner>,
+}
+
+#[async_trait]
+impl Tool for Mem0GetTool {
+    fn name(&self) -> &str {
+        TOOL_GET
+    }
+
+    fn description(&self) -> String {
+        "Retrieve a specific memory by its ID.".into()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "memoryId": {"type": "string", "description": "The memory ID to retrieve."}
+            },
+            "required": ["memoryId"]
+        })
+    }
+
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+        if self.inner.breaker_open() {
+            return Ok(breaker_unavailable());
+        }
+        let memory_id = params
+            .get("memoryId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidParams("memoryId is required".into()))?;
+        let path = format!("/v1/memories/{memory_id}/");
+        match self
+            .inner
+            .request(
+                Method::GET,
+                &path,
+                None,
+                &[],
+                HTTP_TIMEOUT,
+                Some(&ctx.events),
+            )
+            .await
+        {
+            Ok(resp) => {
+                self.inner.record_success();
+                Ok(ToolOutput::Json(json!({
+                    "id": resp.get("id").and_then(|v| v.as_str()).unwrap_or(memory_id),
+                    "memory": resp.get("memory").and_then(|v| v.as_str()).unwrap_or_default(),
+                    "created_at": resp.get("created_at").cloned().unwrap_or(Value::Null),
+                    "updated_at": resp.get("updated_at").cloned().unwrap_or(Value::Null),
+                })))
+            }
+            Err(e) => {
+                self.inner.record_failure();
+                Ok(ToolOutput::Error(format!("{TOOL_GET} failed: {e}")))
+            }
+        }
+    }
+}
+
+struct Mem0ListTool {
+    inner: Arc<Mem0Inner>,
+}
+
+#[async_trait]
+impl Tool for Mem0ListTool {
+    fn name(&self) -> &str {
+        TOOL_LIST
+    }
+
+    fn description(&self) -> String {
+        "List stored memories for the user. Optional `scope` narrows to the current session.".into()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "scope": {"type": "string", "enum": ["session", "long-term", "all"], "description": "\"all\" (default), \"session\", or \"long-term\"."},
+                "userId": {"type": "string", "description": "Override the user scope."},
+                "agentId": {"type": "string", "description": "Filter to a specific agent namespace."}
+            },
+            "required": []
+        })
+    }
+
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+        if self.inner.breaker_open() {
+            return Ok(breaker_unavailable());
+        }
+        let user_id = caller_user_id(&params, ctx);
+        let agent_id = params.get("agentId").and_then(|v| v.as_str());
+        let run_id = scope_run_id(
+            params.get("scope").and_then(|v| v.as_str()),
+            ctx.session_id.as_str(),
+        );
+        let body = json!({"filters": build_filters(user_id, agent_id, run_id, None, None)});
+        let qp = [
+            ("page", "1".to_string()),
+            ("page_size", MAX_LIST_ENTRIES.to_string()),
+        ];
+        match self
+            .inner
+            .request(
+                Method::POST,
+                "/v2/memories/",
+                Some(&body),
+                &qp,
+                HTTP_TIMEOUT,
+                Some(&ctx.events),
+            )
+            .await
+        {
+            Ok(resp) => {
+                self.inner.record_success();
+                let items = result_items(&resp);
+                if items.is_empty() {
+                    return Ok(ToolOutput::Json(
+                        json!({"result": "No memories stored yet.", "count": 0}),
+                    ));
+                }
+                let lines: Vec<String> = items
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "{} (id: {})",
+                            m.get("memory").and_then(|v| v.as_str()).unwrap_or_default(),
+                            m.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                let truncated = lines.len() == MAX_LIST_ENTRIES;
+                Ok(ToolOutput::Json(json!({
+                    "result": lines.join("\n"),
+                    "count": lines.len(),
+                    "truncated": truncated,
+                })))
+            }
+            Err(e) => {
+                self.inner.record_failure();
+                Ok(ToolOutput::Error(format!("{TOOL_LIST} failed: {e}")))
+            }
+        }
+    }
+}
+
+struct Mem0UpdateTool {
+    inner: Arc<Mem0Inner>,
+}
+
+#[async_trait]
+impl Tool for Mem0UpdateTool {
+    fn name(&self) -> &str {
+        TOOL_UPDATE
+    }
+
+    fn description(&self) -> String {
+        "Update an existing memory's text in place. Atomic and preserves history.".into()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "memoryId": {"type": "string", "description": "The memory ID to update."},
+                "text": {"type": "string", "description": "The new text (replaces old)."}
+            },
+            "required": ["memoryId", "text"]
+        })
+    }
+
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+        if self.inner.breaker_open() {
+            return Ok(breaker_unavailable());
+        }
+        let memory_id = params
+            .get("memoryId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidParams("memoryId is required".into()))?;
+        let text = params
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidParams("text is required".into()))?;
+        if text.is_empty() {
+            return Err(ToolError::InvalidParams("text cannot be empty".into()));
+        }
+        let path = format!("/v1/memories/{memory_id}/");
+        let body = json!({"text": text});
+        match self
+            .inner
+            .request(
+                Method::PUT,
+                &path,
+                Some(&body),
+                &[],
+                HTTP_TIMEOUT,
+                Some(&ctx.events),
+            )
+            .await
+        {
+            Ok(_) => {
+                self.inner.record_success();
+                Ok(ToolOutput::Json(json!({
+                    "result": format!("Updated memory {memory_id}."),
+                })))
+            }
+            Err(e) => {
+                self.inner.record_failure();
+                Ok(ToolOutput::Error(format!("{TOOL_UPDATE} failed: {e}")))
+            }
+        }
+    }
+}
+
+struct Mem0DeleteTool {
+    inner: Arc<Mem0Inner>,
+}
+
+impl Mem0DeleteTool {
+    async fn delete_by_id(&self, memory_id: &str, ctx: &ToolContext) -> ToolOutput {
+        let path = format!("/v1/memories/{memory_id}/");
+        match self
+            .inner
+            .request(
+                Method::DELETE,
+                &path,
+                None,
+                &[],
+                HTTP_TIMEOUT,
+                Some(&ctx.events),
+            )
+            .await
+        {
+            Ok(_) => {
+                self.inner.record_success();
+                ToolOutput::Json(json!({"result": format!("Memory {memory_id} deleted.")}))
+            }
+            Err(e) => {
+                self.inner.record_failure();
+                ToolOutput::Error(format!("{TOOL_DELETE} failed: {e}"))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for Mem0DeleteTool {
+    fn name(&self) -> &str {
+        TOOL_DELETE
+    }
+
+    fn description(&self) -> String {
+        "Delete memories. Provide `memoryId`, a `query` to search-and-delete, or `all: true` \
+         (requires `confirm: true`) to wipe the user's memories."
+            .into()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "memoryId": {"type": "string", "description": "Specific memory ID to delete."},
+                "query": {"type": "string", "description": "Search query to find and delete a memory."},
+                "all": {"type": "boolean", "description": "Delete ALL of the user's memories. Requires confirm: true."},
+                "confirm": {"type": "boolean", "description": "Safety gate for bulk deletion."},
+                "userId": {"type": "string", "description": "Override the user scope."},
+                "agentId": {"type": "string", "description": "Agent namespace scope."}
+            },
+            "required": []
+        })
+    }
+
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+        if self.inner.breaker_open() {
+            return Ok(breaker_unavailable());
+        }
+        let user_id = caller_user_id(&params, ctx);
+        let agent_id = params.get("agentId").and_then(|v| v.as_str());
+
+        if let Some(memory_id) = params.get("memoryId").and_then(|v| v.as_str()) {
+            return Ok(self.delete_by_id(memory_id, ctx).await);
+        }
+
+        if let Some(query) = params.get("query").and_then(|v| v.as_str()) {
+            let body = json!({
+                "query": query,
+                "top_k": DELETE_SEARCH_TOP_K,
+                "threshold": DEFAULT_SEARCH_THRESHOLD,
+                "filters": build_filters(user_id, agent_id, None, None, None),
+            });
+            let resp = match self
+                .inner
+                .request(
+                    Method::POST,
+                    "/v2/memories/search/",
+                    Some(&body),
+                    &[],
+                    HTTP_TIMEOUT,
+                    Some(&ctx.events),
+                )
+                .await
+            {
+                Ok(r) => {
+                    self.inner.record_success();
+                    r
+                }
+                Err(e) => {
+                    self.inner.record_failure();
+                    return Ok(ToolOutput::Error(format!("{TOOL_DELETE} failed: {e}")));
+                }
+            };
+            let items = result_items(&resp);
+            if items.is_empty() {
+                return Ok(ToolOutput::Json(
+                    json!({"result": "No matching memories found."}),
+                ));
+            }
+            let top = &items[0];
+            let top_score = top.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if items.len() == 1 || top_score > DELETE_AUTO_SCORE {
+                let id = top.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                if id.is_empty() {
+                    return Ok(ToolOutput::Error("matched memory has no id".into()));
+                }
+                return Ok(self.delete_by_id(id, ctx).await);
+            }
+            let candidates: Vec<Value> = items
+                .iter()
+                .map(|m| {
+                    json!({
+                        "id": m.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "memory": m.get("memory").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "score": m.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    })
+                })
+                .collect();
+            return Ok(ToolOutput::Json(json!({
+                "result": format!("Found {} candidates; pass memoryId to delete one.", candidates.len()),
+                "candidates": candidates,
+            })));
+        }
+
+        if params.get("all").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if !params
+                .get("confirm")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                return Ok(ToolOutput::Error(
+                    "Bulk deletion requires confirm: true.".into(),
+                ));
+            }
+            let mut qp = vec![("user_id", user_id.to_string())];
+            if let Some(agent_id) = agent_id {
+                qp.push(("agent_id", agent_id.to_string()));
+            }
+            return match self
+                .inner
+                .request(
+                    Method::DELETE,
+                    "/v1/memories/",
+                    None,
+                    &qp,
+                    HTTP_TIMEOUT,
+                    Some(&ctx.events),
+                )
+                .await
+            {
+                Ok(_) => {
+                    self.inner.record_success();
+                    Ok(ToolOutput::Json(json!({
+                        "result": format!("All memories deleted for user \"{user_id}\"."),
+                    })))
+                }
+                Err(e) => {
+                    self.inner.record_failure();
+                    Ok(ToolOutput::Error(format!("{TOOL_DELETE} failed: {e}")))
+                }
+            };
+        }
+
+        Err(ToolError::InvalidParams(
+            "provide memoryId, query, or all: true".into(),
+        ))
+    }
+}
+
+struct Mem0EventListTool {
+    inner: Arc<Mem0Inner>,
+}
+
+#[async_trait]
+impl Tool for Mem0EventListTool {
+    fn name(&self) -> &str {
+        TOOL_EVENT_LIST
+    }
+
+    fn description(&self) -> String {
+        "List recent background processing events from the Mem0 Platform. Use to check whether \
+         memory add / update / delete operations were processed successfully."
+            .into()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({"type": "object", "properties": {}, "required": []})
+    }
+
+    async fn execute(&self, _params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+        if self.inner.breaker_open() {
+            return Ok(breaker_unavailable());
+        }
+        match self
+            .inner
+            .request(
+                Method::GET,
+                "/v1/events/",
+                None,
+                &[],
+                HTTP_TIMEOUT,
+                Some(&ctx.events),
+            )
+            .await
+        {
+            Ok(resp) => {
+                self.inner.record_success();
+                let items = result_items(&resp);
+                if items.is_empty() {
+                    return Ok(ToolOutput::Json(
+                        json!({"result": "No events found.", "count": 0}),
+                    ));
+                }
+                let events: Vec<Value> = items.iter().map(format_event).collect();
+                Ok(ToolOutput::Json(json!({
+                    "count": events.len(),
+                    "events": events,
+                })))
+            }
+            Err(e) => {
+                self.inner.record_failure();
+                Ok(ToolOutput::Error(format!("{TOOL_EVENT_LIST} failed: {e}")))
+            }
+        }
+    }
+}
+
+struct Mem0EventStatusTool {
+    inner: Arc<Mem0Inner>,
+}
+
+#[async_trait]
+impl Tool for Mem0EventStatusTool {
+    fn name(&self) -> &str {
+        TOOL_EVENT_STATUS
+    }
+
+    fn description(&self) -> String {
+        "Get detailed status of a specific Mem0 background event — whether the add / update / \
+         delete was processed, its latency, and its results."
+            .into()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string", "description": "The event ID to check."}
+            },
+            "required": ["event_id"]
+        })
+    }
+
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+        if self.inner.breaker_open() {
+            return Ok(breaker_unavailable());
+        }
+        let event_id = params
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidParams("event_id is required".into()))?;
+        let path = format!("/v1/event/{event_id}/");
+        match self
+            .inner
+            .request(
+                Method::GET,
+                &path,
+                None,
+                &[],
+                HTTP_TIMEOUT,
+                Some(&ctx.events),
+            )
+            .await
+        {
+            Ok(resp) => {
+                self.inner.record_success();
+                let mut out = format_event(&resp);
+                if let Some(results) = resp.get("results") {
+                    out["results"] = results.clone();
+                }
+                Ok(ToolOutput::Json(out))
+            }
+            Err(e) => {
+                self.inner.record_failure();
+                Ok(ToolOutput::Error(format!(
+                    "{TOOL_EVENT_STATUS} failed: {e}"
+                )))
+            }
+        }
+    }
+}
+
+/// Project a Mem0 event object into the compact shape both event tools surface.
+fn format_event(ev: &Value) -> Value {
+    json!({
+        "id": ev.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+        "event_type": ev.get("event_type").and_then(|v| v.as_str()).unwrap_or_default(),
+        "status": ev.get("status").and_then(|v| v.as_str()).unwrap_or_default(),
+        "latency": ev.get("latency").cloned().unwrap_or(Value::Null),
+        "created_at": ev.get("created_at").cloned().unwrap_or(Value::Null),
+        "updated_at": ev.get("updated_at").cloned().unwrap_or(Value::Null),
+    })
 }
 
 /// Parse `MemoryConfig.extra` into a typed [`Mem0Config`]. Surfaces a clear
@@ -865,6 +1556,36 @@ mod tests {
 
         let empty = json!({});
         assert!(parse_search_results(&empty).is_empty());
+    }
+
+    #[test]
+    fn build_filters_wraps_user_and_optional_scopes() {
+        let f = build_filters("u-1", None, None, None, None);
+        assert_eq!(f["AND"][0]["user_id"], "u-1");
+
+        let scoped = build_filters("u-1", Some("a-1"), Some("s-1"), None, None);
+        assert_eq!(scoped["AND"][0]["user_id"], "u-1");
+        assert_eq!(scoped["AND"][1]["agent_id"], "a-1");
+        assert_eq!(scoped["AND"][2]["run_id"], "s-1");
+
+        let cats = vec!["identity".to_string()];
+        let with_cats = build_filters("u-1", None, None, Some(&cats), None);
+        assert_eq!(with_cats["AND"][1]["categories"]["in"][0], "identity");
+    }
+
+    #[test]
+    fn build_filters_passes_through_prebuilt_and_or() {
+        let prebuilt = json!({"OR": [{"user_id": "a"}, {"user_id": "b"}]});
+        let f = build_filters("ignored", None, None, None, Some(&prebuilt));
+        assert_eq!(f, prebuilt);
+    }
+
+    #[test]
+    fn scope_run_id_only_for_session() {
+        assert_eq!(scope_run_id(Some("session"), "s-1"), Some("s-1"));
+        assert_eq!(scope_run_id(Some("long-term"), "s-1"), None);
+        assert_eq!(scope_run_id(Some("all"), "s-1"), None);
+        assert_eq!(scope_run_id(None, "s-1"), None);
     }
 
     #[test]
