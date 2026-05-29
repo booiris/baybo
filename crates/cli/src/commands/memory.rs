@@ -12,7 +12,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use aura_config::{AuraConfig, MemoryProvider};
-use aura_memory::{mem0, openviking};
+use aura_memory::backends::{mem0, openviking};
 use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
 use serde_json::{Value, json};
 

@@ -1,11 +1,11 @@
-//! End-to-end tests for `aura_memory::openviking` against an axum mock server.
+//! End-to-end tests for `aura_memory::backends::openviking` against an axum mock server.
 
 mod common;
 
 use std::sync::Arc;
 
 use aura_memory::Memory;
-use aura_memory::openviking::{
+use aura_memory::backends::openviking::{
     OpenVikingConfig, OpenVikingMemory, TOOL_ADD_RESOURCE, TOOL_BROWSE, TOOL_READ, TOOL_REMEMBER,
     TOOL_SEARCH,
 };

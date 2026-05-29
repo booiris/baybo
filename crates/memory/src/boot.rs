@@ -11,7 +11,8 @@ use aura_config::{AuraConfig, MemoryProvider};
 use aura_security::SecretVault;
 use aura_security::http::ProxySettings;
 
-use crate::{Memory, mem0, openviking};
+use crate::Memory;
+use crate::backends::{mem0, openviking};
 
 /// Build the pluggable memory backend selected by
 /// `config.memory.provider`, run its startup probe, and return the

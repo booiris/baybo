@@ -1,4 +1,4 @@
-//! End-to-end tests for `aura_memory::mem0` against an axum mock server.
+//! End-to-end tests for `aura_memory::backends::mem0` against an axum mock server.
 //!
 //! Each test spins up a tiny `axum::Router` that asserts the inbound request
 //! shape (path, auth header, body) and returns a canned JSON response, then
@@ -8,7 +8,9 @@ mod common;
 
 use std::sync::Arc;
 
-use aura_memory::mem0::{Mem0Config, Mem0Memory, TOOL_CONCLUDE, TOOL_PROFILE, TOOL_SEARCH};
+use aura_memory::backends::mem0::{
+    Mem0Config, Mem0Memory, TOOL_CONCLUDE, TOOL_PROFILE, TOOL_SEARCH,
+};
 use aura_memory::{Memory, RecalledMemory};
 use aura_model::ContentBlock;
 use aura_trace::StepKind;
