@@ -170,24 +170,46 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
     new_config.memory.provider = provider;
     new_config.memory.enabled = provider != MemoryProvider::Noop;
 
-    // Minimal-prompts wizard: ask only what's load-bearing for first-time
-    // setup. Power users can edit `aura.json` directly for the rest of the
-    // typed config; the actual API-key value is now delegated to
-    // `aura secret add <name>` (no separate set-key subcommand).
+    // Detailed wizard: walk every typed field with the existing value as
+    // the bracketed default, so the operator can blow through with Enter
+    // to accept or type to override. The API-key *value* still rides on
+    // `aura secret add <NAME>` — only the *name* is asked here.
+    //
+    // For every field, an empty input reverts to `None`, which lets the
+    // typed default kick in and keeps `extra` JSON tidy (see the
+    // `skip_serializing_if` contract on each config struct).
     let mut secret_hint: Option<String> = None;
     match provider {
         MemoryProvider::Noop => {
             new_config.memory.extra = Value::Null;
         }
         MemoryProvider::Mem0 => {
-            let cfg = mem0::parse_extra(&new_config.memory.extra).unwrap_or_default();
-            let name = cfg
-                .api_key_name
-                .clone()
-                .unwrap_or_else(|| "MEM0_API_KEY".into());
+            let mut cfg = mem0::parse_extra(&new_config.memory.extra).unwrap_or_default();
+
+            let name = prompt_optional(
+                "API key secret name",
+                "MEM0_API_KEY",
+                cfg.api_key_name.as_deref(),
+            )?;
+            cfg.api_key_name = name.clone();
+            let key_name = name.unwrap_or_else(|| "MEM0_API_KEY".into());
+
+            cfg.base_url = prompt_optional(
+                "base_url (blank for https://api.mem0.ai)",
+                "",
+                cfg.base_url.as_deref(),
+            )?;
+
+            cfg.rerank = prompt_bool(
+                "rerank — Mem0-side reranking (more accurate, slower)",
+                cfg.rerank.unwrap_or(true),
+            )?;
+
+            cfg.top_k = prompt_usize("top_k — max memories per recall", cfg.top_k.unwrap_or(5))?;
+
             new_config.memory.extra = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Config(format!("serialise mem0 extra: {e}")))?;
-            secret_hint = Some(api_key_setup_hint(ctx, &name).await);
+            secret_hint = Some(api_key_setup_hint(ctx, &key_name).await);
         }
         MemoryProvider::OpenViking => {
             // The crate-internal default; matches OpenVikingConfig's None
@@ -195,6 +217,7 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
             // field as `None` so `extra` stays empty.
             const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:1933";
             let mut cfg = openviking::parse_extra(&new_config.memory.extra).unwrap_or_default();
+
             let default_endpoint = cfg
                 .endpoint
                 .clone()
@@ -205,17 +228,30 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
             } else {
                 Some(endpoint.clone())
             };
-            let name = cfg
-                .api_key_name
-                .clone()
-                .unwrap_or_else(|| "OPENVIKING_API_KEY".into());
+
+            let name = prompt_optional(
+                "API key secret name (blank to skip — local dev runs unauthenticated)",
+                "OPENVIKING_API_KEY",
+                cfg.api_key_name.as_deref(),
+            )?;
+            cfg.api_key_name = name.clone();
+            let key_name = name.unwrap_or_else(|| "OPENVIKING_API_KEY".into());
+
+            cfg.account = prompt_optional(
+                "X-OpenViking-Account header (tenant identity)",
+                "default",
+                cfg.account.as_deref(),
+            )?;
+
+            cfg.top_k = prompt_usize("top_k — max memories per recall", cfg.top_k.unwrap_or(5))?;
+
             new_config.memory.extra = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Config(format!("serialise openviking extra: {e}")))?;
 
             // Local dev (loopback) runs unauthenticated — skip the hint.
             // Remote endpoints warrant the secret.
             if !is_loopback_endpoint(&endpoint) {
-                secret_hint = Some(api_key_setup_hint(ctx, &name).await);
+                secret_hint = Some(api_key_setup_hint(ctx, &key_name).await);
             }
         }
     }
@@ -353,6 +389,66 @@ async fn disable(ctx: &CommandContext) -> Result<CommandOutput> {
         ),
         data: Some(json!({"enabled": false, "provider": "noop", "requires_restart": true})),
     })
+}
+
+// ---------------------------------------------------------------------------
+// prompt helpers for the detailed setup wizard
+// ---------------------------------------------------------------------------
+
+/// Prompt for an optional `String` field. The bracketed default is the
+/// **current** value if one is set, otherwise `default_when_unset`. An empty
+/// input returns `None` so the typed default kicks in and the field elides
+/// from JSON (`skip_serializing_if`).
+fn prompt_optional(
+    label: &str,
+    default_when_unset: &str,
+    current: Option<&str>,
+) -> Result<Option<String>> {
+    let shown = current.unwrap_or(default_when_unset);
+    let v = prompt_with_default(label, shown)?;
+    if v.is_empty() || v == default_when_unset {
+        Ok(None)
+    } else {
+        Ok(Some(v))
+    }
+}
+
+/// Prompt for an `Option<bool>`. Empty input keeps the typed default
+/// (returns `None`); `true`/`false` (or `yes`/`no` / `y`/`n` / `1`/`0`) is
+/// stored only when it differs from `default_when_unset`.
+fn prompt_bool(label: &str, default_when_unset: bool) -> Result<Option<bool>> {
+    let shown = if default_when_unset { "true" } else { "false" };
+    let v = prompt_with_default(&format!("{label} [true/false]"), shown)?;
+    let parsed = match v.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "y" | "1" => true,
+        "false" | "no" | "n" | "0" => false,
+        other => {
+            return Err(CliError::Config(format!(
+                "unrecognised boolean {other:?} (expected true/false)"
+            )));
+        }
+    };
+    if parsed == default_when_unset {
+        Ok(None)
+    } else {
+        Ok(Some(parsed))
+    }
+}
+
+/// Prompt for an `Option<usize>`. Empty input keeps the typed default
+/// (returns `None`); a parsed value is stored only when it differs from
+/// `default_when_unset`.
+fn prompt_usize(label: &str, default_when_unset: usize) -> Result<Option<usize>> {
+    let shown = default_when_unset.to_string();
+    let v = prompt_with_default(label, &shown)?;
+    let parsed: usize = v
+        .parse()
+        .map_err(|_| CliError::Config(format!("invalid integer {v:?}")))?;
+    if parsed == default_when_unset {
+        Ok(None)
+    } else {
+        Ok(Some(parsed))
+    }
 }
 
 // ---------------------------------------------------------------------------
