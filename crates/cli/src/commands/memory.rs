@@ -15,7 +15,7 @@ use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
 use serde_json::{Value, json};
 
 use crate::cli::MemoryCmd;
-use crate::commands::prompt::{confirm, prompt_with_default};
+use crate::commands::prompt::prompt_with_default;
 use crate::commands::secret_input::read_masked_password;
 use crate::commands::select::select_one;
 use crate::context::CommandContext;
@@ -170,100 +170,50 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
     new_config.memory.provider = provider;
     new_config.memory.enabled = provider != MemoryProvider::Noop;
 
+    // Minimal-prompts wizard: ask only what's load-bearing for first-time
+    // setup. Power users can edit `aura.json` directly for agent_id /
+    // rerank / top_k / base_url / api_key_env — the typed structs and
+    // their defaults already cover those.
     match provider {
         MemoryProvider::Noop => {
             new_config.memory.extra = Value::Null;
         }
         MemoryProvider::Mem0 => {
-            let mut cfg = mem0::parse_extra(&new_config.memory.extra).unwrap_or_default();
-            let agent_id =
-                prompt_with_default("agent_id", cfg.agent_id.as_deref().unwrap_or("aura"))?;
-            cfg.agent_id = if agent_id == "aura" {
-                None
-            } else {
-                Some(agent_id)
-            };
-
-            let rerank = prompt_with_default(
-                "rerank [true/false]",
-                if cfg.rerank.unwrap_or(true) {
-                    "true"
-                } else {
-                    "false"
-                },
-            )?;
-            cfg.rerank = Some(matches!(rerank.as_str(), "true" | "yes" | "y" | "1"));
-
-            let top_k_in = prompt_with_default("top_k", "5")?;
-            cfg.top_k = top_k_in.parse::<usize>().ok();
-
-            let base_url_in = prompt_with_default(
-                "base_url (leave blank for default https://api.mem0.ai)",
-                cfg.base_url.as_deref().unwrap_or(""),
-            )?;
-            cfg.base_url = if base_url_in.is_empty() {
-                None
-            } else {
-                Some(base_url_in)
-            };
-
-            let api_key_env_in = prompt_with_default(
-                "api_key_env (env var name; blank → use vault / MEM0_API_KEY)",
-                cfg.api_key_env.as_deref().unwrap_or(""),
-            )?;
-            cfg.api_key_env = if api_key_env_in.is_empty() {
-                None
-            } else {
-                Some(api_key_env_in)
-            };
-
+            // Mem0 is a hosted SaaS, the API key is the only thing the
+            // wizard can't default. Always vault it (the api_key_env path
+            // is a power-user override; not in the wizard).
+            let cfg = mem0::parse_extra(&new_config.memory.extra).unwrap_or_default();
             new_config.memory.extra = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Config(format!("serialise mem0 extra: {e}")))?;
-
-            if cfg.api_key_env.is_none()
-                && confirm("Store API key in vault now (memory.mem0.api_key)?")?
-            {
-                store_vault_key(ctx, "memory.mem0.api_key", "Mem0 API key").await?;
-            }
+            store_vault_key(
+                ctx,
+                "memory.mem0.api_key",
+                "Mem0 API key (stored in vault as memory.mem0.api_key)",
+            )
+            .await?;
         }
         MemoryProvider::OpenViking => {
             let mut cfg = openviking::parse_extra(&new_config.memory.extra).unwrap_or_default();
-            let endpoint = prompt_with_default(
-                "endpoint",
-                cfg.endpoint.as_deref().unwrap_or("http://127.0.0.1:1933"),
-            )?;
-            cfg.endpoint = Some(endpoint);
-
-            let account =
-                prompt_with_default("account", cfg.account.as_deref().unwrap_or("default"))?;
-            cfg.account = Some(account);
-
-            let agent = prompt_with_default("agent", cfg.agent.as_deref().unwrap_or("aura"))?;
-            cfg.agent = Some(agent);
-
-            let top_k_in = prompt_with_default("top_k", "5")?;
-            cfg.top_k = top_k_in.parse::<usize>().ok();
-
-            let api_key_env_in = prompt_with_default(
-                "api_key_env (env var name; blank → use vault / OPENVIKING_API_KEY)",
-                cfg.api_key_env.as_deref().unwrap_or(""),
-            )?;
-            cfg.api_key_env = if api_key_env_in.is_empty() {
-                None
-            } else {
-                Some(api_key_env_in)
-            };
+            let default_endpoint = cfg
+                .endpoint
+                .clone()
+                .unwrap_or_else(|| "http://127.0.0.1:1933".into());
+            let endpoint = prompt_with_default("Endpoint", &default_endpoint)?;
+            cfg.endpoint = Some(endpoint.clone());
 
             new_config.memory.extra = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Config(format!("serialise openviking extra: {e}")))?;
 
-            if cfg.api_key_env.is_none()
-                && confirm(
-                    "Store API key in vault now (memory.openviking.api_key)? \
-                          (leave blank below if running local dev mode without auth)",
-                )?
-            {
-                store_vault_key(ctx, "memory.openviking.api_key", "OpenViking API key").await?;
+            // Local dev (loopback) runs unauthenticated — skip the API
+            // key prompt. Any remote endpoint warrants one (empty input
+            // still skips the vault write, see store_vault_key).
+            if !is_loopback_endpoint(&endpoint) {
+                store_vault_key(
+                    ctx,
+                    "memory.openviking.api_key",
+                    "OpenViking API key (blank to skip; stored in vault as memory.openviking.api_key)",
+                )
+                .await?;
             }
         }
     }
@@ -374,6 +324,25 @@ async fn set_key(ctx: &CommandContext) -> Result<CommandOutput> {
     })
 }
 
+/// Hostname / IP-literal heuristic for "this OpenViking server is running
+/// on the local box" — used to skip the API-key prompt during `setup`,
+/// since the bundled local-dev mode is unauthenticated.
+fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(endpoint) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host_lc = host.to_ascii_lowercase();
+    matches!(
+        host_lc.as_str(),
+        "localhost" | "localhost.localdomain" | "127.0.0.1" | "::1"
+    ) || host_lc.ends_with(".localhost")
+        || host_lc.starts_with("127.")
+}
+
 // ---------------------------------------------------------------------------
 // disable
 // ---------------------------------------------------------------------------
@@ -444,5 +413,27 @@ mod tests {
         let sanitized = sanitize_extra(&extra);
         assert_eq!(sanitized["api_key"], "***");
         assert_eq!(sanitized["agent_id"], "test");
+    }
+
+    #[test]
+    fn is_loopback_endpoint_matches_common_local_hosts() {
+        for ep in [
+            "http://localhost:1933",
+            "https://localhost",
+            "http://127.0.0.1:1933",
+            "http://127.5.6.7/",
+            "http://[::1]:1933",
+            "http://my.localhost:8080",
+        ] {
+            assert!(is_loopback_endpoint(ep), "should match: {ep}");
+        }
+        for ep in [
+            "https://api.mem0.ai",
+            "http://10.0.0.5:1933",
+            "http://example.com",
+            "not-a-url",
+        ] {
+            assert!(!is_loopback_endpoint(ep), "should not match: {ep}");
+        }
     }
 }
