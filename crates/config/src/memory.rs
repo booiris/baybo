@@ -15,7 +15,7 @@ use aura_model::LlmEntryName;
 /// Defaults to [`MemoryProvider::Noop`], which registers `NoopMemory` and
 /// leaves every memory hook inert (no recall, no write, no billing).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "lowercase")]
 pub enum MemoryProvider {
     #[default]
     Noop,
@@ -101,9 +101,9 @@ mod tests {
     }
 
     #[test]
-    fn provider_deserializes_kebab_case() {
+    fn provider_deserializes_lowercase() {
         let cfg: MemoryConfig =
-            serde_json::from_str(r#"{"enabled":true,"provider":"open-viking"}"#).unwrap();
+            serde_json::from_str(r#"{"enabled":true,"provider":"openviking"}"#).unwrap();
         assert_eq!(cfg.provider, MemoryProvider::OpenViking);
 
         let cfg: MemoryConfig =
@@ -116,13 +116,13 @@ mod tests {
     }
 
     #[test]
-    fn provider_serializes_kebab_case() {
+    fn provider_serializes_lowercase() {
         let c = MemoryConfig {
             enabled: true,
             provider: MemoryProvider::OpenViking,
             ..Default::default()
         };
         let json = serde_json::to_string(&c).unwrap();
-        assert!(json.contains(r#""provider":"open-viking""#), "got: {json}");
+        assert!(json.contains(r#""provider":"openviking""#), "got: {json}");
     }
 }

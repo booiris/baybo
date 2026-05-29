@@ -119,7 +119,7 @@ pub enum Commands {
     },
     /// Manage the pluggable long-term memory backend: `status` (current
     /// provider + sanitised config), `configure` (interactive picker for
-    /// mem0 / open-viking / noop), `test` (health probe), `set-key`
+    /// mem0 / openviking / noop), `test` (health probe), `set-key`
     /// (store API key in the vault), `disable` (back to noop). Memory
     /// config is not hot-reload — a restart applies the change.
     Memory {
@@ -597,12 +597,12 @@ pub enum MemoryCmd {
     /// `api_key`-like fields masked), and resolved API-key status
     /// (set/missing without exposing the value).
     Status,
-    /// Interactive picker — pick `mem0` / `open-viking` / `noop`, walk
+    /// Interactive picker — pick `mem0` / `openviking` / `noop`, walk
     /// every per-provider field with the existing value as the default,
     /// optionally vault the API key, then persist to the config file.
     Configure,
     /// Run a one-shot health probe against the configured backend
-    /// (mem0: lightweight `get_all`; open-viking: `GET /health`).
+    /// (mem0: lightweight `get_all`; openviking: `GET /health`).
     /// Failures are logged as `warn`; the command succeeds either way
     /// (the runtime treats probe failure as non-fatal too).
     Test,

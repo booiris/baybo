@@ -165,7 +165,7 @@ These are the implementation's contract.
 
 Two real backends ship in the crate, selected at startup via
 [`MemoryConfig.provider`](../../crates/config/src/memory.rs) (`mem0` /
-`open-viking`); `noop` (the default) keeps the inert path. Both delegate
+`openviking`); `noop` (the default) keeps the inert path. Both delegate
 extraction to their respective servers, so neither uses
 [`MemoryConfig.llm`](../../crates/config/src/memory.rs) — the field stays on
 the typed config for future backends.
@@ -187,7 +187,7 @@ Failure handling: 5-failure / 120 s circuit breaker shared by every API call
 swallowed and logged at `warn`. API key resolution order: `api_key_env` →
 vault key `memory.mem0.api_key` → default env `MEM0_API_KEY`.
 
-### `open-viking` (`aura_memory::openviking`)
+### `openviking` (`aura_memory::openviking`)
 
 Self-hosted context database. Aura `SessionId` maps 1:1 to the OpenViking
 session id; `X-OpenViking-{Account,Agent}` headers carry deployment identity,

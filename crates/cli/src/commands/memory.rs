@@ -80,7 +80,7 @@ fn provider_label(p: MemoryProvider) -> &'static str {
     match p {
         MemoryProvider::Noop => "noop",
         MemoryProvider::Mem0 => "mem0",
-        MemoryProvider::OpenViking => "open-viking",
+        MemoryProvider::OpenViking => "openviking",
     }
 }
 
@@ -133,14 +133,14 @@ async fn configure(ctx: &CommandContext) -> Result<CommandOutput> {
     let mut new_config: AuraConfig = ctx.config.as_ref().clone();
 
     let current = provider_label(new_config.memory.provider);
-    let provider_input = prompt_with_default("Provider [mem0/open-viking/noop]", current)?;
+    let provider_input = prompt_with_default("Provider [mem0/openviking/noop]", current)?;
     let provider = match provider_input.trim() {
         "mem0" => MemoryProvider::Mem0,
-        "open-viking" | "openviking" | "viking" => MemoryProvider::OpenViking,
-        "noop" | "off" | "none" => MemoryProvider::Noop,
+        "openviking" => MemoryProvider::OpenViking,
+        "noop" => MemoryProvider::Noop,
         other => {
             return Err(CliError::Config(format!(
-                "unknown provider {other:?} (expected mem0 / open-viking / noop)"
+                "unknown provider {other:?} (expected mem0 / openviking / noop)"
             )));
         }
     };
@@ -320,7 +320,7 @@ async fn test(ctx: &CommandContext) -> Result<CommandOutput> {
             m.probe().await;
             Ok(CommandOutput {
                 human: "openviking /health probe completed (warnings, if any, were logged)".into(),
-                data: Some(json!({"provider": "open-viking", "status": "probed"})),
+                data: Some(json!({"provider": "openviking", "status": "probed"})),
             })
         }
     }
@@ -414,7 +414,7 @@ mod tests {
     fn provider_label_round_trip() {
         assert_eq!(provider_label(MemoryProvider::Noop), "noop");
         assert_eq!(provider_label(MemoryProvider::Mem0), "mem0");
-        assert_eq!(provider_label(MemoryProvider::OpenViking), "open-viking");
+        assert_eq!(provider_label(MemoryProvider::OpenViking), "openviking");
     }
 
     #[test]

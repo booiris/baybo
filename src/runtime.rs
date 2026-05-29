@@ -173,7 +173,7 @@ pub struct ManagerGraph {
 
     /// Pluggable long-term memory. `None` whenever `config.memory.enabled`
     /// is false or `provider = noop`; a real backend (`mem0` /
-    /// `open-viking`) is constructed in [`build_managers`] from
+    /// `openviking`) is constructed in [`build_managers`] from
     /// `config.memory` + the secret vault. Threaded into every
     /// `AgentLoopConfig` built by the spawner factory in
     /// [`wire_router`]; its `tools()` are registered into the builtin
