@@ -37,7 +37,7 @@ struct UriQuery {
 fn cfg(server_url: &str) -> OpenVikingConfig {
     OpenVikingConfig {
         endpoint: Some(server_url.to_string()),
-        api_key_env: None,
+        api_key_name: None,
         account: Some("acct".into()),
         top_k: Some(5),
     }

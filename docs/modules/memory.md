@@ -186,8 +186,10 @@ with a per-call `agent_id` rather than a config knob.
 
 Failure handling: 5-failure / 120 s circuit breaker shared by every API call
 (matches the hermes-agent reference implementation). Recall failures are
-swallowed and logged at `warn`. API key resolution order: `api_key_env` →
-vault key `memory.mem0.api_key` → default env `MEM0_API_KEY`.
+swallowed and logged at `warn`. API key resolution: vault entry
+`user_env.<api_key_name>` (managed via `aura secret add <name>`) → process
+env `<api_key_name>`. `<name>` defaults to `MEM0_API_KEY` when
+`api_key_name` is unset in config.
 
 ### `openviking` (`aura_memory::openviking`)
 
@@ -203,14 +205,15 @@ session id; `X-OpenViking-Account` (config) and `X-OpenViking-Agent`
 | `on_session_end` | `POST /api/v1/sessions/{ctx.session_id}/commit` — triggers the 6-category server-side extraction (preferences / entities / events / cases / patterns / profile). Skipped if `transcript.is_empty()`. |
 | `tools()` | `viking_search`, `viking_read`, `viking_browse`, `viking_remember`, `viking_add_resource`. `viking_add_resource` includes zip-of-directory upload. |
 
-API key is optional (local dev mode runs unauthenticated). Resolution order:
-`api_key_env` → vault key `memory.openviking.api_key` → default env
-`OPENVIKING_API_KEY` → empty (unauthenticated). Startup health probe is
-`GET /health`; failure logs `warn` and continues.
+API key is optional (local dev mode runs unauthenticated). Resolution:
+vault entry `user_env.<api_key_name>` (`aura secret add <name>`) → process
+env `<api_key_name>` → empty (unauthenticated). `<name>` defaults to
+`OPENVIKING_API_KEY` when `api_key_name` is unset in config. Startup health
+probe is `GET /health`; failure logs `warn` and continues.
 
 ### Operator CLI
 
-`aura memory {status, setup, test, set-key, disable}` — see
+`aura memory {status, setup, test, disable}` — see
 [`docs/cli.md`](../cli.md#aura-memory). Configure is interactive (provider +
 per-field prompts, vault-stash for the API key); memory config is **not**
 hot-reload, so `setup` prints a restart hint.

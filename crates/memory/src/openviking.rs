@@ -33,8 +33,8 @@ use std::time::Duration;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use aura_model::{ChatMessage, ContentBlock, TrustLevel};
-use aura_security::SecretVault;
 use aura_security::http::ProxySettings;
+use aura_security::{SecretVault, USER_SECRET_PREFIX};
 use aura_tools::{Tool, ToolCapability, ToolContext, ToolManifest, ToolOutput};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -63,8 +63,10 @@ const RECALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// `/sessions/{sid}/commit` triggers the 6-category server-side extraction
 /// (LLM-backed), which can be slow under load — give it a generous ceiling.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(600);
-const VAULT_KEY: &str = "memory.openviking.api_key";
-const DEFAULT_API_KEY_ENV: &str = "OPENVIKING_API_KEY";
+/// Default user-secret name (managed via `aura secret add`) holding the
+/// OpenViking API key. Doubles as the process-env var name. Optional —
+/// when nothing is set the backend runs unauthenticated (local-dev mode).
+const DEFAULT_API_KEY_NAME: &str = "OPENVIKING_API_KEY";
 
 const REMOTE_PREFIXES: &[&str] = &["http://", "https://", "git@", "ssh://", "git://"];
 
@@ -83,7 +85,7 @@ const DEFAULT_MEMORY_SUBDIR: &str = "preferences";
 
 /// Per-backend config deserialized from `MemoryConfig.extra`. Unset fields
 /// elide from JSON via `skip_serializing_if`, so a freshly-written `extra`
-/// is `{}` instead of `{"endpoint": null, "api_key_env": null, ...}`.
+/// is `{}` instead of `{"endpoint": null, "api_key_name": null, ...}`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct OpenVikingConfig {
@@ -91,12 +93,13 @@ pub struct OpenVikingConfig {
     /// `http://127.0.0.1:1933` (local dev default).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
-    /// Explicit env var holding the API key. When unset, the runtime falls
-    /// back to the vault key `memory.openviking.api_key` and then
-    /// `OPENVIKING_API_KEY`. Leave the key empty for unauthenticated local
-    /// dev servers.
+    /// Name of the user secret holding the OpenViking API key. Resolution:
+    /// vault entry `user_env.<api_key_name>` (managed via
+    /// `aura secret add <name>`), then process-env `<api_key_name>`.
+    /// `None` defaults the name to `"OPENVIKING_API_KEY"`. Leave the
+    /// secret itself empty for unauthenticated local-dev servers.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key_env: Option<String>,
+    pub api_key_name: Option<String>,
     /// `X-OpenViking-Account` header (tenant identity). Per-user scope is the
     /// `MemoryContext::user_id()` at each call, sent as `X-OpenViking-User`.
     /// `None` → `"default"`.
@@ -119,22 +122,26 @@ impl OpenVikingConfig {
     }
 }
 
-/// Resolve the OpenViking API key. Order: explicit env, vault, default env.
-/// Returns `Ok(String::new())` when no key is set anywhere — OpenViking local
-/// dev mode runs without authentication.
+/// Resolve the OpenViking API key. Order:
+///   1. User secret vault entry `user_env.<name>` (managed via
+///      `aura secret add <name>`).
+///   2. Process env var of the same name.
+///
+/// `<name>` is `cfg.api_key_name` or [`DEFAULT_API_KEY_NAME`] when unset.
+/// Returns an empty string when nothing is found — OpenViking local-dev
+/// mode runs without authentication.
 pub async fn resolve_api_key(cfg: &OpenVikingConfig, vault: Option<&SecretVault>) -> String {
-    if let Some(env) = &cfg.api_key_env
-        && let Ok(v) = std::env::var(env)
-    {
-        return v;
+    let name = cfg.api_key_name.as_deref().unwrap_or(DEFAULT_API_KEY_NAME);
+    if let Some(vault) = vault {
+        let key = format!("{USER_SECRET_PREFIX}{name}");
+        if let Ok(Some(secret)) = vault.get_secret(&key).await
+            && let Ok(s) = secret.as_str()
+            && !s.is_empty()
+        {
+            return s.to_string();
+        }
     }
-    if let Some(vault) = vault
-        && let Ok(Some(secret)) = vault.get_secret(VAULT_KEY).await
-        && let Ok(s) = secret.as_str()
-    {
-        return s.to_string();
-    }
-    std::env::var(DEFAULT_API_KEY_ENV).unwrap_or_default()
+    std::env::var(name).unwrap_or_default()
 }
 
 struct OpenVikingInner {
@@ -1302,7 +1309,7 @@ mod tests {
     fn default_config_serializes_to_empty_object() {
         // Every field is `None` by default; `skip_serializing_if` should
         // elide each one, so the JSON written into `MemoryConfig.extra` is
-        // `{}` rather than `{"endpoint": null, "api_key_env": null, ...}`.
+        // `{}` rather than `{"endpoint": null, "api_key_name": null, ...}`.
         let json = serde_json::to_value(OpenVikingConfig::default()).unwrap();
         assert_eq!(json, json!({}));
     }

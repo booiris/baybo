@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use aura_model::{ContentBlock, TrustLevel};
-use aura_security::SecretVault;
 use aura_security::http::ProxySettings;
+use aura_security::{SecretVault, USER_SECRET_PREFIX};
 use aura_tools::{Tool, ToolCapability, ToolContext, ToolManifest, ToolOutput};
 use parking_lot::Mutex;
 use reqwest::header;
@@ -61,8 +61,10 @@ const RECALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// root, so the user never waits; Mem0's server-side fact-extraction is
 /// LLM-backed and can be slow under load, so give it a generous ceiling.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(600);
-const VAULT_KEY: &str = "memory.mem0.api_key";
-const DEFAULT_API_KEY_ENV: &str = "MEM0_API_KEY";
+/// Default user-secret name (managed via `aura secret add`) holding the
+/// Mem0 API key. Doubles as the process-env var name when the secret
+/// vault is empty.
+const DEFAULT_API_KEY_NAME: &str = "MEM0_API_KEY";
 
 /// Tool names. Exposed as constants so the runtime / tests can reference them
 /// without literal-typo risk.
@@ -77,14 +79,16 @@ const MAX_PROFILE_ENTRIES: usize = 100;
 
 /// Per-backend config deserialized from `MemoryConfig.extra`. Unset fields
 /// elide from JSON via `skip_serializing_if`, so a freshly-written `extra`
-/// is `{}` instead of `{"api_key_env": null, "base_url": null, ...}`.
+/// is `{}` instead of `{"api_key_name": null, "base_url": null, ...}`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Mem0Config {
-    /// Explicit env var holding the API key. When unset, the runtime falls
-    /// back to the vault key `memory.mem0.api_key` and then `MEM0_API_KEY`.
+    /// Name of the user secret holding the Mem0 API key. Resolution at
+    /// startup: vault entry `user_env.<api_key_name>` (managed via
+    /// `aura secret add <name>`), then process-env `<api_key_name>`.
+    /// `None` defaults the name to `"MEM0_API_KEY"`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key_env: Option<String>,
+    pub api_key_name: Option<String>,
     /// Override the Mem0 REST base URL. `None` → `https://api.mem0.ai`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -112,25 +116,27 @@ impl Mem0Config {
 }
 
 /// Resolve the Mem0 API key. Order:
-///   1. Explicit env var named by `cfg.api_key_env`.
-///   2. Per-entry vault key `memory.mem0.api_key`.
-///   3. Default env var `MEM0_API_KEY`.
+///   1. User secret vault entry `user_env.<name>` (managed via
+///      `aura secret add <name>`).
+///   2. Process env var of the same name.
 ///
-/// Mirrors `aura_llm::credentials::resolve_api_key` exactly; kept local
-/// because the vault key + default env are memory-specific.
+/// `<name>` is `cfg.api_key_name` or [`DEFAULT_API_KEY_NAME`] when unset.
+/// The dedicated `memory.mem0.api_key` vault path has been retired —
+/// secrets now live alongside other user-managed credentials under the
+/// `user_env.` namespace, manageable via the existing `aura secret`
+/// command.
 pub async fn resolve_api_key(cfg: &Mem0Config, vault: Option<&SecretVault>) -> Option<String> {
-    if let Some(env) = &cfg.api_key_env
-        && let Ok(v) = std::env::var(env)
-    {
-        return Some(v);
+    let name = cfg.api_key_name.as_deref().unwrap_or(DEFAULT_API_KEY_NAME);
+    if let Some(vault) = vault {
+        let key = format!("{USER_SECRET_PREFIX}{name}");
+        if let Ok(Some(secret)) = vault.get_secret(&key).await
+            && let Ok(s) = secret.as_str()
+            && !s.is_empty()
+        {
+            return Some(s.to_string());
+        }
     }
-    if let Some(vault) = vault
-        && let Ok(Some(secret)) = vault.get_secret(VAULT_KEY).await
-        && let Ok(s) = secret.as_str()
-    {
-        return Some(s.to_string());
-    }
-    std::env::var(DEFAULT_API_KEY_ENV).ok()
+    std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
 #[derive(Default)]
@@ -242,8 +248,8 @@ impl Mem0Memory {
     pub fn new(cfg: Mem0Config, api_key: String, proxy: Option<&ProxySettings>) -> Result<Self> {
         if api_key.is_empty() {
             return Err(MemoryError::Backend(
-                "mem0 API key missing — set api_key_env, MEM0_API_KEY, or vault \
-                 key memory.mem0.api_key"
+                "mem0 API key missing — run `aura secret add MEM0_API_KEY` \
+                 (or set the MEM0_API_KEY env var)"
                     .into(),
             ));
         }
@@ -683,7 +689,7 @@ mod tests {
     fn default_config_serializes_to_empty_object() {
         // Every field is `None` by default; `skip_serializing_if` should
         // elide each one, so the JSON written into `MemoryConfig.extra` is
-        // `{}` rather than `{"api_key_env": null, "base_url": null, ...}`.
+        // `{}` rather than `{"api_key_name": null, "base_url": null, ...}`.
         let json = serde_json::to_value(Mem0Config::default()).unwrap();
         assert_eq!(json, serde_json::json!({}));
     }
@@ -691,7 +697,7 @@ mod tests {
     #[test]
     fn config_round_trip() {
         let cfg = Mem0Config {
-            api_key_env: Some("MY_KEY".into()),
+            api_key_name: Some("MY_KEY".into()),
             base_url: Some("http://localhost:9000".into()),
             rerank: Some(false),
             top_k: Some(7),

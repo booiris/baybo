@@ -16,7 +16,6 @@ use serde_json::{Value, json};
 
 use crate::cli::MemoryCmd;
 use crate::commands::prompt::prompt_with_default;
-use crate::commands::secret_input::read_masked_password;
 use crate::commands::select::select_one;
 use crate::context::CommandContext;
 use crate::error::{CliError, Result};
@@ -30,7 +29,6 @@ pub async fn handle(ctx: &CommandContext, cmd: MemoryCmd) -> Result<CommandOutpu
         MemoryCmd::Status => status(ctx).await,
         MemoryCmd::Setup => setup(ctx).await,
         MemoryCmd::Test => test(ctx).await,
-        MemoryCmd::SetKey => set_key(ctx).await,
         MemoryCmd::Disable => disable(ctx).await,
     }
 }
@@ -92,10 +90,10 @@ async fn describe_key_status(
         MemoryProvider::Noop => "(not required)".into(),
         MemoryProvider::Mem0 => {
             let cfg = mem0::parse_extra(extra).unwrap_or_default();
+            let name = cfg.api_key_name.as_deref().unwrap_or("MEM0_API_KEY");
             match mem0::resolve_api_key(&cfg, ctx.secret_vault.as_deref()).await {
-                Some(k) if !k.is_empty() => format!("set (length {})", k.len()),
-                _ => "MISSING — set MEM0_API_KEY, configure api_key_env, or `aura memory set-key`"
-                    .into(),
+                Some(k) if !k.is_empty() => format!("set (length {}; key '{name}')", k.len()),
+                _ => format!("MISSING — run `aura secret add {name}` (or set the {name} env var)"),
             }
         }
         MemoryProvider::OpenViking => {
@@ -171,26 +169,23 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
     new_config.memory.enabled = provider != MemoryProvider::Noop;
 
     // Minimal-prompts wizard: ask only what's load-bearing for first-time
-    // setup. Power users can edit `aura.json` directly for agent_id /
-    // rerank / top_k / base_url / api_key_env — the typed structs and
-    // their defaults already cover those.
+    // setup. Power users can edit `aura.json` directly for the rest of the
+    // typed config; the actual API-key value is now delegated to
+    // `aura secret add <name>` (no separate set-key subcommand).
+    let mut secret_hint: Option<String> = None;
     match provider {
         MemoryProvider::Noop => {
             new_config.memory.extra = Value::Null;
         }
         MemoryProvider::Mem0 => {
-            // Mem0 is a hosted SaaS, the API key is the only thing the
-            // wizard can't default. Always vault it (the api_key_env path
-            // is a power-user override; not in the wizard).
             let cfg = mem0::parse_extra(&new_config.memory.extra).unwrap_or_default();
+            let name = cfg
+                .api_key_name
+                .clone()
+                .unwrap_or_else(|| "MEM0_API_KEY".into());
             new_config.memory.extra = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Config(format!("serialise mem0 extra: {e}")))?;
-            store_vault_key(
-                ctx,
-                "memory.mem0.api_key",
-                "Mem0 API key (stored in vault as memory.mem0.api_key)",
-            )
-            .await?;
+            secret_hint = Some(api_key_setup_hint(ctx, &name).await);
         }
         MemoryProvider::OpenViking => {
             // The crate-internal default; matches OpenVikingConfig's None
@@ -208,20 +203,17 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
             } else {
                 Some(endpoint.clone())
             };
-
+            let name = cfg
+                .api_key_name
+                .clone()
+                .unwrap_or_else(|| "OPENVIKING_API_KEY".into());
             new_config.memory.extra = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Config(format!("serialise openviking extra: {e}")))?;
 
-            // Local dev (loopback) runs unauthenticated — skip the API
-            // key prompt. Any remote endpoint warrants one (empty input
-            // still skips the vault write, see store_vault_key).
+            // Local dev (loopback) runs unauthenticated — skip the hint.
+            // Remote endpoints warrant the secret.
             if !is_loopback_endpoint(&endpoint) {
-                store_vault_key(
-                    ctx,
-                    "memory.openviking.api_key",
-                    "OpenViking API key (blank to skip; stored in vault as memory.openviking.api_key)",
-                )
-                .await?;
+                secret_hint = Some(api_key_setup_hint(ctx, &name).await);
             }
         }
     }
@@ -234,6 +226,10 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
         provider_label(new_config.memory.provider),
         target.display(),
     );
+    if let Some(hint) = &secret_hint {
+        human.push_str("\n\n");
+        human.push_str(hint);
+    }
     human.push_str(RESTART_HINT);
     Ok(CommandOutput {
         human,
@@ -242,23 +238,31 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
             "provider": provider_label(new_config.memory.provider),
             "written_to": target.display().to_string(),
             "requires_restart": true,
+            "api_key_hint": secret_hint,
         })),
     })
 }
 
-async fn store_vault_key(ctx: &CommandContext, key_name: &str, label: &str) -> Result<()> {
-    let vault = ctx.secret_vault.as_ref().ok_or_else(|| {
-        CliError::Config("secret vault unavailable — run from workspace root".into())
-    })?;
-    let value = read_masked_password(&format!("{label}: "))?;
-    if value.is_empty() {
-        return Ok(());
+/// One-line hint surfaced after `aura memory setup` tells the user
+/// whether the named secret is already populated or needs to be
+/// added via `aura secret add <name>`. Looks up `user_env.<name>` —
+/// the same vault path the backends use at startup.
+async fn api_key_setup_hint(ctx: &CommandContext, name: &str) -> String {
+    let already_set = match ctx.secret_vault.as_ref() {
+        Some(vault) => {
+            let key = format!("{}{name}", aura_security::USER_SECRET_PREFIX);
+            matches!(vault.get_secret(&key).await, Ok(Some(_)))
+        }
+        None => false,
+    };
+    if already_set {
+        format!("API key already present in vault as {name}.")
+    } else {
+        format!(
+            "Run `aura secret add {name}` to provide the API key \
+             (or set the {name} env var)."
+        )
     }
-    vault
-        .store_secret(key_name, value.as_bytes())
-        .await
-        .map_err(|e| CliError::Config(format!("vault store {key_name}: {e}")))?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -307,29 +311,6 @@ async fn test(ctx: &CommandContext) -> Result<CommandOutput> {
             })
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// set-key
-// ---------------------------------------------------------------------------
-
-async fn set_key(ctx: &CommandContext) -> Result<CommandOutput> {
-    require_tty()?;
-    let provider = ctx.config.memory.provider;
-    let (key_name, label) = match provider {
-        MemoryProvider::Mem0 => ("memory.mem0.api_key", "Mem0 API key"),
-        MemoryProvider::OpenViking => ("memory.openviking.api_key", "OpenViking API key"),
-        MemoryProvider::Noop => {
-            return Err(CliError::Config(
-                "no provider configured — run `aura memory setup` first".into(),
-            ));
-        }
-    };
-    store_vault_key(ctx, key_name, label).await?;
-    Ok(CommandOutput {
-        human: format!("stored {key_name} in vault.{RESTART_HINT}"),
-        data: Some(json!({"vault_key": key_name, "requires_restart": true})),
-    })
 }
 
 /// Hostname / IP-literal heuristic for "this OpenViking server is running

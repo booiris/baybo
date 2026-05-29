@@ -119,9 +119,11 @@ pub enum Commands {
     },
     /// Manage the pluggable long-term memory backend: `status` (current
     /// provider + sanitised config), `setup` (interactive wizard for
-    /// mem0 / openviking / noop), `test` (health probe), `set-key`
-    /// (store API key in the vault), `disable` (back to noop). Memory
-    /// config is not hot-reload — a restart applies the change.
+    /// mem0 / openviking / noop), `test` (health probe), `disable` (back
+    /// to noop). The actual API key is stored via the existing
+    /// `aura secret add <NAME>` (defaults: `MEM0_API_KEY` /
+    /// `OPENVIKING_API_KEY`). Memory config is not hot-reload — a
+    /// restart applies the change.
     Memory {
         #[command(subcommand)]
         cmd: MemoryCmd,
@@ -607,10 +609,6 @@ pub enum MemoryCmd {
     /// Failures are logged as `warn`; the command succeeds either way
     /// (the runtime treats probe failure as non-fatal too).
     Test,
-    /// Store the active provider's API key in the vault under
-    /// `memory.<provider>.api_key`. Prompts for the value via a
-    /// masked password reader.
-    SetKey,
     /// Flip `provider = noop` and `enabled = false`, clear `extra`,
     /// persist the change. Use to turn memory off without removing
     /// the saved settings — re-running `setup` brings them back.

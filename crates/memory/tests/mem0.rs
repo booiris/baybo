@@ -29,7 +29,7 @@ struct Captured {
 
 fn cfg(server_url: &str, top_k: usize) -> Mem0Config {
     Mem0Config {
-        api_key_env: None,
+        api_key_name: None,
         base_url: Some(server_url.to_string()),
         rerank: Some(true),
         top_k: Some(top_k),
