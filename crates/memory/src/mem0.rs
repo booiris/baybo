@@ -9,7 +9,9 @@
 //!   immediate on `add`).
 //!
 //! Per-user scoping comes from `MemoryContext::user_id()` at every call;
-//! `agent_id` is config-level (deployment identity).
+//! `agent_id` is hardcoded to `"aura"` (deployment identity) — multi-agent
+//! support would extend `MemoryContext` with a per-call `agent_id` rather
+//! than a config knob.
 //!
 //! Failures are routed through a 5-failure / 120 s circuit breaker that pauses
 //! API calls after sustained outages (port from the Python `_record_failure` /
@@ -82,9 +84,6 @@ pub struct Mem0Config {
     pub api_key_env: Option<String>,
     /// Override the Mem0 REST base URL. `None` → `https://api.mem0.ai`.
     pub base_url: Option<String>,
-    /// `agent_id` tag attached to writes (`POST /v1/memories`). Stable per
-    /// deployment; per-user scope rides on `MemoryContext::user_id()`.
-    pub agent_id: Option<String>,
     /// Enable Mem0 server-side reranking for `recall` (more accurate, slower).
     pub rerank: Option<bool>,
     /// Max results returned by `recall`.
@@ -92,10 +91,6 @@ pub struct Mem0Config {
 }
 
 impl Mem0Config {
-    fn agent_id(&self) -> &str {
-        self.agent_id.as_deref().unwrap_or(DEFAULT_AGENT_ID)
-    }
-
     fn base_url(&self) -> &str {
         self.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL)
     }
@@ -174,7 +169,6 @@ struct Mem0Inner {
     client: reqwest::Client,
     base_url: String,
     api_key: String,
-    agent_id: String,
     rerank: bool,
     top_k: usize,
     breaker: Mutex<BreakerState>,
@@ -255,7 +249,6 @@ impl Mem0Memory {
             client,
             base_url: cfg.base_url().to_string(),
             api_key,
-            agent_id: cfg.agent_id().to_string(),
             rerank: cfg.rerank(),
             top_k: cfg.top_k(),
             breaker: Mutex::new(BreakerState::default()),
@@ -357,7 +350,7 @@ impl Memory for Mem0Memory {
                 {"role": "assistant", "content": assistant_text},
             ],
             "user_id": ctx.user_id(),
-            "agent_id": self.inner.agent_id,
+            "agent_id": DEFAULT_AGENT_ID,
         });
         match self
             .inner
@@ -637,7 +630,7 @@ impl Tool for Mem0ConcludeTool {
         let body = json!({
             "messages": [{"role": "user", "content": conclusion}],
             "user_id": ctx.user.id.as_str(),
-            "agent_id": self.inner.agent_id,
+            "agent_id": DEFAULT_AGENT_ID,
             "infer": false,
         });
         match self
@@ -675,7 +668,6 @@ mod tests {
     fn config_defaults() {
         let cfg = Mem0Config::default();
         assert_eq!(cfg.base_url(), DEFAULT_BASE_URL);
-        assert_eq!(cfg.agent_id(), DEFAULT_AGENT_ID);
         assert!(cfg.rerank());
         assert_eq!(cfg.top_k(), DEFAULT_TOP_K);
     }
@@ -685,14 +677,12 @@ mod tests {
         let cfg = Mem0Config {
             api_key_env: Some("MY_KEY".into()),
             base_url: Some("http://localhost:9000".into()),
-            agent_id: Some("test".into()),
             rerank: Some(false),
             top_k: Some(7),
         };
         let v = serde_json::to_value(&cfg).unwrap();
         let back: Mem0Config = serde_json::from_value(v).unwrap();
         assert_eq!(back.base_url(), "http://localhost:9000");
-        assert_eq!(back.agent_id(), "test");
         assert!(!back.rerank());
         assert_eq!(back.top_k(), 7);
     }
@@ -700,7 +690,7 @@ mod tests {
     #[test]
     fn parse_extra_null_yields_defaults() {
         let cfg = parse_extra(&Value::Null).unwrap();
-        assert_eq!(cfg.agent_id(), DEFAULT_AGENT_ID);
+        assert_eq!(cfg.base_url(), DEFAULT_BASE_URL);
     }
 
     #[test]

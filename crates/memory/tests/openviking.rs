@@ -39,7 +39,6 @@ fn cfg(server_url: &str) -> OpenVikingConfig {
         endpoint: Some(server_url.to_string()),
         api_key_env: None,
         account: Some("acct".into()),
-        agent: Some("aura-test".into()),
         top_k: Some(5),
     }
 }
@@ -90,7 +89,7 @@ async fn recall_sends_query_and_returns_abstract_with_uri() {
     let headers = captured.headers.lock().last().cloned().unwrap();
     assert_eq!(headers.get("x-openviking-account").unwrap(), "acct");
     assert_eq!(headers.get("x-openviking-user").unwrap(), "alice");
-    assert_eq!(headers.get("x-openviking-agent").unwrap(), "aura-test");
+    assert_eq!(headers.get("x-openviking-agent").unwrap(), "aura");
     let body = captured.bodies.lock().last().unwrap().clone();
     assert_eq!(body["query"], "rust");
     assert_eq!(body["top_k"], 5);

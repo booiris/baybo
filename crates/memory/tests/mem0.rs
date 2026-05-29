@@ -31,7 +31,6 @@ fn cfg(server_url: &str, top_k: usize) -> Mem0Config {
     Mem0Config {
         api_key_env: None,
         base_url: Some(server_url.to_string()),
-        agent_id: Some("aura-test".into()),
         rerank: Some(true),
         top_k: Some(top_k),
     }
@@ -162,7 +161,7 @@ async fn on_job_complete_posts_messages_with_user_and_agent_ids() {
 
     let body = captured.bodies.lock().last().unwrap().clone();
     assert_eq!(body["user_id"], "u-2");
-    assert_eq!(body["agent_id"], "aura-test");
+    assert_eq!(body["agent_id"], "aura");
     let messages = body["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0]["role"], "user");
@@ -382,7 +381,7 @@ async fn tool_conclude_posts_verbatim_with_infer_false() {
     let body = captured.bodies.lock().last().unwrap().clone();
     assert_eq!(body["infer"], false);
     assert_eq!(body["user_id"], "u-6");
-    assert_eq!(body["agent_id"], "aura-test");
+    assert_eq!(body["agent_id"], "aura");
     assert_eq!(body["messages"][0]["content"], "user is left-handed");
     assert_eq!(body["messages"][0]["role"], "user");
 }

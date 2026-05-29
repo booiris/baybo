@@ -95,9 +95,6 @@ pub struct OpenVikingConfig {
     /// `X-OpenViking-Account` header (tenant identity). Per-user scope is the
     /// `MemoryContext::user_id()` at each call, sent as `X-OpenViking-User`.
     pub account: Option<String>,
-    /// `X-OpenViking-Agent` header — which agent is writing. Defaults to
-    /// `"aura"`.
-    pub agent: Option<String>,
     /// Max results returned by `recall`.
     pub top_k: Option<usize>,
 }
@@ -108,9 +105,6 @@ impl OpenVikingConfig {
     }
     fn account(&self) -> &str {
         self.account.as_deref().unwrap_or(DEFAULT_ACCOUNT)
-    }
-    fn agent(&self) -> &str {
-        self.agent.as_deref().unwrap_or(DEFAULT_AGENT)
     }
     fn top_k(&self) -> usize {
         self.top_k.unwrap_or(DEFAULT_TOP_K)
@@ -140,7 +134,6 @@ struct OpenVikingInner {
     endpoint: String,
     api_key: String,
     account: String,
-    agent: String,
     top_k: usize,
 }
 
@@ -158,7 +151,7 @@ impl OpenVikingInner {
         if let Ok(v) = HeaderValue::from_str(user_id) {
             h.insert(HeaderName::from_static("x-openviking-user"), v);
         }
-        if let Ok(v) = HeaderValue::from_str(&self.agent) {
+        if let Ok(v) = HeaderValue::from_str(DEFAULT_AGENT) {
             h.insert(HeaderName::from_static("x-openviking-agent"), v);
         }
         if !self.api_key.is_empty() {
@@ -355,7 +348,6 @@ impl OpenVikingMemory {
             endpoint: cfg.endpoint().trim_end_matches('/').to_string(),
             api_key,
             account: cfg.account().to_string(),
-            agent: cfg.agent().to_string(),
             top_k: cfg.top_k(),
         });
         Ok(Self { inner })
@@ -1295,7 +1287,6 @@ mod tests {
         let cfg = OpenVikingConfig::default();
         assert_eq!(cfg.endpoint(), DEFAULT_ENDPOINT);
         assert_eq!(cfg.account(), DEFAULT_ACCOUNT);
-        assert_eq!(cfg.agent(), DEFAULT_AGENT);
         assert_eq!(cfg.top_k(), DEFAULT_TOP_K);
     }
 

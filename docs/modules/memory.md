@@ -173,7 +173,9 @@ the typed config for future backends.
 ### `mem0` (`aura_memory::mem0`)
 
 Hosted SaaS via the Mem0 Platform REST API. Per-user scope comes from
-`MemoryContext::user_id()`; `agent_id` is config-level.
+`MemoryContext::user_id()`; `agent_id` is hardcoded to `"aura"` (deployment
+identity). Multi-agent support is deferred and would extend `MemoryContext`
+with a per-call `agent_id` rather than a config knob.
 
 | Hook | Behaviour |
 | --- | --- |
@@ -190,8 +192,9 @@ vault key `memory.mem0.api_key` → default env `MEM0_API_KEY`.
 ### `openviking` (`aura_memory::openviking`)
 
 Self-hosted context database. Aura `SessionId` maps 1:1 to the OpenViking
-session id; `X-OpenViking-{Account,Agent}` headers carry deployment identity,
-`X-OpenViking-User` carries `MemoryContext::user_id()` per call.
+session id; `X-OpenViking-Account` (config) and `X-OpenViking-Agent`
+(hardcoded `"aura"`) carry deployment identity, `X-OpenViking-User` carries
+`MemoryContext::user_id()` per call.
 
 | Hook | Behaviour |
 | --- | --- |
