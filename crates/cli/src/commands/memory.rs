@@ -1,5 +1,7 @@
-//! `aura memory` subcommands — inspect / setup / test / set-key /
-//! disable the pluggable memory backend.
+//! `aura memory` subcommands — inspect / setup / test / disable the
+//! pluggable memory backend. The API-key value itself rides through
+//! the shared `aura secret add <NAME>` (looking up
+//! `user_env.<NAME>` in the vault).
 //!
 //! Memory config is **not** hot-reload (`reload.rs` classifies it as
 //! non-hot, matching the trait's process-singleton invariant). Each
@@ -285,9 +287,10 @@ async fn test(ctx: &CommandContext) -> Result<CommandOutput> {
                 .await
                 .unwrap_or_default();
             if key.is_empty() {
-                return Err(CliError::Config(
-                    "mem0 API key missing — run `aura memory set-key` first".into(),
-                ));
+                let name = cfg.api_key_name.as_deref().unwrap_or("MEM0_API_KEY");
+                return Err(CliError::Config(format!(
+                    "mem0 API key missing — run `aura secret add {name}` (or set the {name} env var)"
+                )));
             }
             let proxy = ctx.proxy_settings();
             let m = mem0::Mem0Memory::new(cfg, key, proxy.as_ref())
