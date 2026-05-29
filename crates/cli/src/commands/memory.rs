@@ -1,4 +1,4 @@
-//! `aura memory` subcommands — inspect / configure / test / set-key /
+//! `aura memory` subcommands — inspect / setup / test / set-key /
 //! disable the pluggable memory backend.
 //!
 //! Memory config is **not** hot-reload (`reload.rs` classifies it as
@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use crate::cli::MemoryCmd;
 use crate::commands::prompt::{confirm, prompt_with_default};
 use crate::commands::secret_input::read_masked_password;
+use crate::commands::select::select_one;
 use crate::context::CommandContext;
 use crate::error::{CliError, Result};
 use crate::format::CommandOutput;
@@ -27,7 +28,7 @@ const RESTART_HINT: &str =
 pub async fn handle(ctx: &CommandContext, cmd: MemoryCmd) -> Result<CommandOutput> {
     match cmd {
         MemoryCmd::Status => status(ctx).await,
-        MemoryCmd::Configure => configure(ctx).await,
+        MemoryCmd::Setup => setup(ctx).await,
         MemoryCmd::Test => test(ctx).await,
         MemoryCmd::SetKey => set_key(ctx).await,
         MemoryCmd::Disable => disable(ctx).await,
@@ -122,26 +123,50 @@ fn sanitize_extra(extra: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// configure
+// setup
 // ---------------------------------------------------------------------------
 
-async fn configure(ctx: &CommandContext) -> Result<CommandOutput> {
+const PROVIDER_CHOICES: &[(MemoryProvider, &str, &str)] = &[
+    (
+        MemoryProvider::Mem0,
+        "mem0",
+        "Hosted SaaS — mem0.ai (requires API key)",
+    ),
+    (
+        MemoryProvider::OpenViking,
+        "openviking",
+        "Self-hosted OpenViking server (loopback by default)",
+    ),
+    (
+        MemoryProvider::Noop,
+        "noop",
+        "Disabled — no recall, no write",
+    ),
+];
+
+async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
     require_tty()?;
     let target = resolve_target_path(ctx)?;
     let mut new_config: AuraConfig = ctx.config.as_ref().clone();
 
-    let current = provider_label(new_config.memory.provider);
-    let provider_input = prompt_with_default("Provider [mem0/openviking/noop]", current)?;
-    let provider = match provider_input.trim() {
-        "mem0" => MemoryProvider::Mem0,
-        "openviking" => MemoryProvider::OpenViking,
-        "noop" => MemoryProvider::Noop,
-        other => {
-            return Err(CliError::Config(format!(
-                "unknown provider {other:?} (expected mem0 / openviking / noop)"
-            )));
-        }
-    };
+    // Single-select radio list — no typing. Seed the highlight on the
+    // currently-configured provider so re-running the wizard with Enter
+    // keeps the existing choice.
+    let labels: Vec<String> = PROVIDER_CHOICES
+        .iter()
+        .map(|(p, slug, descr)| {
+            let marker = if *p == new_config.memory.provider {
+                " (current)"
+            } else {
+                ""
+            };
+            format!("{slug:<11} — {descr}{marker}")
+        })
+        .collect();
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let picked = select_one("Provider:", &label_refs)?;
+    let provider = PROVIDER_CHOICES[picked].0;
+
     new_config.memory.provider = provider;
     new_config.memory.enabled = provider != MemoryProvider::Noop;
 
@@ -246,7 +271,7 @@ async fn configure(ctx: &CommandContext) -> Result<CommandOutput> {
     new_config.write_to_file(&target).await?;
 
     let mut human = format!(
-        "configured memory: enabled={} provider={}\nwrote {}",
+        "memory set up: enabled={} provider={}\nwrote {}",
         new_config.memory.enabled,
         provider_label(new_config.memory.provider),
         target.display(),
@@ -338,7 +363,7 @@ async fn set_key(ctx: &CommandContext) -> Result<CommandOutput> {
         MemoryProvider::OpenViking => ("memory.openviking.api_key", "OpenViking API key"),
         MemoryProvider::Noop => {
             return Err(CliError::Config(
-                "no provider configured — run `aura memory configure` first".into(),
+                "no provider configured — run `aura memory setup` first".into(),
             ));
         }
     };

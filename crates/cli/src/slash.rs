@@ -265,7 +265,7 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
             cmd: LlmCmd::Add | LlmCmd::Edit | LlmCmd::Remove | LlmCmd::Default,
         } => Err("interactive LLM editor; run it from a shell"),
         Commands::Memory {
-            cmd: MemoryCmd::Configure | MemoryCmd::SetKey,
+            cmd: MemoryCmd::Setup | MemoryCmd::SetKey,
         } => Err("interactive memory editor; run it from a shell"),
         Commands::ExternalAgent {
             cmd: ExternalAgentCmd::Setup | ExternalAgentCmd::Disable | ExternalAgentCmd::Default,

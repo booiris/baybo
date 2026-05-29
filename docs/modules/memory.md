@@ -207,10 +207,10 @@ API key is optional (local dev mode runs unauthenticated). Resolution order:
 
 ### Operator CLI
 
-`aura memory {status, configure, test, set-key, disable}` — see
+`aura memory {status, setup, test, set-key, disable}` — see
 [`docs/cli.md`](../cli.md#aura-memory). Configure is interactive (provider +
 per-field prompts, vault-stash for the API key); memory config is **not**
-hot-reload, so `configure` prints a restart hint.
+hot-reload, so `setup` prints a restart hint.
 
 ## Deferred
 
