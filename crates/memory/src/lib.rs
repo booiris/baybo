@@ -21,6 +21,7 @@
 
 mod error;
 
+pub mod boot;
 pub mod mem0;
 pub mod openviking;
 
