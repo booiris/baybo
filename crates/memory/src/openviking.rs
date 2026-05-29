@@ -51,13 +51,18 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:1933";
 const DEFAULT_ACCOUNT: &str = "default";
 const DEFAULT_AGENT: &str = "aura";
 const DEFAULT_TOP_K: usize = 5;
+/// Default per-request budget for tool calls (model is already waiting).
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 /// Recall is on the critical path — cap it well below `HTTP_TIMEOUT` so a
 /// slow / down OpenViking server degrades the turn to "no recalled context"
-/// instead of stalling the user up to 30 s. `on_job_complete` /
-/// `on_session_end` / tool calls keep `HTTP_TIMEOUT`.
+/// instead of stalling the user up to 30 s.
 const RECALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Background-write budget for `on_job_complete` / `on_session_end`.
+/// Detached on the runtime root, so the user never waits;
+/// `/sessions/{sid}/commit` triggers the 6-category server-side extraction
+/// (LLM-backed), which can be slow under load — give it a generous ceiling.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(600);
 const VAULT_KEY: &str = "memory.openviking.api_key";
 const DEFAULT_API_KEY_ENV: &str = "OPENVIKING_API_KEY";
 
@@ -200,37 +205,52 @@ impl OpenVikingInner {
         Ok(parsed.unwrap_or(Value::Null))
     }
 
-    async fn get(&self, path: &str, user_id: &str, query: &[(&str, &str)]) -> Result<Value> {
+    async fn get(
+        &self,
+        path: &str,
+        user_id: &str,
+        query: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<Value> {
         let url = build_url(&self.endpoint, path, query)
             .map_err(|e| MemoryError::Backend(format!("openviking url build failed: {e}")))?;
         let resp = self
             .client
             .get(url)
             .headers(self.base_headers(user_id))
+            .timeout(timeout)
             .send()
             .await
             .map_err(|e| MemoryError::Backend(format!("openviking GET {path} failed: {e}")))?;
         self.parse(resp).await
     }
 
-    async fn post_json(&self, path: &str, user_id: &str, body: &Value) -> Result<Value> {
+    async fn post_json(
+        &self,
+        path: &str,
+        user_id: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         let resp = self
             .client
             .post(self.url(path))
             .headers(self.json_headers(user_id))
             .json(body)
+            .timeout(timeout)
             .send()
             .await
             .map_err(|e| MemoryError::Backend(format!("openviking POST {path} failed: {e}")))?;
         self.parse(resp).await
     }
 
-    async fn post_empty(&self, path: &str, user_id: &str) -> Result<Value> {
+    async fn post_empty(&self, path: &str, user_id: &str, timeout: Duration) -> Result<Value> {
         let resp = self
             .client
             .post(self.url(path))
             .headers(self.json_headers(user_id))
             .body("{}")
+            .timeout(timeout)
             .send()
             .await
             .map_err(|e| MemoryError::Backend(format!("openviking POST {path} failed: {e}")))?;
@@ -417,23 +437,14 @@ impl Memory for OpenVikingMemory {
             return Ok(Vec::new());
         }
         let body = json!({"query": q, "top_k": self.inner.top_k});
-        match tokio::time::timeout(
-            RECALL_TIMEOUT,
-            self.inner
-                .post_json("/api/v1/search/find", ctx.user_id(), &body),
-        )
-        .await
+        match self
+            .inner
+            .post_json("/api/v1/search/find", ctx.user_id(), &body, RECALL_TIMEOUT)
+            .await
         {
-            Ok(Ok(resp)) => Ok(parse_search_results(&resp)),
-            Ok(Err(e)) => {
-                warn!(error = %e, "openviking recall failed");
-                Ok(Vec::new())
-            }
-            Err(_) => {
-                warn!(
-                    timeout_secs = RECALL_TIMEOUT.as_secs(),
-                    "openviking recall timed out; returning no recalled context"
-                );
+            Ok(resp) => Ok(parse_search_results(&resp)),
+            Err(e) => {
+                warn!(error = %e, "openviking recall failed (timeout or backend)");
                 Ok(Vec::new())
             }
         }
@@ -455,13 +466,21 @@ impl Memory for OpenVikingMemory {
         let user_id = ctx.user_id();
         if !user_text.is_empty() {
             let body = json!({"role": "user", "content": truncate_str(&user_text, 4000)});
-            if let Err(e) = self.inner.post_json(&path, user_id, &body).await {
+            if let Err(e) = self
+                .inner
+                .post_json(&path, user_id, &body, WRITE_TIMEOUT)
+                .await
+            {
                 debug!(error = %e, "openviking on_job_complete user msg failed");
             }
         }
         if !assistant_text.is_empty() {
             let body = json!({"role": "assistant", "content": truncate_str(&assistant_text, 4000)});
-            if let Err(e) = self.inner.post_json(&path, user_id, &body).await {
+            if let Err(e) = self
+                .inner
+                .post_json(&path, user_id, &body, WRITE_TIMEOUT)
+                .await
+            {
                 debug!(error = %e, "openviking on_job_complete assistant msg failed");
             }
         }
@@ -474,7 +493,11 @@ impl Memory for OpenVikingMemory {
         }
         let sid = ctx.session_id().as_str();
         let path = format!("/api/v1/sessions/{sid}/commit");
-        if let Err(e) = self.inner.post_empty(&path, ctx.user_id()).await {
+        if let Err(e) = self
+            .inner
+            .post_empty(&path, ctx.user_id(), WRITE_TIMEOUT)
+            .await
+        {
             warn!(error = %e, "openviking session commit failed");
         }
         Ok(())
@@ -610,7 +633,12 @@ impl Tool for VikingSearchTool {
 
         let resp = self
             .inner
-            .post_json("/api/v1/search/find", ctx.user.id.as_str(), &body)
+            .post_json(
+                "/api/v1/search/find",
+                ctx.user.id.as_str(),
+                &body,
+                HTTP_TIMEOUT,
+            )
             .await
             .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
         let result = resp.get("result").cloned().unwrap_or(Value::Null);
@@ -700,7 +728,7 @@ impl Tool for VikingReadTool {
         let mut used_fallback = false;
         let resp = match self
             .inner
-            .get(endpoint, user_id, &[("uri", &resolved)])
+            .get(endpoint, user_id, &[("uri", &resolved)], HTTP_TIMEOUT)
             .await
         {
             Ok(v) => v,
@@ -708,7 +736,12 @@ impl Tool for VikingReadTool {
                 used_fallback = true;
                 debug!(error = %e, "openviking summary endpoint failed; falling back to /content/read");
                 self.inner
-                    .get("/api/v1/content/read", user_id, &[("uri", &uri)])
+                    .get(
+                        "/api/v1/content/read",
+                        user_id,
+                        &[("uri", &uri)],
+                        HTTP_TIMEOUT,
+                    )
                     .await
                     .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?
             }
@@ -817,7 +850,12 @@ impl Tool for VikingBrowseTool {
         };
         let resp = self
             .inner
-            .get(endpoint, ctx.user.id.as_str(), &[("uri", &path)])
+            .get(
+                endpoint,
+                ctx.user.id.as_str(),
+                &[("uri", &path)],
+                HTTP_TIMEOUT,
+            )
             .await
             .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
         let result = resp.get("result").cloned().unwrap_or(resp);
@@ -916,7 +954,12 @@ impl Tool for VikingRememberTool {
         let body = json!({"uri": uri, "content": content, "mode": "create"});
         let resp = self
             .inner
-            .post_json("/api/v1/content/write", ctx.user.id.as_str(), &body)
+            .post_json(
+                "/api/v1/content/write",
+                ctx.user.id.as_str(),
+                &body,
+                HTTP_TIMEOUT,
+            )
             .await
             .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
         let written = resp
@@ -1014,7 +1057,12 @@ impl Tool for VikingAddResourceTool {
                 reject_private_remote_url(&url)?;
                 payload.insert("path".into(), json!(url));
                 self.inner
-                    .post_json("/api/v1/resources", user_id, &Value::Object(payload))
+                    .post_json(
+                        "/api/v1/resources",
+                        user_id,
+                        &Value::Object(payload),
+                        HTTP_TIMEOUT,
+                    )
                     .await
             }
             ResourceSource::Local(path) => {
@@ -1093,7 +1141,12 @@ impl Tool for VikingAddResourceTool {
                     .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
                 payload.insert("temp_file_id".into(), json!(temp_file_id));
                 self.inner
-                    .post_json("/api/v1/resources", user_id, &Value::Object(payload))
+                    .post_json(
+                        "/api/v1/resources",
+                        user_id,
+                        &Value::Object(payload),
+                        HTTP_TIMEOUT,
+                    )
                     .await
             }
         };

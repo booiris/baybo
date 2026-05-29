@@ -106,6 +106,33 @@ async fn recall_returns_empty_when_query_empty() {
 }
 
 #[tokio::test]
+async fn on_session_end_tolerates_slow_commit() {
+    // Commit can be slow when the server runs LLM-backed extraction.
+    // Verify the call waits well past `HTTP_TIMEOUT` (30s) — a 35-s
+    // server-side stall completes successfully because WRITE_TIMEOUT
+    // (10 min) is the actual budget on this code path.
+    let app = Router::new().route(
+        "/api/v1/sessions/{sid}/commit",
+        post(|Path(_sid): Path<String>| async move {
+            tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+            Json(json!({}))
+        }),
+    );
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+    let ctx = memory_context("alice", "slow-commit", StepKind::MemoryWrite).await;
+    let transcript = vec![ChatMessage::user(vec![ContentBlock::Text("hi".into())])];
+    let started = std::time::Instant::now();
+    m.on_session_end(&ctx, &transcript).await.unwrap();
+    let elapsed = started.elapsed();
+    // The 35-s wait must have completed (not been cancelled at 30 s).
+    assert!(
+        elapsed >= std::time::Duration::from_secs(34),
+        "on_session_end must wait through the slow commit; took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn recall_returns_empty_on_critical_path_timeout() {
     // Handler stalls past the 5 s RECALL_TIMEOUT — recall must return empty
     // (no recalled context) instead of blocking the agent loop.

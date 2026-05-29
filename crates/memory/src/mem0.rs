@@ -43,6 +43,7 @@ use crate::{Memory, MemoryContext, MemoryError, RecalledMemory, Result};
 const DEFAULT_BASE_URL: &str = "https://api.mem0.ai";
 const DEFAULT_AGENT_ID: &str = "aura";
 const DEFAULT_TOP_K: usize = 5;
+/// Default per-request budget for tool calls (model is already waiting).
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Probe is best-effort and runs inline during `build_managers`; keep the
 /// per-request budget short so an unreachable Mem0 endpoint does not stall
@@ -52,9 +53,12 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// the agent loop waits inline for it. Cap the request well below
 /// `HTTP_TIMEOUT` so a slow / down Mem0 endpoint degrades the turn to "no
 /// recalled context" instead of stalling the user up to 30 s before the
-/// first model token. `on_job_complete` / tool calls keep `HTTP_TIMEOUT`
-/// (background path / model is already waiting).
+/// first model token.
 const RECALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Background-write budget for `on_job_complete`. Detached on the runtime
+/// root, so the user never waits; Mem0's server-side fact-extraction is
+/// LLM-backed and can be slow under load, so give it a generous ceiling.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(600);
 const VAULT_KEY: &str = "memory.mem0.api_key";
 const DEFAULT_API_KEY_ENV: &str = "MEM0_API_KEY";
 
@@ -198,12 +202,13 @@ impl Mem0Inner {
         format!("Token {}", self.api_key)
     }
 
-    async fn post_json(&self, path: &str, body: &Value) -> Result<Value> {
+    async fn post_json(&self, path: &str, body: &Value, timeout: Duration) -> Result<Value> {
         let resp = self
             .client
             .post(self.url(path))
             .header(header::AUTHORIZATION, self.auth_header())
             .json(body)
+            .timeout(timeout)
             .send()
             .await
             .map_err(|e| MemoryError::Backend(format!("mem0 request failed: {e}")))?;
@@ -268,14 +273,12 @@ impl Mem0Memory {
             "page": 1,
             "page_size": 1,
         });
-        match tokio::time::timeout(PROBE_TIMEOUT, self.inner.post_json("/v2/memories", &body)).await
+        if let Err(e) = self
+            .inner
+            .post_json("/v2/memories", &body, PROBE_TIMEOUT)
+            .await
         {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => warn!(error = %e, "mem0 startup probe failed; continuing"),
-            Err(_) => warn!(
-                timeout_secs = PROBE_TIMEOUT.as_secs(),
-                "mem0 startup probe timed out; continuing"
-            ),
+            warn!(error = %e, "mem0 startup probe failed; continuing");
         }
     }
 }
@@ -317,27 +320,18 @@ impl Memory for Mem0Memory {
             "rerank": self.inner.rerank,
             "top_k": self.inner.top_k,
         });
-        match tokio::time::timeout(
-            RECALL_TIMEOUT,
-            self.inner.post_json("/v2/memories/search", &body),
-        )
-        .await
+        match self
+            .inner
+            .post_json("/v2/memories/search", &body, RECALL_TIMEOUT)
+            .await
         {
-            Ok(Ok(resp)) => {
+            Ok(resp) => {
                 self.inner.record_success();
                 Ok(parse_search_results(&resp))
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 self.inner.record_failure();
-                warn!(error = %e, "mem0 recall failed");
-                Ok(Vec::new())
-            }
-            Err(_) => {
-                self.inner.record_failure();
-                warn!(
-                    timeout_secs = RECALL_TIMEOUT.as_secs(),
-                    "mem0 recall timed out; returning no recalled context"
-                );
+                warn!(error = %e, "mem0 recall failed (timeout or backend)");
                 Ok(Vec::new())
             }
         }
@@ -365,7 +359,11 @@ impl Memory for Mem0Memory {
             "user_id": ctx.user_id(),
             "agent_id": self.inner.agent_id,
         });
-        match self.inner.post_json("/v1/memories", &body).await {
+        match self
+            .inner
+            .post_json("/v1/memories", &body, WRITE_TIMEOUT)
+            .await
+        {
             Ok(_) => {
                 self.inner.record_success();
                 Ok(())
@@ -471,7 +469,11 @@ impl Tool for Mem0ProfileTool {
             "page": 1,
             "page_size": MAX_PROFILE_ENTRIES,
         });
-        match self.inner.post_json("/v2/memories", &body).await {
+        match self
+            .inner
+            .post_json("/v2/memories", &body, HTTP_TIMEOUT)
+            .await
+        {
             Ok(resp) => {
                 self.inner.record_success();
                 let memories = parse_search_results(&resp);
@@ -552,7 +554,11 @@ impl Tool for Mem0SearchTool {
             "rerank": rerank,
             "top_k": top_k,
         });
-        match self.inner.post_json("/v2/memories/search", &body).await {
+        match self
+            .inner
+            .post_json("/v2/memories/search", &body, HTTP_TIMEOUT)
+            .await
+        {
             Ok(resp) => {
                 self.inner.record_success();
                 let items: Vec<Value> = resp
@@ -634,7 +640,11 @@ impl Tool for Mem0ConcludeTool {
             "agent_id": self.inner.agent_id,
             "infer": false,
         });
-        match self.inner.post_json("/v1/memories", &body).await {
+        match self
+            .inner
+            .post_json("/v1/memories", &body, HTTP_TIMEOUT)
+            .await
+        {
             Ok(_) => {
                 self.inner.record_success();
                 Ok(ToolOutput::Json(json!({"result": "Fact stored."})))
