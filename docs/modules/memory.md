@@ -161,13 +161,59 @@ field — the core has no opinion on whether a backend embeds at all.
 
 These are the implementation's contract.
 
+## Backends
+
+Two real backends ship in the crate, selected at startup via
+[`MemoryConfig.provider`](../../crates/config/src/memory.rs) (`mem0` /
+`open-viking`); `noop` (the default) keeps the inert path. Both delegate
+extraction to their respective servers, so neither uses
+[`MemoryConfig.llm`](../../crates/config/src/memory.rs) — the field stays on
+the typed config for future backends.
+
+### `mem0` (`aura_memory::mem0`)
+
+Hosted SaaS via the Mem0 Platform REST API. Per-user scope comes from
+`MemoryContext::user_id()`; `agent_id` is config-level.
+
+| Hook | Behaviour |
+| --- | --- |
+| `recall` | `POST /v2/memories/search` with `{query, filters: {AND: [{user_id}]}, rerank, top_k}`; returns the `memory` text verbatim. |
+| `on_job_complete` | `POST /v1/memories` with `{messages: [{user,assistant}], user_id, agent_id}`; the Mem0 server runs LLM-based fact extraction. |
+| `on_session_end` | No-op (Mem0 has no session concept; extraction is per-`add`). |
+| `tools()` | `mem0_profile`, `mem0_search`, `mem0_conclude`. |
+
+Failure handling: 5-failure / 120 s circuit breaker shared by every API call
+(matches the hermes-agent reference implementation). Recall failures are
+swallowed and logged at `warn`. API key resolution order: `api_key_env` →
+vault key `memory.mem0.api_key` → default env `MEM0_API_KEY`.
+
+### `open-viking` (`aura_memory::openviking`)
+
+Self-hosted context database. Aura `SessionId` maps 1:1 to the OpenViking
+session id; `X-OpenViking-{Account,Agent}` headers carry deployment identity,
+`X-OpenViking-User` carries `MemoryContext::user_id()` per call.
+
+| Hook | Behaviour |
+| --- | --- |
+| `recall` | `POST /api/v1/search/find` with `{query, top_k}`; returns `"{abstract} (viking://uri)"` so the model can drill in with `viking_read`. |
+| `on_job_complete` | `POST /api/v1/sessions/{ctx.session_id}/messages` ×2 (user, assistant). |
+| `on_session_end` | `POST /api/v1/sessions/{ctx.session_id}/commit` — triggers the 6-category server-side extraction (preferences / entities / events / cases / patterns / profile). Skipped if `transcript.is_empty()`. |
+| `tools()` | `viking_search`, `viking_read`, `viking_browse`, `viking_remember`, `viking_add_resource`. `viking_add_resource` includes zip-of-directory upload. |
+
+API key is optional (local dev mode runs unauthenticated). Resolution order:
+`api_key_env` → vault key `memory.openviking.api_key` → default env
+`OPENVIKING_API_KEY` → empty (unauthenticated). Startup health probe is
+`GET /health`; failure logs `warn` and continues.
+
+### Operator CLI
+
+`aura memory {status, configure, test, set-key, disable}` — see
+[`docs/cli.md`](../cli.md#aura-memory). Configure is interactive (provider +
+per-field prompts, vault-stash for the API key); memory config is **not**
+hot-reload, so `configure` prints a restart hint.
+
 ## Deferred
 
-- **The first real `Memory` impl.** Out of scope — the trait + all wiring are
-  ready for one to drop in at the single construction point in
-  `runtime.rs::build_managers`. If/when a backend needs an embedding handle,
-  it constructs its own embedding client and threads it through `extra` (no
-  embedding scaffolding lives in the core).
 - Operator/GDPR wipe of memory rows: re-add behind a user-triggered command if a
   future backend needs it (no background sweeper — see CLAUDE.md).
 

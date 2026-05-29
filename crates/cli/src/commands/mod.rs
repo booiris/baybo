@@ -9,6 +9,7 @@ pub mod job;
 pub mod llm;
 pub mod log;
 pub mod mcp;
+pub mod memory;
 pub mod pair;
 pub(crate) mod prompt;
 pub mod secret;

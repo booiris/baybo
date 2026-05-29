@@ -14,6 +14,7 @@ pub async fn run(ctx: &CommandContext, cmd: Commands) -> Result<CommandOutput> {
         Commands::Secret { cmd } => commands::secret::handle(ctx, cmd).await,
         Commands::Pair { cmd } => commands::pair::handle(ctx, cmd).await,
         Commands::Llm { cmd } => commands::llm::handle(ctx, cmd).await,
+        Commands::Memory { cmd } => commands::memory::handle(ctx, cmd).await,
         Commands::ExternalAgent { cmd } => commands::external_agent::handle(ctx, cmd).await,
         Commands::Session { cmd } => commands::session::handle(ctx, cmd).await,
         Commands::Job { cmd } => commands::job::handle(ctx, cmd).await,

@@ -7,7 +7,7 @@ use clap::{CommandFactory, Parser};
 
 use crate::cli::{
     ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, ExternalAgentCmd, JobCmd, LlmCmd,
-    LogCmd, McpCmd, PairCmd, SecretCmd, SessionCmd, SkillsCmd,
+    LogCmd, McpCmd, MemoryCmd, PairCmd, SecretCmd, SessionCmd, SkillsCmd,
 };
 use crate::context::{CommandContext, Invocation};
 use crate::dispatch;
@@ -264,6 +264,9 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
         Commands::Llm {
             cmd: LlmCmd::Add | LlmCmd::Edit | LlmCmd::Remove | LlmCmd::Default,
         } => Err("interactive LLM editor; run it from a shell"),
+        Commands::Memory {
+            cmd: MemoryCmd::Configure | MemoryCmd::SetKey,
+        } => Err("interactive memory editor; run it from a shell"),
         Commands::ExternalAgent {
             cmd: ExternalAgentCmd::Setup | ExternalAgentCmd::Disable | ExternalAgentCmd::Default,
         } => {
@@ -306,6 +309,9 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
         },
         Commands::Llm {
             cmd: LlmCmd::Status | LlmCmd::Probe { .. } | LlmCmd::LiveModel { .. },
+        } => Ok(()),
+        Commands::Memory {
+            cmd: MemoryCmd::Status | MemoryCmd::Test | MemoryCmd::Disable,
         } => Ok(()),
         Commands::ExternalAgent {
             cmd: ExternalAgentCmd::Status,

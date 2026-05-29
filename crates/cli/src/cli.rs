@@ -117,6 +117,15 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: LlmCmd,
     },
+    /// Manage the pluggable long-term memory backend: `status` (current
+    /// provider + sanitised config), `configure` (interactive picker for
+    /// mem0 / open-viking / noop), `test` (health probe), `set-key`
+    /// (store API key in the vault), `disable` (back to noop). Memory
+    /// config is not hot-reload — a restart applies the change.
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
     /// Manage external-agent backends (Claude Code, Codex, Gemini CLI)
     /// used by `spawn_subagent(backend: ...)`. `setup` is an interactive
     /// wizard that picks a kind, prompts for a binary path (empty
@@ -580,6 +589,31 @@ pub enum ExternalAgentCmd {
     /// still needs an explicit `backend`), so it only matters once more
     /// than one kind is enabled.
     Default,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MemoryCmd {
+    /// Print the current memory backend, sanitised config (any
+    /// `api_key`-like fields masked), and resolved API-key status
+    /// (set/missing without exposing the value).
+    Status,
+    /// Interactive picker — pick `mem0` / `open-viking` / `noop`, walk
+    /// every per-provider field with the existing value as the default,
+    /// optionally vault the API key, then persist to the config file.
+    Configure,
+    /// Run a one-shot health probe against the configured backend
+    /// (mem0: lightweight `get_all`; open-viking: `GET /health`).
+    /// Failures are logged as `warn`; the command succeeds either way
+    /// (the runtime treats probe failure as non-fatal too).
+    Test,
+    /// Store the active provider's API key in the vault under
+    /// `memory.<provider>.api_key`. Prompts for the value via a
+    /// masked password reader.
+    SetKey,
+    /// Flip `provider = noop` and `enabled = false`, clear `extra`,
+    /// persist the change. Use to turn memory off without removing
+    /// the saved settings — re-running `configure` brings them back.
+    Disable,
 }
 
 #[derive(Debug, Subcommand)]

@@ -21,6 +21,9 @@
 
 mod error;
 
+pub mod mem0;
+pub mod openviking;
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
