@@ -25,6 +25,7 @@
 
 use std::fs::File;
 use std::io::Write as _;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +34,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use aura_model::{ChatMessage, ContentBlock, TrustLevel};
 use aura_security::SecretVault;
+use aura_security::http::ProxySettings;
 use aura_tools::{Tool, ToolCapability, ToolContext, ToolManifest, ToolOutput};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -55,6 +57,11 @@ const VAULT_KEY: &str = "memory.openviking.api_key";
 const DEFAULT_API_KEY_ENV: &str = "OPENVIKING_API_KEY";
 
 const REMOTE_PREFIXES: &[&str] = &["http://", "https://", "git@", "ssh://", "git://"];
+
+/// Cap on a single local upload — matches `aura_tools::builtin::send_local_file`
+/// (the only other tool that ships local bytes to a remote endpoint). Applies
+/// to both single-file uploads and the zipped-directory path (post-deflation).
+const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 
 pub const TOOL_SEARCH: &str = "viking_search";
 pub const TOOL_READ: &str = "viking_read";
@@ -291,13 +298,30 @@ fn mime_for(name: &str) -> String {
 }
 
 /// OpenViking memory backend. Construct via [`OpenVikingMemory::new`].
+///
+/// Unlike `mem0` this backend ships no circuit breaker (matches the Python
+/// reference) — the default endpoint is loopback / local dev, where a
+/// dropped server during iteration would otherwise pin the breaker open for
+/// the cooldown window. Failures are logged at `warn`/`debug` and swallowed
+/// per call.
 pub struct OpenVikingMemory {
     inner: Arc<OpenVikingInner>,
 }
 
 impl OpenVikingMemory {
-    pub fn new(cfg: OpenVikingConfig, api_key: String) -> Result<Self> {
-        let client = reqwest::Client::builder()
+    /// Build the backend. `proxy` is threaded into the underlying
+    /// `reqwest::Client` via [`aura_security::http::client_builder`] — the
+    /// crate-wide outbound-egress chokepoint — so a deployment-configured
+    /// proxy applies to recall/write/tool traffic. `ALWAYS_DIRECT`
+    /// (`localhost,127.0.0.1,::1`) is honoured, so the default loopback
+    /// endpoint stays direct.
+    pub fn new(
+        cfg: OpenVikingConfig,
+        api_key: String,
+        proxy: Option<&ProxySettings>,
+    ) -> Result<Self> {
+        let client = aura_security::http::client_builder(proxy)
+            .map_err(|e| MemoryError::Backend(format!("openviking client build failed: {e}")))?
             .timeout(HTTP_TIMEOUT)
             .build()
             .map_err(|e| MemoryError::Backend(format!("openviking client build failed: {e}")))?;
@@ -457,7 +481,12 @@ impl Memory for OpenVikingMemory {
             tool_pair(Arc::new(VikingRememberTool {
                 inner: Arc::clone(&inner),
             })),
-            tool_pair(Arc::new(VikingAddResourceTool { inner })),
+            // `viking_add_resource` also reads the local filesystem when handed
+            // a local URL; declare both capabilities for governance accuracy.
+            tool_pair_with_caps(
+                Arc::new(VikingAddResourceTool { inner }),
+                vec![ToolCapability::Http, ToolCapability::ReadFile],
+            ),
         ]
     }
 }
@@ -492,12 +521,19 @@ fn parse_search_results(resp: &Value) -> Vec<RecalledMemory> {
 }
 
 fn tool_pair(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
+    tool_pair_with_caps(tool, vec![ToolCapability::Http])
+}
+
+fn tool_pair_with_caps(
+    tool: Arc<dyn Tool>,
+    capabilities: Vec<ToolCapability>,
+) -> (Arc<dyn Tool>, ToolManifest) {
     let manifest = ToolManifest {
         name: tool.name().to_string(),
         description: tool.description(),
         trust_level: TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
-        capabilities: vec![ToolCapability::Http],
+        capabilities,
     };
     (tool, manifest)
 }
@@ -641,8 +677,6 @@ impl Tool for VikingReadTool {
         };
 
         let endpoint = match level.as_str() {
-            "abstract" if resolved != uri => "/api/v1/content/abstract",
-            "overview" if resolved != uri => "/api/v1/content/overview",
             "abstract" => "/api/v1/content/abstract",
             "overview" => "/api/v1/content/overview",
             _ => "/api/v1/content/read",
@@ -915,6 +949,20 @@ impl Tool for VikingAddResourceTool {
         })
     }
 
+    /// Declare ReadFile access for any local URL — the executor's approval
+    /// gate skips ReadFile in this codebase, so this is more about the
+    /// governance contract than per-call prompting. The sensitive-path +
+    /// size + SSRF gates inside `execute` are the load-bearing checks.
+    fn accessed_resources(&self, params: &Value) -> Vec<aura_model::ResourceAccess> {
+        let Some(url) = params.get("url").and_then(|v| v.as_str()) else {
+            return Vec::new();
+        };
+        match classify_resource(url) {
+            ResourceSource::Local(p) => vec![aura_model::ResourceAccess::ReadFile { path: p }],
+            ResourceSource::Remote => Vec::new(),
+        }
+    }
+
     async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
         let url = params
             .get("url")
@@ -942,12 +990,30 @@ impl Tool for VikingAddResourceTool {
         let mut cleanup: Option<PathBuf> = None;
         let result = match source {
             ResourceSource::Remote => {
+                // The model can hand us an arbitrary http(s) URL that the
+                // OpenViking server will fetch on our behalf — without this
+                // guard the server becomes an SSRF proxy onto loopback /
+                // RFC1918 / link-local. Mirrors WebFetch's `validate_url_with`
+                // for the http(s) subset; git/ssh URLs are allowed through
+                // since they are not arbitrary HTTP and the credential model
+                // is upstream.
+                reject_private_remote_url(&url)?;
                 payload.insert("path".into(), json!(url));
                 self.inner
                     .post_json("/api/v1/resources", user_id, &Value::Object(payload))
                     .await
             }
             ResourceSource::Local(path) => {
+                // Sensitive-path guard mirrors `send_local_file`: this is the
+                // only other tool that ships local bytes to a remote endpoint,
+                // and the executor's approval gate skips ReadFile entirely
+                // (see `tool_executor` / `feedback_read_no_confirm`), so
+                // `is_sensitive_path` is the load-bearing check.
+                if aura_security::is_sensitive_path(&path) {
+                    return Err(aura_tools::ToolError::Execution(format!(
+                        "Refusing to upload sensitive path: {url}"
+                    )));
+                }
                 if !path.exists() {
                     return Err(aura_tools::ToolError::Execution(format!(
                         "Local resource path does not exist: {url}"
@@ -962,9 +1028,18 @@ impl Tool for VikingAddResourceTool {
                                 .unwrap_or("upload")
                         ),
                     );
-                    let zip = zip_directory(&path).map_err(|e| {
-                        aura_tools::ToolError::Execution(format!("zip directory failed: {e}"))
-                    })?;
+                    let dir = path.clone();
+                    // WalkDir + read + deflate is fully synchronous; running
+                    // it on the tokio worker would stall other tasks for big
+                    // trees. spawn_blocking releases the worker.
+                    let zip = tokio::task::spawn_blocking(move || zip_directory(&dir))
+                        .await
+                        .map_err(|e| {
+                            aura_tools::ToolError::Execution(format!("zip join failed: {e}"))
+                        })?
+                        .map_err(|e| {
+                            aura_tools::ToolError::Execution(format!("zip directory failed: {e}"))
+                        })?;
                     cleanup = Some(zip.clone());
                     zip
                 } else if path.is_file() {
@@ -982,6 +1057,21 @@ impl Tool for VikingAddResourceTool {
                         "Unsupported local resource path: {url}"
                     )));
                 };
+                // Size cap (matches `send_local_file::MAX_BYTES`). Applies
+                // to the zipped archive too, so a model can't point at /
+                // and force a multi-gig upload.
+                let size = tokio::fs::metadata(&upload_path)
+                    .await
+                    .map_err(|e| {
+                        aura_tools::ToolError::Execution(format!("stat upload path: {e}"))
+                    })?
+                    .len();
+                if size > MAX_UPLOAD_BYTES {
+                    let _ = cleanup.take().map(|p| std::fs::remove_file(p).ok());
+                    return Err(aura_tools::ToolError::Execution(format!(
+                        "{url} is {size} bytes, exceeds the {MAX_UPLOAD_BYTES}-byte cap"
+                    )));
+                }
                 let temp_file_id = self
                     .inner
                     .upload_temp_file(user_id, &upload_path)
@@ -1013,6 +1103,44 @@ impl Tool for VikingAddResourceTool {
             "message": "Resource queued for processing. Use viking_search after a moment to find it.",
         })))
     }
+}
+
+/// Reject http(s) URLs whose host is `localhost` (or `*.localhost`) or whose
+/// literal IP falls into a blocked SSRF range (loopback / RFC1918 /
+/// link-local / unspecified / CGNAT / multicast / reserved). Hostname-target
+/// SSRF on a non-loopback name is left to the OpenViking server's network
+/// boundary — same trade-off as WebFetch's URL pre-check.
+fn reject_private_remote_url(url: &str) -> aura_tools::Result<()> {
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Ok(());
+    }
+    let parsed = url::Url::parse(url)
+        .map_err(|e| aura_tools::ToolError::InvalidParams(format!("invalid url `{url}`: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| aura_tools::ToolError::InvalidParams("url has no host".into()))?;
+    let host_lc = host.to_ascii_lowercase();
+    if host_lc == "localhost"
+        || host_lc == "localhost.localdomain"
+        || host_lc.ends_with(".localhost")
+    {
+        return Err(aura_tools::ToolError::Execution(format!(
+            "host `{host}` blocked (loopback-like name)"
+        )));
+    }
+    let stripped = host_lc
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(&host_lc);
+    if let Ok(addr) = stripped.parse::<IpAddr>()
+        && aura_security::is_blocked_ip(&addr, false)
+    {
+        return Err(aura_tools::ToolError::Execution(format!(
+            "ip `{addr}` blocked"
+        )));
+    }
+    Ok(())
 }
 
 enum ResourceSource {

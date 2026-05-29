@@ -30,6 +30,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use aura_model::{ContentBlock, TrustLevel};
 use aura_security::SecretVault;
+use aura_security::http::ProxySettings;
 use aura_tools::{Tool, ToolCapability, ToolContext, ToolManifest, ToolOutput};
 use parking_lot::Mutex;
 use reqwest::header;
@@ -43,6 +44,10 @@ const DEFAULT_BASE_URL: &str = "https://api.mem0.ai";
 const DEFAULT_AGENT_ID: &str = "aura";
 const DEFAULT_TOP_K: usize = 5;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Probe is best-effort and runs inline during `build_managers`; keep the
+/// per-request budget short so an unreachable Mem0 endpoint does not stall
+/// boot up to `HTTP_TIMEOUT` (mirrors openviking's `HEALTH_TIMEOUT`).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const VAULT_KEY: &str = "memory.mem0.api_key";
 const DEFAULT_API_KEY_ENV: &str = "MEM0_API_KEY";
 
@@ -218,7 +223,10 @@ impl Mem0Memory {
     /// Build the backend from typed config + resolved API key. The
     /// `extra` blob from [`aura_config::MemoryConfig`] is parsed into a
     /// [`Mem0Config`] by the caller (see [`Mem0Config`] / `serde_json::from_value`).
-    pub fn new(cfg: Mem0Config, api_key: String) -> Result<Self> {
+    /// `proxy` threads the deployment-configured egress proxy through
+    /// [`aura_security::http::client_builder`] — the crate-wide outbound
+    /// chokepoint.
+    pub fn new(cfg: Mem0Config, api_key: String, proxy: Option<&ProxySettings>) -> Result<Self> {
         if api_key.is_empty() {
             return Err(MemoryError::Backend(
                 "mem0 API key missing — set api_key_env, MEM0_API_KEY, or vault \
@@ -226,7 +234,8 @@ impl Mem0Memory {
                     .into(),
             ));
         }
-        let client = reqwest::Client::builder()
+        let client = aura_security::http::client_builder(proxy)
+            .map_err(|e| MemoryError::Backend(format!("mem0 client build failed: {e}")))?
             .timeout(HTTP_TIMEOUT)
             .build()
             .map_err(|e| MemoryError::Backend(format!("mem0 client build failed: {e}")))?;
@@ -242,17 +251,24 @@ impl Mem0Memory {
         Ok(Self { inner })
     }
 
-    /// Best-effort startup probe: a small `get_all` call. Logs `warn` on
-    /// failure but does not block startup — the breaker handles persistent
-    /// outages later.
+    /// Best-effort startup probe: a small `get_all` call with a tight
+    /// [`PROBE_TIMEOUT`] so an unreachable Mem0 endpoint does not stall
+    /// `build_managers`. Logs `warn` on failure but does not block startup
+    /// — the breaker handles persistent outages later.
     pub async fn probe(&self) {
         let body = json!({
             "filters": {"AND": [{"user_id": "__aura_probe__"}]},
             "page": 1,
             "page_size": 1,
         });
-        if let Err(e) = self.inner.post_json("/v2/memories", &body).await {
-            warn!(error = %e, "mem0 startup probe failed; continuing");
+        match tokio::time::timeout(PROBE_TIMEOUT, self.inner.post_json("/v2/memories", &body)).await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!(error = %e, "mem0 startup probe failed; continuing"),
+            Err(_) => warn!(
+                timeout_secs = PROBE_TIMEOUT.as_secs(),
+                "mem0 startup probe timed out; continuing"
+            ),
         }
     }
 }
@@ -669,7 +685,7 @@ mod tests {
 
     #[test]
     fn missing_api_key_fails_construction() {
-        let result = Mem0Memory::new(Mem0Config::default(), String::new());
+        let result = Mem0Memory::new(Mem0Config::default(), String::new(), None);
         match result {
             Err(e) => assert!(e.to_string().contains("API key"), "got: {e}"),
             Ok(_) => panic!("expected missing-API-key error"),

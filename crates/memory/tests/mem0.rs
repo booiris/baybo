@@ -38,7 +38,7 @@ fn cfg(server_url: &str, top_k: usize) -> Mem0Config {
 }
 
 fn build(server_url: &str) -> Mem0Memory {
-    Mem0Memory::new(cfg(server_url, 5), "test-key".into()).unwrap()
+    Mem0Memory::new(cfg(server_url, 5), "test-key".into(), None).unwrap()
 }
 
 // ---------------------------------------------------------------------------

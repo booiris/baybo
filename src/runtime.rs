@@ -573,7 +573,8 @@ pub async fn build_managers(
     // `tool_registry` is still mutable so the impl's `tools()` can be
     // registered as builtins. `None` (the no-op path) when
     // `config.memory.enabled = false` or `provider = noop`.
-    let memory = build_memory_backend(&config, &secret_vault, &mut tool_registry).await;
+    let memory =
+        build_memory_backend(&config, &secret_vault, proxy.as_ref(), &mut tool_registry).await;
 
     // Freeze the registry now that mutation is done; downstream
     // consumers (`tool_executor`, `McpReconciler`, the actor spawner)
@@ -691,6 +692,7 @@ pub async fn build_managers(
 async fn build_memory_backend(
     config: &AuraConfig,
     vault: &Arc<SecretVault>,
+    proxy: Option<&aura_security::http::ProxySettings>,
     tool_registry: &mut aura_tools::ToolRegistry,
 ) -> Option<Arc<dyn Memory>> {
     if !config.memory.enabled {
@@ -718,7 +720,7 @@ async fn build_memory_backend(
                     return None;
                 }
             };
-            match aura_memory::mem0::Mem0Memory::new(cfg, key) {
+            match aura_memory::mem0::Mem0Memory::new(cfg, key, proxy) {
                 Ok(m) => {
                     m.probe().await;
                     Arc::new(m)
@@ -738,7 +740,7 @@ async fn build_memory_backend(
                 }
             };
             let key = aura_memory::openviking::resolve_api_key(&cfg, Some(vault.as_ref())).await;
-            match aura_memory::openviking::OpenVikingMemory::new(cfg, key) {
+            match aura_memory::openviking::OpenVikingMemory::new(cfg, key, proxy) {
                 Ok(m) => {
                     m.probe().await;
                     Arc::new(m)

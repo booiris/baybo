@@ -8,11 +8,9 @@
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use aura_config::{AuraConfig, MemoryProvider};
 use aura_memory::{mem0, openviking};
-use aura_security::SecretVault;
 use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
 use serde_json::{Value, json};
 
@@ -304,7 +302,8 @@ async fn test(ctx: &CommandContext) -> Result<CommandOutput> {
                     "mem0 API key missing — run `aura memory set-key` first".into(),
                 ));
             }
-            let m = mem0::Mem0Memory::new(cfg, key)
+            let proxy = ctx.proxy_settings();
+            let m = mem0::Mem0Memory::new(cfg, key, proxy.as_ref())
                 .map_err(|e| CliError::Config(format!("construct mem0: {e}")))?;
             m.probe().await;
             Ok(CommandOutput {
@@ -315,7 +314,8 @@ async fn test(ctx: &CommandContext) -> Result<CommandOutput> {
         MemoryProvider::OpenViking => {
             let cfg = openviking::parse_extra(&mem.extra)?;
             let key = openviking::resolve_api_key(&cfg, ctx.secret_vault.as_deref()).await;
-            let m = openviking::OpenVikingMemory::new(cfg, key)
+            let proxy = ctx.proxy_settings();
+            let m = openviking::OpenVikingMemory::new(cfg, key, proxy.as_ref())
                 .map_err(|e| CliError::Config(format!("construct openviking: {e}")))?;
             m.probe().await;
             Ok(CommandOutput {
@@ -395,10 +395,6 @@ fn require_tty() -> Result<()> {
     }
     Ok(())
 }
-
-// Silence unused-imports in some configurations.
-#[allow(dead_code)]
-fn _arc_ref(_: &Arc<SecretVault>) {}
 
 impl From<aura_memory::MemoryError> for CliError {
     fn from(err: aura_memory::MemoryError) -> Self {

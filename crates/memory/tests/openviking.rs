@@ -45,7 +45,7 @@ fn cfg(server_url: &str) -> OpenVikingConfig {
 }
 
 fn build(server_url: &str) -> OpenVikingMemory {
-    OpenVikingMemory::new(cfg(server_url), "test-key".into()).unwrap()
+    OpenVikingMemory::new(cfg(server_url), "test-key".into(), None).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +449,61 @@ async fn tool_add_resource_passes_remote_url_as_path() {
 }
 
 #[tokio::test]
+async fn tool_add_resource_refuses_sensitive_local_path() {
+    let app = Router::new();
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+    let (tool, _) = m
+        .tools()
+        .into_iter()
+        .find(|(t, _)| t.name() == TOOL_ADD_RESOURCE)
+        .unwrap();
+    let ctx = tool_context("alice");
+    // Pick a path that `is_sensitive_path` matches regardless of host
+    // layout — the function uses suffix / directory matching on canonical
+    // names, so a home-dir-style `~/.ssh/id_rsa` triggers it.
+    let err = tool
+        .execute(json!({"url": "~/.ssh/id_rsa"}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("sensitive"), "got: {err}");
+}
+
+#[tokio::test]
+async fn tool_add_resource_refuses_loopback_remote_url() {
+    let app = Router::new();
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+    let (tool, _) = m
+        .tools()
+        .into_iter()
+        .find(|(t, _)| t.name() == TOOL_ADD_RESOURCE)
+        .unwrap();
+    let ctx = tool_context("alice");
+    // Loopback literal IP must be blocked even via the OpenViking server
+    // (the server would otherwise become an SSRF fetcher onto our box).
+    let err = tool
+        .execute(json!({"url": "http://127.0.0.1:9000/x"}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("blocked"), "got: {err}");
+
+    // Loopback hostname names also blocked.
+    let err = tool
+        .execute(json!({"url": "http://localhost/x"}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("blocked"), "got: {err}");
+
+    // RFC1918 literal IP blocked.
+    let err = tool
+        .execute(json!({"url": "http://10.0.0.5/x"}), &ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("blocked"), "got: {err}");
+}
+
+#[tokio::test]
 async fn tool_add_resource_rejects_both_to_and_parent() {
     let app = Router::new();
     let server = spawn(app).await;
@@ -535,9 +590,20 @@ async fn tools_each_carry_a_matching_manifest() {
     for (tool, manifest) in &tools {
         assert_eq!(tool.name(), manifest.name);
         assert!(!manifest.description.is_empty());
-        assert!(matches!(
-            manifest.capabilities.first(),
-            Some(aura_tools::ToolCapability::Http)
-        ));
+        assert!(
+            manifest
+                .capabilities
+                .contains(&aura_tools::ToolCapability::Http),
+            "{} should declare Http",
+            tool.name()
+        );
+        if tool.name() == TOOL_ADD_RESOURCE {
+            assert!(
+                manifest
+                    .capabilities
+                    .contains(&aura_tools::ToolCapability::ReadFile),
+                "viking_add_resource must declare ReadFile (it reads local paths)"
+            );
+        }
     }
 }
