@@ -261,12 +261,12 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
             new_config.memory.extra = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Config(format!("serialise openviking extra: {e}")))?;
 
-            // Local dev (loopback) runs unauthenticated — skip the API-key
-            // prompt entirely. Remote endpoints get one.
-            if !is_loopback_endpoint(&endpoint) {
-                secret_outcome =
-                    Some(prompt_and_store_api_key(ctx, &key_name, "OpenViking").await?);
-            }
+            // OpenViking auth is optional (server-controlled), so just ask
+            // unconditionally — the inline prompt already says "press
+            // enter to skip", and `prompt_and_store_api_key`'s Skipped
+            // outcome surfaces a hint for setting it later. Don't try to
+            // guess from the endpoint URL.
+            secret_outcome = Some(prompt_and_store_api_key(ctx, &key_name, "OpenViking").await?);
         }
     }
 
@@ -415,25 +415,6 @@ async fn test(ctx: &CommandContext) -> Result<CommandOutput> {
     }
 }
 
-/// Hostname / IP-literal heuristic for "this OpenViking server is running
-/// on the local box" — used to skip the API-key prompt during `setup`,
-/// since the bundled local-dev mode is unauthenticated.
-fn is_loopback_endpoint(endpoint: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(endpoint) else {
-        return false;
-    };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    let host_lc = host.to_ascii_lowercase();
-    matches!(
-        host_lc.as_str(),
-        "localhost" | "localhost.localdomain" | "127.0.0.1" | "::1"
-    ) || host_lc.ends_with(".localhost")
-        || host_lc.starts_with("127.")
-}
-
 // ---------------------------------------------------------------------------
 // disable
 // ---------------------------------------------------------------------------
@@ -564,27 +545,5 @@ mod tests {
         let sanitized = sanitize_extra(&extra);
         assert_eq!(sanitized["api_key"], "***");
         assert_eq!(sanitized["agent_id"], "test");
-    }
-
-    #[test]
-    fn is_loopback_endpoint_matches_common_local_hosts() {
-        for ep in [
-            "http://localhost:1933",
-            "https://localhost",
-            "http://127.0.0.1:1933",
-            "http://127.5.6.7/",
-            "http://[::1]:1933",
-            "http://my.localhost:8080",
-        ] {
-            assert!(is_loopback_endpoint(ep), "should match: {ep}");
-        }
-        for ep in [
-            "https://api.mem0.ai",
-            "http://10.0.0.5:1933",
-            "http://example.com",
-            "not-a-url",
-        ] {
-            assert!(!is_loopback_endpoint(ep), "should not match: {ep}");
-        }
     }
 }
