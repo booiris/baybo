@@ -54,6 +54,7 @@ async fn admin_router() -> axum::Router {
         tool_registry: std::sync::Arc::clone(&tg.deps.tool_registry),
         channel_registry: std::sync::Arc::clone(&tg.deps.channel_registry),
         llm_pool: tg.deps.llm_pool.clone(),
+        supervisor: tg.deps.supervisor.clone(),
         config_reloader: tg.deps.config_reloader.clone(),
         log_buffer: std::sync::Arc::clone(&tg.deps.log_buffer),
         channel_bot_store: tg.deps.stores.channel_bot.clone(),

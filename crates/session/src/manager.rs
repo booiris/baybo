@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use aura_model::{ChannelType, ChatMessage, Session, SessionId, SessionState, TriggerSource, User};
+use aura_model::{
+    ChannelType, ChatMessage, LlmEntryName, Session, SessionId, SessionState, TriggerSource, User,
+};
 use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, warn};
 
@@ -635,6 +637,23 @@ impl SessionManager {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
         debug!(session_id = %session_id, hidden, "toggled session hidden");
+        Ok(())
+    }
+
+    /// Set (or clear, with `None`) the session's per-session LLM pin —
+    /// the chat model switch. Targeted flat-column write that survives a
+    /// concurrent `touch`; see [`aura_store::SessionStore::set_last_llm`].
+    /// Returns `Err(NotFound)` when the session id is unknown.
+    pub async fn set_last_llm(
+        &self,
+        session_id: &SessionId,
+        llm: Option<&LlmEntryName>,
+    ) -> Result<()> {
+        let updated = self.store.set_last_llm(session_id, llm).await?;
+        if !updated {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        debug!(session_id = %session_id, llm = ?llm, "set session llm pin");
         Ok(())
     }
 

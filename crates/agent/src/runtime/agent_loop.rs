@@ -508,6 +508,18 @@ impl AgentLoop {
         self.context_manager.set_active_model_context_window(window);
     }
 
+    /// Re-pin which `aura.json` entry this loop resolves against and
+    /// apply it now (swaps the client + context window via
+    /// [`Self::refresh_active_llm`]) so the next turn runs on the new
+    /// model. `None` reverts to the pool default. Drives the chat
+    /// per-session model switch ([`crate::actor::AgentMessage::SetModel`]);
+    /// the actor also persists the pin to `session.state.last_llm` so it
+    /// survives eviction.
+    pub fn set_initial_llm(&mut self, llm: Option<LlmEntryName>) {
+        self.initial_llm = llm;
+        self.refresh_active_llm();
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &mut self,

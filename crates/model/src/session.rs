@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::approval::ApprovedResource;
 use crate::ids::{JobId, SessionId};
+use crate::llm_entry_name::LlmEntryName;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
@@ -294,6 +295,19 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_type: Option<String>,
 
+    /// Per-session LLM pin: the `aura.json` entry name this session's
+    /// turns should resolve against, overriding `default-llm`. `None`
+    /// (the default) means "follow the pool default", so a session that
+    /// was never switched tracks global `default-llm` changes. Set via
+    /// the chat `PUT /v1/chat/sessions/{id}/model` endpoint and read by
+    /// the actor spawner (`Router::handle_incoming`) as the loop's
+    /// `initial_llm`; a live actor is re-pinned in place via
+    /// `AgentMessage::SetModel`. A stranded name (entry later removed)
+    /// degrades safely — `LlmClientPool::resolve` falls back to the
+    /// default with a warn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_llm: Option<LlmEntryName>,
+
     /// Reserved extension fields for plugins and experiments.
     #[serde(default)]
     pub extra: HashMap<String, Value>,
@@ -434,5 +448,30 @@ mod tests {
         let s = serde_json::to_string(&p).unwrap();
         let back: BackgroundCompressionPayload = serde_json::from_str(&s).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn session_state_last_llm_round_trip() {
+        let state = SessionState {
+            last_llm: Some(LlmEntryName::from("claude-opus")),
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&state).unwrap();
+        let back: SessionState = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.last_llm, Some(LlmEntryName::from("claude-opus")));
+    }
+
+    #[test]
+    fn session_state_last_llm_defaults_to_none() {
+        // Legacy rows persisted before the field existed must deserialize
+        // with `last_llm == None`, and an unpinned state must not emit the
+        // key (skip_serializing_if) so the JSON stays lean.
+        let back: SessionState = serde_json::from_str("{}").unwrap();
+        assert_eq!(back.last_llm, None);
+        let s = serde_json::to_string(&SessionState::default()).unwrap();
+        assert!(
+            !s.contains("last_llm"),
+            "unset last_llm must not serialize: {s}"
+        );
     }
 }

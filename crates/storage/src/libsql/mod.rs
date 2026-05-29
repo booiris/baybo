@@ -150,6 +150,13 @@ impl LibsqlPool {
                     -- does NOT exclude hidden rows, so admin / trace
                     -- surfaces still see them.
                     hidden                INTEGER NOT NULL DEFAULT 0,
+                    -- Per-session LLM pin (chat model switch). Flat column,
+                    -- NULL ⇒ follow `default-llm`. Like `hidden`, it is owned
+                    -- by a targeted UPDATE (`set_last_llm`) and the DO UPDATE
+                    -- in `save` omits it, so a concurrent `touch` (load + full
+                    -- save) can't clobber a just-set pin; `get` patches
+                    -- `Session.state.last_llm` from this column on read.
+                    last_llm              TEXT,
                     data                  TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_root
@@ -446,7 +453,10 @@ impl LibsqlPool {
         // migrations to this list rather than mutating the CREATE
         // TABLE — fresh DBs pick the column up from CREATE, existing
         // DBs from the ALTER.
-        let migrations: &[&str] = &["ALTER TABLE sessions ADD COLUMN parent_span_id TEXT"];
+        let migrations: &[&str] = &[
+            "ALTER TABLE sessions ADD COLUMN parent_span_id TEXT",
+            "ALTER TABLE sessions ADD COLUMN last_llm TEXT",
+        ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {
                 let msg = e.to_string();

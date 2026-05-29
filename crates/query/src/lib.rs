@@ -1284,6 +1284,20 @@ mod tests {
                 None => Ok(false),
             }
         }
+        async fn set_last_llm(
+            &self,
+            id: &SessionId,
+            llm: Option<&aura_model::LlmEntryName>,
+        ) -> std::result::Result<bool, aura_store::StorageError> {
+            let mut data = self.sessions.lock();
+            match data.get_mut(id) {
+                Some(s) => {
+                    s.state.last_llm = llm.cloned();
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
         async fn delete(
             &self,
             _id: &SessionId,

@@ -29,9 +29,10 @@
 
 use std::collections::HashMap;
 
+use aura_agent::actor::AgentMessage;
 use aura_channels::wire::{SessionPatch, SlashCommandSpec};
 use aura_model::{
-    ChannelType, ChatMessage, ContentBlock, MessageSource, Role, Session, SessionId,
+    ChannelType, ChatMessage, ContentBlock, LlmEntryName, MessageSource, Role, Session, SessionId,
     ThinkingContent, TriggerSource, User,
 };
 use axum::Json;
@@ -55,6 +56,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(create_session))
         .routes(routes!(list_sessions))
         .routes(routes!(get_session))
+        .routes(routes!(set_session_model))
         .routes(routes!(delete_session))
         .routes(routes!(unhide_session))
         .routes(routes!(refresh_session_token))
@@ -296,6 +298,12 @@ pub struct ChatSessionDetail {
     /// scroll-up pagination armed. `false` when the slice already
     /// includes the session's first message.
     pub has_more: bool,
+    /// Per-session LLM pin (`session.state.last_llm`): the `aura.json`
+    /// entry name this session's turns resolve against, or `null` to
+    /// follow `default-llm`. Drives the chat header model picker's
+    /// initial selection. Set via `PUT /v1/chat/sessions/{id}/model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_llm: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -558,6 +566,107 @@ async fn get_session(
         hidden: session.hidden,
         transcript,
         has_more,
+        last_llm: session.state.last_llm.as_ref().map(|n| n.to_string()),
+    }))
+}
+
+/// Request body for `PUT /v1/chat/sessions/{session_id}/model`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetSessionModelRequest {
+    /// `aura.json` LLM entry name to pin this session to, or `null`
+    /// (absent) to clear the pin and follow `default-llm`. Must match a
+    /// configured entry — see `GET /v1/llm/models` → `items[].name`.
+    #[serde(default)]
+    pub llm: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SetSessionModelResponse {
+    /// The pin now in effect: the entry name, or `null` for `default-llm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_llm: Option<String>,
+    /// `true` when a live actor was re-pinned in place (applies on the
+    /// session's next turn); `false` when only the persisted state was
+    /// updated because no actor is currently running (the next user
+    /// message spawns one that reads the pin).
+    pub applied_to_live_actor: bool,
+}
+
+#[utoipa::path(
+    put,
+    path = "/chat/sessions/{session_id}/model",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Session id to re-pin"),
+    ),
+    request_body = SetSessionModelRequest,
+    responses(
+        (status = 200, description = "Per-session model pin updated; applies from the session's next turn", body = SetSessionModelResponse),
+        (status = 400, description = "Unknown LLM entry name", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn set_session_model(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<SetSessionModelRequest>,
+) -> Result<Json<SetSessionModelResponse>> {
+    // Same web-chat scoping as get/hide/token — a non-`http` id 404s.
+    // We only need the existence/scope check, not the loaded blob:
+    // persistence goes through the targeted `set_last_llm` below.
+    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
+
+    // Validate against the live pool; `None`/empty clears the pin.
+    // `resolve` would fall back safely on a stranded name, but a 400 here
+    // gives the operator a crisp error instead of a silent default.
+    let pin: Option<LlmEntryName> = match req.llm.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(name) => {
+            let known = state
+                .llm_pool
+                .read()
+                .entry_names()
+                .iter()
+                .any(|e| e.as_str() == name);
+            if !known {
+                return Err(GatewayError::BadRequest(format!(
+                    "unknown LLM entry {name:?}; see GET /v1/llm/models for valid names"
+                )));
+            }
+            Some(LlmEntryName::from(name))
+        }
+    };
+
+    // Persist the pin durably FIRST, via a targeted flat-column write
+    // (`set_last_llm`). Unlike a full-session `save`, this can't be
+    // clobbered by a concurrent `touch` (load + full blob save fired on
+    // every inbound message) — the same flat-column discipline the
+    // `hidden` flag uses. It is synchronous, so a storage failure
+    // surfaces as an error here instead of a false 200, and it is
+    // authoritative for any actor spawned later (the spawner reads
+    // `session.state.last_llm`, which `get` patches from this column).
+    state
+        .session_manager
+        .set_last_llm(&sid, pin.as_ref())
+        .await
+        .map_err(|e| GatewayError::Internal(format!("persist session model pin: {e}")))?;
+
+    // Then re-pin any *live* actor in memory so the switch takes effect
+    // on its next turn without waiting for eviction + rehydration.
+    // Unconditional: a `false` return just means no actor is live right
+    // now, in which case the persisted pin above already covers the next
+    // spawn. (A spawn racing in the µs window between this persist and
+    // the route can still start on the prior pin for its lifetime; the
+    // store stays correct, so it self-heals on the next eviction.)
+    let applied_to_live_actor = state
+        .supervisor
+        .route(&sid, AgentMessage::SetModel { llm: pin.clone() })
+        .await;
+
+    Ok(Json(SetSessionModelResponse {
+        last_llm: pin.map(|n| n.to_string()),
+        applied_to_live_actor,
     }))
 }
 

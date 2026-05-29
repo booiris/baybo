@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aura_agent::LlmPoolHandle;
+use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::{CronScheduler, SessionManager, service::ShutdownSignal};
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_config::AuraConfig;
@@ -80,6 +81,10 @@ pub struct GatewayDeps {
     pub tool_registry: Arc<ToolRegistry>,
     pub channel_registry: Arc<ChannelRegistry>,
     pub llm_pool: LlmPoolHandle,
+    /// Actor registry, used by `PUT /v1/chat/sessions/{id}/model` to
+    /// route an `AgentMessage::SetModel` to a live actor (re-pin in
+    /// place). Cheap to clone — backed by an `Arc<DashMap>`.
+    pub supervisor: AgentSupervisor,
     /// Triggers an in-process config hot-reload; held so admin endpoints
     /// and the SIGHUP handler can call it. See docs/config-hot-reload.md.
     pub config_reloader: Arc<dyn ConfigReloader>,
@@ -146,6 +151,9 @@ pub struct AdminState {
     pub tool_registry: Arc<ToolRegistry>,
     pub channel_registry: Arc<ChannelRegistry>,
     pub llm_pool: LlmPoolHandle,
+    /// Actor registry — lets the chat model-switch endpoint re-pin a
+    /// live session's LLM via `AgentMessage::SetModel`.
+    pub supervisor: AgentSupervisor,
     pub config_reloader: Arc<dyn ConfigReloader>,
     pub log_buffer: Arc<LogBuffer>,
     pub channel_bot_store: Arc<dyn ChannelBotStore>,
@@ -204,6 +212,7 @@ impl AdminState {
             tool_registry: Arc::clone(&deps.tool_registry),
             channel_registry: Arc::clone(&deps.channel_registry),
             llm_pool: Arc::clone(&deps.llm_pool),
+            supervisor: deps.supervisor.clone(),
             config_reloader: Arc::clone(&deps.config_reloader),
             log_buffer: Arc::clone(&deps.log_buffer),
             channel_bot_store: Arc::clone(&deps.stores.channel_bot),

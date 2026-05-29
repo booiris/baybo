@@ -216,6 +216,13 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     let (incoming_tx, incoming_rx) = mpsc::channel(16);
     let channel_tokens = ChannelTokenTable::new();
 
+    // The gateway test harness spawns no actors, so the supervisor stays
+    // empty: `route` always returns false (the model-switch endpoint then
+    // takes its persist-directly branch) and the response channel is
+    // never driven. A throwaway sender satisfies the constructor.
+    let (agent_output_tx, _agent_output_rx) = mpsc::channel(1);
+    let supervisor = aura_agent::supervisor::AgentSupervisor::new(agent_output_tx);
+
     let deps = GatewayDeps {
         config,
         config_path: None,
@@ -227,6 +234,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         tool_registry,
         channel_registry,
         llm_pool,
+        supervisor,
         config_reloader: Arc::new(StubConfigReloader),
         admin_token: TEST_ADMIN_TOKEN.to_string(),
         log_buffer: LogBuffer::new(256),

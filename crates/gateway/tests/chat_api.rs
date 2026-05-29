@@ -218,6 +218,7 @@ fn build_admin_state(
         tool_registry: Arc::clone(&tg.deps.tool_registry),
         channel_registry: Arc::clone(&tg.deps.channel_registry),
         llm_pool: tg.deps.llm_pool.clone(),
+        supervisor: tg.deps.supervisor.clone(),
         config_reloader: tg.deps.config_reloader.clone(),
         log_buffer: Arc::clone(&tg.deps.log_buffer),
         channel_bot_store: tg.deps.stores.channel_bot.clone(),
@@ -262,6 +263,34 @@ async fn post(router: &axum::Router, uri: &str, body: Body, expected: StatusCode
     serde_json::from_slice(&bytes).expect("response is json")
 }
 
+async fn put(router: &axum::Router, uri: &str, body: Body, expected: StatusCode) -> Value {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(
+        response.status(),
+        expected,
+        "PUT {uri} expected {expected:?} got {:?}",
+        response.status(),
+    );
+    let bytes = body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("body bytes");
+    if bytes.is_empty() {
+        return Value::Null;
+    }
+    serde_json::from_slice(&bytes).expect("response is json")
+}
+
 async fn get(router: &axum::Router, uri: &str, expected: StatusCode) -> Value {
     let response = router
         .clone()
@@ -284,6 +313,86 @@ async fn get(router: &axum::Router, uri: &str, expected: StatusCode) -> Value {
         .await
         .expect("body bytes");
     serde_json::from_slice(&bytes).expect("response is json")
+}
+
+// Per-session model switch: `PUT /v1/chat/sessions/{id}/model` rejects
+// an unknown entry name, persists a valid pin (no live actor in this
+// harness, so it takes the persist-directly branch), surfaces it on the
+// session detail, and clears it on `null`.
+#[tokio::test]
+async fn set_session_model_validates_persists_and_clears() {
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let http_config = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &http_config).expect("install http channel");
+
+    let state = build_admin_state(&tg);
+    let router = build_router(state.clone());
+
+    let cred = post(&router, "/v1/chat/sessions", Body::empty(), StatusCode::OK).await;
+    let session_id = cred["session_id"].as_str().expect("session_id").to_owned();
+
+    // The stub pool keys its single entry by the model id, so the active
+    // model id (from `GET /v1/llm`) doubles as the valid entry name.
+    let llm = get(&router, "/v1/llm", StatusCode::OK).await;
+    let valid_name = llm["model_id"].as_str().expect("model_id").to_owned();
+
+    let model_uri = format!("/v1/chat/sessions/{session_id}/model");
+
+    // Unknown name → 400, and the pin stays unset.
+    put(
+        &router,
+        &model_uri,
+        Body::from(r#"{"llm":"definitely-not-a-configured-entry"}"#),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    // Valid name → 200; no live actor here, so it persists directly.
+    let set = put(
+        &router,
+        &model_uri,
+        Body::from(format!(r#"{{"llm":"{valid_name}"}}"#)),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(set["last_llm"].as_str(), Some(valid_name.as_str()));
+    assert_eq!(
+        set["applied_to_live_actor"].as_bool(),
+        Some(false),
+        "no actor is live in the gateway test harness",
+    );
+
+    // The pin shows up on the session detail.
+    let detail = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(detail["last_llm"].as_str(), Some(valid_name.as_str()));
+
+    // `null` clears the pin back to default-llm.
+    let cleared = put(
+        &router,
+        &model_uri,
+        Body::from(r#"{"llm":null}"#),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        cleared.get("last_llm").is_none_or(Value::is_null),
+        "cleared pin must serialize as absent/null: {cleared:?}",
+    );
+    let detail_after = get(
+        &router,
+        &format!("/v1/chat/sessions/{session_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        detail_after.get("last_llm").is_none_or(Value::is_null),
+        "session detail must drop last_llm after clear: {detail_after:?}",
+    );
 }
 
 // Sidebar preview: `list_sessions` must surface each session's most

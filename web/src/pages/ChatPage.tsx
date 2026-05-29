@@ -14,6 +14,7 @@ import remarkGfm from 'remark-gfm';
 import {
   RiAddLine,
   RiArrowDownLine,
+  RiArrowDownSLine,
   RiArrowLeftLine,
   RiArrowRightSLine,
   RiCheckLine,
@@ -135,6 +136,18 @@ interface SessionSummary {
   last_user_text?: string;
 }
 
+/** One selectable model in the header picker, projected from a
+ *  `GET /v1/llm/models` entry. `name` is the `aura.json` entry name
+ *  (the value `PUT …/model` expects); `provider`/`model` are shown as
+ *  the secondary label so two entries on the same provider stay
+ *  distinguishable. */
+interface ModelOption {
+  name: string;
+  provider: string;
+  model: string;
+  isDefault: boolean;
+}
+
 /**
  * State for one session in the tab's view. The tab keeps one of these
  * per session it has visited — switching sessions doesn't drop the
@@ -168,6 +181,12 @@ interface SessionView {
    *  as the activity signal) or on a non-streaming assistant
    *  `Frame::Message`, and on Reset / session switch. */
   awaitingReply: boolean;
+  /** Per-session LLM pin (`session.state.last_llm`) for the header
+   *  model picker. `null` = follow `default-llm`; a string is the
+   *  pinned `aura.json` entry name. Seeded from the GET-session
+   *  detail's `last_llm` on history load and updated on a successful
+   *  `PUT …/model`. */
+  model?: string | null;
 }
 
 const EMPTY_VIEW: SessionView = {
@@ -179,6 +198,7 @@ const EMPTY_VIEW: SessionView = {
   oldestOrdinal: null,
   hasMore: false,
   awaitingReply: false,
+  model: null,
 };
 
 /** Soft cap on `views` map size. Past this, the oldest non-active
@@ -199,6 +219,11 @@ export function ChatPage() {
   const [sessionsLoading, setSessionsLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [slashCommands, setSlashCommands] = useState<{ command: string; description: string }[]>([]);
+  // Switchable models for the header picker + the name of the global
+  // `default-llm`, both from `GET /v1/llm/models`. Fetched once on
+  // mount; the picker only renders when more than one model exists.
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [defaultModelName, setDefaultModelName] = useState('');
 
   // Channel token + bootstrap state. The token is minted once per tab
   // lifetime; the WS reuses it across every session the user switches
@@ -408,9 +433,11 @@ export function ChatPage() {
       const [
         { data: list, error: listError },
         { data: manifest, error: manifestError },
+        { data: modelList, error: modelError },
       ] = await Promise.all([
         client.GET('/v1/chat/sessions'),
         client.GET('/v1/chat/slash-manifest'),
+        client.GET('/v1/llm/models'),
       ]);
       if (cancelled) return;
       if (listError) {
@@ -419,6 +446,18 @@ export function ChatPage() {
       if (manifestError) {
         console.warn('chat bootstrap: slash-manifest failed', manifestError);
       }
+      if (modelError) {
+        console.warn('chat bootstrap: list models failed', modelError);
+      }
+      setModels(
+        (modelList?.items ?? []).map((m) => ({
+          name: m.name,
+          provider: m.provider,
+          model: m.model,
+          isDefault: m.is_default,
+        })),
+      );
+      setDefaultModelName(modelList?.default_name ?? '');
       const existing: SessionSummary[] = (list?.items ?? []).map((s) => ({
         session_id: s.session_id,
         created_at: s.created_at,
@@ -746,6 +785,7 @@ export function ChatPage() {
               historyLoading: false,
               oldestOrdinal,
               hasMore: data.has_more,
+              model: data.last_llm ?? null,
             }),
           );
         } else {
@@ -1069,6 +1109,81 @@ export function ChatPage() {
     [client, releaseSessionView, sessionId, sessions],
   );
 
+  // Re-pin the active session's model. The PUT is authoritative — its
+  // `last_llm` echo drives the local update, and a live actor (if any)
+  // is re-pinned server-side to take effect on the session's next turn.
+  // `name === null` clears the pin back to `default-llm`. A concise
+  // system notice records the switch inline so the transcript shows
+  // which turns ran on which model.
+  const handleSelectModel = useCallback(
+    async (name: string | null) => {
+      if (!sessionId) return;
+      const { response, data, error } = await client.PUT(
+        '/v1/chat/sessions/{session_id}/model',
+        {
+          params: { path: { session_id: sessionId } },
+          body: { llm: name },
+        },
+      );
+      if (error || !response.ok) {
+        console.warn('set session model failed', error);
+        setViews((prev) => {
+          const view = prev[sessionId];
+          if (!view) return prev;
+          return {
+            ...prev,
+            [sessionId]: {
+              ...view,
+              transcript: [
+                ...view.transcript,
+                {
+                  key: `model-err-${Date.now()}`,
+                  role: 'system',
+                  text: '',
+                  notice: {
+                    level: 'error',
+                    text: `Couldn't switch model: ${
+                      error ? formatHttpError(error) : `HTTP ${response.status}`
+                    }.`,
+                  },
+                },
+              ],
+            },
+          };
+        });
+        return;
+      }
+      const applied = data?.last_llm ?? null;
+      setViews((prev) => {
+        const view = prev[sessionId] ?? EMPTY_VIEW;
+        return {
+          ...prev,
+          [sessionId]: {
+            ...view,
+            model: applied,
+            transcript: [
+              ...view.transcript,
+              {
+                key: `model-set-${Date.now()}`,
+                role: 'system',
+                text: '',
+                notice: {
+                  level: 'info',
+                  text: applied
+                    ? `Model set to ${applied}. Applies from your next message.`
+                    : `Model reset to default${
+                        defaultModelName ? ` (${defaultModelName})` : ''
+                      }. Applies from your next message.`,
+                },
+              },
+            ],
+          },
+        };
+      });
+    },
+    [client, sessionId, defaultModelName],
+  );
+
   const handleNewChat = useCallback(async () => {
     setCreating(true);
     try {
@@ -1175,7 +1290,17 @@ export function ChatPage() {
               <span className="font-bold text-sm text-ink-soft">No session</span>
             )}
           </div>
-          <ConnectionBadge status={status} />
+          <div className="flex items-center gap-3 shrink-0">
+            {sessionId && models.length > 1 ? (
+              <ModelPicker
+                models={models}
+                defaultName={defaultModelName}
+                current={currentView.model}
+                onSelect={handleSelectModel}
+              />
+            ) : null}
+            <ConnectionBadge status={status} />
+          </div>
         </header>
 
         <div className="flex-1 flex flex-col overflow-hidden relative xl:pr-[260px]">
@@ -2971,6 +3096,125 @@ function connectionBadgeLabel(status: ConnectionStatus): string {
     case 'disconnected':
       return `reconnecting in ${Math.round(status.retryInMs / 1000)}s`;
   }
+}
+
+/** Header dropdown for switching the active conversation's model.
+ *  `current` is the session's pin (`null` ⇒ following `default-llm`);
+ *  selecting an entry (or "Default") calls `onSelect`, which PUTs the
+ *  change. Rendered only when more than one model is configured. */
+function ModelPicker({
+  models,
+  defaultName,
+  current,
+  onSelect,
+}: {
+  models: ModelOption[];
+  defaultName: string;
+  current: string | null | undefined;
+  onSelect: (name: string | null) => void | Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  // Dismiss on outside click or Escape while the menu is open.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const pinned = current ?? null;
+  const label = pinned ?? (defaultName ? `Default · ${defaultName}` : 'Default');
+
+  const pick = async (name: string | null) => {
+    setOpen(false);
+    // Re-selecting the active pin is a no-op — skip the round-trip.
+    if ((name ?? null) === pinned) return;
+    setBusy(true);
+    try {
+      await onSelect(name);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        disabled={busy}
+        className="flex items-center gap-1.5 px-2 py-1 bg-white border-2 border-black rounded-md shadow-brutal-xs font-mono text-xs hover:bg-gray-100 active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer max-w-[240px]"
+        title="Switch the model for this conversation"
+      >
+        {busy ? <RiLoader4Line className="text-sm animate-spin shrink-0" /> : null}
+        <span className="text-ink-soft uppercase tracking-wider text-[0.6rem] shrink-0">
+          model
+        </span>
+        <span className="font-bold truncate">{label}</span>
+        <RiArrowDownSLine className="text-sm shrink-0" />
+      </button>
+      {open ? (
+        <div className="absolute right-0 mt-1 z-20 w-[260px] max-h-[60vh] overflow-auto bg-white border-2 border-black rounded-md shadow-brutal py-1">
+          <ModelPickerRow
+            label={defaultName ? `Default · ${defaultName}` : 'Default (default-llm)'}
+            sublabel="follow the global default"
+            selected={pinned === null}
+            onClick={() => void pick(null)}
+          />
+          <div className="my-1 border-t-2 border-black/10" />
+          {models.map((m) => (
+            <ModelPickerRow
+              key={m.name}
+              label={m.name}
+              sublabel={`${m.provider} · ${m.model}`}
+              selected={pinned === m.name}
+              onClick={() => void pick(m.name)}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ModelPickerRow({
+  label,
+  sublabel,
+  selected,
+  onClick,
+}: {
+  label: string;
+  sublabel: string;
+  selected: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="w-full text-left px-3 py-1.5 flex items-center gap-2 hover:bg-canvas cursor-pointer"
+    >
+      <RiCheckLine className={`text-sm shrink-0 ${selected ? 'text-brand' : 'invisible'}`} />
+      <span className="min-w-0">
+        <span className="block font-mono text-xs font-bold truncate">{label}</span>
+        <span className="block font-mono text-[0.65rem] text-ink-soft truncate">{sublabel}</span>
+      </span>
+    </button>
+  );
 }
 
 function ConnectionBadge({ status }: { status: ConnectionStatus }) {

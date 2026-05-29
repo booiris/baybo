@@ -89,13 +89,14 @@ impl Router {
         self.session_manager.touch(&typed_session_id).await?;
 
         // Route to the session's actor, lazily spawning one if the
-        // session has no live actor yet. User-channel actors are not
-        // allowed to override the LLM at spawn time: the spawner reads
-        // `session.state.last_llm` (set by admin-side session creation)
-        // for hydration, or falls back to the pool default. Mid-session
-        // swaps are not exposed to user-channel callers —
-        // `SubagentSpawnRequest` is the only path that pins a
-        // non-default model.
+        // session has no live actor yet. The spawner pins the loop to
+        // `session.state.last_llm` — the per-session model the chat
+        // `PUT /v1/chat/sessions/{id}/model` endpoint persisted — or
+        // `None` (pool default) when the session was never switched. A
+        // live actor is re-pinned in place via `AgentMessage::SetModel`,
+        // so this read only matters for a cold spawn / post-eviction
+        // hydration. (`SubagentSpawnRequest` is the other path that pins
+        // a non-default model, via `model_tier`.)
         let response_tx = self.supervisor.response_tx().clone();
         let parent_token = self.actor_parent_token.clone();
         let actor_spawner = self.actor_spawner.as_ref();
@@ -106,7 +107,8 @@ impl Router {
                 AgentMessage::UserInput(Box::new(incoming)),
                 || {
                     let actor_token = parent_token.child_token();
-                    actor_spawner(session, None, response_tx, actor_token)
+                    let pinned = session.state.last_llm.clone();
+                    actor_spawner(session, pinned, response_tx, actor_token)
                 },
             )
             .await;
