@@ -24,10 +24,12 @@
 //! | `mem0_event_list` | `GET /v1/events/` |
 //! | `mem0_event_status` | `GET /v1/event/{id}/` |
 //!
-//! Per-user scoping comes from the caller's `user_id` at every call; an optional
-//! `scope: "session"` narrows reads to the current session via Mem0's `run_id`
-//! (sourced from `ToolContext::session_id`). `agent_id` defaults to `"aura"`
-//! (deployment identity) on writes and is overridable per tool call.
+//! Per-user scoping is fixed to the caller's `user_id` (the session user) at
+//! every call — never overridable by a tool param, so one user's tools cannot
+//! read, write, or delete another user's memories. An optional `scope:
+//! "session"` narrows reads to the current session via Mem0's `run_id` (sourced
+//! from `ToolContext::session_id`). `agent_id` defaults to `"aura"` (deployment
+//! identity) on writes and is the one identity a tool call may still set.
 //!
 //! Failures are routed through a 5-failure / 120 s circuit breaker that pauses
 //! API calls after sustained outages.
@@ -513,15 +515,6 @@ fn scope_run_id<'a>(scope: Option<&str>, session_id: &'a str) -> Option<&'a str>
     }
 }
 
-/// The user-facing user id for a tool call: an explicit `userId` param
-/// overrides the session's own user.
-fn caller_user_id<'a>(params: &'a Value, ctx: &'a ToolContext) -> &'a str {
-    params
-        .get("userId")
-        .and_then(|v| v.as_str())
-        .unwrap_or(ctx.user.id.as_str())
-}
-
 /// Flatten a Mem0 list/search response into its items, accepting a bare
 /// array or a `{results: [...]}` / `{memories: [...]}` wrapper.
 fn result_items(resp: &Value) -> Vec<Value> {
@@ -718,7 +711,6 @@ impl Tool for Mem0SearchTool {
                 "scope": {"type": "string", "enum": ["session", "long-term", "all"], "description": "\"all\" (default), \"session\" (current session only), or \"long-term\"."},
                 "categories": {"type": "array", "items": {"type": "string"}, "description": "Filter by category."},
                 "filters": {"type": "object", "description": "Advanced Mem0 filter object (AND/OR/operators)."},
-                "userId": {"type": "string", "description": "Override the user scope."},
                 "agentId": {"type": "string", "description": "Filter to a specific agent namespace."}
             },
             "required": ["query"]
@@ -738,7 +730,7 @@ impl Tool for Mem0SearchTool {
             .and_then(|v| v.as_u64())
             .map(|n| n.min(50) as usize)
             .unwrap_or(self.inner.top_k);
-        let user_id = caller_user_id(&params, ctx);
+        let user_id = ctx.user.id.as_str();
         let agent_id = params.get("agentId").and_then(|v| v.as_str());
         let run_id = scope_run_id(
             params.get("scope").and_then(|v| v.as_str()),
@@ -829,7 +821,6 @@ impl Tool for Mem0AddTool {
                 "importance": {"type": "number", "description": "Importance 0.0–1.0 (stored as metadata)."},
                 "metadata": {"type": "object", "description": "Additional metadata to attach."},
                 "longTerm": {"type": "boolean", "description": "Long-term (default true). false → session-scoped."},
-                "userId": {"type": "string", "description": "Override the user scope."},
                 "agentId": {"type": "string", "description": "Agent namespace (default: aura)."}
             },
             "required": []
@@ -859,7 +850,7 @@ impl Tool for Mem0AddTool {
                 "provide `text` or a non-empty `facts` array".into(),
             ));
         }
-        let user_id = caller_user_id(&params, ctx);
+        let user_id = ctx.user.id.as_str();
         let agent_id = params
             .get("agentId")
             .and_then(|v| v.as_str())
@@ -1003,7 +994,6 @@ impl Tool for Mem0ListTool {
             "type": "object",
             "properties": {
                 "scope": {"type": "string", "enum": ["session", "long-term", "all"], "description": "\"all\" (default), \"session\", or \"long-term\"."},
-                "userId": {"type": "string", "description": "Override the user scope."},
                 "agentId": {"type": "string", "description": "Filter to a specific agent namespace."}
             },
             "required": []
@@ -1014,7 +1004,7 @@ impl Tool for Mem0ListTool {
         if self.inner.breaker_open() {
             return Ok(breaker_unavailable());
         }
-        let user_id = caller_user_id(&params, ctx);
+        let user_id = ctx.user.id.as_str();
         let agent_id = params.get("agentId").and_then(|v| v.as_str());
         let run_id = scope_run_id(
             params.get("scope").and_then(|v| v.as_str()),
@@ -1189,7 +1179,6 @@ impl Tool for Mem0DeleteTool {
                 "query": {"type": "string", "description": "Search query to find and delete a memory."},
                 "all": {"type": "boolean", "description": "Delete ALL of the user's memories. Requires confirm: true."},
                 "confirm": {"type": "boolean", "description": "Safety gate for bulk deletion."},
-                "userId": {"type": "string", "description": "Override the user scope."},
                 "agentId": {"type": "string", "description": "Agent namespace scope."}
             },
             "required": []
@@ -1200,7 +1189,7 @@ impl Tool for Mem0DeleteTool {
         if self.inner.breaker_open() {
             return Ok(breaker_unavailable());
         }
-        let user_id = caller_user_id(&params, ctx);
+        let user_id = ctx.user.id.as_str();
         let agent_id = params.get("agentId").and_then(|v| v.as_str());
 
         if let Some(memory_id) = params.get("memoryId").and_then(|v| v.as_str()) {

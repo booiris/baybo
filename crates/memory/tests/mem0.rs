@@ -653,6 +653,76 @@ async fn circuit_breaker_trips_after_five_consecutive_failures() {
 }
 
 // ---------------------------------------------------------------------------
+// privacy: user scope is fixed to the session user (no userId param)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tool_search_ignores_user_id_override() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v2/memories/search/",
+            post(
+                |State(c): State<Captured>, Json(body): Json<Value>| async move {
+                    c.bodies.lock().push(body);
+                    Json(json!([]))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    // A tool-supplied userId must NOT retarget the scope to another user.
+    let _ = tool_by_name(&m, TOOL_SEARCH)
+        .execute(
+            json!({"query": "x", "userId": "victim"}),
+            &tool_context("owner"),
+        )
+        .await
+        .unwrap();
+    let body = captured.bodies.lock().last().unwrap().clone();
+    assert_eq!(body["filters"]["AND"][0]["user_id"], "owner");
+}
+
+#[tokio::test]
+async fn tool_delete_all_cannot_target_another_user() {
+    let captured = Captured::default();
+    let app = Router::new()
+        .route(
+            "/v1/memories/",
+            delete(
+                |State(c): State<Captured>, RawQuery(q): RawQuery| async move {
+                    c.queries.lock().push(q.unwrap_or_default());
+                    Json(json!({}))
+                },
+            ),
+        )
+        .with_state(captured.clone());
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+
+    // The sharpest edge: all + confirm + userId must still scope to the
+    // session user, never the model-supplied victim.
+    let _ = tool_by_name(&m, TOOL_DELETE)
+        .execute(
+            json!({"all": true, "confirm": true, "userId": "victim"}),
+            &tool_context("owner"),
+        )
+        .await
+        .unwrap();
+    let q = captured.queries.lock().last().cloned().unwrap();
+    assert!(
+        q.contains("user_id=owner"),
+        "must scope to session user; got: {q}"
+    );
+    assert!(
+        !q.contains("victim"),
+        "must ignore userId override; got: {q}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // tool manifest sanity
 // ---------------------------------------------------------------------------
 
