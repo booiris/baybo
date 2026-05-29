@@ -33,12 +33,13 @@ use async_trait::async_trait;
 use aura_model::{ContentBlock, TrustLevel};
 use aura_security::http::ProxySettings;
 use aura_security::{SecretVault, USER_SECRET_PREFIX};
-use aura_tools::{Tool, ToolCapability, ToolContext, ToolManifest, ToolOutput};
+use aura_tools::{Tool, ToolCapability, ToolContext, ToolEventSink, ToolManifest, ToolOutput};
+use aura_trace::ToolEventPayload;
 use parking_lot::Mutex;
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::{Memory, MemoryContext, MemoryError, RecalledMemory, Result};
 
@@ -209,26 +210,112 @@ impl Mem0Inner {
         format!("Token {}", self.api_key)
     }
 
-    async fn post_json(&self, path: &str, body: &Value, timeout: Duration) -> Result<Value> {
-        let resp = self
+    /// Run one POST + emit observability:
+    /// - `tracing::debug!` with the request preview before the call.
+    /// - `tracing::info!` with elapsed / status / response preview after.
+    /// - When `events` is `Some` (the tool-call path), a `HttpFetch`
+    ///   trace event lands on the surrounding `ToolCall` span so it
+    ///   shows up in the trace UI alongside the tool's own activity.
+    async fn post_json(
+        &self,
+        path: &str,
+        body: &Value,
+        timeout: Duration,
+        events: Option<&Arc<dyn ToolEventSink>>,
+    ) -> Result<Value> {
+        let started = Instant::now();
+        let request_preview = preview_value(body);
+        debug!(
+            backend = "mem0",
+            path,
+            request = %request_preview,
+            "mem0 outbound request"
+        );
+
+        let send_result = self
             .client
             .post(self.url(path))
             .header(header::AUTHORIZATION, self.auth_header())
             .json(body)
             .timeout(timeout)
             .send()
-            .await
-            .map_err(|e| MemoryError::Backend(format!("mem0 request failed: {e}")))?;
+            .await;
+        let resp = match send_result {
+            Ok(r) => r,
+            Err(e) => {
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                info!(
+                    backend = "mem0",
+                    path,
+                    elapsed_ms,
+                    error = %e,
+                    "mem0 HTTP send failed"
+                );
+                return Err(MemoryError::Backend(format!("mem0 request failed: {e}")));
+            }
+        };
+
         let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let body_text = resp.text().await.unwrap_or_default();
+        let bytes = body_text.len() as u64;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        info!(
+            backend = "mem0",
+            path,
+            status = %status,
+            elapsed_ms,
+            bytes,
+            response = %truncate(&body_text, HTTP_PREVIEW_BYTES),
+            "mem0 HTTP roundtrip"
+        );
+        if let Some(sink) = events {
+            sink.emit(
+                "mem0_http",
+                ToolEventPayload::HttpFetch {
+                    status: status.as_u16(),
+                    bytes,
+                    content_type,
+                    body_preview: Some(truncate(&body_text, HTTP_PREVIEW_BYTES)),
+                },
+            );
+        }
+
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
             return Err(MemoryError::Backend(format!(
-                "mem0 {path} returned {status}: {body}"
+                "mem0 {path} returned {status}: {}",
+                truncate(&body_text, HTTP_PREVIEW_BYTES)
             )));
         }
-        resp.json::<Value>()
-            .await
+        serde_json::from_str::<Value>(&body_text)
             .map_err(|e| MemoryError::Backend(format!("mem0 response parse failed: {e}")))
+    }
+}
+
+/// Body preview cap shared by both the tracing logs and the
+/// `HttpFetch` trace event payload. Wide enough to give a useful
+/// snippet for debugging, short enough to keep logs / traces compact.
+const HTTP_PREVIEW_BYTES: usize = 512;
+
+fn preview_value(v: &Value) -> String {
+    let s = serde_json::to_string(v).unwrap_or_default();
+    truncate(&s, HTTP_PREVIEW_BYTES)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let mut end = max;
+        while !s.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        format!("{}…[{} bytes truncated]", &s[..end], s.len() - end)
     }
 }
 
@@ -281,7 +368,7 @@ impl Mem0Memory {
         });
         if let Err(e) = self
             .inner
-            .post_json("/v2/memories/", &body, PROBE_TIMEOUT)
+            .post_json("/v2/memories/", &body, PROBE_TIMEOUT, None)
             .await
         {
             warn!(error = %e, "mem0 startup probe failed; continuing");
@@ -328,7 +415,7 @@ impl Memory for Mem0Memory {
         });
         match self
             .inner
-            .post_json("/v2/memories/search/", &body, RECALL_TIMEOUT)
+            .post_json("/v2/memories/search/", &body, RECALL_TIMEOUT, None)
             .await
         {
             Ok(resp) => {
@@ -367,7 +454,7 @@ impl Memory for Mem0Memory {
         });
         match self
             .inner
-            .post_json("/v1/memories/", &body, WRITE_TIMEOUT)
+            .post_json("/v1/memories/", &body, WRITE_TIMEOUT, None)
             .await
         {
             Ok(_) => {
@@ -477,7 +564,7 @@ impl Tool for Mem0ProfileTool {
         });
         match self
             .inner
-            .post_json("/v2/memories/", &body, HTTP_TIMEOUT)
+            .post_json("/v2/memories/", &body, HTTP_TIMEOUT, Some(&ctx.events))
             .await
         {
             Ok(resp) => {
@@ -562,7 +649,12 @@ impl Tool for Mem0SearchTool {
         });
         match self
             .inner
-            .post_json("/v2/memories/search/", &body, HTTP_TIMEOUT)
+            .post_json(
+                "/v2/memories/search/",
+                &body,
+                HTTP_TIMEOUT,
+                Some(&ctx.events),
+            )
             .await
         {
             Ok(resp) => {
@@ -648,7 +740,7 @@ impl Tool for Mem0ConcludeTool {
         });
         match self
             .inner
-            .post_json("/v1/memories/", &body, HTTP_TIMEOUT)
+            .post_json("/v1/memories/", &body, HTTP_TIMEOUT, Some(&ctx.events))
             .await
         {
             Ok(_) => {

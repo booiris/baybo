@@ -28,18 +28,19 @@ use std::io::Write as _;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
 use aura_model::{ChatMessage, ContentBlock, TrustLevel};
 use aura_security::http::ProxySettings;
 use aura_security::{SecretVault, USER_SECRET_PREFIX};
-use aura_tools::{Tool, ToolCapability, ToolContext, ToolManifest, ToolOutput};
+use aura_tools::{Tool, ToolCapability, ToolContext, ToolEventSink, ToolManifest, ToolOutput};
+use aura_trace::ToolEventPayload;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 use zip::CompressionMethod;
@@ -74,6 +75,28 @@ const REMOTE_PREFIXES: &[&str] = &["http://", "https://", "git@", "ssh://", "git
 /// (the only other tool that ships local bytes to a remote endpoint). Applies
 /// to both single-file uploads and the zipped-directory path (post-deflation).
 const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Body preview cap shared by the tracing logs and the `HttpFetch`
+/// trace event payload. Wide enough to be useful for debugging, short
+/// enough to keep logs / traces compact.
+const HTTP_PREVIEW_BYTES: usize = 512;
+
+fn preview_value(v: &Value) -> String {
+    let s = serde_json::to_string(v).unwrap_or_default();
+    truncate(&s, HTTP_PREVIEW_BYTES)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let mut end = max;
+        while !s.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        format!("{}…[{} bytes truncated]", &s[..end], s.len() - end)
+    }
+}
 
 pub const TOOL_SEARCH: &str = "viking_search";
 pub const TOOL_READ: &str = "viking_read";
@@ -186,10 +209,8 @@ impl OpenVikingInner {
         h
     }
 
-    async fn parse(&self, resp: reqwest::Response) -> Result<Value> {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        let parsed: Option<Value> = serde_json::from_str(&body).ok();
+    fn parse_body(&self, status: reqwest::StatusCode, body: &str) -> Result<Value> {
+        let parsed: Option<Value> = serde_json::from_str(body).ok();
         if !status.is_success() {
             if let Some(v) = &parsed
                 && let Some(err) = v.get("error")
@@ -213,24 +234,96 @@ impl OpenVikingInner {
         Ok(parsed.unwrap_or(Value::Null))
     }
 
+    /// Drive a prepared `RequestBuilder` and emit observability:
+    /// - `tracing::debug!` with the request preview before the call.
+    /// - `tracing::info!` with elapsed / status / response preview after.
+    /// - When `events` is `Some` (the tool-call path), an `HttpFetch`
+    ///   trace event lands on the surrounding span.
+    async fn run_request(
+        &self,
+        method: &str,
+        path: &str,
+        builder: reqwest::RequestBuilder,
+        request_preview: Option<String>,
+        events: Option<&Arc<dyn ToolEventSink>>,
+    ) -> Result<Value> {
+        let started = Instant::now();
+        if let Some(preview) = &request_preview {
+            debug!(
+                backend = "openviking",
+                method, path,
+                request = %preview,
+                "openviking outbound request"
+            );
+        }
+        let resp = match builder.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                info!(
+                    backend = "openviking",
+                    method, path, elapsed_ms,
+                    error = %e,
+                    "openviking HTTP send failed"
+                );
+                return Err(MemoryError::Backend(format!(
+                    "openviking {method} {path} failed: {e}"
+                )));
+            }
+        };
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let body_text = resp.text().await.unwrap_or_default();
+        let bytes = body_text.len() as u64;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        info!(
+            backend = "openviking",
+            method, path,
+            status = %status,
+            elapsed_ms, bytes,
+            response = %truncate(&body_text, HTTP_PREVIEW_BYTES),
+            "openviking HTTP roundtrip"
+        );
+        if let Some(sink) = events {
+            sink.emit(
+                "openviking_http",
+                ToolEventPayload::HttpFetch {
+                    status: status.as_u16(),
+                    bytes,
+                    content_type,
+                    body_preview: Some(truncate(&body_text, HTTP_PREVIEW_BYTES)),
+                },
+            );
+        }
+        self.parse_body(status, &body_text)
+    }
+
     async fn get(
         &self,
         path: &str,
         user_id: &str,
         query: &[(&str, &str)],
         timeout: Duration,
+        events: Option<&Arc<dyn ToolEventSink>>,
     ) -> Result<Value> {
         let url = build_url(&self.endpoint, path, query)
             .map_err(|e| MemoryError::Backend(format!("openviking url build failed: {e}")))?;
-        let resp = self
+        let builder = self
             .client
             .get(url)
             .headers(self.base_headers(user_id))
-            .timeout(timeout)
-            .send()
+            .timeout(timeout);
+        let preview = if query.is_empty() {
+            None
+        } else {
+            Some(format!("{query:?}"))
+        };
+        self.run_request("GET", path, builder, preview, events)
             .await
-            .map_err(|e| MemoryError::Backend(format!("openviking GET {path} failed: {e}")))?;
-        self.parse(resp).await
     }
 
     async fn post_json(
@@ -239,36 +332,45 @@ impl OpenVikingInner {
         user_id: &str,
         body: &Value,
         timeout: Duration,
+        events: Option<&Arc<dyn ToolEventSink>>,
     ) -> Result<Value> {
-        let resp = self
+        let builder = self
             .client
             .post(self.url(path))
             .headers(self.json_headers(user_id))
             .json(body)
-            .timeout(timeout)
-            .send()
+            .timeout(timeout);
+        self.run_request("POST", path, builder, Some(preview_value(body)), events)
             .await
-            .map_err(|e| MemoryError::Backend(format!("openviking POST {path} failed: {e}")))?;
-        self.parse(resp).await
     }
 
-    async fn post_empty(&self, path: &str, user_id: &str, timeout: Duration) -> Result<Value> {
-        let resp = self
+    async fn post_empty(
+        &self,
+        path: &str,
+        user_id: &str,
+        timeout: Duration,
+        events: Option<&Arc<dyn ToolEventSink>>,
+    ) -> Result<Value> {
+        let builder = self
             .client
             .post(self.url(path))
             .headers(self.json_headers(user_id))
             .body("{}")
-            .timeout(timeout)
-            .send()
+            .timeout(timeout);
+        self.run_request("POST", path, builder, Some("{}".into()), events)
             .await
-            .map_err(|e| MemoryError::Backend(format!("openviking POST {path} failed: {e}")))?;
-        self.parse(resp).await
     }
 
-    async fn upload_temp_file(&self, user_id: &str, file_path: &Path) -> Result<String> {
+    async fn upload_temp_file(
+        &self,
+        user_id: &str,
+        file_path: &Path,
+        events: Option<&Arc<dyn ToolEventSink>>,
+    ) -> Result<String> {
         let bytes = tokio::fs::read(file_path)
             .await
             .map_err(|e| MemoryError::Backend(format!("read upload file failed: {e}")))?;
+        let upload_bytes = bytes.len() as u64;
         let file_name = file_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -276,20 +378,28 @@ impl OpenVikingInner {
             .to_string();
         let mime = mime_for(&file_name);
         let part = reqwest::multipart::Part::bytes(bytes)
-            .file_name(file_name)
+            .file_name(file_name.clone())
             .mime_str(&mime)
             .map_err(|e| MemoryError::Backend(format!("mime: {e}")))?;
         let form = reqwest::multipart::Form::new().part("file", part);
 
-        let resp = self
+        let builder = self
             .client
             .post(self.url("/api/v1/resources/temp_upload"))
             .headers(self.base_headers(user_id))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| MemoryError::Backend(format!("openviking temp_upload failed: {e}")))?;
-        let body = self.parse(resp).await?;
+            .multipart(form);
+        // Multipart request preview: just the metadata (filename + mime
+        // + size). The raw bytes themselves are not useful in a trace.
+        let preview = Some(format!("multipart {file_name} ({mime}, {upload_bytes}b)"));
+        let body = self
+            .run_request(
+                "POST",
+                "/api/v1/resources/temp_upload",
+                builder,
+                preview,
+                events,
+            )
+            .await?;
         body.get("result")
             .and_then(|r| r.get("temp_file_id"))
             .and_then(|v| v.as_str())
@@ -446,7 +556,13 @@ impl Memory for OpenVikingMemory {
         let body = json!({"query": q, "top_k": self.inner.top_k});
         match self
             .inner
-            .post_json("/api/v1/search/find", ctx.user_id(), &body, RECALL_TIMEOUT)
+            .post_json(
+                "/api/v1/search/find",
+                ctx.user_id(),
+                &body,
+                RECALL_TIMEOUT,
+                None,
+            )
             .await
         {
             Ok(resp) => Ok(parse_search_results(&resp)),
@@ -475,7 +591,7 @@ impl Memory for OpenVikingMemory {
             let body = json!({"role": "user", "content": truncate_str(&user_text, 4000)});
             if let Err(e) = self
                 .inner
-                .post_json(&path, user_id, &body, WRITE_TIMEOUT)
+                .post_json(&path, user_id, &body, WRITE_TIMEOUT, None)
                 .await
             {
                 debug!(error = %e, "openviking on_job_complete user msg failed");
@@ -485,7 +601,7 @@ impl Memory for OpenVikingMemory {
             let body = json!({"role": "assistant", "content": truncate_str(&assistant_text, 4000)});
             if let Err(e) = self
                 .inner
-                .post_json(&path, user_id, &body, WRITE_TIMEOUT)
+                .post_json(&path, user_id, &body, WRITE_TIMEOUT, None)
                 .await
             {
                 debug!(error = %e, "openviking on_job_complete assistant msg failed");
@@ -502,7 +618,7 @@ impl Memory for OpenVikingMemory {
         let path = format!("/api/v1/sessions/{sid}/commit");
         if let Err(e) = self
             .inner
-            .post_empty(&path, ctx.user_id(), WRITE_TIMEOUT)
+            .post_empty(&path, ctx.user_id(), WRITE_TIMEOUT, None)
             .await
         {
             warn!(error = %e, "openviking session commit failed");
@@ -645,6 +761,7 @@ impl Tool for VikingSearchTool {
                 ctx.user.id.as_str(),
                 &body,
                 HTTP_TIMEOUT,
+                Some(&ctx.events),
             )
             .await
             .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
@@ -735,7 +852,13 @@ impl Tool for VikingReadTool {
         let mut used_fallback = false;
         let resp = match self
             .inner
-            .get(endpoint, user_id, &[("uri", &resolved)], HTTP_TIMEOUT)
+            .get(
+                endpoint,
+                user_id,
+                &[("uri", &resolved)],
+                HTTP_TIMEOUT,
+                Some(&ctx.events),
+            )
             .await
         {
             Ok(v) => v,
@@ -748,6 +871,7 @@ impl Tool for VikingReadTool {
                         user_id,
                         &[("uri", &uri)],
                         HTTP_TIMEOUT,
+                        Some(&ctx.events),
                     )
                     .await
                     .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?
@@ -862,6 +986,7 @@ impl Tool for VikingBrowseTool {
                 ctx.user.id.as_str(),
                 &[("uri", &path)],
                 HTTP_TIMEOUT,
+                Some(&ctx.events),
             )
             .await
             .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
@@ -966,6 +1091,7 @@ impl Tool for VikingRememberTool {
                 ctx.user.id.as_str(),
                 &body,
                 HTTP_TIMEOUT,
+                Some(&ctx.events),
             )
             .await
             .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
@@ -1069,6 +1195,7 @@ impl Tool for VikingAddResourceTool {
                         user_id,
                         &Value::Object(payload),
                         HTTP_TIMEOUT,
+                        Some(&ctx.events),
                     )
                     .await
             }
@@ -1143,7 +1270,7 @@ impl Tool for VikingAddResourceTool {
                 }
                 let temp_file_id = self
                     .inner
-                    .upload_temp_file(user_id, &upload_path)
+                    .upload_temp_file(user_id, &upload_path, Some(&ctx.events))
                     .await
                     .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
                 payload.insert("temp_file_id".into(), json!(temp_file_id));
@@ -1153,6 +1280,7 @@ impl Tool for VikingAddResourceTool {
                         user_id,
                         &Value::Object(payload),
                         HTTP_TIMEOUT,
+                        Some(&ctx.events),
                     )
                     .await
             }
