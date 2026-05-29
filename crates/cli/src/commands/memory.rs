@@ -193,13 +193,21 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
             .await?;
         }
         MemoryProvider::OpenViking => {
+            // The crate-internal default; matches OpenVikingConfig's None
+            // fallback. If the user accepts this verbatim we leave the
+            // field as `None` so `extra` stays empty.
+            const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:1933";
             let mut cfg = openviking::parse_extra(&new_config.memory.extra).unwrap_or_default();
             let default_endpoint = cfg
                 .endpoint
                 .clone()
-                .unwrap_or_else(|| "http://127.0.0.1:1933".into());
+                .unwrap_or_else(|| DEFAULT_ENDPOINT.into());
             let endpoint = prompt_with_default("Endpoint", &default_endpoint)?;
-            cfg.endpoint = Some(endpoint.clone());
+            cfg.endpoint = if endpoint == DEFAULT_ENDPOINT {
+                None
+            } else {
+                Some(endpoint.clone())
+            };
 
             new_config.memory.extra = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Config(format!("serialise openviking extra: {e}")))?;

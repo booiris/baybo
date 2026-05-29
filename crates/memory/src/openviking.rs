@@ -81,21 +81,29 @@ pub const TOOL_ADD_RESOURCE: &str = "viking_add_resource";
 
 const DEFAULT_MEMORY_SUBDIR: &str = "preferences";
 
+/// Per-backend config deserialized from `MemoryConfig.extra`. Unset fields
+/// elide from JSON via `skip_serializing_if`, so a freshly-written `extra`
+/// is `{}` instead of `{"endpoint": null, "api_key_env": null, ...}`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct OpenVikingConfig {
     /// Override the OpenViking REST endpoint. `None` →
     /// `http://127.0.0.1:1933` (local dev default).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     /// Explicit env var holding the API key. When unset, the runtime falls
     /// back to the vault key `memory.openviking.api_key` and then
     /// `OPENVIKING_API_KEY`. Leave the key empty for unauthenticated local
     /// dev servers.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     /// `X-OpenViking-Account` header (tenant identity). Per-user scope is the
     /// `MemoryContext::user_id()` at each call, sent as `X-OpenViking-User`.
+    /// `None` → `"default"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
-    /// Max results returned by `recall`.
+    /// Max results returned by `recall`. `None` → 5.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<usize>,
 }
 
@@ -1288,6 +1296,15 @@ mod tests {
         assert_eq!(cfg.endpoint(), DEFAULT_ENDPOINT);
         assert_eq!(cfg.account(), DEFAULT_ACCOUNT);
         assert_eq!(cfg.top_k(), DEFAULT_TOP_K);
+    }
+
+    #[test]
+    fn default_config_serializes_to_empty_object() {
+        // Every field is `None` by default; `skip_serializing_if` should
+        // elide each one, so the JSON written into `MemoryConfig.extra` is
+        // `{}` rather than `{"endpoint": null, "api_key_env": null, ...}`.
+        let json = serde_json::to_value(OpenVikingConfig::default()).unwrap();
+        assert_eq!(json, json!({}));
     }
 
     #[test]

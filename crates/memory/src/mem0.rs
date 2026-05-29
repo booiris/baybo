@@ -75,18 +75,25 @@ const BREAKER_COOLDOWN: Duration = Duration::from_secs(120);
 
 const MAX_PROFILE_ENTRIES: usize = 100;
 
-/// Per-backend config deserialized from `MemoryConfig.extra`.
+/// Per-backend config deserialized from `MemoryConfig.extra`. Unset fields
+/// elide from JSON via `skip_serializing_if`, so a freshly-written `extra`
+/// is `{}` instead of `{"api_key_env": null, "base_url": null, ...}`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Mem0Config {
     /// Explicit env var holding the API key. When unset, the runtime falls
     /// back to the vault key `memory.mem0.api_key` and then `MEM0_API_KEY`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     /// Override the Mem0 REST base URL. `None` → `https://api.mem0.ai`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     /// Enable Mem0 server-side reranking for `recall` (more accurate, slower).
+    /// `None` → `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rerank: Option<bool>,
-    /// Max results returned by `recall`.
+    /// Max results returned by `recall`. `None` → 5.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<usize>,
 }
 
@@ -670,6 +677,15 @@ mod tests {
         assert_eq!(cfg.base_url(), DEFAULT_BASE_URL);
         assert!(cfg.rerank());
         assert_eq!(cfg.top_k(), DEFAULT_TOP_K);
+    }
+
+    #[test]
+    fn default_config_serializes_to_empty_object() {
+        // Every field is `None` by default; `skip_serializing_if` should
+        // elide each one, so the JSON written into `MemoryConfig.extra` is
+        // `{}` rather than `{"api_key_env": null, "base_url": null, ...}`.
+        let json = serde_json::to_value(Mem0Config::default()).unwrap();
+        assert_eq!(json, serde_json::json!({}));
     }
 
     #[test]
