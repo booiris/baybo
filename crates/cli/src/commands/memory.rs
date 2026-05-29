@@ -208,10 +208,11 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
 
             cfg.rerank = prompt_bool(
                 "rerank — Mem0-side reranking (more accurate, slower)",
-                cfg.rerank.unwrap_or(true),
+                cfg.rerank,
+                true,
             )?;
 
-            cfg.top_k = prompt_usize("top_k — max memories per recall", cfg.top_k.unwrap_or(5))?;
+            cfg.top_k = prompt_usize("top_k — max memories per recall", cfg.top_k, 5)?;
 
             // The user-secret name is intentionally not asked: the default
             // `MEM0_API_KEY` matches the Mem0 docs' env-var convention and
@@ -256,7 +257,7 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
                 cfg.account.as_deref(),
             )?;
 
-            cfg.top_k = prompt_usize("top_k — max memories per recall", cfg.top_k.unwrap_or(5))?;
+            cfg.top_k = prompt_usize("top_k — max memories per recall", cfg.top_k, 5)?;
 
             // Default user-secret name `OPENVIKING_API_KEY`; not asked.
             // Persist the resolved name even when it equals the default
@@ -467,11 +468,16 @@ fn prompt_optional(
     }
 }
 
-/// Prompt for an `Option<bool>`. Empty input keeps the typed default
-/// (returns `None`); `true`/`false` (or `yes`/`no` / `y`/`n` / `1`/`0`) is
-/// stored only when it differs from `default_when_unset`.
-fn prompt_bool(label: &str, default_when_unset: bool) -> Result<Option<bool>> {
-    let shown = if default_when_unset { "true" } else { "false" };
+/// Prompt for an `Option<bool>`. The bracketed default is `current` if set,
+/// else `builtin_default`. The value is stored only when it differs from
+/// `builtin_default` (the backend's true default) — so accepting an existing
+/// non-default value keeps it instead of eliding back to the default.
+fn prompt_bool(label: &str, current: Option<bool>, builtin_default: bool) -> Result<Option<bool>> {
+    let shown = if current.unwrap_or(builtin_default) {
+        "true"
+    } else {
+        "false"
+    };
     let v = prompt_with_default(&format!("{label} [true/false]"), shown)?;
     let parsed = match v.trim().to_ascii_lowercase().as_str() {
         "true" | "yes" | "y" | "1" => true,
@@ -482,23 +488,33 @@ fn prompt_bool(label: &str, default_when_unset: bool) -> Result<Option<bool>> {
             )));
         }
     };
-    if parsed == default_when_unset {
+    // Elide to `None` only when the value equals the backend's built-in
+    // default — comparing against the *shown* current value would flip a
+    // deliberately-set non-default (e.g. pressing Enter on `false`) back to
+    // the default on the next setup run.
+    if parsed == builtin_default {
         Ok(None)
     } else {
         Ok(Some(parsed))
     }
 }
 
-/// Prompt for an `Option<usize>`. Empty input keeps the typed default
-/// (returns `None`); a parsed value is stored only when it differs from
-/// `default_when_unset`.
-fn prompt_usize(label: &str, default_when_unset: usize) -> Result<Option<usize>> {
-    let shown = default_when_unset.to_string();
+/// Prompt for an `Option<usize>`. Bracketed default is `current` if set, else
+/// `builtin_default`; the value is stored only when it differs from
+/// `builtin_default`, so an existing custom value survives an Enter-through.
+fn prompt_usize(
+    label: &str,
+    current: Option<usize>,
+    builtin_default: usize,
+) -> Result<Option<usize>> {
+    let shown = current.unwrap_or(builtin_default).to_string();
     let v = prompt_with_default(label, &shown)?;
     let parsed: usize = v
         .parse()
         .map_err(|_| CliError::Config(format!("invalid integer {v:?}")))?;
-    if parsed == default_when_unset {
+    // See `prompt_bool`: compare against the built-in default, not the shown
+    // current value, so a custom `top_k` is not reset on the next setup run.
+    if parsed == builtin_default {
         Ok(None)
     } else {
         Ok(Some(parsed))
