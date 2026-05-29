@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 use crate::cli::MemoryCmd;
 use crate::commands::prompt::prompt_with_default;
+use crate::commands::secret_input::read_masked_password;
 use crate::commands::select::select_one;
 use crate::context::CommandContext;
 use crate::error::{CliError, Result};
@@ -172,13 +173,16 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
 
     // Detailed wizard: walk every typed field with the existing value as
     // the bracketed default, so the operator can blow through with Enter
-    // to accept or type to override. The API-key *value* still rides on
-    // `aura secret add <NAME>` — only the *name* is asked here.
+    // to accept or type to override.
     //
     // For every field, an empty input reverts to `None`, which lets the
     // typed default kick in and keeps `extra` JSON tidy (see the
-    // `skip_serializing_if` contract on each config struct).
-    let mut secret_hint: Option<String> = None;
+    // `skip_serializing_if` contract on each config struct). The API-key
+    // *value* is prompted at the end of the per-provider block and
+    // stored at `user_env.<name>` — the same path `aura secret add`
+    // writes to, so the operator can later rotate/inspect it through
+    // the existing secret CLI without learning a memory-specific surface.
+    let mut secret_outcome: Option<SecretWriteOutcome> = None;
     match provider {
         MemoryProvider::Noop => {
             new_config.memory.extra = Value::Null;
@@ -211,7 +215,8 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
 
             new_config.memory.extra = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Config(format!("serialise mem0 extra: {e}")))?;
-            secret_hint = Some(api_key_setup_hint(ctx, &key_name).await);
+
+            secret_outcome = Some(prompt_and_store_api_key(ctx, &key_name, "Mem0").await?);
         }
         MemoryProvider::OpenViking => {
             // The crate-internal default; matches OpenVikingConfig's None
@@ -250,10 +255,11 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
             new_config.memory.extra = serde_json::to_value(&cfg)
                 .map_err(|e| CliError::Config(format!("serialise openviking extra: {e}")))?;
 
-            // Local dev (loopback) runs unauthenticated — skip the hint.
-            // Remote endpoints warrant the secret.
+            // Local dev (loopback) runs unauthenticated — skip the API-key
+            // prompt entirely. Remote endpoints get one.
             if !is_loopback_endpoint(&endpoint) {
-                secret_hint = Some(api_key_setup_hint(ctx, &key_name).await);
+                secret_outcome =
+                    Some(prompt_and_store_api_key(ctx, &key_name, "OpenViking").await?);
             }
         }
     }
@@ -266,9 +272,10 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
         provider_label(new_config.memory.provider),
         target.display(),
     );
-    if let Some(hint) = &secret_hint {
+    let summary_line = secret_outcome.as_ref().map(SecretWriteOutcome::human);
+    if let Some(line) = &summary_line {
         human.push_str("\n\n");
-        human.push_str(hint);
+        human.push_str(line);
     }
     human.push_str(RESTART_HINT);
     Ok(CommandOutput {
@@ -278,31 +285,79 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
             "provider": provider_label(new_config.memory.provider),
             "written_to": target.display().to_string(),
             "requires_restart": true,
-            "api_key_hint": secret_hint,
+            "api_key": summary_line,
         })),
     })
 }
 
-/// One-line hint surfaced after `aura memory setup` tells the user
-/// whether the named secret is already populated or needs to be
-/// added via `aura secret add <name>`. Looks up `user_env.<name>` —
-/// the same vault path the backends use at startup.
-async fn api_key_setup_hint(ctx: &CommandContext, name: &str) -> String {
-    let already_set = match ctx.secret_vault.as_ref() {
-        Some(vault) => {
-            let key = format!("{}{name}", aura_security::USER_SECRET_PREFIX);
-            matches!(vault.get_secret(&key).await, Ok(Some(_)))
+/// Outcome of the inline API-key prompt inside the setup wizard. Drives
+/// the one-line summary the operator sees at the end of the flow.
+enum SecretWriteOutcome {
+    /// User typed a value; it was stored in the vault.
+    Stored { name: String },
+    /// User pressed Enter and there was already a value in the vault
+    /// (or env var) — we left it alone.
+    Kept { name: String },
+    /// User pressed Enter and there was no existing value — point them
+    /// at `aura secret add` so they can set it later.
+    Skipped { name: String },
+}
+
+impl SecretWriteOutcome {
+    fn human(&self) -> String {
+        match self {
+            Self::Stored { name } => format!("Stored {name} in vault."),
+            Self::Kept { name } => format!("Kept existing {name} (vault or env)."),
+            Self::Skipped { name } => format!(
+                "Run `aura secret add {name}` to provide the API key \
+                 (or set the {name} env var)."
+            ),
         }
-        None => false,
-    };
-    if already_set {
-        format!("API key already present in vault as {name}.")
-    } else {
-        format!(
-            "Run `aura secret add {name}` to provide the API key \
-             (or set the {name} env var)."
-        )
     }
+}
+
+/// Prompt the operator for an API-key value, masked, and store it at
+/// `user_env.<name>` — the same vault path `aura secret add` writes to,
+/// so the value round-trips with the existing secret management surface.
+///
+/// Empty input leaves the vault untouched. The bracketed label hints
+/// whether a key is already present so the operator knows whether
+/// pressing Enter keeps a prior value or skips entirely.
+async fn prompt_and_store_api_key(
+    ctx: &CommandContext,
+    name: &str,
+    provider_label: &str,
+) -> Result<SecretWriteOutcome> {
+    let vault = ctx.secret_vault.as_ref().ok_or_else(|| {
+        CliError::Config("secret vault unavailable — run from the workspace root".into())
+    })?;
+    let vault_key = format!("{}{name}", aura_security::USER_SECRET_PREFIX);
+    let already_set = matches!(vault.get_secret(&vault_key).await, Ok(Some(_)));
+
+    let label = if already_set {
+        format!("{provider_label} API key (already set; press enter to keep, or type to replace)")
+    } else {
+        format!("{provider_label} API key (stored as {name}; press enter to skip)")
+    };
+    let value = read_masked_password(&format!("{label}: "))?;
+    if value.is_empty() {
+        return Ok(if already_set {
+            SecretWriteOutcome::Kept {
+                name: name.to_string(),
+            }
+        } else {
+            SecretWriteOutcome::Skipped {
+                name: name.to_string(),
+            }
+        });
+    }
+    vault
+        .store_secret(&vault_key, value.as_bytes())
+        .await
+        .map_err(|e| CliError::Config(format!("vault store {vault_key}: {e}")))?;
+    Ok(SecretWriteOutcome::Stored {
+        name: name.to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
