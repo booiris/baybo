@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
-use aura_model::{ChatMessage, Lineage, LineageKind, Session, SessionId};
+use aura_model::{ChatMessage, Lineage, LineageKind, LlmEntryName, Session, SessionId};
 use aura_store::StorageError;
 use aura_store::session::{Result, SessionStore, StoredMessage};
 
@@ -80,7 +80,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data, hidden FROM sessions WHERE id = ?1",
+                "SELECT data, hidden, last_llm FROM sessions WHERE id = ?1",
                 libsql::params![session_id.as_str().to_string()],
             )
             .await
@@ -99,12 +99,17 @@ impl SessionStore for LibsqlSessionStore {
                 let hidden_col: i64 = row
                     .get(1)
                     .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                let last_llm_col: Option<String> = row
+                    .get(2)
+                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
                 let mut session: Session = serde_json::from_str(&data)
                     .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
-                // Flat column is authoritative — `set_hidden` updates
-                // it directly while leaving the JSON blob untouched
-                // to avoid load/save races against `touch`.
+                // Flat columns are authoritative — `set_hidden` /
+                // `set_last_llm` update them directly while leaving the
+                // JSON blob untouched, to avoid load/save races against
+                // `touch`.
                 session.hidden = hidden_col != 0;
+                session.state.last_llm = last_llm_col.map(LlmEntryName::from);
                 Ok(Some(session))
             }
             None => Ok(None),
@@ -197,6 +202,28 @@ impl SessionStore for LibsqlSessionStore {
             )
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_hidden: {e}")))?;
+        Ok(affected > 0)
+    }
+
+    async fn set_last_llm(
+        &self,
+        session_id: &SessionId,
+        llm: Option<&LlmEntryName>,
+    ) -> Result<bool> {
+        let conn = self.pool.conn();
+        // Targeted UPDATE on the flat column only — like `set_hidden`,
+        // the JSON `data` blob is left alone so a concurrent `touch`
+        // (load + full save) can't lose this write. `get` patches
+        // `Session.state.last_llm` from the column on read. `NULL`
+        // clears the pin back to `default-llm`.
+        let value: Option<String> = llm.map(|n| n.as_str().to_string());
+        let affected = conn
+            .execute(
+                "UPDATE sessions SET last_llm = ?2 WHERE id = ?1",
+                libsql::params![session_id.as_str().to_string(), value],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_last_llm: {e}")))?;
         Ok(affected > 0)
     }
 
@@ -310,7 +337,7 @@ impl SessionStore for LibsqlSessionStore {
         // trusting only the blob would read stale values.
         let mut rows = conn
             .query(
-                "SELECT data, hidden FROM sessions \
+                "SELECT data, hidden, last_llm FROM sessions \
                  WHERE is_normal_session = 1 \
                  ORDER BY last_active DESC",
                 (),
@@ -330,9 +357,13 @@ impl SessionStore for LibsqlSessionStore {
             let hidden_col: i64 = row
                 .get(1)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let last_llm_col: Option<String> = row
+                .get(2)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             let mut session: Session = serde_json::from_str(&data)
                 .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
             session.hidden = hidden_col != 0;
+            session.state.last_llm = last_llm_col.map(LlmEntryName::from);
             sessions.push(session);
         }
         Ok(sessions)
@@ -350,7 +381,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data, hidden FROM sessions \
+                "SELECT data, hidden, last_llm FROM sessions \
                  WHERE is_normal_session = 1 \
                    AND json_extract(data, '$.channel') = ?1 \
                  ORDER BY last_active DESC",
@@ -371,9 +402,13 @@ impl SessionStore for LibsqlSessionStore {
             let hidden_col: i64 = row
                 .get(1)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let last_llm_col: Option<String> = row
+                .get(2)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             let mut session: Session = serde_json::from_str(&data)
                 .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
             session.hidden = hidden_col != 0;
+            session.state.last_llm = last_llm_col.map(LlmEntryName::from);
             sessions.push(session);
         }
         Ok(sessions)
@@ -1306,6 +1341,69 @@ mod tests {
         assert!(
             loaded.hidden,
             "save must preserve the hidden column owned by set_hidden"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_does_not_clobber_last_llm_set_by_set_last_llm() {
+        // The exact race flagged in review: a concurrent full-blob `save`
+        // — e.g. `touch` firing on the next inbound message, carrying a
+        // stale in-memory `Session` with last_llm=None — must NOT wipe a
+        // pin set via the targeted `set_last_llm`. Same flat-column guard
+        // as `hidden`.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let s = make_root_session("pin-then-save");
+        store.save(&s).await.unwrap(); // blob carries last_llm=None
+        assert!(
+            store
+                .set_last_llm(&s.id, Some(&aura_model::LlmEntryName::from("claude-opus")))
+                .await
+                .unwrap()
+        );
+
+        // Re-save the stale in-memory copy (still last_llm=None) — the
+        // `touch` / background-actor persist path.
+        store.save(&s).await.unwrap();
+
+        let loaded = store.get(&s.id).await.unwrap().expect("row present");
+        assert_eq!(
+            loaded.state.last_llm,
+            Some(aura_model::LlmEntryName::from("claude-opus")),
+            "save must preserve the last_llm column owned by set_last_llm"
+        );
+
+        // Clearing pins back to default-llm (NULL column → None).
+        assert!(store.set_last_llm(&s.id, None).await.unwrap());
+        let cleared = store.get(&s.id).await.unwrap().expect("row present");
+        assert_eq!(cleared.state.last_llm, None);
+    }
+
+    #[tokio::test]
+    async fn list_by_channel_reflects_last_llm_column() {
+        // `list_by_channel` / `list_all` must project the flat `last_llm`
+        // column the same way `get` does, so a listed `Session` carries
+        // the authoritative pin rather than the (stale) blob value.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let mut s = make_root_session("pin-list");
+        s.channel = ChannelType::http();
+        store.save(&s).await.unwrap();
+        assert!(
+            store
+                .set_last_llm(&s.id, Some(&aura_model::LlmEntryName::from("gpt-4o")))
+                .await
+                .unwrap()
+        );
+
+        let listed = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].state.last_llm,
+            Some(aura_model::LlmEntryName::from("gpt-4o")),
+            "last_llm must reflect the column in list projections"
         );
     }
 

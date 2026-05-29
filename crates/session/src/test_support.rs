@@ -83,6 +83,21 @@ impl SessionStore for MemorySessionStore {
         }
     }
 
+    async fn set_last_llm(
+        &self,
+        session_id: &SessionId,
+        llm: Option<&aura_model::LlmEntryName>,
+    ) -> Result<bool> {
+        let mut data = self.data.lock();
+        match data.get_mut(session_id) {
+            Some(s) => {
+                s.state.last_llm = llm.cloned();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn delete(&self, session_id: &SessionId) -> Result<bool> {
         self.transcripts.lock().remove(session_id);
         Ok(self.data.lock().remove(session_id).is_some())

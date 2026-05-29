@@ -372,6 +372,77 @@
         }
       }
     },
+    "/v1/chat/sessions/{session_id}/model": {
+      "put": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "set_session_model",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to re-pin",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSessionModelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Per-session model pin updated; applies from the session's next turn",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetSessionModelResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown LLM entry name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}/token": {
       "post": {
         "tags": [
@@ -2364,6 +2435,13 @@
             "type": "string",
             "format": "date-time"
           },
+          "last_llm": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Per-session LLM pin (`session.state.last_llm`): the `aura.json`\nentry name this session's turns resolve against, or `null` to\nfollow `default-llm`. Drives the chat header model picker's\ninitial selection. Set via `PUT /v1/chat/sessions/{id}/model`."
+          },
           "session_id": {
             "type": "string"
           },
@@ -3343,6 +3421,38 @@
         "properties": {
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "SetSessionModelRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/chat/sessions/{session_id}/model`.",
+        "properties": {
+          "llm": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`aura.json` LLM entry name to pin this session to, or `null`\n(absent) to clear the pin and follow `default-llm`. Must match a\nconfigured entry — see `GET /v1/llm/models` → `items[].name`."
+          }
+        }
+      },
+      "SetSessionModelResponse": {
+        "type": "object",
+        "required": [
+          "applied_to_live_actor"
+        ],
+        "properties": {
+          "applied_to_live_actor": {
+            "type": "boolean",
+            "description": "`true` when a live actor was re-pinned in place (applies on the\nsession's next turn); `false` when only the persisted state was\nupdated because no actor is currently running (the next user\nmessage spawns one that reads the pin)."
+          },
+          "last_llm": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pin now in effect: the entry name, or `null` for `default-llm`."
           }
         }
       },

@@ -60,6 +60,7 @@ When a session with an in-flight subagent is deleted, the subagent's cancellatio
 
 - `compression_count`: incremented after each successful context compression. Used by monitoring / strategy switching to detect runaway growth.
 - `approved_resources`: tool resources the user has granted permanent approval for in this session, populated on each `ApproveAlways` decision. See [`tools.md`](tools.md).
+- `last_llm`: per-session LLM pin — the `aura.json` entry name this session's turns resolve against, or `None` to follow `default-llm`. Read by the actor spawner as the loop's `initial_llm`; a live actor is re-pinned via `AgentMessage::SetModel`. Set from the chat UI via `PUT /v1/chat/sessions/:id/model`. See [`agent.md`](agent.md) "Per-session model selection".
 - `extra`: reserved extension fields for experimental features or plugin state.
 
 ### Soul-version drift

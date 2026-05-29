@@ -553,7 +553,8 @@ GET    /v1/llm/usage                    ?since=&until=  per-entry usage aggregat
 
 POST   /v1/chat/sessions                create http session + mint web channel-token
 GET    /v1/chat/sessions                ?include_hidden=&include_cron=  newest-first list
-GET    /v1/chat/sessions/:id            ?before_ordinal=&limit=  detail + transcript slice
+GET    /v1/chat/sessions/:id            ?before_ordinal=&limit=  detail + transcript slice (+ last_llm pin)
+PUT    /v1/chat/sessions/:id/model      pin this session's LLM (re-pins live actor; null ⇒ default-llm)
 DELETE /v1/chat/sessions/:id            hide (row preserved); 204
 POST   /v1/chat/sessions/:id/unhide     restore a hidden session
 POST   /v1/chat/sessions/:id/token      refresh the web channel-token

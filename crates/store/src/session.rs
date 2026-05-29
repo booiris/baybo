@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use aura_model::{ChannelType, ChatMessage, LineageKind, Session, SessionId};
+use aura_model::{ChannelType, ChatMessage, LineageKind, LlmEntryName, Session, SessionId};
 use chrono::{DateTime, Utc};
 
 use crate::StorageError;
@@ -50,6 +50,22 @@ pub trait SessionStore: Send + Sync {
     /// always see the authoritative value regardless of blob
     /// staleness.
     async fn set_hidden(&self, session_id: &SessionId, hidden: bool) -> Result<bool>;
+
+    /// Set (or clear, with `None`) the session's per-session LLM pin —
+    /// the chat model switch (`PUT /v1/chat/sessions/:id/model`). Returns
+    /// `Ok(true)` when the row existed and was updated, `Ok(false)` if no
+    /// row matched.
+    ///
+    /// Same flat-column discipline as [`Self::set_hidden`]: implementations
+    /// write only the `last_llm` column and leave the JSON `data` blob
+    /// alone, so a concurrent `save`/`touch` (full-blob rewrite from a
+    /// stale in-memory `Session`) can't clobber the pin. `get` patches
+    /// `Session.state.last_llm` from the column at read time.
+    async fn set_last_llm(
+        &self,
+        session_id: &SessionId,
+        llm: Option<&LlmEntryName>,
+    ) -> Result<bool>;
 
     /// Hard-delete the session.
     ///

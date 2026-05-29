@@ -84,6 +84,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/{session_id}/model": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_session_model"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}/token": {
         parameters: {
             query?: never;
@@ -626,6 +642,13 @@ export interface components {
             hidden: boolean;
             /** Format: date-time */
             last_active: string;
+            /**
+             * @description Per-session LLM pin (`session.state.last_llm`): the `aura.json`
+             *     entry name this session's turns resolve against, or `null` to
+             *     follow `default-llm`. Drives the chat header model picker's
+             *     initial selection. Set via `PUT /v1/chat/sessions/{id}/model`.
+             */
+            last_llm?: string | null;
             session_id: string;
             /**
              * @description Active transcript slice, oldest-first within the page. The
@@ -1092,6 +1115,26 @@ export interface components {
         SetDefaultLlmRequest: {
             name: string;
         };
+        /** @description Request body for `PUT /v1/chat/sessions/{session_id}/model`. */
+        SetSessionModelRequest: {
+            /**
+             * @description `aura.json` LLM entry name to pin this session to, or `null`
+             *     (absent) to clear the pin and follow `default-llm`. Must match a
+             *     configured entry — see `GET /v1/llm/models` → `items[].name`.
+             */
+            llm?: string | null;
+        };
+        SetSessionModelResponse: {
+            /**
+             * @description `true` when a live actor was re-pinned in place (applies on the
+             *     session's next turn); `false` when only the persisted state was
+             *     updated because no actor is currently running (the next user
+             *     message spawns one that reads the pin).
+             */
+            applied_to_live_actor: boolean;
+            /** @description The pin now in effect: the entry name, or `null` for `default-llm`. */
+            last_llm?: string | null;
+        };
         /**
          * @description Wire DTO for slash command entries. Mirror of
          *     [`aura_channels::wire::SlashCommandSpec`] so the OpenAPI surface
@@ -1443,6 +1486,60 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_session_model: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id to re-pin */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSessionModelRequest"];
+            };
+        };
+        responses: {
+            /** @description Per-session model pin updated; applies from the session's next turn */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SetSessionModelResponse"];
+                };
+            };
+            /** @description Unknown LLM entry name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
             };
             /** @description Unauthorized */
             401: {

@@ -13,7 +13,7 @@ use aura_channels::{
     AgentEvent, AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage,
 };
 use aura_job::JobInput;
-use aura_model::{BackgroundCompressionPayload, ContentBlock, PendingSubagentResult};
+use aura_model::{BackgroundCompressionPayload, ContentBlock, LlmEntryName, PendingSubagentResult};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -75,6 +75,15 @@ pub enum AgentMessage {
     /// higher-priority work is queued, drained into one autonomous
     /// `SubagentNotification` turn.
     SubagentFinished(Box<PendingSubagentResult>),
+    /// Re-pin the session's LLM (chat per-session model switch). `llm`
+    /// is the `aura.json` entry name to resolve against, or `None` to
+    /// revert to `default-llm`. The handler re-pins the live loop in
+    /// place and persists `session.state.last_llm` so the choice
+    /// survives eviction. Processed at a turn boundary (the mailbox is
+    /// drained sequentially), so it never swaps the model mid-turn —
+    /// it takes effect on the next turn. Routed by the gateway's
+    /// `PUT /v1/chat/sessions/{id}/model` via [`AgentSupervisor::route`].
+    SetModel { llm: Option<LlmEntryName> },
     /// Stop this actor. Lowest mailbox priority — every queued
     /// `UserInput` / `SubagentFinished` drains first, then the actor
     /// trips its `actor_token` and exits. (The session row lives on; only
@@ -89,6 +98,7 @@ impl mailbox::Prioritized for AgentMessage {
             AgentMessage::UserInput(_)
             | AgentMessage::CronTrigger { .. }
             | AgentMessage::SubagentSpawned { .. }
+            | AgentMessage::SetModel { .. }
             | AgentMessage::BackgroundCompression(_) => MessagePriority::Trigger,
             AgentMessage::SubagentFinished(_) => MessagePriority::SubagentFinished,
             AgentMessage::ActorStop => MessagePriority::Stop,
@@ -360,6 +370,9 @@ impl AgentActor {
             AgentMessage::SubagentFinished(pending) => {
                 self.handle_subagent_finished(*pending).await;
             }
+            AgentMessage::SetModel { llm } => {
+                self.handle_set_model(llm);
+            }
             AgentMessage::ActorStop => {
                 // The run loop owns `ActorStop` (it must break); reaching
                 // here would be a routing bug. Defensive no-op.
@@ -559,6 +572,31 @@ impl AgentActor {
         buffer.push(pending);
         self.persist_session_state_after_pending_change("subagent_finished")
             .await;
+    }
+
+    /// Re-pin this session's LLM in place (chat per-session model switch)
+    /// so the swap lands on the next turn. **In-memory only** — durability
+    /// is the caller's responsibility: the gateway's `PUT
+    /// /v1/chat/sessions/:id/model` does a targeted, race-free
+    /// `set_last_llm` column write *before* routing this message, and that
+    /// column (not the JSON blob) is what a later spawn reads back via
+    /// `get`. Persisting here through a full-blob `save` would instead be
+    /// clobberable by a concurrent `touch`, which is the bug this split
+    /// avoids. The mailbox drains sequentially, so a `SetModel` queued
+    /// behind an in-flight turn applies once that turn ends, never
+    /// mid-turn. The gateway validated `llm` against the pool; even a
+    /// stranded name degrades safely (`LlmClientPool::resolve` falls back
+    /// to the default).
+    fn handle_set_model(&mut self, llm: Option<LlmEntryName>) {
+        debug!(
+            session_id = %self.durable.session.id,
+            llm = ?llm,
+            "re-pinning session LLM",
+        );
+        // Keep the in-memory view consistent (the persisted column is
+        // authoritative on the next `get`); then swap the live loop.
+        self.durable.session.state.last_llm = llm.clone();
+        self.volatile.agent_loop.set_initial_llm(llm);
     }
 
     /// Write the actor's current `durable.session` back to the

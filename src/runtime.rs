@@ -677,6 +677,12 @@ pub struct RouterRunHandle {
     pub incoming_tx: mpsc::Sender<IncomingMessage>,
     pub incoming_rx: mpsc::Receiver<IncomingMessage>,
     pub response_rx: mpsc::Receiver<AgentOutput>,
+    /// Clone of the actor registry, handed to the gateway so the chat
+    /// `PUT /v1/chat/sessions/{id}/model` endpoint can route an
+    /// `AgentMessage::SetModel` to a live actor (re-pin in place) the
+    /// same way `/stop` reaches one. Cheap to clone — backed by an
+    /// `Arc<DashMap>`.
+    pub supervisor: AgentSupervisor,
 }
 
 /// Build the [`Router`] and wire a per-session actor spawner against
@@ -756,11 +762,12 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                   initial_llm: Option<LlmEntryName>,
                   response_tx: mpsc::Sender<AgentOutput>,
                   actor_token: CancellationToken| {
-                // LLM pinning is exclusively a subagent-spawn affair —
-                // user-channel actors always run on `default-llm`.
-                // `initial_llm` is `Some` only when the router's subagent
-                // handler resolved a model for the child (from the spawn
-                // request's `model_tier`) and forwarded it here.
+                // `initial_llm` is `Some` either when the router's
+                // subagent handler resolved a model for a child (from the
+                // spawn request's `model_tier`) or when a user-channel
+                // session carries a per-session pin in
+                // `session.state.last_llm` (the chat model switch) that
+                // `handle_incoming` forwarded here; `None` ⇒ pool default.
 
                 // `summary_state_dir` connects the compressor's
                 // fast-path to the background refresh runner's output.
@@ -865,6 +872,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         boot::proxy_settings(&graph.config),
     );
 
+    // Hand a clone to the gateway before the router takes ownership, so
+    // the chat model-switch endpoint can re-pin live actors.
+    let supervisor_for_gateway = supervisor.clone();
     let router = Router::from_config(aura_agent::router::RouterConfig {
         session_manager: Arc::clone(&graph.session_manager),
         supervisor,
@@ -888,6 +898,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         incoming_tx,
         incoming_rx,
         response_rx,
+        supervisor: supervisor_for_gateway,
     }
 }
 
