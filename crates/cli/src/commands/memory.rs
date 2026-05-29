@@ -241,7 +241,7 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
             };
 
             cfg.account = prompt_optional(
-                "X-OpenViking-Account header (tenant identity)",
+                "Account ID (OpenViking tenant)",
                 "default",
                 cfg.account.as_deref(),
             )?;
