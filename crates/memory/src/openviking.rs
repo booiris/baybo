@@ -53,6 +53,11 @@ const DEFAULT_AGENT: &str = "aura";
 const DEFAULT_TOP_K: usize = 5;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
+/// Recall is on the critical path — cap it well below `HTTP_TIMEOUT` so a
+/// slow / down OpenViking server degrades the turn to "no recalled context"
+/// instead of stalling the user up to 30 s. `on_job_complete` /
+/// `on_session_end` / tool calls keep `HTTP_TIMEOUT`.
+const RECALL_TIMEOUT: Duration = Duration::from_secs(5);
 const VAULT_KEY: &str = "memory.openviking.api_key";
 const DEFAULT_API_KEY_ENV: &str = "OPENVIKING_API_KEY";
 
@@ -412,14 +417,23 @@ impl Memory for OpenVikingMemory {
             return Ok(Vec::new());
         }
         let body = json!({"query": q, "top_k": self.inner.top_k});
-        match self
-            .inner
-            .post_json("/api/v1/search/find", ctx.user_id(), &body)
-            .await
+        match tokio::time::timeout(
+            RECALL_TIMEOUT,
+            self.inner
+                .post_json("/api/v1/search/find", ctx.user_id(), &body),
+        )
+        .await
         {
-            Ok(resp) => Ok(parse_search_results(&resp)),
-            Err(e) => {
+            Ok(Ok(resp)) => Ok(parse_search_results(&resp)),
+            Ok(Err(e)) => {
                 warn!(error = %e, "openviking recall failed");
+                Ok(Vec::new())
+            }
+            Err(_) => {
+                warn!(
+                    timeout_secs = RECALL_TIMEOUT.as_secs(),
+                    "openviking recall timed out; returning no recalled context"
+                );
                 Ok(Vec::new())
             }
         }

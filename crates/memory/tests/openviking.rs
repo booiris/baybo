@@ -105,6 +105,33 @@ async fn recall_returns_empty_when_query_empty() {
     assert!(m.recall(&ctx, &[]).await.unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn recall_returns_empty_on_critical_path_timeout() {
+    // Handler stalls past the 5 s RECALL_TIMEOUT — recall must return empty
+    // (no recalled context) instead of blocking the agent loop.
+    let app = Router::new().route(
+        "/api/v1/search/find",
+        post(|Json(_b): Json<Value>| async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Json(json!({"result": {"memories": [], "resources": []}}))
+        }),
+    );
+    let server = spawn(app).await;
+    let m = build(&base_url(&server));
+    let ctx = memory_context("alice", "s-1", StepKind::MemoryRecall).await;
+    let started = std::time::Instant::now();
+    let out = m
+        .recall(&ctx, &[ContentBlock::Text("hi".into())])
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(out.is_empty());
+    assert!(
+        elapsed < std::time::Duration::from_secs(8),
+        "recall should not stall past RECALL_TIMEOUT; took {elapsed:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // on_job_complete
 // ---------------------------------------------------------------------------

@@ -48,6 +48,13 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// per-request budget short so an unreachable Mem0 endpoint does not stall
 /// boot up to `HTTP_TIMEOUT` (mirrors openviking's `HEALTH_TIMEOUT`).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Recall is on the **critical path** (job start + each interjection), so
+/// the agent loop waits inline for it. Cap the request well below
+/// `HTTP_TIMEOUT` so a slow / down Mem0 endpoint degrades the turn to "no
+/// recalled context" instead of stalling the user up to 30 s before the
+/// first model token. `on_job_complete` / tool calls keep `HTTP_TIMEOUT`
+/// (background path / model is already waiting).
+const RECALL_TIMEOUT: Duration = Duration::from_secs(5);
 const VAULT_KEY: &str = "memory.mem0.api_key";
 const DEFAULT_API_KEY_ENV: &str = "MEM0_API_KEY";
 
@@ -310,14 +317,27 @@ impl Memory for Mem0Memory {
             "rerank": self.inner.rerank,
             "top_k": self.inner.top_k,
         });
-        match self.inner.post_json("/v2/memories/search", &body).await {
-            Ok(resp) => {
+        match tokio::time::timeout(
+            RECALL_TIMEOUT,
+            self.inner.post_json("/v2/memories/search", &body),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => {
                 self.inner.record_success();
                 Ok(parse_search_results(&resp))
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 self.inner.record_failure();
                 warn!(error = %e, "mem0 recall failed");
+                Ok(Vec::new())
+            }
+            Err(_) => {
+                self.inner.record_failure();
+                warn!(
+                    timeout_secs = RECALL_TIMEOUT.as_secs(),
+                    "mem0 recall timed out; returning no recalled context"
+                );
                 Ok(Vec::new())
             }
         }
