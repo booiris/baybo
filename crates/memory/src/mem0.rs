@@ -281,7 +281,7 @@ impl Mem0Memory {
         });
         if let Err(e) = self
             .inner
-            .post_json("/v2/memories", &body, PROBE_TIMEOUT)
+            .post_json("/v2/memories/", &body, PROBE_TIMEOUT)
             .await
         {
             warn!(error = %e, "mem0 startup probe failed; continuing");
@@ -328,7 +328,7 @@ impl Memory for Mem0Memory {
         });
         match self
             .inner
-            .post_json("/v2/memories/search", &body, RECALL_TIMEOUT)
+            .post_json("/v2/memories/search/", &body, RECALL_TIMEOUT)
             .await
         {
             Ok(resp) => {
@@ -367,7 +367,7 @@ impl Memory for Mem0Memory {
         });
         match self
             .inner
-            .post_json("/v1/memories", &body, WRITE_TIMEOUT)
+            .post_json("/v1/memories/", &body, WRITE_TIMEOUT)
             .await
         {
             Ok(_) => {
@@ -477,7 +477,7 @@ impl Tool for Mem0ProfileTool {
         });
         match self
             .inner
-            .post_json("/v2/memories", &body, HTTP_TIMEOUT)
+            .post_json("/v2/memories/", &body, HTTP_TIMEOUT)
             .await
         {
             Ok(resp) => {
@@ -562,7 +562,7 @@ impl Tool for Mem0SearchTool {
         });
         match self
             .inner
-            .post_json("/v2/memories/search", &body, HTTP_TIMEOUT)
+            .post_json("/v2/memories/search/", &body, HTTP_TIMEOUT)
             .await
         {
             Ok(resp) => {
@@ -648,7 +648,7 @@ impl Tool for Mem0ConcludeTool {
         });
         match self
             .inner
-            .post_json("/v1/memories", &body, HTTP_TIMEOUT)
+            .post_json("/v1/memories/", &body, HTTP_TIMEOUT)
             .await
         {
             Ok(_) => {

@@ -49,7 +49,7 @@ async fn recall_sends_query_with_user_filter_and_returns_memory_text() {
     let captured = Captured::default();
     let app = Router::new()
         .route(
-            "/v2/memories/search",
+            "/v2/memories/search/",
             post(
                 |State(c): State<Captured>, headers: HeaderMap, Json(body): Json<Value>| async move {
                     *c.auth.lock() = headers
@@ -99,7 +99,7 @@ async fn recall_skips_empty_query_blocks() {
 #[tokio::test]
 async fn recall_handles_results_wrapper() {
     let app = Router::new().route(
-        "/v2/memories/search",
+        "/v2/memories/search/",
         post(|Json(_b): Json<Value>| async { Json(json!({"results": [{"memory": "fact one"}]})) }),
     );
     let server = spawn(app).await;
@@ -117,7 +117,7 @@ async fn recall_handles_results_wrapper() {
 #[tokio::test]
 async fn recall_swallows_5xx_and_returns_empty() {
     let app = Router::new().route(
-        "/v2/memories/search",
+        "/v2/memories/search/",
         post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
     );
     let server = spawn(app).await;
@@ -140,7 +140,7 @@ async fn on_job_complete_posts_messages_with_user_and_agent_ids() {
     let captured = Captured::default();
     let app = Router::new()
         .route(
-            "/v1/memories",
+            "/v1/memories/",
             post(
                 |State(c): State<Captured>, Json(body): Json<Value>| async move {
                     c.bodies.lock().push(body.clone());
@@ -175,7 +175,7 @@ async fn on_job_complete_skips_when_both_sides_empty() {
     let captured = Captured::default();
     let app = Router::new()
         .route(
-            "/v1/memories",
+            "/v1/memories/",
             post(
                 |State(c): State<Captured>, Json(b): Json<Value>| async move {
                     c.bodies.lock().push(b);
@@ -202,7 +202,7 @@ async fn on_session_end_is_a_noop() {
     // Refuse any call: a body push would prove the no-op contract is broken.
     let app = Router::new()
         .route(
-            "/v1/memories",
+            "/v1/memories/",
             post(
                 |State(c): State<Captured>, Json(b): Json<Value>| async move {
                     c.bodies.lock().push(b);
@@ -228,7 +228,7 @@ async fn tool_profile_fetches_all_memories() {
     let captured = Captured::default();
     let app = Router::new()
         .route(
-            "/v2/memories",
+            "/v2/memories/",
             post(
                 |State(c): State<Captured>, Json(body): Json<Value>| async move {
                     c.bodies.lock().push(body.clone());
@@ -270,7 +270,7 @@ async fn tool_search_passes_query_and_rerank() {
     let captured = Captured::default();
     let app = Router::new()
         .route(
-            "/v2/memories/search",
+            "/v2/memories/search/",
             post(
                 |State(c): State<Captured>, Json(body): Json<Value>| async move {
                     c.bodies.lock().push(body.clone());
@@ -321,7 +321,7 @@ async fn tool_search_caps_top_k_at_fifty() {
     let captured = Captured::default();
     let app = Router::new()
         .route(
-            "/v2/memories/search",
+            "/v2/memories/search/",
             post(
                 |State(c): State<Captured>, Json(body): Json<Value>| async move {
                     c.bodies.lock().push(body.clone());
@@ -356,7 +356,7 @@ async fn tool_conclude_posts_verbatim_with_infer_false() {
     let captured = Captured::default();
     let app = Router::new()
         .route(
-            "/v1/memories",
+            "/v1/memories/",
             post(
                 |State(c): State<Captured>, Json(body): Json<Value>| async move {
                     c.bodies.lock().push(body.clone());
@@ -393,7 +393,7 @@ async fn tool_conclude_posts_verbatim_with_infer_false() {
 #[tokio::test]
 async fn circuit_breaker_trips_after_five_consecutive_failures() {
     let app = Router::new().route(
-        "/v2/memories/search",
+        "/v2/memories/search/",
         post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "down") }),
     );
     let server = spawn(app).await;
