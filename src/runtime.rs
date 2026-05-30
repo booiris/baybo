@@ -171,6 +171,15 @@ pub struct ManagerGraph {
     /// pick it up via `stores.xxx` without a new field here.
     pub stores: Store,
 
+    /// Pluggable long-term memory. `None` whenever `config.memory.enabled`
+    /// is false or `provider = noop`; a real backend (`mem0` /
+    /// `openviking`) is constructed in [`build_managers`] from
+    /// `config.memory` + the secret vault. Threaded into every
+    /// `AgentLoopConfig` built by the spawner factory in
+    /// [`wire_router`]; its `tools()` are registered into the builtin
+    /// tool registry at construction time.
+    pub memory: Option<Arc<dyn Memory>>,
+
     /// Consumed by [`wire_router`]. Stored in the graph so the caller
     /// cannot forget to plumb it through — a silently-missing receiver
     /// would make cron-triggered turns disappear into the void. Wrapped
@@ -560,6 +569,18 @@ pub async fn build_managers(
         }
     };
 
+    // --- pluggable memory backend. Constructed here while
+    // `tool_registry` is still mutable so the impl's `tools()` can be
+    // registered as builtins. `None` (the no-op path) when
+    // `config.memory.enabled = false` or `provider = noop`.
+    let memory =
+        aura_memory::boot::build_memory_backend(&config, &secret_vault, proxy.as_ref()).await;
+    if let Some(m) = &memory {
+        for (tool, manifest) in m.tools() {
+            tool_registry.register(tool, manifest);
+        }
+    }
+
     // Freeze the registry now that mutation is done; downstream
     // consumers (`tool_executor`, `McpReconciler`, the actor spawner)
     // need an `Arc<ToolRegistry>` for sharing across tasks.
@@ -656,6 +677,7 @@ pub async fn build_managers(
         channels_registry,
         secret_vault,
         stores,
+        memory,
         cron_trigger_rx: Some(cron_trigger_rx),
         system_spawn_tx,
         system_spawn_rx: Some(system_spawn_rx),
@@ -749,14 +771,13 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         ));
         let system_spawn_tx = graph.system_spawn_tx.clone();
         let supervisor_for_spawn = supervisor.clone();
-        // Memory subsystem. No real backend ships yet, so this is `None` — the
-        // inert no-op path: every memory hook (recall, `on_job_complete`) is
-        // skipped, no `MemoryRecall`/`MemoryWrite` trace step is opened, nothing
-        // is billed. This is the single construction point: a real
-        // `Arc<dyn Memory>` is built here from `config.memory` + the
-        // LLM/embedding clients, its `tools()` registered into `tool_registry`,
-        // and the handle threaded into every actor's `AgentLoopConfig` below.
-        let memory: Option<Arc<dyn Memory>> = None;
+        // Memory subsystem. Constructed in `build_managers` via
+        // `aura_memory::boot::build_memory_backend` so the impl's
+        // `tools()` could be registered as builtins while `tool_registry`
+        // was still mutable. Threaded into every actor's `AgentLoopConfig`
+        // below; `None` keeps the no-op path (every memory hook skipped,
+        // nothing billed).
+        let memory: Option<Arc<dyn Memory>> = graph.memory.clone();
         Box::new(
             move |session: aura_model::Session,
                   initial_llm: Option<LlmEntryName>,

@@ -11,8 +11,8 @@ use aura_llm::{
 };
 use aura_memory::{Memory, MemoryContext};
 use aura_model::{
-    ChatMessage, ContentBlock, JobId, LlmEntryName, Role, SessionId, SystemSpawnRequest,
-    ThinkingContent,
+    ChatMessage, ContentBlock, JobId, LlmEntryName, MessageSource, Role, SessionId,
+    SystemSpawnRequest, ThinkingContent,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -1392,7 +1392,36 @@ impl AgentLoop {
         if cancel_token.is_cancelled() {
             return;
         }
+        // Belt-and-braces dedup: the `Memory` trait says per-session
+        // de-duplication is the impl's job, but mem0 / openviking don't do
+        // it today (a recall on the same query a few turns later returns
+        // the same `memory` strings). Filter against the live transcript's
+        // existing `RecalledMemory` rows so we don't accumulate identical
+        // `<recalled_memory>` blocks. Survives actor reap for free — the
+        // transcript reloads from the store on rehydration.
+        let already_in_transcript: std::collections::HashSet<String> = self
+            .context_manager
+            .messages()
+            .iter()
+            .filter(|m| m.source() == MessageSource::RecalledMemory)
+            .flat_map(|m| {
+                m.content.iter().filter_map(|b| match b {
+                    ContentBlock::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        let mut seen_this_recall: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for mem in recalled {
+            if already_in_transcript.contains(&mem.content) {
+                continue;
+            }
+            // A single recall can also return the same string twice (the
+            // backend doesn't promise uniqueness in its result vec).
+            if !seen_this_recall.insert(mem.content.clone()) {
+                continue;
+            }
             self.context_manager
                 .append_recalled_memory(vec![ContentBlock::Text(mem.content)])
                 .await;

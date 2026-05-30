@@ -105,7 +105,10 @@ impl SlashHandler for CliSlashHandler {
             // command the dispatcher will reject. The dispatch-time
             // whitelist (`slash_admissible`) is the canonical guard;
             // this is the cosmetic mirror so the menu stays coherent.
-            if matches!(name, "help" | "completion" | "setup" | "tui" | "gateway") {
+            if matches!(
+                name,
+                "help" | "completion" | "setup" | "tui" | "gateway" | "memory"
+            ) {
                 continue;
             }
             let slash = format!("/{name}");
@@ -264,6 +267,11 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
         Commands::Llm {
             cmd: LlmCmd::Add | LlmCmd::Edit | LlmCmd::Remove | LlmCmd::Default,
         } => Err("interactive LLM editor; run it from a shell"),
+        // `memory` edits a non-hot-reload backend (provider, API keys, recall
+        // knobs); the whole family is shell-only — never slash.
+        Commands::Memory { .. } => {
+            Err("`memory` commands edit a non-hot-reload backend; run them from a shell")
+        }
         Commands::ExternalAgent {
             cmd: ExternalAgentCmd::Setup | ExternalAgentCmd::Disable | ExternalAgentCmd::Default,
         } => {
@@ -529,6 +537,41 @@ mod tests {
                 !names.contains(&forbidden.to_string()),
                 "{forbidden} must not appear in the slash menu, got {names:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn slash_excludes_memory_entirely() {
+        let handler = handler_with(SkillRegistry::new());
+        // Not advertised in the menu.
+        let names: Vec<String> = handler.commands().into_iter().map(|c| c.name).collect();
+        assert!(
+            !names.contains(&"/memory".to_string()),
+            "/memory must not appear in the slash menu, got {names:?}"
+        );
+        // And rejected at dispatch — every subcommand is shell-only.
+        for raw in [
+            "/memory status",
+            "/memory setup",
+            "/memory disable",
+            "/memory test",
+        ] {
+            match handler.handle(raw).await {
+                SlashOutcome::Handled(blocks) => {
+                    let text = blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    assert!(
+                        text.contains("not available in slash"),
+                        "expected slash-rejection for {raw}, got: {text}"
+                    );
+                }
+                other => panic!("expected Handled rejection for {raw}, got {other:?}"),
+            }
         }
     }
 

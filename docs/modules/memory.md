@@ -161,13 +161,91 @@ field — the core has no opinion on whether a backend embeds at all.
 
 These are the implementation's contract.
 
+## Backends
+
+Two real backends ship in the crate, selected at startup via
+[`MemoryConfig.provider`](../../crates/config/src/memory.rs) (`mem0` /
+`openviking`); `noop` (the default) keeps the inert path. Both delegate
+extraction to their respective servers, so neither uses
+[`MemoryConfig.llm`](../../crates/config/src/memory.rs) — the field stays on
+the typed config for future backends.
+
+### `mem0` (`aura_memory::mem0`)
+
+Hosted SaaS via the Mem0 Platform REST API. Per-user scope comes from the
+caller's `user_id` at every call; `agent_id` defaults to `"aura"` (deployment
+identity) on writes and is overridable per tool call. Tool reads accept an
+optional `scope: "session"` that narrows to the current session via Mem0's
+`run_id` (sourced from `ToolContext::session_id`).
+
+| Hook | Behaviour |
+| --- | --- |
+| `recall` | `POST /v2/memories/search/` with `{query, filters: {AND: [{user_id}]}, rerank, top_k}`; returns the `memory` text verbatim. |
+| `on_job_complete` | `POST /v1/memories/` with `{messages: [{user,assistant}], user_id, agent_id}`; the Mem0 server runs LLM-based fact extraction. |
+| `on_session_end` | No-op (Mem0 has no session concept; extraction is per-`add`). |
+| `tools()` | Eight `mem0_*` tools — the model's explicit-signal path (see below). |
+
+The tool surface mirrors the Mem0 `openclaw` plugin (each `mem0_`-prefixed),
+mapped onto Mem0 REST endpoints. Unlike `on_job_complete`, `mem0_add` stores
+verbatim (`infer: false`) — the model already decided what is worth keeping.
+
+| Tool | Endpoint | Purpose |
+| --- | --- | --- |
+| `mem0_search` | `POST /v2/memories/search/` | Semantic search; optional `scope` / `categories` / advanced `filters`. |
+| `mem0_add` | `POST /v1/memories/` (`infer: false`) | Store fact(s) verbatim; `category` / `importance` / `metadata`; `longTerm: false` → session-scoped. |
+| `mem0_get` | `GET /v1/memories/{id}/` | Fetch one memory by id. |
+| `mem0_list` | `POST /v2/memories/` | List the user's memories (paginated). |
+| `mem0_update` | `PUT /v1/memories/{id}/` | Replace a memory's text in place. |
+| `mem0_delete` | `DELETE /v1/memories/{id}/` or `?user_id=` | Delete by id, search-and-delete by `query`, or `all: true` + `confirm: true`. |
+| `mem0_event_list` | `GET /v1/events/` | List recent background processing events. |
+| `mem0_event_status` | `GET /v1/event/{id}/` | Status / latency / results of one event. |
+
+Failure handling: 5-failure / 120 s circuit breaker shared by every API call
+(pauses API calls after sustained outages). Recall failures are
+swallowed and logged at `warn`. API key resolution: vault entry
+`user_env.<api_key_name>` (managed via `aura secret add <name>`) → process
+env `<api_key_name>`. `<name>` defaults to `MEM0_API_KEY` when
+`api_key_name` is unset in config.
+
+### `openviking` (`aura_memory::openviking`)
+
+Self-hosted context database. Aura `SessionId` maps 1:1 to the OpenViking
+session id; `X-OpenViking-Account` (config) and `X-OpenViking-Agent`
+(hardcoded `"aura"`) carry deployment identity, `X-OpenViking-User` carries
+`MemoryContext::user_id()` per call.
+
+| Hook | Behaviour |
+| --- | --- |
+| `recall` | `POST /api/v1/search/find` with `{query, top_k}`; returns `"{abstract} (viking://uri)"`. |
+| `on_job_complete` | `POST /api/v1/sessions/{ctx.session_id}/messages` ×2 (user, assistant). |
+| `on_session_end` | `POST /api/v1/sessions/{ctx.session_id}/commit` — triggers the 6-category server-side extraction (preferences / entities / events / cases / patterns / profile). Skipped if `transcript.is_empty()`. |
+| `tools()` | Four `viking_*` tools (see below). |
+
+The tool surface mirrors the official OpenViking `openclaw-plugin`, each
+`viking_`-prefixed:
+
+| Tool | Endpoint(s) | Purpose |
+| --- | --- | --- |
+| `viking_recall` | `POST /api/v1/search/find` | Search memories; without `targetUri`, queries `viking://user/memories` + `viking://agent/memories` concurrently, then merges / dedups / leaf-filters. |
+| `viking_store` | `POST …/messages` + `…/commit` | Write one session message, commit, and poll the extraction task to a memory count. |
+| `viking_forget` | `DELETE /api/v1/fs` | Delete by memory URI, or search-and-delete on a strong single match (`is_memory_uri` guards against deleting non-memory paths). |
+| `viking_archive_expand` | `GET /api/v1/sessions/{sid}/archives/{id}` | Fetch the original messages from a compressed session archive. |
+
+API key is optional (local dev mode runs unauthenticated). Resolution:
+vault entry `user_env.<api_key_name>` (`aura secret add <name>`) → process
+env `<api_key_name>` → empty (unauthenticated). `<name>` defaults to
+`OPENVIKING_API_KEY` when `api_key_name` is unset in config. Startup health
+probe is `GET /health`; failure logs `warn` and continues.
+
+### Operator CLI
+
+`aura memory {status, setup, test, disable}` — see
+[`docs/cli.md`](../cli.md#aura-memory). Configure is interactive (provider +
+per-field prompts, vault-stash for the API key); memory config is **not**
+hot-reload, so `setup` prints a restart hint.
+
 ## Deferred
 
-- **The first real `Memory` impl.** Out of scope — the trait + all wiring are
-  ready for one to drop in at the single construction point in
-  `runtime.rs::build_managers`. If/when a backend needs an embedding handle,
-  it constructs its own embedding client and threads it through `extra` (no
-  embedding scaffolding lives in the core).
 - Operator/GDPR wipe of memory rows: re-add behind a user-triggered command if a
   future backend needs it (no background sweeper — see CLAUDE.md).
 

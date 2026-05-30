@@ -44,7 +44,7 @@ pub use crate::error::{ConfigError, Result, ValidationError};
 pub use crate::external_agents::{ClaudeConfig, CodexConfig, ExternalAgentsConfig, GeminiConfig};
 pub use crate::gateway::GatewayConfig;
 pub use crate::llm::{LlmEntry, LlmPricingOverride};
-pub use crate::memory::MemoryConfig;
+pub use crate::memory::{MemoryConfig, MemoryProvider};
 pub use crate::proxy::ProxyConfig;
 pub use crate::reload::{ConfigHandle, hot_reload_diff};
 pub use crate::security::SecurityConfig;

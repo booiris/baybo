@@ -14,11 +14,27 @@ aura-model = { workspace = true }
 aura-llm = { workspace = true }
 aura-tools = { workspace = true }
 aura-trace = { workspace = true }
+aura-security = { workspace = true }
+aura-config = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+axum = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+serde_json = { workspace = true }
+aura-trace = { workspace = true, features = ["test-support"] }
+aura-workspace = { workspace = true }
+tokio-util = { workspace = true }
+tempfile = { workspace = true }

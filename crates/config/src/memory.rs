@@ -10,19 +10,41 @@ use serde::{Deserialize, Serialize};
 
 use aura_model::LlmEntryName;
 
+/// Which backend the runtime should construct for the single `Arc<dyn Memory>`
+/// slot. The trait is single-pluggable; the runtime dispatches on this enum.
+/// Defaults to [`MemoryProvider::Noop`], which registers `NoopMemory` and
+/// leaves every memory hook inert (no recall, no write, no billing).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryProvider {
+    #[default]
+    Noop,
+    Mem0,
+    OpenViking,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct MemoryConfig {
     /// Master switch. **Default: `false`** (off — like `browser.enable`). When
-    /// false the runtime registers the no-op memory: no recall, no write, no
-    /// memory tools. A real backend opts in by flipping this to `true`. Until
-    /// one ships, the runtime is no-op regardless of this flag.
+    /// false the runtime registers the no-op memory regardless of [`provider`]:
+    /// no recall, no write, no memory tools. A real backend opts in by flipping
+    /// this to `true` and selecting a [`MemoryProvider`].
+    ///
+    /// [`provider`]: Self::provider
     pub enabled: bool,
+
+    /// Which backend the runtime constructs. Ignored when [`enabled`] is false.
+    /// Defaults to [`MemoryProvider::Noop`].
+    ///
+    /// [`enabled`]: Self::enabled
+    pub provider: MemoryProvider,
 
     /// Name of the `llm` entry the memory implementation uses for its
     /// salience / extraction calls. `None` → fall back to `default-llm`.
     /// Mirrors how the agent loop resolves its model, so memory work can target
-    /// a cheaper model than the chat path.
+    /// a cheaper model than the chat path. The bundled `mem0` and `openviking`
+    /// backends do their extraction server-side and ignore this field.
     #[serde(rename = "llm", skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmEntryName>,
 
@@ -45,6 +67,7 @@ mod tests {
             !c.enabled,
             "memory defaults off (opt-in like browser.enable)"
         );
+        assert_eq!(c.provider, MemoryProvider::Noop);
         assert!(c.llm.is_none());
         assert!(c.extra.is_null());
     }
@@ -67,6 +90,7 @@ mod tests {
     fn round_trip_with_extra_passthrough() {
         let c = MemoryConfig {
             enabled: true,
+            provider: MemoryProvider::Mem0,
             llm: Some(LlmEntryName::from("cheap-model")),
             extra: serde_json::json!({ "max_entries": 5000, "namespace": "team-a" }),
         };
@@ -74,5 +98,31 @@ mod tests {
         let back: MemoryConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, c);
         assert_eq!(back.extra["max_entries"], 5000);
+    }
+
+    #[test]
+    fn provider_deserializes_lowercase() {
+        let cfg: MemoryConfig =
+            serde_json::from_str(r#"{"enabled":true,"provider":"openviking"}"#).unwrap();
+        assert_eq!(cfg.provider, MemoryProvider::OpenViking);
+
+        let cfg: MemoryConfig =
+            serde_json::from_str(r#"{"enabled":true,"provider":"mem0"}"#).unwrap();
+        assert_eq!(cfg.provider, MemoryProvider::Mem0);
+
+        let cfg: MemoryConfig =
+            serde_json::from_str(r#"{"enabled":true,"provider":"noop"}"#).unwrap();
+        assert_eq!(cfg.provider, MemoryProvider::Noop);
+    }
+
+    #[test]
+    fn provider_serializes_lowercase() {
+        let c = MemoryConfig {
+            enabled: true,
+            provider: MemoryProvider::OpenViking,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains(r#""provider":"openviking""#), "got: {json}");
     }
 }
