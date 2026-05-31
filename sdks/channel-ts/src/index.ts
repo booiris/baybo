@@ -8,6 +8,9 @@ export type {
   AgentDelta,
   AgentMessage,
   AgentNotice,
+  AgentStatus,
+  AgentToolCompleted,
+  AgentToolStarted,
   ApprovalDecision,
   ApprovalRequest,
   BotStatusReport,
@@ -17,8 +20,11 @@ export type {
   RunOptions,
   StartBotCommand,
   StopBotCommand,
+  ToolStatus,
   UserInbound,
 } from "./channel.js";
+export { StatusRateLimited } from "./status.js";
+export type { StatusMessageId, StatusProgressOptions } from "./status.js";
 export { defaultLogger } from "./logger.js";
 export type { Logger, LogLevel } from "./logger.js";
 export type {

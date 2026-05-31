@@ -3,13 +3,14 @@ import type {
   StartBotCommand,
   WireAttachment,
 } from "@aura/channel-sdk";
-import { fetchBlob, uploadBlob } from "@aura/channel-sdk";
+import { fetchBlob, StatusRateLimited, uploadBlob } from "@aura/channel-sdk";
 import type {
   BotInboundEvent,
   BotMediaPayload,
   BotPlatform,
   BotStartHooks,
   SlashCommandSpec,
+  StatusMessageId,
 } from "@aura/channel-sdk/bot";
 import { composeAuraUserId } from "@aura/channel-sdk/bot";
 import { Bot, type Context, GrammyError, HttpError } from "grammy";
@@ -97,6 +98,43 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
     targetId: number | string,
   ): Promise<void> {
     await bot.api.setMessageReaction(chat.chatId, Number(targetId), []);
+  }
+
+  /**
+   * Post the in-flight progress status message and return its id. Sent
+   * as plain text (no MarkdownV2): the body is emoji + tool labels and
+   * could contain unescaped Markdown specials, and a status bubble must
+   * never fail to render over a stray backtick.
+   */
+  async sendStatusMessage(
+    bot: Bot,
+    chat: TelegramChat,
+    text: string,
+  ): Promise<StatusMessageId> {
+    const msg = await bot.api.sendMessage(chat.chatId, text, threadOpts(chat));
+    return msg.message_id;
+  }
+
+  /**
+   * Edit the status message in place. A 429 carries `retry_after`
+   * (seconds) — surface it as {@link StatusRateLimited} so the SDK's
+   * editor backs off exactly that long instead of hammering.
+   */
+  async editStatusMessage(
+    bot: Bot,
+    chat: TelegramChat,
+    messageId: StatusMessageId,
+    text: string,
+  ): Promise<void> {
+    try {
+      await bot.api.editMessageText(chat.chatId, Number(messageId), text);
+    } catch (err) {
+      if (err instanceof GrammyError && err.error_code === 429) {
+        const retryAfterSec = err.parameters.retry_after ?? 1;
+        throw new StatusRateLimited(retryAfterSec * 1000);
+      }
+      throw err;
+    }
   }
 
   async stopBot(bot: Bot): Promise<void> {

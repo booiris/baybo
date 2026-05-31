@@ -41,6 +41,46 @@ export interface AgentNotice {
   text: string;
 }
 
+/**
+ * A tool call started inside the in-flight turn. `label` is the
+ * human-readable preview (`Tool::call_label`); fall back to `tool`
+ * when absent. `callId` pairs it with the matching
+ * {@link AgentToolCompleted}. Surfaces the agent's mechanical progress
+ * so a sidecar can show "what's happening now" during a long turn;
+ * sidecars without a progress surface omit the hook and the frame is
+ * dropped.
+ */
+export interface AgentToolStarted {
+  sessionId: string;
+  userId: string;
+  callId: string;
+  tool: string;
+  label?: string;
+}
+
+/** A tool call finished. `summary` is a short presentation-only result
+ * rendering ("Read 200 lines", "exit 0", "Error: …"). */
+export interface AgentToolCompleted {
+  sessionId: string;
+  userId: string;
+  callId: string;
+  status: ToolStatus;
+  summary: string;
+}
+
+/** Outcome of a finished tool call carried by {@link AgentToolCompleted}. */
+export type ToolStatus = "ok" | "error" | "denied";
+
+/**
+ * Coarse turn-phase transition (today: context compaction start/end).
+ * Sidecars show/clear a transient status; surfaces without one drop it.
+ */
+export interface AgentStatus {
+  sessionId: string;
+  userId: string;
+  phase: string;
+}
+
 export interface UserInbound {
   sessionId: string;
   userId: string;
@@ -147,6 +187,18 @@ export interface Channel {
   onDelta?(delta: AgentDelta): Promise<void>;
 
   onNotice?(notice: AgentNotice): Promise<void>;
+
+  /**
+   * In-flight turn progress. These ride the same wire frames the
+   * Subscribed surfaces (web, TUI) render tool-by-tool; a bot sidecar
+   * can condense them into a live status message. All optional — an
+   * unimplemented hook drops its frame.
+   */
+  onToolStarted?(ev: AgentToolStarted): Promise<void>;
+
+  onToolCompleted?(ev: AgentToolCompleted): Promise<void>;
+
+  onStatus?(ev: AgentStatus): Promise<void>;
 
   /**
    * Return value is encoded into a `ResolveApproval` frame by the runner.

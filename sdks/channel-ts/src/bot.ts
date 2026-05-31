@@ -1,6 +1,10 @@
 import type {
+  AgentDelta,
   AgentMessage,
   AgentNotice,
+  AgentStatus,
+  AgentToolCompleted,
+  AgentToolStarted,
   ApprovalDecision,
   ApprovalRequest,
   BotStatusReport,
@@ -11,9 +15,12 @@ import type {
 } from "./channel.js";
 import type { SlashCommandSpec } from "./generated/SlashCommandSpec.js";
 import type { Logger } from "./logger.js";
+import { StatusCondenser } from "./status.js";
+import type { StatusMessageId, StatusProgressOptions } from "./status.js";
 import type { WireAttachment } from "./wire.js";
 
 export type { SlashCommandSpec };
+export type { StatusMessageId, StatusProgressOptions } from "./status.js";
 
 /**
  * One native-platform inbound event flowing from the transport into
@@ -246,6 +253,39 @@ export interface BotPlatform<BotHandle, ChatId> {
   ): Promise<void>;
 
   /**
+   * Optional: post the initial in-flight "status" message and return
+   * its platform id. The channel sends one per long turn (a turn still
+   * running after `appearAfterMs`, or once the first tool starts) and
+   * then drives {@link editStatusMessage} to keep it live. Return the
+   * message id so the channel can edit it; throw / reject to skip this
+   * turn's status surface (best-effort, a debug log).
+   *
+   * The live progress surface only activates when BOTH this and
+   * {@link editStatusMessage} are implemented — a platform that can't
+   * edit a sent message (e.g. weixin) omits them and degrades to the
+   * typing indicator + final answer.
+   */
+  sendStatusMessage?(
+    handle: BotHandle,
+    chat: ChatId,
+    text: string,
+  ): Promise<StatusMessageId>;
+
+  /**
+   * Optional: edit a status message previously created via
+   * {@link sendStatusMessage} in place. Throw a
+   * {@link import("./status.js").StatusRateLimited} to ask the channel
+   * to back off for a specific interval (e.g. a Telegram 429 carrying
+   * `retry_after`); any other rejection is a one-off debug log.
+   */
+  editStatusMessage?(
+    handle: BotHandle,
+    chat: ChatId,
+    messageId: StatusMessageId,
+    text: string,
+  ): Promise<void>;
+
+  /**
    * Optional slash-command registrar. Implement when the platform has
    * a server-side command list the client UI surfaces (Telegram
    * `setMyCommands`, Discord application commands, Slack
@@ -339,6 +379,17 @@ export interface BotChannelOptions<
    * while the user keeps typing. Default: 60_000 ms.
    */
   typingSafetyMs?: number;
+  /**
+   * Live in-flight progress: condense the turn's mechanical events
+   * (tool started/completed, compaction, answer deltas) into a single
+   * status message edited in place. Default: enabled. Pass `false` to
+   * disable, or an object to tune `appearAfterMs` / `minEditIntervalMs`
+   * / `heartbeatMs`. Only takes effect when the platform implements
+   * both {@link BotPlatform.sendStatusMessage} and
+   * {@link BotPlatform.editStatusMessage}; otherwise it's silently off.
+   * The quiet-time safety cap reuses {@link typingSafetyMs}.
+   */
+  statusProgress?: boolean | StatusProgressOptions;
   /**
    * Slash commands to publish on every successful StartBot via
    * {@link BotPlatform.registerSlashCommands}. Empty / omitted means
@@ -523,6 +574,10 @@ export class BotChannel<BotHandle, ChatId>
   private readonly typingRefreshMs: number;
   private readonly typingSafetyMs: number;
   private readonly typingSessions = new Map<string, TypingSession>();
+  // Present only when statusProgress is enabled AND the platform can
+  // both send and edit a status message. Drives the single in-place
+  // progress bubble per in-flight turn.
+  private readonly statusCondenser: StatusCondenser | undefined;
   // Mutable: starts as the constructor-supplied seed (defaults to empty)
   // and is replaced wholesale every time the gateway pushes a fresh
   // `Frame::SlashManifest`. The gateway is the single source of truth
@@ -565,6 +620,37 @@ export class BotChannel<BotHandle, ChatId>
     this.typingRefreshMs = opts.typingRefreshMs ?? DEFAULT_TYPING_REFRESH_MS;
     this.typingSafetyMs = opts.typingSafetyMs ?? DEFAULT_TYPING_SAFETY_MS;
     this.slashCommands = opts.slashCommands ?? [];
+    this.statusCondenser = this.buildStatusCondenser(opts.statusProgress);
+  }
+
+  /** Wire the status condenser when enabled and the platform supports
+   * both status hooks. The sink re-resolves the live route per call —
+   * the same pattern the working-reaction clear path uses — so a turn
+   * that outlives a bot restart edits through the fresh handle. */
+  private buildStatusCondenser(
+    setting: boolean | StatusProgressOptions | undefined,
+  ): StatusCondenser | undefined {
+    const send = this.platform.sendStatusMessage?.bind(this.platform);
+    const edit = this.platform.editStatusMessage?.bind(this.platform);
+    if (setting === false || !send || !edit) return undefined;
+    const options = typeof setting === "object" ? setting : undefined;
+    return new StatusCondenser({
+      logger: this.logger,
+      safetyMs: this.typingSafetyMs,
+      ...(options ? { options } : {}),
+      sink: {
+        send: async (userId, text) => {
+          const route = this.route(userId);
+          if (!route) return null;
+          return send(route.handle, route.chat, text);
+        },
+        edit: async (userId, messageId, text) => {
+          const route = this.route(userId);
+          if (!route) return;
+          await edit(route.handle, route.chat, messageId, text);
+        },
+      },
+    });
   }
 
   inbound(signal: AbortSignal): AsyncIterable<UserInbound> {
@@ -605,6 +691,7 @@ export class BotChannel<BotHandle, ChatId>
 
   async onMessage(msg: AgentMessage): Promise<void> {
     this.completeTypingTurn(msg.userId);
+    this.statusCondenser?.onReply(msg.userId);
     const route = this.route(msg.userId);
     if (!route) {
       this.logger.warn(
@@ -645,6 +732,9 @@ export class BotChannel<BotHandle, ChatId>
 
   async onNotice(notice: AgentNotice): Promise<void> {
     this.completeTypingTurn(notice.userId);
+    // A notice is its own out-of-band message, not the turn's terminal
+    // reply — keep the status bubble alive, just refresh its liveness.
+    this.statusCondenser?.touch(notice.userId);
     const route = this.route(notice.userId);
     if (!route) {
       this.logger.debug("notice for unknown user; dropping", notice.userId);
@@ -665,21 +755,57 @@ export class BotChannel<BotHandle, ChatId>
     }
   }
 
+  // Progress hooks: the runner only dispatches these when the hook
+  // exists, so defining them means BotChannel starts seeing the
+  // tool/status/delta frames it used to drop. They feed the condenser
+  // and never touch the platform directly (Telegram still doesn't
+  // render partial answer text).
+  async onToolStarted(ev: AgentToolStarted): Promise<void> {
+    this.statusCondenser?.onProgress(
+      ev.userId,
+      ev.label !== undefined
+        ? { kind: "tool", tool: ev.tool, label: ev.label }
+        : { kind: "tool", tool: ev.tool },
+    );
+  }
+
+  async onToolCompleted(ev: AgentToolCompleted): Promise<void> {
+    this.statusCondenser?.onProgress(ev.userId, { kind: "toolDone" });
+  }
+
+  async onStatus(ev: AgentStatus): Promise<void> {
+    this.statusCondenser?.onProgress(ev.userId, {
+      kind: "status",
+      phase: ev.phase,
+    });
+  }
+
+  async onDelta(delta: AgentDelta): Promise<void> {
+    this.statusCondenser?.onProgress(delta.userId, { kind: "delta" });
+  }
+
   async onApprovalRequested(req: ApprovalRequest): Promise<ApprovalDecision> {
     // Approval UI is about to render to the user; the bot is waiting
-    // on them, not processing. Force-cancel regardless of how many
-    // turns are pending — they're all effectively paused until the
-    // user interacts.
+    // on them, not processing. Force-cancel typing regardless of how
+    // many turns are pending — they're all effectively paused until the
+    // user interacts. The status bubble instead pauses on a ⏸ line: it
+    // survives the wait and resumes once the decision lands.
     this.cancelTyping(req.userId);
+    this.statusCondenser?.onApprovalRequested(req.userId, req.tool);
     if (!this.approvals) {
       this.logger.warn(
         "approval request received but no approvals hook is configured; auto-denying",
         req.callId,
       );
+      this.statusCondenser?.onApprovalSettled(req.userId);
       return "deny";
     }
     const route = this.route(req.userId);
-    return this.approvals.onRequested(req, route);
+    try {
+      return await this.approvals.onRequested(req, route);
+    } finally {
+      this.statusCondenser?.onApprovalSettled(req.userId);
+    }
   }
 
   async onApprovalResolved(
@@ -817,6 +943,7 @@ export class BotChannel<BotHandle, ChatId>
     }
     this.stopped = true;
     this.cancelAllTyping();
+    this.statusCondenser?.forceEndAll();
     if (this.waiter) {
       const waiter = this.waiter;
       this.waiter = null;
@@ -866,6 +993,7 @@ export class BotChannel<BotHandle, ChatId>
     this.botByUser.set(userId, botId);
     this.logInbound(botId, ev);
     this.startOrRefreshTyping(userId, botId, ev.chat, ev.reactionTargetId);
+    this.statusCondenser?.onInbound(userId);
     this.pushInbound({
       sessionId: "",
       userId,
@@ -1077,7 +1205,10 @@ export class BotChannel<BotHandle, ChatId>
 
   private cancelAllTypingForBot(botId: string): void {
     for (const [userId, bid] of this.botByUser.entries()) {
-      if (bid === botId) this.cancelTyping(userId);
+      if (bid === botId) {
+        this.cancelTyping(userId);
+        this.statusCondenser?.onForceEnd(userId);
+      }
     }
   }
 
@@ -1127,6 +1258,7 @@ export class BotChannel<BotHandle, ChatId>
     for (const [userId, bid] of this.botByUser.entries()) {
       if (bid === botId) {
         this.cancelTyping(userId);
+        this.statusCondenser?.onForceEnd(userId);
         this.botByUser.delete(userId);
         this.chatByUser.delete(userId);
       }

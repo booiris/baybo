@@ -8,6 +8,7 @@ import {
   type ReconnectPolicy,
   type ApprovalDecision,
   type NoticeLevel,
+  type ToolStatus,
 } from "./channel.js";
 import { defaultLogger, type Logger } from "./logger.js";
 import { decodeFrame, encodeFrame, type Frame } from "./wire.js";
@@ -603,6 +604,55 @@ function dispatchFrame(
       );
       return;
     }
+    case "tool_started": {
+      if (!channel.onToolStarted) return;
+      void safeInvoke(
+        () =>
+          channel.onToolStarted!({
+            sessionId: frame.session_id,
+            userId: frame.user_id ?? "",
+            callId: frame.call_id,
+            tool: frame.tool,
+            ...(frame.label !== undefined ? { label: frame.label } : {}),
+          }),
+        "onToolStarted",
+        logger,
+      );
+      return;
+    }
+    case "tool_completed": {
+      if (!channel.onToolCompleted) return;
+      void safeInvoke(
+        () =>
+          channel.onToolCompleted!({
+            sessionId: frame.session_id,
+            userId: frame.user_id ?? "",
+            callId: frame.call_id,
+            status: normalizeToolStatus(frame.status),
+            summary: frame.summary,
+          }),
+        "onToolCompleted",
+        logger,
+      );
+      return;
+    }
+    case "status": {
+      if (!channel.onStatus) return;
+      void safeInvoke(
+        () =>
+          channel.onStatus!({
+            sessionId: frame.session_id,
+            userId: frame.user_id ?? "",
+            phase: frame.phase,
+          }),
+        "onStatus",
+        logger,
+      );
+      return;
+    }
+    case "reasoning":
+      // Thinking trace — no bot-side surface today; drop it.
+      return;
     case "approval_requested": {
       void handleApproval(frame, channel, ws, logger);
       return;
@@ -809,6 +859,12 @@ export function normalizeDecision(raw: string): ApprovalDecision | null {
     return raw;
   }
   return null;
+}
+
+/** Map the wire's lower-case tool status to the typed union; anything
+ * unexpected reads as an error so a degraded call never looks `ok`. */
+function normalizeToolStatus(raw: string): ToolStatus {
+  return raw === "ok" || raw === "denied" ? raw : "error";
 }
 
 async function safeInvoke(
