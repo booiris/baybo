@@ -120,6 +120,20 @@ pub fn build_bwrap_argv(
                 argv.push(path.as_os_str().to_owned());
             }
 
+            // Read-only re-binds (e.g. `skills/`) layered on top of the
+            // masking tmpfs, for the same last-wins reason as the
+            // workspace bind below: the denylist masks all of `~/.aura`,
+            // and `skills/` sits inside it, so binding it after the
+            // tmpfs re-establishes it as a readable mountpoint while the
+            // rest of the aura state stays hidden. `--ro-bind-try`
+            // tolerates a missing dir (already filtered at the adapter,
+            // belt-and-braces here).
+            for path in &spec.readable_paths {
+                argv.push(OsString::from("--ro-bind-try"));
+                argv.push(path.as_os_str().to_owned());
+                argv.push(path.as_os_str().to_owned());
+            }
+
             // workspace_root binds LAST. bwrap processes mounts in
             // order, so a later `--tmpfs P` shadows an earlier
             // `--bind P/x P/x`. The agent's denylist includes
@@ -487,6 +501,18 @@ pub fn render_sbpl_profile(
                 s.push_str(&format!(
                     "(allow file-write* (subpath \"{}\"))\n",
                     sbpl_quote(mount.destination())
+                ));
+            }
+
+            // Read-only re-allows (e.g. `skills/`) AFTER the denies, so
+            // last-match-wins keeps them readable even when they sit
+            // under a denied parent (`~/.aura`). Read-only by design: no
+            // file-write* re-allow is emitted, mirroring the bwrap
+            // `--ro-bind-try`.
+            for p in &spec.readable_paths {
+                s.push_str(&format!(
+                    "(allow file-read* (subpath \"{}\"))\n",
+                    sbpl_quote(p)
                 ));
             }
             s.push('\n');
@@ -1316,6 +1342,74 @@ mod tests {
             final_read_allow > deny_pos,
             "workspace read allow must follow denies for last-match-wins to win: \
              allow@{final_read_allow} vs deny@{deny_pos}"
+        );
+    }
+
+    #[test]
+    fn bwrap_argv_permissive_rebinds_readable_paths_ro_after_denied_tmpfs() {
+        // `skills/` lives inside the denied `~/.aura` parent. It must be
+        // re-bound read-only AFTER the masking tmpfs (same last-wins
+        // ordering as the workspace bind) so an installed skill's
+        // script stays readable while the rest of the aura state stays
+        // hidden.
+        let mut spec = spec_for(NetworkPolicy::All, "/home/u/.aura/work");
+        spec.filesystem_policy = FilesystemPolicy::Permissive {
+            extra_root: PathBuf::from("/home/u"),
+            denied_paths: vec![PathBuf::from("/home/u/.aura")],
+        };
+        spec.readable_paths = vec![PathBuf::from("/home/u/.aura/skills")];
+        let argv = build_bwrap_argv(&spec, None);
+        let strs = argv_strs(&argv);
+
+        let ro_idx = strs
+            .windows(3)
+            .position(|w| {
+                w[0] == "--ro-bind-try"
+                    && w[1] == "/home/u/.aura/skills"
+                    && w[2] == "/home/u/.aura/skills"
+            })
+            .expect("skills/ must be RO re-bound");
+        let tmpfs_idx = strs
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/home/u/.aura")
+            .expect("denied tmpfs for /home/u/.aura must be present");
+        assert!(
+            ro_idx > tmpfs_idx,
+            "skills/ RO bind must come AFTER the masking tmpfs; got ro@{ro_idx}, tmpfs@{tmpfs_idx}: {strs:?}"
+        );
+        // It must NOT be a writable bind.
+        assert!(
+            !strs
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/home/u/.aura/skills"),
+            "skills/ must be read-only, never RW-bound: {strs:?}"
+        );
+    }
+
+    #[test]
+    fn sbpl_profile_permissive_reallows_readable_paths_read_only_after_denies() {
+        let mut spec = spec_for(NetworkPolicy::None, "/Users/u/.aura/work");
+        spec.filesystem_policy = FilesystemPolicy::Permissive {
+            extra_root: PathBuf::from("/Users/u"),
+            denied_paths: vec![PathBuf::from("/Users/u/.aura")],
+        };
+        spec.readable_paths = vec![PathBuf::from("/Users/u/.aura/skills")];
+        let s = render_sbpl_profile(&spec, None);
+
+        let deny_pos = s
+            .find(r#"(deny file-read* (subpath "/Users/u/.aura"))"#)
+            .expect("deny for /Users/u/.aura must be present");
+        let read_allow = s
+            .find(r#"(allow file-read* (subpath "/Users/u/.aura/skills"))"#)
+            .expect("post-deny skills read-allow must be emitted");
+        assert!(
+            read_allow > deny_pos,
+            "skills read-allow must follow the deny for last-match-wins: allow@{read_allow} vs deny@{deny_pos}"
+        );
+        // Read-only: there must be no write-allow for skills/.
+        assert!(
+            !s.contains(r#"(allow file-write* (subpath "/Users/u/.aura/skills"))"#),
+            "skills/ must stay read-only (no file-write* allow): {s}"
         );
     }
 

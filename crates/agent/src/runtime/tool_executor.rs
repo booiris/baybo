@@ -448,7 +448,8 @@ impl ToolExecutor {
                                 self.workspace_root.clone(),
                                 NetworkPolicy::All,
                             )
-                            .with_permissive_filesystem(extra_root, denied),
+                            .with_permissive_filesystem(extra_root, denied)
+                            .with_readable_paths(vec![self.workspace_paths.skills_dir()]),
                         ) as Arc<dyn ExecSandbox>
                     })
                 } else {

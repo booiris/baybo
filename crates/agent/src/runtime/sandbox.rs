@@ -16,6 +16,7 @@ pub struct SandboxAdapter {
     resource_limits: ResourceLimits,
     allowed_hosts: BTreeSet<String>,
     filesystem_policy: FilesystemPolicy,
+    readable_paths: Vec<PathBuf>,
     cwd_must_be_in_workspace: bool,
 }
 
@@ -41,6 +42,7 @@ impl SandboxAdapter {
             resource_limits,
             allowed_hosts: BTreeSet::new(),
             filesystem_policy: FilesystemPolicy::Workspace,
+            readable_paths: Vec::new(),
             cwd_must_be_in_workspace: true,
         }
     }
@@ -78,6 +80,20 @@ impl SandboxAdapter {
             denied_paths,
         };
         self.cwd_must_be_in_workspace = false;
+        self
+    }
+
+    /// Expose extra host paths **read-only** inside the sandbox, mounted
+    /// at the same path. Used to surface `<workspace>/skills` so an
+    /// installed skill's bundled script runs in place: under
+    /// `Permissive`, the RO bind is layered on top of the denylist's
+    /// masking tmpfs (the agent's denylist masks all of `~/.aura`), so
+    /// the script stays readable while the rest of the aura state stays
+    /// hidden. Non-existent paths are dropped — bwrap's `--ro-bind-try`
+    /// tolerates them, but Docker's `-v …:ro` would fail and an SBPL
+    /// allow on a missing path is dead weight.
+    pub fn with_readable_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.readable_paths = paths.into_iter().filter(|p| p.exists()).collect();
         self
     }
 }
@@ -128,7 +144,7 @@ impl ExecSandbox for SandboxAdapter {
             args: args.to_vec(),
             cwd: opts.cwd,
             workspace_root: self.workspace_root.clone(),
-            readable_paths: Vec::new(),
+            readable_paths: self.readable_paths.clone(),
             writable_paths: Vec::new(),
             allowed_hosts: self.allowed_hosts.clone(),
             network_policy: self.network_policy,
@@ -284,6 +300,37 @@ mod tests {
         let seen = runner.seen.lock().take().expect("runner saw spec");
         assert_eq!(seen.resource_limits, limits);
         assert_eq!(seen.allowed_hosts, hosts);
+    }
+
+    #[tokio::test]
+    async fn readable_paths_round_trip_into_spec_and_drop_missing() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let skills = tempfile::tempdir().expect("skills tempdir");
+        let missing = workspace.path().join("does-not-exist");
+        let runner = Arc::new(RecordingRunner::default());
+        let adapter = SandboxAdapter::new(
+            Arc::clone(&runner) as Arc<dyn SandboxRunner>,
+            workspace.path().to_path_buf(),
+            NetworkPolicy::All,
+        )
+        .with_readable_paths(vec![skills.path().to_path_buf(), missing.clone()]);
+        adapter
+            .spawn_command(
+                Path::new("/bin/echo"),
+                &["hi".into()],
+                SpawnOpts {
+                    timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("recording runner accepts");
+        let seen = runner.seen.lock().take().expect("runner saw spec");
+        assert_eq!(
+            seen.readable_paths,
+            vec![skills.path().to_path_buf()],
+            "existing readable path must round-trip; missing path must be dropped"
+        );
     }
 
     #[tokio::test]
