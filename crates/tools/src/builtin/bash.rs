@@ -35,6 +35,7 @@
 //! separate prompt offers an unsandboxed retry. Environment
 //! variables and `cd` changes do NOT persist across invocations.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -116,7 +117,7 @@ impl BashTool {
             description: build_description(&work_dir, std::env::consts::OS),
             workspace_root,
             work_dir,
-            uv_env_prefix: build_uv_env_exports(&paths),
+            uv_env_prefix: build_uv_env_exports(&paths, resolve_uv_bin_dir().as_deref()),
         }
     }
 
@@ -164,9 +165,21 @@ const UV_SHELL_SHIMS: &str = "python() { uv run python \"$@\"; }; \
                               pip() { uv pip \"$@\"; }; ";
 
 /// Trailing `; ` lets callers concatenate the command body directly
-/// without a separator.
-fn build_uv_env_exports(paths: &WorkspacePaths) -> String {
+/// without a separator. `uv_dir`, when present, is uv's install directory
+/// resolved off the gateway's `$PATH`; it is folded onto the front of the
+/// in-sandbox `$PATH` so the python/pip shims can find `uv` even though the
+/// bwrap sandbox hands the command a `--clearenv`'d, hardcoded
+/// `PATH=/usr/bin:/bin:/usr/sbin:/sbin` (`aura-sandbox`) that omits the
+/// `~/.local/bin` location uv's own installer uses. `None` (uv not on PATH)
+/// leaves PATH untouched — the shims then fail only if the agent actually
+/// invokes python.
+fn build_uv_env_exports(paths: &WorkspacePaths, uv_dir: Option<&Path>) -> String {
     let mut out = String::new();
+    if let Some(dir) = uv_dir {
+        out.push_str("export PATH=");
+        out.push_str(&sh_quote(&dir.to_string_lossy()));
+        out.push_str(r#":"$PATH"; "#);
+    }
     for (name, get) in UV_ENV_VARS {
         let path = get(paths);
         out.push_str("export ");
@@ -177,6 +190,36 @@ fn build_uv_env_exports(paths: &WorkspacePaths) -> String {
     }
     out.push_str(UV_SHELL_SHIMS);
     out
+}
+
+/// Bare name of the uv binary, looked up on the gateway's `$PATH`.
+const UV_BIN_NAME: &str = "uv";
+
+/// Best-effort resolve of the directory holding the `uv` executable on the
+/// gateway's `$PATH`, for [`build_uv_env_exports`] to splice onto the
+/// sandbox PATH. Resolved once at [`BashTool::new`] from the gateway
+/// process env, which carries the user's full PATH (uv's prewarm
+/// [`spawn_uv_python_prewarm`] relies on the same). `None` when uv isn't
+/// installed.
+fn resolve_uv_bin_dir() -> Option<PathBuf> {
+    uv_bin_dir_in(&std::env::var_os("PATH")?)
+}
+
+/// PATH-walk split out of [`resolve_uv_bin_dir`] so it is unit-testable
+/// without mutating the process-global `PATH`. Empty entries (the `::`
+/// implicit-cwd form) are skipped so cwd never lands on the sandbox PATH.
+fn uv_bin_dir_in(path_var: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path_var)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .find(|dir| is_executable_file(&dir.join(UV_BIN_NAME)))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    matches!(
+        std::fs::metadata(path),
+        Ok(meta) if meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    )
 }
 
 /// Default Python toolchain prefetched at boot. Pinning to a specific
@@ -198,7 +241,7 @@ pub fn spawn_uv_python_prewarm(paths: &WorkspacePaths) {
         .map(|(name, get)| (*name, get(paths)))
         .collect();
     tokio::spawn(async move {
-        let mut cmd = tokio::process::Command::new("uv");
+        let mut cmd = tokio::process::Command::new(UV_BIN_NAME);
         cmd.args(["python", "install", UV_PREWARM_PYTHON]);
         for (k, v) in &env {
             cmd.env(k, v);
@@ -1392,7 +1435,7 @@ mod tests {
     #[test]
     fn build_uv_env_exports_points_at_workspace_subdirs() {
         let paths = WorkspacePaths::new("/var/aura");
-        let prefix = build_uv_env_exports(&paths);
+        let prefix = build_uv_env_exports(&paths, None);
         assert!(
             prefix.contains("export UV_CACHE_DIR='/var/aura/work/.uv/cache'"),
             "UV_CACHE_DIR missing or wrong, got: {prefix}",
@@ -1430,11 +1473,70 @@ mod tests {
     #[test]
     fn build_uv_env_exports_quotes_paths_with_special_chars() {
         let paths = WorkspacePaths::new("/tmp/aura's space");
-        let prefix = build_uv_env_exports(&paths);
+        let prefix = build_uv_env_exports(&paths, None);
         assert!(
             prefix.contains("export UV_CACHE_DIR='/tmp/aura'\\''s space/work/.uv/cache'"),
             "UV_CACHE_DIR must be POSIX-quoted, got: {prefix}",
         );
+    }
+
+    #[test]
+    fn build_uv_env_exports_prepends_resolved_uv_dir_to_path() {
+        let paths = WorkspacePaths::new("/var/aura");
+        let prefix = build_uv_env_exports(&paths, Some(Path::new("/home/u/.local/bin")));
+        assert!(
+            prefix.contains(r#"export PATH='/home/u/.local/bin':"$PATH"; "#),
+            "uv dir must be folded onto PATH ahead of the sandbox default, got: {prefix}",
+        );
+        // PATH export precedes the UV_* exports so the shims resolve `uv`.
+        let path_at = prefix.find("export PATH=").expect("PATH export present");
+        let cache_at = prefix.find("export UV_CACHE_DIR=").expect("cache export");
+        assert!(
+            path_at < cache_at,
+            "PATH export must come first, got: {prefix}"
+        );
+        assert!(prefix.contains("python3() { uv run python \"$@\"; }"));
+    }
+
+    #[test]
+    fn build_uv_env_exports_omits_path_when_uv_absent() {
+        let paths = WorkspacePaths::new("/var/aura");
+        let prefix = build_uv_env_exports(&paths, None);
+        assert!(
+            !prefix.contains("export PATH="),
+            "no PATH export when uv is unresolved, got: {prefix}",
+        );
+    }
+
+    #[test]
+    fn uv_bin_dir_in_finds_executable_skipping_empty_and_nonexec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uv = dir.path().join("uv");
+        std::fs::write(&uv, b"#!/bin/sh\n").expect("write uv");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod uv");
+        }
+        // Leading empty (implicit-cwd) entry and a non-matching dir are
+        // skipped; the executable in `dir` wins.
+        let path = std::env::join_paths(["".as_ref(), Path::new("/nonexistent"), dir.path()])
+            .expect("join paths");
+        assert_eq!(uv_bin_dir_in(&path).as_deref(), Some(dir.path()));
+    }
+
+    #[test]
+    fn uv_bin_dir_in_rejects_non_executable_uv() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uv = dir.path().join("uv");
+        std::fs::write(&uv, b"not exec\n").expect("write uv");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod uv");
+        }
+        let path = std::env::join_paths([dir.path()]).expect("join paths");
+        assert_eq!(uv_bin_dir_in(&path), None);
     }
 
     fn classify(command: &str, bin: &Path) -> AuraResolution {
@@ -1842,7 +1944,8 @@ mod tests {
             stderr: Vec::new(),
             timed_out: false,
         });
-        let out = BashTool::for_test()
+        let tool = BashTool::for_test();
+        let out = tool
             .execute(json!({ "command": "echo hello" }), &ctx_with(Some(sandbox)))
             .await
             .unwrap();
@@ -1854,10 +1957,11 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].program, std::path::PathBuf::from("sh"));
         assert_eq!(calls[0].args[0], "-c");
-        // Tighter than `contains` — locks the prefix to the head so a
-        // future reorder can't accidentally drop it and still pass.
+        // Tighter than `contains` — locks the whole uv env prefix (incl.
+        // the optional leading PATH export) to the head so a future
+        // reorder can't accidentally drop it and still pass.
         assert!(
-            calls[0].args[1].starts_with("export UV_CACHE_DIR="),
+            calls[0].args[1].starts_with(tool.uv_env_prefix.as_str()),
             "uv env prefix must lead the sh -c body, got: {}",
             calls[0].args[1],
         );
@@ -1965,15 +2069,15 @@ mod tests {
             stderr: Vec::new(),
             timed_out: false,
         });
-        BashTool::for_test()
-            .execute(json!({ "command": "pwd" }), &ctx_with(Some(sandbox)))
+        let tool = BashTool::for_test();
+        tool.execute(json!({ "command": "pwd" }), &ctx_with(Some(sandbox)))
             .await
             .expect("pwd must run");
         let calls = fake.calls();
         assert_eq!(calls.len(), 1, "pwd must consult the sandbox now");
         assert_eq!(calls[0].args[0], "-c");
         assert!(
-            calls[0].args[1].starts_with("export UV_CACHE_DIR="),
+            calls[0].args[1].starts_with(tool.uv_env_prefix.as_str()),
             "uv env prefix must lead the sh -c body, got: {}",
             calls[0].args[1],
         );
