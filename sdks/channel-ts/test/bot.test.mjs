@@ -877,3 +877,87 @@ test("a rejected setWorkingReaction is swallowed and does not break ingest", asy
   assert.equal(next.done, false);
   assert.equal(next.value.content, "hi");
 });
+
+// --- Status condenser wiring ------------------------------------------
+//
+// The condenser itself is unit-tested in status.test.mjs; here we only
+// assert BotChannel wires it correctly: the progress hooks feed it, the
+// status hooks gate it, and statusProgress:false / missing hooks disable
+// it without crashing.
+
+function statusPlatform() {
+  const fake = makePlatform();
+  const status = { sends: [], edits: [] };
+  let nextMsgId = 100;
+  fake.platform.notifyTyping = async () => {};
+  fake.platform.sendStatusMessage = async (_h, chat, text) => {
+    status.sends.push({ chat, text });
+    return nextMsgId++;
+  };
+  fake.platform.editStatusMessage = async (_h, _chat, id, text) => {
+    status.edits.push({ id, text });
+  };
+  return { fake, status };
+}
+
+test("status condenser: first tool materializes a status message, reply finalizes it", async () => {
+  const { fake, status } = statusPlatform();
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    statusProgress: { appearAfterMs: 10000, minEditIntervalMs: 10, heartbeatMs: 10000 },
+    typingSafetyMs: 100000,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi" });
+  await channel.onToolStarted({
+    sessionId: "s", userId: "test_b1_42_u", callId: "c1",
+    tool: "bash", label: "bash — cargo test",
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(status.sends.length, 1);
+  assert.match(status.sends[0].text, /🔧 bash — cargo test/);
+
+  await channel.onMessage({ sessionId: "s", userId: "test_b1_42_u", content: "done" });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(
+    status.edits.some((e) => e.text.startsWith("✅ done")),
+    "the final reply collapses the bubble to a ✅ footer",
+  );
+});
+
+test("status condenser: absent status hooks make the progress hooks no-ops", async () => {
+  const fake = makePlatform(); // no sendStatusMessage / editStatusMessage
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi" });
+  // Must not throw despite no condenser being wired.
+  await channel.onToolStarted({
+    sessionId: "s", userId: "test_b1_42_u", callId: "c1", tool: "bash",
+  });
+  await channel.onStatus({ sessionId: "s", userId: "test_b1_42_u", phase: "compacting" });
+  await channel.onMessage({ sessionId: "s", userId: "test_b1_42_u", content: "done" });
+  assert.equal(fake.calls.sends.length, 1, "the answer itself still ships");
+});
+
+test("statusProgress:false disables the condenser even when the hooks exist", async () => {
+  const { fake, status } = statusPlatform();
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    statusProgress: false,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi" });
+  await channel.onToolStarted({
+    sessionId: "s", userId: "test_b1_42_u", callId: "c1", tool: "bash",
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(status.sends.length, 0, "no status message when disabled");
+});
