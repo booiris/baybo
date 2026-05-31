@@ -722,3 +722,158 @@ test("explicit StopBot clears the user route (contrast with polling exit)", asyn
   });
   assert.equal(fake.calls.sends.length, 0);
 });
+
+// --- Working-reaction lifecycle ---------------------------------------
+//
+// The message-anchored "working on it" reaction rides the exact typing
+// lifecycle: set on inbound (when the event names a reactionTargetId and
+// the platform implements both hooks), cleared FIFO as turns complete,
+// and force-cleared when the session is cancelled. The hooks are wired
+// per-test like notifyTyping is in the typing tests above.
+
+/** A fake platform with recording reaction hooks. `notifyTyping` is set
+ * too because reactions ride the typing session (no typing → no
+ * session → no reaction). Long timers keep the ticker/safety out of the
+ * way of the assertions. */
+function reactingPlatform() {
+  const fake = makePlatform();
+  const set = [];
+  const cleared = [];
+  fake.platform.notifyTyping = async () => {};
+  fake.platform.setWorkingReaction = async (handle, chat, targetId) => {
+    set.push({ handleId: handle.id, chat, targetId });
+  };
+  fake.platform.clearWorkingReaction = async (handle, chat, targetId) => {
+    cleared.push({ handleId: handle.id, chat, targetId });
+  };
+  return { fake, set, cleared };
+}
+
+const reactingChannel = (fake) =>
+  new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    typingRefreshMs: 10_000,
+    typingSafetyMs: 10_000,
+  });
+
+test("reacts to the inbound message and clears it when the turn completes", async () => {
+  const { fake, set, cleared } = reactingPlatform();
+  const channel = reactingChannel(fake);
+  await channel.onStartBot({ botId: "b1", token: "t" });
+
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi", reactionTargetId: 100 });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(set, [{ handleId: 0, chat: 42, targetId: 100 }]);
+  assert.equal(cleared.length, 0, "no clear before the turn completes");
+
+  await channel.onMessage({ sessionId: "s", userId: "test_b1_42_u", content: "reply" });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(cleared, [{ handleId: 0, chat: 42, targetId: 100 }]);
+});
+
+test("double-send clears reactions FIFO, one per completed turn", async () => {
+  const { fake, set, cleared } = reactingPlatform();
+  const channel = reactingChannel(fake);
+  await channel.onStartBot({ botId: "b1", token: "t" });
+
+  fake.emit({ chat: 42, platformUserId: "u", content: "A", reactionTargetId: 1 });
+  fake.emit({ chat: 42, platformUserId: "u", content: "B", reactionTargetId: 2 });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(set.map((s) => s.targetId), [1, 2]);
+
+  // Reply to A → oldest reaction (1) comes off; 2 stays (B still pending).
+  await channel.onMessage({ sessionId: "s", userId: "test_b1_42_u", content: "reply A" });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(cleared.map((c) => c.targetId), [1]);
+
+  // Reply to B → 2 comes off.
+  await channel.onMessage({ sessionId: "s", userId: "test_b1_42_u", content: "reply B" });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(cleared.map((c) => c.targetId), [1, 2]);
+});
+
+test("an approval prompt force-clears every live reaction", async () => {
+  const { fake, set, cleared } = reactingPlatform();
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    approvals: { async onRequested() { return "approve"; } },
+    typingRefreshMs: 10_000,
+    typingSafetyMs: 10_000,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+
+  fake.emit({ chat: 42, platformUserId: "u", content: "A", reactionTargetId: 1 });
+  fake.emit({ chat: 42, platformUserId: "u", content: "B", reactionTargetId: 2 });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(set.map((s) => s.targetId), [1, 2]);
+
+  await channel.onApprovalRequested({
+    callId: "c1",
+    sessionId: "s",
+    userId: "test_b1_42_u",
+    tool: "tool",
+    paramsPreview: "",
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(cleared.map((c) => c.targetId).sort(), [1, 2]);
+});
+
+test("no reaction is set when the platform lacks notifyTyping (reactions ride the typing session)", async () => {
+  const fake = makePlatform();
+  const set = [];
+  // setWorkingReaction/clearWorkingReaction present, but no notifyTyping.
+  fake.platform.setWorkingReaction = async (h, c, t) => { set.push(t); };
+  fake.platform.clearWorkingReaction = async () => {};
+  const channel = reactingChannel(fake);
+  await channel.onStartBot({ botId: "b1", token: "t" });
+
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi", reactionTargetId: 100 });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(set.length, 0);
+});
+
+test("no reaction when the event omits reactionTargetId, even with hooks present", async () => {
+  const { fake, set } = reactingPlatform();
+  const channel = reactingChannel(fake);
+  await channel.onStartBot({ botId: "b1", token: "t" });
+
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi" });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(set.length, 0);
+});
+
+test("a platform with no reaction hooks ignores reactionTargetId without crashing", async () => {
+  const fake = makePlatform();
+  fake.platform.notifyTyping = async () => {};
+  const channel = reactingChannel(fake);
+  await channel.onStartBot({ botId: "b1", token: "t" });
+
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi", reactionTargetId: 100 });
+  await new Promise((r) => setImmediate(r));
+  // Completing the turn must not throw even though there's nothing to clear.
+  await channel.onMessage({ sessionId: "s", userId: "test_b1_42_u", content: "reply" });
+
+  // Inbound still reaches a consumer.
+  const iter = channel.inbound(new AbortController().signal)[Symbol.asyncIterator]();
+  const next = await iter.next();
+  assert.equal(next.value.content, "hi");
+});
+
+test("a rejected setWorkingReaction is swallowed and does not break ingest", async () => {
+  const { fake } = reactingPlatform();
+  fake.platform.setWorkingReaction = async () => { throw new Error("REACTION_INVALID"); };
+  const channel = reactingChannel(fake);
+  await channel.onStartBot({ botId: "b1", token: "t" });
+
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi", reactionTargetId: 100 });
+  await new Promise((r) => setImmediate(r));
+
+  const iter = channel.inbound(new AbortController().signal)[Symbol.asyncIterator]();
+  const next = await iter.next();
+  assert.equal(next.done, false);
+  assert.equal(next.value.content, "hi");
+});
