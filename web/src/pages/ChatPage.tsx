@@ -2220,7 +2220,11 @@ interface HistoryRowDto {
 function historyRowToTranscript(sessionId: string, row: HistoryRowDto): TranscriptRow {
   if (row.kind === 'work') {
     return {
-      key: `hist-${sessionId}-${row.ordinal}`,
+      // A direct-answer turn's work block shares its ordinal with the answer
+      // bubble (both reconstructed from the same row), so suffix the key to
+      // keep React identities distinct and let the answer's ordinal-keyed
+      // replay dedup (`hist-<sid>-<ordinal>`) match the bubble, not this block.
+      key: `hist-${sessionId}-${row.ordinal}-work`,
       role: 'system',
       text: '',
       kind: 'work',
