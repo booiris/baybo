@@ -1112,9 +1112,8 @@ export function ChatPage() {
   // Re-pin the active session's model. The PUT is authoritative — its
   // `last_llm` echo drives the local update, and a live actor (if any)
   // is re-pinned server-side to take effect on the session's next turn.
-  // `name === null` clears the pin back to `default-llm`. A concise
-  // system notice records the switch inline so the transcript shows
-  // which turns ran on which model.
+  // `name === null` clears the pin back to `default-llm`. Only a failure
+  // surfaces a transcript notice; a successful switch is silent.
   const handleSelectModel = useCallback(
     async (name: string | null) => {
       if (!sessionId) return;
@@ -1158,30 +1157,11 @@ export function ChatPage() {
         const view = prev[sessionId] ?? EMPTY_VIEW;
         return {
           ...prev,
-          [sessionId]: {
-            ...view,
-            model: applied,
-            transcript: [
-              ...view.transcript,
-              {
-                key: `model-set-${Date.now()}`,
-                role: 'system',
-                text: '',
-                notice: {
-                  level: 'info',
-                  text: applied
-                    ? `Model set to ${applied}. Applies from your next message.`
-                    : `Model reset to default${
-                        defaultModelName ? ` (${defaultModelName})` : ''
-                      }. Applies from your next message.`,
-                },
-              },
-            ],
-          },
+          [sessionId]: { ...view, model: applied },
         };
       });
     },
-    [client, sessionId, defaultModelName],
+    [client, sessionId],
   );
 
   const handleNewChat = useCallback(async () => {
@@ -1291,14 +1271,6 @@ export function ChatPage() {
             )}
           </div>
           <div className="flex items-center gap-3 shrink-0">
-            {sessionId && models.length > 1 ? (
-              <ModelPicker
-                models={models}
-                defaultName={defaultModelName}
-                current={currentView.model}
-                onSelect={handleSelectModel}
-              />
-            ) : null}
             <ConnectionBadge status={status} />
           </div>
         </header>
@@ -1413,20 +1385,30 @@ export function ChatPage() {
             />
 
             <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 border-t-2 border-black bg-canvas rounded-b-[4px]">
-              <span className="hidden md:flex items-center gap-1 text-[0.6rem] font-mono text-ink-soft/80 min-w-0 flex-1">
-                <kbd className="px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
-                  Enter
-                </kbd>
-                send
-                <kbd className="ml-1 px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
-                  ⇧Enter
-                </kbd>
-                newline
-                <kbd className="ml-1 px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
-                  /
-                </kbd>
-                commands
-              </span>
+              <div className="flex items-center gap-2 min-w-0 flex-1">
+                {sessionId && models.length > 1 ? (
+                  <ModelPicker
+                    models={models}
+                    defaultName={defaultModelName}
+                    current={currentView.model}
+                    onSelect={handleSelectModel}
+                  />
+                ) : null}
+                <span className="hidden lg:flex items-center gap-1 text-[0.6rem] font-mono text-ink-soft/80 min-w-0">
+                  <kbd className="px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
+                    Enter
+                  </kbd>
+                  send
+                  <kbd className="ml-1 px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
+                    ⇧Enter
+                  </kbd>
+                  newline
+                  <kbd className="ml-1 px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
+                    /
+                  </kbd>
+                  commands
+                </span>
+              </div>
               <button
                 type="submit"
                 disabled={!sessionId || composer.trim().length === 0 || status.state !== 'connected'}
@@ -3102,10 +3084,11 @@ function connectionBadgeLabel(status: ConnectionStatus): string {
   }
 }
 
-/** Header dropdown for switching the active conversation's model.
- *  `current` is the session's pin (`null` ⇒ following `default-llm`);
- *  selecting an entry (or "Default") calls `onSelect`, which PUTs the
- *  change. Rendered only when more than one model is configured. */
+/** Composer-footer dropdown for switching the active conversation's
+ *  model. `current` is the session's pin (`null` ⇒ following
+ *  `default-llm`); selecting an entry (or "Default") calls `onSelect`,
+ *  which PUTs the change. Opens upward since it sits at the bottom of
+ *  the viewport. Rendered only when more than one model is configured. */
 function ModelPicker({
   models,
   defaultName,
@@ -3172,7 +3155,7 @@ function ModelPicker({
         <RiArrowDownSLine className="text-sm shrink-0" />
       </button>
       {open ? (
-        <div className="absolute right-0 mt-1 z-20 w-[260px] max-h-[60vh] overflow-auto bg-white border-2 border-black rounded-md shadow-brutal py-1">
+        <div className="absolute left-0 bottom-full mb-1 z-20 w-[260px] max-h-[60vh] overflow-auto bg-white border-2 border-black rounded-md shadow-brutal py-1">
           <ModelPickerRow
             label={defaultName ? `Default · ${defaultName}` : 'Default (default-llm)'}
             sublabel="follow the global default"
