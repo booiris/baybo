@@ -1091,11 +1091,17 @@ impl WorkAccumulator {
 fn reconstruct_transcript(tail: Vec<(i64, DateTime<Utc>, ChatMessage)>) -> Vec<ChatTranscriptItem> {
     let mut items: Vec<ChatTranscriptItem> = Vec::new();
     let mut work = WorkAccumulator::default();
+    // Start of the turn currently being folded — the most recent real user
+    // message. A direct-answer turn persists its reasoning in the same row as
+    // the answer (there are no intermediate rows to time against), so its
+    // reconstructed work block spans from here to the answer's timestamp.
+    let mut turn_started: Option<DateTime<Utc>> = None;
 
     for (ordinal, created_at, msg) in tail {
         match msg.role {
             Role::User if msg.from_user() => {
                 work.flush(&mut items, None);
+                turn_started = Some(created_at);
                 if let Some(item) = message_item(ordinal, created_at, "user", &msg) {
                     items.push(item);
                 }
@@ -1131,8 +1137,28 @@ fn reconstruct_transcript(tail: Vec<(i64, DateTime<Utc>, ChatMessage)>) -> Vec<C
                 }
             }
             // Final answer (no tool calls): close the work block, then the
-            // reply bubble lands below it.
+            // reply bubble lands below it. A direct-answer turn (no tool
+            // iterations, so nothing accumulated yet) still carries its
+            // reasoning in this same row; rebuild a single-step work block
+            // from it so a reload shows the same `Worked Xs` + reasoning the
+            // tool path produces, rather than dropping the thinking on the
+            // floor in `message_item`.
             Role::Assistant => {
+                if work.started.is_none() {
+                    for block in &msg.content {
+                        if let ContentBlock::Thinking { content, .. } = block {
+                            let text = thinking_text(content);
+                            if text.is_empty() {
+                                continue;
+                            }
+                            if work.started.is_none() {
+                                work.started = turn_started;
+                                work.ordinal = Some(ordinal);
+                            }
+                            work.steps.push(ChatWorkStep::reasoning(text));
+                        }
+                    }
+                }
                 work.flush(&mut items, Some(created_at));
                 if let Some(item) = message_item(ordinal, created_at, "assistant", &msg) {
                     items.push(item);
@@ -1389,6 +1415,60 @@ mod tests {
         assert!(matches!(items[2].kind, TranscriptItemKind::Message));
         assert_eq!(items[2].role, "assistant");
         assert_eq!(items[2].text, "done, sort of");
+    }
+
+    #[test]
+    fn reconstruct_direct_answer_with_thinking_gets_work_block() {
+        // A turn that thinks then answers with no tool calls keeps both rows
+        // logically: a `Worked Xs` work block (spanning the user turn → the
+        // answer) carrying the reasoning, then the answer bubble.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("1+1?")])),
+            (
+                3,
+                ts(15),
+                ChatMessage::assistant(vec![thinking("let me add"), text("2")]),
+            ),
+        ];
+        let items = reconstruct_transcript(tail);
+        assert_eq!(items.len(), 3);
+
+        assert!(matches!(items[0].kind, TranscriptItemKind::Message));
+        assert_eq!(items[0].role, "user");
+
+        let work = &items[1];
+        assert!(matches!(work.kind, TranscriptItemKind::Work));
+        assert_eq!(work.ordinal, 3, "shares the answer row's ordinal");
+        assert_eq!(
+            work.work_started_at,
+            Some(ts(2)),
+            "spans from the user turn that prompted it"
+        );
+        assert_eq!(work.work_ended_at, Some(ts(15)));
+        assert_eq!(work.steps.len(), 1);
+        assert!(matches!(work.steps[0].kind, WorkStepKind::Reasoning));
+        assert_eq!(work.steps[0].text, "let me add");
+
+        assert!(matches!(items[2].kind, TranscriptItemKind::Message));
+        assert_eq!(items[2].role, "assistant");
+        assert_eq!(items[2].text, "2");
+    }
+
+    #[test]
+    fn reconstruct_direct_answer_without_thinking_stays_bare() {
+        // No reasoning to surface → no empty work block, just the answer.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("hi")])),
+            (3, ts(3), ChatMessage::assistant(vec![text("hello")])),
+        ];
+        let items = reconstruct_transcript(tail);
+        assert_eq!(items.len(), 2);
+        assert!(
+            items
+                .iter()
+                .all(|i| matches!(i.kind, TranscriptItemKind::Message))
+        );
+        assert_eq!(items[1].text, "hello");
     }
 
     #[test]
