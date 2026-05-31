@@ -759,8 +759,13 @@ export class BotChannel<BotHandle, ChatId>
   // exists, so defining them means BotChannel starts seeing the
   // tool/status/delta frames it used to drop. They feed the condenser
   // and never touch the platform directly (Telegram still doesn't
-  // render partial answer text).
+  // render partial answer text). They also refresh the typing safety —
+  // a turn doing tool work or streaming for >typingSafetyMs without an
+  // onMessage/onNotice would otherwise drop the "typing" indicator
+  // mid-turn, which on a no-status-surface platform (weixin) is the
+  // user's only "still working" signal.
   async onToolStarted(ev: AgentToolStarted): Promise<void> {
+    this.refreshTypingSafety(ev.userId);
     this.statusCondenser?.onProgress(
       ev.userId,
       ev.label !== undefined
@@ -770,10 +775,12 @@ export class BotChannel<BotHandle, ChatId>
   }
 
   async onToolCompleted(ev: AgentToolCompleted): Promise<void> {
+    this.refreshTypingSafety(ev.userId);
     this.statusCondenser?.onProgress(ev.userId, { kind: "toolDone" });
   }
 
   async onStatus(ev: AgentStatus): Promise<void> {
+    this.refreshTypingSafety(ev.userId);
     this.statusCondenser?.onProgress(ev.userId, {
       kind: "status",
       phase: ev.phase,
@@ -781,6 +788,7 @@ export class BotChannel<BotHandle, ChatId>
   }
 
   async onDelta(delta: AgentDelta): Promise<void> {
+    this.refreshTypingSafety(delta.userId);
     this.statusCondenser?.onProgress(delta.userId, { kind: "delta" });
   }
 
@@ -1134,6 +1142,23 @@ export class BotChannel<BotHandle, ChatId>
     }
     // Agent is alive — proven by this outbound. Reset the quiet-time
     // cap so the ticker can keep going through the rest of the queue.
+    clearTimeout(session.safety);
+    session.safety = setTimeout(
+      () => this.cancelTyping(userId),
+      this.typingSafetyMs,
+    );
+    session.safety.unref?.();
+  }
+
+  /** A mid-turn progress signal (tool started/completed, status, answer
+   * delta) proves the agent is still working — push the quiet-time cap
+   * out so the typing indicator survives a long active turn that emits
+   * no onMessage/onNotice for a while. Unlike completeTypingTurn this
+   * does NOT touch the pending-turn counter or reactions: the turn isn't
+   * done. No-op once the session has already been cancelled. */
+  private refreshTypingSafety(userId: string): void {
+    const session = this.typingSessions.get(userId);
+    if (session === undefined) return;
     clearTimeout(session.safety);
     session.safety = setTimeout(
       () => this.cancelTyping(userId),
