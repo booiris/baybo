@@ -23,6 +23,15 @@ import { sendTelegramAttachment } from "./media/outbound.js";
 import { markdownToTelegram, TELEGRAM_PARSE_MODE } from "./markdown.js";
 
 /**
+ * Emoji the bot reacts with on a user's message while their turn is in
+ * flight, then removes once the agent's job completes. Must be one of
+ * Telegram's allowed reaction emojis (the `ReactionTypeEmoji` union);
+ * `👀` ("eyes") reads as "seen it, working on it". `as const` preserves
+ * the literal type so it satisfies that union at the call site.
+ */
+const WORKING_REACTION_EMOJI = "👀" as const;
+
+/**
  * Telegram conversation address. `chatId` is the chat/supergroup;
  * `threadId` (aka `message_thread_id`) is the forum topic in a
  * topics-enabled supergroup. In DMs and non-forum groups, `threadId`
@@ -59,6 +68,35 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
    */
   async notifyTyping(bot: Bot, chat: TelegramChat): Promise<void> {
     await bot.api.sendChatAction(chat.chatId, "typing", threadOpts(chat));
+  }
+
+  /**
+   * Set the "working on it" reaction on the user's message. Anchored to
+   * the message_id (chat-global), so — unlike sendMessage /
+   * sendChatAction — this carries no thread option. Best-effort: the SDK
+   * fire-and-forgets and debug-logs a rejection (e.g. reactions disabled
+   * in the chat, or the message aged out).
+   */
+  async setWorkingReaction(
+    bot: Bot,
+    chat: TelegramChat,
+    targetId: number | string,
+  ): Promise<void> {
+    await bot.api.setMessageReaction(chat.chatId, Number(targetId), [
+      { type: "emoji", emoji: WORKING_REACTION_EMOJI },
+    ]);
+  }
+
+  /**
+   * Remove the bot's reaction from the user's message — an empty
+   * reaction list clears it. Called when the agent's job completes.
+   */
+  async clearWorkingReaction(
+    bot: Bot,
+    chat: TelegramChat,
+    targetId: number | string,
+  ): Promise<void> {
+    await bot.api.setMessageReaction(chat.chatId, Number(targetId), []);
   }
 
   async stopBot(bot: Bot): Promise<void> {
@@ -223,6 +261,7 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
           platformUserId: String(from.id),
           content: caption ? `${caption}\n${stub}` : stub,
           platformMsgId,
+          reactionTargetId: message.message_id,
         });
         return;
       }
@@ -231,6 +270,7 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
         platformUserId: String(from.id),
         content: caption,
         platformMsgId,
+        reactionTargetId: message.message_id,
         attachments: [attachment],
       });
       return;
@@ -243,6 +283,7 @@ export class TelegramPlatform implements BotPlatform<Bot, TelegramChat> {
       platformUserId: String(from.id),
       content: text,
       platformMsgId,
+      reactionTargetId: message.message_id,
     });
   }
 

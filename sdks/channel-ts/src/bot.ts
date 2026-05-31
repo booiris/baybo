@@ -39,6 +39,19 @@ export interface BotInboundEvent<ChatId> {
    * for that frame.
    */
   platformMsgId?: string;
+  /**
+   * Platform message reference a transient "working on it" reaction can
+   * be anchored to (Telegram `message_id`, Discord message id, …).
+   * Distinct from {@link platformMsgId}: that one is the dedup key
+   * (Telegram `update_id`) and is NOT a valid reaction target. When set
+   * — and the platform implements {@link BotPlatform.setWorkingReaction}
+   * / {@link BotPlatform.clearWorkingReaction} — the channel reacts to
+   * the user's own message when their turn starts and clears the
+   * reaction once the turn completes, the message-anchored companion to
+   * {@link BotPlatform.notifyTyping}. Omit to leave this event
+   * un-reacted. Carried in-process only; never travels to the gateway.
+   */
+  reactionTargetId?: number | string;
   attachments?: WireAttachment[];
 }
 
@@ -199,6 +212,40 @@ export interface BotPlatform<BotHandle, ChatId> {
   notifyTyping?(handle: BotHandle, chat: ChatId): Promise<void>;
 
   /**
+   * Optional message-anchored "working on it" reaction — the durable
+   * companion to {@link notifyTyping}. The channel calls this with the
+   * inbound event's {@link BotInboundEvent.reactionTargetId} when a
+   * user's turn starts, then calls {@link clearWorkingReaction} with the
+   * same target once the turn completes (or the work session is
+   * force-cancelled: approval prompt, bot stop, safety cap). Both ride
+   * the exact lifecycle the typing indicator does, so a platform that
+   * implements them leaves a persistent marker on the user's own message
+   * alongside the ephemeral typing ping. Best-effort: a thrown error /
+   * rejected promise is a debug log, not a pumped error. Implement when
+   * your platform has a per-message reaction primitive (Telegram
+   * `setMessageReaction`, Discord `message.react`, …); omit otherwise.
+   * Reactions only fire when BOTH this and {@link clearWorkingReaction}
+   * are implemented — a set with no clear would strand the marker.
+   */
+  setWorkingReaction?(
+    handle: BotHandle,
+    chat: ChatId,
+    targetId: number | string,
+  ): Promise<void>;
+
+  /**
+   * Remove a reaction previously set via {@link setWorkingReaction} on
+   * the same `(chat, targetId)`. Called when the turn that triggered the
+   * reaction completes, or when the work session is force-cancelled.
+   * Best-effort like its setter.
+   */
+  clearWorkingReaction?(
+    handle: BotHandle,
+    chat: ChatId,
+    targetId: number | string,
+  ): Promise<void>;
+
+  /**
    * Optional slash-command registrar. Implement when the platform has
    * a server-side command list the client UI surfaces (Telegram
    * `setMyCommands`, Discord application commands, Slack
@@ -320,6 +367,13 @@ interface TypingSession {
   // queued behind aura's per-session serialization.
   pending: number;
   ping: () => void;
+  // FIFO queue of working-reaction targets currently live on the user's
+  // messages (one per inbound that carried a reactionTargetId). Rides
+  // the same lifecycle as the typing ping: each inbound pushes one,
+  // each turn completion clears the oldest, a force-cancel clears all.
+  // Empty when the platform doesn't support reactions or no inbound
+  // named a target.
+  reactions: Array<number | string>;
 }
 
 /**
@@ -811,7 +865,7 @@ export class BotChannel<BotHandle, ChatId>
     this.chatByUser.set(userId, ev.chat);
     this.botByUser.set(userId, botId);
     this.logInbound(botId, ev);
-    this.startOrRefreshTyping(userId, botId, ev.chat);
+    this.startOrRefreshTyping(userId, botId, ev.chat, ev.reactionTargetId);
     this.pushInbound({
       sessionId: "",
       userId,
@@ -871,6 +925,7 @@ export class BotChannel<BotHandle, ChatId>
     userId: string,
     botId: string,
     chat: ChatId,
+    reactionTargetId: number | string | undefined,
   ): void {
     const notify = this.platform.notifyTyping;
     if (!notify) return;
@@ -882,9 +937,25 @@ export class BotChannel<BotHandle, ChatId>
     const entry = this.bots.get(botId);
     if (entry === undefined) return;
     const handle = entry.handle;
+    // A working-reaction rides the same lifecycle as the typing ping —
+    // but only when this event named a reactable message AND the
+    // platform can both set and clear it (a set with no clear would
+    // strand the marker on the user's message). Narrow to a single
+    // defined-or-undefined value so the branches below don't juggle the
+    // three-way guard.
+    const reactTarget =
+      reactionTargetId !== undefined
+      && this.platform.setWorkingReaction !== undefined
+      && this.platform.clearWorkingReaction !== undefined
+        ? reactionTargetId
+        : undefined;
     const existing = this.typingSessions.get(userId);
     if (existing !== undefined) {
       existing.pending += 1;
+      if (reactTarget !== undefined) {
+        existing.reactions.push(reactTarget);
+        this.applyWorkingReaction(handle, chat, reactTarget);
+      }
       // Do NOT reset safety: it's scoped to agent liveness (quiet
       // time between outbounds), not to the user's typing cadence.
       existing.ping();
@@ -906,13 +977,29 @@ export class BotChannel<BotHandle, ChatId>
       this.typingSafetyMs,
     );
     safety.unref?.();
-    this.typingSessions.set(userId, { timer, safety, pending: 1, ping });
+    const reactions: Array<number | string> = [];
+    if (reactTarget !== undefined) {
+      reactions.push(reactTarget);
+      this.applyWorkingReaction(handle, chat, reactTarget);
+    }
+    this.typingSessions.set(userId, {
+      timer,
+      safety,
+      pending: 1,
+      ping,
+      reactions,
+    });
   }
 
   private completeTypingTurn(userId: string): void {
     const session = this.typingSessions.get(userId);
     if (session === undefined) return;
     session.pending -= 1;
+    // This turn produced output → drop its working-reaction. aura
+    // serializes turns per session in FIFO order, so the oldest live
+    // reaction is the one whose turn just finished. (When pending hits
+    // zero `cancelTyping` clears any stragglers too.)
+    this.clearOldestReaction(userId, session);
     if (session.pending <= 0) {
       this.cancelTyping(userId);
       return;
@@ -932,7 +1019,60 @@ export class BotChannel<BotHandle, ChatId>
     if (session === undefined) return;
     clearInterval(session.timer);
     clearTimeout(session.safety);
+    // Force-cancel (turn completed, approval prompt, bot stop, safety
+    // cap): drop any reactions still live so we don't strand a marker
+    // on the user's message.
+    this.clearAllReactions(userId, session);
     this.typingSessions.delete(userId);
+  }
+
+  /** Best-effort set of the platform's "working on it" reaction on the
+   * inbound message `targetId`. Fire-and-forget like the typing ping —
+   * a rejection is a debug log, never a pumped error. */
+  private applyWorkingReaction(
+    handle: BotHandle,
+    chat: ChatId,
+    targetId: number | string,
+  ): void {
+    const set = this.platform.setWorkingReaction;
+    if (!set) return;
+    set.call(this.platform, handle, chat, targetId).catch((err: unknown) => {
+      this.logger.debug("setWorkingReaction failed", err);
+    });
+  }
+
+  /** Clear the oldest still-live working-reaction for this user (FIFO:
+   * the turn that just completed). No-op when the queue is empty. */
+  private clearOldestReaction(userId: string, session: TypingSession): void {
+    const targetId = session.reactions.shift();
+    if (targetId === undefined) return;
+    this.clearReactionTarget(userId, targetId);
+  }
+
+  /** Drain and clear every remaining working-reaction for this user. */
+  private clearAllReactions(userId: string, session: TypingSession): void {
+    for (const targetId of session.reactions.splice(0)) {
+      this.clearReactionTarget(userId, targetId);
+    }
+  }
+
+  private clearReactionTarget(
+    userId: string,
+    targetId: number | string,
+  ): void {
+    const clear = this.platform.clearWorkingReaction;
+    if (!clear) return;
+    // Re-resolve the live route: the clear path only has the userId, but
+    // the platform call needs the current bot handle + chat. A crashed /
+    // detached bot yields no route — skip the API call (the queue is
+    // still drained by the caller, so there's no stuck retry).
+    const route = this.route(userId);
+    if (route === null) return;
+    clear
+      .call(this.platform, route.handle, route.chat, targetId)
+      .catch((err: unknown) => {
+        this.logger.debug("clearWorkingReaction failed", err);
+      });
   }
 
   private cancelAllTypingForBot(botId: string): void {
