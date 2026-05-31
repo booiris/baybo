@@ -639,6 +639,39 @@ test("typing safety timeout caps an orphan session when no outbound ever arrives
   assert.equal(typed, atCap, `no pings after safety cap (atCap=${atCap})`);
 });
 
+test("progress events keep typing alive through an active turn past the safety cap", async () => {
+  const fake = makePlatform();
+  let typed = 0;
+  fake.platform.notifyTyping = async () => { typed++; };
+  // No status hooks → no condenser; this is the weixin shape, where the
+  // typing indicator is the only "still working" signal.
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    typingRefreshMs: 10,
+    typingSafetyMs: 50,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi" });
+
+  // Tool activity every ~25ms (under the 50ms cap) for ~150ms — well
+  // past the cap a quiet turn would have hit at 50ms.
+  for (let i = 0; i < 6; i++) {
+    await new Promise((r) => setTimeout(r, 25));
+    await channel.onToolStarted({
+      sessionId: "s", userId: "test_b1_42_u", callId: `c${i}`, tool: "bash",
+    });
+  }
+  assert.ok(typed >= 8, `progress must keep typing alive (got ${typed})`);
+
+  // Progress stops → the safety cap finally cancels typing.
+  await new Promise((r) => setTimeout(r, 120));
+  const afterQuiet = typed;
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(typed, afterQuiet, "typing caps once progress stops");
+});
+
 test("StopBot cancels pending typing sessions for that bot", async () => {
   const fake = makePlatform();
   let typed = 0;
