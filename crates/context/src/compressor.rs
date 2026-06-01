@@ -25,6 +25,7 @@ use std::pin::Pin;
 
 use aura_llm::{ChatRequest, LlmResponse};
 use aura_model::{ChatMessage, ContentBlock};
+use aura_trace::LlmCallInputs;
 use tracing::{debug, warn};
 
 use crate::error::ContextError;
@@ -41,7 +42,12 @@ pub type ChatFuture =
 
 /// One-shot chat invocation handed to the compressor. Invoked at most
 /// once, only when the fast-path misses and the pre-flight gate passes.
-pub type ChatCallback = Box<dyn FnOnce(ChatRequest) -> ChatFuture + Send>;
+/// The second argument is the trace `input_messages` marker the LLM
+/// span should record — a `Persisted` ordinal reference (so the large
+/// transcript prefix isn't cloned into the span) or an inline fallback;
+/// the runtime stamps it onto the span rather than re-deriving it from
+/// `ChatRequest.messages`.
+pub type ChatCallback = Box<dyn FnOnce(ChatRequest, LlmCallInputs) -> ChatFuture + Send>;
 
 pub enum CompressOutput {
     /// Pre-flight gate fired (non-system count ≤ keep_recent); even
@@ -470,10 +476,23 @@ impl ContextManager {
     async fn summarize_or_truncate(&self, chat: ChatCallback) -> CompressOutput {
         let (system_msgs, non_system) = partition_system(&self.messages);
 
+        let instruction =
+            ChatMessage::agent_context(vec![ContentBlock::Text(SUMMARIZE_INSTRUCTION.to_string())]);
         let mut request_messages: Vec<ChatMessage> = self.messages.to_vec();
-        request_messages.push(ChatMessage::agent_context(vec![ContentBlock::Text(
-            SUMMARIZE_INSTRUCTION.to_string(),
-        )]));
+        request_messages.push(instruction.clone());
+
+        // Reference the (large) transcript prefix by ordinal in the trace
+        // when the in-memory set provably mirrors the persisted log;
+        // `instruction` is the only message not in `session_messages`, so
+        // it rides as the suffix. On any mismatch fall back to inline.
+        let input_marker = match self.synced_last_ordinal().await {
+            Some((last_ordinal, prefix_len)) => LlmCallInputs::Persisted {
+                last_ordinal,
+                prefix_len,
+                suffix: vec![instruction],
+            },
+            None => LlmCallInputs::Inline(request_messages.clone()),
+        };
         let request = ChatRequest {
             messages: request_messages,
             temperature: None,
@@ -489,7 +508,7 @@ impl ContextManager {
         };
 
         let transcript_path = self.workspace.session_log_file(self.session_id.as_str());
-        match chat(request).await {
+        match chat(request, input_marker).await {
             Ok(response) => match parse_summary_response(&response.content) {
                 Some(content) => {
                     let mut new_messages = system_msgs;

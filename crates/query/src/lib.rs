@@ -1165,9 +1165,15 @@ impl QueryApi {
                 for span in step.spans.iter_mut() {
                     let span_started_at = span.started_at;
                     if let SpanKind::LlmCall { begin, .. } = &mut span.kind
-                        && let LlmCallInputs::Persisted { last_ordinal, .. } = &begin.input_messages
+                        && let LlmCallInputs::Persisted {
+                            last_ordinal,
+                            prefix_len,
+                            suffix,
+                        } = &begin.input_messages
                     {
                         let last = *last_ordinal;
+                        let expected_prefix = *prefix_len;
+                        let suffix = suffix.clone();
                         let candidates: Vec<&StoredMessage> = log
                             .iter()
                             .filter(|m| {
@@ -1195,7 +1201,36 @@ impl QueryApi {
                             );
                             Vec::new()
                         } else {
-                            candidates.iter().map(|m| m.message.clone()).collect()
+                            // Active prefix (by ordinal) then the inline
+                            // suffix (framing / sub-loop turns not in the
+                            // log) — together the exact slice the LLM saw.
+                            let mut active: Vec<aura_model::ChatMessage> =
+                                candidates.iter().map(|m| m.message.clone()).collect();
+                            // Tripwire: the reconstructed prefix count must
+                            // match what the writer recorded. A divergence
+                            // means the log drifted under the reference (a
+                            // `superseded_by` bug, a deleted row, or a
+                            // read/write filter divergence) — flag it with a
+                            // visible marker rather than returning a
+                            // plausible-but-wrong slice silently.
+                            if active.len() != expected_prefix {
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    span_id = %span.id,
+                                    last_ordinal = last,
+                                    expected = expected_prefix,
+                                    reconstructed = active.len(),
+                                    "trace input reconstruction count mismatch — \
+                                     session_messages drifted under the Persisted reference; \
+                                     flagging the rehydrated input"
+                                );
+                                active.insert(
+                                    0,
+                                    reconstruction_warning(expected_prefix, active.len()),
+                                );
+                            }
+                            active.extend(suffix);
+                            active
                         };
                         begin.input_messages = LlmCallInputs::Inline(hydrated);
                     }
@@ -1204,6 +1239,18 @@ impl QueryApi {
         }
         Ok(())
     }
+}
+
+/// Visible in-band marker prepended to a rehydrated input whose
+/// reconstructed prefix count didn't match the span's `prefix_len`
+/// tripwire. A `Role::System` message so trace viewers render it
+/// distinctly and `source == 'user'` prompt-detection never picks it up.
+fn reconstruction_warning(expected: usize, reconstructed: usize) -> aura_model::ChatMessage {
+    aura_model::ChatMessage::system(vec![aura_model::ContentBlock::Text(format!(
+        "⚠️ trace reconstruction inconsistent: expected {expected} prefix message(s) from \
+         session_messages, reconstructed {reconstructed}. The log drifted under this span's \
+         ordinal reference — the input shown may be incomplete or wrong."
+    ))])
 }
 
 fn filter_matches(j: &Job, f: &JobFilter) -> bool {
@@ -1837,6 +1884,434 @@ mod tests {
         assert!(replay.jobs[0].job.created_at <= replay.jobs[1].job.created_at);
     }
 
+    /// A `Persisted` span with a non-empty `suffix` (compression /
+    /// progress-observer framing that is not itself in `session_messages`)
+    /// hydrates to the active prefix *followed by* that suffix — the exact
+    /// slice the LLM saw, without the prefix being cloned into span storage.
+    #[tokio::test]
+    async fn replay_appends_persisted_suffix() {
+        use aura_model::{ChatMessage, ContentBlock, SpanId, StepId};
+        use aura_trace::{
+            LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind, TraceStore,
+        };
+
+        fn msg(text: &str) -> ChatMessage {
+            ChatMessage::agent_context(vec![ContentBlock::Text(text.into())])
+        }
+
+        let session_store = Arc::new(MemSessionStore::default());
+        let s = make_session("cli-suffix");
+        session_store.save(&s).await.unwrap();
+        session_store
+            .append_session_message(
+                &s.id,
+                &ChatMessage::system(vec![ContentBlock::Text("sys".into())]),
+            )
+            .await
+            .unwrap();
+        session_store
+            .append_session_message(&s.id, &msg("hello"))
+            .await
+            .unwrap();
+        let last = session_store
+            .latest_session_ordinal(&s.id)
+            .await
+            .unwrap()
+            .expect("messages appended");
+        let active = session_store
+            .load_active_session_messages(&s.id)
+            .await
+            .unwrap();
+
+        let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
+        let j = lifecycle
+            .start_job(
+                s.id.clone(),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lifecycle.start(&j.id).await.unwrap();
+
+        let trace_store: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
+        let step_id = StepId::new();
+        let now = Utc::now();
+        trace_store
+            .save_step(
+                &Step {
+                    id: step_id,
+                    job_id: j.id,
+                    kind: StepKind::Compression,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                }
+                .to_row()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let instruction = msg("SUMMARIZE NOW");
+        let span_id = SpanId::new();
+        trace_store
+            .save_span(
+                &Span {
+                    id: span_id,
+                    step_id,
+                    kind: SpanKind::LlmCall {
+                        begin: LlmCallBegin {
+                            model_id: "claude".into(),
+                            provider: "anthropic".into(),
+                            provider_config_hash: String::new(),
+                            input_messages: LlmCallInputs::Persisted {
+                                last_ordinal: last,
+                                prefix_len: active.len(),
+                                suffix: vec![instruction.clone()],
+                            },
+                            temperature: None,
+                        },
+                        result: None,
+                    },
+                    parallel_group: None,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                    events: vec![],
+                }
+                .to_row()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let api = QueryApi::new(
+            session_store,
+            lifecycle,
+            trace_store,
+            Arc::new(MemoryCostStore::default()),
+        );
+        let replay = api.replay(&s.id, None).await.unwrap();
+        let span = replay
+            .jobs
+            .iter()
+            .flat_map(|j| j.steps.iter())
+            .flat_map(|st| st.spans.iter())
+            .find(|sp| sp.id == span_id)
+            .expect("the compression span survives replay");
+        let SpanKind::LlmCall { begin, .. } = &span.kind else {
+            unreachable!()
+        };
+        let LlmCallInputs::Inline(hydrated) = &begin.input_messages else {
+            panic!(
+                "Persisted must hydrate to Inline; got {:?}",
+                begin.input_messages
+            );
+        };
+
+        let mut expected = active.clone();
+        expected.push(instruction);
+        assert_eq!(
+            hydrated, &expected,
+            "hydration must append the inline suffix after the active prefix"
+        );
+    }
+
+    /// Differential test: the write-side "active as of N" snapshot
+    /// (`load_active_session_messages_up_to`, captured by the background
+    /// summary at call time) and the read-side reconstruction in
+    /// `hydrate_persisted_inputs` must agree — even after the referenced
+    /// rows are later superseded by a compaction. `load_*_up_to` is
+    /// time-sensitive (only currently-active rows), so the snapshot is
+    /// captured BEFORE compaction; replay must reproduce it AFTER. Pins
+    /// the equivalence so the two separate filter implementations can't
+    /// drift apart silently.
+    #[tokio::test]
+    async fn replay_matches_write_side_load_up_to_across_compaction() {
+        use aura_model::{ChatMessage, ContentBlock, SpanId, StepId};
+        use aura_trace::{
+            LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind, TraceStore,
+        };
+        fn um(t: &str) -> ChatMessage {
+            ChatMessage::agent_context(vec![ContentBlock::Text(t.into())])
+        }
+        fn sm(t: &str) -> ChatMessage {
+            ChatMessage::system(vec![ContentBlock::Text(t.into())])
+        }
+
+        let session_store = Arc::new(MemSessionStore::default());
+        let s = make_session("cli-diff");
+        session_store.save(&s).await.unwrap();
+        session_store
+            .append_session_message(&s.id, &sm("sys"))
+            .await
+            .unwrap();
+        session_store
+            .append_session_message(&s.id, &um("u1"))
+            .await
+            .unwrap();
+        let n = session_store
+            .latest_session_ordinal(&s.id)
+            .await
+            .unwrap()
+            .expect("messages appended");
+
+        // Write-side snapshot, BEFORE compaction — exactly what the
+        // background pass records (prefix + its count for the tripwire).
+        let write_side = session_store
+            .load_active_session_messages_up_to(&s.id, n)
+            .await
+            .unwrap();
+
+        // Compaction supersedes ordinals 0,1 (superseded_by = 2) and
+        // appends new rows at 2,3 — the referenced rows are now inactive,
+        // so only the historical "as of N" filter can still recover them.
+        session_store
+            .apply_session_compaction(&s.id, &[sm("sys-v2"), um("<summary>S</summary>")])
+            .await
+            .unwrap();
+
+        let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
+        let j = lifecycle
+            .start_job(
+                s.id.clone(),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lifecycle.start(&j.id).await.unwrap();
+        let trace_store: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
+        let step_id = StepId::new();
+        let now = Utc::now();
+        trace_store
+            .save_step(
+                &Step {
+                    id: step_id,
+                    job_id: j.id,
+                    kind: StepKind::Compression,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                }
+                .to_row()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let span_id = SpanId::new();
+        trace_store
+            .save_span(
+                &Span {
+                    id: span_id,
+                    step_id,
+                    kind: SpanKind::LlmCall {
+                        begin: LlmCallBegin {
+                            model_id: "claude".into(),
+                            provider: "anthropic".into(),
+                            provider_config_hash: String::new(),
+                            input_messages: LlmCallInputs::Persisted {
+                                last_ordinal: n,
+                                prefix_len: write_side.len(),
+                                suffix: vec![],
+                            },
+                            temperature: None,
+                        },
+                        result: None,
+                    },
+                    parallel_group: None,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                    events: vec![],
+                }
+                .to_row()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let api = QueryApi::new(
+            session_store,
+            lifecycle,
+            trace_store,
+            Arc::new(MemoryCostStore::default()),
+        );
+        let replay = api.replay(&s.id, None).await.unwrap();
+        let span = replay
+            .jobs
+            .iter()
+            .flat_map(|j| j.steps.iter())
+            .flat_map(|st| st.spans.iter())
+            .find(|sp| sp.id == span_id)
+            .expect("span survives replay");
+        let SpanKind::LlmCall { begin, .. } = &span.kind else {
+            unreachable!()
+        };
+        let LlmCallInputs::Inline(read_side) = &begin.input_messages else {
+            panic!(
+                "Persisted must hydrate to Inline; got {:?}",
+                begin.input_messages
+            )
+        };
+        assert_eq!(
+            read_side, &write_side,
+            "read-side hydration must reproduce the write-side load_up_to snapshot \
+             even after the referenced rows were superseded"
+        );
+        assert_eq!(
+            read_side.len(),
+            2,
+            "no tripwire marker on a consistent reconstruction"
+        );
+    }
+
+    /// Negative tripwire test: when the recorded `prefix_len` no longer
+    /// matches what the log reconstructs (a `superseded_by` bug, a deleted
+    /// row, a read/write filter divergence), hydration must FLAG it with a
+    /// visible marker rather than returning a plausible-but-wrong slice.
+    /// Simulated by recording a `prefix_len` larger than the rows that
+    /// actually reconstruct.
+    #[tokio::test]
+    async fn replay_flags_prefix_len_tripwire_mismatch() {
+        use aura_model::{ChatMessage, ContentBlock, Role, SpanId, StepId};
+        use aura_trace::{
+            LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind, TraceStore,
+        };
+        fn um(t: &str) -> ChatMessage {
+            ChatMessage::agent_context(vec![ContentBlock::Text(t.into())])
+        }
+
+        let session_store = Arc::new(MemSessionStore::default());
+        let s = make_session("cli-tripwire");
+        session_store.save(&s).await.unwrap();
+        session_store
+            .append_session_message(&s.id, &um("a"))
+            .await
+            .unwrap();
+        session_store
+            .append_session_message(&s.id, &um("b"))
+            .await
+            .unwrap();
+        let n = session_store
+            .latest_session_ordinal(&s.id)
+            .await
+            .unwrap()
+            .expect("messages appended");
+
+        let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
+        let j = lifecycle
+            .start_job(
+                s.id.clone(),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lifecycle.start(&j.id).await.unwrap();
+        let trace_store: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
+        let step_id = StepId::new();
+        let now = Utc::now();
+        trace_store
+            .save_step(
+                &Step {
+                    id: step_id,
+                    job_id: j.id,
+                    kind: StepKind::Compression,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                }
+                .to_row()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let span_id = SpanId::new();
+        // Record prefix_len = 99 though only 2 rows reconstruct → drift.
+        trace_store
+            .save_span(
+                &Span {
+                    id: span_id,
+                    step_id,
+                    kind: SpanKind::LlmCall {
+                        begin: LlmCallBegin {
+                            model_id: "claude".into(),
+                            provider: "anthropic".into(),
+                            provider_config_hash: String::new(),
+                            input_messages: LlmCallInputs::Persisted {
+                                last_ordinal: n,
+                                prefix_len: 99,
+                                suffix: vec![],
+                            },
+                            temperature: None,
+                        },
+                        result: None,
+                    },
+                    parallel_group: None,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                    events: vec![],
+                }
+                .to_row()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let api = QueryApi::new(
+            session_store,
+            lifecycle,
+            trace_store,
+            Arc::new(MemoryCostStore::default()),
+        );
+        let replay = api.replay(&s.id, None).await.unwrap();
+        let span = replay
+            .jobs
+            .iter()
+            .flat_map(|j| j.steps.iter())
+            .flat_map(|st| st.spans.iter())
+            .find(|sp| sp.id == span_id)
+            .expect("span survives replay");
+        let SpanKind::LlmCall { begin, .. } = &span.kind else {
+            unreachable!()
+        };
+        let LlmCallInputs::Inline(hydrated) = &begin.input_messages else {
+            panic!(
+                "Persisted must hydrate to Inline; got {:?}",
+                begin.input_messages
+            )
+        };
+        let first = hydrated
+            .first()
+            .expect("a marker must be prepended on mismatch");
+        assert_eq!(
+            first.role,
+            Role::System,
+            "the tripwire marker is a system-role message"
+        );
+        let ContentBlock::Text(text) = first.content.first().expect("marker has a text block")
+        else {
+            panic!("expected a text marker block");
+        };
+        assert!(
+            text.contains("reconstruction inconsistent"),
+            "marker must explain the drift; got: {text}"
+        );
+        assert_eq!(
+            hydrated.len(),
+            3,
+            "marker + the 2 rows that did reconstruct"
+        );
+    }
+
     /// `replay` rehydrates `LlmCallInputs::Persisted { last_ordinal }`
     /// into the active slice as of that ordinal — including across a
     /// compaction. This locks the storage / span / hydration triangle
@@ -1928,6 +2403,8 @@ mod tests {
                             provider_config_hash: String::new(),
                             input_messages: LlmCallInputs::Persisted {
                                 last_ordinal: pre_last,
+                                prefix_len: pre_active.len(),
+                                suffix: vec![],
                             },
                             temperature: None,
                         },
@@ -1999,6 +2476,14 @@ mod tests {
             )
             .await
             .unwrap();
+        // Count the active-as-of-`post_last` slice now (before
+        // `session_store` moves into the QueryApi) so the span's
+        // `prefix_len` tripwire matches what hydration will reconstruct.
+        let post_active_count = session_store
+            .load_active_session_messages(&s.id)
+            .await
+            .unwrap()
+            .len();
         let span2_id = SpanId::new();
         trace_store
             .save_span(
@@ -2012,6 +2497,8 @@ mod tests {
                             provider_config_hash: String::new(),
                             input_messages: LlmCallInputs::Persisted {
                                 last_ordinal: post_last,
+                                prefix_len: post_active_count,
+                                suffix: vec![],
                             },
                             temperature: None,
                         },
@@ -2239,7 +2726,11 @@ mod tests {
                             model_id: "claude".into(),
                             provider: "anthropic".into(),
                             provider_config_hash: String::new(),
-                            input_messages: LlmCallInputs::Persisted { last_ordinal: last },
+                            input_messages: LlmCallInputs::Persisted {
+                                last_ordinal: last,
+                                prefix_len: 1,
+                                suffix: vec![],
+                            },
                             temperature: None,
                         },
                         result: None,

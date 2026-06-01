@@ -82,6 +82,7 @@ impl CompressionRunner {
     pub(crate) async fn run(
         self,
         request: aura_llm::ChatRequest,
+        input_marker: aura_trace::LlmCallInputs,
     ) -> Result<aura_context::SummaryChatRun, aura_context::ContextError> {
         let CompressionRunner {
             llm_client,
@@ -99,11 +100,13 @@ impl CompressionRunner {
             model_id: model_info.id.clone(),
             provider: model_info.provider.clone(),
             provider_config_hash: String::new(),
-            // Compression LLM input is a one-off slice the caller
-            // built off the active transcript — it never lands in
-            // `session_messages`, so embed inline rather than
-            // referencing an ordinal that doesn't exist.
-            input_messages: aura_trace::LlmCallInputs::Inline(request.messages.clone()),
+            // Marker supplied by the caller: a `Persisted` ordinal
+            // reference to the transcript prefix (so the span doesn't
+            // re-embed the whole summarized window) plus an inline
+            // suffix for the framing/sub-loop turns that aren't in
+            // `session_messages`. The compressor owns the split because
+            // it's the layer that knows which slice is persisted.
+            input_messages: input_marker,
             temperature: request.temperature,
         };
 
@@ -235,7 +238,7 @@ impl BackgroundCompressionRunner {
         // outside; the closure rebuilds a fresh runner per call. The
         // runner's per-call `Compression` step + `LlmCall` span are
         // each treated as one iteration in telemetry.
-        let chat: aura_context::BackgroundSummaryCallback = Box::new(move |req| {
+        let chat: aura_context::BackgroundSummaryCallback = Box::new(move |req, marker| {
             let runner = CompressionRunner {
                 llm_client: llm_client.clone(),
                 recorder: recorder.clone(),
@@ -246,7 +249,7 @@ impl BackgroundCompressionRunner {
                 model_info: model_info.clone(),
                 cancel_token: cancel_token.clone(),
             };
-            Box::pin(async move { runner.run(req).await })
+            Box::pin(async move { runner.run(req, marker).await })
         });
 
         let config = BackgroundSummaryConfig {

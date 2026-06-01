@@ -1985,8 +1985,8 @@ impl AgentLoop {
         }
         let result = self
             .context_manager
-            .maybe_compress(&model_id, |req| async move {
-                runner.run(req).await.map(|run| run.response)
+            .maybe_compress(&model_id, |req, marker| async move {
+                runner.run(req, marker).await.map(|run| run.response)
             })
             .await;
         if compacting {
@@ -2084,9 +2084,18 @@ impl AgentLoop {
         // snapshot NOW, synchronously at the boundary, so the detached task
         // owns a coherent frozen copy and never reads live context.
         let mut messages = self.context_manager.messages_for_llm();
-        messages.push(ChatMessage::user(vec![ContentBlock::Text(
-            build_observer_prompt(&observer_state.sent_notices),
-        )]));
+        let prompt_msg = ChatMessage::user(vec![ContentBlock::Text(build_observer_prompt(
+            &observer_state.sent_notices,
+        ))]);
+        messages.push(prompt_msg.clone());
+        // The cached prefix (`messages_for_llm`) is referenced by ordinal
+        // in the span; only the observer prompt rides inline as the
+        // suffix. Computed synchronously at the boundary so the detached
+        // task owns a coherent marker and never reads live context.
+        let input_marker = self
+            .context_manager
+            .input_marker_with_suffix(vec![prompt_msg])
+            .await;
         let request = ChatRequest {
             messages,
             temperature: None,
@@ -2105,7 +2114,9 @@ impl AgentLoop {
         // so a real stop closes it as Cancelled cleanly.
         let runner =
             self.build_progress_observer_runner(session, span_recorder, job_id, cancel_token);
-        observer_state.in_flight = Some(tokio::spawn(async move { runner.run(request).await }));
+        observer_state.in_flight = Some(tokio::spawn(async move {
+            runner.run(request, input_marker).await
+        }));
     }
 
     fn build_progress_observer_runner(
@@ -2198,8 +2209,8 @@ impl AgentLoop {
                 let model_id = runner.model_info.id.clone();
                 let outcome = self
                     .context_manager
-                    .force_compress(&model_id, |req| async move {
-                        runner.run(req).await.map(|run| run.response)
+                    .force_compress(&model_id, |req, marker| async move {
+                        runner.run(req, marker).await.map(|run| run.response)
                     })
                     .await?;
                 let text = match outcome {
