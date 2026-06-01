@@ -269,6 +269,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "aura-bench-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aura-memory",
+ "chrono",
+ "clap",
+ "futures",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "aura-channels"
 version = "0.1.0"
 dependencies = [

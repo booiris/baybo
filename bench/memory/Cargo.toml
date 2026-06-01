@@ -1,0 +1,33 @@
+# LOCOMO memory benchmark. NOT shipped and NOT on the CI/test path: the bins
+# hit real DeepSeek + a real OpenViking server and spend money.
+#
+# Standalone end-to-end harness: it talks to DeepSeek over a raw
+# OpenAI-compatible HTTP client (`llm.rs`) and reaches OpenViking only through
+# `aura_memory::backends::openviking`'s concrete methods (`recall_for` /
+# `add_message` / `commit_session` / `wait_commit_task`). No Aura agent/context/
+# session/tool stack — QA is recall-injection, and recall is read-only, so a QA
+# turn can never write the question into the store.
+[package]
+name = "aura-bench-memory"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The only Aura dependency: the OpenViking memory backend under test, driven
+# through its concrete (context-free) methods.
+aura-memory = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

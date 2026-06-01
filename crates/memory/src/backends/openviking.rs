@@ -396,6 +396,85 @@ impl OpenVikingInner {
         self.run_request("DELETE", path, builder, preview, events)
             .await
     }
+
+    /// `POST /sessions/{session_id}/commit`, parsed into a [`CommitAck`].
+    async fn commit(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        timeout: Duration,
+        events: Option<&Arc<dyn ToolEventSink>>,
+    ) -> Result<CommitAck> {
+        let path = format!("/api/v1/sessions/{session_id}/commit");
+        let resp = self.post_empty(&path, user_id, timeout, events).await?;
+        Ok(CommitAck {
+            status: resp
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            task_id: resp
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            memories_extracted: count_extracted(&resp),
+        })
+    }
+
+    /// Poll `/tasks/{task_id}` until terminal, `timeout` elapses, or
+    /// `cancelled()` returns true. A poll `get` error ends it early. Shared by
+    /// `viking_store` and the public [`OpenVikingMemory::wait_commit_task`].
+    async fn poll_commit_task(
+        &self,
+        user_id: &str,
+        task_id: &str,
+        interval: Duration,
+        timeout: Duration,
+        events: Option<&Arc<dyn ToolEventSink>>,
+        cancelled: impl Fn() -> bool,
+    ) -> CommitTaskOutcome {
+        let task_path = format!("/api/v1/tasks/{task_id}");
+        let deadline = Instant::now() + timeout;
+        let mut outcome = CommitTaskOutcome {
+            status: "pending".to_string(),
+            memories_extracted: 0,
+        };
+        loop {
+            if cancelled() {
+                outcome.status = "cancelled".to_string();
+                return outcome;
+            }
+            if Instant::now() >= deadline {
+                outcome.status = "timeout".to_string();
+                return outcome;
+            }
+            tokio::time::sleep(interval).await;
+            match self
+                .get(&task_path, user_id, &[], HTTP_TIMEOUT, events)
+                .await
+            {
+                Ok(task) => match task.get("status").and_then(|v| v.as_str()) {
+                    Some("completed") => {
+                        outcome.status = "completed".to_string();
+                        if let Some(result) = task.get("result") {
+                            outcome.memories_extracted = count_extracted(result);
+                        }
+                        return outcome;
+                    }
+                    Some("failed") => {
+                        outcome.status = "failed".to_string();
+                        return outcome;
+                    }
+                    _ => {}
+                },
+                Err(e) => {
+                    debug!(error = %e, "openviking commit task poll failed");
+                    outcome.status = "error".to_string();
+                    return outcome;
+                }
+            }
+        }
+    }
 }
 
 fn build_url(endpoint: &str, path: &str, query: &[(&str, &str)]) -> Result<url::Url> {
@@ -410,6 +489,27 @@ fn build_url(endpoint: &str, path: &str, query: &[(&str, &str)]) -> Result<url::
         }
     }
     Ok(url)
+}
+
+/// Parsed `/sessions/{sid}/commit` response. A commit kicks off the 6-category
+/// server-side extraction; when that runs asynchronously the ack carries a
+/// `task_id` to poll via [`OpenVikingMemory::wait_commit_task`], otherwise it
+/// is absent (extraction completed synchronously). `memories_extracted` is the
+/// count the commit itself already reports (0 while a task is still running).
+#[derive(Debug, Clone)]
+pub struct CommitAck {
+    pub status: String,
+    pub task_id: Option<String>,
+    pub memories_extracted: u64,
+}
+
+/// Terminal outcome of polling a commit's extraction task. `status` is one of
+/// `completed` / `failed` / `timeout` / `cancelled` / `error`; only `completed`
+/// carries a meaningful `memories_extracted`.
+#[derive(Debug, Clone)]
+pub struct CommitTaskOutcome {
+    pub status: String,
+    pub memories_extracted: u64,
 }
 
 /// OpenViking memory backend. Construct via [`OpenVikingMemory::new`].
@@ -470,6 +570,65 @@ impl OpenVikingMemory {
             Err(e) => warn!(error = %e, "openviking health probe failed; continuing"),
         }
     }
+
+    /// Commit a session's accumulated messages and return the [`CommitAck`]
+    /// (including any extraction `task_id`). The production write path
+    /// ([`Memory::on_session_end`]) commits fire-and-forget; callers that must
+    /// know when server-side extraction actually *finished* — benchmarks,
+    /// diagnostics — commit through this and then poll [`Self::wait_commit_task`].
+    pub async fn commit_session(&self, user_id: &str, session_id: &str) -> Result<CommitAck> {
+        self.inner
+            .commit(user_id, session_id, WRITE_TIMEOUT, None)
+            .await
+    }
+
+    /// Poll a commit's extraction `task_id` to a terminal state (or `timeout`).
+    /// The true completion signal `recall`-count stability can only approximate.
+    pub async fn wait_commit_task(
+        &self,
+        user_id: &str,
+        task_id: &str,
+        interval: Duration,
+        timeout: Duration,
+    ) -> CommitTaskOutcome {
+        self.inner
+            .poll_commit_task(user_id, task_id, interval, timeout, None, || false)
+            .await
+    }
+
+    /// Context-free recall for harnesses/diagnostics: `POST /search/find` with
+    /// the configured `top_k`, returning the recalled memory contents. The
+    /// trait [`Memory::recall`] is this plus `MemoryContext` plumbing and
+    /// failure-swallowing.
+    pub async fn recall_for(&self, user_id: &str, query: &str) -> Result<Vec<RecalledMemory>> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = json!({"query": query, "top_k": self.inner.top_k});
+        let resp = self
+            .inner
+            .post_json("/api/v1/search/find", user_id, &body, RECALL_TIMEOUT, None)
+            .await?;
+        Ok(parse_search_results(&resp))
+    }
+
+    /// Context-free single-message write: `POST /sessions/{session_id}/messages`.
+    /// Writes `content` **verbatim** (no truncation). Commit the session
+    /// afterward — via [`Self::commit_session`] — to trigger extraction.
+    pub async fn add_message(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<()> {
+        let path = format!("/api/v1/sessions/{session_id}/messages");
+        let body = json!({"role": role, "content": content});
+        self.inner
+            .post_json(&path, user_id, &body, WRITE_TIMEOUT, None)
+            .await?;
+        Ok(())
+    }
 }
 
 fn concat_text(blocks: &[ContentBlock]) -> String {
@@ -483,18 +642,6 @@ fn concat_text(blocks: &[ContentBlock]) -> String {
         }
     }
     out
-}
-
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut end = max;
-        while !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        s[..end].to_string()
-    }
 }
 
 /// Whether `uri` points into a deletable memory tree — `viking://user/…/memories`
@@ -589,23 +736,8 @@ impl Memory for OpenVikingMemory {
         ctx: &MemoryContext,
         query: &[ContentBlock],
     ) -> Result<Vec<RecalledMemory>> {
-        let q = concat_text(query);
-        if q.is_empty() {
-            return Ok(Vec::new());
-        }
-        let body = json!({"query": q, "top_k": self.inner.top_k});
-        match self
-            .inner
-            .post_json(
-                "/api/v1/search/find",
-                ctx.user_id(),
-                &body,
-                RECALL_TIMEOUT,
-                None,
-            )
-            .await
-        {
-            Ok(resp) => Ok(parse_search_results(&resp)),
+        match self.recall_for(ctx.user_id(), &concat_text(query)).await {
+            Ok(memories) => Ok(memories),
             Err(e) => {
                 warn!(error = %e, "openviking recall failed (timeout or backend)");
                 Ok(Vec::new())
@@ -624,28 +756,19 @@ impl Memory for OpenVikingMemory {
         if user_text.is_empty() && assistant_text.is_empty() {
             return Ok(());
         }
-        let sid = ctx.session_id().as_str();
-        let path = format!("/api/v1/sessions/{sid}/messages");
         let user_id = ctx.user_id();
-        if !user_text.is_empty() {
-            let body = json!({"role": "user", "content": truncate_str(&user_text, 4000)});
-            if let Err(e) = self
-                .inner
-                .post_json(&path, user_id, &body, WRITE_TIMEOUT, None)
-                .await
-            {
-                debug!(error = %e, "openviking on_job_complete user msg failed");
-            }
+        let sid = ctx.session_id().as_str();
+        if !user_text.is_empty()
+            && let Err(e) = self.add_message(user_id, sid, "user", &user_text).await
+        {
+            debug!(error = %e, "openviking on_job_complete user msg failed");
         }
-        if !assistant_text.is_empty() {
-            let body = json!({"role": "assistant", "content": truncate_str(&assistant_text, 4000)});
-            if let Err(e) = self
-                .inner
-                .post_json(&path, user_id, &body, WRITE_TIMEOUT, None)
+        if !assistant_text.is_empty()
+            && let Err(e) = self
+                .add_message(user_id, sid, "assistant", &assistant_text)
                 .await
-            {
-                debug!(error = %e, "openviking on_job_complete assistant msg failed");
-            }
+        {
+            debug!(error = %e, "openviking on_job_complete assistant msg failed");
         }
         Ok(())
     }
@@ -654,11 +777,11 @@ impl Memory for OpenVikingMemory {
         if transcript.is_empty() {
             return Ok(());
         }
-        let sid = ctx.session_id().as_str();
-        let path = format!("/api/v1/sessions/{sid}/commit");
+        // Fire-and-forget: the extraction `task_id` the commit hands back is
+        // discarded here (the user never waits on extraction). Callers needing
+        // true completion go through `commit_session` + `wait_commit_task`.
         if let Err(e) = self
-            .inner
-            .post_empty(&path, ctx.user_id(), WRITE_TIMEOUT, None)
+            .commit_session(ctx.user_id(), ctx.session_id().as_str())
             .await
         {
             warn!(error = %e, "openviking session commit failed");
@@ -917,62 +1040,42 @@ impl Tool for VikingStoreTool {
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
 
-        let commit_path = format!("/api/v1/sessions/{session_id}/commit");
-        let commit = self
+        let ack = self
             .inner
-            .post_empty(&commit_path, user_id, HTTP_TIMEOUT, Some(&ctx.events))
+            .commit(user_id, &session_id, HTTP_TIMEOUT, Some(&ctx.events))
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
-
-        let mut status = commit
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let mut memories = count_extracted(&commit);
+        let mut status = ack.status;
+        let mut memories = ack.memories_extracted;
 
         // Phase 2 (extraction) runs as a background task; poll it to completion
         // so the model gets a real count, bounded by STORE_POLL_TIMEOUT and the
         // user's cancellation.
-        if let Some(task_id) = commit.get("task_id").and_then(|v| v.as_str())
+        if let Some(task_id) = ack.task_id.as_deref()
             && status != "completed"
             && status != "failed"
         {
-            let task_path = format!("/api/v1/tasks/{task_id}");
-            let deadline = Instant::now() + STORE_POLL_TIMEOUT;
-            loop {
-                if ctx.cancellation_token.is_cancelled() {
-                    break;
+            let outcome = self
+                .inner
+                .poll_commit_task(
+                    user_id,
+                    task_id,
+                    STORE_POLL_INTERVAL,
+                    STORE_POLL_TIMEOUT,
+                    Some(&ctx.events),
+                    || ctx.cancellation_token.is_cancelled(),
+                )
+                .await;
+            match outcome.status.as_str() {
+                "completed" => {
+                    status = "completed".into();
+                    memories = outcome.memories_extracted;
                 }
-                if Instant::now() >= deadline {
-                    status = "timeout".into();
-                    break;
-                }
-                tokio::time::sleep(STORE_POLL_INTERVAL).await;
-                match self
-                    .inner
-                    .get(&task_path, user_id, &[], HTTP_TIMEOUT, Some(&ctx.events))
-                    .await
-                {
-                    Ok(task) => match task.get("status").and_then(|v| v.as_str()) {
-                        Some("completed") => {
-                            status = "completed".into();
-                            if let Some(result) = task.get("result") {
-                                memories = count_extracted(result);
-                            }
-                            break;
-                        }
-                        Some("failed") => {
-                            status = "failed".into();
-                            break;
-                        }
-                        _ => {}
-                    },
-                    Err(e) => {
-                        debug!(error = %e, "openviking store task poll failed");
-                        break;
-                    }
-                }
+                "failed" => status = "failed".into(),
+                "timeout" => status = "timeout".into(),
+                // cancelled / poll error → keep the commit's status, matching
+                // the original loop's early `break` without a status change.
+                _ => {}
             }
         }
 
@@ -1313,13 +1416,5 @@ mod tests {
         let commit = json!({"memories_extracted": {"preferences": 2, "events": 3, "cases": 0}});
         assert_eq!(count_extracted(&commit), 5);
         assert_eq!(count_extracted(&json!({})), 0);
-    }
-
-    #[test]
-    fn truncate_str_respects_utf8_boundaries() {
-        assert_eq!(truncate_str("hello", 10), "hello");
-        assert_eq!(truncate_str("hello world", 5), "hello");
-        let s = "héllo";
-        assert!(truncate_str(s, 3).len() <= 3);
     }
 }

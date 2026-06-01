@@ -1,0 +1,13 @@
+# OpenViking runtime data: vector DB + extracted memories (mounted by
+# docker-compose at ./data → /app/.openviking/data). Not source.
+/data/
+# Benchmark scratch: downloaded dataset + ingest manifests.
+/bench-out/
+# Per-run result JSONs: summary + every answer/judge reason. Large,
+# LLM-generated, and rewritten each run — regenerate with run-bench.sh.
+/results/
+# Per-run aura workspaces the bench generates (config + vault + sessions.db +
+# logs). Disposable scratch, regenerated each run.
+/aura-ws/
+# Self-hosted mem0 arm's qdrant vector store (docker volume mount).
+/mem0-data/

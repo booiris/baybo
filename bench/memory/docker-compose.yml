@@ -1,0 +1,65 @@
+services:
+  openviking:
+    image: ghcr.io/volcengine/openviking:latest
+    container_name: openviking
+    # Secrets live in the gitignored .env beside this file (copy from
+    # .env.example). ov.conf references them via ${...}, expanded inside the
+    # container on load — so the committed config has no keys.
+    env_file:
+      - .env
+    environment:
+      # ov.conf is mounted below; point the server straight at it.
+      OPENVIKING_CONFIG_FILE: /app/.openviking/ov.conf
+    extra_hosts:
+      # So ov.conf can reach an embedding / LLM server on the host via
+      # http://host.docker.internal:<port> (Linux needs this mapping).
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:1933:1933"
+    volumes:
+      - .:/app/.openviking # ov.conf + ./data (workspace) live in bench/memory/
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:1933/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # Self-hosted mem0 arm: a thin mem0-lib server (mem0-server/) + its qdrant
+  # vector store. LLM + embedder come from the same .env vars OpenViking uses
+  # (DEEPSEEK_API_KEY, OPENVIKING_VLM_*, OPENVIKING_EMBEDDING_*), so both arms
+  # run the identical DeepSeek + Qwen3 stack. Point the bench at it with
+  # MEM0_BASE_URL=http://127.0.0.1:8765 (the OSS-mode backend).
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: mem0-qdrant
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - ./mem0-data/qdrant:/qdrant/storage
+    restart: unless-stopped
+
+  mem0:
+    build: ./mem0-server
+    container_name: mem0
+    env_file:
+      - .env
+    environment:
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      # OPENVIKING_EMBEDDING_DIMS is read from .env (env_file above) — one source
+      # shared with ov.conf so both arms' vector widths stay aligned.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:8765:8000"
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s

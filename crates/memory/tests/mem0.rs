@@ -37,6 +37,7 @@ fn cfg(server_url: &str, top_k: usize) -> Mem0Config {
         base_url: Some(server_url.to_string()),
         rerank: Some(true),
         top_k: Some(top_k),
+        self_hosted: None,
     }
 }
 

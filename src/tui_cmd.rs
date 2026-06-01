@@ -71,14 +71,11 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
 
     // Read the per-start TUI token from the vault. Done once up front
     // so a missing token (gateway not running yet) flows into the same
-    // `NotReachable`-style fallback as an unreachable admin port. The
-    // admin bearer token is read from the same vault so the TUI can query
-    // the gateway's active LLM metadata for the input footer. In
-    // `--dev-auto-gateway` mode the spawned child writes the TUI token
-    // before the admin listener accepts connections; we re-read after
-    // spawn to pick up the freshly-rotated value.
-    let mut tui_token = read_tui_token(&config).await;
-    let mut admin_token = read_admin_token(&config).await;
+    // `NotReachable`-style fallback as an unreachable admin port. In
+    // `--dev-auto-gateway` mode the spawned child rotates this token
+    // before its admin listener accepts connections, so that arm
+    // re-reads it for the retry connect.
+    let tui_token = read_tui_token(&config).await;
 
     let transport =
         match try_connect_with_token(admin_addr, tui_token.as_deref(), &session_id).await {
@@ -97,10 +94,9 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
                     let config_path = crate::boot::resolve_config_path();
                     _auto_gateway =
                         Some(dev_auto::spawn_and_wait_ready(admin_addr, config_path).await?);
-                    // Reread the freshly-rotated token the spawned gateway
-                    // just published.
-                    tui_token = read_tui_token(&config).await;
-                    admin_token = read_admin_token(&config).await;
+                    // Reconnect with the freshly-rotated token the spawned
+                    // gateway just published.
+                    let tui_token = read_tui_token(&config).await;
                     Arc::new(
                         try_connect_with_token(admin_addr, tui_token.as_deref(), &session_id)
                             .await
@@ -117,6 +113,10 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
         };
     info!(%admin_addr, "connected to gateway");
 
+    // Read the admin bearer token now that the connect has settled — in
+    // `--dev-auto-gateway` mode the gateway has spawned and rotated it by
+    // this point. Only used for the active-LLM footer query below.
+    let admin_token = read_admin_token(&config).await;
     let model_label = fetch_current_model_label(admin_addr, admin_token.as_deref()).await;
     let slash_handler = Arc::new(TuiSlashHandler::new());
     let dashboard_provider = Arc::new(TuiDashboardProvider::new());

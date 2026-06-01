@@ -575,6 +575,16 @@ pub async fn build_managers(
     // `config.memory.enabled = false` or `provider = noop`.
     let memory =
         aura_memory::boot::build_memory_backend(&config, &secret_vault, proxy.as_ref()).await;
+    // Benchmark-only: wrap so recall + tools stay live but writes are no-ops, so
+    // the memory bench can drive the real agent without QA turns polluting the
+    // recall scope. Compiled out of production builds.
+    #[cfg(feature = "bench-readonly-memory")]
+    let memory = memory.map(|m| {
+        tracing::warn!(
+            "bench-readonly-memory: memory writes disabled (recall + tools only) — benchmark build"
+        );
+        Arc::new(aura_memory::ReadOnlyMemory::new(m)) as Arc<dyn aura_memory::Memory>
+    });
     if let Some(m) = &memory {
         for (tool, manifest) in m.tools() {
             tool_registry.register(tool, manifest);

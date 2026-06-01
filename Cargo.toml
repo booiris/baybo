@@ -30,6 +30,7 @@ members = [
     "crates/integration-tests",
     "crates/janitor",
     "crates/setup",
+    "bench/memory",
 ]
 exclude = ["crates/security/fuzz"]
 
@@ -170,6 +171,13 @@ base64 = "0.22"
 name = "aura"
 version.workspace = true
 edition.workspace = true
+
+[features]
+# Build a benchmark-only `aura` that recalls memory but never writes it, so the
+# LOCOMO bench (`bench/memory`) can drive the real agent end-to-end without QA
+# turns polluting the recall scope. Wraps the backend in
+# `aura_memory::ReadOnlyMemory` (see `src/runtime.rs`). NOT for production.
+bench-readonly-memory = ["aura-memory/bench-readonly-memory"]
 
 [dependencies]
 aura-model = { workspace = true }
