@@ -107,7 +107,7 @@ interface TurnState {
   heartbeatTimer: ReturnType<typeof setInterval> | null;
 }
 
-const DEFAULT_APPEAR_AFTER_MS = 6000;
+const DEFAULT_APPEAR_AFTER_MS = 10000;
 const DEFAULT_MIN_EDIT_INTERVAL_MS = 2500;
 const DEFAULT_HEARTBEAT_MS = 3000;
 
