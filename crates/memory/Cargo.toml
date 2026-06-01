@@ -8,6 +8,12 @@ doctest = false
 
 [features]
 test-support = []
+# Recall-only memory for the LOCOMO benchmark (`bench/memory`): exposes
+# `ReadOnlyMemory`, a wrapper that forwards recall + tools but no-ops the write
+# hooks. `aura`'s runtime applies it under the matching feature so the bench can
+# drive the real agent (recall live) without QA turns polluting the scope. Not
+# a production path.
+bench-readonly-memory = []
 
 [dependencies]
 aura-model = { workspace = true }

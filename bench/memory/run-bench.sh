@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+#
+# Run the aura memory benchmark end-to-end for one or more arms and print a
+# comparison table. QA drives the REAL Aura agent (one `aura gateway` per arm +
+# a concurrent `aura prompt` per question). See bench/memory/README.md.
+#   noop = floor (memory off), oracle = ceiling (whole convo in prompt),
+#   mem0 / openviking = real backends (an ingest pass runs first).
+#
+# Keys + endpoints live in bench/memory/.env (auto-loaded — copy from
+# .env.example and fill in). The agent is built read-only so QA turns don't
+# pollute the recall scope; this script builds `aura --features
+# bench-readonly-memory` for you. By default it generates a self-contained
+# config + workspace (no aura.json needed); set AURA_CONFIG to derive from yours.
+#
+# Quick start — fill bench/memory/.env, then (floor vs ceiling, self-contained):
+#   bench/memory/run-bench.sh
+#
+# The real thing (OpenViking up at :1933; ingest runs automatically):
+#   ARMS="noop oracle openviking" bench/memory/run-bench.sh
+#
+# Preview the plan without spending (no keys/config needed):
+#   DRY_RUN=1 ARMS="noop oracle mem0 openviking" bench/memory/run-bench.sh
+#
+# Every UPPERCASE setting below is overridable from the environment.
+set -euo pipefail
+# shellcheck disable=SC2086  # $Q_ARG is intentionally word-split (numeric/empty)
+
+# Auto-load this dir's .env (keys + endpoints) so you don't have to `source` it.
+# `set -a` exports each var so the bench bins + spawned gateway inherit them.
+BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
+
+# ---- config (override via env) --------------------------------------------
+: "${ARMS:=noop oracle}"            # space-separated: noop oracle mem0 openviking
+: "${CONVERSATIONS:=1}"
+: "${QUESTIONS:=}"                  # empty = all questions per conversation
+: "${CONCURRENCY:=4}"
+: "${GATEWAY_PORT:=0}"              # QA `aura gateway` port; 0 = auto-pick a free one
+: "${TOP_K:=10}"                    # ingest recall depth
+: "${SETTLE_TIMEOUT_SECS:=3600}"    # how long ingest waits for extraction to settle (1h)
+: "${ALLOW_UNSETTLED:=0}"           # 1 = run QA even if extraction never settled
+: "${MEM0_BASE_URL:=http://127.0.0.1:8765}"   # self-hosted mem0 server (docker); empty = cloud Platform
+: "${DRY_RUN:=0}"                  # 1 = print plan only (no build, no spend)
+: "${OUTDIR:=$BENCH_DIR/bench-out}"   # bench scratch (gitignored): dataset + manifests
+: "${DATASET:=$OUTDIR/locomo10.json}"
+: "${RESULTS_DIR:=$BENCH_DIR/results}"   # per-run result JSONs — tracked in git (sibling of bench-out)
+: "${WS_ROOT:=$BENCH_DIR/aura-ws}"    # per-run aura workspaces (gitignored): config + vault + sessions + logs
+: "${RUN_ID:=bench-$(date +%Y%m%d-%H%M%S)}"
+: "${RUST_LOG:=aura_bench_memory=info}"; export RUST_LOG
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+: "${AURA_CONFIG:=}"               # base aura.json to derive from; empty = self-contained generated config
+: "${AURA_BIN:=$REPO_ROOT/target/release/aura}"   # built with the bench feature below
+LOCOMO_URL="https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
+PKG="aura-bench-memory"
+# ---------------------------------------------------------------------------
+
+mkdir -p "$OUTDIR" "$RESULTS_DIR" "$WS_ROOT"
+
+# Optional flag. QUESTIONS is numeric, so unquoted word-splitting is safe and
+# an empty value expands to no argument.
+Q_ARG=""
+if [ -n "$QUESTIONS" ]; then Q_ARG="--questions $QUESTIONS"; fi
+# Base config is optional: empty → the bench derives one from ~/.aura/config/aura.json.
+CFG_ARG=""
+if [ -n "$AURA_CONFIG" ]; then CFG_ARG="--aura-config $AURA_CONFIG"; fi
+# Optional --allow-unsettled (run QA even if extraction never settled).
+UNSETTLED_ARG=""
+if [ "$ALLOW_UNSETTLED" = 1 ]; then UNSETTLED_ARG="--allow-unsettled"; fi
+# mem0 base URL → self-hosted OSS server (empty = managed cloud Platform).
+MEM0_ARG=""
+if [ -n "$MEM0_BASE_URL" ]; then MEM0_ARG="--mem0-base-url $MEM0_BASE_URL"; fi
+
+# Warm the OpenViking embedding endpoint so the first recalls don't hit the
+# model's cold-start (~20s) and time out — that alone swings the score wildly
+# (10% vs 70% on a sample). No-op unless the embedding URL is set (from .env).
+warm_embedding() {
+  [ -n "${OPENVIKING_EMBEDDING_URL:-}" ] || return 0
+  echo ">> warming embedding endpoint (${OPENVIKING_EMBEDDING_MODEL:-?})"
+  for _ in 1 2 3; do
+    curl -fsS --max-time 60 "$OPENVIKING_EMBEDDING_URL/embeddings" \
+      -H 'content-type: application/json' \
+      -d "{\"model\":\"${OPENVIKING_EMBEDDING_MODEL:-}\",\"input\":\"warmup\"}" \
+      -o /dev/null 2>/dev/null || true
+  done
+}
+
+# ---- preflight ------------------------------------------------------------
+for arm in $ARMS; do
+  case "$arm" in
+    noop | oracle | mem0 | openviking) ;;
+    *) echo "unknown arm '$arm' (want: noop oracle mem0 openviking)" >&2; exit 1 ;;
+  esac
+done
+if [ "$DRY_RUN" != "1" ]; then
+  : "${DEEPSEEK_API_KEY:?required — used by the judge model}"
+  for arm in $ARMS; do
+    case "$arm" in
+      mem0)
+        # Self-hosted docker server (MEM0_BASE_URL set) needs no cloud key; only
+        # the managed cloud Platform (empty MEM0_BASE_URL) requires MEM0_API_KEY.
+        if [ -z "${MEM0_BASE_URL:-}" ]; then
+          : "${MEM0_API_KEY:?the mem0 cloud arm needs MEM0_API_KEY (use a throwaway project), or set MEM0_BASE_URL to target the self-hosted docker server}"
+        fi ;;
+      openviking)
+        : "${OPENVIKING_ENDPOINT:?the openviking arm needs OPENVIKING_ENDPOINT (ingest)}"
+        : "${OPENVIKING_API_KEY:?the openviking arm needs OPENVIKING_API_KEY (matches ov.conf root key)}" ;;
+    esac
+  done
+fi
+
+# ---- dataset: download once, reuse thereafter (dry-run needs it too, to count
+# questions for the plan) -----------------------------------------------------
+if [ ! -f "$DATASET" ]; then
+  echo ">> downloading LOCOMO dataset -> $DATASET"
+  curl -fL -o "$DATASET" "$LOCOMO_URL"
+fi
+
+if [ "$DRY_RUN" = "1" ]; then
+  for arm in $ARMS; do
+    echo ">> [dry-run] $arm"
+    cargo run -q -p "$PKG" --bin run -- \
+      --arm "$arm" --dataset "$DATASET" --conversations "$CONVERSATIONS" \
+      --concurrency "$CONCURRENCY" $Q_ARG --dry-run
+  done
+  exit 0
+fi
+
+# ---- build: the bench bins + a read-only `aura` the bench drives ----------
+echo ">> building $PKG bins"
+cargo build -p "$PKG" --bins
+echo ">> building read-only aura (--features bench-readonly-memory) -> $AURA_BIN"
+cargo build --release -p aura --features bench-readonly-memory
+
+run_arm() {
+  local arm="$1"
+  local results="$RESULTS_DIR/results-$arm-$RUN_ID.json"
+
+  [ "$arm" = "openviking" ] && warm_embedding
+
+  case "$arm" in
+    mem0 | openviking)
+      local manifest="$OUTDIR/manifest-$arm-$RUN_ID.json"
+      # Reuse an existing manifest (same RUN_ID) so one ingest can back many QA
+      # reruns; otherwise ingest fresh. Fix RUN_ID across invocations to reuse.
+      if [ -f "$manifest" ]; then
+        echo ">> [$arm] reusing manifest $manifest (skipping ingest)"
+      else
+        echo ">> [$arm] ingest -> $manifest"
+        cargo run -q -p "$PKG" --bin ingest -- \
+          --arm "$arm" --dataset "$DATASET" --conversations "$CONVERSATIONS" \
+          --top-k "$TOP_K" --run-id "$RUN_ID" --out "$manifest" \
+          --settle-timeout-secs "$SETTLE_TIMEOUT_SECS" $MEM0_ARG
+      fi
+      echo ">> [$arm] QA run -> $results"
+      cargo run -q -p "$PKG" --bin run -- \
+        --arm "$arm" --dataset "$DATASET" --conversations "$CONVERSATIONS" \
+        --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" $Q_ARG $UNSETTLED_ARG $MEM0_ARG \
+        $CFG_ARG --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" \
+        --manifest "$manifest" --out "$results"
+      ;;
+    noop | oracle)
+      echo ">> [$arm] QA run -> $results"
+      cargo run -q -p "$PKG" --bin run -- \
+        --arm "$arm" --dataset "$DATASET" --conversations "$CONVERSATIONS" \
+        --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" $Q_ARG \
+        $CFG_ARG --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" --out "$results"
+      ;;
+  esac
+}
+
+for arm in $ARMS; do
+  run_arm "$arm"
+done
+
+# ---- comparison table across arms -----------------------------------------
+echo
+echo "=== summary (run_id=$RUN_ID) ==="
+if command -v jq >/dev/null 2>&1; then
+  printf '%-12s %5s %8s %8s\n' arm n acc f1
+  for arm in $ARMS; do
+    f="$RESULTS_DIR/results-$arm-$RUN_ID.json"
+    [ -f "$f" ] || continue
+    jq -r '[.arm, .total_questions, (.overall_accuracy*100), .mean_f1] | @tsv' "$f" \
+      | awk -F'\t' '{printf "%-12s %5d %7.1f%% %8.3f\n", $1,$2,$3,$4}'
+  done
+else
+  echo "(install jq for the comparison table; raw results listed below)"
+  ls -1 "$RESULTS_DIR"/results-*-"$RUN_ID".json
+fi
+echo
+echo "full per-question JSON: $RESULTS_DIR/results-*-$RUN_ID.json"

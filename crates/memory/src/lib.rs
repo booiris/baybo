@@ -228,3 +228,52 @@ impl Memory for NoopMemory {
         Ok(())
     }
 }
+
+/// Recall-only wrapper: forwards `recall` + `tools` to the inner backend but
+/// no-ops the write hooks (`on_job_complete` / `on_session_end`). Wired into
+/// `aura`'s runtime only under the `bench-readonly-memory` feature, so the
+/// memory benchmark can drive the real agent end-to-end (recall + tools live)
+/// without QA turns writing into — and polluting — the recall scope. NOT a
+/// production path.
+#[cfg(feature = "bench-readonly-memory")]
+pub struct ReadOnlyMemory(Arc<dyn Memory>);
+
+#[cfg(feature = "bench-readonly-memory")]
+impl ReadOnlyMemory {
+    pub fn new(inner: Arc<dyn Memory>) -> Self {
+        Self(inner)
+    }
+}
+
+#[cfg(feature = "bench-readonly-memory")]
+#[async_trait]
+impl Memory for ReadOnlyMemory {
+    async fn recall(
+        &self,
+        ctx: &MemoryContext,
+        query: &[ContentBlock],
+    ) -> Result<Vec<RecalledMemory>> {
+        self.0.recall(ctx, query).await
+    }
+
+    async fn on_job_complete(
+        &self,
+        _ctx: &MemoryContext,
+        _user_input: &[ContentBlock],
+        _final_output: &[ContentBlock],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn on_session_end(
+        &self,
+        _ctx: &MemoryContext,
+        _transcript: &[ChatMessage],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn tools(&self) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
+        self.0.tools()
+    }
+}

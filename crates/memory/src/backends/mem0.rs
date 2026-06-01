@@ -1,4 +1,5 @@
-//! Mem0 Platform memory backend.
+//! Mem0 memory backend — the managed Platform API by default, or a self-hosted
+//! OSS server when `self_hosted` is set (see "Self-hosted (OSS) mode" below).
 //!
 //! Hosted SaaS memory with server-side LLM fact extraction, semantic search,
 //! and reranking via the Mem0 REST API. Two coexisting surfaces:
@@ -33,6 +34,16 @@
 //!
 //! Failures are routed through a 5-failure / 120 s circuit breaker that pauses
 //! API calls after sustained outages.
+//!
+//! ## Self-hosted (OSS) mode
+//!
+//! Set `self_hosted: true` (with `base_url` pointing at your server) to target
+//! the open-source mem0 server instead of the managed Platform. Its API
+//! differs: unversioned paths (`/memories`, `/search`), no `Token` auth, and
+//! synchronous extraction — there is no `/events` feed, so settle is immediate
+//! and the event tools say as much. Platform paths are folded automatically
+//! ([`Mem0Inner::map_path`]); search scopes by `user_id` rather than the v2
+//! filter shape.
 //!
 //! # References
 //!
@@ -137,6 +148,11 @@ pub struct Mem0Config {
     /// Max results returned by `recall`. `None` → 5.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<usize>,
+    /// Target a self-hosted mem0 OSS server (`/memories`, `/search`, no auth,
+    /// synchronous extraction) instead of the managed Platform API. `None` →
+    /// `false` (Platform). Set `base_url` to the server when enabling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_hosted: Option<bool>,
 }
 
 impl Mem0Config {
@@ -150,6 +166,10 @@ impl Mem0Config {
 
     fn top_k(&self) -> usize {
         self.top_k.unwrap_or(DEFAULT_TOP_K)
+    }
+
+    fn self_hosted(&self) -> bool {
+        self.self_hosted.unwrap_or(false)
     }
 }
 
@@ -220,6 +240,8 @@ struct Mem0Inner {
     client: reqwest::Client,
     base_url: String,
     api_key: String,
+    /// `true` → self-hosted OSS server (OSS paths, no auth header, no events).
+    self_hosted: bool,
     rerank: bool,
     top_k: usize,
     breaker: Mutex<BreakerState>,
@@ -240,7 +262,26 @@ impl Mem0Inner {
 
     fn url(&self, path: &str) -> String {
         let base = self.base_url.trim_end_matches('/');
-        format!("{base}{path}")
+        format!("{base}{}", self.map_path(path))
+    }
+
+    /// Map a Platform-API path to its self-hosted OSS-server equivalent: drop
+    /// the `/v1`·`/v2` version prefix and the trailing slash, and fold
+    /// `/memories/search` onto `/search`. A no-op in Platform mode.
+    fn map_path<'a>(&self, path: &'a str) -> &'a str {
+        if !self.self_hosted {
+            return path;
+        }
+        let p = path.trim_end_matches('/');
+        let p = p
+            .strip_prefix("/v1")
+            .or_else(|| p.strip_prefix("/v2"))
+            .unwrap_or(p);
+        if p == "/memories/search" {
+            "/search"
+        } else {
+            p
+        }
     }
 
     fn auth_header(&self) -> String {
@@ -287,11 +328,10 @@ impl Mem0Inner {
                 pairs.append_pair(k, v);
             }
         }
-        let mut req = self
-            .client
-            .request(method.clone(), url)
-            .header(header::AUTHORIZATION, self.auth_header())
-            .timeout(timeout);
+        let mut req = self.client.request(method.clone(), url).timeout(timeout);
+        if !self.self_hosted {
+            req = req.header(header::AUTHORIZATION, self.auth_header());
+        }
         if let Some(b) = body {
             req = req.json(b);
         }
@@ -407,7 +447,9 @@ impl Mem0Memory {
     /// [`aura_security::http::client_builder`] — the crate-wide outbound
     /// chokepoint.
     pub fn new(cfg: Mem0Config, api_key: String, proxy: Option<&ProxySettings>) -> Result<Self> {
-        if api_key.is_empty() {
+        let self_hosted = cfg.self_hosted();
+        // A self-hosted OSS server needs no key; the Platform API does.
+        if api_key.is_empty() && !self_hosted {
             return Err(MemoryError::Backend(
                 "mem0 API key missing — run `aura secret add MEM0_API_KEY` \
                  (or set the MEM0_API_KEY env var)"
@@ -423,6 +465,7 @@ impl Mem0Memory {
             client,
             base_url: cfg.base_url().to_string(),
             api_key,
+            self_hosted,
             rerank: cfg.rerank(),
             top_k: cfg.top_k(),
             breaker: Mutex::new(BreakerState::default()),
@@ -446,6 +489,86 @@ impl Mem0Memory {
             .await
         {
             warn!(error = %e, "mem0 startup probe failed; continuing");
+        }
+    }
+
+    /// Context-free recall for harnesses/diagnostics: `POST /v2/memories/search/`
+    /// scoped to `user_id`. The trait [`Memory::recall`] is this plus the
+    /// circuit breaker and failure-swallowing.
+    pub async fn recall_for(&self, user_id: &str, query: &str) -> Result<Vec<RecalledMemory>> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = if self.inner.self_hosted {
+            json!({"query": query, "user_id": user_id, "limit": self.inner.top_k})
+        } else {
+            json!({
+                "query": query,
+                "filters": read_filters(user_id),
+                "rerank": self.inner.rerank,
+                "top_k": self.inner.top_k,
+            })
+        };
+        let resp = self
+            .inner
+            .post_json("/v2/memories/search/", &body, RECALL_TIMEOUT, None)
+            .await?;
+        Ok(parse_search_results(&resp))
+    }
+
+    /// Context-free turn write for harnesses: `POST /v1/memories/` with one
+    /// user+assistant pair under `user_id`. Extraction runs async server-side;
+    /// poll its completion with [`Self::wait_events_completed`].
+    pub async fn add_turn(
+        &self,
+        user_id: &str,
+        user_text: &str,
+        assistant_text: &str,
+    ) -> Result<()> {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_text},
+            ],
+            "user_id": user_id,
+            "agent_id": DEFAULT_AGENT_ID,
+        });
+        self.inner
+            .post_json("/v1/memories/", &body, WRITE_TIMEOUT, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Poll the account-global `GET /v1/events/` feed until every event is
+    /// `completed` (true extraction completion) or `timeout` elapses. Assumes a
+    /// dedicated project — see the bench README's isolation note. Mirrors the
+    /// `mem0_event_list` tool's read.
+    pub async fn wait_events_completed(&self, interval: Duration, timeout: Duration) -> bool {
+        // The OSS server extracts synchronously inside `add` — there is no
+        // event feed and nothing to wait for, so settle is immediate.
+        if self.inner.self_hosted {
+            return true;
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(resp) = self
+                .inner
+                .request(Method::GET, "/v1/events/", None, &[], HTTP_TIMEOUT, None)
+                .await
+            {
+                let items = result_items(&resp);
+                if !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|e| e.get("status").and_then(|s| s.as_str()) == Some("completed"))
+                {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(interval).await;
         }
     }
 }
@@ -548,24 +671,10 @@ impl Memory for Mem0Memory {
         if self.inner.breaker_open() {
             return Ok(Vec::new());
         }
-        let q = concat_text(query);
-        if q.is_empty() {
-            return Ok(Vec::new());
-        }
-        let body = json!({
-            "query": q,
-            "filters": read_filters(ctx.user_id()),
-            "rerank": self.inner.rerank,
-            "top_k": self.inner.top_k,
-        });
-        match self
-            .inner
-            .post_json("/v2/memories/search/", &body, RECALL_TIMEOUT, None)
-            .await
-        {
-            Ok(resp) => {
+        match self.recall_for(ctx.user_id(), &concat_text(query)).await {
+            Ok(memories) => {
                 self.inner.record_success();
-                Ok(parse_search_results(&resp))
+                Ok(memories)
             }
             Err(e) => {
                 self.inner.record_failure();
@@ -589,20 +698,11 @@ impl Memory for Mem0Memory {
         if user_text.is_empty() && assistant_text.is_empty() {
             return Ok(());
         }
-        let body = json!({
-            "messages": [
-                {"role": "user", "content": user_text},
-                {"role": "assistant", "content": assistant_text},
-            ],
-            "user_id": ctx.user_id(),
-            "agent_id": DEFAULT_AGENT_ID,
-        });
         match self
-            .inner
-            .post_json("/v1/memories/", &body, WRITE_TIMEOUT, None)
+            .add_turn(ctx.user_id(), &user_text, &assistant_text)
             .await
         {
-            Ok(_) => {
+            Ok(()) => {
                 self.inner.record_success();
                 Ok(())
             }
@@ -744,13 +844,19 @@ impl Tool for Mem0SearchTool {
                     .filter_map(|x| x.as_str().map(String::from))
                     .collect()
             });
-        let body = json!({
-            "query": query,
-            "top_k": limit,
-            "threshold": DEFAULT_SEARCH_THRESHOLD,
-            "rerank": self.inner.rerank,
-            "filters": build_filters(user_id, agent_id, run_id, categories.as_deref(), params.get("filters")),
-        });
+        // OSS scopes by user_id and ignores the Platform v2 filter shape
+        // (agent/run/category/advanced filters), so they degrade to user scope.
+        let body = if self.inner.self_hosted {
+            json!({"query": query, "user_id": user_id, "limit": limit})
+        } else {
+            json!({
+                "query": query,
+                "top_k": limit,
+                "threshold": DEFAULT_SEARCH_THRESHOLD,
+                "rerank": self.inner.rerank,
+                "filters": build_filters(user_id, agent_id, run_id, categories.as_deref(), params.get("filters")),
+            })
+        };
         match self
             .inner
             .request(
@@ -1010,17 +1116,26 @@ impl Tool for Mem0ListTool {
             params.get("scope").and_then(|v| v.as_str()),
             ctx.session_id.as_str(),
         );
-        let body = json!({"filters": build_filters(user_id, agent_id, run_id, None, None)});
-        let qp = [
-            ("page", "1".to_string()),
-            ("page_size", MAX_LIST_ENTRIES.to_string()),
-        ];
+        // OSS lists via GET /memories?user_id=; Platform POSTs a v2 filter + page.
+        let (method, body, qp): (Method, Option<Value>, Vec<(&str, String)>) =
+            if self.inner.self_hosted {
+                (Method::GET, None, vec![("user_id", user_id.to_string())])
+            } else {
+                (
+                    Method::POST,
+                    Some(json!({"filters": build_filters(user_id, agent_id, run_id, None, None)})),
+                    vec![
+                        ("page", "1".to_string()),
+                        ("page_size", MAX_LIST_ENTRIES.to_string()),
+                    ],
+                )
+            };
         match self
             .inner
             .request(
-                Method::POST,
+                method,
                 "/v2/memories/",
-                Some(&body),
+                body.as_ref(),
                 &qp,
                 HTTP_TIMEOUT,
                 Some(&ctx.events),
@@ -1197,12 +1312,16 @@ impl Tool for Mem0DeleteTool {
         }
 
         if let Some(query) = params.get("query").and_then(|v| v.as_str()) {
-            let body = json!({
-                "query": query,
-                "top_k": DELETE_SEARCH_TOP_K,
-                "threshold": DEFAULT_SEARCH_THRESHOLD,
-                "filters": build_filters(user_id, agent_id, None, None, None),
-            });
+            let body = if self.inner.self_hosted {
+                json!({"query": query, "user_id": user_id, "limit": DELETE_SEARCH_TOP_K})
+            } else {
+                json!({
+                    "query": query,
+                    "top_k": DELETE_SEARCH_TOP_K,
+                    "threshold": DEFAULT_SEARCH_THRESHOLD,
+                    "filters": build_filters(user_id, agent_id, None, None, None),
+                })
+            };
             let resp = match self
                 .inner
                 .request(
@@ -1324,6 +1443,12 @@ impl Tool for Mem0EventListTool {
         if self.inner.breaker_open() {
             return Ok(breaker_unavailable());
         }
+        if self.inner.self_hosted {
+            return Ok(ToolOutput::Json(json!({
+                "result": "Self-hosted mem0 extracts synchronously and has no event feed.",
+                "count": 0,
+            })));
+        }
         match self
             .inner
             .request(
@@ -1387,6 +1512,11 @@ impl Tool for Mem0EventStatusTool {
     async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
         if self.inner.breaker_open() {
             return Ok(breaker_unavailable());
+        }
+        if self.inner.self_hosted {
+            return Ok(ToolOutput::Error(
+                "Self-hosted mem0 extracts synchronously and has no event feed.".into(),
+            ));
         }
         let event_id = params
             .get("event_id")
@@ -1473,12 +1603,14 @@ mod tests {
             base_url: Some("http://localhost:9000".into()),
             rerank: Some(false),
             top_k: Some(7),
+            self_hosted: Some(true),
         };
         let v = serde_json::to_value(&cfg).unwrap();
         let back: Mem0Config = serde_json::from_value(v).unwrap();
         assert_eq!(back.base_url(), "http://localhost:9000");
         assert!(!back.rerank());
         assert_eq!(back.top_k(), 7);
+        assert!(back.self_hosted());
     }
 
     #[test]
@@ -1504,6 +1636,39 @@ mod tests {
             Err(e) => assert!(e.to_string().contains("API key"), "got: {e}"),
             Ok(_) => panic!("expected missing-API-key error"),
         }
+    }
+
+    #[test]
+    fn self_hosted_needs_no_key_and_maps_oss_paths() {
+        let cfg = Mem0Config {
+            self_hosted: Some(true),
+            base_url: Some("http://host:8000".into()),
+            ..Default::default()
+        };
+        // No key required in self-hosted mode.
+        let mem = Mem0Memory::new(cfg, String::new(), None).expect("self-hosted needs no key");
+        let inner = &mem.inner;
+        assert!(inner.self_hosted);
+        // Platform paths fold onto the OSS server's shapes.
+        assert_eq!(inner.map_path("/v1/memories/"), "/memories");
+        assert_eq!(inner.map_path("/v2/memories/search/"), "/search");
+        assert_eq!(inner.map_path("/v2/memories/"), "/memories");
+        assert_eq!(inner.map_path("/v1/memories/abc123/"), "/memories/abc123");
+        assert_eq!(inner.url("/v2/memories/search/"), "http://host:8000/search");
+    }
+
+    #[test]
+    fn platform_mode_leaves_paths_untouched() {
+        let mem = Mem0Memory::new(Mem0Config::default(), "k".into(), None).unwrap();
+        assert!(!mem.inner.self_hosted);
+        assert_eq!(
+            mem.inner.map_path("/v2/memories/search/"),
+            "/v2/memories/search/"
+        );
+        assert_eq!(
+            mem.inner.url("/v1/memories/"),
+            "https://api.mem0.ai/v1/memories/"
+        );
     }
 
     #[test]
