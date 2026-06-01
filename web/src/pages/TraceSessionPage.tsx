@@ -4,6 +4,7 @@ import {
   RiArrowLeftLine,
   RiArchiveLine,
   RiBookmark3Line,
+  RiBroadcastLine,
   RiBrainLine,
   RiCornerDownLeftLine,
   RiCornerDownRightLine,
@@ -85,6 +86,12 @@ const STEP_VISUALS: Record<StepKindTag, KindVisual> = {
     bg: 'bg-ok/10',
     label: 'Skill selection',
   },
+  progress_observer: {
+    icon: RiBroadcastLine,
+    accent: 'text-info',
+    bg: 'bg-info/10',
+    label: 'Progress observer',
+  },
   subagent: {
     icon: RiTeamLine,
     accent: 'text-brand',
@@ -113,6 +120,25 @@ const SPAN_VISUALS: Record<SpanKindTag, KindVisual> = {
     label: 'Subagent stub',
   },
 };
+
+// A kind the frontend doesn't know yet (wire drift, or a new Rust variant
+// shipped ahead of this map) must degrade to a generic row — never let a
+// `STEP_VISUALS[kind].icon` on `undefined` throw and white-screen the whole
+// trace view. The raw tag becomes the label so it's still legible.
+const FALLBACK_VISUAL: KindVisual = {
+  icon: RiCpuLine,
+  accent: 'text-ink-soft',
+  bg: 'bg-gray-100',
+  label: 'step',
+};
+
+function stepVisual(kind: StepKindTag): KindVisual {
+  return STEP_VISUALS[kind] ?? { ...FALLBACK_VISUAL, label: kind };
+}
+
+function spanVisual(kind: SpanKindTag): KindVisual {
+  return SPAN_VISUALS[kind] ?? { ...FALLBACK_VISUAL, label: kind };
+}
 
 // ── Utilities ────────────────────────────────────────────────────────
 
@@ -215,6 +241,13 @@ function stepSummaryText(step: Step, spans: Span[]): string {
       }
       return 'skill selection';
     }
+    case 'progress_observer': {
+      const llm = spans.find((s) => s.kind.kind === 'llm_call');
+      if (llm && llm.kind.kind === 'llm_call' && llm.kind.result?.output_content) {
+        return llm.kind.result.output_content.slice(0, 80);
+      }
+      return 'progress update';
+    }
     case 'subagent':
       return `child ${step.kind.child_session_id}`;
   }
@@ -231,7 +264,7 @@ function SpanRow({
   selected: boolean;
   onSelect: (id: string) => void;
 }) {
-  const visual = SPAN_VISUALS[span.kind.kind];
+  const visual = spanVisual(span.kind.kind);
   const Icon = visual.icon;
   const ms = durationMs(span);
 
@@ -316,7 +349,7 @@ function StepBlock({
   onSelect: (id: string) => void;
 }) {
   const { step, spans } = rs;
-  const visual = STEP_VISUALS[step.kind.kind];
+  const visual = stepVisual(step.kind.kind);
   const Icon = visual.icon;
   const summary = stepSummaryText(step, spans);
   const ms = durationMs(step);
@@ -564,7 +597,7 @@ function SubagentStubDetail({
 
 function MetaTab({ span }: { span: Span }) {
   const ms = durationMs(span);
-  const visual = SPAN_VISUALS[span.kind.kind];
+  const visual = spanVisual(span.kind.kind);
   const baseRows: [string, React.ReactNode][] = [
     ['Span ID', <code className="break-all">{span.id}</code>],
     ['Step ID', <code className="break-all">{span.step_id}</code>],
@@ -793,7 +826,7 @@ function SpanDetailPanel({
   onJumpToLlm: (id: string) => void;
   onDrillIn: (id: string) => void;
 }) {
-  const visual = SPAN_VISUALS[span.kind.kind];
+  const visual = spanVisual(span.kind.kind);
   const Icon = visual.icon;
   const events = span.events ?? [];
   const eventCount = events.length;
