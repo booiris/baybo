@@ -140,6 +140,44 @@ and judge reason). That folder is **tracked in git** as a score history — the
 downloaded dataset and ingest manifests under `bench-out/` are not. `run-bench.sh`
 compares the run's JSONs into the floor → backend → ceiling table.
 
+## Inspecting results — error analysis
+
+Two read-only helper scripts trace a scored question back to its sources, so you
+can tell *why* an answer was wrong — gold noise vs recall miss vs extraction loss
+vs integration failure. Both read `results/results-<arm>-<run_id>.json` plus the
+run's artifacts; neither starts a gateway or spends anything. (Run-id suffix:
+`noop`/`oracle` were `full10`, `mem0`/`openviking` were `full10b` — pass whichever
+`<run_id>` produced the results you're reading.)
+
+**`trace_incorrect.py` — back to the source dialogue.** Matches each incorrect
+answer (by `conv_idx` + question) to its LOCOMO `evidence` dia_ids and the
+original dialogue turns. LOCOMO's `evidence` often points at a lead-in line while
+the answer sits a turn over, so `--context K` prints K turns on each side.
+
+```bash
+# the ceiling's misses with surrounding context (best signal for gold noise)
+python3 bench/memory/trace_incorrect.py oracle full10 --context 1 --limit 15
+# a single conversation
+python3 bench/memory/trace_incorrect.py openviking full10b --conv 0
+```
+
+**`trace_recall.py` — what aura actually recalled.** Each question runs in its own
+aura session (`aura-ws/aura-bench-ws-<run_id>-<arm>/logs/sessions/`); the backend's
+recall lands there as `source="recalled_memory"` messages. Prints, per question:
+question + gold + correct, every recalled block, and aura's final answer — pinning
+a wrong answer to a **recall miss** (fact never recalled), an **extraction loss**
+(recalled but the detail was generalized away), or an **integration failure**
+(recalled but unused).
+
+```bash
+# wrong answers in conv 0 and the memory aura saw for each
+python3 bench/memory/trace_recall.py openviking full10b --conv 0 --incorrect
+# one question, full recall text (--chars 0 = untruncated)
+python3 bench/memory/trace_recall.py openviking full10b --conv 0 --q 1 --chars 0
+# compare what a different backend recalled for the same question
+python3 bench/memory/trace_recall.py mem0 full10b --conv 0 --q 1
+```
+
 ## Caveats
 
 - **Read-only build is mandatory.** Without `--features bench-readonly-memory`,
