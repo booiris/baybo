@@ -45,12 +45,17 @@ Do not repeat any of them. Report only what has changed or advanced since the la
 "#;
 
 /// Per-turn observer state the agent loop threads through each tick: when
-/// the last Notice fired (throttle) and the lines already shown (so the
-/// next tick can dedupe against the user's real view).
+/// the last Notice fired (throttle), the lines already shown (so the next
+/// tick can dedupe against the user's real view), and the detached call
+/// currently in flight (drained at the next boundary; at most one).
 #[derive(Default)]
 pub(crate) struct ObserverState {
     pub(crate) last_fired_at: Option<std::time::Instant>,
     pub(crate) sent_notices: Vec<String>,
+    /// The spawned observer call, if one is running. Drained (awaited when
+    /// finished) at the next iteration boundary before a new one can fire,
+    /// enforcing at-most-one-in-flight. Detached on drop — never aborted.
+    pub(crate) in_flight: Option<tokio::task::JoinHandle<anyhow::Result<String>>>,
 }
 
 /// Build the user turn appended after the cached prefix: the bare
@@ -285,6 +290,19 @@ mod gate_tests {
         let last = t0 + OBSERVER_APPEAR_AFTER;
         let now = last + OBSERVER_MIN_INTERVAL;
         assert!(should_fire_observer(true, true, 9, t0, Some(last), now));
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::ObserverState;
+
+    #[test]
+    fn default_has_no_in_flight_call() {
+        let state = ObserverState::default();
+        assert!(state.in_flight.is_none());
+        assert!(state.last_fired_at.is_none());
+        assert!(state.sent_notices.is_empty());
     }
 }
 
