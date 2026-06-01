@@ -2018,9 +2018,12 @@ impl AgentLoop {
     }
 
     /// Read-only out-of-band progress: summarize the in-flight turn with a
-    /// billed LLM call and ship it as a `Notice`. No-op unless the gate
-    /// (`should_fire_observer`) passes; throttled to one per
-    /// `OBSERVER_MIN_INTERVAL`.
+    /// billed LLM call and ship it as a `Notice`. The call runs detached so
+    /// it never blocks the next iteration: at each boundary we first DRAIN
+    /// the previous call (emit its line if it finished), then SPAWN a fresh
+    /// one when the gate (`should_fire_observer`) passes and none is already
+    /// in flight. No-op unless the gate passes; throttled to one attempt per
+    /// `OBSERVER_MIN_INTERVAL`. At most one call is in flight at a time.
     #[allow(clippy::too_many_arguments)]
     async fn maybe_run_progress_observer(
         &self,
@@ -2033,6 +2036,32 @@ impl AgentLoop {
         turn_started: std::time::Instant,
         observer_state: &mut ObserverState,
     ) {
+        // Drain the previous detached call first. If it finished, emit its
+        // line (the snapshot it summarized is from a prior boundary, but it's
+        // still strictly older than any further iteration, so ordering holds).
+        // If it's still running, put it back and skip spawning — at-most-one.
+        if let Some(handle) = observer_state.in_flight.take() {
+            if handle.is_finished() {
+                match handle.await {
+                    Ok(Ok(text)) if !text.trim().is_empty() => {
+                        // Re-check cancel: the call may have raced a preempt/stop.
+                        if !cancel_token.is_cancelled() {
+                            // Record only what actually reaches the user, so the
+                            // next tick dedupes against their real view.
+                            observer_state.sent_notices.push(text.clone());
+                            self.emit_progress_notice(delta_tx, session, text).await;
+                        }
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => debug!(error = %e, "progress observer call failed; skipping"),
+                    Err(e) => debug!(error = %e, "progress observer task join failed; skipping"),
+                }
+            } else {
+                observer_state.in_flight = Some(handle);
+                return;
+            }
+        }
+
         let now = std::time::Instant::now();
         if cancel_token.is_cancelled()
             || !should_fire_observer(
@@ -2051,7 +2080,9 @@ impl AgentLoop {
         // also carries the lines already shown this turn so the model
         // advances instead of repeating. The prior lines + instruction are
         // the appended suffix — `messages_for_llm()` (the cached prefix) is
-        // untouched. No tools, so the observer only narrates.
+        // untouched. No tools, so the observer only narrates. Clone the
+        // snapshot NOW, synchronously at the boundary, so the detached task
+        // owns a coherent frozen copy and never reads live context.
         let mut messages = self.context_manager.messages_for_llm();
         messages.push(ChatMessage::user(vec![ContentBlock::Text(
             build_observer_prompt(&observer_state.sent_notices),
@@ -2066,21 +2097,15 @@ impl AgentLoop {
         // must not re-fire every iteration boundary.
         observer_state.last_fired_at = Some(now);
 
+        // Build the runner from `&self` first; it owns / Arc-clones every
+        // field, so the spawned future is `'static + Send` and borrows
+        // nothing from `self`. We detach on drop and never abort: aborting
+        // mid-`with_step` would leave a Pending step until boot recovery,
+        // whereas the runner already threads `cancel_token` through the step
+        // so a real stop closes it as Cancelled cleanly.
         let runner =
             self.build_progress_observer_runner(session, span_recorder, job_id, cancel_token);
-        match runner.run(request).await {
-            Ok(text) if !text.trim().is_empty() => {
-                // Re-check cancel: the call may have raced a preempt/stop.
-                if !cancel_token.is_cancelled() {
-                    // Record only what actually reaches the user, so the next
-                    // tick dedupes against their real view.
-                    observer_state.sent_notices.push(text.clone());
-                    self.emit_progress_notice(delta_tx, session, text).await;
-                }
-            }
-            Ok(_) => {}
-            Err(e) => debug!(error = %e, "progress observer call failed; skipping this tick"),
-        }
+        observer_state.in_flight = Some(tokio::spawn(async move { runner.run(request).await }));
     }
 
     fn build_progress_observer_runner(

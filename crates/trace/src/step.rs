@@ -8,8 +8,14 @@ use serde::{Deserialize, Serialize};
 use crate::outcome::{LifecycleOutcome, LifecycleState};
 
 /// One step in a job's life. Owns 1+ child `Span`s (in the spans table,
-/// keyed by `step_id`). Steps within a job are strictly serial — there
-/// is no `parallel_group` at the step level.
+/// keyed by `step_id`). Steps under a job carry no `parallel_group`
+/// (unlike spans) and are ordered purely by `started_at`. Their
+/// wall-clock intervals are normally disjoint, but not guaranteed to be:
+/// the detached progress-observer step is `tokio::spawn`ed at an iteration
+/// boundary and runs concurrently with the next `LlmIteration`, so its
+/// interval can overlap a sibling under the same job. Don't assume
+/// non-overlapping step intervals — recovery closes each step
+/// independently and the trace UI orders by `started_at` / keys by id.
 ///
 /// **Lifecycle invariant:** `outcome.is_terminal() ⟺ ended_at.is_some()`.
 /// Mutate the two together via [`Step::close`]; never set one without
