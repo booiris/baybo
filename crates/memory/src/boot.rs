@@ -61,6 +61,10 @@ async fn build_mem0(
     };
     let key = match mem0::resolve_api_key(&cfg, Some(vault.as_ref())).await {
         Some(k) if !k.is_empty() => k,
+        // A self-hosted OSS server needs no key; only the managed Platform does.
+        // `Mem0Memory::new` already enforces that distinction — don't short-circuit
+        // memory to disabled here before it gets the chance.
+        _ if cfg.self_hosted() => String::new(),
         _ => {
             tracing::warn!(
                 "mem0 API key not found; memory disabled. Run \

@@ -168,7 +168,7 @@ impl Mem0Config {
         self.top_k.unwrap_or(DEFAULT_TOP_K)
     }
 
-    fn self_hosted(&self) -> bool {
+    pub(crate) fn self_hosted(&self) -> bool {
         self.self_hosted.unwrap_or(false)
     }
 }
