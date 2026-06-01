@@ -27,7 +27,7 @@ use tracing::{debug, error, info, warn};
 use crate::runtime::compression::CompressionRunner;
 use crate::runtime::error_recovery::ErrorHandler;
 use crate::runtime::progress_observer::{
-    PROGRESS_OBSERVER_PROMPT, ProgressObserverRunner, should_fire_observer,
+    ObserverState, ProgressObserverRunner, build_observer_prompt, should_fire_observer,
 };
 use crate::runtime::scope::JobSpec;
 use aura_context::{LlmCallOutcome, LlmResponseMeta};
@@ -649,7 +649,7 @@ impl AgentLoop {
         // Iterative LLM loop
         let mut iterations = 0;
         let turn_started = std::time::Instant::now();
-        let mut last_observer_at: Option<std::time::Instant> = None;
+        let mut observer_state = ObserverState::default();
         // Tool invocations issued during intermediate iterations. Channels
         // only receive the terminal `OutgoingMessage`, so without this the
         // TUI (which renders `ContentBlock::ToolUse`) would never see tool
@@ -729,7 +729,7 @@ impl AgentLoop {
                 delta_tx.as_ref(),
                 iterations,
                 turn_started,
-                &mut last_observer_at,
+                &mut observer_state,
             )
             .await;
 
@@ -2031,7 +2031,7 @@ impl AgentLoop {
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         iterations: usize,
         turn_started: std::time::Instant,
-        last_observer_at: &mut Option<std::time::Instant>,
+        observer_state: &mut ObserverState,
     ) {
         let now = std::time::Instant::now();
         if cancel_token.is_cancelled()
@@ -2040,18 +2040,21 @@ impl AgentLoop {
                 session.trigger.kind() == aura_model::TriggerKind::User,
                 iterations,
                 turn_started,
-                *last_observer_at,
+                observer_state.last_fired_at,
                 now,
             )
         {
             return;
         }
 
-        // Reuse the main call's prefix (cache hit) + a summarize turn; no
-        // tools, so the observer only narrates.
+        // Reuse the main call's prefix (cache hit) + a summarize turn that
+        // also carries the lines already shown this turn so the model
+        // advances instead of repeating. The prior lines + instruction are
+        // the appended suffix — `messages_for_llm()` (the cached prefix) is
+        // untouched. No tools, so the observer only narrates.
         let mut messages = self.context_manager.messages_for_llm();
         messages.push(ChatMessage::user(vec![ContentBlock::Text(
-            PROGRESS_OBSERVER_PROMPT.to_string(),
+            build_observer_prompt(&observer_state.sent_notices),
         )]));
         let request = ChatRequest {
             messages,
@@ -2061,7 +2064,7 @@ impl AgentLoop {
 
         // Throttle on attempt, not just success — a failing or empty call
         // must not re-fire every iteration boundary.
-        *last_observer_at = Some(now);
+        observer_state.last_fired_at = Some(now);
 
         let runner =
             self.build_progress_observer_runner(session, span_recorder, job_id, cancel_token);
@@ -2069,6 +2072,9 @@ impl AgentLoop {
             Ok(text) if !text.trim().is_empty() => {
                 // Re-check cancel: the call may have raced a preempt/stop.
                 if !cancel_token.is_cancelled() {
+                    // Record only what actually reaches the user, so the next
+                    // tick dedupes against their real view.
+                    observer_state.sent_notices.push(text.clone());
                     self.emit_progress_notice(delta_tx, session, text).await;
                 }
             }

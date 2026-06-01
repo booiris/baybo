@@ -32,6 +32,44 @@ pub(crate) const OBSERVER_MIN_INTERVAL: std::time::Duration = std::time::Duratio
 /// user-facing status — never the final answer.
 pub(crate) const PROGRESS_OBSERVER_PROMPT: &str = r#"You are observing an assistant that is still working on the user's request. In ONE short sentence, in the user's own language, tell the user what has been done so far and what is happening right now — a brief progress update, not the final answer. Output only that one line: no preamble, no markdown, no quotes."#;
 
+/// Prepended to [`PROGRESS_OBSERVER_PROMPT`] once the turn has already shown
+/// the user one or more progress lines, so the model sees what it said and
+/// advances instead of repeating. `{{prior_notices}}` expands to the
+/// newline-joined list (oldest first). This whole block is the appended
+/// suffix; it never edits the cached `messages_for_llm()` prefix.
+const PROGRESS_OBSERVER_PRIOR_CONTEXT: &str = r#"You have already sent the user these progress updates earlier in THIS SAME turn (oldest first):
+{{prior_notices}}
+
+Do not repeat any of them. Report only what has changed or advanced since the last line. If nothing meaningful has changed yet, say that briefly instead of restating an earlier update.
+
+"#;
+
+/// Per-turn observer state the agent loop threads through each tick: when
+/// the last Notice fired (throttle) and the lines already shown (so the
+/// next tick can dedupe against the user's real view).
+#[derive(Default)]
+pub(crate) struct ObserverState {
+    pub(crate) last_fired_at: Option<std::time::Instant>,
+    pub(crate) sent_notices: Vec<String>,
+}
+
+/// Build the user turn appended after the cached prefix: the bare
+/// instruction on the first tick, or the instruction prefixed with the
+/// already-sent lines on later ticks. Pure + cheap, so it's unit-tested
+/// without an LLM.
+pub(crate) fn build_observer_prompt(prior_notices: &[String]) -> String {
+    if prior_notices.is_empty() {
+        return PROGRESS_OBSERVER_PROMPT.to_string();
+    }
+    let joined = prior_notices
+        .iter()
+        .map(|line| format!("- {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prefix = PROGRESS_OBSERVER_PRIOR_CONTEXT.replace("{{prior_notices}}", &joined);
+    format!("{prefix}{PROGRESS_OBSERVER_PROMPT}")
+}
+
 /// Pure gate (everything except the live cancel check, which the caller
 /// does separately). Extracted so the streaming / user / iteration /
 /// appear-after / throttle logic is unit-testable without an LLM or real
@@ -247,5 +285,35 @@ mod gate_tests {
         let last = t0 + OBSERVER_APPEAR_AFTER;
         let now = last + OBSERVER_MIN_INTERVAL;
         assert!(should_fire_observer(true, true, 9, t0, Some(last), now));
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::{PROGRESS_OBSERVER_PROMPT, build_observer_prompt};
+
+    #[test]
+    fn empty_history_is_exactly_the_bare_instruction() {
+        assert_eq!(build_observer_prompt(&[]), PROGRESS_OBSERVER_PROMPT);
+    }
+
+    #[test]
+    fn prior_lines_are_listed_before_the_instruction() {
+        let prior = vec!["读取了配置".to_string(), "正在跑测试".to_string()];
+        let prompt = build_observer_prompt(&prior);
+
+        for line in &prior {
+            assert!(prompt.contains(&format!("- {line}")), "missing prior line");
+        }
+        // The dedup directive and the bare instruction both survive, and the
+        // instruction is the trailing suffix (prior context comes first).
+        assert!(prompt.contains("Do not repeat any of them."));
+        assert!(prompt.ends_with(PROGRESS_OBSERVER_PROMPT));
+        let first_prior = prompt.find("- 读取了配置").expect("prior line present");
+        let instruction = prompt.find(PROGRESS_OBSERVER_PROMPT).expect("instruction");
+        assert!(
+            first_prior < instruction,
+            "prior lines must precede the ask"
+        );
     }
 }
