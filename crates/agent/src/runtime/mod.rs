@@ -11,6 +11,7 @@ pub mod billed_chat;
 pub mod compression;
 pub mod error_recovery;
 pub mod llm_pool;
+pub mod progress_observer;
 pub mod sandbox;
 pub mod scope;
 pub mod tool_executor;

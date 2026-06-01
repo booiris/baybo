@@ -26,6 +26,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::runtime::compression::CompressionRunner;
 use crate::runtime::error_recovery::ErrorHandler;
+use crate::runtime::progress_observer::{
+    PROGRESS_OBSERVER_PROMPT, ProgressObserverRunner, should_fire_observer,
+};
 use crate::runtime::scope::JobSpec;
 use aura_context::{LlmCallOutcome, LlmResponseMeta};
 
@@ -645,6 +648,8 @@ impl AgentLoop {
 
         // Iterative LLM loop
         let mut iterations = 0;
+        let turn_started = std::time::Instant::now();
+        let mut last_observer_at: Option<std::time::Instant> = None;
         // Tool invocations issued during intermediate iterations. Channels
         // only receive the terminal `OutgoingMessage`, so without this the
         // TUI (which renders `ContentBlock::ToolUse`) would never see tool
@@ -713,6 +718,20 @@ impl AgentLoop {
                 delta_tx.as_ref(),
             )
             .await?;
+
+            // Here (post-compression, between iterations) the context
+            // snapshot the observer reads is coherent — no dangling tool_use.
+            self.maybe_run_progress_observer(
+                session,
+                span_recorder,
+                job_id,
+                &cancel_token,
+                delta_tx.as_ref(),
+                iterations,
+                turn_started,
+                &mut last_observer_at,
+            )
+            .await;
 
             // Stream deltas on every iteration, not just the first. The
             // final answer can land on any iteration (it follows however
@@ -1996,6 +2015,108 @@ impl AgentLoop {
             model_info,
             cancel_token: cancel_token.clone(),
         }
+    }
+
+    /// Read-only out-of-band progress: summarize the in-flight turn with a
+    /// billed LLM call and ship it as a `Notice`. No-op unless the gate
+    /// (`should_fire_observer`) passes; throttled to one per
+    /// `OBSERVER_MIN_INTERVAL`.
+    #[allow(clippy::too_many_arguments)]
+    async fn maybe_run_progress_observer(
+        &self,
+        session: &Session,
+        span_recorder: &Arc<SpanRecorder>,
+        job_id: JobId,
+        cancel_token: &CancellationToken,
+        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        iterations: usize,
+        turn_started: std::time::Instant,
+        last_observer_at: &mut Option<std::time::Instant>,
+    ) {
+        let now = std::time::Instant::now();
+        if cancel_token.is_cancelled()
+            || !should_fire_observer(
+                delta_tx.is_some(),
+                session.trigger.kind() == aura_model::TriggerKind::User,
+                iterations,
+                turn_started,
+                *last_observer_at,
+                now,
+            )
+        {
+            return;
+        }
+
+        // Reuse the main call's prefix (cache hit) + a summarize turn; no
+        // tools, so the observer only narrates.
+        let mut messages = self.context_manager.messages_for_llm();
+        messages.push(ChatMessage::user(vec![ContentBlock::Text(
+            PROGRESS_OBSERVER_PROMPT.to_string(),
+        )]));
+        let request = ChatRequest {
+            messages,
+            temperature: None,
+            tools: Vec::new(),
+        };
+
+        // Throttle on attempt, not just success — a failing or empty call
+        // must not re-fire every iteration boundary.
+        *last_observer_at = Some(now);
+
+        let runner =
+            self.build_progress_observer_runner(session, span_recorder, job_id, cancel_token);
+        match runner.run(request).await {
+            Ok(text) if !text.trim().is_empty() => {
+                // Re-check cancel: the call may have raced a preempt/stop.
+                if !cancel_token.is_cancelled() {
+                    self.emit_progress_notice(delta_tx, session, text).await;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => debug!(error = %e, "progress observer call failed; skipping this tick"),
+        }
+    }
+
+    fn build_progress_observer_runner(
+        &self,
+        session: &Session,
+        span_recorder: &Arc<SpanRecorder>,
+        job_id: JobId,
+        cancel_token: &CancellationToken,
+    ) -> ProgressObserverRunner {
+        ProgressObserverRunner {
+            llm_client: self.llm_client.clone(),
+            recorder: Arc::clone(span_recorder),
+            security_gateway: Arc::clone(&self.security_gateway),
+            job_id,
+            user_id: session.user.id.clone(),
+            session_id: session.id.clone(),
+            model_info: self.llm_client.model_info().clone(),
+            cancel_token: cancel_token.clone(),
+        }
+    }
+
+    /// Emit the observer's one-line summary as an `Info` Notice. The text
+    /// is already scrubbed by the runner (`sanitize_llm_response`), so
+    /// this only routes it. No-op when the turn isn't streaming.
+    async fn emit_progress_notice(
+        &self,
+        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        session: &Session,
+        text: String,
+    ) {
+        let Some(tx) = delta_tx else { return };
+        let _ = tx
+            .send(AgentOutput {
+                session_id: session.id.clone(),
+                user_id: session.user.id.clone(),
+                channel: session.channel.clone(),
+                event: AgentEvent::Notice {
+                    level: aura_channels::NoticeLevel::Info,
+                    text,
+                },
+            })
+            .await;
     }
 
     /// Run an on-demand compression pass and return the confirmation
