@@ -63,6 +63,10 @@ pub enum StepKind {
     MemoryRecall,
     MemoryWrite,
     SkillSelection,
+    /// An out-of-band LLM call that summarizes the in-flight turn's
+    /// progress for the user (the progress-observer Notice). Read-only:
+    /// it reuses the turn's context but never writes back to it.
+    ProgressObserver,
 }
 
 impl StepKind {
@@ -73,6 +77,7 @@ impl StepKind {
             StepKind::MemoryRecall => "memory_recall",
             StepKind::MemoryWrite => "memory_write",
             StepKind::SkillSelection => "skill_selection",
+            StepKind::ProgressObserver => "progress_observer",
         }
     }
 }
