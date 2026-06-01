@@ -1,8 +1,10 @@
 use std::collections::HashSet;
 
-use aura_channels::{AgentEvent, AgentOutput, IncomingMessage, NoticeLevel, STOP_COMMAND_NAME};
+use aura_channels::{
+    AgentEvent, AgentOutput, IncomingMessage, NoticeLevel, OutgoingMessage, STOP_COMMAND_NAME,
+};
 use aura_job::{CancelReason, JobStatusKind};
-use aura_model::{ChannelType, ContentBlock, JobId, SessionId};
+use aura_model::{ChannelType, ContentBlock, JobId, MessageMetadata, SessionId};
 use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;
@@ -13,8 +15,36 @@ use super::Router;
 impl Router {
     pub(super) async fn handle_incoming(
         &mut self,
-        mut incoming: IncomingMessage,
+        incoming: IncomingMessage,
     ) -> anyhow::Result<()> {
+        // Reply target captured before `incoming` is consumed, so a rejection
+        // inside `route_incoming` can still close the turn for the client.
+        let session_id = SessionId::from(incoming.message.session_id.as_str());
+        let user_id = incoming.message.sender.id.clone();
+        let channel = incoming.message.channel.clone();
+        let result = self.route_incoming(incoming).await;
+        if let Err(e) = &result {
+            // A pre-actor rejection (rate limit, cost cap, sanitizer, store
+            // error, route failure) otherwise sends nothing back: a
+            // request/response client like `aura prompt` then blocks for the
+            // whole timeout, and a live channel just shows silence. Emit a
+            // terminal `AgentEvent::Message` (via `From<OutgoingMessage>`) so
+            // the turn closes with a visible reason.
+            let reply = OutgoingMessage {
+                session_id,
+                user_id,
+                channel,
+                content: vec![ContentBlock::Text(format!("⚠️ {e}"))],
+                reply_to: None,
+                metadata: MessageMetadata::default(),
+                ordinal: None,
+            };
+            self.handle_agent_output(reply.into()).await;
+        }
+        result
+    }
+
+    async fn route_incoming(&mut self, mut incoming: IncomingMessage) -> anyhow::Result<()> {
         let span = tracing::info_span!(
             "handle_incoming",
             session_id = %incoming.message.session_id,
@@ -113,7 +143,7 @@ impl Router {
             )
             .await;
         if !routed {
-            warn!(session_id = %session_id, "failed to route user input to actor");
+            anyhow::bail!("failed to route user input to actor for session '{session_id}'");
         }
 
         Ok(())
