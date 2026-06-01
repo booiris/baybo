@@ -136,9 +136,10 @@ cargo run -p aura-bench-memory --bin run -- --arm openviking --dataset locomo10.
 
 Each `run` evaluates one arm and writes its full report to
 `results/results-<arm>-<run_id>.json` (summary scores + every question's answer
-and judge reason). That folder is **tracked in git** as a score history — the
-downloaded dataset and ingest manifests under `bench-out/` are not. `run-bench.sh`
-compares the run's JSONs into the floor → backend → ceiling table.
+and judge reason). That folder is **gitignored** (local only, like `bench-out/`) —
+the JSONs are large, LLM-generated, and rewritten each run, so they're
+regenerated rather than committed. `run-bench.sh` compares the run's JSONs into
+the floor → backend → ceiling table.
 
 ## Inspecting results — error analysis
 
