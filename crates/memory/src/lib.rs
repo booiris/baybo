@@ -274,6 +274,11 @@ impl Memory for ReadOnlyMemory {
     }
 
     fn tools(&self) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
-        self.0.tools()
+        // Read-only mode must not hand the agent mutating tools (mem0_add,
+        // viking_store, …): a QA turn could invoke one and write into the recall
+        // scope, contaminating later questions — exactly what this wrapper exists
+        // to prevent. Recall is auto-injected, so the benchmark agent needs no
+        // memory tools at all.
+        Vec::new()
     }
 }
