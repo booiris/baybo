@@ -13,7 +13,7 @@ pub struct ErrorHandler {
 impl Default for ErrorHandler {
     fn default() -> Self {
         Self {
-            max_retries: 3,
+            max_retries: 10,
             backoff_base: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
         }

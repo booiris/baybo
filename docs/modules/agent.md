@@ -139,6 +139,71 @@ Each session can pin its own `aura.json` LLM entry via `session.state.last_llm` 
 
 Persistence and the live re-pin are deliberately **split** to avoid a lost-update race. `last_llm` is a **flat `sessions` column**, not a JSON-blob field — exactly like `hidden` — written only by the targeted `SessionStore::set_last_llm` and omitted from `save`'s `DO UPDATE`, so a concurrent `touch` (which is a full-blob `get` + `save` fired on every inbound message) can't clobber it; `get` patches `Session.state.last_llm` from the column on read. The chat `PUT /v1/chat/sessions/{id}/model` validates the name against the pool, then (1) **persists** via `set_last_llm` synchronously — authoritative for any later spawn, and a storage failure surfaces as an error rather than a false 200 — and (2) routes `SetModel` to re-pin the live actor **in memory only** (the gateway holds an `AgentSupervisor` clone for this reach-the-live-actor hop, the same way `/stop` reaches one). `SetModel` does not itself persist. Subagent spawns are the other `initial_llm = Some(...)` path, pinning via `model_tier` instead.
 
+### Timeouts and time limits
+
+Consolidated reference for every time bound a turn can hit. Two structural facts come first, because they explain why most of the table is about tools and subprocesses rather than the loop itself:
+
+- **A turn is bounded by step count, not a wall clock.** `agent.max_iterations` (default 1000, range 1–1000; `AgentConfig` in `aura-config`, enforced in `config/src/validate.rs`) caps how many LLM↔tool iterations one turn may run. Cancellation is cooperative, checked at the iteration boundary (`/stop` is the only hard interrupt) — there is no per-turn timer.
+- **The main LLM chat call has no Aura-imposed wall-clock timeout.** The shared reqwest client (`aura_security::http::client`) sets no `.timeout()`, so a `chat` / `chat_stream` call is bounded only by the provider/transport. Transient failures (5xx/408/429, connect/transport flake) are absorbed by the retry loop below, not by a deadline.
+
+**LLM retry** — `ErrorHandler::default` in `runtime/error_recovery.rs`, wrapping every model call in `AgentLoop::call_llm`. Exponential backoff, capped; not configurable (hardcoded default).
+
+| Knob | Value |
+|------|-------|
+| `max_retries` | 10 |
+| `backoff_base` | 1s |
+| `backoff_max` | 30s |
+
+Backoff sequence is `1, 2, 4, 8, 16, 30, 30, 30, 30, 30` s — worst case ≈ 2.7 min of waiting before the call gives up. Only `LlmError::is_retriable()` errors (transient) and raw `io::Error` retry; config / model-shape errors surface immediately.
+
+**Tool execution** (`runtime/tool_executor.rs`) — two nested deadlines:
+
+- *Inner* = the tool's own `max_timeout()`, written into `ToolContext::timeout`.
+- *Outer* = `ToolContext::timeout + APPROVAL_HEADROOM` (300s), enforced by `tokio::time::timeout`. The headroom mirrors the approval gate's wait window so a tool blocked on a user-approval prompt isn't killed before the user can answer.
+
+Per-tool `max_timeout()`:
+
+| Tool | `max_timeout` | Where |
+|------|--------------|-------|
+| trait default | 30s | `Tool::max_timeout` in `aura-tools` (`tools/src/lib.rs`) |
+| Bash | 600s | `tools/src/builtin/bash.rs` — per-call `timeout_ms` and the sandbox spawn tighten further |
+| WebFetch | 120s | `tools/src/builtin/web_fetch.rs` — connect phase capped at 10s independently |
+| Grep / Glob | 60s | `tools/src/builtin/{grep,glob_tool}.rs` |
+| send_local_file | 60s | `tools/src/builtin/send_local_file.rs` |
+| Skill read (risk-assessed) | 60s | `skills/src/tools.rs` |
+| Skill install pipeline | 120s | `skills/src/tools.rs` |
+| MCP tool | 60s | `tools/src/mcp/tool.rs` |
+| OpenViking memory store | 120s | `STORE_MAX_TIMEOUT` in `memory/src/backends/openviking.rs` |
+| Subagent (in-process) | `TOOL_WAIT_BACKSTOP` = 30 days | `subagent/src/tool.rs` — effectively unbounded; the real bound is the caller's cancel / job lineage |
+
+**Approval gate** — `APPROVAL_TIMEOUT` = 300s (`gateway/src/channel/boot.rs`). How long a tool-approval prompt waits for the user before timing out; the executor's `APPROVAL_HEADROOM` tracks it.
+
+**Progress observer** (`runtime/progress_observer.rs`) — out-of-band status emitter for long UserChat turns:
+
+| Const | Value | Meaning |
+|-------|-------|---------|
+| `OBSERVER_APPEAR_AFTER` | 10s | turn must run this long (and >1 iteration) before the first progress Notice |
+| `OBSERVER_MIN_INTERVAL` | 40s | minimum gap between Notices — each is a billed LLM sub-call, so it stays sparse |
+
+**External CLI subagents** (`external_agent/*`, claude/codex/gemini) — opaque subprocesses, so they get real wall-clock guards:
+
+| Const | Value | Meaning |
+|-------|-------|---------|
+| `EXTERNAL_SUBAGENT_TIMEOUT` | 8h | **idle** safety timeout; resets on every output line, kills only a silent/hung process |
+| `VERSION_CHECK_TIMEOUT` | 5s | `--version` probe (`probe.rs`) |
+| `KILL_GRACE` | 3s | SIGTERM→SIGKILL grace; `probe.rs` also waits `timeout(2s, child.wait())` for a graceful exit first |
+
+**Actor lifecycle** (around the loop, not inside a turn):
+
+| Const | Value | Meaning |
+|-------|-------|---------|
+| `REAP_INTERVAL` (`actor/supervisor.rs`) | 5 min | idle-reaper tick |
+| `idle_timeout()` (`actor/supervisor.rs`) | 30 min | drop the in-memory actor after this much idle; the session row is never touched (see CLAUDE.md, "Session data is core data") |
+| `NOTIFY_RETRY_INITIAL_BACKOFF` (`actor/mod.rs`) | 60s | subagent-completion notify retry, initial |
+| `NOTIFY_RETRY_MAX_BACKOFF` (`actor/mod.rs`) | 300s | …capped at |
+
+Router-level user rate limiting (`actor/router`) uses a sliding window (default 60s) — a time *window*, not a timeout.
+
 ## Constraints
 
 - Top-level assembly module — depends on all business crates
