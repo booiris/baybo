@@ -1,8 +1,9 @@
 //! The LOCOMO test set: parse the released JSON into the normalized
 //! [`BenchSample`] IR. LOCOMO is a long, multi-session two-speaker dialogue with
-//! categorized QA pairs (category 5 = adversarial / "not mentioned"). Sessions
-//! live under dynamic `session_{n}` / `session_{n}_date_time` keys. See the
-//! README for the dataset source and full shape.
+//! categorized QA pairs (category 5 = adversarial: unanswerable distractors,
+//! flagged here so the runner can drop them before scoring). Sessions live under
+//! dynamic `session_{n}` / `session_{n}_date_time` keys. See the README for the
+//! dataset source and full shape.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,8 +14,10 @@ use serde_json::{Map, Value};
 
 use super::{BenchConversation, BenchQuestion, BenchSample, BenchSession, TestSet};
 
-/// The LOCOMO category whose gold answer is "not mentioned" — the agent is
-/// expected to abstain, and the judge scores abstention as correct.
+/// The LOCOMO "adversarial" category: the question asks about one speaker but
+/// the fact belongs to the other, so its `adversarial_answer` is a distractor,
+/// not a gradeable gold. The runner drops these before QA (upstream excludes the
+/// category from scoring); the [`BenchQuestion::adversarial`] flag marks them.
 const ADVERSARIAL_CATEGORY: u8 = 5;
 
 pub struct Locomo;

@@ -14,7 +14,6 @@ pub struct QuestionResult {
     pub gold: String,
     pub answer: String,
     pub correct: bool,
-    pub adversarial: bool,
     pub f1: f64,
     pub judge_reason: String,
     pub latency_ms: u64,

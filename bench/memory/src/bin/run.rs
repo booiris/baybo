@@ -173,7 +173,6 @@ struct QaTask {
     seq: usize,
     conv_idx: usize,
     category: String,
-    adversarial: bool,
     question: String,
     gold: String,
     user_id: String,
@@ -189,7 +188,15 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let testset_name = args.testset.name();
-    let samples = args.testset.test_set().load(&args.dataset)?;
+    let mut samples = args.testset.test_set().load(&args.dataset)?;
+    // LOCOMO category 5 ("adversarial") questions are unanswerable distractors:
+    // the question asks about one speaker but the fact belongs to the other, so
+    // the dataset's `adversarial_answer` is a trap, not a gradeable gold. Upstream
+    // leaves these gold answers empty and drops the category from its denominator;
+    // we do the same so every scored question is genuinely answerable.
+    for sample in &mut samples {
+        sample.questions.retain(|q| !q.adversarial);
+    }
     let n_conv = args.conversations.min(samples.len());
     let n_q = args.questions.unwrap_or(usize::MAX);
 
@@ -286,7 +293,6 @@ async fn main() -> Result<()> {
                 seq,
                 conv_idx,
                 category: q.category.clone(),
-                adversarial: q.adversarial,
                 question: q.question.clone(),
                 gold: q.gold_answer.clone(),
                 user_id: user_id.clone(),
@@ -322,7 +328,6 @@ async fn main() -> Result<()> {
                             gold: task.gold,
                             answer: format!("<prompt error: {e}>"),
                             correct: false,
-                            adversarial: task.adversarial,
                             f1: 0.0,
                             judge_reason: "aura prompt failed; not judged".to_string(),
                             latency_ms,
@@ -331,7 +336,7 @@ async fn main() -> Result<()> {
                 }
             };
 
-            let verdict = judge(judge_ref, &task.question, &task.gold, &answer, task.adversarial)
+            let verdict = judge(judge_ref, &task.question, &task.gold, &answer)
                 .await
                 .with_context(|| format!("judge conv {} seq {}", task.conv_idx, task.seq))?;
             let f1 = token_f1(&task.gold, &answer);
@@ -345,7 +350,6 @@ async fn main() -> Result<()> {
                     gold: task.gold,
                     answer,
                     correct: verdict.correct,
-                    adversarial: task.adversarial,
                     f1,
                     judge_reason: verdict.reason,
                     latency_ms,

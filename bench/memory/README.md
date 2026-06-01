@@ -148,6 +148,13 @@ compares the run's JSONs into the floor → backend → ceiling table.
   build.
 - **Extraction-model confound:** mem0/openviking extract server-side with their
   *own* LLM, not your answer model. The arms measure the systems as shipped.
+- **Adversarial questions are dropped.** LOCOMO category 5 ("adversarial") are
+  unanswerable distractors: the question asks about one speaker but the fact
+  belongs to the other, so the dataset's `adversarial_answer` is a trap, not a
+  gradeable gold (upstream leaves these gold answers empty and excludes the
+  category from scoring). The runner drops them before QA, matching upstream — so
+  every scored question is genuinely answerable, and the no-memory floor sits
+  near 0% instead of being flattered by guesses the judge can't grade.
 - Settling: `ingest` polls true completion (openviking commit tasks; mem0's
   events feed) and marks the manifest unsettled otherwise; `run` refuses a
   mismatched/unsettled manifest unless `--allow-unsettled`.
