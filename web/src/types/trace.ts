@@ -124,13 +124,18 @@ export interface ToolCallOrigin {
  * Mirrors `aura_trace::LlmCallInputs` (`#[serde(untagged)]`). The
  * inline array variant matches the long-standing wire shape; the
  * `{ last_ordinal }` object variant is what the per-job trace endpoint
- * returns for main-agent spans whose transcript lives in
- * `session_messages`. Use `resolveInputMessages` to flatten either
- * form into a `ChatMessage[]` for rendering.
+ * returns for spans whose transcript prefix lives in `session_messages`.
+ * `suffix` (compression / progress-observer spans) carries the framing
+ * messages appended after that prefix which are *not* themselves rows in
+ * the log; it is absent for main-agent spans. `prefix_len` is a tripwire:
+ * the prefix message count the writer expected hydration to reconstruct —
+ * a mismatch flags log drift loudly. Always present on a `Persisted` ref.
+ * Use `resolveInputMessages` to flatten either form into a `ChatMessage[]`
+ * for rendering.
  */
 export type LlmCallInputs =
   | ChatMessage[]
-  | { last_ordinal: number };
+  | { last_ordinal: number; prefix_len: number; suffix?: ChatMessage[] };
 
 export interface LlmCallBegin {
   model_id: string;
@@ -326,11 +331,22 @@ export interface JobTrace {
  * If any candidate row was written *after* the span started, the
  * current log is from a different epoch (parent session reset, ordinal
  * reuse) and we return an empty slice rather than misleading content.
+ *
+ * `suffix` (the framing / sub-loop messages not in the log) is appended
+ * after the reconstructed active prefix, matching the Rust hydration; on
+ * an epoch mismatch it is dropped along with the (empty) prefix.
+ *
+ * `prefixLen` is the tripwire: if the reconstructed prefix count doesn't
+ * match what the writer recorded, the log drifted under the reference, so
+ * a visible warning message is prepended (mirrors the Rust hydration's
+ * server-side marker).
  */
 export function hydratePersistedInput(
   log: SessionMessageRow[],
   lastOrdinal: number,
   spanStartedAt: string,
+  prefixLen: number,
+  suffix: ChatMessage[] = [],
 ): ChatMessage[] {
   const candidates = log.filter(
     (m) =>
@@ -341,7 +357,39 @@ export function hydratePersistedInput(
   if (candidates.some((m) => new Date(m.created_at).getTime() > spanStart)) {
     return [];
   }
-  return candidates.map((c) => c.message);
+  const prefix = candidates.map((c) => c.message);
+  if (prefix.length !== prefixLen) {
+    return [
+      reconstructionWarning(prefixLen, prefix.length),
+      ...prefix,
+      ...suffix,
+    ];
+  }
+  return [...prefix, ...suffix];
+}
+
+/**
+ * Visible marker prepended when the `prefix_len` tripwire fails — a
+ * `system`-role message so the trace viewer renders it distinctly and
+ * genuine-prompt detection (`source === 'user'`) never picks it up.
+ */
+function reconstructionWarning(
+  expected: number,
+  reconstructed: number,
+): ChatMessage {
+  return {
+    role: 'system',
+    source: 'agent',
+    content: [
+      {
+        Text:
+          `⚠️ trace reconstruction inconsistent: expected ${expected} prefix ` +
+          `message(s) from session_messages, reconstructed ${reconstructed}. ` +
+          `The log drifted under this span's ordinal reference — the input ` +
+          `shown may be incomplete or wrong.`,
+      },
+    ],
+  };
 }
 
 /**
@@ -356,5 +404,11 @@ export function resolveInputMessages(
   spanStartedAt: string,
 ): ChatMessage[] {
   if (Array.isArray(input)) return input;
-  return hydratePersistedInput(log, input.last_ordinal, spanStartedAt);
+  return hydratePersistedInput(
+    log,
+    input.last_ordinal,
+    spanStartedAt,
+    input.prefix_len,
+    input.suffix ?? [],
+  );
 }

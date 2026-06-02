@@ -122,7 +122,11 @@ impl ProgressObserverRunner {
     /// attribute to the turn's job, sanitizes the response, and returns
     /// the trimmed summary text (empty string when the model produced
     /// nothing — the caller then emits no Notice).
-    pub(crate) async fn run(self, request: ChatRequest) -> anyhow::Result<String> {
+    pub(crate) async fn run(
+        self,
+        request: ChatRequest,
+        input_marker: LlmCallInputs,
+    ) -> anyhow::Result<String> {
         let ProgressObserverRunner {
             llm_client,
             recorder,
@@ -139,9 +143,11 @@ impl ProgressObserverRunner {
             model_id: model_info.id.clone(),
             provider: model_info.provider.clone(),
             provider_config_hash: String::new(),
-            // One-off slice built off the live transcript — it never lands
-            // in `session_messages`, so embed inline.
-            input_messages: LlmCallInputs::Inline(request.messages.clone()),
+            // Marker built at the iteration boundary: the cached transcript
+            // prefix referenced by ordinal, the observer prompt inline as
+            // the suffix — so each fire's span no longer re-embeds the whole
+            // context snapshot.
+            input_messages: input_marker,
             temperature: request.temperature,
         };
 

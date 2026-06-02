@@ -166,21 +166,33 @@ async fn compression_call_records_cost_with_matching_span_id() {
         assert_eq!(r.output_tokens, main_usage.output_tokens);
     }
 
-    // The compression LlmCall span now records a real call lifecycle.
-    // Its input is one-off (built ad hoc from the active transcript)
-    // so the span carries `LlmCallInputs::Inline` with the actual
-    // messages — not an `LlmCallInputs::Persisted` ordinal reference,
-    // which is reserved for main agent calls whose input is in the
-    // `session_messages` log.
+    // The compression LlmCall span references the summarized transcript
+    // prefix by ordinal (`Persisted`) instead of cloning it inline — the
+    // span-bloat fix. Only the one-off `SUMMARIZE_INSTRUCTION`, which is
+    // not a `session_messages` row, rides inline as the suffix; the
+    // transcript itself is recovered from the log at replay time.
     if let SpanKind::LlmCall { begin, .. } = &compression_span.kind {
         match &begin.input_messages {
-            aura_trace::LlmCallInputs::Inline(messages) => {
+            aura_trace::LlmCallInputs::Persisted {
+                last_ordinal,
+                prefix_len,
+                suffix,
+            } => {
                 assert!(
-                    !messages.is_empty(),
-                    "compression LlmCall span must record real input messages"
+                    *last_ordinal >= 0,
+                    "compression span must anchor to a real transcript ordinal"
+                );
+                assert!(
+                    *prefix_len >= 1,
+                    "compression span must record a real prefix_len tripwire count end-to-end"
+                );
+                assert_eq!(
+                    suffix.len(),
+                    1,
+                    "only the summarize instruction rides inline as the suffix"
                 );
             }
-            other => panic!("expected Inline, got {other:?}"),
+            other => panic!("expected Persisted, got {other:?}"),
         }
     } else {
         panic!("compression span has unexpected kind");

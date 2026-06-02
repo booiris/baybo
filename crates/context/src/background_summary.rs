@@ -46,6 +46,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::ContextError;
 use crate::tokenizer::Tokenizer;
+use aura_trace::LlmCallInputs;
 
 /// Total file-size budget the summary is asked to fit within. When
 /// `summary.md` already exceeds this, the prompt appends a "CRITICAL"
@@ -125,7 +126,8 @@ pub type BackgroundSummaryFuture =
 /// gets its own `Compression` step + `LlmCall` span; the loop
 /// accumulates `cost_micros` and reports the *last* `span_id` on the
 /// outcome.
-pub type BackgroundSummaryCallback = Box<dyn FnMut(ChatRequest) -> BackgroundSummaryFuture + Send>;
+pub type BackgroundSummaryCallback =
+    Box<dyn FnMut(ChatRequest, LlmCallInputs) -> BackgroundSummaryFuture + Send>;
 
 /// Required inputs for one [`run_background_summary`] pass. `model_id`
 /// is the LLM the chat callback will hit — recorded against
@@ -529,6 +531,11 @@ pub async fn run_background_summary(
     };
 
     let notes_path = workspace.session_summary_file(parent_session_id.as_str());
+    // The pinned parent transcript is the persisted prefix every
+    // iteration's trace span references by `up_to_ordinal`; everything
+    // appended past this index (the summary prompt + the sub-loop's own
+    // turns) is not in `session_messages` and rides inline as the suffix.
+    let parent_len = parent_messages.len();
     let mut messages: Vec<ChatMessage> = parent_messages;
     messages.push(ChatMessage::agent_context(vec![ContentBlock::Text(
         build_summary_prompt(&notes_path, &current_notes, tokenizer.as_ref()),
@@ -559,6 +566,11 @@ iterations without terminating"
         }
         iterations += 1;
 
+        let input_marker = LlmCallInputs::Persisted {
+            last_ordinal: up_to_ordinal,
+            prefix_len: parent_len,
+            suffix: messages[parent_len..].to_vec(),
+        };
         let request = ChatRequest {
             messages: messages.clone(),
             temperature: None,
@@ -568,7 +580,7 @@ iterations without terminating"
             response,
             span_id: turn_span,
             cost_micros: turn_cost,
-        } = match chat(request).await {
+        } = match chat(request, input_marker).await {
             Ok(run) => run,
             Err(e) => {
                 let _ = sessions

@@ -149,6 +149,29 @@ pub enum LlmCallInputs {
         /// time. The active set as of this ordinal is the slice the
         /// LLM saw.
         last_ordinal: i64,
+        /// Self-validating tripwire: the number of prefix messages the
+        /// writer expected hydration to reconstruct from the log (the
+        /// active-as-of-`last_ordinal` count, suffix excluded). Hydration
+        /// compares the reconstructed count against this; a mismatch means
+        /// the log drifted under the reference (a `superseded_by` bug, a
+        /// deleted row, or a read/write filter divergence) and is
+        /// surfaced LOUDLY instead of returning a plausible-but-wrong
+        /// slice. Always written — a `Persisted` marker is only emitted
+        /// when the count is known, so every reference is validated.
+        /// See `docs/modules/trace.md`.
+        prefix_len: usize,
+        /// Framing messages appended after the persisted active set
+        /// that are NOT themselves rows in `session_messages` — the
+        /// compression `SUMMARIZE_INSTRUCTION`, the progress-observer
+        /// prompt, and (for the background-summary tool loop) the
+        /// sub-loop's own assistant / tool turns. Empty for main-agent
+        /// calls, which see only the persisted prefix. Hydration appends
+        /// these verbatim after the reconstructed active slice, so the
+        /// rebuilt `Inline` view equals the exact `request.messages` the
+        /// LLM saw. Kept inline because there is nothing in the log to
+        /// point at; tiny next to the prefix it replaces.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        suffix: Vec<ChatMessage>,
     },
 }
 
@@ -390,16 +413,60 @@ mod tests {
         assert!(json.is_array(), "Inline must serialize as a bare array");
         assert_eq!(json.as_array().unwrap().len(), 1);
 
-        let persisted = LlmCallInputs::Persisted { last_ordinal: 7 };
+        let persisted = LlmCallInputs::Persisted {
+            last_ordinal: 7,
+            prefix_len: 3,
+            suffix: vec![],
+        };
         let json = serde_json::to_value(&persisted).unwrap();
         assert!(json.is_object(), "Persisted must serialize as an object");
         assert_eq!(json["last_ordinal"], 7);
+        assert_eq!(json["prefix_len"], 3);
+        assert!(
+            json.get("suffix").is_none(),
+            "an empty suffix must be skipped so main-agent spans stay wire-compact"
+        );
 
         // Round-trip both shapes back through Deserialize.
         let v1: LlmCallInputs = serde_json::from_value(serde_json::json!([])).unwrap();
         assert!(matches!(v1, LlmCallInputs::Inline(_)));
+        // The minimal Persisted shape (no suffix key) decodes with the
+        // suffix defaulting to empty; `prefix_len` is required.
         let v2: LlmCallInputs =
-            serde_json::from_value(serde_json::json!({"last_ordinal": 1})).unwrap();
-        assert!(matches!(v2, LlmCallInputs::Persisted { .. }));
+            serde_json::from_value(serde_json::json!({"last_ordinal": 1, "prefix_len": 2}))
+                .unwrap();
+        assert!(matches!(
+            v2,
+            LlmCallInputs::Persisted { last_ordinal: 1, prefix_len: 2, ref suffix }
+                if suffix.is_empty()
+        ));
+    }
+
+    /// A `Persisted` with a non-empty `suffix` survives a serde round-trip
+    /// and stays distinguishable from the bare-array `Inline` shape.
+    #[test]
+    fn persisted_suffix_round_trips() {
+        let suffix = vec![aura_model::ChatMessage::agent_context(vec![
+            aura_model::ContentBlock::Text("SUMMARIZE NOW".into()),
+        ])];
+        let persisted = LlmCallInputs::Persisted {
+            last_ordinal: 42,
+            prefix_len: 5,
+            suffix: suffix.clone(),
+        };
+        let json = serde_json::to_value(&persisted).unwrap();
+        assert!(json.is_object());
+        assert_eq!(json["last_ordinal"], 42);
+        assert!(json["suffix"].is_array());
+
+        let back: LlmCallInputs = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            back,
+            LlmCallInputs::Persisted {
+                last_ordinal: 42,
+                prefix_len: 5,
+                suffix,
+            }
+        );
     }
 }

@@ -868,7 +868,7 @@ impl ContextManager {
         chat: F,
     ) -> crate::Result<CompressionOutcome>
     where
-        F: FnOnce(ChatRequest) -> Fut + Send + 'static,
+        F: FnOnce(ChatRequest, LlmCallInputs) -> Fut + Send + 'static,
         Fut: Future<Output = std::result::Result<LlmResponse, ContextError>> + Send + 'static,
     {
         if !self.needs_compression(model_id) {
@@ -889,7 +889,7 @@ impl ContextManager {
         chat: F,
     ) -> crate::Result<CompressionOutcome>
     where
-        F: FnOnce(ChatRequest) -> Fut + Send + 'static,
+        F: FnOnce(ChatRequest, LlmCallInputs) -> Fut + Send + 'static,
         Fut: Future<Output = std::result::Result<LlmResponse, ContextError>> + Send + 'static,
     {
         self.set_current_model(model_id);
@@ -899,10 +899,11 @@ impl ContextManager {
 
     async fn run_compression<F, Fut>(&mut self, chat: F) -> crate::Result<CompressionOutcome>
     where
-        F: FnOnce(ChatRequest) -> Fut + Send + 'static,
+        F: FnOnce(ChatRequest, LlmCallInputs) -> Fut + Send + 'static,
         Fut: Future<Output = std::result::Result<LlmResponse, ContextError>> + Send + 'static,
     {
-        let chat_box: compressor::ChatCallback = Box::new(move |req| Box::pin(chat(req)));
+        let chat_box: compressor::ChatCallback =
+            Box::new(move |req, marker| Box::pin(chat(req, marker)));
         let plan = self.run_compression_flow(chat_box).await?;
         let mut new_messages = match plan {
             CompressOutput::NoOp => return Ok(CompressionOutcome::StrategyDeclined),
@@ -1342,10 +1343,66 @@ impl ContextManager {
     /// every turn. Falls back to `Inline(messages)` when the store
     /// has no rows yet (fresh session) or the lookup errors.
     pub async fn build_call_input_marker(&self) -> LlmCallInputs {
-        match self.sessions.latest_session_ordinal(&self.session_id).await {
-            Ok(Some(last_ordinal)) => LlmCallInputs::Persisted { last_ordinal },
-            _ => LlmCallInputs::Inline(self.messages.clone()),
+        self.input_marker_with_suffix(Vec::new()).await
+    }
+
+    /// Like [`build_call_input_marker`](Self::build_call_input_marker) but
+    /// for callers whose request appends framing messages that are *not*
+    /// rows in `session_messages` (the progress observer's prompt, a
+    /// compression instruction). The persisted prefix references the
+    /// active set by ordinal; `suffix` rides inline so hydration can
+    /// rebuild the exact `request.messages` the LLM saw. Falls back to a
+    /// fully inline marker (prefix + suffix) when the store has no rows
+    /// yet, the lookup errors, or an in-memory-only row (`append_in_memory`)
+    /// makes the active set diverge from the in-memory window.
+    pub async fn input_marker_with_suffix(&self, suffix: Vec<ChatMessage>) -> LlmCallInputs {
+        // Emit a `Persisted` reference only when the anchor ordinal and the
+        // prefix count are both known AND the persisted active set mirrors the
+        // in-memory window (`count == messages.len()` — the same invariant
+        // `synced_last_ordinal` guards). An in-memory-only row
+        // (`append_in_memory`, e.g. the subagent-notification turn's synthetic
+        // prompt that is deliberately not persisted) would make `prefix_len`
+        // under-count the real prefix; and because the tripwire compares the
+        // reconstructed count against that same `prefix_len`, the omission
+        // would pass silently. Any miss falls back to a self-contained inline
+        // copy.
+        if let (Ok(Some(last_ordinal)), Ok(prefix_len)) = (
+            self.sessions.latest_session_ordinal(&self.session_id).await,
+            self.sessions.count_active_messages(&self.session_id).await,
+        ) && prefix_len == self.messages.len()
+        {
+            LlmCallInputs::Persisted {
+                last_ordinal,
+                prefix_len,
+                suffix,
+            }
+        } else {
+            let mut messages = self.messages.clone();
+            messages.extend(suffix);
+            LlmCallInputs::Inline(messages)
         }
+    }
+
+    /// `Some((last_ordinal, active_count))` only when the in-memory
+    /// transcript provably mirrors the persisted active set — the same
+    /// `active_count == len` invariant [`Compressor`](crate::compressor)'s
+    /// fast path trusts. A compression call sends `self.messages` verbatim,
+    /// so a `Persisted` trace reference is only safe to emit when hydration
+    /// would rebuild exactly that slice; otherwise the caller embeds inline.
+    /// The returned count seeds the `prefix_len` tripwire. `None` on any
+    /// mismatch or store error.
+    async fn synced_last_ordinal(&self) -> Option<(i64, usize)> {
+        let last = self
+            .sessions
+            .latest_session_ordinal(&self.session_id)
+            .await
+            .ok()??;
+        let active_count = self
+            .sessions
+            .count_active_messages(&self.session_id)
+            .await
+            .ok()?;
+        (active_count == self.messages.len()).then_some((last, active_count))
     }
 
     /// Read-only access to the token budget.
@@ -2057,14 +2114,20 @@ mod tests {
     /// Chat closure that panics if invoked. Use in tests where
     /// compression must not reach the LLM stage; a panic surfaces any
     /// regression that lets the call slip through.
-    async fn never_chat(_: ChatRequest) -> std::result::Result<LlmResponse, ContextError> {
+    async fn never_chat(
+        _: ChatRequest,
+        _: LlmCallInputs,
+    ) -> std::result::Result<LlmResponse, ContextError> {
         panic!("test must not invoke the chat closure");
     }
 
     /// Chat closure that errors so the compressor falls through to
     /// the truncate stage. Use to exercise truncate fallback
     /// deterministically.
-    async fn err_chat(_: ChatRequest) -> std::result::Result<LlmResponse, ContextError> {
+    async fn err_chat(
+        _: ChatRequest,
+        _: LlmCallInputs,
+    ) -> std::result::Result<LlmResponse, ContextError> {
         Err(ContextError::Compression("test: chat unavailable".into()))
     }
 
@@ -2131,6 +2194,56 @@ mod tests {
             ctx.maybe_compress("test-model", never_chat).await.unwrap(),
             CompressionOutcome::BelowThreshold
         ));
+    }
+
+    /// Steady state — every in-memory row is also persisted — so the marker
+    /// references the transcript by ordinal: `prefix_len` equals the window
+    /// size.
+    #[tokio::test]
+    async fn input_marker_emits_persisted_when_active_set_mirrors_window() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, "hi")).await;
+
+        match ctx.build_call_input_marker().await {
+            LlmCallInputs::Persisted {
+                last_ordinal,
+                prefix_len,
+                suffix,
+            } => {
+                assert_eq!(prefix_len, 2, "prefix_len must equal the active-set size");
+                assert_eq!(last_ordinal, 1, "MAX ordinal of two 0-based rows");
+                assert!(suffix.is_empty());
+            }
+            other => panic!("expected Persisted, got {other:?}"),
+        }
+    }
+
+    /// An `append_in_memory` row (the subagent-notification turn's synthetic
+    /// prompt) lives in the window but not in `session_messages`, so the active
+    /// count under-counts the real prefix. A `Persisted` marker would silently
+    /// drop that row on hydration AND slip past the `prefix_len` tripwire (the
+    /// reconstructed count matches the under-counted `prefix_len`), so the
+    /// marker must fall back to a self-contained `Inline` copy of the whole
+    /// window plus the suffix.
+    #[tokio::test]
+    async fn input_marker_falls_back_to_inline_on_in_memory_only_rows() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::System, "sys")).await; // persisted (active = 1)
+        ctx.append(&make_msg(Role::User, "hi")).await; // persisted (active = 2)
+        ctx.append_in_memory(&make_msg(Role::User, "subagent done")); // window = 3, active = 2
+
+        let suffix = vec![make_msg(Role::User, "observer prompt")];
+        match ctx.input_marker_with_suffix(suffix).await {
+            LlmCallInputs::Inline(messages) => {
+                assert_eq!(
+                    messages.len(),
+                    4,
+                    "Inline must carry the full window (3) + suffix (1) verbatim"
+                );
+            }
+            other => panic!("expected Inline fallback, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2776,7 +2889,10 @@ mod tests {
 
     /// Chat closure returning a well-formed `<summary>S</summary>` so the
     /// LLM-summary stage produces a usable summary message.
-    async fn ok_summary_chat(_: ChatRequest) -> std::result::Result<LlmResponse, ContextError> {
+    async fn ok_summary_chat(
+        _: ChatRequest,
+        _: LlmCallInputs,
+    ) -> std::result::Result<LlmResponse, ContextError> {
         Ok(LlmResponse {
             content: "<analysis>x</analysis><summary>S</summary>".into(),
             content_blocks: vec![],

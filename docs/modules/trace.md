@@ -86,6 +86,52 @@ Step and Span lifecycle writes go to the canonical tables (`steps`, `spans`, `sp
 
 The earlier two-layer WAL (`trace_events` table mirroring every begin/end) was removed once it became clear no reader consumed it: recovery scans `spans` directly, and there is no replay / OTel-export path yet that would benefit from the append-only log. If one lands later, the WAL can come back together with its consumer.
 
+### LlmCall input storage: Inline vs Persisted
+
+An `LlmCall` span records what the model saw in `begin.input_messages`
+(`LlmCallInputs`), which has two shapes:
+
+- **`Inline(Vec<ChatMessage>)`** — messages embedded directly. Used only when the
+  input is genuinely not in any session log. Self-contained (cannot desync) but
+  costs the full message bytes per span.
+- **`Persisted { last_ordinal, prefix_len, suffix }`** — a *reference* to the
+  `session_messages` active-as-of-`last_ordinal` slice (the ordinal log in
+  [storage.md](storage.md)). The main agent, compression, and the progress
+  observer all use it. It exists to avoid embedding the prefix: the main agent
+  would otherwise re-clone a growing prefix every turn (O(N²) over session
+  length), and compression / observer would re-embed the whole summarised window
+  on every fire. `suffix` carries the framing that is *not* a `session_messages`
+  row — a compression instruction, the observer prompt, the background-summary
+  sub-loop's own turns — appended verbatim after the reconstructed prefix so the
+  rebuilt view equals exactly what the LLM saw.
+
+Hydration (`QueryApi::replay`, and the web client's `hydratePersistedInput`)
+collapses every `Persisted` back to `Inline` for consumers: it reconstructs the
+prefix with the "active as of N" filter and appends `suffix`.
+
+**Cross-session resolution.** A background-compression span lives under a
+`SystemMaintenance` session, but its `last_ordinal` / `prefix_len` are
+parent-relative — the maintenance session keeps no transcript of its own (it
+summarizes the parent). So hydration must read the **parent's** log, not the
+empty maintenance log: both `replay` and `load_trace_overview` route through
+`hydration_log_session`, which resolves a maintenance session to its
+`lineage.parent_session_id` before loading. Without this every maintenance span
+would reconstruct empty and trip the `prefix_len` guard. Normal sessions resolve
+to themselves.
+
+**`prefix_len` is a self-validating tripwire.** The reference points into mutable
+derived state (`superseded_by` bookkeeping), so a `superseded_by` bug, a deleted
+row, or a read/write-filter divergence could silently rehydrate the wrong slice.
+`prefix_len` records how many prefix messages the writer expected; hydration
+compares it against the reconstructed count and, on mismatch, prepends a visible
+`Role::System` marker (and logs a warning) rather than returning a plausible-but-
+wrong input. A `Persisted` marker is only emitted when the count is known, so
+every reference is validated — there is no skip path. A hydration *code* bug is
+recoverable (the truth lives in durable `session_messages`; `replay` is pure and
+re-runnable after the fix) — the tripwire only makes drift loud, not silent. The
+write-side / read-side filter equivalence is pinned by a differential test, the
+marker path by a negative test.
+
 ### Async writes with LLM/tool fences
 
 Writes are asynchronous, with **synchronous fences** before any LLM or tool call: previous span's `end` and current span's `begin` must be durable before the request goes out. Other writes happen on a background writer task — the agent actor never blocks on persistence except at fences.
