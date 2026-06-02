@@ -109,6 +109,16 @@ Hydration (`QueryApi::replay`, and the web client's `hydratePersistedInput`)
 collapses every `Persisted` back to `Inline` for consumers: it reconstructs the
 prefix with the "active as of N" filter and appends `suffix`.
 
+**Cross-session resolution.** A background-compression span lives under a
+`SystemMaintenance` session, but its `last_ordinal` / `prefix_len` are
+parent-relative — the maintenance session keeps no transcript of its own (it
+summarizes the parent). So hydration must read the **parent's** log, not the
+empty maintenance log: both `replay` and `load_trace_overview` route through
+`hydration_log_session`, which resolves a maintenance session to its
+`lineage.parent_session_id` before loading. Without this every maintenance span
+would reconstruct empty and trip the `prefix_len` guard. Normal sessions resolve
+to themselves.
+
 **`prefix_len` is a self-validating tripwire.** The reference points into mutable
 derived state (`superseded_by` bookkeeping), so a `superseded_by` bug, a deleted
 row, or a read/write-filter divergence could silently rehydrate the wrong slice.

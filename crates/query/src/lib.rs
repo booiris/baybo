@@ -1001,8 +1001,11 @@ impl QueryApi {
         // `Inline` shape the trace API serializes. The session_messages
         // log is read once per session and reused for every Persisted
         // span — turn `O(N²)` storage into `O(N)` storage plus one
-        // join on read.
-        self.hydrate_persisted_inputs(session_id, &mut jobs).await?;
+        // join on read. A maintenance session's spans reference the
+        // parent transcript, so resolve which log to read first.
+        let log_session = self.hydration_log_session(session_id).await?;
+        self.hydrate_persisted_inputs(&log_session, &mut jobs)
+            .await?;
 
         Ok(ReplayedConversation {
             session_id: session_id.clone(),
@@ -1032,9 +1035,14 @@ impl QueryApi {
         let mut summaries = self.list_jobs(session_id, JobFilter::default()).await?;
         summaries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
+        // For a maintenance session (background compression) the spans
+        // reference the parent transcript and the maintenance session keeps
+        // no log of its own — ship the parent's log so the client hydrates
+        // those `Persisted` refs against the right ordinals.
+        let log_session = self.hydration_log_session(session_id).await?;
         let session_messages = self
             .sessions
-            .load_session_messages_with_supersede(session_id)
+            .load_session_messages_with_supersede(&log_session)
             .await
             .map_err(SessionError::from)?
             .into_iter()
@@ -1128,14 +1136,41 @@ impl QueryApi {
         })
     }
 
+    /// The session whose `session_messages` log a `Persisted` reference in
+    /// `session_id`'s spans resolves against. A `SystemMaintenance` session
+    /// (background compression) keeps **no transcript of its own** — every
+    /// `Persisted` span it records references the PARENT session it was
+    /// summarizing, so `last_ordinal` / `prefix_len` are parent-relative.
+    /// Hydration for such a session must therefore read the parent's log,
+    /// not the (empty) maintenance log. Every other session resolves to
+    /// itself.
+    async fn hydration_log_session(&self, session_id: &SessionId) -> Result<SessionId> {
+        let lineage = self
+            .sessions
+            .get(session_id)
+            .await
+            .map_err(SessionError::from)?
+            .and_then(|s| s.lineage);
+        Ok(match lineage {
+            Some(Lineage {
+                kind: LineageKind::SystemMaintenance,
+                parent_session_id,
+                ..
+            }) => parent_session_id,
+            _ => session_id.clone(),
+        })
+    }
+
     /// Walk every span in `jobs`, and for each `LlmCall` whose
     /// `input_messages` is `Persisted { last_ordinal, .. }` replace
     /// it with the corresponding `Inline` slice reconstructed from
     /// `session_messages`. Skips the work entirely if no span needs
-    /// hydration; reads the session log once when at least one does.
+    /// hydration; reads the log once when at least one does. `log_session_id`
+    /// is the session whose log to read — usually the replayed session, but
+    /// the parent for a maintenance session (see `hydration_log_session`).
     async fn hydrate_persisted_inputs(
         &self,
-        session_id: &SessionId,
+        log_session_id: &SessionId,
         jobs: &mut [ReplayJob],
     ) -> Result<()> {
         use aura_trace::{LlmCallInputs, SpanKind};
@@ -1156,7 +1191,7 @@ impl QueryApi {
 
         let log = self
             .sessions
-            .load_session_messages_with_supersede(session_id)
+            .load_session_messages_with_supersede(log_session_id)
             .await
             .map_err(SessionError::from)?;
 
@@ -1193,7 +1228,7 @@ impl QueryApi {
                         let mismatch = candidates.iter().any(|m| m.created_at > span_started_at);
                         let hydrated: Vec<aura_model::ChatMessage> = if mismatch {
                             tracing::warn!(
-                                session_id = %session_id,
+                                log_session_id = %log_session_id,
                                 span_id = %span.id,
                                 last_ordinal = last,
                                 "session_messages epoch mismatch — span predates current log; \
@@ -1215,7 +1250,7 @@ impl QueryApi {
                             // plausible-but-wrong slice silently.
                             if active.len() != expected_prefix {
                                 tracing::warn!(
-                                    session_id = %session_id,
+                                    log_session_id = %log_session_id,
                                     span_id = %span.id,
                                     last_ordinal = last,
                                     expected = expected_prefix,
@@ -2309,6 +2344,155 @@ mod tests {
             hydrated.len(),
             3,
             "marker + the 2 rows that did reconstruct"
+        );
+    }
+
+    /// A maintenance session (background compression) keeps no transcript of
+    /// its own; its spans reference the PARENT's `session_messages` by
+    /// ordinal. Replaying the maintenance session must hydrate those refs
+    /// against the parent's log (resolved via lineage), not the empty
+    /// maintenance log — otherwise the summarized transcript vanishes and the
+    /// prefix_len tripwire fires on every span.
+    #[tokio::test]
+    async fn replay_resolves_maintenance_spans_against_parent_log() {
+        use aura_model::{ChatMessage, ContentBlock, JobId, Lineage, LineageKind, SpanId, StepId};
+        use aura_trace::{
+            LifecycleState, LlmCallBegin, LlmCallInputs, Span, SpanKind, Step, StepKind, TraceStore,
+        };
+        fn um(t: &str) -> ChatMessage {
+            ChatMessage::agent_context(vec![ContentBlock::Text(t.into())])
+        }
+
+        let session_store = Arc::new(MemSessionStore::default());
+
+        // Parent session with a real transcript.
+        let parent = make_session("cli-parent");
+        session_store.save(&parent).await.unwrap();
+        session_store
+            .append_session_message(&parent.id, &um("p0"))
+            .await
+            .unwrap();
+        session_store
+            .append_session_message(&parent.id, &um("p1"))
+            .await
+            .unwrap();
+        let parent_last = session_store
+            .latest_session_ordinal(&parent.id)
+            .await
+            .unwrap()
+            .expect("parent has messages");
+        let parent_active = session_store
+            .load_active_session_messages(&parent.id)
+            .await
+            .unwrap();
+
+        // Maintenance session: lineage → parent, no transcript of its own.
+        let mut maint = make_session("maint-x");
+        maint.lineage = Some(Lineage {
+            parent_session_id: parent.id.clone(),
+            parent_job_id: JobId::new(),
+            parent_span_id: None,
+            kind: LineageKind::SystemMaintenance,
+        });
+        session_store.save(&maint).await.unwrap();
+
+        let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
+        let j = lifecycle
+            .start_job(
+                maint.id.clone(),
+                TriggerKind::User,
+                user_input(),
+                "soul-v1",
+                None,
+            )
+            .await
+            .unwrap();
+        lifecycle.start(&j.id).await.unwrap();
+        let trace_store: Arc<dyn TraceStore> = Arc::new(MemoryTraceStore::new());
+        let step_id = StepId::new();
+        let now = Utc::now();
+        trace_store
+            .save_step(
+                &Step {
+                    id: step_id,
+                    job_id: j.id,
+                    kind: StepKind::Compression,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                }
+                .to_row()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The background marker is parent-relative: last_ordinal / prefix_len
+        // index the PARENT log; suffix is the framing not in any log.
+        let suffix_msg = um("SUMMARIZE NOW");
+        let span_id = SpanId::new();
+        trace_store
+            .save_span(
+                &Span {
+                    id: span_id,
+                    step_id,
+                    kind: SpanKind::LlmCall {
+                        begin: LlmCallBegin {
+                            model_id: "claude".into(),
+                            provider: "anthropic".into(),
+                            provider_config_hash: String::new(),
+                            input_messages: LlmCallInputs::Persisted {
+                                last_ordinal: parent_last,
+                                prefix_len: parent_active.len(),
+                                suffix: vec![suffix_msg.clone()],
+                            },
+                            temperature: None,
+                        },
+                        result: None,
+                    },
+                    parallel_group: None,
+                    started_at: now,
+                    ended_at: None,
+                    outcome: LifecycleState::Pending,
+                    events: vec![],
+                }
+                .to_row()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let api = QueryApi::new(
+            session_store,
+            lifecycle,
+            trace_store,
+            Arc::new(MemoryCostStore::default()),
+        );
+        // Replay the MAINTENANCE session — its spans must resolve against the
+        // parent's log via lineage.
+        let replay = api.replay(&maint.id, None).await.unwrap();
+        let span = replay
+            .jobs
+            .iter()
+            .flat_map(|j| j.steps.iter())
+            .flat_map(|st| st.spans.iter())
+            .find(|sp| sp.id == span_id)
+            .expect("maintenance span survives replay");
+        let SpanKind::LlmCall { begin, .. } = &span.kind else {
+            unreachable!()
+        };
+        let LlmCallInputs::Inline(hydrated) = &begin.input_messages else {
+            panic!(
+                "Persisted must hydrate to Inline; got {:?}",
+                begin.input_messages
+            )
+        };
+
+        let mut expected = parent_active.clone();
+        expected.push(suffix_msg);
+        assert_eq!(
+            hydrated, &expected,
+            "maintenance span must hydrate against the parent transcript (+ suffix), \
+             not the empty maintenance log"
         );
     }
 
