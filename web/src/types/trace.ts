@@ -286,7 +286,6 @@ export interface SessionMessageRow {
  * job-summary panel need before the user drills into a specific job —
  * notably the `↑in ↓out` token chips, aggregated server-side from the
  * cost store so the client doesn't need the span tree to render them.
- * `is_inherited === true` rows live in the parent of a UserFork session.
  */
 export interface TraceJobSummary {
   job_id: string;
@@ -295,8 +294,6 @@ export interface TraceJobSummary {
   created_at: string;
   started_at?: string | null;
   ended_at?: string | null;
-  is_inherited: boolean;
-  inherited_from_session_id?: string | null;
   input_tokens: number;
   output_tokens: number;
   cached_input_tokens: number;

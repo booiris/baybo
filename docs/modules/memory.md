@@ -104,9 +104,9 @@ Two gates run independently:
   for `System`, `Spawned` (subagent), and `SubagentNotification` (no direct
   user input → would pollute / double-write).
 - **`should_fire_session_end(&Session)`** — session-level gate for the
-  shutdown hook. Returns true for root `User` / `Cron` sessions and `UserFork`
-  branches; false for `Subagent`, `SystemMaintenance`, and `System`-triggered
-  actors (they send `ActorStop` too but are not user-session endings).
+  shutdown hook. Returns true for root `User` / `Cron` sessions; false for
+  `Subagent`, `SystemMaintenance`, and `System`-triggered actors (they send
+  `ActorStop` too but are not user-session endings).
 
 The agent loop (`agent_loop.rs`) owns the first three hooks; the actor's
 `AgentMessage::ActorStop` handler (`actor/mod.rs`) owns the fourth.

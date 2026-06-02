@@ -27,12 +27,11 @@ struct StoredMessageRow {
     created_at: DateTime<Utc>,
 }
 
-/// In-memory `SessionStore` for tests across the workspace. Lineage /
-/// fork columns are stubbed (`list_live_forks` /
-/// `list_lineage_children` / `list_active_maintenance_for_parent` /
-/// `list_all_maintenance_sessions` all return empty) — tests that
-/// need that surface should use the real libsql store via
-/// `aura_storage::Store::open` against a tempfile.
+/// In-memory `SessionStore` for tests across the workspace. Lineage
+/// columns are stubbed (`list_lineage_children` /
+/// `list_active_maintenance_for_parent` / `list_all_maintenance_sessions`
+/// all return empty) — tests that need that surface should use the
+/// real libsql store via `aura_storage::Store::open` against a tempfile.
 #[derive(Default)]
 pub struct MemorySessionStore {
     data: Mutex<HashMap<SessionId, Session>>,
@@ -125,10 +124,6 @@ impl SessionStore for MemorySessionStore {
             .filter(|s| &s.channel == channel)
             .cloned()
             .collect())
-    }
-
-    async fn list_live_forks(&self, _source_session_id: &SessionId) -> Result<Vec<SessionId>> {
-        Ok(Vec::new())
     }
 
     async fn list_lineage_children(

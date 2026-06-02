@@ -126,8 +126,6 @@ async fn get_trace(
                 "created_at": s.created_at,
                 "started_at": s.started_at,
                 "ended_at": s.ended_at,
-                "is_inherited": s.is_inherited,
-                "inherited_from_session_id": s.inherited_from_session_id.as_ref().map(|sid| sid.as_str()),
                 "input_tokens": j.input_tokens,
                 "output_tokens": j.output_tokens,
                 "cached_input_tokens": j.cached_input_tokens,

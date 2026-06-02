@@ -7,14 +7,14 @@ The `query` crate is the read-only facade over `Session` / `Job` / `Step` / `Spa
 Thirteen endpoints today:
 
 1. `load_session` — resolves lineage
-2. `list_jobs` — fork-prefix UNION + `is_inherited` flag
+2. `list_jobs` — job summaries for a session
 3. `load_job` — Job + step list
 4. `load_step` — Step + spans + span events
 5. `find_recoverable_jobs` — recovery scan over non-terminal jobs
 6. `list_active_subagents` — live Subagent-lineage children
 7. `lineage_tree` — ancestry + immediate descendants
 8. `cost_summary` — `User` / `Session` / `Job` / `TimeRange` scope
-9. `replay` — chronological Job → Step → Span tree (also the backend for fork's view-layer UNION)
+9. `replay` — chronological Job → Step → Span tree
 10. `list_session_summaries` — paginated, filtered per-session aggregates for the admin session browser
 11. `compute_analytics` — cost + session-creation aggregates for the analytics dashboard (`Unsupported` without a `CostStore`)
 12. `load_trace_overview` — a session's job list + message log once, for the trace sidebar

@@ -28,11 +28,8 @@ pub struct StoredMessage {
 /// Persistence interface for sessions.
 ///
 /// `SessionId` is the caller-supplied opaque string (see
-/// `aura_model::SessionId`). Lineage / fork relationships are stored
-/// inline on the session row (`root_session_id`, `lineage_*` columns)
-/// — there is no separate forks table; fork reads are a view-layer
-/// UNION over the source session's prefix and the new session's own
-/// jobs.
+/// `aura_model::SessionId`). Lineage relationships are stored inline on
+/// the session row (`root_session_id`, `lineage_*` columns).
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     async fn get(&self, session_id: &SessionId) -> Result<Option<Session>>;
@@ -71,12 +68,6 @@ pub trait SessionStore: Send + Sync {
     ///
     /// Returns `Ok(true)` if the row existed and was removed, `Ok(false)`
     /// if it did not exist (idempotent).
-    /// Returns `Err(StorageError::HasLiveForks { .. })` if any session has a
-    /// `LineageKind::UserFork` pointing into `session_id`. The live-fork
-    /// scan and the parent-row delete run inside one `BEGIN IMMEDIATE`
-    /// write transaction — a fork inserted concurrently either lands
-    /// before the scan (and is reported back) or after the commit (and
-    /// protects a still-live parent on the *next* call).
     ///
     /// Does **not** drain in-flight subagents — that is the
     /// `SessionManager`'s responsibility (cancel propagation through
@@ -107,10 +98,6 @@ pub trait SessionStore: Send + Sync {
         let all = self.list_all().await?;
         Ok(all.into_iter().filter(|s| &s.channel == channel).collect())
     }
-    /// Return the live forks (sessions with `LineageKind::UserFork`)
-    /// whose `parent_session_id` equals the given session.
-    async fn list_live_forks(&self, source_session_id: &SessionId) -> Result<Vec<SessionId>>;
-
     /// Return the session ids of every active maintenance session whose
     /// `Lineage.parent_session_id` matches `parent_session_id`. Used by
     /// the parent's agent loop to enforce the at-most-one-in-flight
@@ -149,8 +136,8 @@ pub trait SessionStore: Send + Sync {
     /// would accumulate dead rows.
     async fn list_unfinished_maintenance_sessions(&self) -> Result<Vec<SessionId>>;
 
-    /// Return every immediate live descendant (Subagent or UserFork)
-    /// of the given parent. Powers `lineage_tree` and
+    /// Return every immediate live descendant (Subagent or
+    /// SystemMaintenance) of the given parent. Powers `lineage_tree` and
     /// `list_active_subagents`. Order is unspecified.
     async fn list_lineage_children(
         &self,

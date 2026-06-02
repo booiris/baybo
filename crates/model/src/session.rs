@@ -83,7 +83,7 @@ impl std::fmt::Display for ChannelType {
 ///
 /// `Cron` and `System` carry their own contextual reference; `User` is
 /// purely "a person typed a message". A session spawned via subagent or
-/// user-fork **inherits its trigger from its root session** — the
+/// maintenance **inherits its trigger from its root session** — the
 /// `TriggerSource` answers "who paid for this work" / "what was the
 /// business reason", not "who literally constructed this session row".
 ///
@@ -173,8 +173,8 @@ pub struct Lineage {
     /// The parent's `SpanId` that birthed this session. For
     /// `Subagent`, this is the parent's `ToolCall(spawn_subagent)`
     /// span — disambiguates sibling subagents from the same job. For
-    /// `SystemMaintenance` and `UserFork` it is `None` because those
-    /// don't originate inside a span.
+    /// `SystemMaintenance` it is `None` because those don't originate
+    /// inside a span.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_span_id: Option<crate::ids::SpanId>,
     pub kind: LineageKind,
@@ -186,11 +186,6 @@ pub struct Lineage {
 /// LLM iteration; the parent waits synchronously for the child to finish
 /// (cancellation propagates down via the cancellation-token tree).
 ///
-/// `UserFork`: a human chose to branch the parent's conversation at a
-/// specific job boundary. `fork_at_job_id` and `prefix_state_hash`
-/// together let the read-time view UNION the source's prefix with this
-/// session's own jobs while detecting source mutation.
-///
 /// `SystemMaintenance`: an internal, non-user-facing maintenance session
 /// (e.g. `SystemReason::BackgroundCompression`) doing work on behalf of its
 /// parent. The `Lineage.parent_session_id` pins the session being worked
@@ -201,10 +196,6 @@ pub struct Lineage {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LineageKind {
     Subagent,
-    UserFork {
-        fork_at_job_id: JobId,
-        prefix_state_hash: String,
-    },
     SystemMaintenance,
 }
 
@@ -235,7 +226,7 @@ pub struct Session {
     pub trigger: TriggerSource,
 
     /// Direct parent relationship, present iff this session was spawned
-    /// from another (subagent or user-fork).
+    /// from another (subagent or maintenance).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<Lineage>,
 
@@ -373,22 +364,6 @@ mod tests {
             parent_job_id: JobId::new(),
             parent_span_id: Some(crate::ids::SpanId::new()),
             kind: LineageKind::Subagent,
-        };
-        let s = serde_json::to_string(&l).unwrap();
-        let back: Lineage = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, l);
-    }
-
-    #[test]
-    fn lineage_user_fork_round_trip() {
-        let l = Lineage {
-            parent_session_id: SessionId::from("cli-source"),
-            parent_job_id: JobId::new(),
-            parent_span_id: None,
-            kind: LineageKind::UserFork {
-                fork_at_job_id: JobId::new(),
-                prefix_state_hash: "deadbeef".into(),
-            },
         };
         let s = serde_json::to_string(&l).unwrap();
         let back: Lineage = serde_json::from_str(&s).unwrap();

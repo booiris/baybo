@@ -140,10 +140,6 @@ Writes are asynchronous, with **synchronous fences** before any LLM or tool call
 
 Not implemented yet. The schema indexes the half-open lookup (`spans.ended_at IS NULL AND deleted_at IS NULL`), and `CancelReason::SystemCrash` is reserved for it, but the scan + rewrite is not wired. After a crash, half-open spans stay half-open until an operator cancels the parent job via the admin API.
 
-### Fork view-layer union
-
-When listing jobs / steps / spans for a session whose `Lineage` is `UserFork { fork_at_job_id, ... }`, the read path UNIONs source-session rows up to the fork point with the new session's own rows, ordered by `created_at`. API responses tag inherited rows with `is_inherited: true` so UIs can render lineage without rewriting IDs. IDs themselves are unchanged — every backend lookup still works directly.
-
 ## Constraints
 
 - Depends on `aura-job` (for `JobId`, `CancelReason`, `DriftRecord`) and `aura-model` (for `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.). No dependency on `aura-storage`.

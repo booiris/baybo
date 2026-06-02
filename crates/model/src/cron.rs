@@ -182,7 +182,7 @@ pub struct CronExecution {
     /// Carried through to the dispatched `CronTriggerEvent` so the
     /// router can set `Lineage` / `TriggerSource` on the resulting
     /// turn — the symmetric counterpart to `create_spawned_session`'s
-    /// lineage plumbing for subagents and forks.
+    /// lineage plumbing for subagents and maintenance.
     #[serde(default)]
     pub origin_session_id: Option<SessionId>,
 }

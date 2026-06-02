@@ -88,7 +88,6 @@ pub enum SystemReason {
 
 pub enum LineageKind {
     Subagent,
-    UserFork { fork_at_job_id: JobId, prefix_state_hash: String },
     SystemMaintenance,      // NEW — no extra fields; Lineage.parent_session_id pins the for-session
 }
 ```
@@ -309,9 +308,8 @@ In `ContextManager::restore_from_store`:
 
 When a maintenance session is marked `Failed` on startup, increment `session_summaries.error_count` for its `parent_session_id`. Conservative: prevents a crash loop on a doomed conversation from quietly burning summary calls every restart.
 
-## Fork / Subagent Inheritance
+## Subagent Inheritance
 
-- **Forked sessions** (`LineageKind::UserFork`): start fresh, no summary inheritance (φ-i b). Develop their own summary lifecycle if they grow long enough to trigger.
 - **Subagent sessions** (`LineageKind::Subagent`): start fresh, no summary inheritance (φ-ii a). Almost never long enough to trigger; if they do, develop their own.
 
 `<workspace>/state/sessions/<id>/summary.md` is strictly per-session — no symlinks, no shared paths.

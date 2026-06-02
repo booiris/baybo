@@ -4,7 +4,7 @@
 
 The `session` crate owns the session lifecycle vertical: `SessionError` and the `SessionManager` business-logic facade. The `SessionStore` / `SessionSummaryStore` traits and their per-row `StoredMessage` / `SessionSummaryRow` value types live in the `aura-store` ports crate; domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `SystemReason`, `Lineage`, `LineageKind`) live in `aura-model`. The libsql implementations of both store traits live in `aura-storage`, which implements the `aura-store` contracts; `aura-session` calls them.
 
-A `Session` is the top of one trace tree. There is exactly one trace per session — fork and subagent spawn create new sessions with `Lineage` pointers, never new trees rooted in the same session.
+A `Session` is the top of one trace tree. There is exactly one trace per session — subagent and maintenance spawn create new sessions with `Lineage` pointers, never new trees rooted in the same session.
 
 The conversation transcript itself is **not** carried on `Session`. It lives in `aura_context::ContextManager` while the actor is alive; the agent loop persists each appended message and each `/compact` apply through `SessionManager::append_session_message` / `apply_session_compaction`, and the router seeds it from `load_active_session_messages` on cold start.
 
@@ -27,7 +27,7 @@ The same `User` has independent sessions on different channels. Sessions are key
 
 ### Trigger and lineage are orthogonal
 
-`Session.trigger: TriggerSource` records the **business source** that started this session (`User`, `Cron { cron_job_id }`, `System { reason: SystemReason }`). `Session.lineage: Option<Lineage>` records the **parent relationship** when the session was spawned from another (`Subagent` or `UserFork { fork_at_job_id, prefix_state_hash }`).
+`Session.trigger: TriggerSource` records the **business source** that started this session (`User`, `Cron { cron_job_id }`, `System { reason: SystemReason }`). `Session.lineage: Option<Lineage>` records the **parent relationship** when the session was spawned from another (`Subagent` or `SystemMaintenance`).
 
 A spawned session's `trigger` is **inherited from the root** session (so a subagent spawned by a cron-triggered session has `trigger = Cron { ... }`), making "is this work cron-driven?" an O(1) field read. `Lineage` separately records the direct parent. `SystemReason` is a closed strong-typed enum extended by adding variants — never by string.
 
@@ -39,9 +39,9 @@ A spawned session's `trigger` is **inherited from the root** session (so a subag
 
 One `AgentActor` per session. All messages targeting the same session (user input, cron, rollback, timeout) are queued through the actor handle and consumed sequentially. Therefore `SessionStore` implementations do not need to defend against concurrent writes on the same `session_id` — that guarantee comes from the actor model and is what lets `append_session_message` use a single `INSERT … SELECT MAX(ordinal)+1` without locking. Re-introducing concurrent paths into the session would invalidate the storage contract.
 
-### Source deletion is rejected when live forks exist
+### Source deletion cascades the transcript
 
-`SessionStore::delete(source_id)` returns `Err(StorageError::HasLiveForks { fork_session_ids })` at the trait boundary when any session has a `LineageKind::UserFork` pointing into the source; the manager layer translates this into `SessionError::HasLiveForks { fork_session_ids }`, preserving the id list so the `aura session delete` CLI surface can render the offending forks back to the operator. Callers must delete the forks first or accept the error. There is no materialize-on-delete escape hatch — the case is rare enough to surface as an error rather than silently rewrite snapshots. The same delete cascades the session's `session_messages` rows so a stranded transcript can never outlive its parent.
+`SessionStore::delete(source_id)` runs the `session_messages` cascade and the session-row delete inside one `BEGIN IMMEDIATE` write transaction so a stranded transcript can never outlive its parent.
 
 ### Subagent parent deletion drains the subtree first
 
@@ -52,7 +52,7 @@ When a session with an in-flight subagent is deleted, the subagent's cancellatio
 `SessionId` is a caller-supplied opaque string. Producers prefix a UUID v4 to namespace by channel:
 - CLI: `cli-<uuid>` — one id per process.
 - Cron: `cron-<user>-<channel>` — stable across triggers so repeated firings resume the same session.
-- Subagent / fork: minted by `create_spawned_session` from the parent's id and the lineage kind.
+- Subagent / maintenance: minted by `create_spawned_session` from the parent's id and the lineage kind.
 
 `SessionManager::create_session` generates a bare UUID v4 only when no id is requested. A spawned session's `trigger` must equal its root session's `trigger` — enforced at `create_session` time.
 

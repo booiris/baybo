@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Discriminator for the four job shapes. Mirrors `TriggerKind` 1:1
-/// plus `Spawned` (subagent / user-fork-continuation jobs).
+/// plus `Spawned` (subagent jobs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
