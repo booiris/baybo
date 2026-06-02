@@ -39,6 +39,7 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 : "${TOP_K:=10}"                    # ingest recall depth
 : "${SETTLE_TIMEOUT_SECS:=3600}"    # how long ingest waits for extraction to settle (1h)
 : "${ALLOW_UNSETTLED:=0}"           # 1 = run QA even if extraction never settled
+: "${OPENVIKING_ENDPOINT:=http://127.0.0.1:1933}"   # openviking server (docker port-map); override only off-default
 : "${MEM0_BASE_URL:=http://127.0.0.1:8765}"   # self-hosted mem0 server (docker); empty = cloud Platform
 : "${DRY_RUN:=0}"                  # 1 = print plan only (no build, no spend)
 : "${OUTDIR:=$BENCH_DIR/bench-out}"   # bench scratch (gitignored): dataset + manifests
@@ -50,6 +51,12 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 : "${AURA_CONFIG:=}"               # base aura.json to derive from; empty = self-contained generated config
 : "${AURA_BIN:=$REPO_ROOT/target/release/aura}"   # built with the bench feature below
+# Self-contained answer model — the model Aura answers with (ignored when
+# AURA_CONFIG is set). Defaults = DeepSeek; repoint at any provider to compare.
+: "${ANSWER_MODEL:=deepseek-chat}"
+: "${ANSWER_PROVIDER:=deepseek}"
+: "${ANSWER_API_KEY_ENV:=DEEPSEEK_API_KEY}"   # env var holding the provider key
+: "${ANSWER_BASE_URL:=}"                       # empty = provider's built-in endpoint
 LOCOMO_URL="https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
 PKG="aura-bench-memory"
 # ---------------------------------------------------------------------------
@@ -63,6 +70,12 @@ if [ -n "$QUESTIONS" ]; then Q_ARG="--questions $QUESTIONS"; fi
 # Base config is optional: empty → the bench derives one from ~/.aura/config/aura.json.
 CFG_ARG=""
 if [ -n "$AURA_CONFIG" ]; then CFG_ARG="--aura-config $AURA_CONFIG"; fi
+# Self-contained answer model → CLI flags (skipped under --aura-config: yours wins).
+ANSWER_ARG=""
+if [ -z "$AURA_CONFIG" ]; then
+  ANSWER_ARG="--answer-model $ANSWER_MODEL --answer-provider $ANSWER_PROVIDER --answer-api-key-env $ANSWER_API_KEY_ENV"
+  [ -n "$ANSWER_BASE_URL" ] && ANSWER_ARG="$ANSWER_ARG --answer-base-url $ANSWER_BASE_URL"
+fi
 # Optional --allow-unsettled (run QA even if extraction never settled).
 UNSETTLED_ARG=""
 if [ "$ALLOW_UNSETTLED" = 1 ]; then UNSETTLED_ARG="--allow-unsettled"; fi
@@ -93,6 +106,11 @@ for arm in $ARMS; do
 done
 if [ "$DRY_RUN" != "1" ]; then
   : "${DEEPSEEK_API_KEY:?required — used by the judge model}"
+  # Self-contained answer model needs its provider's API key present too.
+  if [ -z "$AURA_CONFIG" ]; then
+    answer_key="${!ANSWER_API_KEY_ENV:-}"
+    : "${answer_key:?required — \$$ANSWER_API_KEY_ENV holds the $ANSWER_PROVIDER answer-model key (or set AURA_CONFIG to use your own)}"
+  fi
   for arm in $ARMS; do
     case "$arm" in
       mem0)
@@ -102,7 +120,6 @@ if [ "$DRY_RUN" != "1" ]; then
           : "${MEM0_API_KEY:?the mem0 cloud arm needs MEM0_API_KEY (use a throwaway project), or set MEM0_BASE_URL to target the self-hosted docker server}"
         fi ;;
       openviking)
-        : "${OPENVIKING_ENDPOINT:?the openviking arm needs OPENVIKING_ENDPOINT (ingest)}"
         : "${OPENVIKING_API_KEY:?the openviking arm needs OPENVIKING_API_KEY (matches ov.conf root key)}" ;;
     esac
   done
@@ -149,13 +166,15 @@ run_arm() {
         cargo run -q -p "$PKG" --bin ingest -- \
           --arm "$arm" --dataset "$DATASET" --conversations "$CONVERSATIONS" \
           --top-k "$TOP_K" --run-id "$RUN_ID" --out "$manifest" \
+          --openviking-endpoint "$OPENVIKING_ENDPOINT" \
           --settle-timeout-secs "$SETTLE_TIMEOUT_SECS" $MEM0_ARG
       fi
       echo ">> [$arm] QA run -> $results"
       cargo run -q -p "$PKG" --bin run -- \
         --arm "$arm" --dataset "$DATASET" --conversations "$CONVERSATIONS" \
         --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" $Q_ARG $UNSETTLED_ARG $MEM0_ARG \
-        $CFG_ARG --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" \
+        $CFG_ARG $ANSWER_ARG --openviking-endpoint "$OPENVIKING_ENDPOINT" \
+        --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" \
         --manifest "$manifest" --out "$results"
       ;;
     noop | oracle)
@@ -163,7 +182,7 @@ run_arm() {
       cargo run -q -p "$PKG" --bin run -- \
         --arm "$arm" --dataset "$DATASET" --conversations "$CONVERSATIONS" \
         --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" $Q_ARG \
-        $CFG_ARG --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" --out "$results"
+        $CFG_ARG $ANSWER_ARG --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" --out "$results"
       ;;
   esac
 }
@@ -176,12 +195,12 @@ done
 echo
 echo "=== summary (run_id=$RUN_ID) ==="
 if command -v jq >/dev/null 2>&1; then
-  printf '%-12s %5s %8s %8s\n' arm n acc f1
+  printf '%-12s %5s %7s %8s %9s %9s %9s %11s\n' arm n acc f1 lat_ms in_tok out_tok cost$
   for arm in $ARMS; do
     f="$RESULTS_DIR/results-$arm-$RUN_ID.json"
     [ -f "$f" ] || continue
-    jq -r '[.arm, .total_questions, (.overall_accuracy*100), .mean_f1] | @tsv' "$f" \
-      | awk -F'\t' '{printf "%-12s %5d %7.1f%% %8.3f\n", $1,$2,$3,$4}'
+    jq -r '[.arm, .total_questions, (.overall_accuracy*100), .mean_f1, .mean_latency_ms, .mean_input_tokens, .mean_output_tokens, (.mean_cost_micro_usd/1000000)] | @tsv' "$f" \
+      | awk -F'\t' '{printf "%-12s %5d %6.1f%% %8.3f %9.0f %9.0f %9.0f %11.6f\n", $1,$2,$3,$4,$5,$6,$7,$8}'
   done
 else
   echo "(install jq for the comparison table; raw results listed below)"

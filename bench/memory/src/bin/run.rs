@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use aura_bench_memory::agent::{GatewayHandle, generate_config, prepare_arm_config};
+use aura_bench_memory::agent::{AnswerModel, GatewayHandle, generate_config, prepare_arm_config};
 use aura_bench_memory::judge::judge;
-use aura_bench_memory::llm::{ChatClient, DEFAULT_BASE_URL};
+use aura_bench_memory::llm::ChatClient;
 use aura_bench_memory::report::{QuestionResult, ReportMeta, aggregate, print_table};
 use aura_bench_memory::testset::{BenchSample, TestSetKind};
 use aura_bench_memory::{Manifest, scope_user_id, token_f1};
@@ -25,8 +25,8 @@ use futures::{StreamExt, stream};
 /// regardless of the configured soul. Mirrors upstream's "answer directly".
 const ANSWER_INSTRUCTION: &str = "Answer the question directly and concisely with just the specific fact requested. If the information is not available to you, say you do not have it rather than guessing.";
 
-/// Answer model label in the report — the real agent answers (self-contained
-/// config uses `--answer-model`; `--aura-config` uses that config's `default-llm`).
+/// Report label for the answer model under `--aura-config` (we don't introspect
+/// that config's `default-llm`); self-contained runs report `provider/model`.
 const ANSWER_LABEL: &str = "aura-prompt (gateway)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -115,10 +115,25 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     top_k: usize,
 
-    /// Answer model for the self-contained config (the DeepSeek `llm` entry the
-    /// agent answers with). Ignored when `--aura-config` is given (yours wins).
+    /// Answer model for the self-contained config — the `llm` entry the real
+    /// agent answers with. Ignored when `--aura-config` is given (yours wins).
     #[arg(long, default_value = "deepseek-chat")]
     answer_model: String,
+
+    /// Provider for the self-contained answer model — any Aura-supported
+    /// provider (`deepseek`, `openai`, `anthropic`, …). Self-contained only.
+    #[arg(long, default_value = "deepseek")]
+    answer_provider: String,
+
+    /// Env var holding the answer provider's API key, written as `api_key_env`
+    /// into the generated config. Self-contained only.
+    #[arg(long, default_value = "DEEPSEEK_API_KEY")]
+    answer_api_key_env: String,
+
+    /// Override the answer provider's base URL (self-contained only). Omit to
+    /// use the provider's built-in default endpoint.
+    #[arg(long)]
+    answer_base_url: Option<String>,
 
     /// Gateway port for the self-contained config. `0` (default) auto-picks a
     /// free ephemeral port, so repeated/concurrent runs (and a user's own
@@ -264,17 +279,19 @@ async fn main() -> Result<()> {
         }
         None => {
             let ws = ws_root.join(format!("aura-bench-ws-{run_id}-{}", args.arm.as_str()));
-            let base_url = args
-                .deepseek_base_url
-                .as_deref()
-                .unwrap_or(DEFAULT_BASE_URL);
             // 0 → grab a free ephemeral port so repeated/concurrent runs (and the
             // user's own gateway) never collide on a fixed port.
             let gateway_port = match args.gateway_port {
                 0 => pick_free_port()?,
                 p => p,
             };
-            generate_config(&ws, memory, &args.answer_model, base_url, gateway_port)?
+            let answer = AnswerModel {
+                provider: args.answer_provider.clone(),
+                model: args.answer_model.clone(),
+                api_key_env: args.answer_api_key_env.clone(),
+                base_url: args.answer_base_url.clone(),
+            };
+            generate_config(&ws, memory, &answer, gateway_port)?
         }
     };
     tracing::info!(arm = args.arm.as_str(), %admin_addr, "starting aura gateway");
@@ -331,8 +348,24 @@ async fn main() -> Result<()> {
                             f1: 0.0,
                             judge_reason: "aura prompt failed; not judged".to_string(),
                             latency_ms,
+                            session_id: task.session_id.clone(),
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cost_micro_usd: 0,
                         },
                     ));
+                }
+            };
+
+            // A cost-read failure degrades to zeros — it must not fail the question.
+            let (input_tokens, output_tokens, cost_micro_usd) = match gateway_ref
+                .session_cost(&task.session_id)
+                .await
+            {
+                Ok(metrics) => metrics,
+                Err(e) => {
+                    tracing::warn!(conv = task.conv_idx, seq = task.seq, error = %e, "cost read failed; recording zeros");
+                    (0, 0, 0)
                 }
             };
 
@@ -353,6 +386,10 @@ async fn main() -> Result<()> {
                     f1,
                     judge_reason: verdict.reason,
                     latency_ms,
+                    session_id: task.session_id.clone(),
+                    input_tokens,
+                    output_tokens,
+                    cost_micro_usd,
                 },
             ))
         })
@@ -369,17 +406,22 @@ async fn main() -> Result<()> {
     ordered.sort_by_key(|(seq, _)| *seq);
     let results: Vec<QuestionResult> = ordered.into_iter().map(|(_, r)| r).collect();
 
+    let answer_model = if args.aura_config.is_some() {
+        ANSWER_LABEL.to_string()
+    } else {
+        format!(
+            "{}/{} (aura gateway)",
+            args.answer_provider, args.answer_model
+        )
+    };
     let report = aggregate(
         ReportMeta {
             run_id: run_id.clone(),
             testset: testset_name.to_string(),
             arm: args.arm.as_str().to_string(),
-            answer_model: ANSWER_LABEL.to_string(),
+            answer_model,
             judge_model: args.judge_model.clone(),
             conversations: n_conv,
-            // Answer-side tokens live in Aura's cost ledger (`aura cost`), not
-            // surfaced by `aura prompt --json`; not tracked here.
-            tokens: (0, 0),
         },
         results,
     );
@@ -481,7 +523,9 @@ fn print_plan(arm: Arm, testset: &str, samples: &[BenchSample], n_q: usize, conc
     println!("dry run — testset: {testset}  arm: {}", arm.as_str());
     println!("conversations: {}", samples.len());
     println!("questions: {questions}");
-    println!("calls: {questions} aura-prompt (real agent) + {questions} judge");
+    println!(
+        "calls: {questions} aura-prompt (real agent) + {questions} judge + {questions} cost-show"
+    );
     println!("concurrency: {}", concurrency.max(1));
     println!("(no gateway started, no API calls made)");
 }
