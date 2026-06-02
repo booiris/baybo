@@ -49,7 +49,9 @@ Two phases, coupled by a **manifest**:
    workspace/keys/llm, overwrite only the memory section). Each `aura prompt`
    runs with `USER=<conv-scope>` → message sender → session user → recall scope,
    matching what `ingest` populated. Answers are judged by DeepSeek; per-category
-   accuracy + token-overlap F1 are reported.
+   accuracy + token-overlap F1 are reported, alongside answer-time (latency),
+   answer-side token counts, and cost (read back per question from Aura's cost
+   ledger — see the token/cost caveat).
 
 - **arm → memory**: `openviking`/`mem0` enable that backend in the gateway
   config; `noop`/`oracle` turn memory off (`oracle` prepends the whole
@@ -62,9 +64,10 @@ Two phases, coupled by a **manifest**:
 
 | Var / flag | Used by | Notes |
 | --- | --- | --- |
-| `--aura-config` | `run` | **optional override.** Omit → self-contained config (fresh workspace + minted key + DeepSeek `--answer-model`). Given → derive from yours (reuse its workspace/keys/llm), overwriting only the `memory` section. |
+| `--aura-config` | `run` | **optional override.** Omit → self-contained config (fresh workspace + minted key + the configurable answer model below). Given → derive from yours (reuse its workspace/keys/llm), overwriting only the `memory` section. |
+| `--answer-model` / `--answer-provider` / `--answer-api-key-env` / `--answer-base-url` (env: `ANSWER_MODEL` / `ANSWER_PROVIDER` / `ANSWER_API_KEY_ENV` / `ANSWER_BASE_URL`) | `run` (self-contained only) | the model Aura answers with. Defaults reproduce the DeepSeek answerer (`deepseek` / `deepseek-chat` / `DEEPSEEK_API_KEY`, provider default endpoint); point them at any Aura-supported provider to benchmark its cost/quality. Ignored with `--aura-config`. |
 | `--aura-bin` | `run` | the `aura` built with `--features bench-readonly-memory` (default `aura` on PATH). |
-| `DEEPSEEK_API_KEY` | `run` | judge model + (self-contained) answer model — the gateway inherits it |
+| `DEEPSEEK_API_KEY` | `run` | judge model always; the self-contained answer model when `ANSWER_API_KEY_ENV` is left at its default — the gateway inherits whichever key env you point it at |
 | `OPENVIKING_API_KEY` | `ingest` + `run` openviking arm | matches `ov.conf`'s root key; the agent resolves it from this env var |
 | `OPENVIKING_ENDPOINT` | `ingest` openviking arm | or `--openviking-endpoint` |
 | `MEM0_BASE_URL` | `ingest`/`run` mem0 arm | self-hosted docker server (default `http://127.0.0.1:8765`, shares OV's DeepSeek+Qwen3 stack); blank it to use the cloud Platform |
@@ -75,11 +78,15 @@ mints a fresh, isolated workspace per arm (so nothing of yours is touched and
 there's no pollution). Those workspaces (config + vault + sessions + logs) go
 under `aura-ws/` (gitignored, override with `WS_ROOT` / `--workspace-root`;
 defaults to the system temp dir when the bins are run directly). The **answer
-model** defaults to `--answer-model`
-(`deepseek-chat`); set it (and `--deepseek-base-url`) if your DeepSeek endpoint
-differs. With `--aura-config` the answer model is that config's `default-llm`
-and QA sessions land in its workspace (harmless — memory writes are off under
-the feature). No other `aura gateway` may run in the workspace in use.
+model** (the model Aura answers with) defaults to DeepSeek `deepseek-chat`, but
+provider, model, key-env, and base URL are all configurable —
+`--answer-provider` / `--answer-model` / `--answer-api-key-env` /
+`--answer-base-url` (or the `ANSWER_*` env vars in `run-bench.sh`) — so you can
+benchmark any provider's cost/quality (the per-question token/cost metrics make
+the comparison direct). With `--aura-config` the answer model is instead that
+config's `default-llm` and QA sessions land in its workspace (harmless — memory
+writes are off under the feature). No other `aura gateway` may run in the
+workspace in use.
 
 ## Bring up the backends (docker)
 
@@ -135,11 +142,12 @@ cargo run -p aura-bench-memory --bin run -- --arm openviking --dataset locomo10.
 ```
 
 Each `run` evaluates one arm and writes its full report to
-`results/results-<arm>-<run_id>.json` (summary scores + every question's answer
-and judge reason). That folder is **gitignored** (local only, like `bench-out/`) —
-the JSONs are large, LLM-generated, and rewritten each run, so they're
-regenerated rather than committed. `run-bench.sh` compares the run's JSONs into
-the floor → backend → ceiling table.
+`results/results-<arm>-<run_id>.json` (summary scores + every question's answer,
+judge reason, answer-time, token counts, and cost). That folder is **gitignored**
+(local only, like `bench-out/`) — the JSONs are large, LLM-generated, and
+rewritten each run, so they're regenerated rather than committed. `run-bench.sh`
+compares the run's JSONs into the floor → backend → ceiling table, which now
+also carries `lat_ms` / `in_tok` / `out_tok` / `cost$` columns per arm.
 
 ## Inspecting results — error analysis
 
@@ -197,9 +205,23 @@ python3 bench/memory/trace_recall.py mem0 full10b --conv 0 --q 1
 - Settling: `ingest` polls true completion (openviking commit tasks; mem0's
   events feed) and marks the manifest unsettled otherwise; `run` refuses a
   mismatched/unsettled manifest unless `--allow-unsettled`.
-- **Token usage isn't surfaced.** `aura prompt --json` returns only the answer;
-  the answer model's spend lives in Aura's cost ledger (`aura cost`), so the
-  report's token fields are `0`.
+- **Answer-time, tokens, and cost are surfaced** per question, sourced from
+  Aura's `cost_records` ledger via a per-question `aura cost show --session <id>
+  --json` issued after each answer. The **judge is excluded by construction** —
+  it's a standalone DeepSeek `ChatClient` (`llm.rs`) that never writes
+  `cost_records`. The number is **whole-turn answer-side spend** (the answer
+  call plus any recall/tool sub-calls billed to the session), not just the final
+  completion. `input_tokens` is gross input (cached tokens are reported
+  separately and not subtracted); for the DeepSeek answerer cache hits are ~0,
+  so it reflects the real prompt size. The cost row is written asynchronously
+  and races the answer, so the read polls briefly for the row to land; under
+  heavy concurrency a turn can still record zeros if the row hasn't committed in
+  time. In `--aura-config` mode these rows land in your real workspace ledger
+  under the bench's `qa-*` sessions and are left in place (Aura never
+  auto-deletes cost history), so they also surface in untargeted `aura cost`
+  totals.
 - **Oracle assumes the conversation fits** the answer model's context window
   (~26k tokens for LOCOMO); if it doesn't it's truncated and oracle is no longer
-  a clean ceiling.
+  a clean ceiling. Oracle's `input_tokens`/`cost` are also inflated by the whole
+  conversation prepended to every prompt — expected, a useful signal, not a
+  backend cost.
