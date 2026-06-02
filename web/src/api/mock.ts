@@ -452,8 +452,6 @@ function buildMockSession(sessionId: string): MockSessionFixture {
         created_at: createdAt,
         started_at: startedAt,
         ended_at: endedAt,
-        is_inherited: false,
-        inherited_from_session_id: null,
         input_tokens: 380,
         output_tokens: 96,
         cached_input_tokens: 228,

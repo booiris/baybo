@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
-use aura_model::{ChatMessage, Lineage, LineageKind, LlmEntryName, Session, SessionId};
+use aura_model::{ChatMessage, LineageKind, LlmEntryName, Session, SessionId};
 use aura_store::StorageError;
 use aura_store::session::{Result, SessionStore, StoredMessage};
 
@@ -19,15 +19,13 @@ impl LibsqlSessionStore {
 /// SQL strings for the `lineage_kind` column, matched by both
 /// `lineage_kind_str` (write side) and `list_lineage_children` /
 /// `list_active_maintenance_for_parent` (read sides). Keeping them
-/// here as named constants prevents drift when a fourth variant lands.
+/// here as named constants prevents drift when a new variant lands.
 pub(super) const LINEAGE_KIND_SUBAGENT: &str = "subagent";
-pub(super) const LINEAGE_KIND_USER_FORK: &str = "user_fork";
 pub(super) const LINEAGE_KIND_SYSTEM_MAINTENANCE: &str = "system_maintenance";
 
 fn lineage_kind_str(s: &Session) -> Option<&'static str> {
     s.lineage.as_ref().map(|l| match l.kind {
         LineageKind::Subagent => LINEAGE_KIND_SUBAGENT,
-        LineageKind::UserFork { .. } => LINEAGE_KIND_USER_FORK,
         LineageKind::SystemMaintenance => LINEAGE_KIND_SYSTEM_MAINTENANCE,
     })
 }
@@ -228,43 +226,14 @@ impl SessionStore for LibsqlSessionStore {
     }
 
     async fn delete(&self, session_id: &SessionId) -> Result<bool> {
-        // BEGIN IMMEDIATE acquires a write lock at start, so any concurrent
-        // INSERT/UPDATE on `sessions` either blocks behind us or fails BUSY.
-        // That's the atomicity contract callers rely on: a fork inserted
-        // *after* the live-fork scan returns empty cannot land while we hold
-        // the lock.
+        // The message-log cascade and the session-row delete must commit
+        // as a unit (see below); BEGIN IMMEDIATE takes the write lock up
+        // front so the pair runs without an interleaved writer.
         let conn = self.pool.conn();
         let tx = conn
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql begin delete tx: {e}")))?;
-
-        let mut rows = tx
-            .query(
-                "SELECT id FROM sessions \
-                 WHERE parent_session_id = ?1 AND lineage_kind = 'user_fork'",
-                libsql::params![session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql live-forks scan: {e}")))?;
-        let mut live_forks = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let id: String = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            live_forks.push(SessionId::from(id));
-        }
-        drop(rows);
-        if !live_forks.is_empty() {
-            let _ = tx.rollback().await;
-            return Err(StorageError::HasLiveForks {
-                fork_session_ids: live_forks,
-            });
-        }
 
         // Cascade the message log first — there's no FK in sqlite, so
         // a stranded `session_messages` row would otherwise outlive
@@ -421,7 +390,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT id, lineage_kind, data FROM sessions \
+                "SELECT id, lineage_kind FROM sessions \
                  WHERE parent_session_id = ?1 AND lineage_kind IS NOT NULL",
                 libsql::params![parent_session_id.as_str().to_string()],
             )
@@ -440,57 +409,18 @@ impl SessionStore for LibsqlSessionStore {
             let kind_tag: String = row
                 .get(1)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            // Subagent rows carry no extra payload; UserFork rows
-            // carry `fork_at_job_id` + `prefix_state_hash` only on
-            // the full Lineage struct, which is reconstructable from
-            // `data`. Decode `data` only when the kind is UserFork.
-            // Subagent and SystemMaintenance carry no extra payload
-            // beyond the kind tag, so we can avoid the JSON decode.
-            // Only UserFork's variant has fields, and those are only
-            // recoverable from the full Lineage struct in `data`.
+            // Both variants are payload-free, so the kind tag alone
+            // reconstructs the `LineageKind` — no JSON decode needed.
+            // An unrecognised tag (e.g. an orphaned legacy row) is
+            // skipped rather than erroring the whole listing.
             let kind = match kind_tag.as_str() {
                 LINEAGE_KIND_SUBAGENT => LineageKind::Subagent,
                 LINEAGE_KIND_SYSTEM_MAINTENANCE => LineageKind::SystemMaintenance,
-                _ => {
-                    let data: String = row
-                        .get(2)
-                        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-                    let session: Session = serde_json::from_str(&data)
-                        .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
-                    match session.lineage {
-                        Some(Lineage { kind, .. }) => kind,
-                        None => continue,
-                    }
-                }
+                _ => continue,
             };
             children.push((SessionId::from(id), kind));
         }
         Ok(children)
-    }
-
-    async fn list_live_forks(&self, source_session_id: &SessionId) -> Result<Vec<SessionId>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT id FROM sessions \
-                 WHERE parent_session_id = ?1 AND lineage_kind = 'user_fork'",
-                libsql::params![source_session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
-
-        let mut forks = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let id: String = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            forks.push(SessionId::from(id));
-        }
-        Ok(forks)
     }
 
     async fn list_active_maintenance_for_parent(
@@ -1140,7 +1070,7 @@ impl SessionStore for LibsqlSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, JobId, Lineage, LineageKind, SessionState, TriggerSource, User};
+    use aura_model::{ChannelType, SessionState, TriggerSource, User};
 
     fn make_root_session(id: &str) -> Session {
         let id = SessionId::from(id);
@@ -1163,35 +1093,6 @@ mod tests {
         }
     }
 
-    fn make_fork_session(id: &str, parent: &SessionId, fork_at: JobId) -> Session {
-        let id = SessionId::from(id);
-        Session {
-            id: id.clone(),
-            user: User {
-                id: "u1".to_string(),
-                name: Some("Test".to_string()),
-                channel: ChannelType::tui(),
-            },
-            channel: ChannelType::tui(),
-            created_at: Utc::now(),
-            last_active: Utc::now(),
-            state: SessionState::default(),
-            root_session_id: parent.clone(),
-            trigger: TriggerSource::User,
-            lineage: Some(Lineage {
-                parent_session_id: parent.clone(),
-                parent_job_id: fork_at,
-                parent_span_id: None,
-                kind: LineageKind::UserFork {
-                    fork_at_job_id: fork_at,
-                    prefix_state_hash: "hash-1".into(),
-                },
-            }),
-            bound_soul_version: "soul-v1".into(),
-            hidden: false,
-        }
-    }
-
     #[tokio::test]
     async fn round_trip_session() {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
@@ -1206,43 +1107,6 @@ mod tests {
 
         store.delete(&s.id).await.unwrap();
         assert!(store.get(&s.id).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn delete_rejects_when_live_forks_exist() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
-        let parent = make_root_session("cli-source");
-        store.save(&parent).await.unwrap();
-
-        let fork_at = JobId::new();
-        let fork = make_fork_session("cli-fork", &parent.id, fork_at);
-        store.save(&fork).await.unwrap();
-
-        let err = store.delete(&parent.id).await.unwrap_err();
-        match err {
-            StorageError::HasLiveForks { fork_session_ids } => {
-                assert_eq!(fork_session_ids, vec![fork.id.clone()]);
-            }
-            other => panic!("expected HasLiveForks, got {other:?}"),
-        }
-        // parent must still be live
-        assert!(store.get(&parent.id).await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn delete_succeeds_after_fork_deleted() {
-        let pool = LibsqlPool::open_in_memory().await.unwrap();
-        let store = LibsqlSessionStore::new(pool);
-        let parent = make_root_session("cli-source");
-        store.save(&parent).await.unwrap();
-        let fork_at = JobId::new();
-        let fork = make_fork_session("cli-fork", &parent.id, fork_at);
-        store.save(&fork).await.unwrap();
-
-        store.delete(&fork.id).await.unwrap();
-        // After fork is gone, parent delete must succeed
-        store.delete(&parent.id).await.unwrap();
     }
 
     #[tokio::test]

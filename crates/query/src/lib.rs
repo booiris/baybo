@@ -4,15 +4,14 @@
 //! 9 endpoints:
 //!
 //! 1. `load_session` — resolves lineage
-//! 2. `list_jobs` — fork-prefix UNION + `is_inherited` flag
+//! 2. `list_jobs` — job summaries for a session
 //! 3. `load_job` — Job + step list
 //! 4. `load_step` — Step + spans + span events
 //! 5. `find_recoverable_jobs` — recovery scan
 //! 6. `list_active_subagents` — live Subagent-lineage children
 //! 7. `lineage_tree` — ancestry + immediate descendants
 //! 8. `cost_summary` — User / Session / Job / TimeRange
-//! 9. `replay` — chronological Job → Step → Span tree (also the
-//!    backend for fork's view-layer UNION)
+//! 9. `replay` — chronological Job → Step → Span tree
 //!
 //! Errors collapse into a single `QueryError` so callers don't need to
 //! match four different store error types.
@@ -59,10 +58,7 @@ pub struct JobFilter {
     pub until: Option<DateTime<Utc>>,
 }
 
-/// Lightweight row returned by `list_jobs`. `is_inherited = true`
-/// means the job lives in another session and is being surfaced via
-/// the fork view-layer UNION; `inherited_from_session_id` then
-/// names the source.
+/// Lightweight row returned by `list_jobs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSummary {
     pub id: JobId,
@@ -72,10 +68,6 @@ pub struct JobSummary {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub is_inherited: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inherited_from_session_id: Option<SessionId>,
 }
 
 impl JobSummary {
@@ -88,22 +80,6 @@ impl JobSummary {
             created_at: j.created_at,
             started_at: j.started_at,
             ended_at: j.ended_at,
-            is_inherited: false,
-            inherited_from_session_id: None,
-        }
-    }
-
-    fn from_inherited(j: &Job, source: SessionId) -> Self {
-        Self {
-            id: j.id,
-            session_id: j.session_id.clone(),
-            kind: j.kind,
-            status: j.status.clone(),
-            created_at: j.created_at,
-            started_at: j.started_at,
-            ended_at: j.ended_at,
-            is_inherited: true,
-            inherited_from_session_id: Some(source),
         }
     }
 }
@@ -182,8 +158,7 @@ pub struct ReplayedConversation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionKind {
-    /// Root user-triggered session (chat or fork — both are
-    /// human-initiated).
+    /// Root user-triggered chat session.
     User,
     /// Root cron-triggered session.
     Cron,
@@ -438,15 +413,14 @@ impl QueryApi {
         Ok(self.sessions.get(id).await.map_err(SessionError::from)?)
     }
 
-    // ── 2. list_jobs (with fork-prefix UNION) ──────────────────
+    // ── 2. list_jobs ───────────────────────────────────────────
 
     pub async fn list_jobs(
         &self,
         session_id: &SessionId,
         filter: JobFilter,
     ) -> Result<Vec<JobSummary>> {
-        // Always include this session's own jobs first.
-        let mut summaries: Vec<JobSummary> = self
+        let summaries: Vec<JobSummary> = self
             .jobs
             .list_by_session(session_id, filter.status_kind)
             .await?
@@ -454,49 +428,6 @@ impl QueryApi {
             .filter(|j| filter_matches(j, &filter))
             .map(|j| JobSummary::from_owned(&j))
             .collect();
-
-        // If this is a UserFork session, prepend the source's prefix.
-        if let Some(session) = self
-            .sessions
-            .get(session_id)
-            .await
-            .map_err(SessionError::from)?
-            && let Some(Lineage {
-                parent_session_id,
-                kind: LineageKind::UserFork { fork_at_job_id, .. },
-                ..
-            }) = session.lineage
-        {
-            let source_jobs: Vec<Job> = self
-                .jobs
-                .list_by_session(&parent_session_id, filter.status_kind)
-                .await?
-                .into_iter()
-                .filter(|j| filter_matches(j, &filter))
-                .collect();
-            // Tie-break by JobId after `created_at` so two jobs minted in
-            // the same microsecond on the source session don't both pass
-            // the cutoff (or both get dropped). `created_at` resolution
-            // is µs; ULID JobIds give a deterministic secondary order.
-            let cutoff = source_jobs
-                .iter()
-                .find(|j| j.id == fork_at_job_id)
-                .map(|j| (j.created_at, j.id));
-            let prefix: Vec<JobSummary> = source_jobs
-                .into_iter()
-                .filter(|j| match cutoff {
-                    Some((c_at, c_id)) => (j.created_at, j.id) <= (c_at, c_id),
-                    None => true,
-                })
-                .map(|j| JobSummary::from_inherited(&j, parent_session_id.clone()))
-                .collect();
-            let mut combined = prefix;
-            combined.append(&mut summaries);
-            summaries = combined;
-        }
-        // Newest-first (already sorted by JobLifecycle::list, but the
-        // UNION above interleaved two streams).
-        summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(summaries)
     }
 
@@ -914,7 +845,6 @@ impl QueryApi {
         session_id: &SessionId,
         until_step_id: Option<StepId>,
     ) -> Result<ReplayedConversation> {
-        // Use `list_jobs` so fork-prefix UNION is honoured.
         let summaries = self.list_jobs(session_id, JobFilter::default()).await?;
         // Re-sort oldest-first for replay.
         let mut summaries = summaries;
@@ -1029,8 +959,7 @@ impl QueryApi {
     /// client hydrate slices keeps the wire payload linear in
     /// `message_count + span_count`.
     pub async fn load_trace_overview(&self, session_id: &SessionId) -> Result<TraceOverview> {
-        // Reuse `list_jobs` so fork-prefix UNION is honoured, then
-        // re-sort oldest-first to match the trace sidebar's job
+        // Re-sort oldest-first to match the trace sidebar's job
         // numbering (`#1, #2, ...` from earliest to latest).
         let mut summaries = self.list_jobs(session_id, JobFilter::default()).await?;
         summaries.sort_by(|a, b| a.created_at.cmp(&b.created_at));
@@ -1394,12 +1323,6 @@ mod tests {
         }
         async fn list_all(&self) -> std::result::Result<Vec<Session>, aura_store::StorageError> {
             Ok(self.sessions.lock().values().cloned().collect())
-        }
-        async fn list_live_forks(
-            &self,
-            _src: &SessionId,
-        ) -> std::result::Result<Vec<SessionId>, aura_store::StorageError> {
-            Ok(Vec::new())
         }
         async fn list_lineage_children(
             &self,

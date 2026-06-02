@@ -294,9 +294,9 @@ impl SessionManager {
     }
 
     /// Create a session that descends from `parent` via the given
-    /// lineage (subagent or user-fork). The child inherits its
+    /// lineage (subagent or maintenance). The child inherits its
     /// trigger from the parent's root session and gets a fresh
-    /// session_id prefixed with `subagent-` / `fork-` as a hint.
+    /// session_id prefixed with `subagent-` / `maint-` as a hint.
     pub async fn create_spawned_session(
         &self,
         user: User,
@@ -306,7 +306,6 @@ impl SessionManager {
     ) -> Result<Session> {
         let prefix = match lineage.kind {
             aura_model::LineageKind::Subagent => "subagent-",
-            aura_model::LineageKind::UserFork { .. } => "fork-",
             aura_model::LineageKind::SystemMaintenance => "maint-",
         };
         let id = SessionId::from(format!("{prefix}{}", uuid::Uuid::new_v4()));
@@ -331,7 +330,7 @@ impl SessionManager {
         debug!(
             session_id = %session.id,
             parent_session_id = %parent.id,
-            "spawned subagent / fork session"
+            "spawned subagent / maintenance session"
         );
         Ok(session)
     }
@@ -614,9 +613,7 @@ impl SessionManager {
     }
 
     /// Hard-delete a session by id. Errors with `SessionError::NotFound`
-    /// if the session did not exist at the time of the call. Surfaces
-    /// `StorageError::HasLiveForks` (wrapped) when the session has live
-    /// forks pointing at it.
+    /// if the session did not exist at the time of the call.
     pub async fn delete(&self, session_id: &SessionId) -> Result<()> {
         let deleted = self.store.delete(session_id).await?;
         if !deleted {

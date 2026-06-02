@@ -897,8 +897,7 @@ function SpanDetailPanel({
 // the wire didn't carry job-level times. For in-flight jobs we use
 // `now` as the upper bound so the counter keeps ticking; callers
 // re-render on each poll. Accepts an optional loaded trace so we can
-// fall back when the summary is missing `started_at` (mid-fork prefix
-// rows, etc.).
+// fall back when the summary is missing `started_at`.
 function jobDurationMs(
   job: { started_at?: string | null; ended_at?: string | null },
   trace: JobTrace | undefined,
@@ -1373,8 +1372,8 @@ export function TraceSessionPage() {
     };
   }, [client, isMock, logout, sessionId, overviewRefreshKey]);
 
-  // Reset cached per-job traces whenever the session changes so a fork
-  // navigation doesn't surface a stale tree.
+  // Reset cached per-job traces whenever the session changes so
+  // navigating to another session doesn't surface a stale tree.
   useEffect(() => {
     setJobTraces(new Map());
   }, [sessionId]);

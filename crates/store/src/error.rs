@@ -1,4 +1,3 @@
-use aura_model::SessionId;
 use thiserror::Error;
 
 /// Error returned by every `*Store` trait. Concrete adapters (e.g. the
@@ -24,13 +23,6 @@ pub enum StorageError {
     /// it to short-circuit oversized writes without buffering the rest.
     #[error("payload too large: {actual} bytes exceeds limit of {limit}")]
     TooLarge { limit: u64, actual: u64 },
-
-    /// `SessionStore::delete` rejected the request because the target
-    /// session has forks pointing at it. The caller must delete the
-    /// listed forks first (or accept the error) — there is no
-    /// materialize-on-delete escape hatch.
-    #[error("session has {} live fork(s); delete forks first", .fork_session_ids.len())]
-    HasLiveForks { fork_session_ids: Vec<SessionId> },
 
     /// Generic wrapper for unexpected lower-layer errors (e.g. libsql
     /// driver failures that don't map cleanly onto a richer variant).

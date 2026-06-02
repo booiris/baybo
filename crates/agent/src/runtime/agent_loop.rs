@@ -297,11 +297,11 @@ fn cron_prompt_blocks(action_payload: &serde_json::Value) -> Vec<ContentBlock> {
 
 /// Whether the `on_session_end` memory hook should fire for this session.
 /// The session-level analogue of [`memory_recall_query`]: only sessions a person
-/// would call "theirs" — root `User`/`Cron` sessions and `UserFork` branches.
-/// Subagent, `SystemMaintenance`, and `System`-triggered (background
-/// compression) actors all send `ActorStop` when they finish, but their
-/// shutdown is not a user-session ending. Exhaustive arms force a
-/// classification when a new `TriggerSource` / `LineageKind` variant is added.
+/// would call "theirs" — root `User`/`Cron` sessions. Subagent,
+/// `SystemMaintenance`, and `System`-triggered (background compression)
+/// actors all send `ActorStop` when they finish, but their shutdown is
+/// not a user-session ending. Exhaustive arms force a classification
+/// when a new `TriggerSource` / `LineageKind` variant is added.
 fn should_fire_session_end(session: &Session) -> bool {
     let user_trigger = match &session.trigger {
         TriggerSource::User | TriggerSource::Cron { .. } => true,
@@ -310,7 +310,6 @@ fn should_fire_session_end(session: &Session) -> bool {
     let user_lineage = match &session.lineage {
         None => true,
         Some(l) => match &l.kind {
-            LineageKind::UserFork { .. } => true,
             LineageKind::Subagent | LineageKind::SystemMaintenance => false,
         },
     };
@@ -2822,23 +2821,6 @@ mod session_end_gate_tests {
             None,
         );
         assert!(should_fire_session_end(&s));
-    }
-
-    #[test]
-    fn fires_for_user_fork_branch() {
-        let lineage = Lineage {
-            parent_session_id: SessionId::from("parent"),
-            parent_job_id: JobId::new(),
-            parent_span_id: None,
-            kind: LineageKind::UserFork {
-                fork_at_job_id: JobId::new(),
-                prefix_state_hash: "deadbeef".into(),
-            },
-        };
-        assert!(should_fire_session_end(&session_with(
-            TriggerSource::User,
-            Some(lineage)
-        )));
     }
 
     #[test]

@@ -134,7 +134,7 @@ Fields difficult to fully structure (`SessionState.extra`, `Job.input/output`) a
 
 ### Transaction boundaries
 
-Use transactions wherever a check-and-write pair must be atomic — most importantly `SessionStore::delete`, which scans for live forks before removing the parent row (a non-transactional implementation admits orphan forks under concurrent `create_fork`).
+Use transactions wherever a multi-statement write must be atomic — most importantly `SessionStore::delete`, which cascades the session's `session_messages` rows and removes the parent row in one `BEGIN IMMEDIATE` transaction (a non-transactional implementation could strand a transcript under a concurrent write).
 
 ### Hard delete
 

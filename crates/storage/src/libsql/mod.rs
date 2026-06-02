@@ -129,9 +129,8 @@ impl LibsqlPool {
                     -- viewers can hop from the parent's span to the
                     -- child's session and so sibling subagents from
                     -- one parent job stay distinguishable. NULL for
-                    -- non-subagent lineage (maintenance / fork) and
-                    -- for sessions migrated from before this column
-                    -- existed.
+                    -- non-subagent lineage (maintenance) and for
+                    -- sessions migrated from before this column existed.
                     parent_span_id        TEXT,
                     lineage_kind          TEXT,
                     bound_soul_version    TEXT NOT NULL,
