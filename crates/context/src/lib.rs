@@ -1353,16 +1353,24 @@ impl ContextManager {
     /// active set by ordinal; `suffix` rides inline so hydration can
     /// rebuild the exact `request.messages` the LLM saw. Falls back to a
     /// fully inline marker (prefix + suffix) when the store has no rows
-    /// yet or the lookup errors.
+    /// yet, the lookup errors, or an in-memory-only row (`append_in_memory`)
+    /// makes the active set diverge from the in-memory window.
     pub async fn input_marker_with_suffix(&self, suffix: Vec<ChatMessage>) -> LlmCallInputs {
-        // Emit a `Persisted` reference only when BOTH the anchor ordinal
-        // and the prefix count (the `prefix_len` tripwire) are known; the
-        // marker is never written without a validatable count. Any miss
-        // falls back to a self-contained inline copy.
+        // Emit a `Persisted` reference only when the anchor ordinal and the
+        // prefix count are both known AND the persisted active set mirrors the
+        // in-memory window (`count == messages.len()` — the same invariant
+        // `synced_last_ordinal` guards). An in-memory-only row
+        // (`append_in_memory`, e.g. the subagent-notification turn's synthetic
+        // prompt that is deliberately not persisted) would make `prefix_len`
+        // under-count the real prefix; and because the tripwire compares the
+        // reconstructed count against that same `prefix_len`, the omission
+        // would pass silently. Any miss falls back to a self-contained inline
+        // copy.
         if let (Ok(Some(last_ordinal)), Ok(prefix_len)) = (
             self.sessions.latest_session_ordinal(&self.session_id).await,
             self.sessions.count_active_messages(&self.session_id).await,
-        ) {
+        ) && prefix_len == self.messages.len()
+        {
             LlmCallInputs::Persisted {
                 last_ordinal,
                 prefix_len,
@@ -2186,6 +2194,56 @@ mod tests {
             ctx.maybe_compress("test-model", never_chat).await.unwrap(),
             CompressionOutcome::BelowThreshold
         ));
+    }
+
+    /// Steady state — every in-memory row is also persisted — so the marker
+    /// references the transcript by ordinal: `prefix_len` equals the window
+    /// size.
+    #[tokio::test]
+    async fn input_marker_emits_persisted_when_active_set_mirrors_window() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::System, "sys")).await;
+        ctx.append(&make_msg(Role::User, "hi")).await;
+
+        match ctx.build_call_input_marker().await {
+            LlmCallInputs::Persisted {
+                last_ordinal,
+                prefix_len,
+                suffix,
+            } => {
+                assert_eq!(prefix_len, 2, "prefix_len must equal the active-set size");
+                assert_eq!(last_ordinal, 1, "MAX ordinal of two 0-based rows");
+                assert!(suffix.is_empty());
+            }
+            other => panic!("expected Persisted, got {other:?}"),
+        }
+    }
+
+    /// An `append_in_memory` row (the subagent-notification turn's synthetic
+    /// prompt) lives in the window but not in `session_messages`, so the active
+    /// count under-counts the real prefix. A `Persisted` marker would silently
+    /// drop that row on hydration AND slip past the `prefix_len` tripwire (the
+    /// reconstructed count matches the under-counted `prefix_len`), so the
+    /// marker must fall back to a self-contained `Inline` copy of the whole
+    /// window plus the suffix.
+    #[tokio::test]
+    async fn input_marker_falls_back_to_inline_on_in_memory_only_rows() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::System, "sys")).await; // persisted (active = 1)
+        ctx.append(&make_msg(Role::User, "hi")).await; // persisted (active = 2)
+        ctx.append_in_memory(&make_msg(Role::User, "subagent done")); // window = 3, active = 2
+
+        let suffix = vec![make_msg(Role::User, "observer prompt")];
+        match ctx.input_marker_with_suffix(suffix).await {
+            LlmCallInputs::Inline(messages) => {
+                assert_eq!(
+                    messages.len(),
+                    4,
+                    "Inline must carry the full window (3) + suffix (1) verbatim"
+                );
+            }
+            other => panic!("expected Inline fallback, got {other:?}"),
+        }
     }
 
     #[tokio::test]
