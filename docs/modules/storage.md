@@ -47,6 +47,69 @@ The row schema carries **no read/unread state** — there is no `read_at`, `seen
 - `skill_risk_assessments` — finalized `RiskVerdict`s, keyed by `(skill_name, content_hash)`. The content hash's prefix tag distinguishes full-scope from primary-scope verdicts, so one table serves both scopes without an extra column.
 - `skill_risk_assessment_jobs` — in-flight full-scope assessments enqueued for the background worker (`AssessmentJob { skill_name, content_hash, source_path, status, attempts, last_error, created_at, updated_at }`, status one of `Pending`/`InProgress`/`Failed`). Written _before_ the channel send so a crash between persist and send is recoverable; `load_pending_jobs()` re-enqueues survivors on startup. `forget(skill)` deletes from both tables so a removed skill doesn't leave orphan work behind.
 
+### Session transcript: the append-only ordinal log
+
+The conversation transcript lives in `session_messages` as a per-session
+**append-only log**, never an in-place mutable list. Each row is keyed by
+`(session_id, ordinal)`, where `ordinal` is a dense, monotonic, per-session
+sequence assigned at append time (`MAX(ordinal) + 1`). Rows are never deleted
+or rewritten — this is user-facing core data (see the never-delete rule in the
+repo `CLAUDE.md`). Columns: `role`, `content` (the serialized `ChatMessage`),
+`created_at`, `source` (`MessageSource`: `user` / `cron` / `agent` — tells a
+genuine prompt and a cron fire apart from the agent's own injected `user`-role
+rows), and `superseded_by`.
+
+**The ordinal is the load-bearing primitive.** Because it is stable, dense, and
+durable, other subsystems reference a transcript position *by value* (one `i64`)
+instead of copying message content:
+
+- `session_summaries.cursor` is the ordinal high-water mark of the last
+  successful summary pass.
+- trace `LlmCallInputs::Persisted { last_ordinal, .. }` records the slice an LLM
+  call saw by ordinal rather than inlining it — keeps span storage constant per
+  call instead of cloning a growing prefix every turn. See [trace.md](trace.md).
+
+**Compaction supersedes, it never deletes.** `/compact` and background
+summarisation both go through `apply_session_compaction(session, new_active)`,
+which in one transaction (a) bulk-marks every currently-active row
+`superseded_by = <first new ordinal>`, then (b) appends `new_active` at the next
+contiguous ordinals. The pre-compaction rows stay in the table forever (the full
+transcript is always recoverable); only their `superseded_by` flips from NULL to
+the summary's ordinal.
+
+**Two derived views over the one log:**
+
+- **Active set** — rows where `superseded_by IS NULL`, ordered by `ordinal`:
+  the live LLM context. Served by `load_active_session_messages`; a partial index
+  `idx_session_messages_active` on `(session_id, ordinal) WHERE superseded_by IS
+  NULL` makes it a back-of-index walk, never a full scan.
+- **Full history** — every row ever appended, ignoring `superseded_by`.
+
+**"Active as of ordinal N"** is the reconstruction that lets a stored ordinal
+recover the exact active slice that *was* live when `N` was the head, even after
+later compactions supersede those rows:
+
+```
+WHERE ordinal <= N AND (superseded_by IS NULL OR superseded_by > N)
+```
+
+A row superseded by a *later* compaction (`superseded_by > N`) was still part of
+the snapshot at `N`; a row superseded at or before `N` was not. This filter is
+what makes the ordinal references above replay-stable across compaction.
+
+**Two implementations of that filter, kept in lockstep.** The write-side
+snapshot — `load_active_session_messages_up_to(session, N)`, plain SQL
+`superseded_by IS NULL AND ordinal <= N` — is *time-sensitive*: it returns what
+is active *right now*. The read-side reconstruction (trace hydration over
+`load_session_messages_with_supersede`, which loads every row plus its marker)
+applies the `superseded_by > N` form above. They agree only at the instant
+before the referenced rows are superseded — which holds because a reference is
+captured at call time (rows still active) and the at-most-one-compaction-in-
+flight invariant rules out a concurrent supersede. A differential test pins the
+equivalence so the two filters can't drift apart silently. The remaining helpers
+— `latest_session_ordinal`, `count_active_messages`, `active_index_of_ordinal` —
+exist to anchor and validate those references.
+
 ### Single backend: libsql
 
 All store implementations use libsql (async-native, SQLite-compatible). There is no rusqlite or separate in-memory backend. `Store::open(path)` opens (or creates) a file-backed libsql database (creating parent directories if missing); `LibsqlPool::open_in_memory()` is still available for tests. `LibsqlPool` wraps a shared `libsql::Connection` behind `Arc` for cheap cloning across async tasks.
