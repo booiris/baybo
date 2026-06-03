@@ -71,14 +71,9 @@ CREATE TABLE session_summaries (
 
 `in_flight` / `in_flight_owner` are **inert legacy columns**. They once drove the durable at-most-one-in-flight gate when the pass ran in a separate maintenance actor. The pass now runs as a detached step inside the parent actor, gated by an in-memory `JoinHandle` (see [Spawn serialization](#spawn-serialization)) — nothing reads or writes these columns. They stay in `CREATE TABLE` only so old DBs need no migration; there is **no `DROP COLUMN` / cleanup migration** (per `feedback_no_legacy_data_migration.md`).
 
-### libsql — `is_normal_session` column on `sessions`
+### libsql — maintenance-session machinery removed (Phase 3 teardown)
 
-`sessions` declares `is_normal_session INTEGER NOT NULL DEFAULT 1` directly in its canonical `CREATE TABLE` (see `crates/storage/src/libsql/mod.rs`). This column and the maintenance-session machinery below are **retained but currently unused** by background compression — the pass no longer creates a maintenance row. They remain because other system-maintenance work (history review, memory consolidation) may use them, and removing them is out of scope (see [Retained, currently-unused machinery](#retained-currently-unused-machinery)).
-
-- Set to `0` at session creation when `LineageKind::SystemMaintenance`.
-- Default `SessionStore` queries add `WHERE is_normal_session = 1`.
-- Opt-in helpers (e.g. `list_all_sessions_including_maintenance`) include all rows.
-- Does **not** propagate to spawned children.
+The `is_normal_session` column on `sessions`, its partial index `idx_sessions_normal_last_active`, and the whole maintenance-session listing/lineage surface were **torn down** once the background pass moved into the parent actor (it never creates a maintenance row). Removed in this teardown: the `is_normal_session` column + index from the `sessions` `CREATE TABLE`, the `LineageKind::SystemMaintenance` variant, the `create_maintenance_session` / `list_*_maintenance_*` helpers, and the `WHERE is_normal_session = 1` predicates on the default listings. Per `feedback_no_legacy_data_migration.md` there is **no `DROP COLUMN` / cleanup migration**: the column and index simply vanish from fresh-DB schema, and any pre-existing maintenance rows in old DBs are orphaned and inert. Because `list_all` / `list_by_channel` no longer filter on `is_normal_session`, they would now select those legacy rows — whose `data` blob carries the deleted `lineage.kind = "system_maintenance"` and can no longer deserialize — so both list paths **skip a per-row deserialize failure (logged) instead of propagating it**, degrading a legacy maintenance row to "absent from listings" rather than failing the whole list.
 
 ### `aura-model` types (retained)
 
@@ -88,14 +83,9 @@ pub enum SystemReason {
     MemoryConsolidation,
     BackgroundCompression,         // retained; no longer drives a maintenance session
 }
-
-pub enum LineageKind {
-    Subagent,
-    SystemMaintenance,             // retained; not minted by background compression anymore
-}
 ```
 
-`SystemReason::BackgroundCompression` and `LineageKind::SystemMaintenance` are no longer constructed by the background-compression path (the pass attributes to the parent session, not a maintenance child). They are kept as `pub` items for the broader system-maintenance surface; being unused is intentional and is not a clippy warning. See [Retained, currently-unused machinery](#retained-currently-unused-machinery).
+`SystemReason::BackgroundCompression` is no longer constructed by the background-compression path (the pass attributes to the parent session, not a maintenance child). It is kept as a `pub` variant for the broader system-maintenance surface; being unused is intentional and is not a clippy warning. `LineageKind::SystemMaintenance` was **removed** in this teardown — `LineageKind` is now `{ Subagent }`.
 
 ## Trigger Conditions (parent side)
 
@@ -349,14 +339,13 @@ SELECT cost_micros FROM session_summaries WHERE session_id = ?;
 | `STATE_SESSIONS_DIR` | `"state/sessions"` | `aura-workspace` |
 | `SUMMARY_FILE_NAME` | `"summary.md"` | `aura-workspace` |
 
-## Retained, currently-unused machinery
+## Phase 3 teardown — maintenance-session machinery removed
 
-The background pass moved into the parent actor, but the broader **system-maintenance** scaffolding it once rode on was deliberately left in place (no Phase-3 removal in this change):
+The background pass moved into the parent actor (Phase 1+2), so the broader **system-maintenance** scaffolding it once rode on was torn down in Phase 3:
 
-- `LineageKind::SystemMaintenance`, `SystemReason::BackgroundCompression`, the `is_normal_session` column, and the maintenance-session helpers (`create_maintenance_session`, `list_active_maintenance_for_parent`, `list_unfinished_maintenance_sessions`, the `is_normal_session = 0` listings) all still compile and run.
-- The trace-lineage hydration that resolves a maintenance span back to its parent session is likewise retained.
-
-None of these are constructed by background compression anymore — the pass attributes to the parent session directly. They are `pub` (so no `dead_code` clippy warning) and may be reused by future system-maintenance work (history review, memory consolidation). The `session_summaries.in_flight` / `in_flight_owner` columns are the same story at the storage layer: inert, retained, no cleanup migration.
+- **Removed**: `LineageKind::SystemMaintenance` (`LineageKind` is now `{ Subagent }`); the `is_normal_session` column + `idx_sessions_normal_last_active` index on `sessions`; the maintenance-session helpers (`create_maintenance_session`, `list_active_maintenance_for_parent`, `list_all_maintenance_sessions`, `list_unfinished_maintenance_sessions`, `list_all_sessions_including_maintenance`); the `WHERE is_normal_session = 1` listing predicates; and the trace-lineage hydration (`hydration_log_session`) that resolved a maintenance span back to its parent session.
+- **Legacy robustness**: dropping the `is_normal_session = 1` filter means `list_all` / `list_by_channel` now select any pre-existing maintenance rows from old DBs. Their `data` blob carries `lineage.kind = "system_maintenance"`, which no longer deserializes, so both list paths **skip a per-row deserialize failure (logged) via `continue` instead of propagating with `?`** — a legacy maintenance row degrades to "absent from listings", not "whole list errors". A single-row `get(id)` against a legacy maintenance id may still return a clean `Err`; it must not panic. No `DROP`/cleanup migration was added (per `feedback_no_legacy_data_migration.md`); the orphaned rows stay inert.
+- **Retained**: `SystemReason::BackgroundCompression` (and `TriggerSource::System` / `TriggerKind::System`) stay as valid `pub` items — they are the trigger axis the in-actor System job still uses, and are dead-in-production-constructor only (no clippy warning). The `session_summaries.in_flight` / `in_flight_owner` columns are the same story at the storage layer: inert, retained, no cleanup migration.
 
 ## Known Limitations
 
