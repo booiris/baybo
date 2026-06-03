@@ -139,6 +139,15 @@ pub enum AgentEvent {
     /// Channels decide how to render; the TUI inlines it into scrollback
     /// styled by `level`, transports without a banner surface may drop it.
     Notice { level: NoticeLevel, text: String },
+    /// Out-of-band, *transient* progress narration for the in-flight turn
+    /// — the progress observer's one-line "what's happening now". Unlike
+    /// [`AgentEvent::Notice`] it is **not** terminal: the turn keeps
+    /// running after it. Channels that render a per-turn work block (the
+    /// web dashboard) must fold this into that block and keep it open
+    /// rather than collapsing the turn; simpler surfaces render it like an
+    /// `Info` notice. This is the user-facing twin of [`AgentEvent::Status`]
+    /// (compaction) but carries free text instead of a coarse phase.
+    Progress(String),
 }
 
 /// Outcome of a finished tool call, carried by

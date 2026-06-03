@@ -855,6 +855,7 @@ async fn enforce_pairing(
                 user_id: user_id.to_owned(),
                 level: "warn".to_owned(),
                 text,
+                transient: false,
             };
             if let Err(e) = sidecar.send_frame(notice).await {
                 tracing::debug!(error = %e, "send pairing notice failed");

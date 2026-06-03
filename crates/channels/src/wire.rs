@@ -319,6 +319,14 @@ pub enum Frame {
         user_id: String,
         level: String,
         text: String,
+        /// `true` for a *transient* mid-turn progress update (the progress
+        /// observer) rather than a terminal notice. Clients that render a
+        /// per-turn work block must fold it into the open block and keep
+        /// the turn going; clients without one render it like any notice.
+        /// Omitted on the wire when `false` (the default), so existing
+        /// terminal notices are byte-identical.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        transient: bool,
     },
     /// Server → client: a tool call is blocked waiting for the
     /// channel's user to approve or deny. Clients with an approval UX
@@ -692,6 +700,19 @@ mod tests {
             user_id: "u1".into(),
             level: "warn".into(),
             text: "heads up".into(),
+            transient: false,
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_transient_notice() {
+        let frame = Frame::Notice {
+            session_id: "s1".into(),
+            user_id: "u1".into(),
+            level: "info".into(),
+            text: "still working on it".into(),
+            transient: true,
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }

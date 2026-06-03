@@ -26,7 +26,8 @@ use tracing::{debug, error, info, warn};
 use crate::runtime::compression::CompressionRunner;
 use crate::runtime::error_recovery::ErrorHandler;
 use crate::runtime::progress_observer::{
-    ObserverState, ProgressObserverRunner, build_observer_prompt, should_fire_observer,
+    ObserverState, ProgressObserverRunner, build_observer_prompt, channel_wants_progress,
+    should_fire_observer,
 };
 use crate::runtime::scope::JobSpec;
 use aura_context::{LlmCallOutcome, LlmResponseMeta};
@@ -2041,7 +2042,7 @@ impl AgentLoop {
                             // Record only what actually reaches the user, so the
                             // next tick dedupes against their real view.
                             observer_state.sent_notices.push(text.clone());
-                            self.emit_progress_notice(delta_tx, session, text).await;
+                            self.emit_progress(delta_tx, session, text).await;
                         }
                     }
                     Ok(Ok(_)) => {}
@@ -2059,6 +2060,7 @@ impl AgentLoop {
             || !should_fire_observer(
                 delta_tx.is_some(),
                 session.trigger.kind() == aura_model::TriggerKind::User,
+                channel_wants_progress(&session.channel),
                 iterations,
                 turn_started,
                 observer_state.last_fired_at,
@@ -2130,10 +2132,12 @@ impl AgentLoop {
         }
     }
 
-    /// Emit the observer's one-line summary as an `Info` Notice. The text
-    /// is already scrubbed by the runner (`sanitize_llm_response`), so
-    /// this only routes it. No-op when the turn isn't streaming.
-    async fn emit_progress_notice(
+    /// Emit the observer's one-line summary as a transient
+    /// [`AgentEvent::Progress`] — non-terminal, so a work-block client
+    /// keeps the turn open around it. The text is already scrubbed by the
+    /// runner (`sanitize_llm_response`), so this only routes it. No-op when
+    /// the turn isn't streaming.
+    async fn emit_progress(
         &self,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         session: &Session,
@@ -2145,10 +2149,7 @@ impl AgentLoop {
                 session_id: session.id.clone(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
-                event: AgentEvent::Notice {
-                    level: aura_channels::NoticeLevel::Info,
-                    text,
-                },
+                event: AgentEvent::Progress(text),
             })
             .await;
     }

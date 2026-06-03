@@ -39,6 +39,13 @@ export interface AgentNotice {
   userId: string;
   level: NoticeLevel;
   text: string;
+  /**
+   * `true` for a transient mid-turn progress update (the progress
+   * observer) rather than a terminal notice. The turn keeps running
+   * after it, so a bot must keep its "typing"/working indicator alive
+   * instead of completing the turn. Absent/false for a terminal notice.
+   */
+  transient?: boolean;
 }
 
 /**
