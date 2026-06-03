@@ -1,6 +1,6 @@
 //! The progress-observer LLM call: a read-only, out-of-band summary of
-//! the in-flight turn, shipped to the user as an `AgentEvent::Notice` on
-//! a long UserChat turn. It is the user-facing twin of
+//! the in-flight turn, shipped to the user as a transient
+//! `AgentEvent::Progress` on a long UserChat turn. It is the user-facing twin of
 //! [`crate::runtime::compression::CompressionRunner`] and reuses the same
 //! step, span, attribution, and sanitize machinery, but it never writes
 //! back to the turn's context. The agent loop fires it at an iteration
@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use aura_llm::{Attribution, BillableLlm, ChatRequest, ModelInfo};
-use aura_model::{JobId, SessionId};
+use aura_model::{ChannelType, JobId, SessionId};
 use aura_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallInputs, LlmCallResult, SpanRecorder, StepKind,
 };
@@ -24,7 +24,7 @@ use crate::security::SecurityGateway;
 /// status condenser (PR #58) covers the sub-threshold window.
 pub(crate) const OBSERVER_APPEAR_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Minimum gap between successive observer Notices on one turn. Each tick
+/// Minimum gap between successive observer updates on one turn. Each tick
 /// is a billed LLM sub-call, so it stays sparse — milestones, not a heartbeat.
 pub(crate) const OBSERVER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(40);
 
@@ -45,7 +45,7 @@ Do not repeat any of them. Report only what has changed or advanced since the la
 "#;
 
 /// Per-turn observer state the agent loop threads through each tick: when
-/// the last Notice fired (throttle), the lines already shown (so the next
+/// the last update fired (throttle), the lines already shown (so the next
 /// tick can dedupe against the user's real view), and the detached call
 /// currently in flight (drained at the next boundary; at most one).
 #[derive(Default)]
@@ -75,13 +75,30 @@ pub(crate) fn build_observer_prompt(prior_notices: &[String]) -> String {
     format!("{prefix}{PROGRESS_OBSERVER_PROMPT}")
 }
 
+/// Whether `channel` wants the LLM progress narration. True for sidecar
+/// channels (telegram / weixin and any out-of-tree sidecar): text-only
+/// surfaces with no live work-block view, so a one-line "what's happening
+/// now" is the user's only in-turn feedback on a long turn. The web
+/// dashboard already streams reasoning + tool steps into its work block —
+/// the narration would be redundant there (and previously split that block
+/// in two) — and the one-shot CLI / TUI never display it, so both are
+/// skipped.
+///
+/// Sidecars are exactly the gateway's `Multiplexed` channel kinds: anything
+/// that isn't the `Subscribed` web (`http`) or CLI/TUI (`tui`). See the
+/// `ChannelKind` mapping in the gateway's channel boot.
+pub(crate) fn channel_wants_progress(channel: &ChannelType) -> bool {
+    *channel != ChannelType::http() && *channel != ChannelType::tui()
+}
+
 /// Pure gate (everything except the live cancel check, which the caller
-/// does separately). Extracted so the streaming / user / iteration /
-/// appear-after / throttle logic is unit-testable without an LLM or real
-/// wall-clock waits.
+/// does separately). Extracted so the streaming / user / channel /
+/// iteration / appear-after / throttle logic is unit-testable without an
+/// LLM or real wall-clock waits.
 pub(crate) fn should_fire_observer(
     is_streaming: bool,
     trigger_is_user: bool,
+    channel_wants_progress: bool,
     iterations: usize,
     turn_started: std::time::Instant,
     last_observer_at: Option<std::time::Instant>,
@@ -89,6 +106,7 @@ pub(crate) fn should_fire_observer(
 ) -> bool {
     is_streaming
         && trigger_is_user
+        && channel_wants_progress
         // iteration 1 is the original turn; ≥1 tool round must have run
         // for there to be progress worth summarizing.
         && iterations > 1
@@ -214,13 +232,17 @@ mod gate_tests {
     //! `should_fire_observer` is the pure throttle / appear gate. Instants
     //! are built relative to a base so the timing logic is tested without
     //! real wall-clock waits.
-    use super::{OBSERVER_APPEAR_AFTER, OBSERVER_MIN_INTERVAL, should_fire_observer};
+    use super::{
+        OBSERVER_APPEAR_AFTER, OBSERVER_MIN_INTERVAL, channel_wants_progress, should_fire_observer,
+    };
+    use aura_model::ChannelType;
     use std::time::{Duration, Instant};
 
     #[test]
     fn fires_after_appear_with_no_prior_notice() {
         let t0 = Instant::now();
         assert!(should_fire_observer(
+            true,
             true,
             true,
             2,
@@ -236,6 +258,7 @@ mod gate_tests {
         assert!(!should_fire_observer(
             true,
             true,
+            true,
             5,
             t0,
             None,
@@ -247,6 +270,7 @@ mod gate_tests {
     fn never_fires_on_the_first_iteration() {
         let t0 = Instant::now();
         assert!(!should_fire_observer(
+            true,
             true,
             true,
             1,
@@ -262,6 +286,7 @@ mod gate_tests {
         assert!(!should_fire_observer(
             true,
             false,
+            true,
             5,
             t0,
             None,
@@ -275,6 +300,23 @@ mod gate_tests {
         assert!(!should_fire_observer(
             false,
             true,
+            true,
+            5,
+            t0,
+            None,
+            t0 + OBSERVER_APPEAR_AFTER
+        ));
+    }
+
+    #[test]
+    fn never_fires_for_a_channel_that_does_not_want_progress() {
+        let t0 = Instant::now();
+        // Every timing/trigger gate passes; only the channel is ineligible
+        // (the web work block or the CLI), so the observer must stay silent.
+        assert!(!should_fire_observer(
+            true,
+            true,
+            false,
             5,
             t0,
             None,
@@ -287,7 +329,15 @@ mod gate_tests {
         let t0 = Instant::now();
         let now = t0 + OBSERVER_APPEAR_AFTER + OBSERVER_MIN_INTERVAL;
         // A notice just went out at `now` → the next one is suppressed.
-        assert!(!should_fire_observer(true, true, 9, t0, Some(now), now));
+        assert!(!should_fire_observer(
+            true,
+            true,
+            true,
+            9,
+            t0,
+            Some(now),
+            now
+        ));
     }
 
     #[test]
@@ -295,7 +345,25 @@ mod gate_tests {
         let t0 = Instant::now();
         let last = t0 + OBSERVER_APPEAR_AFTER;
         let now = last + OBSERVER_MIN_INTERVAL;
-        assert!(should_fire_observer(true, true, 9, t0, Some(last), now));
+        assert!(should_fire_observer(
+            true,
+            true,
+            true,
+            9,
+            t0,
+            Some(last),
+            now
+        ));
+    }
+
+    #[test]
+    fn only_sidecar_channels_want_progress() {
+        // Sidecars (telegram/weixin) are text-only, so they get the
+        // narration; the web has a work block and the CLI/TUI don't show it.
+        assert!(channel_wants_progress(&ChannelType::telegram()));
+        assert!(channel_wants_progress(&ChannelType::weixin()));
+        assert!(!channel_wants_progress(&ChannelType::http()));
+        assert!(!channel_wants_progress(&ChannelType::tui()));
     }
 }
 

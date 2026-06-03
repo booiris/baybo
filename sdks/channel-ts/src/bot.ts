@@ -731,7 +731,16 @@ export class BotChannel<BotHandle, ChatId>
   }
 
   async onNotice(notice: AgentNotice): Promise<void> {
-    this.completeTypingTurn(notice.userId);
+    if (notice.transient) {
+      // Mid-turn progress narration (the observer), NOT the turn's reply:
+      // the turn keeps running, so refresh the typing safety like a
+      // tool/status event rather than completing the turn — otherwise the
+      // indicator drops mid-turn, which on a no-status-surface platform
+      // (weixin) is the user's only "still working" signal.
+      this.refreshTypingSafety(notice.userId);
+    } else {
+      this.completeTypingTurn(notice.userId);
+    }
     // A notice is its own out-of-band message, not the turn's terminal
     // reply — keep the status bubble alive, just refresh its liveness.
     this.statusCondenser?.touch(notice.userId);

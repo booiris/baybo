@@ -672,6 +672,45 @@ test("progress events keep typing alive through an active turn past the safety c
   assert.equal(typed, afterQuiet, "typing caps once progress stops");
 });
 
+test("a transient notice keeps typing alive; a terminal notice ends the turn", async () => {
+  const fake = makePlatform();
+  let typed = 0;
+  fake.platform.notifyTyping = async () => { typed++; };
+  // No status hooks → no condenser; the weixin shape, where typing is the
+  // only "still working" signal. The progress observer's mid-turn notice
+  // must NOT drop it (the bug: onNotice used to complete the turn).
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    typingRefreshMs: 10,
+    typingSafetyMs: 50,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  fake.emit({ chat: 42, platformUserId: "u", content: "hi" });
+
+  // Transient progress notices every ~25ms (under the 50ms cap) for
+  // ~150ms — well past where a quiet turn would have capped at 50ms.
+  for (let i = 0; i < 6; i++) {
+    await new Promise((r) => setTimeout(r, 25));
+    await channel.onNotice({
+      sessionId: "s", userId: "test_b1_42_u", level: "info",
+      text: `progress ${i}`, transient: true,
+    });
+  }
+  assert.ok(typed >= 8, `transient notices must keep typing alive (got ${typed})`);
+
+  // A terminal notice IS the turn's reply → it completes the turn and
+  // typing stops (the only inbound's pending counter reaches zero).
+  const beforeReply = typed;
+  await channel.onNotice({
+    sessionId: "s", userId: "test_b1_42_u", level: "info",
+    text: "done", transient: false,
+  });
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(typed, beforeReply, "a terminal notice stops typing");
+});
+
 test("StopBot cancels pending typing sessions for that bot", async () => {
   const fake = makePlatform();
   let typed = 0;

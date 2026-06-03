@@ -237,6 +237,9 @@ test("runChannel round-trips every frame shape across a real WS hop", async () =
     userId: "tg_42",
     level: "warn",
     text: "low battery",
+    // A plain notice carries no `transient` flag on the wire; the runner
+    // normalizes the absent field to `false` before `onNotice`.
+    transient: false,
   });
   // Only the assistant-role message reaches onMessage — the role:"user"
   // frame the fixture also sent is dropped by the runner's defensive

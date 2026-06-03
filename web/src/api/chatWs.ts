@@ -93,7 +93,17 @@ export type Frame =
       summary: string;
     }
   | { kind: 'status'; session_id: string; user_id?: string; phase: string }
-  | { kind: 'notice'; session_id: string; user_id?: string; level: string; text: string }
+  | {
+      kind: 'notice';
+      session_id: string;
+      user_id?: string;
+      level: string;
+      text: string;
+      /** `true` for a transient mid-turn progress update (the progress
+       *  observer), which must fold into the open work block rather than
+       *  end the turn. Absent/false for a terminal notice. */
+      transient?: boolean;
+    }
   | {
       kind: 'approval_requested';
       call_id: string;

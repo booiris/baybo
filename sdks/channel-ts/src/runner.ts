@@ -598,6 +598,7 @@ function dispatchFrame(
             userId: frame.user_id ?? "",
             level,
             text: frame.text,
+            transient: frame.transient ?? false,
           }),
         "onNotice",
         logger,

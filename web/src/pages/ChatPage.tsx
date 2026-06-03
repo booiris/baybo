@@ -1744,6 +1744,26 @@ function routeInboundFrame(
     }
     case 'notice': {
       const sid = frame.session_id;
+      // A transient notice is the progress observer's mid-turn narration,
+      // NOT the turn's reply: fold it into the open work block as a status
+      // step and leave the turn running, exactly like the `status`
+      // (compaction) path. Treating it as terminal here is what split one
+      // long turn into two `Worked Xs` blocks — the observer collapsed the
+      // block, then later tool activity opened a fresh one.
+      if (frame.transient) {
+        setViews((prev) => {
+          const view = prev[sid] ?? EMPTY_VIEW;
+          return {
+            ...prev,
+            [sid]: {
+              ...view,
+              transcript: pushStatusStep(view.transcript, frame.text),
+              awaitingReply: false,
+            },
+          };
+        });
+        return;
+      }
       setViews((prev) => {
         const view = prev[sid] ?? EMPTY_VIEW;
         // A notice is terminal for the turn (slash-command reply,

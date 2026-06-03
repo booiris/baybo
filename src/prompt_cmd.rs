@@ -340,10 +340,13 @@ async fn consume_inprocess_turn(
                 return Ok(writer.into_answer());
             }
             AgentEvent::Notice { level, text } => eprint_notice(level, &text),
+            // Transient turn progress (reasoning, tool steps, compaction
+            // status, observer narration) isn't part of the one-shot answer.
             AgentEvent::Reasoning(_)
             | AgentEvent::ToolStarted { .. }
             | AgentEvent::ToolCompleted { .. }
-            | AgentEvent::Status(_) => {}
+            | AgentEvent::Status(_)
+            | AgentEvent::Progress(_) => {}
         }
     }
     writer.finish_incomplete()

@@ -389,8 +389,21 @@ async fn agent_output_to_frame(
                 user_id,
                 level: level.to_owned(),
                 text,
+                transient: false,
             }
         }
+        // Transient progress narration (the observer) rides the same
+        // notice frame so banner-only surfaces (TUI, sidecars) render it
+        // exactly like an info notice; the `transient` flag tells a
+        // work-block client (web) to fold it into the open turn instead
+        // of collapsing it.
+        AgentEvent::Progress(text) => Frame::Notice {
+            session_id,
+            user_id,
+            level: "info".to_owned(),
+            text,
+            transient: true,
+        },
     }
 }
 
@@ -506,8 +519,10 @@ async fn stat_attachment(
 #[cfg(test)]
 mod tests {
     use super::resolve_or_install_channel;
-    use aura_channels::ChannelRegistry;
+    use aura_channels::wire::Frame;
+    use aura_channels::{AgentEvent, AgentOutput, ChannelRegistry, NoticeLevel};
     use aura_model::ChannelType;
+    use aura_storage::test_support::MemoryBlobStore;
     use std::sync::Arc;
 
     /// An installed channel is returned directly without invoking the
@@ -544,5 +559,60 @@ mod tests {
             registry.get(&ct).is_some(),
             "lazy install must publish to the registry so a second connect hits the hot path",
         );
+    }
+
+    /// The progress observer's `Progress` rides the notice frame so
+    /// banner-only surfaces render it like any info notice, but carries
+    /// `transient: true` so a work-block client folds it into the open
+    /// turn instead of collapsing it (the "two `Worked Xs`" bug).
+    #[tokio::test]
+    async fn progress_event_maps_to_transient_info_notice() {
+        let out = AgentOutput {
+            session_id: "s1".into(),
+            user_id: "u1".to_owned(),
+            channel: ChannelType::http(),
+            event: AgentEvent::Progress("still working on it".to_owned()),
+        };
+        let blobs = MemoryBlobStore::new();
+        let frame = super::agent_output_to_frame(out, &ChannelType::http(), &blobs).await;
+        match frame {
+            Frame::Notice {
+                level,
+                text,
+                transient,
+                ..
+            } => {
+                assert_eq!(level, "info");
+                assert_eq!(text, "still working on it");
+                assert!(transient, "progress must be transient");
+            }
+            other => panic!("expected a notice frame, got {other:?}"),
+        }
+    }
+
+    /// A genuine (terminal) notice maps to `transient: false` so it stays
+    /// the turn's reply and downstream clients see byte-identical frames.
+    #[tokio::test]
+    async fn notice_event_is_not_transient() {
+        let out = AgentOutput {
+            session_id: "s1".into(),
+            user_id: "u1".to_owned(),
+            channel: ChannelType::http(),
+            event: AgentEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: "heads up".to_owned(),
+            },
+        };
+        let blobs = MemoryBlobStore::new();
+        let frame = super::agent_output_to_frame(out, &ChannelType::http(), &blobs).await;
+        match frame {
+            Frame::Notice {
+                level, transient, ..
+            } => {
+                assert_eq!(level, "warn");
+                assert!(!transient, "a terminal notice must not be transient");
+            }
+            other => panic!("expected a notice frame, got {other:?}"),
+        }
     }
 }
