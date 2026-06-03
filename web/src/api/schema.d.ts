@@ -1104,7 +1104,7 @@ export interface components {
          *     label for the trace browser list view.
          * @enum {string}
          */
-        SessionKind: "user" | "cron" | "compression" | "subagent";
+        SessionKind: "user" | "cron" | "subagent";
         /** @description `PUT /v1/config` body. */
         SetConfigRequest: {
             path: string;
@@ -2652,11 +2652,7 @@ export interface operations {
                 until?: string;
                 /** @description Case-insensitive substring on session id. */
                 q?: string;
-                /**
-                 * @description Filter on coarse trigger/lineage label. `compression` matches no
-                 *     live row — background compression runs as an in-actor step, not a
-                 *     separate session — so it yields an empty listing.
-                 */
+                /** @description Filter on coarse trigger/lineage label. */
                 kind?: components["schemas"]["SessionKind"];
                 limit?: number;
                 offset?: number;

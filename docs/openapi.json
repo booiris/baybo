@@ -2005,7 +2005,7 @@
           {
             "name": "kind",
             "in": "query",
-            "description": "Filter on coarse trigger/lineage label. `compression` matches no\nlive row — background compression runs as an in-actor step, not a\nseparate session — so it yields an empty listing.",
+            "description": "Filter on coarse trigger/lineage label.",
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/SessionKind"
@@ -3391,7 +3391,6 @@
         "enum": [
           "user",
           "cron",
-          "compression",
           "subagent"
         ]
       },

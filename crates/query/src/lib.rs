@@ -162,11 +162,6 @@ pub enum SessionKind {
     User,
     /// Root cron-triggered session.
     Cron,
-    /// `System`-triggered session — the `derive_session_kind` bucket for
-    /// a `TriggerSource::System` row. Background compression runs as an
-    /// in-actor step, so nothing currently produces this kind and the
-    /// filter yields an empty listing.
-    Compression,
     /// Subagent spawned by another session — its trigger is inherited
     /// from the root, but `lineage.kind == Subagent` wins for display.
     Subagent,
@@ -182,7 +177,6 @@ fn derive_session_kind(session: &Session) -> SessionKind {
     }
     match session.trigger {
         aura_model::TriggerSource::Cron { .. } => SessionKind::Cron,
-        aura_model::TriggerSource::System { .. } => SessionKind::Compression,
         aura_model::TriggerSource::User => SessionKind::User,
     }
 }

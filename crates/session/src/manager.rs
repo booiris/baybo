@@ -131,7 +131,6 @@ impl SessionManager {
         let prefix = match &trigger {
             TriggerSource::User => "",
             TriggerSource::Cron { .. } => "cron-",
-            TriggerSource::System { .. } => "system-",
         };
         let id = SessionId::from(format!("{prefix}{}", uuid::Uuid::new_v4()));
         self.create_session_with_id(id, user, channel, trigger)

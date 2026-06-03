@@ -296,15 +296,13 @@ fn cron_prompt_blocks(action_payload: &serde_json::Value) -> Vec<ContentBlock> {
 
 /// Whether the `on_session_end` memory hook should fire for this session.
 /// The session-level analogue of [`memory_recall_query`]: only sessions a person
-/// would call "theirs" — root `User`/`Cron` sessions. Subagent and
-/// `System`-triggered (background compression) actors send `ActorStop`
-/// when they finish, but their shutdown is not a user-session ending.
-/// Exhaustive arms force a classification when a new `TriggerSource` /
-/// `LineageKind` variant is added.
+/// would call "theirs" — root `User`/`Cron` sessions, not subagents.
+/// Subagent actors send `ActorStop` when they finish, but their shutdown
+/// is not a user-session ending. Exhaustive arms force a classification
+/// when a new `TriggerSource` / `LineageKind` variant is added.
 fn should_fire_session_end(session: &Session) -> bool {
     let user_trigger = match &session.trigger {
         TriggerSource::User | TriggerSource::Cron { .. } => true,
-        TriggerSource::System { .. } => false,
     };
     let user_lineage = match &session.lineage {
         None => true,
@@ -2722,8 +2720,8 @@ mod session_end_gate_tests {
     //! for them would write garbage memory.
     use super::should_fire_session_end;
     use aura_model::{
-        ChannelType, JobId, Lineage, LineageKind, Session, SessionId, SessionState, SystemReason,
-        TriggerSource, User,
+        ChannelType, JobId, Lineage, LineageKind, Session, SessionId, SessionState, TriggerSource,
+        User,
     };
     use chrono::Utc;
 
@@ -2782,19 +2780,6 @@ mod session_end_gate_tests {
             TriggerSource::User,
             Some(lineage),
         )));
-    }
-
-    #[test]
-    fn skips_root_system_session() {
-        // No lineage but System trigger → still a system-class actor
-        // (background compression's trigger axis), not a user session.
-        let s = session_with(
-            TriggerSource::System {
-                reason: SystemReason::BackgroundCompression,
-            },
-            None,
-        );
-        assert!(!should_fire_session_end(&s));
     }
 }
 

@@ -37,7 +37,7 @@ Bottom-up along the dependency graph:
 - **workspace** — Identity files and long-running configuration.
 - **cron** — Cron scheduling: the `CronScheduler` business logic and `CronError`, standard cron syntax. The cron data types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`) now live in `model` (re-exported here for back-compat); the `CronStore` trait lives in `store`.
 - **context** — Per-actor token budget + compression strategy + transcript ownership (`ContextManager`). Pure in-memory; persistence is the agent loop's job, brokered through `SessionStore` from `session`.
-- **session** — Owns the session business logic: the `SessionManager` facade (CRUD, timeout cleanup, transcript / summary persistence helpers) and `SessionError` (with `From<StorageError>`). The `SessionStore` / `SessionSummaryStore` traits and their `StoredMessage` / `SessionSummaryRow` row types now live in `store`; session domain types (`User`, `ChannelType`, `Session`, `SessionState`, `TriggerSource`, `SystemReason`, `Lineage`) live in `model`; `aura-storage` provides the libsql implementations. A `Session` is the top of one trace tree (1 trace = 1 session); subagent and maintenance spawn create new sessions linked through `Lineage`.
+- **session** — Owns the session business logic: the `SessionManager` facade (CRUD, timeout cleanup, transcript / summary persistence helpers) and `SessionError` (with `From<StorageError>`). The `SessionStore` / `SessionSummaryStore` traits and their `StoredMessage` / `SessionSummaryRow` row types now live in `store`; session domain types (`User`, `ChannelType`, `Session`, `SessionState`, `TriggerSource`, `Lineage`) live in `model`; `aura-storage` provides the libsql implementations. A `Session` is the top of one trace tree (1 trace = 1 session); subagent spawn creates new sessions linked through `Lineage`.
 
 ### Runtime and Observability Layer
 
@@ -62,7 +62,7 @@ Bottom-up along the dependency graph:
 ## Cross-Cutting Guides
 
 - [testing.md](../testing.md) — Test pyramid (unit / crate-level / cross-crate), `test-support` gating, fixture inventory, and the six conventions every new test should follow.
-- [background-compression.md](../background-compression.md) — Async per-session summary maintenance (`SystemReason::BackgroundCompression`); runs as an in-actor detached step on the parent's `AgentLoop`, attributing to the parent session. Trigger gates in `agent`, fast-path strategy + summary metadata in `context`, on-disk summary file under `<workspace>/state/sessions/<id>/`, `session_summaries` table in `storage`.
+- [background-compression.md](../background-compression.md) — Async per-session summary maintenance; runs as an in-actor detached step on the parent's `AgentLoop`, attributing to the parent session. Trigger gates in `agent`, fast-path strategy + summary metadata in `context`, on-disk summary file under `<workspace>/state/sessions/<id>/`, `session_summaries` table in `storage`.
 
 ## Dependency Overview
 

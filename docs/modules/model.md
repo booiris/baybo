@@ -7,7 +7,7 @@
 Contents:
 
 - **Content models**: `ContentBlock`, `BlobRef`, `ChatMessage`, `Role`, `MessageSource`, `ThinkingContent`, `MessageMetadata` (now an empty struct), plus the `TOOL_OUTPUT_OPEN_PREFIX` / `TOOL_OUTPUT_CLOSE_PREFIX` marker constants
-- **Session types**: `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `SystemReason`, `Lineage`, `LineageKind`, `BackgroundCompressionPayload`
+- **Session types**: `Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `Lineage`, `LineageKind`, `BackgroundCompressionPayload`
 - **Memory types**: `MessageSource::RecalledMemory` (the framed recall-injection marker) + the `ChatMessage::recalled_memory` constructor
 - **Governance types**: `TrustLevel`, `ArtifactSource`, `ExtensionManifest`, `ExtensionKind`
 - **Cost & money types**: `CostRecord`, `CostSummary`, `TimeRange`, `MicroUsd` (integer micro-USD; the project never uses floats for money)
@@ -22,7 +22,7 @@ Contents:
 
 ### Minimal scope
 
-`model` retains the data types that are shared by two or more layers (channel, LLM, storage, agent) and cannot naturally belong to any single one — content primitives, cross-cutting domain records, ID newtypes, and protocol shapes. Session/user domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `SystemReason`, `Lineage`, `LineageKind`) live here so every consumer (channels, agent, storage, session manager) shares one shape; `aura-session` re-uses them via `aura_model` and adds only the lifecycle manager + error type. Message types live in `channels`, operation types in `job`, and per-module error types replace any shared error enum. Governance types (`TrustLevel`, `ArtifactSource`) also live here as they are consumed by both `tools` and `skills`. Filesystem addresses (`WorkspacePaths`, `IdentityKind`, the workspace-relative filename constants, `AURA_CONFIG_PATH`) live in `aura-workspace::paths`, not here — they are workspace-shaped data, not content primitives.
+`model` retains the data types that are shared by two or more layers (channel, LLM, storage, agent) and cannot naturally belong to any single one — content primitives, cross-cutting domain records, ID newtypes, and protocol shapes. Session/user domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `Lineage`, `LineageKind`) live here so every consumer (channels, agent, storage, session manager) shares one shape; `aura-session` re-uses them via `aura_model` and adds only the lifecycle manager + error type. Message types live in `channels`, operation types in `job`, and per-module error types replace any shared error enum. Governance types (`TrustLevel`, `ArtifactSource`) also live here as they are consumed by both `tools` and `skills`. Filesystem addresses (`WorkspacePaths`, `IdentityKind`, the workspace-relative filename constants, `AURA_CONFIG_PATH`) live in `aura-workspace::paths`, not here — they are workspace-shaped data, not content primitives.
 
 ### Media by reference, not inline
 

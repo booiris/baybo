@@ -93,7 +93,6 @@ impl std::fmt::Display for ChannelType {
 pub enum TriggerSource {
     User,
     Cron { cron_job_id: String },
-    System { reason: SystemReason },
 }
 
 impl TriggerSource {
@@ -103,7 +102,6 @@ impl TriggerSource {
         match self {
             TriggerSource::User => TriggerKind::User,
             TriggerSource::Cron { .. } => TriggerKind::Cron,
-            TriggerSource::System { .. } => TriggerKind::System,
         }
     }
 }
@@ -123,23 +121,6 @@ pub enum TriggerKind {
     Cron,
     System,
     Spawned,
-}
-
-/// Why an internal subsystem started this session.
-///
-/// Closed enum — add a variant when a new subsystem needs to attribute
-/// work back to itself. Never use the open-ended `Other` antipattern.
-///
-/// Acts as the discriminator-only label persisted on `Session.trigger`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SystemReason {
-    /// Async per-session background summary — a `BackgroundCompressionRunner` actor
-    /// reads its parent's transcript, generates an updated summary, and
-    /// writes `<workspace>/state/sessions/<parent_id>/summary.md` plus
-    /// the `session_summaries` metadata row. Triggered between turns
-    /// from the parent's agent loop. See `docs/background-compression.md`.
-    BackgroundCompression,
 }
 
 /// Payload carried by a background compression trigger. Built by the
@@ -329,17 +310,6 @@ mod tests {
     }
 
     #[test]
-    fn trigger_source_system_round_trip() {
-        let t = TriggerSource::System {
-            reason: SystemReason::BackgroundCompression,
-        };
-        let s = serde_json::to_string(&t).unwrap();
-        let back: TriggerSource = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, t);
-        assert_eq!(back.kind(), TriggerKind::System);
-    }
-
-    #[test]
     fn lineage_subagent_round_trip() {
         let l = Lineage {
             parent_session_id: SessionId::from("cli-parent"),
@@ -369,17 +339,6 @@ mod tests {
         let back: Lineage = serde_json::from_str(&s).unwrap();
         assert!(back.parent_span_id.is_none());
         assert_eq!(back.kind, LineageKind::Subagent);
-    }
-
-    #[test]
-    fn trigger_source_system_background_compression_round_trip() {
-        let t = TriggerSource::System {
-            reason: SystemReason::BackgroundCompression,
-        };
-        let s = serde_json::to_string(&t).unwrap();
-        let back: TriggerSource = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, t);
-        assert_eq!(back.kind(), TriggerKind::System);
     }
 
     #[test]
