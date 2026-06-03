@@ -1,6 +1,6 @@
 # Background Compression — Design
 
-A cross-cutting feature that runs the existing compression operation in a second, **background** mode in addition to the original **inline** one. The inline path (`ContextManager::maybe_compress`'s 3-stage compressor — summary.md fast-path → live LLM summary → truncate fallback) blocks the user's turn for one synchronous LLM round-trip whenever the budget threshold trips and stage 1 misses. The background path is a **detached task the parent's own `AgentLoop` spawns** between LLM iterations / at end-of-job: it precomputes the summary asynchronously and persists it per-session; at compression time the inline compressor's stage-1 fast-path swaps it into the output deterministically, so the inline LLM call is skipped whenever the precomputed summary is available. Both paths share `compression::CompressionRunner` for the actual LLM dispatch; the background pass bills + traces against the **parent** session.
+A cross-cutting feature that runs the existing compression operation in a second, **background** mode in addition to the original **inline** one. The inline path (`ContextManager::maybe_compress`'s 3-stage compressor — summary.md fast-path → live LLM summary → truncate fallback) blocks the user's turn for one synchronous LLM round-trip whenever the budget threshold trips and stage 1 misses. The background path is a **detached task the session's own `AgentLoop` spawns** between LLM iterations / at end-of-job: it precomputes the summary asynchronously and persists it per-session; at compression time the inline compressor's stage-1 fast-path swaps it into the output deterministically, so the inline LLM call is skipped whenever the precomputed summary is available. Both paths share `compression::CompressionRunner` for the actual LLM dispatch; the background pass bills + traces against the session.
 
 Affected crates: `aura-model`, `aura-storage`, `aura-session`, `aura-context`, `aura-agent`, `aura-workspace`.
 
@@ -11,14 +11,14 @@ See also: [`docs/modules/context.md`](modules/context.md), [`docs/modules/sessio
 Quality-first, latency-second. Without precomputed summaries, the compressor's stage-2 LLM call fires synchronously inside the agent loop, blocking the user's turn for one LLM round-trip every time the budget threshold trips. The background path moves summary generation off the hot path so:
 
 1. **Quality**: each summary pass refines the previous one with full transcript access; terminology stays consistent across passes; detail can grow as conversation accumulates.
-2. **Latency**: at compression time, the parent assembles `[system + summary + recent + skill_trailer]` from the precomputed `summary.md` — no LLM call on the hot path.
+2. **Latency**: at compression time, the session assembles `[system + summary + recent + skill_trailer]` from the precomputed `summary.md` — no LLM call on the hot path.
 
 ## Architecture
 
-Two paths, decoupled, both inside the parent actor. The background pass is a detached `tokio::spawn` off the parent's `AgentLoop` (mirroring `AgentLoop::spawn_session_end_write`):
+Two paths, decoupled, both inside the session's actor. The background pass is a detached `tokio::spawn` off the session's `AgentLoop` (mirroring `AgentLoop::spawn_session_end_write`):
 
 ```
-Parent session (TriggerKind::User|Cron)
+Session (TriggerKind::User|Cron)
   AgentActor → AgentLoop
     ├─ end-of-iteration check  ──→ maybe_run_background_compression(job_done=false)
     ├─ end-of-job check        ──→ maybe_run_background_compression(job_done=true)
@@ -27,9 +27,9 @@ Parent session (TriggerKind::User|Cron)
     │            mint JobInput::System job (attributed to PARENT session,
     │            parent_job_id = triggering turn's job)
     │              → BackgroundCompressionRunner::run → aura_context::run_background_summary:
-    │                  1. load parent's session_messages (active, ordinal ≤ up_to_ordinal)
+    │                  1. load the session's session_messages (active, ordinal ≤ up_to_ordinal)
     │                  2. read summary.md (if exists)
-    │                  3. one tool-free LLM call (same model as parent)
+    │                  3. one tool-free LLM call (same model as the session)
     │                  4. atomic write summary.md (tempfile + rename)
     │                  5. update libsql metadata (retry on transient failure)
     │          store the JoinHandle on AgentLoop.bg_compression
@@ -67,9 +67,9 @@ CREATE TABLE session_summaries (
 );
 ```
 
-## Trigger Conditions (parent side)
+## Trigger Conditions (session side)
 
-Two checkpoints in the parent's `AgentLoop`, both gated by a 3-way conjunction:
+Two checkpoints in the session's `AgentLoop`, both gated by a 3-way conjunction:
 
 ```
 fire_summary = tokens_now > 0.5 × max_tokens                  (a)
@@ -107,7 +107,7 @@ Before measuring the anchor-relative clauses (b) and (c), the gate reads `sessio
 
 ### Spawn serialization
 
-At most one in-flight background pass per parent session, enforced **in-memory** by a `JoinHandle` field on the parent's `AgentLoop` (`AgentLoop.bg_compression: Option<JoinHandle<()>>`):
+At most one in-flight background pass per session, enforced **in-memory** by a `JoinHandle` field on the session's `AgentLoop` (`AgentLoop.bg_compression: Option<JoinHandle<()>>`):
 
 ```rust
 // In AgentLoop::maybe_run_background_compression, before doing anything:
@@ -122,7 +122,7 @@ After a successful spawn the new `JoinHandle` is stored back on `self.bg_compres
 
 ## The detached background pass
 
-### Spawn (entirely inside the parent's `AgentLoop`)
+### Spawn (entirely inside the session's `AgentLoop`)
 
 `maybe_run_background_compression` pre-extracts everything the `'static` task needs (the spawned future cannot borrow `&self` / `&session`), then `tokio::spawn`s the pass directly — mirroring `AgentLoop::spawn_session_end_write`:
 
@@ -158,18 +158,18 @@ self.bg_compression = Some(handle);
 Key properties:
 
 - **Attribution is the session's.** `JobSpec.session_id`, and the `BackgroundCompressionRunner`'s `session_id` / `user_id`, are all the session's. The pass's cost row, `StepKind::Compression` step, and `LlmCall` span therefore attribute to the session/user.
-- **`session_trigger_kind: TriggerKind::System`** is passed purely to satisfy `JobInput::System`'s `allowed_for` gate (a `System` job is only admitted under a `System`-trigger session). The job row's real attribution keys off `session_id` above, which is the parent's.
+- **`session_trigger_kind: TriggerKind::System`** is passed purely to satisfy `JobInput::System`'s `allowed_for` gate (a `System` job is only admitted under a `System`-trigger session). The job row's real attribution keys off `session_id` above, which is the session's.
 - **`parent_job_id = Some(current_job_id)`** parents the minted `System` job under the triggering turn's job, so the trace nests correctly.
 - **Cancel token** is a fresh `CancellationToken::new()` that is never cancelled. It is **not** derived from the actor's token — see *Cancellation* below.
 
 ### `BackgroundCompressionRunner::run` → `aura_context::run_background_summary`
 
-`BackgroundCompressionRunner` (in `crates/agent/src/runtime/compression.rs`) is the agent-side adapter: it bundles the agent-layer deps (`BillableLlm`, `SpanRecorder`, `SecurityGateway`, `SessionManager`, `WorkspacePaths`, tokenizer, model info, the parent identity, the minted `job_id`, and the cancel token), wraps a fresh `CompressionRunner` per LLM iteration into the context-crate callback shape, and delegates the actual flow to `aura_context::run_background_summary`. That flow:
+`BackgroundCompressionRunner` (in `crates/agent/src/runtime/compression.rs`) is the agent-side adapter: it bundles the agent-layer deps (`BillableLlm`, `SpanRecorder`, `SecurityGateway`, `SessionManager`, `WorkspacePaths`, tokenizer, model info, the session identity, the minted `job_id`, and the cancel token), wraps a fresh `CompressionRunner` per LLM iteration into the context-crate callback shape, and delegates the actual flow to `aura_context::run_background_summary`. That flow:
 
-1. Load parent's active messages up to `up_to_ordinal` (`load_active_session_messages_up_to`).
-2. Load `summary.md` from `<workspace>/state/sessions/<parent_id>/summary.md` (None if absent).
+1. Load the session's active messages up to `up_to_ordinal` (`load_active_session_messages_up_to`).
+2. Load `summary.md` from `<workspace>/state/sessions/<session_id>/summary.md` (None if absent).
 3. Build `ChatRequest` (extended `SUMMARIZE_INSTRUCTION`, see Appendix A).
-4. Call the chat callback — each call opens its own `StepKind::Compression` + `LlmCall` span via `CompressionRunner::run`. No tools. Same model as the parent.
+4. Call the chat callback — each call opens its own `StepKind::Compression` + `LlmCall` span via `CompressionRunner::run`. No tools. Same model as the session.
 5. Parse response (`<analysis>` + `<summary>` block; reuse `parse_summary_response`).
 6. **Atomic file write**: write to `summary.md.tmp`, fsync, rename to `summary.md`.
 7. **libsql metadata update** (retry on transient failure, leave FS orphan on exhaustion):
@@ -183,7 +183,7 @@ Key properties:
 
 ### Cancellation
 
-The detached pass uses a **fresh `CancellationToken::new()` that is never cancelled** — deliberately decoupled from the actor's `actor_token`. The actor reaper (`AgentSupervisor::reap_idle`) cancels an idle session's `actor_token`; if the pass's token derived from it, a reap that fires mid-pass would tear down an in-flight summary and waste the LLM call. By minting a standalone token we let an in-flight pass run to completion even if the parent actor is reaped between turns. This mirrors `spawn_session_end_write`, which mints its own `JobId` and runs detached for the same reason.
+The detached pass uses a **fresh `CancellationToken::new()` that is never cancelled** — deliberately decoupled from the actor's `actor_token`. The actor reaper (`AgentSupervisor::reap_idle`) cancels an idle session's `actor_token`; if the pass's token derived from it, a reap that fires mid-pass would tear down an in-flight summary and waste the LLM call. By minting a standalone token we let an in-flight pass run to completion even if the session's actor is reaped between turns. This mirrors `spawn_session_end_write`, which mints its own `JobId` and runs detached for the same reason.
 
 The trade-off is that a process shutdown does not actively cancel an in-flight pass; the task is detached and simply abandoned when the runtime stops. That is acceptable — the pass is idempotent (atomic file write + INSERT OR REPLACE), so an abandoned pass just leaves the previous summary in place and the next trigger fires fresh.
 
@@ -262,11 +262,11 @@ The first compression on every session pays a one-time synchronous-LLM-summary l
 | Compression fires while refresh in-flight | Fast-path reads the last-successful summary without waiting (stale-by-one tolerated) |
 | Compression fires before any summary written | Fall through to inner `Summarize` |
 | Refresh writes summary.md while compression reads | Atomic tempfile+rename — never partial |
-| Two refreshes interleave on same parent | In-memory `AgentLoop.bg_compression` `JoinHandle` rejects the second: a present, not-finished handle short-circuits the spawn. |
+| Two refreshes interleave on same session | In-memory `AgentLoop.bg_compression` `JoinHandle` rejects the second: a present, not-finished handle short-circuits the spawn. |
 | Stale cursor (covers very old prefix) | Recent slice must cover everything after cursor; if `summary + recent + skill_trailer > 0.6 × max_tokens`, fall through |
 | Process restart mid-pass | The detached task is abandoned (its `JoinHandle` lived only in the dead actor); the previous summary stays on disk and the next trigger fires fresh. A summary dir whose metadata row never committed is swept by the startup FS reaper. |
 
-## Cold-Start Recovery (parent side)
+## Cold-Start Recovery (session side)
 
 In `ContextManager::restore_from_store`:
 1. Load `session_messages` (existing behaviour).
@@ -278,7 +278,7 @@ In `ContextManager::restore_from_store`:
 
 The only startup cleanup the background path needs is the **FS sweep** in `reap_orphan_summaries` (`crates/agent/src/runtime/compression.rs`), run once per boot before the supervisor spawns any actors:
 
-- **FS orphans**: scan `<workspace>/state/sessions/*/`; for each directory name (a parent `session_id`), check `SELECT 1 FROM session_summaries WHERE session_id = ?`. If no row, delete the directory. This removes a summary dir left behind when a pass wrote `summary.md` (disk first) and then crashed before its metadata row committed.
+- **FS orphans**: scan `<workspace>/state/sessions/*/`; for each directory name (a `session_id`), check `SELECT 1 FROM session_summaries WHERE session_id = ?`. If no row, delete the directory. This removes a summary dir left behind when a pass wrote `summary.md` (disk first) and then crashed before its metadata row committed.
 
 A leftover orphan dir is otherwise harmless (the fast-path sees `summary_metadata == None` and falls through); the sweep just keeps the workspace tidy. Best-effort: errors are logged at `warn` and never block boot.
 
@@ -293,11 +293,11 @@ A leftover orphan dir is otherwise harmless (the fast-path sees `summary_metadat
 Each background-summary pass:
 
 - Wrapped in real `StepKind::Compression` + `SpanKind::LlmCall` span (same machinery as the inline `CompressionRunner`).
-- The LLM call is bound to an `Attribution` whose `session_id` / `user_id` are the **parent's** (the pass runs as a `JobInput::System` job under the parent session), so the cost row is charged against the **parent session**.
-- `session_summaries.cost_micros` accumulates the per-parent summary-spend total (informational rollup).
+- The LLM call is bound to an `Attribution` whose `session_id` / `user_id` are the **session's** (the pass runs as a `JobInput::System` job under the session), so the cost row is charged against the **session**.
+- `session_summaries.cost_micros` accumulates the per-session summary-spend total (informational rollup).
 - Per-pass detail is queryable via `cost_records` joined on `span_id`.
 
-Because the spend lands directly on the parent session, a "summary cost for session X" report is just:
+Because the spend lands directly on the session, a "summary cost for session X" report is just:
 
 ```sql
 SELECT cost_micros FROM session_summaries WHERE session_id = ?;
@@ -323,7 +323,7 @@ SELECT cost_micros FROM session_summaries WHERE session_id = ?;
 
 ### Pattern A creep after first compression
 
-After a fast-path or full-`Summarize` compression, the parent's *active* `session_messages` no longer contains the original conversation — it contains the compressed list. Subsequent `BackgroundCompressionRunner` passes load active messages only (`superseded_by IS NULL`), so they see the embedded prior summary blob as just-another-message rather than re-deriving from original turns.
+After a fast-path or full-`Summarize` compression, the session's *active* `session_messages` no longer contains the original conversation — it contains the compressed list. Subsequent `BackgroundCompressionRunner` passes load active messages only (`superseded_by IS NULL`), so they see the embedded prior summary blob as just-another-message rather than re-deriving from original turns.
 
 **Net effect**: Pattern B (authoritative rewrite from original transcript) is achieved on **pre-compression** passes only. Post-first-compression passes are effectively Pattern A (refine from prior summary + new turns). The summary prompt's "conversation is authoritative" instruction still helps because the prior summary appears verbatim in the messages and the LLM is told to use it as scaffolding — but the original transcript is unrecoverable from the active slice.
 

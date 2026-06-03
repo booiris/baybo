@@ -1,9 +1,9 @@
 //! Background summary pass.
 //!
-//! Iterative pass driven from the parent's in-actor background step:
+//! Iterative pass driven from the session's in-actor background step:
 //!
-//! 1. Load the parent's transcript up to a pinned ordinal.
-//! 2. Make sure `<workspace>/state/sessions/<parent>/summary.md` exists
+//! 1. Load the session's transcript up to a pinned ordinal.
+//! 2. Make sure `<workspace>/state/sessions/<session>/summary.md` exists
 //!    on disk — first pass writes `DEFAULT_NOTES_TEMPLATE` so the
 //!    model's `Edit` calls always land against a real file with the
 //!    canonical section scaffold.
@@ -67,7 +67,7 @@ const READ_TOOL_NAME: &str = "Read";
 const EDIT_TOOL_NAME: &str = "Edit";
 
 /// Default scaffold written to the prompt as `currentNotes` when the
-/// parent has no `summary.md` yet — gives the model fixed section
+/// the session has no `summary.md` yet — gives the model fixed section
 /// headers + italic descriptors to fill in. The italic descriptors are
 /// preserved verbatim across passes (see the `STRUCTURE PRESERVATION
 /// REMINDER` block of the prompt).
@@ -132,12 +132,12 @@ pub type BackgroundSummaryCallback =
 /// Required inputs for one [`run_background_summary`] pass. `model_id`
 /// is the LLM the chat callback will hit — recorded against
 /// `session_summaries` for telemetry. `tokenizer` is the same one the
-/// parent's `ContextManager` uses (see
+/// the session's `ContextManager` uses (see
 /// [`crate::ContextManager::tokenizer`]) so the prompt's per-section /
 /// total-budget appendices match the rest of the system's accounting.
 /// `cancel_token` is the detached pass's own token (a fresh
-/// `CancellationToken`, NOT derived from the parent actor's token, so an
-/// idle reap of the parent can't tear down an in-flight pass); the loop
+/// `CancellationToken`, NOT derived from the session actor's token, so an
+/// idle reap can't tear down an in-flight pass); the loop
 /// hands it to each tool call's [`ToolContext`] so the pass's own cancel
 /// cascades into any in-flight `Read` / `Edit` along with the LLM call.
 pub struct BackgroundSummaryConfig {
@@ -228,7 +228,7 @@ fn section_token_counts(notes: &str, tokenizer: &dyn Tokenizer) -> Vec<(String, 
     out
 }
 
-/// Trailing user prompt appended to the parent's transcript before the
+/// Trailing user prompt appended to the session's transcript before the
 /// LLM call. Substitutes `{{notesPath}}` / `{{currentNotes}}` into
 /// [`PROMPT_TEMPLATE`], then optionally appends size-budget directives
 /// when the existing notes already exceed
@@ -327,7 +327,7 @@ async fn load_session_transcript_up_to(
         session_id = %session_id,
         up_to_ordinal,
         loaded = out.len(),
-        "background summary: loaded parent transcript slice"
+        "background summary: loaded session transcript slice"
     );
     Ok(out)
 }
@@ -347,7 +347,7 @@ fn tool_def_from(tool: &dyn Tool) -> ToolDefinitionForLlm {
 /// Stub [`ToolContext`] for the in-loop `Read` / `Edit` calls. Both
 /// builtin tools mark `ctx` as unused, so the field values just have
 /// to compile — no real session/user/sandbox is exposed. The cancel
-/// token is the loop's own so a parent cancel cascades into any
+/// token is the loop's own so a cancel cascades into any
 /// in-flight tool call.
 fn make_tool_context(workspace_paths: &WorkspacePaths, cancel: CancellationToken) -> ToolContext {
     ToolContext {
@@ -465,7 +465,7 @@ async fn ensure_notes_file(
 }
 
 /// Execute one background-summary pass. Returns the structured outcome
-/// on success; on failure, increments the parent's `error_count` and
+/// on success; on failure, increments the session's `error_count` and
 /// returns the underlying error.
 ///
 /// The chat callback is the only agent-layer-coupled piece — it bundles
@@ -487,7 +487,7 @@ pub async fn run_background_summary(
     } = config;
 
     // `up_to_ordinal` pins the snapshot the trigger fired against so
-    // concurrent appends to the parent's transcript don't bleed into
+    // concurrent appends to the session's transcript don't bleed into
     // this pass' input.
     let transcript =
         match load_session_transcript_up_to(&sessions, &session_id, up_to_ordinal).await {
@@ -502,7 +502,7 @@ pub async fn run_background_summary(
     if transcript.is_empty() {
         warn!(
             session_id = %session_id,
-            "background summary: parent transcript is empty after load — skipping pass"
+            "background summary: session transcript is empty after load — skipping pass"
         );
         return Ok(BackgroundSummaryOutcome {
             cursor: up_to_ordinal,
@@ -531,7 +531,7 @@ pub async fn run_background_summary(
     };
 
     let notes_path = workspace.session_summary_file(session_id.as_str());
-    // The pinned parent transcript is the persisted prefix every
+    // The pinned session transcript is the persisted prefix every
     // iteration's trace span references by `up_to_ordinal`; everything
     // appended past this index (the summary prompt + the sub-loop's own
     // turns) is not in `session_messages` and rides inline as the suffix.
