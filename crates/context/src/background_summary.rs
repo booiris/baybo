@@ -135,11 +135,11 @@ pub type BackgroundSummaryCallback =
 /// parent's `ContextManager` uses (see
 /// [`crate::ContextManager::tokenizer`]) so the prompt's per-section /
 /// total-budget appendices match the rest of the system's accounting.
-/// `cancel_token` is the maintenance actor's lifetime token (a child
-/// of the parent's `actor_token` carried over the
-/// `SystemSpawnRequest`); the loop hands it to each tool call's
-/// [`ToolContext`] so a parent cancel cascades into any in-flight
-/// `Read` / `Edit` along with the LLM call.
+/// `cancel_token` is the detached pass's own token (a fresh
+/// `CancellationToken`, NOT derived from the parent actor's token, so an
+/// idle reap of the parent can't tear down an in-flight pass); the loop
+/// hands it to each tool call's [`ToolContext`] so the pass's own cancel
+/// cascades into any in-flight `Read` / `Edit` along with the LLM call.
 pub struct BackgroundSummaryConfig {
     pub workspace: Arc<WorkspacePaths>,
     pub sessions: Arc<SessionManager>,

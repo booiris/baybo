@@ -33,20 +33,6 @@ pub struct SessionSummaryRow {
     pub model_id: String,
     pub span_id: String,
     pub error_count: i64,
-    /// `true` while a `BackgroundCompressionRunner` pass is active for
-    /// this parent. Set by the trigger gate before emitting a
-    /// `SystemSpawnRequest` and cleared by
-    /// `record_summary_success`/`record_summary_failure`. The gate
-    /// reads this flag to enforce the at-most-one-in-flight invariant
-    /// without consulting the maintenance session row (which is kept
-    /// as audit history).
-    pub in_flight: bool,
-    /// Opaque owner token stamped onto the `in_flight = true` mark.
-    /// Used by the runner's defensive post-pass cleanup to do a
-    /// compare-and-clear (`WHERE in_flight_owner = ?`) so a stale
-    /// cleanup from a finished pass cannot wipe a newer pass'
-    /// in-flight mark. `None` whenever `in_flight` is false.
-    pub in_flight_owner: Option<String>,
 }
 
 /// Per-session summary metadata persistence.
@@ -91,49 +77,6 @@ pub trait SessionSummaryStore: Send + Sync {
         span_id: &str,
         updated_at: DateTime<Utc>,
     ) -> Result<()>;
-
-    /// Set the `in_flight` flag for `session_id`. UPSERTs a placeholder
-    /// row (cursor=0, pass_count=0, model_id="", span_id="") if none
-    /// exists, so the gate can mark a session in-flight before its
-    /// first successful pass has ever recorded. Other columns on an
-    /// existing row are left untouched.
-    ///
-    /// `owner` is the opaque token to stamp alongside the flag — pass
-    /// `Some(token)` when setting `in_flight = true`, `None` when
-    /// clearing. The clear path overwrites the prior owner token to
-    /// NULL unconditionally; for owner-checked clears that don't want
-    /// to clobber a newer pass' mark, use [`Self::clear_in_flight_if_owned`]
-    /// instead.
-    async fn set_in_flight(
-        &self,
-        session_id: &SessionId,
-        in_flight: bool,
-        owner: Option<&str>,
-        updated_at: DateTime<Utc>,
-    ) -> Result<()>;
-
-    /// Compare-and-clear: set `in_flight = 0` only when the row's
-    /// `in_flight_owner` matches `owner`. Returns `Ok(true)` when the
-    /// row was updated (the caller's pass still owned the mark) and
-    /// `Ok(false)` when no row matched (a newer pass took ownership,
-    /// or the row was already cleared by `record_summary_*`). Used by
-    /// the runner's defensive post-pass cleanup so a stale Pass A
-    /// finishing after a Pass B already remarked the parent cannot
-    /// wipe Pass B's mark.
-    async fn clear_in_flight_if_owned(
-        &self,
-        session_id: &SessionId,
-        owner: &str,
-        updated_at: DateTime<Utc>,
-    ) -> Result<bool>;
-
-    /// Reset `in_flight` to 0 across the entire table. Called once at
-    /// startup by the orphan reaper: a process that just started has
-    /// no in-flight passes by definition, so any leftover `in_flight = 1`
-    /// from a crash mid-mark (between `set_in_flight(true)` and the
-    /// router's `create_maintenance_session`) is stale. Also clears
-    /// `in_flight_owner` (no live process owns these tokens any more).
-    async fn clear_all_in_flight(&self) -> Result<()>;
 
     /// Hard-delete the row. Idempotent; returns `Ok(false)` if the
     /// row did not exist. Cascade from `sessions` is the normal path;

@@ -11,8 +11,7 @@ use aura_llm::{
 };
 use aura_memory::{Memory, MemoryContext};
 use aura_model::{
-    ChatMessage, ContentBlock, JobId, LlmEntryName, MessageSource, Role, SessionId,
-    SystemSpawnRequest, ThinkingContent,
+    ChatMessage, ContentBlock, JobId, LlmEntryName, MessageSource, Role, SessionId, ThinkingContent,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -332,35 +331,30 @@ pub struct AgentLoop {
     max_iterations: usize,
     security_gateway: Arc<SecurityGateway>,
     error_handler: ErrorHandler,
-    /// Lifetime token for the surrounding `AgentActor`. The spawner
-    /// factory derives the token once and threads it into both this
-    /// loop and the actor. The summary-refresh trigger gate clones it
-    /// into outgoing `SystemSpawnRequest`s so cancellation cascades
-    /// from the parent actor into its maintenance children
-    /// automatically.
-    actor_token: CancellationToken,
-    /// Sender half of the generic system-spawn channel. The router
-    /// consumes the receiving half. Today only the summary-refresh
-    /// trigger gate emits on it; future system tasks (history review,
-    /// memory consolidation, ...) will share the same channel via
-    /// other `SystemSpawnRequest` variants. `None` disables every
-    /// system-trigger gate that gates on it.
-    system_spawn_tx: Option<mpsc::Sender<SystemSpawnRequest>>,
-    /// Resolved workspace paths. Today only the summary-refresh
-    /// maintenance handler reads it (to write `summary.md`); other
-    /// future system handlers may want it too. `None` in tests that
-    /// don't exercise such handlers.
+    /// Resolved workspace paths. Today only the background-summary
+    /// pass reads it (to write `summary.md`); other future system
+    /// work may want it too. `None` in tests that don't exercise such
+    /// passes.
     workspace_paths: Option<Arc<aura_workspace::WorkspacePaths>>,
-    /// Cross-session manager — used by handlers that operate across
-    /// sessions (today: background summary, for transcript loads,
-    /// in-flight maintenance lookups, summary metadata writes).
-    /// Distinct from the `SessionManager` plumbed inside
-    /// `ContextManager` because that one is per-session-bound.
+    /// Cross-session manager — used by passes that operate across
+    /// sessions (today: background summary, for transcript loads and
+    /// summary metadata writes). Distinct from the `SessionManager`
+    /// plumbed inside `ContextManager` because that one is
+    /// per-session-bound.
     sessions: Option<Arc<crate::SessionManager>>,
     /// Pluggable long-term memory. `None` disables every memory hook (recall,
     /// `on_job_complete`) — the runtime wires `None` until a real
     /// implementation is registered.
     memory: Option<Arc<dyn Memory>>,
+    /// At-most-one handle for the in-actor background-summary pass. The
+    /// trigger gate ([`Self::maybe_run_background_compression`]) checks
+    /// it before spawning: a present, not-yet-finished handle means a
+    /// pass is already running for this session, so a second is skipped.
+    /// Detached (its own fresh `CancellationToken`, NOT derived from the
+    /// surrounding actor's token) so the idle reaper cancelling that
+    /// token can't kill an in-flight pass — mirrors
+    /// [`Self::spawn_session_end_write`].
+    bg_compression: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Construction bundle for [`AgentLoop`]. Every field maps 1:1 to a
@@ -378,18 +372,11 @@ pub struct AgentLoopConfig {
     pub context_manager: ContextManager,
     pub max_iterations: usize,
     pub security_gateway: Arc<SecurityGateway>,
-    /// Lifetime token for the surrounding `AgentActor`. The spawner
-    /// factory derives the actor token once and threads the same
-    /// handle into both this loop and the actor.
-    pub actor_token: CancellationToken,
-    /// Generic system-spawn channel sender (any
-    /// `SystemSpawnRequest` variant — today background summary).
-    pub system_spawn_tx: Option<mpsc::Sender<SystemSpawnRequest>>,
-    /// Workspace paths. Used by system handlers that touch on-disk
-    /// state.
+    /// Workspace paths. Used by the background-summary pass to write
+    /// on-disk `summary.md`.
     pub workspace_paths: Option<Arc<aura_workspace::WorkspacePaths>>,
-    /// Cross-session manager. Used by system handlers that operate
-    /// across sessions.
+    /// Cross-session manager. Used by the background-summary pass for
+    /// transcript loads + summary metadata writes.
     pub sessions: Option<Arc<crate::SessionManager>>,
     /// Pluggable long-term memory handle — one registered implementation, or
     /// `None` to disable the memory hooks (recall / `on_job_complete`).
@@ -406,8 +393,6 @@ impl AgentLoop {
             context_manager,
             max_iterations,
             security_gateway,
-            actor_token,
-            system_spawn_tx,
             workspace_paths,
             sessions,
             memory,
@@ -426,11 +411,10 @@ impl AgentLoop {
             max_iterations,
             security_gateway,
             error_handler: ErrorHandler::default(),
-            actor_token,
-            system_spawn_tx,
             workspace_paths,
             sessions,
             memory,
+            bg_compression: None,
         }
     }
 
@@ -612,7 +596,6 @@ impl AgentLoop {
         mut interjections: Option<&mut dyn InterjectionSource>,
         memory_query: Option<Vec<ContentBlock>>,
     ) -> anyhow::Result<(OutgoingMessage, Option<PendingMemoryWrite>)> {
-        let _ = job_lifecycle;
         self.context_manager.ensure_seeded().await;
 
         // Tool-authored notices (`AgentEvent::Notice`) ride the job-wide
@@ -704,8 +687,14 @@ impl AgentLoop {
                     }
                 }
                 // Iteration-boundary summary-refresh check.
-                self.maybe_spawn_background_compression(job_id, /* job_done */ false)
-                    .await;
+                self.maybe_run_background_compression(
+                    session,
+                    job_lifecycle,
+                    span_recorder,
+                    job_id,
+                    /* job_done */ false,
+                )
+                .await;
             }
 
             // Proactive compression before building the ChatRequest.
@@ -773,8 +762,14 @@ impl AgentLoop {
                     // End-of-job summary-refresh check. The activity
                     // disjunct is satisfied by `job_done = true`;
                     // the tokens / diff conjuncts still apply.
-                    self.maybe_spawn_background_compression(job_id, /* job_done */ true)
-                        .await;
+                    self.maybe_run_background_compression(
+                        session,
+                        job_lifecycle,
+                        span_recorder,
+                        job_id,
+                        /* job_done */ true,
+                    )
+                    .await;
                     // Capture the memory write inputs and return them up to
                     // `run()` — the actual `spawn_job_complete_write` fires
                     // **after** `with_job` accepts the job, so a cancel-race
@@ -2235,130 +2230,109 @@ impl AgentLoop {
         .await
     }
 
-    /// Parent-side trigger gate. Fires at iteration boundaries and
-    /// on terminal-state commit. When tokens and activity have
-    /// crossed their thresholds and no maintenance session is
-    /// already in flight for this parent, sends a
-    /// `SystemSpawnRequest::BackgroundCompression` on the system-spawn
-    /// channel for the router to materialise into a maintenance
-    /// session + actor. Fire-and-forget — a full or closed channel
-    /// never blocks the user's turn.
+    /// Parent-side trigger gate + in-actor detached background-summary
+    /// spawn. Fires at iteration boundaries and on terminal-state
+    /// commit. When tokens and activity have crossed their thresholds
+    /// (see [`ContextManager::maybe_request_background_summary`]) it
+    /// `tokio::spawn`s a DETACHED background-summary pass attributed to
+    /// **this** (parent) session — no new maintenance session, no router
+    /// hop. Fire-and-forget: the user's turn never blocks on it.
     ///
-    /// `job_done = true` is passed at end-of-job (where the
-    /// activity disjunct is trivially satisfied); `false` at
-    /// iteration boundaries (where it relies on
-    /// `tool_calls_since_anchor` exceeding the threshold).
+    /// `job_done = true` is passed at end-of-job (where the activity
+    /// disjunct is trivially satisfied); `false` at iteration boundaries
+    /// (where it relies on `tool_calls_since_anchor` exceeding the
+    /// threshold).
     ///
-    /// **Anchor-cursor sync (lazy pull).** The in-memory
-    /// `last_summary_anchor` is only advanced by inline-compression
-    /// applies. A successful background pass writes a fresh
-    /// `session_summaries.cursor` but doesn't touch this loop's
-    /// state — without intervention `tokens_since_anchor` would keep
-    /// reporting the same delta and the gate would re-spawn a fresh
-    /// pass on every later job. The fix is to read the metadata
-    /// **once per evaluation** (we already need the same row for
-    /// the `in_flight` check) and use its cursor to advance the
-    /// in-memory anchor before measuring `tokens_since_anchor` /
-    /// `tool_calls_since_anchor`. `sync_anchor_to_cursor` is
-    /// monotonic, so a stale cursor or one already inside a
-    /// rewritten slice is a no-op.
-    async fn maybe_spawn_background_compression(
+    /// **At-most-one** is enforced in-memory by [`Self::bg_compression`]:
+    /// if a pass is already running (handle present and not finished) we
+    /// skip rather than spawn a second. No durable in-flight flag.
+    ///
+    /// **Detached cancel token.** The pass gets a fresh
+    /// [`CancellationToken::new`] — NOT derived from the surrounding
+    /// actor's token — so the idle reaper cancelling that token can't
+    /// tear down an in-flight pass. Mirrors
+    /// [`Self::spawn_session_end_write`].
+    ///
+    /// **Anchor-cursor sync** lives in
+    /// `maybe_request_background_summary`: it reads
+    /// `session_summaries.cursor` and `sync_anchor_to_cursor`s the
+    /// in-memory anchor forward *before* measuring the anchor-relative
+    /// thresholds, so a session that crossed 50% once doesn't re-fire on
+    /// every later job.
+    async fn maybe_run_background_compression(
         &mut self,
-        current_job_id: aura_model::JobId,
-        job_done: bool,
-    ) {
-        let Some(tx) = self.system_spawn_tx.as_ref() else {
-            return;
-        };
-        let tx = tx.clone();
-        let actor_token = self.actor_token.clone();
-
-        self.context_manager
-            .maybe_request_background_summary(job_done, move |payload| {
-                let request = SystemSpawnRequest::BackgroundCompression {
-                    parent_session_id: payload.parent_session_id.clone(),
-                    parent_job_id: current_job_id,
-                    parent_actor_token: actor_token,
-                    payload,
-                };
-                // `TrySendError<SystemSpawnRequest>` carries the
-                // request back as its payload — large enough to trip
-                // clippy's `result_large_err`. The gate only needs the
-                // Display message for its rollback warn, so flatten
-                // here.
-                tx.try_send(request).map_err(|e| e.to_string())
-            })
-            .await;
-    }
-
-    /// Maintenance entry point — runs one async summary-refresh
-    /// pass on behalf of the parent session named in `payload`. The
-    /// surrounding actor (a System session with
-    /// `LineageKind::SystemMaintenance`) invokes this from its
-    /// `AgentMessage::SystemTrigger` mailbox handler, bypassing the
-    /// normal chat-turn `run` cycle entirely. Wraps the LLM call in
-    /// a `JobInput::System { reason: BackgroundCompression }` job so cost
-    /// + trace are properly attributed.
-    ///
-    /// Errors when `workspace_paths` or `sessions` are unwired (test
-    /// harnesses) — production bootstrap always sets both.
-    pub(crate) async fn run_background_compression(
-        &mut self,
-        session: &mut Session,
-        payload: aura_model::BackgroundCompressionPayload,
+        session: &Session,
         job_lifecycle: &Arc<JobLifecycle>,
         span_recorder: &Arc<SpanRecorder>,
-        cancel_token: CancellationToken,
-    ) -> anyhow::Result<aura_context::BackgroundSummaryOutcome> {
-        let workspace_paths = self
-            .workspace_paths
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow::anyhow!("workspace_paths not configured for background summary")
-            })?
-            .clone();
-        let sessions = self
-            .sessions
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("sessions not configured for background summary"))?
-            .clone();
-        // Held for the post-`with_job` defensive cleanup that
-        // guarantees `in_flight` is cleared even when the runner
-        // returns Err before reaching `record_summary_*` (cancel,
-        // job-lifecycle rejection, transcript load failure). The
-        // cleanup is gated on the owner token so a stale Pass A
-        // finishing after Pass B already remarked the parent cannot
-        // wipe Pass B's mark.
-        let cleanup_sessions = sessions.clone();
-        let parent_id_for_cleanup = payload.parent_session_id.clone();
-        let cleanup_owner = payload.in_flight_owner.clone();
+        current_job_id: JobId,
+        job_done: bool,
+    ) {
+        // At-most-one: a still-running pass blocks a second.
+        if let Some(handle) = self.bg_compression.as_ref()
+            && !handle.is_finished()
+        {
+            return;
+        }
+
+        let Some(payload) = self
+            .context_manager
+            .maybe_request_background_summary(job_done)
+            .await
+        else {
+            return;
+        };
+
+        // The pass writes on-disk `summary.md` + cross-session metadata,
+        // so both deps are required. Unwired only in test harnesses that
+        // don't exercise the pass — skip silently there.
+        let (Some(workspace_paths), Some(sessions)) =
+            (self.workspace_paths.clone(), self.sessions.clone())
+        else {
+            return;
+        };
+
+        // Pre-extract everything the 'static task needs — the spawned
+        // future cannot borrow `&self` / `&session`. session_id/user_id
+        // are the PARENT's: the pass bills + traces against the parent,
+        // not a maintenance session.
+        let parent_session_id = session.id.clone();
+        let parent_user_id = session.user.id.clone();
+        let effective_soul_version = session.bound_soul_version.clone();
         let llm_client = self.llm_client.clone();
         let security_gateway = self.security_gateway.clone();
         let tokenizer = Arc::clone(self.context_manager.tokenizer());
         let model_info = self.llm_client.model_info().clone();
-        let user_id = session.user.id.clone();
-        let maintenance_session_id = session.id.clone();
-        let recorder = span_recorder.clone();
+        let recorder = Arc::clone(span_recorder);
+        let job_lifecycle = Arc::clone(job_lifecycle);
 
-        let spec = JobSpec {
-            session_id: session.id.clone(),
-            session_trigger_kind: session.trigger.kind(),
-            input: aura_job::JobInput::System {
-                payload: payload.clone(),
-            },
-            effective_soul_version: session.bound_soul_version.clone(),
-            parent_job_id: session.lineage.as_ref().map(|l| l.parent_job_id),
-        };
+        // Fresh, never-cancelled token — NOT a child of the actor's
+        // token. The idle reaper cancels the actor token; deriving from
+        // it would let a reap mid-pass tear the summary down. Mirrors
+        // `spawn_session_end_write`.
+        let cancel_token = CancellationToken::new();
 
-        let result = crate::runtime::scope::with_job(
-            job_lifecycle,
-            cancel_token.clone(),
-            spec,
-            move |job_id| {
-                let payload = payload.clone();
-                let cancel_token = cancel_token.clone();
-                async move {
-                    let refresher = crate::runtime::compression::BackgroundCompressionRunner {
+        let handle = tokio::spawn(async move {
+            let spec = JobSpec {
+                session_id: parent_session_id,
+                // The pass is a `System` job, which `allowed_for` only
+                // admits under a `System`-trigger session. It now runs
+                // inside the PARENT actor (User / Cron trigger), so pass
+                // `System` here purely to clear the gate — the job row's
+                // attribution keys off `session_id` above, not this kind.
+                session_trigger_kind: aura_model::TriggerKind::System,
+                input: aura_job::JobInput::System {
+                    payload: payload.clone(),
+                },
+                effective_soul_version,
+                // Parent the System job under the triggering turn's job.
+                parent_job_id: Some(current_job_id),
+            };
+            let result = crate::runtime::scope::with_job(
+                &job_lifecycle,
+                cancel_token.clone(),
+                spec,
+                move |job_id| async move {
+                    let runner = crate::runtime::compression::BackgroundCompressionRunner {
                         llm_client,
                         security_gateway,
                         sessions,
@@ -2366,54 +2340,23 @@ impl AgentLoop {
                         tokenizer,
                         recorder,
                         model_info,
-                        maintenance_session_id,
-                        maintenance_user_id: user_id,
+                        parent_session_id: payload.parent_session_id.clone(),
+                        parent_user_id,
                         job_id,
                         cancel_token,
                     };
-                    let outcome = refresher.run(payload).await?;
+                    let outcome = runner.run(payload).await?;
                     let value = serde_json::to_value(&outcome)?;
                     let output = aura_job::JobOutput::Structured { value };
                     Ok((output, outcome))
-                }
-            },
-        )
-        .await;
-
-        // Defense in depth: CAS-clear `in_flight` after the runner
-        // returns. Successful and failed passes already clear the
-        // flag via `record_summary_success`/`record_summary_failure`
-        // (which also nulls `in_flight_owner`), so this owned-clear
-        // is a no-op on those paths. It only fires for runner exits
-        // that bypass `record_*` (cancellation before the runner
-        // started, job-lifecycle rejection, mid-await drop). The
-        // owner-token gate keeps a stale cleanup from this pass from
-        // wiping a fresher pass' mark.
-        match cleanup_sessions
-            .clear_summary_in_flight_if_owned(&parent_id_for_cleanup, &cleanup_owner)
-            .await
-        {
-            Ok(true) => {
-                debug!(
-                    parent_session_id = %parent_id_for_cleanup,
-                    owner_token = %cleanup_owner,
-                    "background summary: defensive in_flight clear fired (runner bypassed record_*)"
-                );
+                },
+            )
+            .await;
+            if let Err(e) = result {
+                warn!(error = %e, "background summary pass failed");
             }
-            Ok(false) => {
-                // Either record_* already cleared it, or a fresher
-                // pass took ownership — both are correct outcomes.
-            }
-            Err(e) => {
-                warn!(
-                    parent_session_id = %parent_id_for_cleanup,
-                    error = %e,
-                    "background summary: clear_summary_in_flight_if_owned after runner failed"
-                );
-            }
-        }
-
-        result
+        });
+        self.bg_compression = Some(handle);
     }
 }
 
@@ -2868,5 +2811,68 @@ mod session_end_gate_tests {
             None,
         );
         assert!(!should_fire_session_end(&s));
+    }
+}
+
+#[cfg(test)]
+mod bg_compression_at_most_one_tests {
+    //! Focused coverage of the at-most-one gate in
+    //! [`super::AgentLoop::maybe_run_background_compression`]:
+    //!
+    //! ```ignore
+    //! if let Some(handle) = self.bg_compression.as_ref()
+    //!     && !handle.is_finished() { return; }   // skip — pass already running
+    //! ```
+    //!
+    //! Wiring a full `AgentLoop` (LLM pool, tool registry/executor,
+    //! `ContextManager`, span recorder, …) into a unit test is
+    //! disproportionately heavy, so this asserts the load-bearing
+    //! predicate directly against real `tokio::task::JoinHandle`s — a
+    //! present, not-yet-finished handle blocks; a finished or absent one
+    //! lets the spawn through. The end-to-end "no second maintenance
+    //! session" behavior is covered in
+    //! `integration-tests/tests/background_compression_e2e.rs`.
+
+    use tokio::sync::oneshot;
+
+    /// Mirror of the gate: returns `true` when a NEW pass may be spawned.
+    fn may_spawn(handle: &Option<tokio::task::JoinHandle<()>>) -> bool {
+        !matches!(handle.as_ref(), Some(h) if !h.is_finished())
+    }
+
+    #[tokio::test]
+    async fn none_handle_allows_spawn() {
+        let handle: Option<tokio::task::JoinHandle<()>> = None;
+        assert!(may_spawn(&handle), "no in-flight pass ⇒ spawn allowed");
+    }
+
+    #[tokio::test]
+    async fn unfinished_handle_blocks_second_spawn() {
+        // A task parked on a oneshot stays unfinished until we release it.
+        let (tx, rx) = oneshot::channel::<()>();
+        let handle = Some(tokio::spawn(async move {
+            let _ = rx.await;
+        }));
+        assert!(
+            !may_spawn(&handle),
+            "an unfinished in-flight pass must block a second spawn"
+        );
+        // Release so the parked task can complete.
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn finished_handle_allows_spawn() {
+        // Spawn a trivial task and await it so the handle is observably
+        // finished, then re-check via a fresh `is_finished()` read. We
+        // keep the awaited handle (await on `&mut`) so `may_spawn` can
+        // inspect the same, now-finished, handle.
+        let mut h = tokio::spawn(async {});
+        (&mut h).await.unwrap();
+        let handle = Some(h);
+        assert!(
+            may_spawn(&handle),
+            "a finished pass must not block the next spawn"
+        );
     }
 }

@@ -8,8 +8,8 @@
 //!
 //! Two value families share this module:
 //!  * [`SystemSpawnRequest`] — the envelope the router consumes on its
-//!    `system_trigger_rx` arm. Today's variants cover background
-//!    summary compression and child-subagent dispatch.
+//!    `system_trigger_rx` arm. Today its sole variant covers
+//!    child-subagent dispatch.
 //!  * `Subagent*` — the per-spawn request / parent-context / result /
 //!    exit-status quadruple the LLM-facing `spawn_subagent` tool
 //!    exchanges with the router.
@@ -18,10 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    BackgroundCompressionPayload, ContentBlock, JobId, ModelTier, SessionId, SpanId,
-    SubagentBackend,
-};
+use crate::{ContentBlock, JobId, ModelTier, SessionId, SpanId, SubagentBackend};
 
 /// Tool name the LLM emits to spawn a subagent.
 pub const SPAWN_SUBAGENT_TOOL_NAME: &str = "spawn_subagent";
@@ -38,25 +35,19 @@ pub const SUBAGENT_CHANNEL_TAG: &str = "subagent";
 /// in-flight handles.
 pub const BACKGROUND_SUBAGENT_HANDLE_PREFIX: &str = "bg-";
 
-/// Request emitted by `AgentLoop`'s parent-side trigger gate and by
-/// the `spawn_subagent` tool, consumed by `Router`'s `system_trigger_rx`
-/// arm. Senders push onto an `mpsc::Sender<SystemSpawnRequest>`; the
-/// router does the session-create + actor-spawn + mailbox-dispatch.
+/// Request emitted by the `spawn_subagent` tool, consumed by `Router`'s
+/// `system_trigger_rx` arm. Senders push onto an
+/// `mpsc::Sender<SystemSpawnRequest>`; the router does the
+/// session-create + actor-spawn + mailbox-dispatch.
 ///
 /// `parent_actor_token` is the lifetime token of whatever component
-/// owns this spawn (parent actor for background-compression, parent
-/// per-job token for subagent dispatch). The router derives the
-/// spawned actor's `actor_token` as a child of it, so cancelling the
-/// parent cascades into the child via the `tokio_util` token tree
-/// — no explicit `Shutdown` mailbox dance required.
+/// owns this spawn (parent per-job token for subagent dispatch). The
+/// router derives the spawned actor's `actor_token` as a child of it,
+/// so cancelling the parent cascades into the child via the
+/// `tokio_util` token tree — no explicit `Shutdown` mailbox dance
+/// required.
 #[derive(Debug)]
 pub enum SystemSpawnRequest {
-    BackgroundCompression {
-        parent_session_id: SessionId,
-        parent_job_id: JobId,
-        parent_actor_token: CancellationToken,
-        payload: BackgroundCompressionPayload,
-    },
     Subagent {
         parent_session_id: SessionId,
         parent_job_id: JobId,
@@ -67,9 +58,9 @@ pub enum SystemSpawnRequest {
         /// job stay distinguishable.
         parent_span_id: SpanId,
         parent_actor_token: CancellationToken,
-        /// Boxed: the in-line variant is ~3× the size of
-        /// `BackgroundCompression`, so the box keeps `SystemSpawnRequest`
-        /// small on the channel (`clippy::large_enum_variant`).
+        /// Boxed to keep the channel message small — the inline request
+        /// is large, so the box keeps `SystemSpawnRequest` cheap to move
+        /// onto the `mpsc` queue (`clippy::large_enum_variant`).
         request: Box<SubagentSpawnRequest>,
         result_tx: oneshot::Sender<SubagentResult>,
     },

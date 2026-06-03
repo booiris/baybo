@@ -68,20 +68,6 @@ pub const RECENT_SLICE_MAX_TOKENS: usize = 40_000;
 /// Recent slice is bounded by `RECENT_SLICE_MAX_TOKENS`.
 pub const FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO: f64 = 0.6;
 
-/// Maximum wall-clock time the summary.md fast-path will wait for an
-/// in-flight `BackgroundCompressionRunner` pass to settle before
-/// reading the parent's `summary_metadata`. Mirrors Claude Code's
-/// `waitForSessionMemoryExtraction` budget. Bounded so a stuck
-/// refresh can't block a user turn indefinitely.
-pub const BACKGROUND_SUMMARY_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Poll interval used while waiting for an in-flight refresh pass to
-/// land. Fast enough that a sub-second pass barely shows up in
-/// latency, slow enough to keep the polling load on the metadata
-/// store negligible.
-pub const BACKGROUND_SUMMARY_WAIT_POLL_INTERVAL: std::time::Duration =
-    std::time::Duration::from_millis(250);
-
 pub type Result<T> = std::result::Result<T, ContextError>;
 
 use std::future::Future;
@@ -1180,39 +1166,32 @@ impl ContextManager {
             .count()
     }
 
-    /// Trigger-gate decision for the background background summary.
+    /// Trigger-gate decision for the background summary.
     ///
     /// Inspects the in-memory budget, the parent's `session_summaries`
-    /// row (in_flight flag + cursor), and the anchor-relative
-    /// diff/tool-call thresholds. When all gates pass:
-    ///   1. pins `up_to_ordinal` to the latest persisted ordinal
-    ///   2. mints a fresh owner token (UUID v4)
-    ///   3. marks the parent in_flight
-    ///   4. invokes `send` with the freshly-built payload — typically
-    ///      `mpsc::Sender::try_send` against the router's
-    ///      `system_spawn_tx` channel
-    ///   5. on `send` failure, rolls back the in_flight mark via
-    ///      compare-and-clear on the owner token.
+    /// cursor, and the anchor-relative diff/tool-call thresholds.
+    /// Returns `Some(payload)` when all gates pass — the caller (the
+    /// agent loop) owns the at-most-one-in-flight invariant via an
+    /// in-memory `JoinHandle` and spawns the detached pass itself.
+    /// Returns `None` otherwise.
     ///
     /// Side-effecting steps (`summary_metadata` round-trip,
-    /// `sync_anchor_to_cursor`, `mark_summary_in_flight`) only fire
+    /// `sync_anchor_to_cursor`, `latest_session_ordinal`) only fire
     /// after the cheap budget check, so callers can invoke this on
     /// every iteration without rate-limiting.
-    pub async fn maybe_request_background_summary<F, E>(&mut self, job_done: bool, send: F)
-    where
-        F: FnOnce(BackgroundCompressionPayload) -> std::result::Result<(), E>,
-        E: std::fmt::Display,
-    {
+    pub async fn maybe_request_background_summary(
+        &mut self,
+        job_done: bool,
+    ) -> Option<BackgroundCompressionPayload> {
         let max_tokens = self.budget.max_tokens();
         let tokens_now = self.budget.current();
         let tokens_threshold = (max_tokens as f64 * SUMMARY_TRIGGER_TOKEN_THRESHOLD_RATIO) as usize;
         if tokens_now <= tokens_threshold {
-            return;
+            return None;
         }
 
-        // One round-trip to the parent's `session_summaries` row
-        // covers two needs: (a) the `in_flight` gate, (b) the cursor of
-        // the latest successful pass. (b) pulls the in-memory anchor
+        // Read the parent's `session_summaries` row for the cursor of
+        // the latest successful pass. It pulls the in-memory anchor
         // forward *before* the anchor-relative threshold checks below
         // — otherwise a session that crossed the 50% mark once would
         // re-fire the background path on every subsequent job until
@@ -1225,17 +1204,10 @@ impl ContextManager {
                     error = %e,
                     "background-summary trigger: summary_metadata lookup failed; skipping"
                 );
-                return;
+                return None;
             }
         };
         if let Some(meta) = metadata.as_ref() {
-            if meta.in_flight {
-                debug!(
-                    parent_session_id = %self.session_id,
-                    "background-summary trigger: in_flight already set; skipping"
-                );
-                return;
-            }
             // `sync_anchor_to_cursor` is monotonic and a no-op when
             // the cursor isn't in the current active set.
             self.sync_anchor_to_cursor(meta.cursor).await;
@@ -1243,12 +1215,12 @@ impl ContextManager {
 
         let tokens_since = self.tokens_since_anchor();
         if tokens_since <= SUMMARY_DIFF_TOKEN_THRESHOLD {
-            return;
+            return None;
         }
 
         let tool_calls = self.tool_calls_since_anchor();
         if !job_done && tool_calls <= SUMMARY_TRIGGER_TOOL_CALL_THRESHOLD {
-            return;
+            return None;
         }
 
         // Pin the snapshot's upper bound at trigger time so concurrent
@@ -1262,18 +1234,8 @@ impl ContextManager {
                     error = %e,
                     "background-summary trigger: ordinal lookup failed; skipping"
                 );
-                return;
+                return None;
             }
-        };
-        // Fresh owner token per pass. Used as the CAS key for the
-        // runner's defensive in_flight cleanup so a stale Pass A
-        // finishing after Pass B remarked the parent cannot wipe
-        // Pass B's mark.
-        let owner_token = uuid::Uuid::new_v4().to_string();
-        let payload = BackgroundCompressionPayload {
-            parent_session_id: self.session_id.clone(),
-            up_to_ordinal,
-            in_flight_owner: owner_token.clone(),
         };
         debug!(
             parent_session_id = %self.session_id,
@@ -1282,50 +1244,13 @@ impl ContextManager {
             tool_calls,
             job_done,
             up_to_ordinal,
-            owner_token = %owner_token,
-            "background-summary trigger: spawning pass"
+            "background-summary trigger: gate passed"
         );
 
-        // Mark in-flight before the send so the next gate iteration on
-        // this parent observes the flag and skips. A persistence
-        // failure here means we cannot enforce the at-most-one
-        // invariant — abort the trigger rather than risk a duplicate
-        // pass.
-        if let Err(e) = self
-            .sessions
-            .mark_summary_in_flight(&self.session_id, &owner_token)
-            .await
-        {
-            warn!(
-                parent_session_id = %self.session_id,
-                error = %e,
-                "background-summary trigger: mark_summary_in_flight failed; skipping"
-            );
-            return;
-        }
-        if let Err(e) = send(payload) {
-            warn!(
-                parent_session_id = %self.session_id,
-                error = %e,
-                "background-summary trigger: system-spawn channel send failed; rolling back in_flight"
-            );
-            // Roll back the mark so the next iteration retries. CAS on
-            // owner_token so we don't clobber a mark a *different* pass
-            // landed in the same window. Failure is logged but
-            // otherwise tolerated; the orphan reaper is the last line
-            // of defense.
-            if let Err(e) = self
-                .sessions
-                .clear_summary_in_flight_if_owned(&self.session_id, &owner_token)
-                .await
-            {
-                warn!(
-                    parent_session_id = %self.session_id,
-                    error = %e,
-                    "background-summary trigger: clear_summary_in_flight_if_owned rollback failed"
-                );
-            }
-        }
+        Some(BackgroundCompressionPayload {
+            parent_session_id: self.session_id.clone(),
+            up_to_ordinal,
+        })
     }
 
     /// Read the anchor index. Test-only: production callers measure

@@ -1,5 +1,5 @@
-//! End-to-end exercise of the async-summary-refresh storage +
-//! orphan-reaper paths.
+//! End-to-end exercise of the in-actor background-summary pass +
+//! the FS orphan reaper.
 //!
 //! These tests stand up a libsql-backed `Store` and a real
 //! `SessionManager` with the `SessionSummaryStore` wired in, then
@@ -7,32 +7,38 @@
 //!
 //!  1. `record_summary_success` → `summary_metadata` round trip
 //!     across the `SessionManager` API.
-//!  2. Maintenance-session row management — verified indirectly by
-//!     checking that `active_maintenance_for_parent` (the gate the
-//!     in-flight serialization rule reads) and the cascade-on-delete
-//!     cover the `LineageKind::SystemMaintenance` rows.
-//!  3. `reap_maintenance_orphans` — DB rows deleted, parent's
-//!     `error_count` bumped, on-disk orphan summary directory
-//!     removed.
+//!  2. A full background-summary pass via `aura_context::run_background_summary`
+//!     (the same flow the in-actor `BackgroundCompressionRunner` delegates to):
+//!     it writes `summary.md`, advances `session_summaries.cursor`, and —
+//!     critically for the new model — creates NO maintenance session.
+//!  3. The inline fast-path's two on-disk inputs (`summary.md` +
+//!     `session_summaries.cursor`) are present after a pass.
+//!  4. `reap_maintenance_orphans` — FS-only now: an orphan summary
+//!     directory with no metadata row is removed; a known one survives.
 //!
-//! The full agent-loop wiring (LLM call, JobLifecycle, SpanRecorder)
-//! is exercised at the unit-test layer in `aura-agent::compression`
-//! and `aura-context::compressor`; this file focuses on the
-//! storage + filesystem boundary.
+//! The LLM call / JobLifecycle / SpanRecorder wrapping the pass is
+//! exercised at the `aura-agent` unit layer; this file focuses on the
+//! storage + filesystem boundary and the no-maintenance-session
+//! invariant.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::SessionManager;
 use aura_agent::compression::reap_maintenance_orphans;
+use aura_context::{
+    BackgroundSummaryConfig, SummaryChatRun, TiktokenTokenizer, run_background_summary,
+};
+use aura_llm::{LlmResponse, TokenUsage, ToolCallInfo};
 use aura_model::{
-    BackgroundCompressionPayload, ChannelType, JobId, Lineage, LineageKind, Session, SessionId,
+    ChannelType, ChatMessage, ContentBlock, JobId, Lineage, LineageKind, Session, SessionId,
     SessionState, SystemReason, TriggerSource, User,
 };
 use aura_storage::Store;
 use aura_workspace::WorkspacePaths;
 use chrono::Utc;
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 fn user(id: &str) -> User {
     User {
@@ -66,8 +72,14 @@ async fn fresh_store_and_paths() -> (Store, TempDir) {
     (store, dir)
 }
 
+/// A `summary.md` body line unique to the seeded scaffold. The fake
+/// LLM `Edit`-replaces it so the test can assert the file changed.
+const SEEDED_WORKLOG_MARKER: &str =
+    "_Step by step, what was attempted, done? Very terse summary for each step_";
+const PASS_SUMMARY_TEXT: &str = "user wired the background-summary pass into the parent actor";
+
 /// Round-trip a successful summary pass through the `SessionManager`
-/// wrapper layer — the same surface the `BackgroundCompressionRunner` uses.
+/// wrapper layer — the same surface the background pass uses.
 #[tokio::test]
 async fn record_then_read_summary_metadata_via_session_manager() {
     let (store, _dir) = fresh_store_and_paths().await;
@@ -113,48 +125,62 @@ async fn record_then_read_summary_metadata_via_session_manager() {
     assert_eq!(row.cost_micros, 12_346);
 }
 
-/// Maintenance sessions are filtered from default listings; the
-/// dedicated `active_maintenance_for_parent` lookup surfaces them.
-#[tokio::test]
-async fn maintenance_sessions_are_invisible_to_default_listings() {
-    let (store, _dir) = fresh_store_and_paths().await;
-    let parent = root_session("parent-1");
-    store.session.save(&parent).await.unwrap();
-
-    let mgr = SessionManager::new(store.session.clone(), store.session_summary.clone());
-
-    // Spawn one maintenance session for the parent.
-    let maint = mgr
-        .create_maintenance_session(&parent, JobId::new(), SystemReason::BackgroundCompression)
-        .await
-        .unwrap();
-    assert!(maint.id.as_str().starts_with("maint-"));
-
-    // `list()` (operator-facing) shows only the parent.
-    let listed = mgr.list().await.unwrap();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].id, parent.id);
-
-    // Lookup by parent surfaces the maintenance row.
-    let active = mgr.active_maintenance_for_parent(&parent.id).await.unwrap();
-    assert_eq!(active.len(), 1);
-    assert_eq!(active[0], maint.id);
-
-    // The maintenance set lookup also surfaces it.
-    let all = mgr.all_maintenance_sessions().await.unwrap();
-    assert_eq!(all.len(), 1);
-    assert_eq!(all[0], maint.id);
+/// Build a deterministic background-summary chat callback that, on its
+/// first call, issues one `Edit` rewriting the seeded worklog marker,
+/// and on every later call returns a no-tool-call response so the
+/// pass terminates. `Arc<AtomicUsize>` tracks the call count so the
+/// `FnMut` closure stays `Send`.
+fn fake_edit_then_stop(notes_path: std::path::PathBuf) -> aura_context::BackgroundSummaryCallback {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    Box::new(move |_req, _marker| {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        let notes_path = notes_path.clone();
+        Box::pin(async move {
+            let response = if n == 0 {
+                LlmResponse {
+                    content: String::new(),
+                    content_blocks: vec![],
+                    tool_calls: vec![ToolCallInfo {
+                        id: "edit-1".into(),
+                        name: "Edit".into(),
+                        arguments: serde_json::json!({
+                            "file_path": notes_path.display().to_string(),
+                            "old_string": SEEDED_WORKLOG_MARKER,
+                            "new_string": PASS_SUMMARY_TEXT,
+                        }),
+                        signature: None,
+                    }],
+                    usage: TokenUsage::default(),
+                    thinking: None,
+                }
+            } else {
+                LlmResponse {
+                    content: "done".into(),
+                    content_blocks: vec![ContentBlock::Text("done".into())],
+                    tool_calls: vec![],
+                    usage: TokenUsage::default(),
+                    thinking: None,
+                }
+            };
+            Ok(SummaryChatRun {
+                response,
+                span_id: format!("span-{n}"),
+                cost_micros: 100,
+            })
+        })
+    })
 }
 
-/// Orphan reaper end-to-end:
-///   - DB-side: maintenance session row is deleted, parent's
-///     `error_count` is bumped.
-///   - FS-side: a `summary.md` directory whose session has no
-///     metadata row is removed.
+/// The core new-model assertion: a background pass run inline (no
+/// maintenance session, no router hop) writes `summary.md`, advances
+/// `session_summaries.cursor` to the pinned ordinal, and leaves NO
+/// maintenance session row behind. Afterwards the inline fast-path's
+/// two on-disk inputs are both present.
 #[tokio::test]
-async fn orphan_reaper_cleans_db_and_fs() {
+async fn background_pass_writes_summary_and_advances_cursor_without_maintenance_session() {
     let (store, dir) = fresh_store_and_paths().await;
-    let parent = root_session("parent-orphan");
+    let parent = root_session("parent-inline");
     store.session.save(&parent).await.unwrap();
 
     let mgr = Arc::new(SessionManager::new(
@@ -162,23 +188,93 @@ async fn orphan_reaper_cleans_db_and_fs() {
         store.session_summary.clone(),
     ));
 
-    // Create a maintenance session — represents a pass that was
-    // running when the previous process crashed.
-    let maint = mgr
-        .create_maintenance_session(&parent, JobId::new(), SystemReason::BackgroundCompression)
+    // Two persisted parent turns so `load_active_session_messages_up_to`
+    // returns a non-empty transcript for the pass to summarize.
+    let o1 = mgr
+        .append_session_message(
+            &parent.id,
+            &ChatMessage::user(vec![ContentBlock::Text("how do I wire the pass?".into())]),
+        )
         .await
         .unwrap();
-    assert_eq!(
-        mgr.all_maintenance_sessions().await.unwrap().len(),
-        1,
-        "maintenance row must exist before reap"
+    let up_to_ordinal = mgr
+        .append_session_message(
+            &parent.id,
+            &ChatMessage::assistant(vec![ContentBlock::Text("spawn it detached".into())]),
+        )
+        .await
+        .unwrap();
+    assert!(up_to_ordinal > o1);
+
+    let paths = WorkspacePaths::new(dir.path().join("workspace"));
+    let notes_path = paths.session_summary_file(parent.id.as_str());
+
+    let config = BackgroundSummaryConfig {
+        workspace: Arc::new(paths.clone()),
+        sessions: Arc::clone(&mgr),
+        tokenizer: Arc::new(TiktokenTokenizer::for_model("test")),
+        parent_session_id: parent.id.clone(),
+        up_to_ordinal,
+        model_id: "test-model".into(),
+        cancel_token: CancellationToken::new(),
+    };
+    let outcome = run_background_summary(config, fake_edit_then_stop(notes_path.clone()))
+        .await
+        .expect("background summary pass should succeed");
+
+    // Pass outcome pins the cursor at the trigger-time ordinal.
+    assert_eq!(outcome.cursor, up_to_ordinal);
+
+    // summary.md was written and reflects the Edit the pass applied.
+    let body = tokio::fs::read_to_string(&notes_path)
+        .await
+        .expect("summary.md must exist after the pass");
+    assert!(
+        body.contains(PASS_SUMMARY_TEXT),
+        "summary.md must contain the edited text, got:\n{body}"
+    );
+    assert!(
+        !body.contains(SEEDED_WORKLOG_MARKER),
+        "the seeded marker must have been replaced"
     );
 
-    // Set up a workspace dir with one orphan summary file under
-    // `<root>/state/sessions/orphan-abc/summary.md`. No metadata
-    // row for `orphan-abc` exists, so the FS sweep should reap it.
-    let ws_root = dir.path().join("workspace");
-    let paths = WorkspacePaths::new(ws_root.clone());
+    // session_summaries.cursor advanced to the pinned ordinal.
+    let meta = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
+    assert_eq!(meta.cursor, up_to_ordinal);
+    assert_eq!(meta.pass_count, 1);
+
+    // The pass created NO maintenance session — the whole point of the
+    // in-actor model.
+    assert!(
+        mgr.all_maintenance_sessions().await.unwrap().is_empty(),
+        "in-actor background pass must NOT create a maintenance session"
+    );
+
+    // The inline fast-path reads exactly these two on-disk inputs; both
+    // are now present, so a subsequent turn's fast-path can hit.
+    assert!(notes_path.exists(), "fast-path reads summary.md");
+    assert!(
+        mgr.summary_metadata(&parent.id).await.unwrap().is_some(),
+        "fast-path reads session_summaries.cursor"
+    );
+}
+
+/// FS orphan reaper (now FS-only): an on-disk summary directory whose
+/// `session_id` has no `session_summaries` row is removed; a directory
+/// whose session HAS a row is preserved. No maintenance-session DB
+/// sweep happens anymore.
+#[tokio::test]
+async fn orphan_reaper_cleans_fs_orphans_only() {
+    let (store, dir) = fresh_store_and_paths().await;
+
+    let mgr = Arc::new(SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+    ));
+
+    let paths = WorkspacePaths::new(dir.path().join("workspace"));
+
+    // Orphan: a summary dir with no metadata row.
     let orphan_dir = paths.session_state_dir("orphan-abc");
     tokio::fs::create_dir_all(&orphan_dir).await.unwrap();
     tokio::fs::write(
@@ -189,8 +285,7 @@ async fn orphan_reaper_cleans_db_and_fs() {
     .unwrap();
     assert!(paths.session_summary_file("orphan-abc").exists());
 
-    // Set up a *non*-orphan summary too — this one HAS a metadata
-    // row, so the sweep must leave it alone.
+    // Known: a summary dir whose session HAS a metadata row.
     let kept_id = "still-known";
     let kept_session = root_session(kept_id);
     store.session.save(&kept_session).await.unwrap();
@@ -203,157 +298,32 @@ async fn orphan_reaper_cleans_db_and_fs() {
         .await
         .unwrap();
 
-    // Run the reaper.
     reap_maintenance_orphans(&mgr, &paths).await;
 
-    // DB: maintenance session deleted; parent's error_count = 1.
-    assert!(
-        mgr.all_maintenance_sessions().await.unwrap().is_empty(),
-        "maintenance row must be reaped"
-    );
-    assert!(
-        store.session.get(&maint.id).await.unwrap().is_none(),
-        "maintenance row must be hard-deleted"
-    );
-    let parent_meta = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
-    assert_eq!(parent_meta.error_count, 1);
-
-    // FS: orphan dir removed.
     assert!(
         !paths.session_summary_file("orphan-abc").exists(),
         "FS orphan must be deleted"
     );
-
-    // FS: known dir preserved.
     assert!(
         paths.session_summary_file(kept_id).exists(),
         "non-orphan summary must survive the sweep"
     );
 }
 
-/// Reaper preserves maintenance sessions whose job reached a
-/// terminal state — they are kept as audit history for the
-/// cost-records join. Only sessions whose job is still pending /
-/// in_progress / stuck (or has no job at all) get reaped.
+/// The reaper is a no-op when the sessions dir doesn't exist yet (fresh
+/// install, first boot before any session wrote a summary).
 #[tokio::test]
-async fn orphan_reaper_preserves_completed_maintenance_sessions() {
+async fn orphan_reaper_no_op_when_sessions_dir_missing() {
     let (store, dir) = fresh_store_and_paths().await;
-    let parent = root_session("parent-mixed");
-    store.session.save(&parent).await.unwrap();
-
     let mgr = Arc::new(SessionManager::new(
         store.session.clone(),
         store.session_summary.clone(),
     ));
-
-    // (a) A maintenance session whose pass *succeeded* — its job is
-    //     `Completed`. Reaper must keep it.
-    let completed_maint = mgr
-        .create_maintenance_session(&parent, JobId::new(), SystemReason::BackgroundCompression)
-        .await
-        .unwrap();
-    let mut completed_job = aura_job::Job::new(
-        completed_maint.id.clone(),
-        aura_job::JobInput::System {
-            payload: BackgroundCompressionPayload {
-                parent_session_id: parent.id.clone(),
-                up_to_ordinal: 0,
-                in_flight_owner: "test-owner-completed".into(),
-            },
-        },
-        "soul-v1",
-        None,
-    );
-    store
-        .job
-        .create(&completed_job.to_row().unwrap())
-        .await
-        .unwrap();
-    let _ = completed_job.start().unwrap();
-    let _ = completed_job
-        .complete(aura_job::JobOutput::Structured {
-            value: serde_json::json!({"cursor": 1}),
-        })
-        .unwrap();
-    store
-        .job
-        .save(&completed_job.to_row().unwrap())
-        .await
-        .unwrap();
-
-    // (b) A maintenance session whose job stayed `InProgress` — a
-    //     crash mid-pass. Reaper must delete it.
-    let in_flight_maint = mgr
-        .create_maintenance_session(&parent, JobId::new(), SystemReason::BackgroundCompression)
-        .await
-        .unwrap();
-    let mut in_flight_job = aura_job::Job::new(
-        in_flight_maint.id.clone(),
-        aura_job::JobInput::System {
-            payload: BackgroundCompressionPayload {
-                parent_session_id: parent.id.clone(),
-                up_to_ordinal: 0,
-                in_flight_owner: "test-owner-in-flight".into(),
-            },
-        },
-        "soul-v1",
-        None,
-    );
-    store
-        .job
-        .create(&in_flight_job.to_row().unwrap())
-        .await
-        .unwrap();
-    let _ = in_flight_job.start().unwrap();
-    store
-        .job
-        .save(&in_flight_job.to_row().unwrap())
-        .await
-        .unwrap();
-
-    // (c) A maintenance session with **no** job row — also reaped
-    //     (process died between session create and `with_job`).
-    let no_job_maint = mgr
-        .create_maintenance_session(&parent, JobId::new(), SystemReason::BackgroundCompression)
-        .await
-        .unwrap();
-
-    let ws_root = dir.path().join("workspace");
-    let paths = WorkspacePaths::new(ws_root.clone());
+    // Point at a workspace whose state/sessions dir was never created.
+    let paths = WorkspacePaths::new(dir.path().join("empty-workspace"));
+    // Must not panic / error.
     reap_maintenance_orphans(&mgr, &paths).await;
-
-    // The completed maintenance session survives.
-    assert!(
-        store
-            .session
-            .get(&completed_maint.id)
-            .await
-            .unwrap()
-            .is_some(),
-        "completed maintenance session must be preserved as audit history"
-    );
-
-    // The in-flight and no-job ones get deleted.
-    assert!(
-        store
-            .session
-            .get(&in_flight_maint.id)
-            .await
-            .unwrap()
-            .is_none(),
-        "in-flight maintenance session must be reaped"
-    );
-    assert!(
-        store.session.get(&no_job_maint.id).await.unwrap().is_none(),
-        "maintenance session without a job row must be reaped"
-    );
-
-    // Parent's error_count reflects exactly the two reaped passes.
-    let parent_meta = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
-    assert_eq!(
-        parent_meta.error_count, 2,
-        "error_count must bump only for reaped (unfinished) passes, not for completed ones"
-    );
+    assert!(!paths.state_sessions_dir().exists());
 }
 
 /// Cascade-on-delete: removing a parent session takes its
@@ -380,8 +350,8 @@ async fn parent_delete_cascades_summary_metadata() {
 
 /// `LineageKind::SystemMaintenance` round-trips through the libsql
 /// `lineage_kind_str` mapping — `list_lineage_children` returns the
-/// new variant. Belt-and-suspenders verification that the
-/// `system_maintenance` SQL string matches both write and read sides.
+/// variant. Phase-3 leaves the maintenance lineage scaffolding in place
+/// (intentionally unused by the runtime now), so this still holds.
 #[tokio::test]
 async fn lineage_kind_round_trips_for_system_maintenance() {
     let (store, _dir) = fresh_store_and_paths().await;
@@ -417,200 +387,6 @@ async fn lineage_kind_round_trips_for_system_maintenance() {
         .unwrap();
     assert_eq!(kids.len(), 1);
     assert!(matches!(kids[0].1, LineageKind::SystemMaintenance));
-}
-
-/// Trigger-gate `in_flight` lifecycle: marking the parent in-flight
-/// stamps the owner token; a recorded success clears flag and owner
-/// in one UPSERT; a stale CAS clear with the original owner is a
-/// no-op now that the owner is NULL.
-#[tokio::test]
-async fn in_flight_marks_then_clears_on_recorded_pass() {
-    let (store, _dir) = fresh_store_and_paths().await;
-    let parent = root_session("parent-in-flight");
-    store.session.save(&parent).await.unwrap();
-
-    let mgr = SessionManager::new(store.session.clone(), store.session_summary.clone());
-
-    // Initially no metadata row at all.
-    assert!(mgr.summary_metadata(&parent.id).await.unwrap().is_none());
-
-    // Gate marks in-flight before emitting the spawn — placeholder row
-    // is created carrying `in_flight = true`, the owner token, and
-    // zero-valued counters.
-    let owner_a = "owner-A";
-    mgr.mark_summary_in_flight(&parent.id, owner_a)
-        .await
-        .unwrap();
-    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
-    assert!(row.in_flight);
-    assert_eq!(row.in_flight_owner.as_deref(), Some(owner_a));
-    assert_eq!(row.cursor, 0);
-    assert_eq!(row.pass_count, 0);
-
-    // Runner records success → flag cleared in the same UPSERT that
-    // bumps `pass_count`, advances `cursor`, and nulls the owner.
-    mgr.record_summary_success(&parent.id, 7, 1_000, "m", "span", Utc::now())
-        .await
-        .unwrap();
-    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
-    assert!(!row.in_flight);
-    assert!(row.in_flight_owner.is_none());
-    assert_eq!(row.cursor, 7);
-    assert_eq!(row.pass_count, 1);
-
-    // Stale defensive cleanup with the same owner is now a no-op
-    // (the row has owner = NULL after the success). Counters stay put.
-    let cleared = mgr
-        .clear_summary_in_flight_if_owned(&parent.id, owner_a)
-        .await
-        .unwrap();
-    assert!(!cleared, "stale cleanup must not match a NULL owner");
-    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
-    assert!(!row.in_flight);
-    assert_eq!(row.cursor, 7);
-    assert_eq!(row.pass_count, 1);
-}
-
-/// Issue 2 regression: a stale Pass A finishing after Pass B
-/// remarked the parent must NOT wipe Pass B's mark via the
-/// runner's defensive cleanup.
-#[tokio::test]
-async fn defensive_clear_does_not_clobber_newer_pass_mark() {
-    let (store, _dir) = fresh_store_and_paths().await;
-    let parent = root_session("parent-cas-race");
-    store.session.save(&parent).await.unwrap();
-
-    let mgr = SessionManager::new(store.session.clone(), store.session_summary.clone());
-
-    // Pass A marks itself in-flight, then lands a successful summary
-    // (which clears flag + owner in one terminal UPSERT).
-    mgr.mark_summary_in_flight(&parent.id, "owner-A")
-        .await
-        .unwrap();
-    mgr.record_summary_success(&parent.id, 5, 100, "m", "span", Utc::now())
-        .await
-        .unwrap();
-
-    // Pass B picks up the parent (gate sees in_flight=false, marks
-    // again with a fresh token).
-    mgr.mark_summary_in_flight(&parent.id, "owner-B")
-        .await
-        .unwrap();
-
-    // Pass A's stale outer cleanup fires. Pre-fix this would clear
-    // Pass B's mark — with the owner-token CAS it must be a no-op.
-    let cleared = mgr
-        .clear_summary_in_flight_if_owned(&parent.id, "owner-A")
-        .await
-        .unwrap();
-    assert!(!cleared, "stale Pass A cleanup must not match Pass B owner");
-
-    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
-    assert!(row.in_flight, "Pass B's mark must survive stale cleanup");
-    assert_eq!(row.in_flight_owner.as_deref(), Some("owner-B"));
-
-    // Pass B's matching cleanup clears as expected.
-    let cleared = mgr
-        .clear_summary_in_flight_if_owned(&parent.id, "owner-B")
-        .await
-        .unwrap();
-    assert!(cleared);
-    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
-    assert!(!row.in_flight);
-    assert!(row.in_flight_owner.is_none());
-}
-
-/// Orphan reaper closes the "mark-without-row" gap. Trigger gate
-/// marks `in_flight = true` *before* emitting the SystemSpawnRequest;
-/// if the process dies after the mark but before the router creates
-/// the maintenance session row, no maintenance row exists for the
-/// next boot's reaper to walk. Without an explicit sweep the parent
-/// would stay blocked. The reaper's `clear_all_summary_in_flight`
-/// step handles exactly this case.
-#[tokio::test]
-async fn orphan_reaper_clears_orphan_in_flight_without_maintenance_row() {
-    let (store, dir) = fresh_store_and_paths().await;
-    let parent = root_session("parent-mark-only");
-    store.session.save(&parent).await.unwrap();
-
-    let mgr = Arc::new(SessionManager::new(
-        store.session.clone(),
-        store.session_summary.clone(),
-    ));
-
-    // Simulate the gap: gate persisted in_flight = 1, process crashed
-    // before the router could call create_maintenance_session.
-    mgr.mark_summary_in_flight(&parent.id, "owner-orphan-mark")
-        .await
-        .unwrap();
-    assert!(
-        mgr.summary_metadata(&parent.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .in_flight
-    );
-    assert!(
-        mgr.all_maintenance_sessions().await.unwrap().is_empty(),
-        "this scenario specifically has no maintenance session row to walk"
-    );
-
-    let paths = WorkspacePaths::new(dir.path().join("workspace"));
-    reap_maintenance_orphans(&mgr, &paths).await;
-
-    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
-    assert!(
-        !row.in_flight,
-        "reaper's clear_all_summary_in_flight must recover orphaned in_flight \
-         even when no maintenance session row exists for it to walk"
-    );
-    // No spurious error_count bump: the orphan-without-row path doesn't
-    // know which model to attribute the failure to, so the sweep just
-    // clears the flag silently.
-    assert_eq!(row.error_count, 0);
-}
-
-/// Orphan reaper recovery: a parent left with `in_flight = true`
-/// after a process crash gets its flag cleared on next boot via
-/// `record_summary_failure` (which the reaper invokes per reaped
-/// maintenance session).
-#[tokio::test]
-async fn orphan_reaper_clears_in_flight_on_recovered_parent() {
-    let (store, dir) = fresh_store_and_paths().await;
-    let parent = root_session("parent-stale-flight");
-    store.session.save(&parent).await.unwrap();
-
-    let mgr = Arc::new(SessionManager::new(
-        store.session.clone(),
-        store.session_summary.clone(),
-    ));
-
-    // Simulate the crash mid-pass: maintenance row exists, parent's
-    // `in_flight` is still set.
-    let _maint = mgr
-        .create_maintenance_session(&parent, JobId::new(), SystemReason::BackgroundCompression)
-        .await
-        .unwrap();
-    mgr.mark_summary_in_flight(&parent.id, "owner-stale-flight")
-        .await
-        .unwrap();
-    assert!(
-        mgr.summary_metadata(&parent.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .in_flight
-    );
-
-    let paths = WorkspacePaths::new(dir.path().join("workspace"));
-    reap_maintenance_orphans(&mgr, &paths).await;
-
-    let row = mgr.summary_metadata(&parent.id).await.unwrap().unwrap();
-    assert!(
-        !row.in_flight,
-        "orphan reaper must clear in_flight on the parent so the gate can emit again"
-    );
-    assert_eq!(row.error_count, 1);
 }
 
 #[tokio::test]

@@ -12,18 +12,14 @@
 //!   LLM call needs and exposes a single `run(self, req)` method that
 //!   the agent loop hands to `maybe_compress` (inline path) and to
 //!   [`BackgroundCompressionRunner`] (background path).
-//! - [`BackgroundCompressionRunner`] is the maintenance-actor's entry
-//!   point: it gathers the agent-layer deps, adapts
-//!   `CompressionRunner` to the context callback shape, and delegates
-//!   the rest of the flow to [`aura_context::run_background_summary`].
+//! - [`BackgroundCompressionRunner`] is the in-actor background pass:
+//!   it gathers the agent-layer deps, adapts `CompressionRunner` to the
+//!   context callback shape, and delegates the rest of the flow to
+//!   [`aura_context::run_background_summary`]. The pass is spawned
+//!   detached by [`crate::runtime::agent_loop::AgentLoop`] — no
+//!   maintenance session, no router hop.
 //! - [`reap_maintenance_orphans`] is the startup cleanup pass that
-//!   removes leftover maintenance sessions and FS-orphan summaries
-//!   from a previous boot.
-//!
-//! The `SystemSpawnRequest` channel contract that ferries
-//! background-compression triggers from the parent's gate to the
-//! router lives in [`crate::actor::router`] — it's the router's surface, not
-//! a compression concern.
+//!   removes FS-orphan summary directories from a previous boot.
 //!
 //! See `docs/background-compression.md`.
 
@@ -38,14 +34,9 @@ use aura_session::SessionManager;
 use aura_trace::{LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepKind};
 use aura_workspace::WorkspacePaths;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::security::SecurityGateway;
-
-/// Synthetic `model_id` recorded against `session_summaries.error_count`
-/// when the orphan reaper bumps a parent's failure count for a
-/// crashed-mid-pass maintenance session.
-const ORPHAN_REAP_MODEL_TAG: &str = "orphan-reap";
 
 /// Agent-side dependencies needed to execute the compression LLM call:
 /// trace recorder, cost ledger, the LLM client, and the identity /
@@ -196,8 +187,12 @@ pub(crate) struct BackgroundCompressionRunner {
     pub tokenizer: Arc<dyn Tokenizer>,
     pub recorder: Arc<SpanRecorder>,
     pub model_info: ModelInfo,
-    pub maintenance_session_id: SessionId,
-    pub maintenance_user_id: String,
+    /// The session the pass runs on behalf of — also the session the
+    /// pass's cost + `StepKind::Compression` + `LlmCall` spans attribute
+    /// to. The pass now runs inside the parent's own actor, so this is
+    /// the parent session (no maintenance session is created).
+    pub parent_session_id: SessionId,
+    pub parent_user_id: String,
     pub job_id: JobId,
     pub cancel_token: CancellationToken,
 }
@@ -218,8 +213,8 @@ impl BackgroundCompressionRunner {
             tokenizer,
             recorder,
             model_info,
-            maintenance_session_id,
-            maintenance_user_id,
+            parent_session_id,
+            parent_user_id,
             job_id,
             cancel_token,
         } = self;
@@ -244,8 +239,8 @@ impl BackgroundCompressionRunner {
                 recorder: recorder.clone(),
                 security_gateway: security_gateway.clone(),
                 job_id,
-                user_id: maintenance_user_id.clone(),
-                session_id: maintenance_session_id.clone(),
+                user_id: parent_user_id.clone(),
+                session_id: parent_session_id.clone(),
                 model_info: model_info.clone(),
                 cancel_token: cancel_token.clone(),
             };
@@ -267,87 +262,24 @@ impl BackgroundCompressionRunner {
     }
 }
 
-/// Startup orphan reaper. Runs once per process boot, *before* the
-/// supervisor starts spawning actors. Two responsibilities:
+/// Startup FS orphan reaper. Runs once per process boot, *before* the
+/// supervisor starts spawning actors.
 ///
-/// 1. **DB-side** — delete only the maintenance session rows
-///    (`is_normal_session = 0`) whose associated job is **not** in a
-///    terminal state. Those represent in-flight passes that were
-///    running when the previous process crashed; their actors are
-///    gone, their state is stateless by design, and their parents'
-///    `error_count` should reflect the failed pass so operators see
-///    the trace. Maintenance sessions whose pass landed cleanly
-///    (`jobs.status_kind` ∈ {`completed`, `failed`, `cancelled`})
-///    are kept as audit history — cost-records joins depend on them.
-/// 2. **FS-side** — scan
-///    `<workspace>/state/sessions/*/summary.md` and delete any file
-///    whose `session_id` has no corresponding row in
-///    `session_summaries`. Removes orphans left by metadata-write
-///    failures (ρ-1 Option A).
+/// Scans `<workspace>/state/sessions/*/` and deletes any directory whose
+/// `session_id` has no corresponding row in `session_summaries`. This
+/// removes summary dirs left by an `Edit`-wrote-the-file-then-crashed
+/// pass (the on-disk `summary.md` lands before the metadata row commits).
+///
+/// The background pass now runs inside the parent's own actor with an
+/// in-memory at-most-one handle — there is no maintenance session row and
+/// no durable in-flight flag to recover, so the previous DB-side sweep is
+/// gone. A leftover orphan dir is otherwise harmless (the fast-path reads
+/// `summary_metadata == None` and falls through), but the sweep keeps the
+/// workspace tidy.
 ///
 /// Best-effort: errors are logged at warn but never propagate; a
 /// flaky filesystem must not block process boot.
 pub async fn reap_maintenance_orphans(sessions: &SessionManager, workspace_paths: &WorkspacePaths) {
-    // ---- Stale in_flight sweep ----------------------------------------
-    // A process that just started has no in-flight pass by definition,
-    // so any `session_summaries.in_flight = 1` left from the previous
-    // boot is stale. The maintenance-session sweep below also clears
-    // `in_flight` (via `record_summary_failure` → `bump_error_count`)
-    // for parents whose maintenance row survived, but cannot recover
-    // the case where the trigger gate marked `in_flight = 1` *before*
-    // the router created the maintenance session row and the process
-    // died in that window. Run this first, idempotent.
-    if let Err(e) = sessions.clear_all_summary_in_flight().await {
-        warn!(
-            error = %e,
-            "orphan reap: clear_all_summary_in_flight failed"
-        );
-    }
-
-    // ---- DB orphans ---------------------------------------------------
-    // `unfinished_maintenance_sessions()` excludes rows whose job
-    // reached a terminal state — those are kept as audit history.
-    let maintenance_ids = match sessions.unfinished_maintenance_sessions().await {
-        Ok(ids) => ids,
-        Err(e) => {
-            warn!(error = %e, "orphan reap: list_unfinished_maintenance_sessions failed");
-            Vec::new()
-        }
-    };
-    for id in &maintenance_ids {
-        // Find the parent (lineage may be missing; fall back to no-op)
-        // and bump its `session_summaries.error_count` so failed
-        // passes surface in telemetry. The maintenance session
-        // itself gets deleted regardless.
-        if let Ok(Some(maint)) = sessions.get(id).await
-            && let Some(parent_id) = maint.lineage.as_ref().map(|l| l.parent_session_id.clone())
-            && let Err(e) = sessions
-                .record_summary_failure(&parent_id, ORPHAN_REAP_MODEL_TAG, "", chrono::Utc::now())
-                .await
-        {
-            warn!(
-                parent_session_id = %parent_id,
-                error = %e,
-                "orphan reap: bump_error_count failed for parent"
-            );
-        }
-        if let Err(e) = sessions.delete(id).await {
-            warn!(
-                maintenance_session_id = %id,
-                error = %e,
-                "orphan reap: delete maintenance session failed"
-            );
-        } else {
-            debug!(maintenance_session_id = %id, "orphan reap: deleted maintenance session");
-        }
-    }
-    if !maintenance_ids.is_empty() {
-        info!(
-            reaped = maintenance_ids.len(),
-            "orphan reap: deleted unfinished maintenance sessions from previous boot"
-        );
-    }
-
     let summary_store = sessions.summary_store();
     let known_ids: std::collections::HashSet<String> = match summary_store.list_session_ids().await
     {
