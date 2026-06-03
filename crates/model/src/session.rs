@@ -147,7 +147,6 @@ pub enum SystemReason {
 /// background-summary task the loop spawns in-process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundCompressionPayload {
-    pub parent_session_id: SessionId,
     /// Highest `session_messages.ordinal` to include in this pass'
     /// input. Pinned at trigger time so concurrent appends to the
     /// parent don't bleed in mid-pass.
@@ -385,10 +384,7 @@ mod tests {
 
     #[test]
     fn background_compression_payload_round_trip() {
-        let p = BackgroundCompressionPayload {
-            parent_session_id: SessionId::from("user-1"),
-            up_to_ordinal: 42,
-        };
+        let p = BackgroundCompressionPayload { up_to_ordinal: 42 };
         let s = serde_json::to_string(&p).unwrap();
         let back: BackgroundCompressionPayload = serde_json::from_str(&s).unwrap();
         assert_eq!(back, p);

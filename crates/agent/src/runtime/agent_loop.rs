@@ -2312,6 +2312,9 @@ impl AgentLoop {
         let cancel_token = CancellationToken::new();
 
         let handle = tokio::spawn(async move {
+            // Clone the parent session id for the runner before the spec
+            // moves it into `session_id`.
+            let runner_session_id = parent_session_id.clone();
             let spec = JobSpec {
                 session_id: parent_session_id,
                 // The pass is a `System` job, which `allowed_for` only
@@ -2340,7 +2343,7 @@ impl AgentLoop {
                         tokenizer,
                         recorder,
                         model_info,
-                        parent_session_id: payload.parent_session_id.clone(),
+                        parent_session_id: runner_session_id,
                         parent_user_id,
                         job_id,
                         cancel_token,

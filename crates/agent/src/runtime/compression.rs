@@ -218,6 +218,9 @@ impl BackgroundCompressionRunner {
             cancel_token,
         } = self;
         let model_id = model_info.id.clone();
+        // Clone the parent session id for the summary config — the chat
+        // closure below moves the destructured field.
+        let summary_session_id = parent_session_id.clone();
         // Hand a clone to the context's tool loop so a parent cancel
         // cascades into in-flight `Read`/`Edit`. The original token
         // moves into the chat-callback closure below, where each
@@ -250,7 +253,7 @@ impl BackgroundCompressionRunner {
             workspace: workspace_paths,
             sessions,
             tokenizer,
-            parent_session_id: payload.parent_session_id,
+            parent_session_id: summary_session_id,
             up_to_ordinal: payload.up_to_ordinal,
             model_id,
             cancel_token: tool_cancel,

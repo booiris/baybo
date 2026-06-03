@@ -1247,10 +1247,7 @@ impl ContextManager {
             "background-summary trigger: gate passed"
         );
 
-        Some(BackgroundCompressionPayload {
-            parent_session_id: self.session_id.clone(),
-            up_to_ordinal,
-        })
+        Some(BackgroundCompressionPayload { up_to_ordinal })
     }
 
     /// Read the anchor index. Test-only: production callers measure
