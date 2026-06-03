@@ -89,7 +89,7 @@ function generateMockSummaries(count: number): TraceSessionSummary[] {
     'completed',
   ];
   // Weighted to reflect typical traffic: user chats dominate, subagent
-  // spawns + cron are common, compression is a thin background tail.
+  // spawns + cron are common.
   const kinds: components['schemas']['SessionKind'][] = [
     'user',
     'user',
@@ -99,7 +99,6 @@ function generateMockSummaries(count: number): TraceSessionSummary[] {
     'cron',
     'subagent',
     'subagent',
-    'compression',
   ];
 
   for (let i = 0; i < count; i++) {
