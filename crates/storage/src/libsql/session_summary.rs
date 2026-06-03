@@ -43,12 +43,6 @@ fn row_from_libsql(row: &libsql::Row) -> Result<SessionSummaryRow> {
     let error_count: i64 = row.get(7).map_err(|e| {
         StorageError::Internal(anyhow::anyhow!("session_summaries.error_count: {e}"))
     })?;
-    let in_flight: i64 = row
-        .get(8)
-        .map_err(|e| StorageError::Internal(anyhow::anyhow!("session_summaries.in_flight: {e}")))?;
-    let in_flight_owner: Option<String> = row.get(9).map_err(|e| {
-        StorageError::Internal(anyhow::anyhow!("session_summaries.in_flight_owner: {e}"))
-    })?;
     let updated_at = super::time::from_us(updated_at_us).ok_or_else(|| {
         StorageError::Storage(format!(
             "session_summaries.updated_at out of range: {updated_at_us}"
@@ -63,8 +57,6 @@ fn row_from_libsql(row: &libsql::Row) -> Result<SessionSummaryRow> {
         model_id,
         span_id,
         error_count,
-        in_flight: in_flight != 0,
-        in_flight_owner,
     })
 }
 
@@ -75,7 +67,7 @@ impl SessionSummaryStore for LibsqlSessionSummaryStore {
         let mut rows = conn
             .query(
                 "SELECT session_id, cursor, pass_count, updated_at, \
-                        cost_micros, model_id, span_id, error_count, in_flight, in_flight_owner \
+                        cost_micros, model_id, span_id, error_count \
                  FROM session_summaries WHERE session_id = ?1",
                 libsql::params![session_id.as_str().to_string()],
             )
@@ -104,15 +96,11 @@ impl SessionSummaryStore for LibsqlSessionSummaryStore {
         let conn = self.pool.conn();
         // Single-statement upsert: INSERT … ON CONFLICT DO UPDATE so
         // pass_count and cost_micros increment atomically and
-        // error_count + in_flight reset to zero on success. Clearing
-        // in_flight (and in_flight_owner) here is the primary terminal
-        // handler — the gate sets it true before emitting
-        // `SystemSpawnRequest`, and a landed pass is the canonical
-        // "done" signal.
+        // error_count resets to zero on success.
         conn.execute(
             "INSERT INTO session_summaries \
-                 (session_id, cursor, pass_count, updated_at, cost_micros, model_id, span_id, error_count, in_flight, in_flight_owner) \
-             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, 0, 0, NULL) \
+                 (session_id, cursor, pass_count, updated_at, cost_micros, model_id, span_id, error_count) \
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, 0) \
              ON CONFLICT(session_id) DO UPDATE SET \
                  cursor          = excluded.cursor, \
                  pass_count      = session_summaries.pass_count + 1, \
@@ -120,9 +108,7 @@ impl SessionSummaryStore for LibsqlSessionSummaryStore {
                  cost_micros     = session_summaries.cost_micros + excluded.cost_micros, \
                  model_id        = excluded.model_id, \
                  span_id         = excluded.span_id, \
-                 error_count     = 0, \
-                 in_flight       = 0, \
-                 in_flight_owner = NULL",
+                 error_count     = 0",
             libsql::params![
                 session_id.as_str().to_string(),
                 cursor,
@@ -151,21 +137,15 @@ impl SessionSummaryStore for LibsqlSessionSummaryStore {
         // sessions that have never produced a successful summary can
         // surface failure telemetry. On conflict, increments error_count
         // and refreshes the model_id / span_id / updated_at trio.
-        // Clearing `in_flight` (and `in_flight_owner`) here is the
-        // secondary terminal handler: a recorded failure means the
-        // pass has stopped trying, so the gate must be free to emit
-        // the next one.
         conn.execute(
             "INSERT INTO session_summaries \
-                 (session_id, cursor, pass_count, updated_at, cost_micros, model_id, span_id, error_count, in_flight, in_flight_owner) \
-             VALUES (?1, 0, 0, ?2, 0, ?3, ?4, 1, 0, NULL) \
+                 (session_id, cursor, pass_count, updated_at, cost_micros, model_id, span_id, error_count) \
+             VALUES (?1, 0, 0, ?2, 0, ?3, ?4, 1) \
              ON CONFLICT(session_id) DO UPDATE SET \
                  error_count     = session_summaries.error_count + 1, \
                  model_id        = excluded.model_id, \
                  span_id         = excluded.span_id, \
-                 updated_at      = excluded.updated_at, \
-                 in_flight       = 0, \
-                 in_flight_owner = NULL",
+                 updated_at      = excluded.updated_at",
             libsql::params![
                 session_id.as_str().to_string(),
                 super::time::to_us(updated_at),
@@ -176,85 +156,6 @@ impl SessionSummaryStore for LibsqlSessionSummaryStore {
         .await
         .map_err(|e| {
             StorageError::Internal(anyhow::anyhow!("libsql bump session_summaries error: {e}"))
-        })?;
-        Ok(())
-    }
-
-    async fn set_in_flight(
-        &self,
-        session_id: &SessionId,
-        in_flight: bool,
-        owner: Option<&str>,
-        updated_at: DateTime<Utc>,
-    ) -> Result<()> {
-        let conn = self.pool.conn();
-        // UPSERT: place a placeholder row (cursor=0, model="", span="")
-        // when none exists so the gate can mark in_flight before the
-        // first successful pass has ever recorded. On conflict, only
-        // `in_flight`, `in_flight_owner`, and `updated_at` are touched
-        // — cursor / pass_count / cost_micros / error_count are left
-        // intact.
-        conn.execute(
-            "INSERT INTO session_summaries \
-                 (session_id, cursor, pass_count, updated_at, cost_micros, model_id, span_id, error_count, in_flight, in_flight_owner) \
-             VALUES (?1, 0, 0, ?2, 0, '', '', 0, ?3, ?4) \
-             ON CONFLICT(session_id) DO UPDATE SET \
-                 in_flight       = excluded.in_flight, \
-                 in_flight_owner = excluded.in_flight_owner, \
-                 updated_at      = excluded.updated_at",
-            libsql::params![
-                session_id.as_str().to_string(),
-                super::time::to_us(updated_at),
-                if in_flight { 1_i64 } else { 0_i64 },
-                owner.map(|s| s.to_string()),
-            ],
-        )
-        .await
-        .map_err(|e| {
-            StorageError::Internal(anyhow::anyhow!("libsql set_in_flight session_summaries: {e}"))
-        })?;
-        Ok(())
-    }
-
-    async fn clear_in_flight_if_owned(
-        &self,
-        session_id: &SessionId,
-        owner: &str,
-        updated_at: DateTime<Utc>,
-    ) -> Result<bool> {
-        let conn = self.pool.conn();
-        let affected = conn
-            .execute(
-                "UPDATE session_summaries \
-                 SET in_flight = 0, in_flight_owner = NULL, updated_at = ?2 \
-                 WHERE session_id = ?1 AND in_flight_owner = ?3",
-                libsql::params![
-                    session_id.as_str().to_string(),
-                    super::time::to_us(updated_at),
-                    owner.to_string(),
-                ],
-            )
-            .await
-            .map_err(|e| {
-                StorageError::Internal(anyhow::anyhow!(
-                    "libsql clear_in_flight_if_owned session_summaries: {e}"
-                ))
-            })?;
-        Ok(affected > 0)
-    }
-
-    async fn clear_all_in_flight(&self) -> Result<()> {
-        let conn = self.pool.conn();
-        conn.execute(
-            "UPDATE session_summaries SET in_flight = 0, in_flight_owner = NULL \
-             WHERE in_flight = 1 OR in_flight_owner IS NOT NULL",
-            (),
-        )
-        .await
-        .map_err(|e| {
-            StorageError::Internal(anyhow::anyhow!(
-                "libsql clear_all_in_flight session_summaries: {e}"
-            ))
         })?;
         Ok(())
     }
@@ -500,179 +401,5 @@ mod tests {
             store.get(&s.id).await.unwrap().is_none(),
             "summary row must cascade-delete with parent session"
         );
-    }
-
-    /// `set_in_flight(true)` on a session that has no metadata row
-    /// yet should INSERT a placeholder row carrying `in_flight = 1`,
-    /// `cursor = 0`, empty `model_id` / `span_id`, and zero counters.
-    /// This is the trigger gate's "first ever pass" path.
-    #[tokio::test]
-    async fn set_in_flight_creates_placeholder_when_missing() {
-        let pool = fresh_pool().await;
-        let sessions = LibsqlSessionStore::new(pool.clone());
-        sessions.save(&make_session("s-in-flight-1")).await.unwrap();
-        let store = LibsqlSessionSummaryStore::new(pool);
-        let id = SessionId::from("s-in-flight-1");
-
-        store
-            .set_in_flight(&id, true, Some("owner-token-1"), Utc::now())
-            .await
-            .unwrap();
-        let row = store.get(&id).await.unwrap().unwrap();
-        assert!(row.in_flight);
-        assert_eq!(row.in_flight_owner.as_deref(), Some("owner-token-1"));
-        assert_eq!(row.cursor, 0);
-        assert_eq!(row.pass_count, 0);
-        assert_eq!(row.error_count, 0);
-        assert_eq!(row.model_id, "");
-        assert_eq!(row.span_id, "");
-    }
-
-    /// `set_in_flight(false)` on an existing row toggles only the flag
-    /// (and `updated_at`) — never overwrites cursor, pass_count, cost,
-    /// model_id, span_id, or error_count.
-    #[tokio::test]
-    async fn set_in_flight_preserves_existing_metadata() {
-        let pool = fresh_pool().await;
-        let sessions = LibsqlSessionStore::new(pool.clone());
-        sessions.save(&make_session("s-in-flight-2")).await.unwrap();
-        let store = LibsqlSessionSummaryStore::new(pool);
-        let id = SessionId::from("s-in-flight-2");
-
-        store
-            .upsert_success(&id, 42, 12_345, "claude-x", "span-x", Utc::now())
-            .await
-            .unwrap();
-        store
-            .set_in_flight(&id, true, Some("owner-token-2"), Utc::now())
-            .await
-            .unwrap();
-        let row = store.get(&id).await.unwrap().unwrap();
-        assert!(row.in_flight);
-        assert_eq!(row.cursor, 42);
-        assert_eq!(row.pass_count, 1);
-        assert_eq!(row.cost_micros, 12_345);
-        assert_eq!(row.model_id, "claude-x");
-        assert_eq!(row.span_id, "span-x");
-
-        store
-            .set_in_flight(&id, false, None, Utc::now())
-            .await
-            .unwrap();
-        let row = store.get(&id).await.unwrap().unwrap();
-        assert!(!row.in_flight);
-        assert!(row.in_flight_owner.is_none());
-        assert_eq!(row.cursor, 42);
-        assert_eq!(row.pass_count, 1);
-    }
-
-    /// A successful pass on a session that was marked in-flight by the
-    /// gate clears the flag — the gate's "is a pass running?" lookup
-    /// will return false on the next iteration.
-    #[tokio::test]
-    async fn upsert_success_clears_in_flight() {
-        let pool = fresh_pool().await;
-        let sessions = LibsqlSessionStore::new(pool.clone());
-        sessions.save(&make_session("s-clear-1")).await.unwrap();
-        let store = LibsqlSessionSummaryStore::new(pool);
-        let id = SessionId::from("s-clear-1");
-
-        store
-            .set_in_flight(&id, true, Some("owner-token-3"), Utc::now())
-            .await
-            .unwrap();
-        let row = store.get(&id).await.unwrap().unwrap();
-        assert!(row.in_flight);
-        assert_eq!(row.in_flight_owner.as_deref(), Some("owner-token-3"));
-
-        store
-            .upsert_success(&id, 5, 100, "m", "span", Utc::now())
-            .await
-            .unwrap();
-        let row = store.get(&id).await.unwrap().unwrap();
-        assert!(!row.in_flight);
-        assert!(
-            row.in_flight_owner.is_none(),
-            "upsert_success must NULL the owner on terminal landing"
-        );
-    }
-
-    /// Compare-and-clear: only the owning pass can clear the mark, so
-    /// a stale Pass A finishing after Pass B remarked the parent
-    /// cannot wipe Pass B's owner.
-    #[tokio::test]
-    async fn clear_in_flight_if_owned_only_clears_when_owner_matches() {
-        let pool = fresh_pool().await;
-        let sessions = LibsqlSessionStore::new(pool.clone());
-        sessions.save(&make_session("s-cas-1")).await.unwrap();
-        let store = LibsqlSessionSummaryStore::new(pool);
-        let id = SessionId::from("s-cas-1");
-
-        // Pass A marks itself in-flight.
-        store
-            .set_in_flight(&id, true, Some("owner-A"), Utc::now())
-            .await
-            .unwrap();
-        // Pass A finishes (record_summary_success) → mark cleared,
-        // owner reset to NULL.
-        store
-            .upsert_success(&id, 5, 100, "m", "span", Utc::now())
-            .await
-            .unwrap();
-        // Pass B picks up the parent and marks itself.
-        store
-            .set_in_flight(&id, true, Some("owner-B"), Utc::now())
-            .await
-            .unwrap();
-        // Pass A's stale defensive cleanup with token A — must NOT
-        // clear Pass B's mark.
-        let cleared = store
-            .clear_in_flight_if_owned(&id, "owner-A", Utc::now())
-            .await
-            .unwrap();
-        assert!(!cleared, "stale owner token must not clear newer mark");
-
-        let row = store.get(&id).await.unwrap().unwrap();
-        assert!(row.in_flight);
-        assert_eq!(row.in_flight_owner.as_deref(), Some("owner-B"));
-
-        // Pass B's matching defensive cleanup with token B — clears.
-        let cleared = store
-            .clear_in_flight_if_owned(&id, "owner-B", Utc::now())
-            .await
-            .unwrap();
-        assert!(cleared, "matching owner token must clear");
-        let row = store.get(&id).await.unwrap().unwrap();
-        assert!(!row.in_flight);
-        assert!(row.in_flight_owner.is_none());
-    }
-
-    /// Same invariant for the failure path: a recorded failure means
-    /// the pass is no longer running, so the gate must be free to emit
-    /// the next trigger.
-    #[tokio::test]
-    async fn bump_error_count_clears_in_flight() {
-        let pool = fresh_pool().await;
-        let sessions = LibsqlSessionStore::new(pool.clone());
-        sessions.save(&make_session("s-clear-2")).await.unwrap();
-        let store = LibsqlSessionSummaryStore::new(pool);
-        let id = SessionId::from("s-clear-2");
-
-        store
-            .set_in_flight(&id, true, Some("owner-bump"), Utc::now())
-            .await
-            .unwrap();
-        let row = store.get(&id).await.unwrap().unwrap();
-        assert!(row.in_flight);
-        assert_eq!(row.in_flight_owner.as_deref(), Some("owner-bump"));
-
-        store
-            .bump_error_count(&id, "m", "span-err", Utc::now())
-            .await
-            .unwrap();
-        let row = store.get(&id).await.unwrap().unwrap();
-        assert!(!row.in_flight);
-        assert!(row.in_flight_owner.is_none());
-        assert_eq!(row.error_count, 1);
     }
 }

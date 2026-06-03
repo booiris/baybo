@@ -755,15 +755,14 @@ mod tests {
     ) -> tokio::task::JoinHandle<Option<(SubagentSpawnRequest, aura_model::SessionId)>> {
         tokio::spawn(async move {
             let envelope = rx.recv().await?;
+            // `SystemSpawnRequest` has a single variant (`Subagent`); the
+            // destructure is irrefutable.
             let SystemSpawnRequest::Subagent {
                 request,
                 parent_session_id,
                 result_tx,
                 ..
-            } = envelope
-            else {
-                return None;
-            };
+            } = envelope;
             let _ = result_tx.send(response);
             Some((*request, parent_session_id))
         })

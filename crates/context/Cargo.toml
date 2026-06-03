@@ -30,24 +30,21 @@ tiktoken-rs = { workspace = true }
 parking_lot = { workspace = true }
 # Used by the fast-path's async `summary.md` read.
 tokio = { workspace = true, features = ["fs"] }
-# Cancellation tokens: `BACKGROUND_SUMMARY_WAIT_TIMEOUT` cooperates
-# with the agent's cancel cascade, and the background-summary tool
-# loop hands a token to `aura_tools::ToolContext` so a parent cancel
-# kills any in-flight `Read`/`Edit` along with the LLM call.
+# Cancellation tokens: the background-summary tool loop hands a token
+# to `aura_tools::ToolContext` so a parent cancel kills any in-flight
+# `Read`/`Edit` along with the LLM call.
 tokio-util = { workspace = true }
-# Owner token for `session_summaries.in_flight_owner` minted by the
-# trigger gate so a stale Pass A finishing after Pass B remarked the
-# parent cannot CAS-clear Pass B's mark.
+# Per-run identifiers in the session log (`session_log.rs`).
 uuid = { workspace = true }
 # Content-addressed tool-output spill files (`prompts::tool_output`).
 sha2 = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
+# Pulls the in-memory `MemorySessionStore` / `MemorySessionSummaryStore`
+# fakes the context unit tests build their `SessionManager` from.
+aura-session = { workspace = true, features = ["test-support"] }
 aura-storage = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
-# `test-util` enables `tokio::time::pause` / `start_paused = true`
-# attribute used by the wrapper's `wait_for_in_flight` tests so the
-# 15s wall-clock timeout stays virtual.
-tokio = { workspace = true, features = ["full", "test-util"] }
+tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }

@@ -113,49 +113,6 @@ async fn rehydrate_after_idle_eviction_preserves_session_state() {
     );
 }
 
-/// Compression `in_flight` flag must not survive a reap — otherwise
-/// the next compression pass for the session is permanently blocked.
-/// `SessionManager::clear_summary_in_flight` is invoked by
-/// `AgentSupervisor::reap_idle` before sending `Shutdown`; this test
-/// exercises the same clear path in isolation.
-#[tokio::test]
-async fn clearing_in_flight_unblocks_post_reap_compression() {
-    use aura_session::SessionSummaryStore;
-
-    let session_store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
-    let summary_store: Arc<dyn SessionSummaryStore> = Arc::new(MemorySessionSummaryStore::new());
-    let sessions = SessionManager::new(session_store, summary_store.clone());
-
-    let session_id = SessionId::from("session-inflight");
-    sessions
-        .mark_summary_in_flight(&session_id, "owner-a")
-        .await
-        .expect("mark in_flight");
-
-    let row = summary_store
-        .get(&session_id)
-        .await
-        .expect("query summary row")
-        .expect("row exists post-mark");
-    assert!(row.in_flight, "pre-condition: flag is set");
-
-    // Reaper's pre-shutdown clear.
-    sessions
-        .clear_summary_in_flight(&session_id)
-        .await
-        .expect("clear in_flight");
-
-    let row = summary_store
-        .get(&session_id)
-        .await
-        .expect("query summary row")
-        .expect("row still exists");
-    assert!(
-        !row.in_flight,
-        "post-reap rehydration must see in_flight = false so the next pass can run"
-    );
-}
-
 /// Background subagent deliveries that landed on the actor are
 /// persisted to the session row immediately, so a parent that the
 /// idle reaper later reclaims still hands the pending notifications

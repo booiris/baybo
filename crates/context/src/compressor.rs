@@ -31,8 +31,7 @@ use tracing::{debug, warn};
 use crate::error::ContextError;
 use crate::prompts::compression::{CONTINUATION_FOOTER, CONTINUATION_INTRO, SUMMARIZE_INSTRUCTION};
 use crate::{
-    BACKGROUND_SUMMARY_WAIT_POLL_INTERVAL, BACKGROUND_SUMMARY_WAIT_TIMEOUT, ContextManager,
-    FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO, RECENT_SLICE_MAX_TOKENS,
+    ContextManager, FAST_PATH_FALLTHROUGH_THRESHOLD_RATIO, RECENT_SLICE_MAX_TOKENS,
     RECENT_SLICE_MIN_TEXT_BLOCK_MSGS, RECENT_SLICE_MIN_TOKENS, estimate_skill_trailer_tokens,
     scan_skill_calls,
 };
@@ -259,33 +258,12 @@ impl ContextManager {
     /// Stage 1: try to assemble `[system + summary.md + recent slice]`.
     /// Returns `None` on any fall-through condition; all such
     /// conditions log at debug/warn so production has a paper trail.
+    ///
+    /// Reads whatever cursor + `summary.md` is on file without waiting
+    /// for a concurrent background pass to land (stale-by-one
+    /// tolerated): a background refresh that finishes after this read
+    /// simply lands for the next turn.
     async fn try_summary_fast_path(&self) -> Option<CompressOutput> {
-        // Wait for any in-flight background pass to land first so we
-        // pick up the fresher cursor instead of re-summarizing content
-        // it already covered. Bounded — a stuck refresh can't block a
-        // user turn indefinitely; on timeout we proceed with whatever
-        // metadata is on file (stale-by-one tolerated).
-        let wait_future = async {
-            loop {
-                match self.sessions.summary_metadata(&self.session_id).await {
-                    Ok(Some(meta)) if meta.in_flight => {
-                        tokio::time::sleep(BACKGROUND_SUMMARY_WAIT_POLL_INTERVAL).await;
-                    }
-                    _ => return,
-                }
-            }
-        };
-        if tokio::time::timeout(BACKGROUND_SUMMARY_WAIT_TIMEOUT, wait_future)
-            .await
-            .is_err()
-        {
-            warn!(
-                session_id = %self.session_id,
-                "fast-path: in-flight refresh did not settle within timeout; \
-                 proceeding with last recorded metadata"
-            );
-        }
-
         let metadata = match self.sessions.summary_metadata(&self.session_id).await {
             Ok(Some(m)) => m,
             Ok(None) => {

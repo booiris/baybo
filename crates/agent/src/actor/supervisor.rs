@@ -285,17 +285,13 @@ impl AgentSupervisor {
     /// Reap actors whose underlying sessions have been idle for longer
     /// than `idle_threshold`.
     ///
-    /// Flow per reaped session:
-    /// 1. Clear the `session_summaries.in_flight` flag so any maintenance
-    ///    child that gets cascade-cancelled below does not leave the
-    ///    session permanently blocked from future background compression
-    ///    passes. The clear is unconditional (not owner-scoped) because
-    ///    the maintenance child is about to die regardless.
-    /// 2. Send `AgentMessage::ActorStop` to the actor's mailbox. The
-    ///    actor's `run` loop matches `ActorStop`, trips its `actor_token`
-    ///    (cascade-killing every maintenance grandchild), and exits.
-    ///    The `ActorRegistryGuard` then removes the entry from
-    ///    `self.actors` on drop.
+    /// Per reaped session: send `AgentMessage::ActorStop` to the actor's
+    /// mailbox. The actor's `run` loop matches `ActorStop`, trips its
+    /// `actor_token`, and exits; the `ActorRegistryGuard` then removes the
+    /// entry from `self.actors` on drop. A detached background-summary
+    /// pass on that actor's loop survives the reap by design — it runs on
+    /// its own fresh token, not a child of `actor_token` (see
+    /// [`crate::runtime::agent_loop::AgentLoop::maybe_run_background_compression`]).
     ///
     /// Returns the number of `ActorStop` sends attempted. Idle sessions
     /// that were not registered (cron / maintenance / subagent
@@ -329,15 +325,6 @@ impl AgentSupervisor {
                     "idle reaper: skipping parent with in-flight background subagent(s)"
                 );
                 continue;
-            }
-            if let Err(e) = sessions.clear_summary_in_flight(&session_id).await {
-                warn!(
-                    %session_id,
-                    error = %e,
-                    "idle reaper: failed to clear summary in_flight before shutdown"
-                );
-                // Press on — losing one compression pass slot is
-                // better than leaving the actor stuck in memory.
             }
             let Some(sender) = self.actors.get(&session_id).map(|e| e.sender.clone()) else {
                 continue;
@@ -469,8 +456,8 @@ mod tests {
     use super::*;
     use crate::actor::mailbox;
     use aura_model::{ChannelType, SessionId, User};
+    use aura_session::SessionStore;
     use aura_session::test_support::{MemorySessionStore, MemorySessionSummaryStore};
-    use aura_session::{SessionStore, SessionSummaryStore};
 
     fn make_supervisor() -> AgentSupervisor {
         let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
@@ -659,13 +646,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Mark idle session as having an in-flight compression so we
-        // can verify the reaper clears it.
-        sessions
-            .mark_summary_in_flight(&idle.id, "owner-x")
-            .await
-            .unwrap();
-
         let supervisor = make_supervisor();
         let (idle_tx, mut idle_rx) = mailbox::channel(8);
         let (fresh_tx, mut fresh_rx) = mailbox::channel(8);
@@ -683,10 +663,6 @@ mod tests {
         assert!(matches!(idle_rx.try_recv(), Ok(AgentMessage::ActorStop)));
         // The fresh actor received nothing.
         assert!(fresh_rx.try_recv().is_err());
-
-        // The in_flight flag on the reaped session is cleared.
-        let row = summary_store.get(&idle.id).await.unwrap().unwrap();
-        assert!(!row.in_flight);
     }
 
     #[test]

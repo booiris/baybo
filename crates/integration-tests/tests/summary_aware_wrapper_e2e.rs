@@ -137,18 +137,19 @@ async fn fast_path_skips_chat_callback_when_summary_md_present() {
          captured a request whose trailing message carries SUMMARIZE_INSTRUCTION: {captured:#?}"
     );
 
-    // The harness's `session_summaries.in_flight` flag stays clear
-    // throughout: the wrapper never spawns a refresh pass, and
-    // `record_summary_success` we ran above wrote `in_flight = 0`.
+    // The fast-path is read-only against `session_summaries`: it reads
+    // the cursor we seeded above to map summary.md into the recent
+    // slice, but never writes the row. The cursor stays exactly where
+    // `record_summary_success` left it.
     let row = harness
         .session_manager
         .summary_metadata(&harness.session.id)
         .await
         .unwrap()
         .expect("metadata exists");
-    assert!(
-        !row.in_flight,
-        "fast-path read path must not flip the in_flight flag"
+    assert_eq!(
+        row.cursor, 2,
+        "fast-path read path must not mutate the summary cursor"
     );
 
     harness.shutdown().await;

@@ -13,7 +13,7 @@ use aura_channels::{
     AgentEvent, AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage,
 };
 use aura_job::JobInput;
-use aura_model::{BackgroundCompressionPayload, ContentBlock, LlmEntryName, PendingSubagentResult};
+use aura_model::{ContentBlock, LlmEntryName, PendingSubagentResult};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -64,10 +64,6 @@ pub enum AgentMessage {
         initial_message: Box<IncomingMessage>,
         parent_job_id: aura_model::JobId,
     },
-    /// A maintenance task has been spawned on this actor's session.
-    /// Bypasses the normal chat-turn cycle (`agent_loop.run`) and
-    /// dispatches the carried payload to a dedicated handler.
-    BackgroundCompression(BackgroundCompressionPayload),
     /// A `background: true` subagent dispatched from this session
     /// reached a terminal state. The wait task posts this to the parent
     /// actor's mailbox; it is buffered on
@@ -98,8 +94,7 @@ impl mailbox::Prioritized for AgentMessage {
             AgentMessage::UserInput(_)
             | AgentMessage::CronTrigger { .. }
             | AgentMessage::SubagentSpawned { .. }
-            | AgentMessage::SetModel { .. }
-            | AgentMessage::BackgroundCompression(_) => MessagePriority::Trigger,
+            | AgentMessage::SetModel { .. } => MessagePriority::Trigger,
             AgentMessage::SubagentFinished(_) => MessagePriority::SubagentFinished,
             AgentMessage::ActorStop => MessagePriority::Stop,
         }
@@ -360,11 +355,6 @@ impl AgentActor {
                     .await
                 {
                     error!(session_id = %session_id, error = %e, "failed to handle subagent spawn");
-                }
-            }
-            AgentMessage::BackgroundCompression(payload) => {
-                if let Err(e) = self.handle_background_compression(payload).await {
-                    error!(session_id = %session_id, error = %e, "failed to handle background compression");
                 }
             }
             AgentMessage::SubagentFinished(pending) => {
@@ -821,32 +811,6 @@ impl AgentActor {
         if let Err(e) = self.volatile.response_tx.send(output).await {
             warn!(error = %e, source, "failed to send agent output to channel");
         }
-    }
-
-    /// Run a background compression pass on this actor's session via
-    /// `agent_loop.run_background_compression`.
-    async fn handle_background_compression(
-        &mut self,
-        payload: BackgroundCompressionPayload,
-    ) -> anyhow::Result<()> {
-        let outcome = self
-            .volatile
-            .agent_loop
-            .run_background_compression(
-                &mut self.durable.session,
-                payload,
-                &self.volatile.job_lifecycle,
-                &self.volatile.span_recorder,
-                self.volatile.actor_token.child_token(),
-            )
-            .await?;
-        debug!(
-            session_id = %self.durable.session.id,
-            cursor = outcome.cursor,
-            cost_micros = outcome.cost_micros,
-            "background summary: pass landed"
-        );
-        Ok(())
     }
 }
 

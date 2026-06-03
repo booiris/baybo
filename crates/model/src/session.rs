@@ -143,9 +143,8 @@ pub enum SystemReason {
 }
 
 /// Payload carried by a background compression trigger. Built by the
-/// parent's agent loop at trigger time and forwarded through
-/// `JobInput::System` and the maintenance actor's mailbox to the
-/// `BackgroundCompressionRunner`.
+/// parent's agent loop at trigger time and handed to the detached
+/// background-summary task the loop spawns in-process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundCompressionPayload {
     pub parent_session_id: SessionId,
@@ -153,12 +152,6 @@ pub struct BackgroundCompressionPayload {
     /// input. Pinned at trigger time so concurrent appends to the
     /// parent don't bleed in mid-pass.
     pub up_to_ordinal: i64,
-    /// Opaque owner token stamped onto `session_summaries.in_flight_owner`
-    /// when the trigger gate marked the parent in-flight. The runner
-    /// uses it for compare-and-clear cleanup so a stale Pass A
-    /// finishing after Pass B remarked the parent cannot wipe Pass
-    /// B's mark. Generated once per pass at the gate (UUID v4).
-    pub in_flight_owner: String,
 }
 
 /// Direct parent relationship for sessions spawned from another session.
@@ -418,7 +411,6 @@ mod tests {
         let p = BackgroundCompressionPayload {
             parent_session_id: SessionId::from("user-1"),
             up_to_ordinal: 42,
-            in_flight_owner: "owner-token".into(),
         };
         let s = serde_json::to_string(&p).unwrap();
         let back: BackgroundCompressionPayload = serde_json::from_str(&s).unwrap();

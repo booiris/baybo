@@ -109,68 +109,6 @@ impl SessionManager {
             .map_err(SessionError::from)
     }
 
-    /// Mark `session_id` as having an in-flight `BackgroundCompressionRunner`
-    /// pass and stamp `owner` onto the row. The trigger gate calls
-    /// this immediately before emitting a `SystemSpawnRequest`, and
-    /// the next gate iteration on the same parent will see the flag
-    /// and skip. A landed `record_summary_success` /
-    /// `record_summary_failure` clears it automatically; the orphan
-    /// reaper clears it on next boot for sessions whose maintenance
-    /// row was reaped.
-    ///
-    /// `owner` should be a freshly-generated UUID (or any unique
-    /// token) so [`Self::clear_summary_in_flight_if_owned`] can do a
-    /// CAS-style clear without wiping a newer pass' mark.
-    pub async fn mark_summary_in_flight(&self, session_id: &SessionId, owner: &str) -> Result<()> {
-        self.summary_store
-            .set_in_flight(session_id, true, Some(owner), Utc::now())
-            .await
-            .map_err(SessionError::from)
-    }
-
-    /// Compare-and-clear the `in_flight` flag: only clears when the
-    /// row's `in_flight_owner` matches `owner`. Returns `Ok(true)`
-    /// when the caller still owned the mark. Used by the trigger
-    /// gate's `try_send` rollback and the runner's defensive
-    /// post-pass cleanup so a stale Pass A finishing after Pass B
-    /// remarked the parent cannot wipe Pass B's mark.
-    pub async fn clear_summary_in_flight_if_owned(
-        &self,
-        session_id: &SessionId,
-        owner: &str,
-    ) -> Result<bool> {
-        self.summary_store
-            .clear_in_flight_if_owned(session_id, owner, Utc::now())
-            .await
-            .map_err(SessionError::from)
-    }
-
-    /// Reset `in_flight = 0` on every `session_summaries` row. Called
-    /// once at startup by the orphan reaper so the gap between a
-    /// `mark_summary_in_flight` write and a process crash before the
-    /// router could create the corresponding maintenance session row
-    /// (or even before the `try_send` returned) doesn't leave the
-    /// parent permanently blocked.
-    pub async fn clear_all_summary_in_flight(&self) -> Result<()> {
-        self.summary_store
-            .clear_all_in_flight()
-            .await
-            .map_err(SessionError::from)
-    }
-
-    /// Unconditionally clear the `in_flight` flag for one session.
-    /// Used by the actor idle reaper before sending `Shutdown`: the
-    /// maintenance child whose `actor_token` is a grandchild of the
-    /// reaped parent will cascade-cancel, so any pass it owned is
-    /// abandoned. Without this clear, the next hydration would see
-    /// the dangling mark and skip compression forever.
-    pub async fn clear_summary_in_flight(&self, session_id: &SessionId) -> Result<()> {
-        self.summary_store
-            .set_in_flight(session_id, false, None, Utc::now())
-            .await
-            .map_err(SessionError::from)
-    }
-
     pub async fn create_session(&self, user: User, channel: ChannelType) -> Result<Session> {
         self.create_session_with_trigger(user, channel, TriggerSource::User)
             .await
@@ -696,7 +634,7 @@ mod tests {
     use aura_model::{ChannelType, SessionId, User};
     use chrono::{Duration, Utc};
 
-    use super::{SessionError, SessionManager, SessionStore, SessionSummaryStore};
+    use super::{SessionError, SessionManager, SessionStore};
     use crate::test_support::{MemorySessionStore, MemorySessionSummaryStore};
 
     fn test_user() -> User {
@@ -816,26 +754,6 @@ mod tests {
         // List-only — neither session is deleted.
         assert!(store.get(&idle.id).await.unwrap().is_some());
         assert!(store.get(&fresh.id).await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn clear_summary_in_flight_resets_single_session() {
-        let summary_store = Arc::new(MemorySessionSummaryStore::new());
-        let mgr = SessionManager::new(Arc::new(MemorySessionStore::new()), summary_store.clone());
-
-        let session_id = SessionId::from("clear-target");
-        let other = SessionId::from("clear-other");
-        mgr.mark_summary_in_flight(&session_id, "owner-1")
-            .await
-            .unwrap();
-        mgr.mark_summary_in_flight(&other, "owner-2").await.unwrap();
-
-        mgr.clear_summary_in_flight(&session_id).await.unwrap();
-
-        let row = summary_store.get(&session_id).await.unwrap().unwrap();
-        assert!(!row.in_flight);
-        let other_row = summary_store.get(&other).await.unwrap().unwrap();
-        assert!(other_row.in_flight, "other session's flag untouched");
     }
 
     #[tokio::test]

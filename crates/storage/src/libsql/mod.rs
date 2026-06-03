@@ -229,24 +229,12 @@ impl LibsqlPool {
                     -- underlying issue resolves; that's an explicit design
                     -- choice (no backoff complexity).
                     error_count INTEGER NOT NULL DEFAULT 0,
-                    -- 1 while a `BackgroundCompressionRunner` pass is active for
-                    -- this parent; 0 otherwise. The trigger gate reads this
-                    -- column to enforce the at-most-one-in-flight invariant
-                    -- without inspecting the maintenance session row (which is
-                    -- preserved as audit history). Set by the gate before
-                    -- emitting a `SystemSpawnRequest`; cleared by
-                    -- `record_summary_success`/`record_summary_failure` and by
-                    -- the orphan reaper.
+                    -- LEGACY (inert): the DB-flag at-most-one-in-flight
+                    -- mechanism for background compression was removed when
+                    -- the pass moved to an in-actor detached step gated by an
+                    -- in-memory JoinHandle. The columns stay in the schema so
+                    -- old DBs need no migration; nothing reads or writes them.
                     in_flight   INTEGER NOT NULL DEFAULT 0,
-                    -- Opaque owner token (UUID) stamped by the trigger gate
-                    -- when it sets `in_flight = 1`. The runner's defensive
-                    -- post-pass cleanup uses a CAS-style clear (UPDATE
-                    -- `in_flight_owner = ?`) so a Pass A that finishes
-                    -- *after* a Pass B already marked itself in flight
-                    -- cannot wipe Pass B's mark. Reset to NULL by every
-                    -- terminal handler (`upsert_success` /
-                    -- `bump_error_count` / `clear_all_in_flight`) so a
-                    -- newly-started pass starts from a clean slate.
                     in_flight_owner TEXT
                 );
 

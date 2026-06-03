@@ -188,17 +188,13 @@ pub struct ManagerGraph {
     /// out a dummy receiver.
     pub cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
 
-    /// Sender half of the system-spawn channel. The agent loop's
-    /// trigger gate sends `SystemSpawnRequest` values here; the
-    /// receiving half lives on the router until [`wire_router`]
-    /// `.take()`s it. Cloned into every `AgentLoop` the spawner
-    /// factory builds so any actor can schedule a maintenance task.
-    pub system_spawn_tx: mpsc::Sender<SystemSpawnRequest>,
-
-    /// Receiving half of the system-spawn channel. Same `Option` +
+    /// Receiving half of the system-spawn channel. The sender is held by
+    /// the `spawn_subagent` tool (cloned at build time); only the router
+    /// needs the receiver, taken on [`wire_router`]. Same `Option` +
     /// `take`-on-wire pattern as `cron_trigger_rx` — calling
     /// `wire_router` twice panics rather than silently dropping
-    /// system-spawn requests.
+    /// system-spawn requests. (Background compression no longer uses
+    /// this channel — it runs as a detached in-actor pass.)
     pub system_spawn_rx: Option<mpsc::Receiver<SystemSpawnRequest>>,
 
     /// Process-wide parent token for `AgentActor`s. Bridged to the
@@ -465,30 +461,31 @@ pub async fn build_managers(
         cron_trigger_tx,
         Arc::new(shutdown.clone()) as Arc<dyn aura_cron::Shutdown>,
     ));
-    // System-spawn channel: agent_loop's trigger gate (sender end) ↔
+    // System-spawn channel: the `spawn_subagent` tool (sender end) ↔
     // router's `system_trigger_rx` arm (receiver end).
     //
-    // Per-parent serialization (`active_maintenance_for_parent` check)
-    // caps queue depth at one outstanding request per active parent
-    // session, so the upper bound is roughly the number of parents
-    // that cross the trigger thresholds in the same instant the
-    // router happens to be busy. Each request is ~100–200 B
-    // (`SessionId` + `JobId` + `Arc<CancellationToken>` +
-    // `BackgroundCompressionPayload`); 1024 slots is ~200 KB and gives a
-    // multi-user gateway comfortable headroom over its concurrent
-    // active session count, so a `try_send` failure becomes a real
-    // backpressure alarm rather than routine bursty drops. Bump
-    // further if a deployment regularly trips it.
+    // `SystemSpawnRequest` now carries a single variant (`Subagent`);
+    // background compression no longer rides this channel (it spawns a
+    // detached in-actor task directly). Queue depth is therefore bounded
+    // by the number of concurrent `spawn_subagent` dispatches awaiting
+    // the router, which the per-root fan-out limiter already caps. Each
+    // request is small — the bulky `SubagentSpawnRequest` is boxed, so
+    // the inline message is `SessionId` + `JobId` + `SpanId` +
+    // `CancellationToken` + `Box<SubagentSpawnRequest>` +
+    // `oneshot::Sender<SubagentResult>` (a few hundred bytes). 1024 slots
+    // gives a multi-user gateway comfortable headroom, so a `try_send`
+    // failure is a real backpressure alarm rather than routine bursty
+    // drops. Bump further if a deployment regularly trips it.
     let (system_spawn_tx, system_spawn_rx) = mpsc::channel::<SystemSpawnRequest>(1024);
     for (tool, manifest) in aura_cron::tools::agent_tools(Arc::clone(&cron_scheduler)) {
         tool_registry.register(tool, manifest);
     }
 
     // `spawn_subagent` is just another tool from the LLM's perspective.
-    // It ferries the spawn request to the router via the same
-    // system-spawn channel that background-compression uses; the router
-    // does the session-create + actor-spawn + wait, and ships the
-    // final `SubagentResult` back through a oneshot the tool blocks on.
+    // It ferries the spawn request to the router via the system-spawn
+    // channel (now the channel's sole producer); the router does the
+    // session-create + actor-spawn + wait, and ships the final
+    // `SubagentResult` back through a oneshot the tool blocks on.
     // The fan-out limiter is constructed here so it can be shared
     // between the tool (reserves at dispatch) and the router (releases
     // on terminal) — both will hold the same `Arc<FanOutLimiter>`.
@@ -689,7 +686,6 @@ pub async fn build_managers(
         stores,
         memory,
         cron_trigger_rx: Some(cron_trigger_rx),
-        system_spawn_tx,
         system_spawn_rx: Some(system_spawn_rx),
         actor_parent_token,
         subagent_dispatch_limiter,
@@ -759,8 +755,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let llm_pool = Arc::clone(&graph.llm_pool);
 
     // Single boxed factory owned by the router: used for top-level
-    // user/cron actors, background-compression maintenance spawns,
-    // AND `SystemSpawnRequest::Subagent` child materialisation.
+    // user/cron actors AND `SystemSpawnRequest::Subagent` child
+    // materialisation. (Background compression no longer spawns an
+    // actor — it runs as a detached in-actor pass on the parent's loop.)
     let spawn_actor_for: aura_agent::router::ActorSpawner = {
         let llm_pool = Arc::clone(&llm_pool);
         let tool_registry = Arc::clone(&graph.tool_registry);
@@ -779,7 +776,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let workspace_paths_arc = Arc::new(aura_workspace::WorkspacePaths::new(
             graph.workspace.root.clone(),
         ));
-        let system_spawn_tx = graph.system_spawn_tx.clone();
         let supervisor_for_spawn = supervisor.clone();
         // Memory subsystem. Constructed in `build_managers` via
         // `aura_memory::boot::build_memory_backend` so the impl's
@@ -828,8 +824,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),
-                    actor_token: actor_token.clone(),
-                    system_spawn_tx: Some(system_spawn_tx.clone()),
                     workspace_paths: Some(Arc::clone(&workspace_paths_arc)),
                     sessions: Some(Arc::clone(&sessions)),
                     memory: memory.clone(),

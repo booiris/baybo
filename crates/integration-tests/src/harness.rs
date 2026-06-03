@@ -443,8 +443,6 @@ impl AgentTestHarnessBuilder {
             context_manager,
             max_iterations: 20,
             security_gateway: gateway.clone(),
-            actor_token: actor_token.clone(),
-            system_spawn_tx: None,
             workspace_paths: None,
             // Mirror what production wires so the `on_session_end` hook
             // (which loads the durable transcript via `SessionManager`) is

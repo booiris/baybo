@@ -136,7 +136,6 @@ mod tests {
             payload: BackgroundCompressionPayload {
                 parent_session_id: aura_model::SessionId::from("sess-1"),
                 up_to_ordinal: 0,
-                in_flight_owner: "owner".into(),
             },
         };
         assert_eq!(i.kind(), JobKind::System);
@@ -156,7 +155,6 @@ mod tests {
             payload: BackgroundCompressionPayload {
                 parent_session_id: aura_model::SessionId::from("sess-1"),
                 up_to_ordinal: 0,
-                in_flight_owner: "owner".into(),
             },
         };
         let s = serde_json::to_string(&i).unwrap();

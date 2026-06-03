@@ -36,7 +36,6 @@ async fn build_router_with_seeded_jobs(sessions: &[(&str, TriggerKind, usize)]) 
                     payload: aura_model::BackgroundCompressionPayload {
                         parent_session_id: SessionId::from(*sid),
                         up_to_ordinal: 0,
-                        in_flight_owner: "test".into(),
                     },
                 },
                 TriggerKind::Spawned => JobInput::Spawned {
