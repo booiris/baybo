@@ -32,7 +32,7 @@ pub use pricing::LlmPricingOverride;
 pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{
     BackgroundCompressionPayload, ChannelType, Lineage, LineageKind, Session, SessionState,
-    SystemReason, TriggerKind, TriggerSource, User,
+    TriggerKind, TriggerSource, User,
 };
 pub use spawn_protocol::{
     BACKGROUND_SUBAGENT_HANDLE_PREFIX, PendingSubagentResult, SPAWN_SUBAGENT_TOOL_NAME,

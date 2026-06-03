@@ -296,20 +296,18 @@ fn cron_prompt_blocks(action_payload: &serde_json::Value) -> Vec<ContentBlock> {
 
 /// Whether the `on_session_end` memory hook should fire for this session.
 /// The session-level analogue of [`memory_recall_query`]: only sessions a person
-/// would call "theirs" — root `User`/`Cron` sessions. Subagent,
-/// `SystemMaintenance`, and `System`-triggered (background compression)
-/// actors all send `ActorStop` when they finish, but their shutdown is
-/// not a user-session ending. Exhaustive arms force a classification
+/// would call "theirs" — root `User`/`Cron` sessions, not subagents.
+/// Subagent actors send `ActorStop` when they finish, but their shutdown
+/// is not a user-session ending. Exhaustive arms force a classification
 /// when a new `TriggerSource` / `LineageKind` variant is added.
 fn should_fire_session_end(session: &Session) -> bool {
     let user_trigger = match &session.trigger {
         TriggerSource::User | TriggerSource::Cron { .. } => true,
-        TriggerSource::System { .. } => false,
     };
     let user_lineage = match &session.lineage {
         None => true,
         Some(l) => match &l.kind {
-            LineageKind::Subagent | LineageKind::SystemMaintenance => false,
+            LineageKind::Subagent => false,
         },
     };
     user_trigger && user_lineage
@@ -1452,7 +1450,7 @@ impl AgentLoop {
     ///
     /// No-op when memory is unwired, when `sessions` is unwired (test
     /// harnesses with no cross-session store), or when the session isn't
-    /// user-facing per [`should_fire_session_end`] (subagents, maintenance,
+    /// user-facing per [`should_fire_session_end`] (subagents and
     /// system-triggered actors all send `ActorStop` too, but their shutdown
     /// is not a user-session ending).
     ///
@@ -2235,8 +2233,8 @@ impl AgentLoop {
     /// commit. When tokens and activity have crossed their thresholds
     /// (see [`ContextManager::maybe_request_background_summary`]) it
     /// `tokio::spawn`s a DETACHED background-summary pass attributed to
-    /// **this** (parent) session — no new maintenance session, no router
-    /// hop. Fire-and-forget: the user's turn never blocks on it.
+    /// **this** (parent) session. Fire-and-forget: the user's turn never
+    /// blocks on it.
     ///
     /// `job_done = true` is passed at end-of-job (where the activity
     /// disjunct is trivially satisfied); `false` at iteration boundaries
@@ -2292,11 +2290,10 @@ impl AgentLoop {
         };
 
         // Pre-extract everything the 'static task needs — the spawned
-        // future cannot borrow `&self` / `&session`. session_id/user_id
-        // are the PARENT's: the pass bills + traces against the parent,
-        // not a maintenance session.
-        let parent_session_id = session.id.clone();
-        let parent_user_id = session.user.id.clone();
+        // future cannot borrow `&self` / `&session`. The pass bills +
+        // traces against this session.
+        let session_id = session.id.clone();
+        let user_id = session.user.id.clone();
         let effective_soul_version = session.bound_soul_version.clone();
         let llm_client = self.llm_client.clone();
         let security_gateway = self.security_gateway.clone();
@@ -2312,12 +2309,15 @@ impl AgentLoop {
         let cancel_token = CancellationToken::new();
 
         let handle = tokio::spawn(async move {
+            // Clone the session id for the runner before the spec moves
+            // it into `session_id`.
+            let runner_session_id = session_id.clone();
             let spec = JobSpec {
-                session_id: parent_session_id,
+                session_id,
                 // The pass is a `System` job, which `allowed_for` only
-                // admits under a `System`-trigger session. It now runs
-                // inside the PARENT actor (User / Cron trigger), so pass
-                // `System` here purely to clear the gate — the job row's
+                // admits under a `System`-trigger session. It runs inside
+                // a User / Cron-trigger session's actor, so pass `System`
+                // here purely to clear the gate — the job row's
                 // attribution keys off `session_id` above, not this kind.
                 session_trigger_kind: aura_model::TriggerKind::System,
                 input: aura_job::JobInput::System {
@@ -2340,8 +2340,8 @@ impl AgentLoop {
                         tokenizer,
                         recorder,
                         model_info,
-                        parent_session_id: payload.parent_session_id.clone(),
-                        parent_user_id,
+                        session_id: runner_session_id,
+                        user_id,
                         job_id,
                         cancel_token,
                     };
@@ -2713,15 +2713,14 @@ mod trim_response_text_edges_tests {
 #[cfg(test)]
 mod session_end_gate_tests {
     //! `should_fire_session_end` decides whether `Memory::on_session_end`
-    //! runs when an actor processes `ActorStop`. Subagent /
-    //! `SystemMaintenance` actors and `System`-triggered (background
-    //! compression) sessions also stop, but their teardown is not a
-    //! user-session ending — firing the hook for them would write
-    //! garbage memory.
+    //! runs when an actor processes `ActorStop`. Subagent actors and
+    //! `System`-triggered (background compression) sessions also stop,
+    //! but their teardown is not a user-session ending — firing the hook
+    //! for them would write garbage memory.
     use super::should_fire_session_end;
     use aura_model::{
-        ChannelType, JobId, Lineage, LineageKind, Session, SessionId, SessionState, SystemReason,
-        TriggerSource, User,
+        ChannelType, JobId, Lineage, LineageKind, Session, SessionId, SessionState, TriggerSource,
+        User,
     };
     use chrono::Utc;
 
@@ -2780,37 +2779,6 @@ mod session_end_gate_tests {
             TriggerSource::User,
             Some(lineage),
         )));
-    }
-
-    #[test]
-    fn skips_system_maintenance_session() {
-        let lineage = Lineage {
-            parent_session_id: SessionId::from("parent"),
-            parent_job_id: JobId::new(),
-            parent_span_id: None,
-            kind: LineageKind::SystemMaintenance,
-        };
-        let s = session_with(
-            TriggerSource::System {
-                reason: SystemReason::BackgroundCompression,
-            },
-            Some(lineage),
-        );
-        assert!(!should_fire_session_end(&s));
-    }
-
-    #[test]
-    fn skips_root_system_session() {
-        // No lineage but System trigger → still a maintenance-class actor
-        // (a hypothetical future System variant without SystemMaintenance
-        // lineage), not a user session.
-        let s = session_with(
-            TriggerSource::System {
-                reason: SystemReason::BackgroundCompression,
-            },
-            None,
-        );
-        assert!(!should_fire_session_end(&s));
     }
 }
 

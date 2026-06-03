@@ -1200,7 +1200,7 @@ impl ContextManager {
             Ok(m) => m,
             Err(e) => {
                 warn!(
-                    parent_session_id = %self.session_id,
+                    session_id = %self.session_id,
                     error = %e,
                     "background-summary trigger: summary_metadata lookup failed; skipping"
                 );
@@ -1230,7 +1230,7 @@ impl ContextManager {
             Ok(None) => 0,
             Err(e) => {
                 warn!(
-                    parent_session_id = %self.session_id,
+                    session_id = %self.session_id,
                     error = %e,
                     "background-summary trigger: ordinal lookup failed; skipping"
                 );
@@ -1238,7 +1238,7 @@ impl ContextManager {
             }
         };
         debug!(
-            parent_session_id = %self.session_id,
+            session_id = %self.session_id,
             tokens_now,
             tokens_since,
             tool_calls,
@@ -1247,10 +1247,7 @@ impl ContextManager {
             "background-summary trigger: gate passed"
         );
 
-        Some(BackgroundCompressionPayload {
-            parent_session_id: self.session_id.clone(),
-            up_to_ordinal,
-        })
+        Some(BackgroundCompressionPayload { up_to_ordinal })
     }
 
     /// Read the anchor index. Test-only: production callers measure

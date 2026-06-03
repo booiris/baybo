@@ -749,7 +749,6 @@ pub struct LogsResponse {
 pub enum SessionKind {
     User,
     Cron,
-    Compression,
     Subagent,
 }
 
@@ -758,7 +757,6 @@ impl From<aura_query::SessionKind> for SessionKind {
         match v {
             aura_query::SessionKind::User => Self::User,
             aura_query::SessionKind::Cron => Self::Cron,
-            aura_query::SessionKind::Compression => Self::Compression,
             aura_query::SessionKind::Subagent => Self::Subagent,
         }
     }
@@ -769,7 +767,6 @@ impl From<SessionKind> for aura_query::SessionKind {
         match v {
             SessionKind::User => Self::User,
             SessionKind::Cron => Self::Cron,
-            SessionKind::Compression => Self::Compression,
             SessionKind::Subagent => Self::Subagent,
         }
     }
@@ -792,8 +789,7 @@ pub struct TracesListQuery {
     /// Case-insensitive substring on session id.
     #[serde(default)]
     pub q: Option<String>,
-    /// Filter on coarse trigger/lineage label. `compression` opts into
-    /// background-maintenance sessions that the default list hides.
+    /// Filter on coarse trigger/lineage label.
     #[serde(default)]
     pub kind: Option<SessionKind>,
     #[serde(default)]

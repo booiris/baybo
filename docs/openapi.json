@@ -2005,7 +2005,7 @@
           {
             "name": "kind",
             "in": "query",
-            "description": "Filter on coarse trigger/lineage label. `compression` opts into\nbackground-maintenance sessions that the default list hides.",
+            "description": "Filter on coarse trigger/lineage label.",
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/SessionKind"
@@ -3391,7 +3391,6 @@
         "enum": [
           "user",
           "cron",
-          "compression",
           "subagent"
         ]
       },

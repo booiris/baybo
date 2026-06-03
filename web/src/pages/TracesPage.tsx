@@ -34,7 +34,6 @@ const KIND_OPTIONS: { value: 'all' | SessionKind; label: string }[] = [
   { value: 'user', label: 'User' },
   { value: 'subagent', label: 'Subagent' },
   { value: 'cron', label: 'Cron' },
-  { value: 'compression', label: 'Compression' },
 ];
 
 const STATUS_BADGE_CLASS: Record<JobStatusKind, string> = {
@@ -49,14 +48,12 @@ const STATUS_BADGE_CLASS: Record<JobStatusKind, string> = {
 const KIND_BADGE_CLASS: Record<SessionKind, string> = {
   user: 'bg-white text-ink',
   cron: 'bg-warn/15 text-warn',
-  compression: 'bg-gray-100 text-ink-soft',
   subagent: 'bg-brand/10 text-brand',
 };
 
 const KIND_BADGE_LABEL: Record<SessionKind, string> = {
   user: 'user',
   cron: 'cron',
-  compression: 'compress',
   subagent: 'subagent',
 };
 

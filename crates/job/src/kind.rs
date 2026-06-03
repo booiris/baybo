@@ -133,10 +133,7 @@ mod tests {
         assert_eq!(i.kind(), JobKind::Cron);
 
         let i = JobInput::System {
-            payload: BackgroundCompressionPayload {
-                parent_session_id: aura_model::SessionId::from("sess-1"),
-                up_to_ordinal: 0,
-            },
+            payload: BackgroundCompressionPayload { up_to_ordinal: 0 },
         };
         assert_eq!(i.kind(), JobKind::System);
 
@@ -152,10 +149,7 @@ mod tests {
     #[test]
     fn input_round_trips_through_serde() {
         let i = JobInput::System {
-            payload: BackgroundCompressionPayload {
-                parent_session_id: aura_model::SessionId::from("sess-1"),
-                up_to_ordinal: 0,
-            },
+            payload: BackgroundCompressionPayload { up_to_ordinal: 0 },
         };
         let s = serde_json::to_string(&i).unwrap();
         let back: JobInput = serde_json::from_str(&s).unwrap();

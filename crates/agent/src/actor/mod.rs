@@ -281,10 +281,10 @@ impl AgentActor {
                         &self.durable.session,
                     );
                     // Cancelling our `actor_token` cascades into every
-                    // child we spawned — including maintenance actors,
-                    // whose `actor_token` is a grandchild of ours via
-                    // the `parent_actor_token` carried in their
-                    // `SystemSpawnRequest`. No explicit dispatch needed.
+                    // child we spawned — a subagent actor derives its
+                    // `actor_token` from ours via the `parent_actor_token`
+                    // carried in its `SystemSpawnRequest`, so parent
+                    // shutdown reaches it with no explicit dispatch.
                     self.volatile.actor_token.cancel();
                     break;
                 }

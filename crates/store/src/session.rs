@@ -74,18 +74,13 @@ pub trait SessionStore: Send + Sync {
     /// the actor token tree happens before this call).
     async fn delete(&self, session_id: &SessionId) -> Result<bool>;
     /// Return session ids whose `last_active` is older than `before`.
-    /// Excludes maintenance sessions (`is_normal_session = 0`) — those
-    /// get reaped through the orphan-marker on startup, not through
-    /// the regular expiry sweep.
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<SessionId>>;
-    /// Return every live **user-facing** session, ordered by
-    /// `last_active` descending. Maintenance sessions (`is_normal_session
-    /// = 0`) are filtered out; use [`Self::list_all_maintenance_sessions`]
-    /// to enumerate those. Operator-facing: drives `aura session list`.
+    /// Return every live session, ordered by `last_active` descending.
+    /// Operator-facing: drives `aura session list`.
     async fn list_all(&self) -> Result<Vec<Session>>;
 
-    /// Return live user-facing sessions whose `channel` equals
-    /// `channel`, newest-active first. Used by the chat REST surface
+    /// Return live sessions whose `channel` equals `channel`,
+    /// newest-active first. Used by the chat REST surface
     /// (`GET /v1/chat/sessions`) so a long-running gateway with
     /// thousands of telegram / weixin sessions doesn't ship every
     /// row over the wire only to discard the non-http ones in
@@ -98,47 +93,10 @@ pub trait SessionStore: Send + Sync {
         let all = self.list_all().await?;
         Ok(all.into_iter().filter(|s| &s.channel == channel).collect())
     }
-    /// Return the session ids of every active maintenance session whose
-    /// `Lineage.parent_session_id` matches `parent_session_id`. Used by
-    /// the parent's agent loop to enforce the at-most-one-in-flight
-    /// `BackgroundCompressionRunner` invariant before spawning a new pass — if a
-    /// row is returned, the parent skips this trigger and re-evaluates
-    /// next iteration. Returns the ids regardless of state because the
-    /// "active" determination is whether an actor is running, which the
-    /// store cannot know directly; the caller correlates with the
-    /// `JobStore` for liveness.
-    async fn list_active_maintenance_for_parent(
-        &self,
-        parent_session_id: &SessionId,
-    ) -> Result<Vec<SessionId>>;
 
-    /// Return every maintenance session id (`is_normal_session = 0`).
-    /// Used by the startup orphan reaper to terminate sessions whose
-    /// actor isn't running after a process bounce.
-    async fn list_all_maintenance_sessions(&self) -> Result<Vec<SessionId>>;
-
-    /// Return only the maintenance session ids whose associated job is
-    /// **not** in a terminal state (`completed` / `failed` /
-    /// `cancelled`). These are passes that were running when the
-    /// previous process crashed; their parents' `error_count` should
-    /// be bumped and their session rows reaped.
-    ///
-    /// Maintenance sessions whose job is terminal are *kept* as audit
-    /// history — joining `cost_records` through them is the only way
-    /// to attribute background-compression spend back to the
-    /// originating parent, and treating them as orphans on every
-    /// restart would silently delete that audit chain.
-    ///
-    /// Sessions with **no** job row at all (a pathological window
-    /// between `create_maintenance_session` and `with_job` that the
-    /// process didn't survive) are also returned — there's no LLM
-    /// spend or audit value to preserve, and leaving them behind
-    /// would accumulate dead rows.
-    async fn list_unfinished_maintenance_sessions(&self) -> Result<Vec<SessionId>>;
-
-    /// Return every immediate live descendant (Subagent or
-    /// SystemMaintenance) of the given parent. Powers `lineage_tree` and
-    /// `list_active_subagents`. Order is unspecified.
+    /// Return every immediate live descendant (by `Lineage`) of the
+    /// given parent. Powers `lineage_tree` and `list_active_subagents`.
+    /// Order is unspecified.
     async fn list_lineage_children(
         &self,
         parent_session_id: &SessionId,

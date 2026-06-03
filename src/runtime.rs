@@ -193,8 +193,7 @@ pub struct ManagerGraph {
     /// needs the receiver, taken on [`wire_router`]. Same `Option` +
     /// `take`-on-wire pattern as `cron_trigger_rx` — calling
     /// `wire_router` twice panics rather than silently dropping
-    /// system-spawn requests. (Background compression no longer uses
-    /// this channel — it runs as a detached in-actor pass.)
+    /// system-spawn requests.
     pub system_spawn_rx: Option<mpsc::Receiver<SystemSpawnRequest>>,
 
     /// Process-wide parent token for `AgentActor`s. Bridged to the
@@ -431,12 +430,11 @@ pub async fn build_managers(
         stores.session_summary.clone(),
     ));
 
-    // Reap orphans from any maintenance sessions that were
-    // running when the previous process exited. Best-effort —
-    // logged at warn on failure, never blocks boot. Runs before
-    // any actor spawns so newly-created background-summary actors
-    // don't race against stale rows.
-    aura_agent::compression::reap_maintenance_orphans(session_manager.as_ref(), &workspace_paths)
+    // Delete orphan summary directories under `state/sessions/` left by
+    // a background-summary pass that wrote `summary.md` but exited before
+    // recording its `session_summaries` row. Best-effort — logged at warn
+    // on failure, never blocks boot.
+    aura_agent::compression::reap_orphan_summaries(session_manager.as_ref(), &workspace_paths)
         .await;
 
     let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
@@ -464,11 +462,10 @@ pub async fn build_managers(
     // System-spawn channel: the `spawn_subagent` tool (sender end) ↔
     // router's `system_trigger_rx` arm (receiver end).
     //
-    // `SystemSpawnRequest` now carries a single variant (`Subagent`);
-    // background compression no longer rides this channel (it spawns a
-    // detached in-actor task directly). Queue depth is therefore bounded
-    // by the number of concurrent `spawn_subagent` dispatches awaiting
-    // the router, which the per-root fan-out limiter already caps. Each
+    // `SystemSpawnRequest` carries a single variant (`Subagent`), so the
+    // queue depth is bounded by the number of concurrent `spawn_subagent`
+    // dispatches awaiting the router, which the per-root fan-out limiter
+    // already caps. Each
     // request is small — the bulky `SubagentSpawnRequest` is boxed, so
     // the inline message is `SessionId` + `JobId` + `SpanId` +
     // `CancellationToken` + `Box<SubagentSpawnRequest>` +
@@ -756,8 +753,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
 
     // Single boxed factory owned by the router: used for top-level
     // user/cron actors AND `SystemSpawnRequest::Subagent` child
-    // materialisation. (Background compression no longer spawns an
-    // actor — it runs as a detached in-actor pass on the parent's loop.)
+    // materialisation.
     let spawn_actor_for: aura_agent::router::ActorSpawner = {
         let llm_pool = Arc::clone(&llm_pool);
         let tool_registry = Arc::clone(&graph.tool_registry);

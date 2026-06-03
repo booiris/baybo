@@ -9,30 +9,29 @@
 //!     across the `SessionManager` API.
 //!  2. A full background-summary pass via `aura_context::run_background_summary`
 //!     (the same flow the in-actor `BackgroundCompressionRunner` delegates to):
-//!     it writes `summary.md`, advances `session_summaries.cursor`, and —
-//!     critically for the new model — creates NO maintenance session.
+//!     it writes `summary.md`, advances `session_summaries.cursor`, and
+//!     creates no extra session — the pass runs against the parent's storage.
 //!  3. The inline fast-path's two on-disk inputs (`summary.md` +
 //!     `session_summaries.cursor`) are present after a pass.
-//!  4. `reap_maintenance_orphans` — FS-only now: an orphan summary
-//!     directory with no metadata row is removed; a known one survives.
+//!  4. `reap_orphan_summaries`: an orphan summary directory with no
+//!     metadata row is removed; a known one survives.
 //!
 //! The LLM call / JobLifecycle / SpanRecorder wrapping the pass is
 //! exercised at the `aura-agent` unit layer; this file focuses on the
-//! storage + filesystem boundary and the no-maintenance-session
+//! storage + filesystem boundary and the parent-only-session
 //! invariant.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use aura_agent::SessionManager;
-use aura_agent::compression::reap_maintenance_orphans;
+use aura_agent::compression::reap_orphan_summaries;
 use aura_context::{
     BackgroundSummaryConfig, SummaryChatRun, TiktokenTokenizer, run_background_summary,
 };
 use aura_llm::{LlmResponse, TokenUsage, ToolCallInfo};
 use aura_model::{
-    ChannelType, ChatMessage, ContentBlock, JobId, Lineage, LineageKind, Session, SessionId,
-    SessionState, SystemReason, TriggerSource, User,
+    ChannelType, ChatMessage, ContentBlock, Session, SessionId, SessionState, TriggerSource, User,
 };
 use aura_storage::Store;
 use aura_workspace::WorkspacePaths;
@@ -172,13 +171,12 @@ fn fake_edit_then_stop(notes_path: std::path::PathBuf) -> aura_context::Backgrou
     })
 }
 
-/// The core new-model assertion: a background pass run inline (no
-/// maintenance session, no router hop) writes `summary.md`, advances
-/// `session_summaries.cursor` to the pinned ordinal, and leaves NO
-/// maintenance session row behind. Afterwards the inline fast-path's
-/// two on-disk inputs are both present.
+/// The core assertion: a background pass run inline writes `summary.md`,
+/// advances `session_summaries.cursor` to the pinned ordinal, and creates
+/// no extra session row. Afterwards the inline fast-path's two on-disk
+/// inputs are both present.
 #[tokio::test]
-async fn background_pass_writes_summary_and_advances_cursor_without_maintenance_session() {
+async fn background_pass_writes_summary_and_advances_cursor_without_extra_session() {
     let (store, dir) = fresh_store_and_paths().await;
     let parent = root_session("parent-inline");
     store.session.save(&parent).await.unwrap();
@@ -213,7 +211,7 @@ async fn background_pass_writes_summary_and_advances_cursor_without_maintenance_
         workspace: Arc::new(paths.clone()),
         sessions: Arc::clone(&mgr),
         tokenizer: Arc::new(TiktokenTokenizer::for_model("test")),
-        parent_session_id: parent.id.clone(),
+        session_id: parent.id.clone(),
         up_to_ordinal,
         model_id: "test-model".into(),
         cancel_token: CancellationToken::new(),
@@ -243,11 +241,24 @@ async fn background_pass_writes_summary_and_advances_cursor_without_maintenance_
     assert_eq!(meta.cursor, up_to_ordinal);
     assert_eq!(meta.pass_count, 1);
 
-    // The pass created NO maintenance session — the whole point of the
-    // in-actor model.
+    // The pass created NO extra session — the whole point of the
+    // in-actor model. Only the parent row exists, and it has no
+    // lineage children.
+    let all = store.session.list_all().await.unwrap();
+    assert_eq!(
+        all.len(),
+        1,
+        "in-actor background pass must NOT create a separate session"
+    );
+    assert_eq!(all[0].id, parent.id);
     assert!(
-        mgr.all_maintenance_sessions().await.unwrap().is_empty(),
-        "in-actor background pass must NOT create a maintenance session"
+        store
+            .session
+            .list_lineage_children(&parent.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "in-actor background pass must NOT spawn a child session"
     );
 
     // The inline fast-path reads exactly these two on-disk inputs; both
@@ -298,7 +309,7 @@ async fn orphan_reaper_cleans_fs_orphans_only() {
         .await
         .unwrap();
 
-    reap_maintenance_orphans(&mgr, &paths).await;
+    reap_orphan_summaries(&mgr, &paths).await;
 
     assert!(
         !paths.session_summary_file("orphan-abc").exists(),
@@ -322,7 +333,7 @@ async fn orphan_reaper_no_op_when_sessions_dir_missing() {
     // Point at a workspace whose state/sessions dir was never created.
     let paths = WorkspacePaths::new(dir.path().join("empty-workspace"));
     // Must not panic / error.
-    reap_maintenance_orphans(&mgr, &paths).await;
+    reap_orphan_summaries(&mgr, &paths).await;
     assert!(!paths.state_sessions_dir().exists());
 }
 
@@ -346,47 +357,6 @@ async fn parent_delete_cascades_summary_metadata() {
         mgr.summary_metadata(&parent.id).await.unwrap().is_none(),
         "summary metadata must cascade-delete with parent"
     );
-}
-
-/// `LineageKind::SystemMaintenance` round-trips through the libsql
-/// `lineage_kind_str` mapping — `list_lineage_children` returns the
-/// variant. Phase-3 leaves the maintenance lineage scaffolding in place
-/// (intentionally unused by the runtime now), so this still holds.
-#[tokio::test]
-async fn lineage_kind_round_trips_for_system_maintenance() {
-    let (store, _dir) = fresh_store_and_paths().await;
-    let parent = root_session("p-lineage");
-    store.session.save(&parent).await.unwrap();
-
-    let maint = Session {
-        id: SessionId::from("m-1"),
-        user: parent.user.clone(),
-        channel: parent.channel.clone(),
-        created_at: Utc::now(),
-        last_active: Utc::now(),
-        state: SessionState::default(),
-        root_session_id: parent.id.clone(),
-        trigger: TriggerSource::System {
-            reason: SystemReason::BackgroundCompression,
-        },
-        lineage: Some(Lineage {
-            parent_session_id: parent.id.clone(),
-            parent_job_id: JobId::new(),
-            parent_span_id: None,
-            kind: LineageKind::SystemMaintenance,
-        }),
-        bound_soul_version: "soul".into(),
-        hidden: false,
-    };
-    store.session.save(&maint).await.unwrap();
-
-    let kids = store
-        .session
-        .list_lineage_children(&parent.id)
-        .await
-        .unwrap();
-    assert_eq!(kids.len(), 1);
-    assert!(matches!(kids[0].1, LineageKind::SystemMaintenance));
 }
 
 #[tokio::test]

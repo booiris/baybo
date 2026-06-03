@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `session` crate owns the session lifecycle vertical: `SessionError` and the `SessionManager` business-logic facade. The `SessionStore` / `SessionSummaryStore` traits and their per-row `StoredMessage` / `SessionSummaryRow` value types live in the `aura-store` ports crate; domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `SystemReason`, `Lineage`, `LineageKind`) live in `aura-model`. The libsql implementations of both store traits live in `aura-storage`, which implements the `aura-store` contracts; `aura-session` calls them.
+The `session` crate owns the session lifecycle vertical: `SessionError` and the `SessionManager` business-logic facade. The `SessionStore` / `SessionSummaryStore` traits and their per-row `StoredMessage` / `SessionSummaryRow` value types live in the `aura-store` ports crate; domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `Lineage`, `LineageKind`) live in `aura-model`. The libsql implementations of both store traits live in `aura-storage`, which implements the `aura-store` contracts; `aura-session` calls them.
 
 A `Session` is the top of one trace tree. There is exactly one trace per session — subagent and maintenance spawn create new sessions with `Lineage` pointers, never new trees rooted in the same session.
 
@@ -27,9 +27,9 @@ The same `User` has independent sessions on different channels. Sessions are key
 
 ### Trigger and lineage are orthogonal
 
-`Session.trigger: TriggerSource` records the **business source** that started this session (`User`, `Cron { cron_job_id }`, `System { reason: SystemReason }`). `Session.lineage: Option<Lineage>` records the **parent relationship** when the session was spawned from another (`Subagent` or `SystemMaintenance`).
+`Session.trigger: TriggerSource` records the **business source** that started this session (`User`, `Cron { cron_job_id }`). `Session.lineage: Option<Lineage>` records the **parent relationship** when the session was spawned from another (`Subagent`).
 
-A spawned session's `trigger` is **inherited from the root** session (so a subagent spawned by a cron-triggered session has `trigger = Cron { ... }`), making "is this work cron-driven?" an O(1) field read. `Lineage` separately records the direct parent. `SystemReason` is a closed strong-typed enum extended by adding variants — never by string.
+A spawned session's `trigger` is **inherited from the root** session (so a subagent spawned by a cron-triggered session has `trigger = Cron { ... }`), making "is this work cron-driven?" an O(1) field read. `Lineage` separately records the direct parent.
 
 ### Root-session ancestry
 

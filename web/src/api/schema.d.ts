@@ -1104,7 +1104,7 @@ export interface components {
          *     label for the trace browser list view.
          * @enum {string}
          */
-        SessionKind: "user" | "cron" | "compression" | "subagent";
+        SessionKind: "user" | "cron" | "subagent";
         /** @description `PUT /v1/config` body. */
         SetConfigRequest: {
             path: string;
@@ -2652,10 +2652,7 @@ export interface operations {
                 until?: string;
                 /** @description Case-insensitive substring on session id. */
                 q?: string;
-                /**
-                 * @description Filter on coarse trigger/lineage label. `compression` opts into
-                 *     background-maintenance sessions that the default list hides.
-                 */
+                /** @description Filter on coarse trigger/lineage label. */
                 kind?: components["schemas"]["SessionKind"];
                 limit?: number;
                 offset?: number;

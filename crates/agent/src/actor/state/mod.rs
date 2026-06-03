@@ -86,7 +86,7 @@ pub struct VolatileResources {
     /// Lifetime token for this actor. Derived as a child of the
     /// `parent_token` passed at construction. For top-level user/cron
     /// sessions the parent is the process-wide actor parent token; for
-    /// maintenance children spawned via `SystemSpawnRequest` it is the
+    /// subagent children spawned via `SystemSpawnRequest` it is the
     /// originating parent actor's `actor_token`, so parent shutdown
     /// cascades automatically via the `tokio_util` token tree.
     pub actor_token: CancellationToken,

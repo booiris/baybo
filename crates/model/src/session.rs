@@ -82,10 +82,10 @@ impl std::fmt::Display for ChannelType {
 /// What externally observable signal started this session.
 ///
 /// `Cron` and `System` carry their own contextual reference; `User` is
-/// purely "a person typed a message". A session spawned via subagent or
-/// maintenance **inherits its trigger from its root session** — the
-/// `TriggerSource` answers "who paid for this work" / "what was the
-/// business reason", not "who literally constructed this session row".
+/// purely "a person typed a message". A session spawned via subagent
+/// **inherits its trigger from its root session** — the `TriggerSource`
+/// answers "who paid for this work" / "what was the business reason",
+/// not "who literally constructed this session row".
 ///
 /// Closed strong-typed enum. Extend by adding variants, never by string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +93,6 @@ impl std::fmt::Display for ChannelType {
 pub enum TriggerSource {
     User,
     Cron { cron_job_id: String },
-    System { reason: SystemReason },
 }
 
 impl TriggerSource {
@@ -103,7 +102,6 @@ impl TriggerSource {
         match self {
             TriggerSource::User => TriggerKind::User,
             TriggerSource::Cron { .. } => TriggerKind::Cron,
-            TriggerSource::System { .. } => TriggerKind::System,
         }
     }
 }
@@ -125,29 +123,11 @@ pub enum TriggerKind {
     Spawned,
 }
 
-/// Why an internal subsystem started this session.
-///
-/// Closed enum — add a variant when a new subsystem needs to attribute
-/// work back to itself. Never use the open-ended `Other` antipattern.
-///
-/// Acts as the discriminator-only label persisted on `Session.trigger`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SystemReason {
-    /// Async per-session background summary — a `BackgroundCompressionRunner` actor
-    /// reads its parent's transcript, generates an updated summary, and
-    /// writes `<workspace>/state/sessions/<parent_id>/summary.md` plus
-    /// the `session_summaries` metadata row. Triggered between turns
-    /// from the parent's agent loop. See `docs/background-compression.md`.
-    BackgroundCompression,
-}
-
 /// Payload carried by a background compression trigger. Built by the
 /// parent's agent loop at trigger time and handed to the detached
 /// background-summary task the loop spawns in-process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundCompressionPayload {
-    pub parent_session_id: SessionId,
     /// Highest `session_messages.ordinal` to include in this pass'
     /// input. Pinned at trigger time so concurrent appends to the
     /// parent don't bleed in mid-pass.
@@ -165,9 +145,7 @@ pub struct Lineage {
     pub parent_job_id: JobId,
     /// The parent's `SpanId` that birthed this session. For
     /// `Subagent`, this is the parent's `ToolCall(spawn_subagent)`
-    /// span — disambiguates sibling subagents from the same job. For
-    /// `SystemMaintenance` it is `None` because those don't originate
-    /// inside a span.
+    /// span — disambiguates sibling subagents from the same job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_span_id: Option<crate::ids::SpanId>,
     pub kind: LineageKind,
@@ -178,18 +156,10 @@ pub struct Lineage {
 /// `Subagent`: the parent agent invoked the spawn-subagent tool inside an
 /// LLM iteration; the parent waits synchronously for the child to finish
 /// (cancellation propagates down via the cancellation-token tree).
-///
-/// `SystemMaintenance`: an internal, non-user-facing maintenance session
-/// (e.g. `SystemReason::BackgroundCompression`) doing work on behalf of its
-/// parent. The `Lineage.parent_session_id` pins the session being worked
-/// for; cancellation propagates down on parent shutdown via lookup.
-/// Maintenance sessions get `is_normal_session = 0` on the row, so default
-/// `SessionStore` listings exclude them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LineageKind {
     Subagent,
-    SystemMaintenance,
 }
 
 /// A persisted conversation session — the root container of one trace
@@ -219,7 +189,7 @@ pub struct Session {
     pub trigger: TriggerSource,
 
     /// Direct parent relationship, present iff this session was spawned
-    /// from another (subagent or maintenance).
+    /// from another (subagent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<Lineage>,
 
@@ -266,8 +236,8 @@ pub struct SessionState {
 
     /// Which backend created this subagent session, plus (for
     /// External) the agent's `workspace_dir` and `resume_key`.
-    /// `None` for non-subagent sessions (top-level user, cron,
-    /// maintenance) and for pre-tag subagent rows.
+    /// `None` for non-subagent sessions (top-level user, cron) and
+    /// for pre-tag subagent rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_backend: Option<crate::SubagentBackendTag>,
 
@@ -340,36 +310,12 @@ mod tests {
     }
 
     #[test]
-    fn trigger_source_system_round_trip() {
-        let t = TriggerSource::System {
-            reason: SystemReason::BackgroundCompression,
-        };
-        let s = serde_json::to_string(&t).unwrap();
-        let back: TriggerSource = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, t);
-        assert_eq!(back.kind(), TriggerKind::System);
-    }
-
-    #[test]
     fn lineage_subagent_round_trip() {
         let l = Lineage {
             parent_session_id: SessionId::from("cli-parent"),
             parent_job_id: JobId::new(),
             parent_span_id: Some(crate::ids::SpanId::new()),
             kind: LineageKind::Subagent,
-        };
-        let s = serde_json::to_string(&l).unwrap();
-        let back: Lineage = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, l);
-    }
-
-    #[test]
-    fn lineage_system_maintenance_round_trip() {
-        let l = Lineage {
-            parent_session_id: SessionId::from("user-parent"),
-            parent_job_id: JobId::new(),
-            parent_span_id: None,
-            kind: LineageKind::SystemMaintenance,
         };
         let s = serde_json::to_string(&l).unwrap();
         let back: Lineage = serde_json::from_str(&s).unwrap();
@@ -396,22 +342,8 @@ mod tests {
     }
 
     #[test]
-    fn trigger_source_system_background_compression_round_trip() {
-        let t = TriggerSource::System {
-            reason: SystemReason::BackgroundCompression,
-        };
-        let s = serde_json::to_string(&t).unwrap();
-        let back: TriggerSource = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, t);
-        assert_eq!(back.kind(), TriggerKind::System);
-    }
-
-    #[test]
     fn background_compression_payload_round_trip() {
-        let p = BackgroundCompressionPayload {
-            parent_session_id: SessionId::from("user-1"),
-            up_to_ordinal: 42,
-        };
+        let p = BackgroundCompressionPayload { up_to_ordinal: 42 };
         let s = serde_json::to_string(&p).unwrap();
         let back: BackgroundCompressionPayload = serde_json::from_str(&s).unwrap();
         assert_eq!(back, p);
