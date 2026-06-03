@@ -25,7 +25,7 @@ impl Router {
     ///
     /// Symmetric to [`Router::handle_cron_trigger`]:
     ///   - **Session**: created via `create_spawned_session`, so the
-    ///     row is `is_normal_session = 0` and lineaged to the parent.
+    ///     row is lineaged to the parent.
     ///   - **Cancel parent**: the request carries the originating
     ///     parent actor's `actor_token`; the spawned child's
     ///     `actor_token` derives as a grandchild. Cancelling the

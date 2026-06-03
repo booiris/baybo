@@ -792,8 +792,9 @@ pub struct TracesListQuery {
     /// Case-insensitive substring on session id.
     #[serde(default)]
     pub q: Option<String>,
-    /// Filter on coarse trigger/lineage label. `compression` opts into
-    /// background-maintenance sessions that the default list hides.
+    /// Filter on coarse trigger/lineage label. `compression` matches no
+    /// live row — background compression runs as an in-actor step, not a
+    /// separate session — so it yields an empty listing.
     #[serde(default)]
     pub kind: Option<SessionKind>,
     #[serde(default)]

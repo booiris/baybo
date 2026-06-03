@@ -296,11 +296,11 @@ fn cron_prompt_blocks(action_payload: &serde_json::Value) -> Vec<ContentBlock> {
 
 /// Whether the `on_session_end` memory hook should fire for this session.
 /// The session-level analogue of [`memory_recall_query`]: only sessions a person
-/// would call "theirs" — root `User`/`Cron` sessions. Subagent,
-/// `SystemMaintenance`, and `System`-triggered (background compression)
-/// actors all send `ActorStop` when they finish, but their shutdown is
-/// not a user-session ending. Exhaustive arms force a classification
-/// when a new `TriggerSource` / `LineageKind` variant is added.
+/// would call "theirs" — root `User`/`Cron` sessions. Subagent and
+/// `System`-triggered (background compression) actors send `ActorStop`
+/// when they finish, but their shutdown is not a user-session ending.
+/// Exhaustive arms force a classification when a new `TriggerSource` /
+/// `LineageKind` variant is added.
 fn should_fire_session_end(session: &Session) -> bool {
     let user_trigger = match &session.trigger {
         TriggerSource::User | TriggerSource::Cron { .. } => true,
@@ -309,7 +309,7 @@ fn should_fire_session_end(session: &Session) -> bool {
     let user_lineage = match &session.lineage {
         None => true,
         Some(l) => match &l.kind {
-            LineageKind::Subagent | LineageKind::SystemMaintenance => false,
+            LineageKind::Subagent => false,
         },
     };
     user_trigger && user_lineage
@@ -1452,7 +1452,7 @@ impl AgentLoop {
     ///
     /// No-op when memory is unwired, when `sessions` is unwired (test
     /// harnesses with no cross-session store), or when the session isn't
-    /// user-facing per [`should_fire_session_end`] (subagents, maintenance,
+    /// user-facing per [`should_fire_session_end`] (subagents and
     /// system-triggered actors all send `ActorStop` too, but their shutdown
     /// is not a user-session ending).
     ///
@@ -2713,11 +2713,10 @@ mod trim_response_text_edges_tests {
 #[cfg(test)]
 mod session_end_gate_tests {
     //! `should_fire_session_end` decides whether `Memory::on_session_end`
-    //! runs when an actor processes `ActorStop`. Subagent /
-    //! `SystemMaintenance` actors and `System`-triggered (background
-    //! compression) sessions also stop, but their teardown is not a
-    //! user-session ending — firing the hook for them would write
-    //! garbage memory.
+    //! runs when an actor processes `ActorStop`. Subagent actors and
+    //! `System`-triggered (background compression) sessions also stop,
+    //! but their teardown is not a user-session ending — firing the hook
+    //! for them would write garbage memory.
     use super::should_fire_session_end;
     use aura_model::{
         ChannelType, JobId, Lineage, LineageKind, Session, SessionId, SessionState, SystemReason,
@@ -2783,27 +2782,9 @@ mod session_end_gate_tests {
     }
 
     #[test]
-    fn skips_system_maintenance_session() {
-        let lineage = Lineage {
-            parent_session_id: SessionId::from("parent"),
-            parent_job_id: JobId::new(),
-            parent_span_id: None,
-            kind: LineageKind::SystemMaintenance,
-        };
-        let s = session_with(
-            TriggerSource::System {
-                reason: SystemReason::BackgroundCompression,
-            },
-            Some(lineage),
-        );
-        assert!(!should_fire_session_end(&s));
-    }
-
-    #[test]
     fn skips_root_system_session() {
-        // No lineage but System trigger → still a maintenance-class actor
-        // (a hypothetical future System variant without SystemMaintenance
-        // lineage), not a user session.
+        // No lineage but System trigger → still a system-class actor
+        // (background compression's trigger axis), not a user session.
         let s = session_with(
             TriggerSource::System {
                 reason: SystemReason::BackgroundCompression,

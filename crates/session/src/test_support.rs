@@ -28,10 +28,9 @@ struct StoredMessageRow {
 }
 
 /// In-memory `SessionStore` for tests across the workspace. Lineage
-/// columns are stubbed (`list_lineage_children` /
-/// `list_active_maintenance_for_parent` / `list_all_maintenance_sessions`
-/// all return empty) — tests that need that surface should use the
-/// real libsql store via `aura_storage::Store::open` against a tempfile.
+/// columns are stubbed (`list_lineage_children` returns empty) — tests
+/// that need that surface should use the real libsql store via
+/// `aura_storage::Store::open` against a tempfile.
 #[derive(Default)]
 pub struct MemorySessionStore {
     data: Mutex<HashMap<SessionId, Session>>,
@@ -131,28 +130,6 @@ impl SessionStore for MemorySessionStore {
         _parent_session_id: &SessionId,
     ) -> Result<Vec<(SessionId, LineageKind)>> {
         Ok(Vec::new())
-    }
-
-    async fn list_active_maintenance_for_parent(
-        &self,
-        _parent_session_id: &SessionId,
-    ) -> Result<Vec<SessionId>> {
-        Ok(Vec::new())
-    }
-
-    async fn list_all_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
-        Ok(Vec::new())
-    }
-
-    /// In-memory mock has no `jobs` table, so it cannot do the
-    /// cross-table check the libsql backend performs. Conservative:
-    /// reuse `list_all_maintenance_sessions` semantics (treat every
-    /// maintenance session as unfinished). Tests that need to assert
-    /// the "completed pass survives reap" path must run against the
-    /// libsql in-memory backend, where the SQL implementation
-    /// genuinely joins `jobs.status_kind`.
-    async fn list_unfinished_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
-        self.list_all_maintenance_sessions().await
     }
 
     async fn append_session_message(

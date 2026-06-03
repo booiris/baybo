@@ -138,103 +138,10 @@ impl SessionManager {
             .await
     }
 
-    /// Create a `LineageKind::SystemMaintenance` session for
-    /// internal maintenance work on behalf of `parent`. Unlike
-    /// [`Self::create_spawned_session`], the trigger is **not**
-    /// inherited — maintenance work always carries
-    /// `TriggerSource::System { reason }` so cost / trace
-    /// attribution shows it as system-driven, not user-driven.
-    /// `root_session_id` *is* inherited from the parent so
-    /// "all work descended from session X" queries surface
-    /// maintenance work too.
-    ///
-    /// The `is_normal_session = 0` flag is set automatically by the
-    /// `LineageKind::SystemMaintenance` branch in
-    /// `LibsqlSessionStore::save`, so default queries (CLI session
-    /// picker, web UI) skip these rows. `parent_job_id` pins the
-    /// exact moment in the parent's lifeline that the spawn
-    /// happened — same role it plays for subagents.
-    ///
-    /// Used today by the async summary-refresh path
-    /// (`SystemReason::BackgroundCompression`); future maintenance reasons
-    /// can reuse the same constructor without a code change.
-    pub async fn create_maintenance_session(
-        &self,
-        parent: &Session,
-        parent_job_id: aura_model::JobId,
-        reason: aura_model::SystemReason,
-    ) -> Result<Session> {
-        let id = SessionId::from(format!("maint-{}", uuid::Uuid::new_v4()));
-        let now = Utc::now();
-        let session = Session {
-            id: id.clone(),
-            user: parent.user.clone(),
-            channel: parent.channel.clone(),
-            created_at: now,
-            last_active: now,
-            state: aura_model::SessionState::default(),
-            root_session_id: parent.root_session_id.clone(),
-            trigger: TriggerSource::System { reason },
-            lineage: Some(aura_model::Lineage {
-                parent_session_id: parent.id.clone(),
-                parent_job_id,
-                parent_span_id: None,
-                kind: aura_model::LineageKind::SystemMaintenance,
-            }),
-            bound_soul_version: parent.bound_soul_version.clone(),
-            hidden: false,
-        };
-        self.store.save(&session).await?;
-        debug!(
-            session_id = %session.id,
-            parent_session_id = %parent.id,
-            "spawned system maintenance session"
-        );
-        Ok(session)
-    }
-
-    /// Return ids of in-flight maintenance sessions whose lineage
-    /// points at `parent_session_id`. Used by the parent's agent
-    /// loop to enforce the at-most-one-in-flight `BackgroundCompressionRunner`
-    /// invariant before spawning a new pass — if any row is
-    /// returned, skip the trigger (the in-flight pass will eventually
-    /// land or be reaped on next startup).
-    pub async fn active_maintenance_for_parent(
-        &self,
-        parent_session_id: &SessionId,
-    ) -> Result<Vec<SessionId>> {
-        self.store
-            .list_active_maintenance_for_parent(parent_session_id)
-            .await
-            .map_err(SessionError::from)
-    }
-
-    /// Enumerate every maintenance session id (`is_normal_session
-    /// = 0`). Used by the startup orphan reaper to delete sessions
-    /// whose actor isn't running after a process bounce.
-    pub async fn all_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
-        self.store
-            .list_all_maintenance_sessions()
-            .await
-            .map_err(SessionError::from)
-    }
-
-    /// Maintenance sessions whose associated job is **not** in a
-    /// terminal state (`completed` / `failed` / `cancelled`) — i.e.
-    /// only the ones the startup reaper actually needs to clean up.
-    /// Sessions whose pass landed cleanly are kept as audit history
-    /// (cost-records join lookups depend on them).
-    pub async fn unfinished_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
-        self.store
-            .list_unfinished_maintenance_sessions()
-            .await
-            .map_err(SessionError::from)
-    }
-
     /// Create a session that descends from `parent` via the given
-    /// lineage (subagent or maintenance). The child inherits its
-    /// trigger from the parent's root session and gets a fresh
-    /// session_id prefixed with `subagent-` / `maint-` as a hint.
+    /// lineage (subagent). The child inherits its trigger from the
+    /// parent's root session and gets a fresh session_id prefixed
+    /// with `subagent-` as a hint.
     pub async fn create_spawned_session(
         &self,
         user: User,
@@ -244,7 +151,6 @@ impl SessionManager {
     ) -> Result<Session> {
         let prefix = match lineage.kind {
             aura_model::LineageKind::Subagent => "subagent-",
-            aura_model::LineageKind::SystemMaintenance => "maint-",
         };
         let id = SessionId::from(format!("{prefix}{}", uuid::Uuid::new_v4()));
         let now = Utc::now();
@@ -268,7 +174,7 @@ impl SessionManager {
         debug!(
             session_id = %session.id,
             parent_session_id = %parent.id,
-            "spawned subagent / maintenance session"
+            "spawned subagent session"
         );
         Ok(session)
     }
@@ -995,43 +901,5 @@ mod tests {
 
         let loaded = mgr.load_active_session_messages(&session.id).await.unwrap();
         assert!(loaded.is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_maintenance_session_carries_system_trigger_and_maintenance_lineage() {
-        use aura_model::{JobId, LineageKind, SystemReason};
-
-        let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
-
-        let parent = mgr
-            .create_session(test_user(), ChannelType::tui())
-            .await
-            .unwrap();
-        let parent_job = JobId::new();
-
-        let maint = mgr
-            .create_maintenance_session(&parent, parent_job, SystemReason::BackgroundCompression)
-            .await
-            .unwrap();
-
-        // System trigger + reason — not inherited from parent.
-        match &maint.trigger {
-            aura_model::TriggerSource::System { reason } => {
-                assert_eq!(*reason, SystemReason::BackgroundCompression);
-            }
-            other => panic!("expected System trigger, got {other:?}"),
-        }
-        // Lineage points back at the parent through SystemMaintenance.
-        let lineage = maint.lineage.as_ref().expect("maintenance has lineage");
-        assert_eq!(lineage.parent_session_id, parent.id);
-        assert_eq!(lineage.parent_job_id, parent_job);
-        assert!(matches!(lineage.kind, LineageKind::SystemMaintenance));
-        // Root inherits from the parent (not self) so descendant
-        // queries cover maintenance work.
-        assert_eq!(maint.root_session_id, parent.root_session_id);
-        // Maintenance ids carry the `maint-` prefix for log
-        // recognisability.
-        assert!(maint.id.as_str().starts_with("maint-"));
     }
 }

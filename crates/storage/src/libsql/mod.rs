@@ -129,20 +129,13 @@ impl LibsqlPool {
                     -- viewers can hop from the parent's span to the
                     -- child's session and so sibling subagents from
                     -- one parent job stay distinguishable. NULL for
-                    -- non-subagent lineage (maintenance) and for
-                    -- sessions migrated from before this column existed.
+                    -- non-subagent (root) sessions and for sessions
+                    -- migrated from before this column existed.
                     parent_span_id        TEXT,
                     lineage_kind          TEXT,
                     bound_soul_version    TEXT NOT NULL,
                     created_at            INTEGER NOT NULL,
                     last_active           INTEGER NOT NULL,
-                    -- 1 for user-facing sessions (the default); 0 for internal
-                    -- maintenance sessions (e.g. SystemReason::BackgroundCompression).
-                    -- Default `SessionStore` listings filter `is_normal_session = 1`
-                    -- so maintenance sessions stay invisible in CLI / UI session
-                    -- pickers; opt-in helpers exist for the spawn-serialization
-                    -- lookup and the orphan reaper.
-                    is_normal_session     INTEGER NOT NULL DEFAULT 1,
                     -- User-facing chat-list hide flag, set by
                     -- DELETE /v1/chat/sessions/:id. Filtered at the
                     -- chat API layer only; SessionStore::list_all
@@ -168,11 +161,6 @@ impl LibsqlPool {
                     WHERE parent_span_id IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_sessions_last_active
                     ON sessions(last_active DESC);
-                -- Partial index over normal sessions only — most listings hit
-                -- this path, and excluding maintenance keeps the index narrow.
-                CREATE INDEX IF NOT EXISTS idx_sessions_normal_last_active
-                    ON sessions(last_active DESC)
-                    WHERE is_normal_session = 1;
                 -- Append-only per-message log. One row per appended
                 -- ChatMessage; `/compact` does not delete or rewrite
                 -- prior rows — it inserts the summary message(s) at

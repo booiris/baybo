@@ -1079,15 +1079,6 @@ mod resume_validation_tests {
     }
 
     #[test]
-    fn rejects_non_subagent_lineage_kind() {
-        let parent = mk_parent("p");
-        let child = mk_child("c", "p", LineageKind::SystemMaintenance, Some(aura_tag()));
-        let err = validate_resume_session(&child, &parent, aura_request(), "general-purpose")
-            .expect_err("non-Subagent lineage must reject");
-        assert!(err.contains("Subagent lineage"), "got: {err}");
-    }
-
-    #[test]
     fn rejects_child_without_backend_tag() {
         // Pre-tag sessions (or any row that bypassed the spawn router)
         // must be refused — resume validation depends on the durable

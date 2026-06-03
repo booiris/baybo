@@ -2653,8 +2653,9 @@ export interface operations {
                 /** @description Case-insensitive substring on session id. */
                 q?: string;
                 /**
-                 * @description Filter on coarse trigger/lineage label. `compression` opts into
-                 *     background-maintenance sessions that the default list hides.
+                 * @description Filter on coarse trigger/lineage label. `compression` matches no
+                 *     live row — background compression runs as an in-actor step, not a
+                 *     separate session — so it yields an empty listing.
                  */
                 kind?: components["schemas"]["SessionKind"];
                 limit?: number;

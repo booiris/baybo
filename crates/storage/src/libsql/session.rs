@@ -16,17 +16,15 @@ impl LibsqlSessionStore {
     }
 }
 
-/// SQL strings for the `lineage_kind` column, matched by both
-/// `lineage_kind_str` (write side) and `list_lineage_children` /
-/// `list_active_maintenance_for_parent` (read sides). Keeping them
-/// here as named constants prevents drift when a new variant lands.
+/// SQL string for the `lineage_kind` column, matched by both
+/// `lineage_kind_str` (write side) and `list_lineage_children`
+/// (read side). Keeping it here as a named constant prevents drift
+/// when a new variant lands.
 pub(super) const LINEAGE_KIND_SUBAGENT: &str = "subagent";
-pub(super) const LINEAGE_KIND_SYSTEM_MAINTENANCE: &str = "system_maintenance";
 
 fn lineage_kind_str(s: &Session) -> Option<&'static str> {
     s.lineage.as_ref().map(|l| match l.kind {
         LineageKind::Subagent => LINEAGE_KIND_SUBAGENT,
-        LineageKind::SystemMaintenance => LINEAGE_KIND_SYSTEM_MAINTENANCE,
     })
 }
 
@@ -59,17 +57,6 @@ fn rehydrate_message(
             Role::Tool => ChatMessage::tool(content),
         },
     })
-}
-
-/// `is_normal_session` column value: `0` for maintenance sessions
-/// (`LineageKind::SystemMaintenance`), `1` otherwise. Default queries
-/// filter `is_normal_session = 1` so maintenance sessions stay
-/// invisible in regular listings; opt-in helpers query directly.
-fn is_normal_session_flag(s: &Session) -> i64 {
-    match s.lineage.as_ref().map(|l| &l.kind) {
-        Some(LineageKind::SystemMaintenance) => 0,
-        _ => 1,
-    }
 }
 
 #[async_trait]
@@ -137,21 +124,20 @@ impl SessionStore for LibsqlSessionStore {
             .as_ref()
             .and_then(|l| l.parent_span_id.as_ref().map(|s| s.to_string()));
         let lineage_kind = lineage_kind_str(session).map(|s| s.to_string());
-        let is_normal = is_normal_session_flag(session);
         let hidden_flag: i64 = if session.hidden { 1 } else { 0 };
         // Upsert in place (NOT `INSERT OR REPLACE`, which delete+reinserts
         // the row). The DO UPDATE clause deliberately omits `hidden`:
         // that flat column is owned by `set_hidden`, and `save` carries a
         // possibly-stale in-memory `Session` (e.g. a background-subagent
-        // persist after the user hid the conversation). `?12` only seeds
+        // persist after the user hid the conversation). `?11` only seeds
         // `hidden` on a brand-new row; `get` reads the column as
         // authoritative regardless of the blob's stale field.
         conn.execute(
             "INSERT INTO sessions \
              (id, root_session_id, trigger_kind, parent_session_id, parent_job_id, \
               parent_span_id, lineage_kind, bound_soul_version, created_at, last_active, \
-              is_normal_session, hidden, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+              hidden, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
              ON CONFLICT(id) DO UPDATE SET \
                root_session_id = excluded.root_session_id, \
                trigger_kind = excluded.trigger_kind, \
@@ -162,7 +148,6 @@ impl SessionStore for LibsqlSessionStore {
                bound_soul_version = excluded.bound_soul_version, \
                created_at = excluded.created_at, \
                last_active = excluded.last_active, \
-               is_normal_session = excluded.is_normal_session, \
                data = excluded.data",
             libsql::params![
                 session.id.as_str().to_string(),
@@ -175,7 +160,6 @@ impl SessionStore for LibsqlSessionStore {
                 session.bound_soul_version.clone(),
                 super::time::to_us(session.created_at),
                 super::time::to_us(session.last_active),
-                is_normal,
                 hidden_flag,
                 data,
             ],
@@ -266,15 +250,9 @@ impl SessionStore for LibsqlSessionStore {
 
     async fn list_expired(&self, before: DateTime<Utc>) -> Result<Vec<SessionId>> {
         let conn = self.pool.conn();
-        // Maintenance sessions (`is_normal_session = 0`) are reaped via
-        // the startup orphan-marker, not the regular expiry sweep —
-        // they're short-lived and stateless by design, and a long-tail
-        // expiry from the regular sweep would race with the in-flight
-        // pass that owns the row.
         let mut rows = conn
             .query(
-                "SELECT id FROM sessions \
-                 WHERE last_active < ?1 AND is_normal_session = 1",
+                "SELECT id FROM sessions WHERE last_active < ?1",
                 libsql::params![super::time::to_us(before)],
             )
             .await
@@ -296,18 +274,15 @@ impl SessionStore for LibsqlSessionStore {
 
     async fn list_all(&self) -> Result<Vec<Session>> {
         let conn = self.pool.conn();
-        // Filter `is_normal_session = 1` so maintenance sessions
-        // (e.g. `BackgroundCompression`) stay invisible to user-facing
-        // listings (CLI session picker, web UI). Use
-        // `list_all_maintenance_sessions` for the maintenance set.
-        //
-        // Also project the flat `hidden` column — `set_hidden` writes
-        // there directly without rewriting the JSON `data` blob, so
-        // trusting only the blob would read stale values.
+        // Project the flat `hidden` column — `set_hidden` writes there
+        // directly without rewriting the JSON `data` blob, so trusting
+        // only the blob would read stale values. `id` rides along purely
+        // so a row whose `data` blob fails to deserialize (e.g. a legacy
+        // maintenance row whose lineage kind no longer exists) can be
+        // named in the skip warning.
         let mut rows = conn
             .query(
-                "SELECT data, hidden, last_llm FROM sessions \
-                 WHERE is_normal_session = 1 \
+                "SELECT data, hidden, last_llm, id FROM sessions \
                  ORDER BY last_active DESC",
                 (),
             )
@@ -329,8 +304,23 @@ impl SessionStore for LibsqlSessionStore {
             let last_llm_col: Option<String> = row
                 .get(2)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let mut session: Session = serde_json::from_str(&data)
-                .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
+            let id_col: String = row
+                .get(3)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            // A single undeserializable row (e.g. a pre-teardown
+            // maintenance session whose `lineage.kind` no longer exists)
+            // must degrade to "silently absent from the listing", never
+            // fail the whole listing and 500 the CLI picker / web UI.
+            let mut session: Session = match serde_json::from_str(&data) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %id_col,
+                        "skipping session row that failed to deserialize: {e}"
+                    );
+                    continue;
+                }
+            };
             session.hidden = hidden_col != 0;
             session.state.last_llm = last_llm_col.map(LlmEntryName::from);
             sessions.push(session);
@@ -350,9 +340,8 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data, hidden, last_llm FROM sessions \
-                 WHERE is_normal_session = 1 \
-                   AND json_extract(data, '$.channel') = ?1 \
+                "SELECT data, hidden, last_llm, id FROM sessions \
+                 WHERE json_extract(data, '$.channel') = ?1 \
                  ORDER BY last_active DESC",
                 libsql::params![channel.as_str().to_string()],
             )
@@ -374,8 +363,22 @@ impl SessionStore for LibsqlSessionStore {
             let last_llm_col: Option<String> = row
                 .get(2)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            let mut session: Session = serde_json::from_str(&data)
-                .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
+            let id_col: String = row
+                .get(3)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            // Same skip-on-error discipline as `list_all`: one legacy row
+            // whose blob no longer deserializes drops out of the listing
+            // rather than failing the whole chat-list query.
+            let mut session: Session = match serde_json::from_str(&data) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %id_col,
+                        "skipping session row that failed to deserialize: {e}"
+                    );
+                    continue;
+                }
+            };
             session.hidden = hidden_col != 0;
             session.state.last_llm = last_llm_col.map(LlmEntryName::from);
             sessions.push(session);
@@ -409,112 +412,18 @@ impl SessionStore for LibsqlSessionStore {
             let kind_tag: String = row
                 .get(1)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            // Both variants are payload-free, so the kind tag alone
+            // The variant is payload-free, so the kind tag alone
             // reconstructs the `LineageKind` — no JSON decode needed.
-            // An unrecognised tag (e.g. an orphaned legacy row) is
-            // skipped rather than erroring the whole listing.
+            // An unrecognised tag (e.g. an orphaned legacy
+            // `system_maintenance` row) is skipped rather than erroring
+            // the whole listing.
             let kind = match kind_tag.as_str() {
                 LINEAGE_KIND_SUBAGENT => LineageKind::Subagent,
-                LINEAGE_KIND_SYSTEM_MAINTENANCE => LineageKind::SystemMaintenance,
                 _ => continue,
             };
             children.push((SessionId::from(id), kind));
         }
         Ok(children)
-    }
-
-    async fn list_active_maintenance_for_parent(
-        &self,
-        parent_session_id: &SessionId,
-    ) -> Result<Vec<SessionId>> {
-        let conn = self.pool.conn();
-        let sql = format!(
-            "SELECT id FROM sessions \
-             WHERE parent_session_id = ?1 \
-               AND lineage_kind = '{LINEAGE_KIND_SYSTEM_MAINTENANCE}' \
-               AND is_normal_session = 0"
-        );
-        let mut rows = conn
-            .query(
-                &sql,
-                libsql::params![parent_session_id.as_str().to_string()],
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let id: String = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            out.push(SessionId::from(id));
-        }
-        Ok(out)
-    }
-
-    async fn list_all_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query("SELECT id FROM sessions WHERE is_normal_session = 0", ())
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let id: String = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            out.push(SessionId::from(id));
-        }
-        Ok(out)
-    }
-
-    async fn list_unfinished_maintenance_sessions(&self) -> Result<Vec<SessionId>> {
-        // Maintenance sessions are reaped only when their associated
-        // job is in a non-terminal state — or when there is no job
-        // row at all (the session was created but the process died
-        // before `with_job` ran). Terminal jobs (completed, failed,
-        // cancelled) are kept as audit history so cost reports can
-        // still join `cost_records` back through the maintenance
-        // session row.
-        //
-        // String literals match `JobStatusKind`'s `status_kind_str`
-        // mapping in `crates/storage/src/libsql/job.rs:18`.
-        let conn = self.pool.conn();
-        let mut rows = conn
-            .query(
-                "SELECT s.id FROM sessions s \
-                 WHERE s.is_normal_session = 0 \
-                 AND NOT EXISTS ( \
-                     SELECT 1 FROM jobs j \
-                     WHERE j.session_id = s.id \
-                     AND j.status_kind IN ('completed', 'failed', 'cancelled') \
-                 )",
-                (),
-            )
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql query: {e}")))?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
-        {
-            let id: String = row
-                .get(0)
-                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            out.push(SessionId::from(id));
-        }
-        Ok(out)
     }
 
     async fn append_session_message(
@@ -1107,6 +1016,62 @@ mod tests {
 
         store.delete(&s.id).await.unwrap();
         assert!(store.get(&s.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_all_skips_undeserializable_legacy_row() {
+        // A pre-teardown maintenance row's `data` blob carries
+        // `lineage.kind = "system_maintenance"`, a variant `LineageKind`
+        // no longer knows. `list_all` must skip that one row (log +
+        // continue) and still return every good session, rather than
+        // erroring the whole listing and 500-ing the CLI picker / web UI.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let good = make_root_session("good-1");
+        store.save(&good).await.unwrap();
+
+        // Hand-write a legacy maintenance row straight into the table —
+        // the modern `save` path can no longer construct one.
+        let legacy_blob = r#"{
+            "id": "maint-legacy",
+            "user": {"id": "u1", "name": null, "channel": "tui"},
+            "channel": "tui",
+            "created_at": "2024-01-01T00:00:00Z",
+            "last_active": "2024-01-01T00:00:00Z",
+            "state": {},
+            "root_session_id": "good-1",
+            "trigger": {"kind": "system", "reason": "background_compression"},
+            "lineage": {"parent_session_id": "good-1", "parent_job_id": "job-x", "kind": "system_maintenance"},
+            "bound_soul_version": "soul-v1"
+        }"#;
+        assert!(
+            serde_json::from_str::<Session>(legacy_blob).is_err(),
+            "the legacy blob must no longer deserialize after the teardown"
+        );
+        store
+            .pool
+            .conn()
+            .execute(
+                "INSERT INTO sessions \
+                 (id, root_session_id, trigger_kind, bound_soul_version, created_at, last_active, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                libsql::params![
+                    "maint-legacy".to_string(),
+                    "good-1".to_string(),
+                    "system".to_string(),
+                    "soul-v1".to_string(),
+                    super::super::time::to_us(Utc::now()),
+                    super::super::time::to_us(Utc::now()),
+                    legacy_blob.to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let listed = store.list_all().await.unwrap();
+        let ids: Vec<&str> = listed.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["good-1"], "legacy maintenance row is skipped");
     }
 
     #[tokio::test]

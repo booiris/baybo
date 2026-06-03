@@ -82,10 +82,10 @@ impl std::fmt::Display for ChannelType {
 /// What externally observable signal started this session.
 ///
 /// `Cron` and `System` carry their own contextual reference; `User` is
-/// purely "a person typed a message". A session spawned via subagent or
-/// maintenance **inherits its trigger from its root session** — the
-/// `TriggerSource` answers "who paid for this work" / "what was the
-/// business reason", not "who literally constructed this session row".
+/// purely "a person typed a message". A session spawned via subagent
+/// **inherits its trigger from its root session** — the `TriggerSource`
+/// answers "who paid for this work" / "what was the business reason",
+/// not "who literally constructed this session row".
 ///
 /// Closed strong-typed enum. Extend by adding variants, never by string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,9 +165,7 @@ pub struct Lineage {
     pub parent_job_id: JobId,
     /// The parent's `SpanId` that birthed this session. For
     /// `Subagent`, this is the parent's `ToolCall(spawn_subagent)`
-    /// span — disambiguates sibling subagents from the same job. For
-    /// `SystemMaintenance` it is `None` because those don't originate
-    /// inside a span.
+    /// span — disambiguates sibling subagents from the same job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_span_id: Option<crate::ids::SpanId>,
     pub kind: LineageKind,
@@ -178,18 +176,10 @@ pub struct Lineage {
 /// `Subagent`: the parent agent invoked the spawn-subagent tool inside an
 /// LLM iteration; the parent waits synchronously for the child to finish
 /// (cancellation propagates down via the cancellation-token tree).
-///
-/// `SystemMaintenance`: an internal, non-user-facing maintenance session
-/// (e.g. `SystemReason::BackgroundCompression`) doing work on behalf of its
-/// parent. The `Lineage.parent_session_id` pins the session being worked
-/// for; cancellation propagates down on parent shutdown via lookup.
-/// Maintenance sessions get `is_normal_session = 0` on the row, so default
-/// `SessionStore` listings exclude them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LineageKind {
     Subagent,
-    SystemMaintenance,
 }
 
 /// A persisted conversation session — the root container of one trace
@@ -219,7 +209,7 @@ pub struct Session {
     pub trigger: TriggerSource,
 
     /// Direct parent relationship, present iff this session was spawned
-    /// from another (subagent or maintenance).
+    /// from another (subagent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<Lineage>,
 
@@ -266,8 +256,8 @@ pub struct SessionState {
 
     /// Which backend created this subagent session, plus (for
     /// External) the agent's `workspace_dir` and `resume_key`.
-    /// `None` for non-subagent sessions (top-level user, cron,
-    /// maintenance) and for pre-tag subagent rows.
+    /// `None` for non-subagent sessions (top-level user, cron) and
+    /// for pre-tag subagent rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_backend: Option<crate::SubagentBackendTag>,
 
@@ -357,19 +347,6 @@ mod tests {
             parent_job_id: JobId::new(),
             parent_span_id: Some(crate::ids::SpanId::new()),
             kind: LineageKind::Subagent,
-        };
-        let s = serde_json::to_string(&l).unwrap();
-        let back: Lineage = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, l);
-    }
-
-    #[test]
-    fn lineage_system_maintenance_round_trip() {
-        let l = Lineage {
-            parent_session_id: SessionId::from("user-parent"),
-            parent_job_id: JobId::new(),
-            parent_span_id: None,
-            kind: LineageKind::SystemMaintenance,
         };
         let s = serde_json::to_string(&l).unwrap();
         let back: Lineage = serde_json::from_str(&s).unwrap();
