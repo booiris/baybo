@@ -2235,8 +2235,8 @@ impl AgentLoop {
     /// commit. When tokens and activity have crossed their thresholds
     /// (see [`ContextManager::maybe_request_background_summary`]) it
     /// `tokio::spawn`s a DETACHED background-summary pass attributed to
-    /// **this** (parent) session — no new maintenance session, no router
-    /// hop. Fire-and-forget: the user's turn never blocks on it.
+    /// **this** (parent) session. Fire-and-forget: the user's turn never
+    /// blocks on it.
     ///
     /// `job_done = true` is passed at end-of-job (where the activity
     /// disjunct is trivially satisfied); `false` at iteration boundaries
@@ -2293,8 +2293,8 @@ impl AgentLoop {
 
         // Pre-extract everything the 'static task needs — the spawned
         // future cannot borrow `&self` / `&session`. session_id/user_id
-        // are the PARENT's: the pass bills + traces against the parent,
-        // not a maintenance session.
+        // are the parent's: the pass bills + traces against the parent
+        // session.
         let parent_session_id = session.id.clone();
         let parent_user_id = session.user.id.clone();
         let effective_soul_version = session.bound_soul_version.clone();

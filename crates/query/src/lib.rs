@@ -162,12 +162,10 @@ pub enum SessionKind {
     User,
     /// Root cron-triggered session.
     Cron,
-    /// `System`-triggered session (the trigger axis kept for
-    /// `SystemReason::BackgroundCompression` attribution). No longer
-    /// produced by the runtime — background compression runs as an
-    /// in-actor step, not a separate session — so this classification
-    /// is unreachable in practice but stays a valid `derive_session_kind`
-    /// arm for any `TriggerSource::System` row.
+    /// `System`-triggered session — the `derive_session_kind` bucket for
+    /// a `TriggerSource::System` row. Background compression runs as an
+    /// in-actor step, so nothing currently produces this kind and the
+    /// filter yields an empty listing.
     Compression,
     /// Subagent spawned by another session — its trigger is inherited
     /// from the root, but `lineage.kind == Subagent` wins for display.
@@ -199,9 +197,9 @@ pub struct SessionSummaryFilter {
     pub until: Option<DateTime<Utc>>,
     pub session_id_prefix: Option<String>,
     /// Coarse trigger/lineage label. Filters the `list_all` pool by
-    /// [`derive_session_kind`]. (`Compression` no longer matches any
-    /// live row — background compression is an in-actor step, not a
-    /// session — so that variant yields an empty listing.)
+    /// [`derive_session_kind`]. `Compression` matches no live row
+    /// (background compression runs as an in-actor step), so that
+    /// variant yields an empty listing.
     pub kind: Option<SessionKind>,
 }
 

@@ -277,9 +277,9 @@ impl SessionStore for LibsqlSessionStore {
         // Project the flat `hidden` column — `set_hidden` writes there
         // directly without rewriting the JSON `data` blob, so trusting
         // only the blob would read stale values. `id` rides along purely
-        // so a row whose `data` blob fails to deserialize (e.g. a legacy
-        // maintenance row whose lineage kind no longer exists) can be
-        // named in the skip warning.
+        // so a row whose `data` blob fails to deserialize (e.g. one
+        // written by an older build whose lineage kind this build doesn't
+        // know) can be named in the skip warning.
         let mut rows = conn
             .query(
                 "SELECT data, hidden, last_llm, id FROM sessions \
@@ -307,10 +307,10 @@ impl SessionStore for LibsqlSessionStore {
             let id_col: String = row
                 .get(3)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            // A single undeserializable row (e.g. a pre-teardown
-            // maintenance session whose `lineage.kind` no longer exists)
-            // must degrade to "silently absent from the listing", never
-            // fail the whole listing and 500 the CLI picker / web UI.
+            // A single undeserializable row (e.g. one written by an older
+            // build whose `lineage.kind` this build doesn't know) must
+            // degrade to "silently absent from the listing", never fail
+            // the whole listing and 500 the CLI picker / web UI.
             let mut session: Session = match serde_json::from_str(&data) {
                 Ok(s) => s,
                 Err(e) => {
@@ -366,9 +366,9 @@ impl SessionStore for LibsqlSessionStore {
             let id_col: String = row
                 .get(3)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
-            // Same skip-on-error discipline as `list_all`: one legacy row
-            // whose blob no longer deserializes drops out of the listing
-            // rather than failing the whole chat-list query.
+            // Same skip-on-error discipline as `list_all`: a row whose
+            // blob fails to deserialize drops out of the listing rather
+            // than failing the whole chat-list query.
             let mut session: Session = match serde_json::from_str(&data) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1020,19 +1020,19 @@ mod tests {
 
     #[tokio::test]
     async fn list_all_skips_undeserializable_legacy_row() {
-        // A pre-teardown maintenance row's `data` blob carries
-        // `lineage.kind = "system_maintenance"`, a variant `LineageKind`
-        // no longer knows. `list_all` must skip that one row (log +
-        // continue) and still return every good session, rather than
-        // erroring the whole listing and 500-ing the CLI picker / web UI.
+        // A row written by an older build can carry a `lineage.kind` this
+        // build doesn't know (here `"system_maintenance"`). `list_all`
+        // must skip that one row (log + continue) and still return every
+        // good session, rather than erroring the whole listing and
+        // 500-ing the CLI picker / web UI.
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlSessionStore::new(pool);
 
         let good = make_root_session("good-1");
         store.save(&good).await.unwrap();
 
-        // Hand-write a legacy maintenance row straight into the table —
-        // the modern `save` path can no longer construct one.
+        // Hand-write such a row straight into the table — the current
+        // `save` path can't construct one.
         let legacy_blob = r#"{
             "id": "maint-legacy",
             "user": {"id": "u1", "name": null, "channel": "tui"},
@@ -1047,7 +1047,7 @@ mod tests {
         }"#;
         assert!(
             serde_json::from_str::<Session>(legacy_blob).is_err(),
-            "the legacy blob must no longer deserialize after the teardown"
+            "the unknown-lineage-kind blob must not deserialize"
         );
         store
             .pool
@@ -1071,7 +1071,11 @@ mod tests {
 
         let listed = store.list_all().await.unwrap();
         let ids: Vec<&str> = listed.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, vec!["good-1"], "legacy maintenance row is skipped");
+        assert_eq!(
+            ids,
+            vec!["good-1"],
+            "row with unknown lineage kind is skipped"
+        );
     }
 
     #[tokio::test]

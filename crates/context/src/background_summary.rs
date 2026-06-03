@@ -1,6 +1,6 @@
 //! Background summary pass.
 //!
-//! Iterative pass driven from a maintenance session:
+//! Iterative pass driven from the parent's in-actor background step:
 //!
 //! 1. Load the parent's transcript up to a pinned ordinal.
 //! 2. Make sure `<workspace>/state/sessions/<parent>/summary.md` exists
@@ -544,8 +544,7 @@ pub async fn run_background_summary(
         tool_def_from(&ReadTool),
         tool_def_from(&EditTool::new(workspace.as_ref().clone())),
     ];
-    // Hang `Read` / `Edit` off the trigger's cancel token so a parent
-    // cancel (`cancel_token.cancel()` on the maintenance actor)
+    // Hang `Read` / `Edit` off the pass's cancel token so cancelling it
     // cascades into any in-flight tool call alongside the LLM request.
     let tool_ctx = make_tool_context(&workspace, cancel_token);
 

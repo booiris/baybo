@@ -8,10 +8,6 @@
 //! The dispatcher itself ([`Router::handle_system_spawn`]) lives here
 //! and simply fans out to the variant handlers; everything substantive
 //! is in the submodules.
-//!
-//! Background compression is no longer a `SystemSpawnRequest` variant —
-//! it runs as a detached in-actor pass on the parent's own `AgentLoop`
-//! (see [`crate::runtime::agent_loop::AgentLoop::maybe_run_background_compression`]).
 
 mod subagent;
 

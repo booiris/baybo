@@ -1,6 +1,6 @@
 # Background Compression — Design
 
-A cross-cutting feature that runs the existing compression operation in a second, **background** mode in addition to the original **inline** one. The inline path (`ContextManager::maybe_compress`'s 3-stage compressor — summary.md fast-path → live LLM summary → truncate fallback) blocks the user's turn for one synchronous LLM round-trip whenever the budget threshold trips and stage 1 misses. The background path is a **detached task the parent's own `AgentLoop` spawns** between LLM iterations / at end-of-job: it precomputes the summary asynchronously and persists it per-session; at compression time the inline compressor's stage-1 fast-path swaps it into the output deterministically, so the inline LLM call is skipped whenever the precomputed summary is available. Both paths share `compression::CompressionRunner` for the actual LLM dispatch; the background pass bills + traces against the **parent** session (no separate maintenance session exists).
+A cross-cutting feature that runs the existing compression operation in a second, **background** mode in addition to the original **inline** one. The inline path (`ContextManager::maybe_compress`'s 3-stage compressor — summary.md fast-path → live LLM summary → truncate fallback) blocks the user's turn for one synchronous LLM round-trip whenever the budget threshold trips and stage 1 misses. The background path is a **detached task the parent's own `AgentLoop` spawns** between LLM iterations / at end-of-job: it precomputes the summary asynchronously and persists it per-session; at compression time the inline compressor's stage-1 fast-path swaps it into the output deterministically, so the inline LLM call is skipped whenever the precomputed summary is available. Both paths share `compression::CompressionRunner` for the actual LLM dispatch; the background pass bills + traces against the **parent** session.
 
 Affected crates: `aura-model`, `aura-storage`, `aura-session`, `aura-context`, `aura-agent`, `aura-workspace`.
 
@@ -8,14 +8,14 @@ See also: [`docs/modules/context.md`](modules/context.md), [`docs/modules/sessio
 
 ## Goal
 
-Quality-first, latency-second. Without precomputed summaries, the compressor's stage-2 LLM call fires synchronously inside the agent loop, blocking the user's turn for one LLM round-trip every time the budget threshold trips. The new design moves summary generation to a background path so:
+Quality-first, latency-second. Without precomputed summaries, the compressor's stage-2 LLM call fires synchronously inside the agent loop, blocking the user's turn for one LLM round-trip every time the budget threshold trips. The background path moves summary generation off the hot path so:
 
 1. **Quality**: each summary pass refines the previous one with full transcript access; terminology stays consistent across passes; detail can grow as conversation accumulates.
 2. **Latency**: at compression time, the parent assembles `[system + summary + recent + skill_trailer]` from the precomputed `summary.md` — no LLM call on the hot path.
 
 ## Architecture
 
-Two paths, decoupled — but **both inside the parent actor**. There is no maintenance session, no router hop, and no second `AgentActor`. The background pass is a detached `tokio::spawn` off the parent's `AgentLoop` (mirroring `AgentLoop::spawn_session_end_write`):
+Two paths, decoupled, both inside the parent actor. The background pass is a detached `tokio::spawn` off the parent's `AgentLoop` (mirroring `AgentLoop::spawn_session_end_write`):
 
 ```
 Parent session (TriggerKind::User|Cron)
@@ -52,7 +52,7 @@ Parent session (TriggerKind::User|Cron)
 
 Atomic write via tempfile + `rename` (mirrors `crates/workspace/src/identity.rs:36-40`).
 
-### libsql — new table `session_summaries`
+### libsql — table `session_summaries`
 
 ```sql
 CREATE TABLE session_summaries (
@@ -63,29 +63,9 @@ CREATE TABLE session_summaries (
   cost_micros INTEGER NOT NULL DEFAULT 0, -- per `feedback_money_no_float.md`: integer micro-USD
   model_id    TEXT    NOT NULL,
   span_id     TEXT    NOT NULL,
-  error_count INTEGER NOT NULL DEFAULT 0, -- telemetry only; does NOT gate triggers
-  in_flight       INTEGER NOT NULL DEFAULT 0, -- LEGACY (inert): see note below
-  in_flight_owner TEXT                        -- LEGACY (inert): see note below
+  error_count INTEGER NOT NULL DEFAULT 0  -- telemetry only; does NOT gate triggers
 );
 ```
-
-`in_flight` / `in_flight_owner` are **inert legacy columns**. They once drove the durable at-most-one-in-flight gate when the pass ran in a separate maintenance actor. The pass now runs as a detached step inside the parent actor, gated by an in-memory `JoinHandle` (see [Spawn serialization](#spawn-serialization)) — nothing reads or writes these columns. They stay in `CREATE TABLE` only so old DBs need no migration; there is **no `DROP COLUMN` / cleanup migration** (per `feedback_no_legacy_data_migration.md`).
-
-### libsql — maintenance-session machinery removed (Phase 3 teardown)
-
-The `is_normal_session` column on `sessions`, its partial index `idx_sessions_normal_last_active`, and the whole maintenance-session listing/lineage surface were **torn down** once the background pass moved into the parent actor (it never creates a maintenance row). Removed in this teardown: the `is_normal_session` column + index from the `sessions` `CREATE TABLE`, the `LineageKind::SystemMaintenance` variant, the `create_maintenance_session` / `list_*_maintenance_*` helpers, and the `WHERE is_normal_session = 1` predicates on the default listings. Per `feedback_no_legacy_data_migration.md` there is **no `DROP COLUMN` / cleanup migration**: the column and index simply vanish from fresh-DB schema, and any pre-existing maintenance rows in old DBs are orphaned and inert. Because `list_all` / `list_by_channel` no longer filter on `is_normal_session`, they would now select those legacy rows — whose `data` blob carries the deleted `lineage.kind = "system_maintenance"` and can no longer deserialize — so both list paths **skip a per-row deserialize failure (logged) instead of propagating it**, degrading a legacy maintenance row to "absent from listings" rather than failing the whole list.
-
-### `aura-model` types (retained)
-
-```rust
-pub enum SystemReason {
-    HistoryReview,
-    MemoryConsolidation,
-    BackgroundCompression,         // retained; no longer drives a maintenance session
-}
-```
-
-`SystemReason::BackgroundCompression` is no longer constructed by the background-compression path (the pass attributes to the parent session, not a maintenance child). It is kept as a `pub` variant for the broader system-maintenance surface; being unused is intentional and is not a clippy warning. `LineageKind::SystemMaintenance` was **removed** in this teardown — `LineageKind` is now `{ Subagent }`.
 
 ## Trigger Conditions (parent side)
 
@@ -138,13 +118,13 @@ if let Some(handle) = self.bg_compression.as_ref()
 }
 ```
 
-After a successful spawn the new `JoinHandle` is stored back on `self.bg_compression`. A finished handle (or `None`) lets the next trigger spawn afresh. There is **no durable in-flight flag, no `mark_summary_in_flight` / `clear_summary_in_flight`, no rollback path, and no orphan reaper for in-flight state** — the in-memory handle dies with the actor, and a process restart simply starts with `bg_compression = None`.
+After a successful spawn the new `JoinHandle` is stored back on `self.bg_compression`. A finished handle (or `None`) lets the next trigger spawn afresh. The in-memory handle dies with the actor, so a process restart simply starts with `bg_compression = None`.
 
 ## The detached background pass
 
 ### Spawn (entirely inside the parent's `AgentLoop`)
 
-No `SystemSpawnRequest`, no `mpsc` send, no router hop, no second actor. `maybe_run_background_compression` pre-extracts everything the `'static` task needs (the spawned future cannot borrow `&self` / `&session`), then `tokio::spawn`s the pass directly — mirroring `AgentLoop::spawn_session_end_write`:
+`maybe_run_background_compression` pre-extracts everything the `'static` task needs (the spawned future cannot borrow `&self` / `&session`), then `tokio::spawn`s the pass directly — mirroring `AgentLoop::spawn_session_end_write`:
 
 ```rust
 // In AgentLoop::maybe_run_background_compression, after the gate passes
@@ -157,7 +137,7 @@ let cancel_token = CancellationToken::new();
 
 let handle = tokio::spawn(async move {
     let spec = JobSpec {
-        session_id: parent_session_id,            // PARENT, not a maintenance session
+        session_id: parent_session_id,            // the parent session
         session_trigger_kind: TriggerKind::System, // clears JobInput::System's allowed_for gate
         input: JobInput::System { payload },
         effective_soul_version,
@@ -177,7 +157,7 @@ self.bg_compression = Some(handle);
 
 Key properties:
 
-- **Attribution is the parent's.** `JobSpec.session_id`, and the `BackgroundCompressionRunner`'s `parent_session_id` / `parent_user_id`, are all the parent's. The pass's cost row, `StepKind::Compression` step, and `LlmCall` span therefore attribute to the parent session/user — not a maintenance session.
+- **Attribution is the parent's.** `JobSpec.session_id`, and the `BackgroundCompressionRunner`'s `parent_session_id` / `parent_user_id`, are all the parent's. The pass's cost row, `StepKind::Compression` step, and `LlmCall` span therefore attribute to the parent session/user.
 - **`session_trigger_kind: TriggerKind::System`** is passed purely to satisfy `JobInput::System`'s `allowed_for` gate (a `System` job is only admitted under a `System`-trigger session). The job row's real attribution keys off `session_id` above, which is the parent's.
 - **`parent_job_id = Some(current_job_id)`** parents the minted `System` job under the triggering turn's job, so the trace nests correctly.
 - **Cancel token** is a fresh `CancellationToken::new()` that is never cancelled. It is **not** derived from the actor's token — see *Cancellation* below.
@@ -211,7 +191,7 @@ The trade-off is that a process shutdown does not actively cancel an in-flight p
 
 - LLM call fails → metadata `error_count++`, no summary.md written, next trigger fires fresh.
 - Disk write fails → metadata not updated; cost paid for nothing (logged); next trigger fires fresh.
-- Metadata update fails → file orphan; cold-start orphan reaper deletes orphan files whose `session_id` has no metadata row.
+- Metadata update fails → file orphan; the startup FS reaper deletes orphan summary dirs whose `session_id` has no metadata row.
 
 `error_count` is **telemetry only** — it does not gate future triggers. Acceptable cost: a persistent failure burns one LLM call per trigger event until conditions self-resolve.
 
@@ -221,7 +201,7 @@ The fast-path lives as a private `try_summary_fast_path` method on `ContextManag
 
 ### Body
 
-The fast-path **never waits** for an in-flight background pass — it reads whatever cursor + `summary.md` is currently on file and tolerates being stale-by-one. A refresh that lands just after this read simply applies on the next turn. (There is no `waitForSessionMemoryExtraction`-style poll loop; that was removed when the durable in-flight flag went away.)
+The fast-path **never waits** for an in-flight background pass — it reads whatever cursor + `summary.md` is currently on file and tolerates being stale-by-one. A refresh that lands just after this read simply applies on the next turn.
 
 1. Load `session_summaries` row + `summary.md` content for `session_id`.
 2. **Cursor mapping**: walk `load_session_messages_with_supersede(session_id)` counting active rows (`superseded_by IS NULL`) until ordinal == `metadata.cursor`; the count is the cursor's index in the in-memory `messages` (full frame, including system). Fall through if:
@@ -282,9 +262,9 @@ The first compression on every session pays a one-time synchronous-LLM-summary l
 | Compression fires while refresh in-flight | Fast-path reads the last-successful summary without waiting (stale-by-one tolerated) |
 | Compression fires before any summary written | Fall through to inner `Summarize` |
 | Refresh writes summary.md while compression reads | Atomic tempfile+rename — never partial |
-| Two refreshes interleave on same parent | In-memory `AgentLoop.bg_compression` `JoinHandle` rejects the second: a present, not-finished handle short-circuits the spawn. No DB flag. |
+| Two refreshes interleave on same parent | In-memory `AgentLoop.bg_compression` `JoinHandle` rejects the second: a present, not-finished handle short-circuits the spawn. |
 | Stale cursor (covers very old prefix) | Recent slice must cover everything after cursor; if `summary + recent + skill_trailer > 0.6 × max_tokens`, fall through |
-| Process restart mid-pass | The detached task is abandoned (its `JoinHandle` lived only in the dead actor). No durable in-flight state to recover; the previous summary stays on disk and the next trigger fires fresh. A summary dir whose metadata row never committed is swept by the startup FS reaper. |
+| Process restart mid-pass | The detached task is abandoned (its `JoinHandle` lived only in the dead actor); the previous summary stays on disk and the next trigger fires fresh. A summary dir whose metadata row never committed is swept by the startup FS reaper. |
 
 ## Cold-Start Recovery (parent side)
 
@@ -296,11 +276,11 @@ In `ContextManager::restore_from_store`:
 
 ### Orphan reaping (startup)
 
-The only startup cleanup the background path needs is the **FS sweep** in `reap_maintenance_orphans` (`crates/agent/src/runtime/compression.rs`), run once per boot before the supervisor spawns any actors:
+The only startup cleanup the background path needs is the **FS sweep** in `reap_orphan_summaries` (`crates/agent/src/runtime/compression.rs`), run once per boot before the supervisor spawns any actors:
 
 - **FS orphans**: scan `<workspace>/state/sessions/*/`; for each directory name (a parent `session_id`), check `SELECT 1 FROM session_summaries WHERE session_id = ?`. If no row, delete the directory. This removes a summary dir left behind when a pass wrote `summary.md` (disk first) and then crashed before its metadata row committed.
 
-There is **no DB-side reaping for background compression** anymore — no maintenance session rows are created, so there is nothing to mark `Failed`, and there is no durable in-flight flag to clear. A leftover orphan dir is otherwise harmless (the fast-path sees `summary_metadata == None` and falls through); the sweep just keeps the workspace tidy. Best-effort: errors are logged at `warn` and never block boot.
+A leftover orphan dir is otherwise harmless (the fast-path sees `summary_metadata == None` and falls through); the sweep just keeps the workspace tidy. Best-effort: errors are logged at `warn` and never block boot.
 
 ## Subagent Inheritance
 
@@ -313,11 +293,11 @@ There is **no DB-side reaping for background compression** anymore — no mainte
 Each background-summary pass:
 
 - Wrapped in real `StepKind::Compression` + `SpanKind::LlmCall` span (same machinery as the inline `CompressionRunner`).
-- The LLM call is bound to an `Attribution` whose `session_id` / `user_id` are the **parent's** (the pass runs as a `JobInput::System` job under the parent session), so the cost row is charged against the **parent session** — there is no separate maintenance session to bill.
+- The LLM call is bound to an `Attribution` whose `session_id` / `user_id` are the **parent's** (the pass runs as a `JobInput::System` job under the parent session), so the cost row is charged against the **parent session**.
 - `session_summaries.cost_micros` accumulates the per-parent summary-spend total (informational rollup).
 - Per-pass detail is queryable via `cost_records` joined on `span_id`.
 
-Because the spend now lands directly on the parent session, a "summary cost for session X" report is just:
+Because the spend lands directly on the parent session, a "summary cost for session X" report is just:
 
 ```sql
 SELECT cost_micros FROM session_summaries WHERE session_id = ?;
@@ -338,14 +318,6 @@ SELECT cost_micros FROM session_summaries WHERE session_id = ?;
 | `FAST_PATH_FALLTHROUGH_THRESHOLD` | `0.6 × max_tokens` | `aura-context` |
 | `STATE_SESSIONS_DIR` | `"state/sessions"` | `aura-workspace` |
 | `SUMMARY_FILE_NAME` | `"summary.md"` | `aura-workspace` |
-
-## Phase 3 teardown — maintenance-session machinery removed
-
-The background pass moved into the parent actor (Phase 1+2), so the broader **system-maintenance** scaffolding it once rode on was torn down in Phase 3:
-
-- **Removed**: `LineageKind::SystemMaintenance` (`LineageKind` is now `{ Subagent }`); the `is_normal_session` column + `idx_sessions_normal_last_active` index on `sessions`; the maintenance-session helpers (`create_maintenance_session`, `list_active_maintenance_for_parent`, `list_all_maintenance_sessions`, `list_unfinished_maintenance_sessions`, `list_all_sessions_including_maintenance`); the `WHERE is_normal_session = 1` listing predicates; and the trace-lineage hydration (`hydration_log_session`) that resolved a maintenance span back to its parent session.
-- **Legacy robustness**: dropping the `is_normal_session = 1` filter means `list_all` / `list_by_channel` now select any pre-existing maintenance rows from old DBs. Their `data` blob carries `lineage.kind = "system_maintenance"`, which no longer deserializes, so both list paths **skip a per-row deserialize failure (logged) via `continue` instead of propagating with `?`** — a legacy maintenance row degrades to "absent from listings", not "whole list errors". A single-row `get(id)` against a legacy maintenance id may still return a clean `Err`; it must not panic. No `DROP`/cleanup migration was added (per `feedback_no_legacy_data_migration.md`); the orphaned rows stay inert.
-- **Retained**: `SystemReason::BackgroundCompression` (and `TriggerSource::System` / `TriggerKind::System`) stay as valid `pub` items — they are the trigger axis the in-actor System job still uses, and are dead-in-production-constructor only (no clippy warning). The `session_summaries.in_flight` / `in_flight_owner` columns are the same story at the storage layer: inert, retained, no cleanup migration.
 
 ## Known Limitations
 

@@ -16,9 +16,8 @@
 //!   it gathers the agent-layer deps, adapts `CompressionRunner` to the
 //!   context callback shape, and delegates the rest of the flow to
 //!   [`aura_context::run_background_summary`]. The pass is spawned
-//!   detached by [`crate::runtime::agent_loop::AgentLoop`] — no
-//!   maintenance session, no router hop.
-//! - [`reap_maintenance_orphans`] is the startup cleanup pass that
+//!   detached by [`crate::runtime::agent_loop::AgentLoop`].
+//! - [`reap_orphan_summaries`] is the startup cleanup pass that
 //!   removes FS-orphan summary directories from a previous boot.
 //!
 //! See `docs/background-compression.md`.
@@ -189,8 +188,8 @@ pub(crate) struct BackgroundCompressionRunner {
     pub model_info: ModelInfo,
     /// The session the pass runs on behalf of — also the session the
     /// pass's cost + `StepKind::Compression` + `LlmCall` spans attribute
-    /// to. The pass now runs inside the parent's own actor, so this is
-    /// the parent session (no maintenance session is created).
+    /// to. The pass runs inside the parent's own actor, so this is the
+    /// parent session.
     pub parent_session_id: SessionId,
     pub parent_user_id: String,
     pub job_id: JobId,
@@ -270,16 +269,13 @@ impl BackgroundCompressionRunner {
 /// removes summary dirs left by an `Edit`-wrote-the-file-then-crashed
 /// pass (the on-disk `summary.md` lands before the metadata row commits).
 ///
-/// The background pass now runs inside the parent's own actor with an
-/// in-memory at-most-one handle — there is no maintenance session row and
-/// no durable in-flight flag to recover, so the previous DB-side sweep is
-/// gone. A leftover orphan dir is otherwise harmless (the fast-path reads
+/// A leftover orphan dir is otherwise harmless (the fast-path reads
 /// `summary_metadata == None` and falls through), but the sweep keeps the
 /// workspace tidy.
 ///
 /// Best-effort: errors are logged at warn but never propagate; a
 /// flaky filesystem must not block process boot.
-pub async fn reap_maintenance_orphans(sessions: &SessionManager, workspace_paths: &WorkspacePaths) {
+pub async fn reap_orphan_summaries(sessions: &SessionManager, workspace_paths: &WorkspacePaths) {
     let summary_store = sessions.summary_store();
     let known_ids: std::collections::HashSet<String> = match summary_store.list_session_ids().await
     {
