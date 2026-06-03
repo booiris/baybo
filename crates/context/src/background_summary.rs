@@ -144,7 +144,7 @@ pub struct BackgroundSummaryConfig {
     pub workspace: Arc<WorkspacePaths>,
     pub sessions: Arc<SessionManager>,
     pub tokenizer: Arc<dyn Tokenizer>,
-    pub parent_session_id: SessionId,
+    pub session_id: SessionId,
     pub up_to_ordinal: i64,
     pub model_id: String,
     pub cancel_token: CancellationToken,
@@ -279,9 +279,9 @@ CRITICAL: The session memory file is currently ~{total_tokens} tokens, which exc
 
 async fn read_existing_summary(
     paths: &WorkspacePaths,
-    parent_id: &SessionId,
+    session_id: &SessionId,
 ) -> std::io::Result<Option<String>> {
-    let path = paths.session_summary_file(parent_id.as_str());
+    let path = paths.session_summary_file(session_id.as_str());
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => Ok(Some(content)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -295,36 +295,36 @@ async fn read_existing_summary(
 /// either the prior file or the new one, never a partial.
 async fn atomic_write_summary(
     paths: &WorkspacePaths,
-    parent_session_id: &SessionId,
+    session_id: &SessionId,
     body: &str,
 ) -> std::io::Result<PathBuf> {
-    let dir = paths.session_state_dir(parent_session_id.as_str());
+    let dir = paths.session_state_dir(session_id.as_str());
     tokio::fs::create_dir_all(&dir).await?;
-    let target = paths.session_summary_file(parent_session_id.as_str());
-    let tmp = paths.session_summary_tmp_file(parent_session_id.as_str());
+    let target = paths.session_summary_file(session_id.as_str());
+    let tmp = paths.session_summary_tmp_file(session_id.as_str());
     tokio::fs::write(&tmp, body).await?;
     tokio::fs::rename(&tmp, &target).await?;
     Ok(target)
 }
 
-async fn load_parent_transcript_up_to(
+async fn load_session_transcript_up_to(
     sessions: &SessionManager,
-    parent_id: &SessionId,
+    session_id: &SessionId,
     up_to_ordinal: i64,
 ) -> Result<Vec<ChatMessage>, ContextError> {
     // SQL pushes both the supersede filter and the ordinal upper
     // bound, so neither superseded rows nor the post-snapshot tail
     // cross the wire.
     let out = sessions
-        .load_active_session_messages_up_to(parent_id, up_to_ordinal)
+        .load_active_session_messages_up_to(session_id, up_to_ordinal)
         .await
         .map_err(|e| {
             ContextError::Compression(format!(
-                "load_active_session_messages_up_to({parent_id}): {e}"
+                "load_active_session_messages_up_to({session_id}): {e}"
             ))
         })?;
     debug!(
-        parent_session_id = %parent_id,
+        session_id = %session_id,
         up_to_ordinal,
         loaded = out.len(),
         "background summary: loaded parent transcript slice"
@@ -453,12 +453,12 @@ async fn execute_tool_call(
 /// tool calls have a real file with the section scaffold in place.
 async fn ensure_notes_file(
     workspace: &WorkspacePaths,
-    parent_session_id: &SessionId,
+    session_id: &SessionId,
 ) -> std::io::Result<String> {
-    match read_existing_summary(workspace, parent_session_id).await? {
+    match read_existing_summary(workspace, session_id).await? {
         Some(content) => Ok(content),
         None => {
-            atomic_write_summary(workspace, parent_session_id, DEFAULT_NOTES_TEMPLATE).await?;
+            atomic_write_summary(workspace, session_id, DEFAULT_NOTES_TEMPLATE).await?;
             Ok(DEFAULT_NOTES_TEMPLATE.to_string())
         }
     }
@@ -480,7 +480,7 @@ pub async fn run_background_summary(
         workspace,
         sessions,
         tokenizer,
-        parent_session_id,
+        session_id,
         up_to_ordinal,
         model_id,
         cancel_token,
@@ -489,19 +489,19 @@ pub async fn run_background_summary(
     // `up_to_ordinal` pins the snapshot the trigger fired against so
     // concurrent appends to the parent's transcript don't bleed into
     // this pass' input.
-    let parent_messages =
-        match load_parent_transcript_up_to(&sessions, &parent_session_id, up_to_ordinal).await {
+    let transcript =
+        match load_session_transcript_up_to(&sessions, &session_id, up_to_ordinal).await {
             Ok(m) => m,
             Err(e) => {
                 let _ = sessions
-                    .record_summary_failure(&parent_session_id, &model_id, "", Utc::now())
+                    .record_summary_failure(&session_id, &model_id, "", Utc::now())
                     .await;
                 return Err(e);
             }
         };
-    if parent_messages.is_empty() {
+    if transcript.is_empty() {
         warn!(
-            parent_session_id = %parent_session_id,
+            session_id = %session_id,
             "background summary: parent transcript is empty after load — skipping pass"
         );
         return Ok(BackgroundSummaryOutcome {
@@ -517,11 +517,11 @@ pub async fn run_background_summary(
     // the canonical section headers in place. Read failures fall back
     // to the in-memory template so the prompt still ships valid
     // content even if the disk read itself flakes.
-    let current_notes = match ensure_notes_file(&workspace, &parent_session_id).await {
+    let current_notes = match ensure_notes_file(&workspace, &session_id).await {
         Ok(body) => body,
         Err(e) => {
             warn!(
-                parent_session_id = %parent_session_id,
+                session_id = %session_id,
                 error = %e,
                 "background summary: failed to read or seed summary.md; \
                  inlining default template into the prompt"
@@ -530,13 +530,13 @@ pub async fn run_background_summary(
         }
     };
 
-    let notes_path = workspace.session_summary_file(parent_session_id.as_str());
+    let notes_path = workspace.session_summary_file(session_id.as_str());
     // The pinned parent transcript is the persisted prefix every
     // iteration's trace span references by `up_to_ordinal`; everything
     // appended past this index (the summary prompt + the sub-loop's own
     // turns) is not in `session_messages` and rides inline as the suffix.
-    let parent_len = parent_messages.len();
-    let mut messages: Vec<ChatMessage> = parent_messages;
+    let transcript_len = transcript.len();
+    let mut messages: Vec<ChatMessage> = transcript;
     messages.push(ChatMessage::agent_context(vec![ContentBlock::Text(
         build_summary_prompt(&notes_path, &current_notes, tokenizer.as_ref()),
     )]));
@@ -556,7 +556,7 @@ pub async fn run_background_summary(
     loop {
         if iterations >= MAX_BACKGROUND_SUMMARY_ITERATIONS {
             let _ = sessions
-                .record_summary_failure(&parent_session_id, &model_id, &span_id, Utc::now())
+                .record_summary_failure(&session_id, &model_id, &span_id, Utc::now())
                 .await;
             return Err(ContextError::Compression(format!(
                 "background summary loop exceeded {MAX_BACKGROUND_SUMMARY_ITERATIONS} \
@@ -567,8 +567,8 @@ iterations without terminating"
 
         let input_marker = LlmCallInputs::Persisted {
             last_ordinal: up_to_ordinal,
-            prefix_len: parent_len,
-            suffix: messages[parent_len..].to_vec(),
+            prefix_len: transcript_len,
+            suffix: messages[transcript_len..].to_vec(),
         };
         let request = ChatRequest {
             messages: messages.clone(),
@@ -583,7 +583,7 @@ iterations without terminating"
             Ok(run) => run,
             Err(e) => {
                 let _ = sessions
-                    .record_summary_failure(&parent_session_id, &model_id, &span_id, Utc::now())
+                    .record_summary_failure(&session_id, &model_id, &span_id, Utc::now())
                     .await;
                 return Err(e);
             }
@@ -614,7 +614,7 @@ iterations without terminating"
 
     if !applied_any_edit {
         debug!(
-            parent_session_id = %parent_session_id,
+            session_id = %session_id,
             iterations,
             "background summary: pass produced no Edit calls — notes left unchanged"
         );
@@ -625,7 +625,7 @@ iterations without terminating"
     // the startup reaper cleans up. Return success regardless.
     if let Err(e) = sessions
         .record_summary_success(
-            &parent_session_id,
+            &session_id,
             up_to_ordinal,
             cost_micros,
             &model_id,
@@ -635,14 +635,14 @@ iterations without terminating"
         .await
     {
         warn!(
-            parent_session_id = %parent_session_id,
+            session_id = %session_id,
             error = %e,
             "background summary: metadata write failed; FS orphan possible"
         );
     }
 
     info!(
-        parent_session_id = %parent_session_id,
+        session_id = %session_id,
         cursor = up_to_ordinal,
         cost_micros,
         iterations,

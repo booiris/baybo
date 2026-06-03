@@ -2290,11 +2290,10 @@ impl AgentLoop {
         };
 
         // Pre-extract everything the 'static task needs — the spawned
-        // future cannot borrow `&self` / `&session`. session_id/user_id
-        // are the parent's: the pass bills + traces against the parent
-        // session.
-        let parent_session_id = session.id.clone();
-        let parent_user_id = session.user.id.clone();
+        // future cannot borrow `&self` / `&session`. The pass bills +
+        // traces against this session.
+        let session_id = session.id.clone();
+        let user_id = session.user.id.clone();
         let effective_soul_version = session.bound_soul_version.clone();
         let llm_client = self.llm_client.clone();
         let security_gateway = self.security_gateway.clone();
@@ -2310,15 +2309,15 @@ impl AgentLoop {
         let cancel_token = CancellationToken::new();
 
         let handle = tokio::spawn(async move {
-            // Clone the parent session id for the runner before the spec
-            // moves it into `session_id`.
-            let runner_session_id = parent_session_id.clone();
+            // Clone the session id for the runner before the spec moves
+            // it into `session_id`.
+            let runner_session_id = session_id.clone();
             let spec = JobSpec {
-                session_id: parent_session_id,
+                session_id,
                 // The pass is a `System` job, which `allowed_for` only
-                // admits under a `System`-trigger session. It now runs
-                // inside the PARENT actor (User / Cron trigger), so pass
-                // `System` here purely to clear the gate — the job row's
+                // admits under a `System`-trigger session. It runs inside
+                // a User / Cron-trigger session's actor, so pass `System`
+                // here purely to clear the gate — the job row's
                 // attribution keys off `session_id` above, not this kind.
                 session_trigger_kind: aura_model::TriggerKind::System,
                 input: aura_job::JobInput::System {
@@ -2341,8 +2340,8 @@ impl AgentLoop {
                         tokenizer,
                         recorder,
                         model_info,
-                        parent_session_id: runner_session_id,
-                        parent_user_id,
+                        session_id: runner_session_id,
+                        user_id,
                         job_id,
                         cancel_token,
                     };

@@ -211,7 +211,7 @@ async fn background_pass_writes_summary_and_advances_cursor_without_extra_sessio
         workspace: Arc::new(paths.clone()),
         sessions: Arc::clone(&mgr),
         tokenizer: Arc::new(TiktokenTokenizer::for_model("test")),
-        parent_session_id: parent.id.clone(),
+        session_id: parent.id.clone(),
         up_to_ordinal,
         model_id: "test-model".into(),
         cancel_token: CancellationToken::new(),

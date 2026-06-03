@@ -186,12 +186,10 @@ pub(crate) struct BackgroundCompressionRunner {
     pub tokenizer: Arc<dyn Tokenizer>,
     pub recorder: Arc<SpanRecorder>,
     pub model_info: ModelInfo,
-    /// The session the pass runs on behalf of — also the session the
-    /// pass's cost + `StepKind::Compression` + `LlmCall` spans attribute
-    /// to. The pass runs inside the parent's own actor, so this is the
-    /// parent session.
-    pub parent_session_id: SessionId,
-    pub parent_user_id: String,
+    /// The session the pass runs on behalf of — also the session its
+    /// cost + `StepKind::Compression` + `LlmCall` spans attribute to.
+    pub session_id: SessionId,
+    pub user_id: String,
     pub job_id: JobId,
     pub cancel_token: CancellationToken,
 }
@@ -212,15 +210,15 @@ impl BackgroundCompressionRunner {
             tokenizer,
             recorder,
             model_info,
-            parent_session_id,
-            parent_user_id,
+            session_id,
+            user_id,
             job_id,
             cancel_token,
         } = self;
         let model_id = model_info.id.clone();
         // Clone the parent session id for the summary config — the chat
         // closure below moves the destructured field.
-        let summary_session_id = parent_session_id.clone();
+        let summary_session_id = session_id.clone();
         // Hand a clone to the context's tool loop so a parent cancel
         // cascades into in-flight `Read`/`Edit`. The original token
         // moves into the chat-callback closure below, where each
@@ -241,8 +239,8 @@ impl BackgroundCompressionRunner {
                 recorder: recorder.clone(),
                 security_gateway: security_gateway.clone(),
                 job_id,
-                user_id: parent_user_id.clone(),
-                session_id: parent_session_id.clone(),
+                user_id: user_id.clone(),
+                session_id: session_id.clone(),
                 model_info: model_info.clone(),
                 cancel_token: cancel_token.clone(),
             };
@@ -253,7 +251,7 @@ impl BackgroundCompressionRunner {
             workspace: workspace_paths,
             sessions,
             tokenizer,
-            parent_session_id: summary_session_id,
+            session_id: summary_session_id,
             up_to_ordinal: payload.up_to_ordinal,
             model_id,
             cancel_token: tool_cancel,

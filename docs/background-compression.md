@@ -47,7 +47,7 @@ Parent session (TriggerKind::User|Cron)
 `crates/workspace/src/paths.rs` adds:
 
 ```
-<workspace>/state/sessions/<parent_session_id>/summary.md
+<workspace>/state/sessions/<session_id>/summary.md
 ```
 
 Atomic write via tempfile + `rename` (mirrors `crates/workspace/src/identity.rs:36-40`).
@@ -137,14 +137,14 @@ let cancel_token = CancellationToken::new();
 
 let handle = tokio::spawn(async move {
     let spec = JobSpec {
-        session_id: parent_session_id,            // the parent session
+        session_id,                                // this session
         session_trigger_kind: TriggerKind::System, // clears JobInput::System's allowed_for gate
         input: JobInput::System { payload },
         effective_soul_version,
         parent_job_id: Some(current_job_id),      // parent the System job under the triggering turn
     };
     let result = scope::with_job(&job_lifecycle, cancel_token.clone(), spec, move |job_id| async move {
-        let runner = BackgroundCompressionRunner { /* parent_session_id, parent_user_id, job_id, cancel_token, … */ };
+        let runner = BackgroundCompressionRunner { /* session_id, user_id, job_id, cancel_token, … */ };
         let outcome = runner.run(payload).await?;
         Ok((JobOutput::Structured { value: serde_json::to_value(&outcome)? }, outcome))
     }).await;
@@ -157,7 +157,7 @@ self.bg_compression = Some(handle);
 
 Key properties:
 
-- **Attribution is the parent's.** `JobSpec.session_id`, and the `BackgroundCompressionRunner`'s `parent_session_id` / `parent_user_id`, are all the parent's. The pass's cost row, `StepKind::Compression` step, and `LlmCall` span therefore attribute to the parent session/user.
+- **Attribution is the session's.** `JobSpec.session_id`, and the `BackgroundCompressionRunner`'s `session_id` / `user_id`, are all the session's. The pass's cost row, `StepKind::Compression` step, and `LlmCall` span therefore attribute to the session/user.
 - **`session_trigger_kind: TriggerKind::System`** is passed purely to satisfy `JobInput::System`'s `allowed_for` gate (a `System` job is only admitted under a `System`-trigger session). The job row's real attribution keys off `session_id` above, which is the parent's.
 - **`parent_job_id = Some(current_job_id)`** parents the minted `System` job under the triggering turn's job, so the trace nests correctly.
 - **Cancel token** is a fresh `CancellationToken::new()` that is never cancelled. It is **not** derived from the actor's token — see *Cancellation* below.
