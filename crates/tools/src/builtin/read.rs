@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use super::paths::require_absolute;
-use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput, VirtualReadAccess};
+use crate::{
+    ResourceAccess, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, VirtualReadAccess,
+};
 
 /// Canonical name of the file-reading builtin. A const so `name()` and the
 /// `require_absolute` label share one source of truth for the literal.
@@ -125,6 +127,12 @@ impl Tool for ReadTool {
                 }]
             })
             .unwrap_or_default()
+    }
+
+    /// Read-only (filesystem or virtual transcript); mutates no shared
+    /// state, so parallel reads within a turn cannot race.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Concurrent
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {

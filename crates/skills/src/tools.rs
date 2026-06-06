@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use aura_model::TrustLevel;
 use aura_tools::{
     ApprovalDecision, NoticeLevel, ResourceAccess as ToolResourceAccess, Tool, ToolCapability,
-    ToolContext, ToolError, ToolManifest, ToolOutput,
+    ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -72,6 +72,12 @@ struct SkillParams {
 impl Tool for SkillTool {
     fn name(&self) -> &str {
         SKILL_TOOL_NAME
+    }
+
+    /// Reads skill metadata/files (the risk-assessor cache write is
+    /// idempotent) — safe to run concurrently.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Concurrent
     }
 
     fn description(&self) -> String {

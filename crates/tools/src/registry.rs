@@ -6,7 +6,7 @@ use aura_workspace::WorkspacePaths;
 use parking_lot::RwLock;
 use serde_json::Value;
 
-use crate::{Tool, ToolContext, ToolDefinition, ToolManifest, ToolOutput};
+use crate::{Tool, ToolConcurrency, ToolContext, ToolDefinition, ToolManifest, ToolOutput};
 
 pub struct ToolRegistry {
     builtin: HashMap<String, Arc<dyn Tool>>,
@@ -163,6 +163,17 @@ impl ToolRegistry {
         self.get(name).and_then(|tool| tool.progress_label(params))
     }
 
+    /// Concurrency policy for a pending call via [`Tool::concurrency`].
+    /// Unknown tools default to [`ToolConcurrency::Exclusive`] (fail
+    /// safe — never parallelize a call we cannot classify). The agent
+    /// loop uses this to size how many permits the call holds before it
+    /// runs.
+    pub fn concurrency(&self, name: &str) -> ToolConcurrency {
+        self.get(name)
+            .map(|tool| tool.concurrency())
+            .unwrap_or(ToolConcurrency::Exclusive)
+    }
+
     /// Execute a tool by name with the given parameters and context.
     pub async fn execute(
         &self,
@@ -202,17 +213,62 @@ mod tests {
     use aura_store::BlobStore;
 
     use super::ToolRegistry;
+    use crate::ToolConcurrency;
 
-    #[test]
-    fn defaults_register_send_file() {
+    fn default_registry() -> ToolRegistry {
         let blob_store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
-        let registry = ToolRegistry::with_defaults(
+        ToolRegistry::with_defaults(
             blob_store,
             aura_workspace::WorkspacePaths::new("/tmp"),
             None,
-        );
+        )
+    }
+
+    #[test]
+    fn defaults_register_send_file() {
+        let registry = default_registry();
 
         assert!(registry.get("SendFile").is_some());
         assert!(registry.get_manifest("SendFile").is_some());
+    }
+
+    #[test]
+    fn read_only_builtins_are_concurrent() {
+        let registry = default_registry();
+
+        // Read-only builtins opt into concurrent execution; the rest
+        // (writers, exec, blob-staging) keep the exclusive default.
+        for name in [
+            "Read",
+            "Glob",
+            "Grep",
+            "WebFetch",
+            "Now",
+            "SecretList",
+            "SecretCheck",
+        ] {
+            assert_eq!(
+                registry.concurrency(name),
+                ToolConcurrency::Concurrent,
+                "{name} should be concurrent"
+            );
+        }
+        for name in ["Write", "Edit", "Bash", "SendFile", "SecretAdd"] {
+            assert_eq!(
+                registry.concurrency(name),
+                ToolConcurrency::Exclusive,
+                "{name} must stay exclusive"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_tool_fails_safe_to_exclusive() {
+        let registry = default_registry();
+        assert_eq!(
+            registry.concurrency("NoSuchTool"),
+            ToolConcurrency::Exclusive,
+            "an unclassifiable tool must never be parallelized"
+        );
     }
 }

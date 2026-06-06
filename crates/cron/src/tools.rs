@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::{CronSchedule, CronScheduler};
 use async_trait::async_trait;
-use aura_tools::{Tool, ToolContext, ToolError, ToolManifest, ToolOutput};
+use aura_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput};
 use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::Deserialize;
@@ -257,6 +257,11 @@ impl CronListTool {
 impl Tool for CronListTool {
     fn name(&self) -> &str {
         "CronList"
+    }
+
+    /// Read-only listing — safe to run concurrently.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Concurrent
     }
 
     fn description(&self) -> String {

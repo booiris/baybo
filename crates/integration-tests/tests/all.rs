@@ -23,3 +23,5 @@ mod summary_aware_wrapper_e2e;
 mod token_calibration_e2e;
 #[path = "tool_boundary.rs"]
 mod tool_boundary;
+#[path = "tool_concurrency.rs"]
+mod tool_concurrency;

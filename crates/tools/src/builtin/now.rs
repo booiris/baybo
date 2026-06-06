@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::{Local, Utc};
 use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext, ToolOutput};
+use crate::{Tool, ToolConcurrency, ToolContext, ToolOutput};
 
 pub struct NowTool;
 
@@ -17,6 +17,11 @@ pub struct NowTool;
 impl Tool for NowTool {
     fn name(&self) -> &str {
         "Now"
+    }
+
+    /// Pure clock read — safe to run concurrently.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Concurrent
     }
 
     fn description(&self) -> String {
