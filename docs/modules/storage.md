@@ -110,6 +110,26 @@ equivalence so the two filters can't drift apart silently. The remaining helpers
 — `latest_session_ordinal`, `count_active_messages`, `active_index_of_ordinal` —
 exist to anchor and validate those references.
 
+### Session planning checklist: the `session_tasks` table
+
+The `Task*` planning checklist (see [`task.md`](task.md)) lives in its own
+`session_tasks` table — one row per task, keyed `(session_id, task_id)` with
+`REFERENCES sessions(id) ON DELETE CASCADE`, served by `LibsqlTaskStore` over the
+`TaskStore` trait. It is **not** a `SessionState` field: a live checklist is
+mutated on every `TaskUpdate`, concurrently with the full-blob writers on the
+`sessions` row (`touch`, the actor's `save`), so a blob `Vec` would lose updates
+to that clobber race. A dedicated table gives the same anti-clobber property the
+`hidden` / `last_llm` flat columns buy, but at row granularity — each
+`TaskUpdate` is `UPDATE … WHERE session_id=? AND task_id=?`, touching only its
+own row.
+
+Task rows are removed by `TaskUpdate(status: "deleted")` — a plain single-row
+`DELETE` of one task — or reaped by the `sessions` cascade; never a session or
+transcript row, so the never-delete-session-data rule is never in tension here. `TaskStore::list` skips
+a row whose stored `status` is unrecognized (written by a future variant) rather
+than failing the whole call, mirroring the session-blob skip discipline. Like
+every other table here, unread/acknowledged state is **not** stored server-side.
+
 ### Single backend: libsql
 
 All store implementations use libsql (async-native, SQLite-compatible). There is no rusqlite or separate in-memory backend. `Store::open(path)` opens (or creates) a file-backed libsql database (creating parent directories if missing); `LibsqlPool::open_in_memory()` is still available for tests. `LibsqlPool` wraps a shared `libsql::Connection` behind `Arc` for cheap cloning across async tasks.

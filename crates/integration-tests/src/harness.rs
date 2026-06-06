@@ -66,6 +66,10 @@ pub struct AgentTestHarness {
     /// tests can pre-seed session messages or summary metadata before
     /// driving the agent loop (e.g. compressor fast-path e2e coverage).
     pub session_manager: Arc<aura_agent::SessionManager>,
+    /// Planning-checklist store shared by the registered `Task*` tools and the
+    /// loop's per-turn reminder. Exposed so a task e2e can assert what the
+    /// model's tool calls persisted.
+    pub task_store: Arc<dyn aura_store::TaskStore>,
     pub mailbox: MailboxSender<AgentMessage>,
     outputs: mpsc::Receiver<AgentOutput>,
     actor_handle: Option<JoinHandle<()>>,
@@ -346,6 +350,14 @@ impl AgentTestHarnessBuilder {
         for (tool, manifest) in self.tools {
             tool_registry.register(tool, manifest);
         }
+        // Wire the planning-checklist tools against a shared store the loop
+        // also reads for its per-turn reminder — mirrors production so a task
+        // e2e exercises the full tool→store→reminder→TaskList path.
+        let task_store: Arc<dyn aura_store::TaskStore> =
+            Arc::new(aura_task::test_support::MemoryTaskStore::new());
+        for (tool, manifest) in aura_task::tools::agent_tools(task_store.clone()) {
+            tool_registry.register(tool, manifest);
+        }
         let tool_registry = Arc::new(tool_registry);
         let skill_registry = Arc::new(SkillRegistry::new());
         let approval_gates = Arc::new(ApprovalGateMap::new());
@@ -450,6 +462,7 @@ impl AgentTestHarnessBuilder {
             // guard.
             sessions: Some(Arc::clone(&session_manager)),
             memory: self.memory,
+            task_store: task_store.clone(),
         });
         let (mailbox_tx, mailbox_rx) = aura_agent::mailbox::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
@@ -482,6 +495,7 @@ impl AgentTestHarnessBuilder {
             cost_manager,
             token_calibration,
             session_manager,
+            task_store,
             mailbox: mailbox_tx,
             outputs: output_rx,
             actor_handle: Some(actor_handle),

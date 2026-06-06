@@ -32,8 +32,10 @@ import {
   type Frame,
   type ResourceAccess,
   type SessionPatch,
+  type TaskView,
 } from '../api/chatWs';
 import { CronInbox } from '../components/CronInbox';
+import { TaskChecklist } from '../components/chat/TaskChecklist';
 
 /** One progress entry inside a turn's work block. `reasoning`, `status`
  *  and `prose` carry `text`; `tool` carries the tool-call fields and is
@@ -187,6 +189,10 @@ interface SessionView {
    *  detail's `last_llm` on history load and updated on a successful
    *  `PUT …/model`. */
   model?: string | null;
+  /** The session's planning checklist, replaced wholesale by each
+   *  `Frame::TaskList` snapshot (it's idempotent, not a delta). Empty
+   *  when the agent has no active plan — the checklist panel hides. */
+  tasks: TaskView[];
 }
 
 const EMPTY_VIEW: SessionView = {
@@ -199,6 +205,7 @@ const EMPTY_VIEW: SessionView = {
   hasMore: false,
   awaitingReply: false,
   model: null,
+  tasks: [],
 };
 
 /** Soft cap on `views` map size. Past this, the oldest non-active
@@ -647,6 +654,7 @@ export function ChatPage() {
           case 'message':
           case 'notice':
           case 'approval_requested':
+          case 'task_list':
             recencyRef.current.set(frame.session_id, Date.now());
             break;
           default:
@@ -1282,6 +1290,7 @@ export function ChatPage() {
           onScroll={handleTranscriptScroll}
           className="chat-scroll relative w-full max-w-6xl overflow-y-auto overflow-x-hidden px-6 py-4"
         >
+          <TaskChecklist tasks={currentView.tasks} />
           {currentView.historyLoading ? (
             <div className="flex justify-center py-12 text-ink-soft">
               <RiLoader4Line className="text-3xl animate-spin" />
@@ -1531,6 +1540,14 @@ function routeInboundFrame(
           },
         };
       });
+      return;
+    }
+    case 'task_list': {
+      // Idempotent snapshot — REPLACE the session's checklist wholesale
+      // (not a delta). An empty array means the plan is currently empty
+      // and the checklist panel hides.
+      const sid = frame.session_id;
+      setViews((prev) => mergeView(prev, sid, { tasks: frame.tasks }));
       return;
     }
     case 'message': {

@@ -204,6 +204,7 @@ dependencies = [
  "aura-storage",
  "aura-store",
  "aura-subagent",
+ "aura-task",
  "aura-tools",
  "aura-trace",
  "aura-tui",
@@ -245,6 +246,7 @@ dependencies = [
  "aura-skills",
  "aura-skills-assessor",
  "aura-storage",
+ "aura-store",
  "aura-subagent",
  "aura-tools",
  "aura-trace",
@@ -518,6 +520,7 @@ dependencies = [
  "aura-storage",
  "aura-store",
  "aura-subagent",
+ "aura-task",
  "aura-tools",
  "aura-trace",
  "aura-workspace",
@@ -863,6 +866,24 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "aura-task"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aura-model",
+ "aura-store",
+ "aura-tools",
+ "aura-workspace",
+ "chrono",
+ "parking_lot",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",

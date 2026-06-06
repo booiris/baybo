@@ -7,7 +7,9 @@
 
 use std::time::Duration;
 
-use aura_channels::wire::{self, AttachmentKind, Frame, Message as WireMessage, WireAttachment};
+use aura_channels::wire::{
+    self, AttachmentKind, Frame, Message as WireMessage, TaskView, WireAttachment,
+};
 use aura_channels::{ChannelKind, IncomingMessage, Message as AgentMessage, MessageRole};
 use aura_model::{
     BlobRef, ChannelType, ChatMessage, ContentBlock, MessageMetadata, Role, SessionId, User,
@@ -406,6 +408,31 @@ async fn run_inbound_loop(
                         // the replay storm.
                         if let Some(since) = since_ordinal {
                             replay_catch_up(state, sidecar, channel_type, &session_id, since).await;
+                        }
+                        // Hydrate the durable planning checklist for this
+                        // connection — reload / reconnect / view-cache eviction
+                        // all re-subscribe, so this is the single place a client
+                        // recovers the list without waiting for the next turn.
+                        // Sent only when non-empty and to this connection only;
+                        // surfaces without a checklist (TUI) drop the frame.
+                        match state.task_store.list(&session_id).await {
+                            Ok(tasks) if !tasks.is_empty() => {
+                                let tasks = tasks.into_iter().map(TaskView::from).collect();
+                                if let Err(e) = sidecar
+                                    .send_frame(Frame::TaskList {
+                                        session_id: session_id.clone(),
+                                        user_id: String::new(),
+                                        tasks,
+                                    })
+                                    .await
+                                {
+                                    tracing::warn!(error = %e, %session_id, "failed to send TaskList snapshot");
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(error = %e, %session_id, "failed to load tasks for snapshot");
+                            }
                         }
                     }
                     Frame::Unsubscribe { session_id } => {

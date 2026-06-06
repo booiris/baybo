@@ -1826,3 +1826,120 @@ async fn memory_on_session_end_fires_on_actor_stop_with_durable_transcript() {
         transcripts[0],
     );
 }
+
+/// The `Task*` tools persist the checklist to the shared store AND the loop
+/// surfaces it to the channel as a `TaskList` snapshot — across three turns:
+/// `TaskCreate`, then `TaskUpdate` editing a task in place, then
+/// `TaskUpdate(status: "deleted")` removing one.
+#[tokio::test]
+async fn task_tools_persist_and_emit_checklist_to_the_channel() {
+    // The harness auto-registers the Task* tools against an inspectable store.
+    let mut harness = AgentTestHarness::builder().build();
+    let session_id = harness.session.id.clone();
+
+    fn last_task_list(outs: &[AgentOutput]) -> Option<Vec<aura_model::Task>> {
+        outs.iter().rev().find_map(|o| match &o.event {
+            AgentEvent::TaskList(tasks) => Some(tasks.clone()),
+            _ => None,
+        })
+    }
+
+    // Turn 1: the model lays out a two-item plan, then answers.
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+            id: "call-create".into(),
+            name: "TaskCreate".into(),
+            arguments: json!({
+                "tasks": [
+                    { "subject": "write the table", "description": "create session_tasks" },
+                    { "subject": "wire the runtime", "description": "register the tools", "status": "in_progress" }
+                ]
+            }),
+            signature: None,
+        })]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("planned it".into())]);
+
+    harness.send_text("make a plan").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    // Persisted to the shared store...
+    let stored = harness.task_store.list(&session_id).await.unwrap();
+    assert_eq!(stored.len(), 2, "TaskCreate persisted both tasks");
+    assert_eq!(stored[0].subject, "write the table");
+    assert_eq!(stored[1].subject, "wire the runtime");
+    assert_eq!(stored[1].status, aura_model::TaskStatus::InProgress);
+    let first_id = stored[0].id;
+    let second_id = stored[1].id;
+
+    // ...and surfaced to the channel as the latest TaskList snapshot.
+    let list = last_task_list(&outs).expect("a TaskList event reached the channel");
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[1].subject, "wire the runtime");
+
+    // Turn 2: TaskUpdate marks the first task completed (by its real minted id).
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+            id: "call-update".into(),
+            name: "TaskUpdate".into(),
+            arguments: json!({ "id": first_id.to_string(), "status": "completed" }),
+            signature: None,
+        })]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("marked it done".into())]);
+
+    harness.send_text("first one is done").await.unwrap();
+    let outs2 = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let stored2 = harness.task_store.list(&session_id).await.unwrap();
+    assert_eq!(
+        stored2.len(),
+        2,
+        "TaskUpdate edits in place — count unchanged"
+    );
+    let updated = stored2
+        .iter()
+        .find(|t| t.id == first_id)
+        .expect("the updated task still exists");
+    assert_eq!(updated.subject, "write the table");
+    assert_eq!(updated.status, aura_model::TaskStatus::Completed);
+
+    let list2 = last_task_list(&outs2).expect("a TaskList event after TaskUpdate");
+    assert_eq!(list2.len(), 2);
+    assert!(
+        list2.iter().any(
+            |t| t.subject == "write the table" && t.status == aura_model::TaskStatus::Completed
+        ),
+        "the snapshot reflects the completed task"
+    );
+
+    // Turn 3: TaskUpdate(status: "deleted") removes the second task entirely.
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::ToolCall(ToolCallInfo {
+            id: "call-delete".into(),
+            name: "TaskUpdate".into(),
+            arguments: json!({ "id": second_id.to_string(), "status": "deleted" }),
+            signature: None,
+        })]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("dropped it".into())]);
+
+    harness.send_text("scrap the second one").await.unwrap();
+    let outs3 = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let stored3 = harness.task_store.list(&session_id).await.unwrap();
+    assert_eq!(stored3.len(), 1, "the deleted task is gone from the store");
+    assert_eq!(stored3[0].id, first_id);
+
+    let list3 = last_task_list(&outs3).expect("a TaskList event after the delete");
+    assert_eq!(list3.len(), 1);
+    assert_eq!(list3[0].subject, "write the table");
+
+    harness.shutdown().await;
+}

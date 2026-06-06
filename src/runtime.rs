@@ -478,6 +478,14 @@ pub async fn build_managers(
         tool_registry.register(tool, manifest);
     }
 
+    // Planning-checklist tools (`Task*`). Like cron's, they hold
+    // an `Arc<dyn Store>` (here the per-session `TaskStore`) so they register
+    // from the runtime rather than `default_tools`. The agent loop re-injects
+    // the live list each turn (see `AgentLoop::refresh_task_reminder`).
+    for (tool, manifest) in aura_task::tools::agent_tools(stores.task.clone()) {
+        tool_registry.register(tool, manifest);
+    }
+
     // `spawn_subagent` is just another tool from the LLM's perspective.
     // It ferries the spawn request to the router via the system-spawn
     // channel (now the channel's sole producer); the router does the
@@ -760,6 +768,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let skill_registry = Arc::clone(&graph.skill_registry);
         let tool_executor = Arc::clone(&graph.tool_executor);
         let trace_store = graph.stores.trace.clone();
+        let task_store = graph.stores.task.clone();
         let job_lifecycle = Arc::clone(&graph.job_lifecycle);
         let security_gateway = Arc::clone(&graph.security_gateway);
         let session_logger = Arc::clone(&session_logger);
@@ -823,6 +832,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     workspace_paths: Some(Arc::clone(&workspace_paths_arc)),
                     sessions: Some(Arc::clone(&sessions)),
                     memory: memory.clone(),
+                    task_store: task_store.clone(),
                 });
 
                 let span_recorder = Arc::new(SpanRecorder::new(

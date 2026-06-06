@@ -345,6 +345,22 @@ pub struct AgentLoop {
     /// `on_job_complete`) — the runtime wires `None` until a real
     /// implementation is registered.
     memory: Option<Arc<dyn Memory>>,
+    /// Durable per-session planning checklist (`Task*`). The loop
+    /// loads it each turn — and after any checklist-mutating tool call — to
+    /// refresh the transient reminder the model sees via `ContextManager`.
+    /// Always present in production (sourced from the `Store` bundle).
+    task_store: Arc<dyn aura_store::TaskStore>,
+    /// Monotonic per-turn counter (one tick per `run_inner`) backing the task
+    /// reminder throttle below. In-memory: a rehydrated actor restarts at 0,
+    /// which just re-grants the start-of-session grace window.
+    turn_counter: u64,
+    /// `turn_counter` value when the model last ran a checklist-mutating tool
+    /// (`TaskCreate` / `TaskUpdate`). `0` until the first management.
+    last_task_management_turn: u64,
+    /// `turn_counter` value when the task reminder was last injected. `0` until
+    /// the first injection. With both starting at `0`, the throttle holds the
+    /// reminder for the first [`TURNS_SINCE_WRITE`] turns of a session.
+    last_reminder_turn: u64,
     /// At-most-one handle for the in-actor background-summary pass. The
     /// trigger gate ([`Self::maybe_run_background_compression`]) checks
     /// it before spawning: a present, not-yet-finished handle means a
@@ -380,6 +396,41 @@ pub struct AgentLoopConfig {
     /// Pluggable long-term memory handle — one registered implementation, or
     /// `None` to disable the memory hooks (recall / `on_job_complete`).
     pub memory: Option<Arc<dyn Memory>>,
+    /// Durable per-session planning-checklist store backing the `Task*` tools
+    /// and the per-turn reminder.
+    pub task_store: Arc<dyn aura_store::TaskStore>,
+}
+
+/// Task-reminder throttle (mirrors Claude Code's `TODO_REMINDER_CONFIG`): the
+/// model-facing reminder is injected only once the model has gone
+/// `TURNS_SINCE_WRITE` turns without managing tasks AND it has been at least
+/// `TURNS_BETWEEN_REMINDERS` turns since the last reminder — so it nudges
+/// periodically instead of riding every request. The web `TaskList` surface is
+/// **not** throttled (it tracks the live list).
+const TURNS_SINCE_WRITE: u64 = 10;
+const TURNS_BETWEEN_REMINDERS: u64 = 10;
+
+/// The throttle decision: inject the model-facing task reminder this turn iff the
+/// model has gone `TURNS_SINCE_WRITE` turns without managing tasks AND it has
+/// been `TURNS_BETWEEN_REMINDERS` turns since the last reminder.
+fn should_inject_task_reminder(
+    turn_counter: u64,
+    last_task_management_turn: u64,
+    last_reminder_turn: u64,
+) -> bool {
+    turn_counter.saturating_sub(last_task_management_turn) >= TURNS_SINCE_WRITE
+        && turn_counter.saturating_sub(last_reminder_turn) >= TURNS_BETWEEN_REMINDERS
+}
+
+/// `true` when a tool-use block names a checklist-mutating `Task*` tool
+/// (`TaskCreate` / `TaskUpdate`), the signal to reload the
+/// reminder. `TaskList` / `TaskGet` are read-only and excluded.
+fn is_task_mutating_tool_use(block: &ContentBlock) -> bool {
+    matches!(
+        block,
+        ContentBlock::ToolUse { name, .. }
+            if aura_model::TASK_MUTATING_TOOL_NAMES.contains(&name.as_str())
+    )
 }
 
 impl AgentLoop {
@@ -395,6 +446,7 @@ impl AgentLoop {
             workspace_paths,
             sessions,
             memory,
+            task_store,
         } = config;
         let (llm_client, _effective_name) = llm_pool.read().resolve(initial_llm.as_ref());
         let mut context_manager = context_manager;
@@ -413,6 +465,10 @@ impl AgentLoop {
             workspace_paths,
             sessions,
             memory,
+            task_store,
+            turn_counter: 0,
+            last_task_management_turn: 0,
+            last_reminder_turn: 0,
             bg_compression: None,
         }
     }
@@ -438,6 +494,47 @@ impl AgentLoop {
     /// Restore a transcript snapshot taken by [`Self::context_snapshot`].
     pub fn restore_context(&mut self, messages: Vec<ChatMessage>) {
         self.context_manager.restore_messages(messages);
+    }
+
+    /// Load the session's planning checklist, (throttled) refresh the transient
+    /// reminder the model sees, and push the live list to any work-block client
+    /// (the web checklist) via `delta_tx`. `inject` is the per-turn throttle
+    /// decision: when `false`, the model-facing reminder is cleared (the web
+    /// surface is **never** throttled). A store error degrades to leaving the
+    /// prior reminder in place (logged) rather than dropping it.
+    async fn refresh_task_reminder(
+        &mut self,
+        session: &Session,
+        delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        inject: bool,
+    ) {
+        let tasks = match self.task_store.list(&session.id).await {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                warn!(session_id = %session.id, error = %e, "failed to load session tasks for the checklist reminder");
+                return;
+            }
+        };
+        // Model-facing reminder: only when the throttle allows AND there's a
+        // list to show. Otherwise clear it so it doesn't ride this request.
+        let shown = inject && !tasks.is_empty();
+        self.context_manager
+            .refresh_task_reminder(if shown { tasks.as_slice() } else { &[] });
+        if shown {
+            self.last_reminder_turn = self.turn_counter;
+        }
+        // Borrow of `tasks` above is done; move it onto the event so the web
+        // dashboard can render the live checklist (unthrottled, idempotent).
+        if let Some(tx) = delta_tx {
+            let _ = tx
+                .send(AgentOutput {
+                    session_id: session.id.clone(),
+                    user_id: session.user.id.clone(),
+                    channel: session.channel.clone(),
+                    event: AgentEvent::TaskList(tasks),
+                })
+                .await;
+        }
     }
 
     /// Seed the system prompt (+ skill reminder) if the transcript doesn't
@@ -641,6 +738,22 @@ impl AgentLoop {
         // Hoisted into the final OutgoingMessage so the channel sidecar
         // delivers them out-of-band; never echoed back to the LLM.
         let mut accumulated_attachments: Vec<ContentBlock> = Vec::new();
+        // Drives the per-turn planning-checklist reminder: load on the first
+        // iteration (to surface tasks a prior turn persisted) and reload after
+        // any iteration that ran a checklist-mutating tool, so the web checklist
+        // and (when injected) the model reminder stay current.
+        let mut task_reminder_dirty = true;
+        // Task-reminder throttle: one tick per turn; inject the model-facing
+        // reminder only after the model has ignored task management for
+        // `TURNS_SINCE_WRITE` turns and not been reminded for
+        // `TURNS_BETWEEN_REMINDERS`. Decided once here so it's stable across this
+        // turn's iterations; the web `TaskList` emission below ignores it.
+        self.turn_counter += 1;
+        let inject_task_reminder = should_inject_task_reminder(
+            self.turn_counter,
+            self.last_task_management_turn,
+            self.last_reminder_turn,
+        );
         loop {
             // Cooperative cancel checkpoint between iterations. Without
             // this, a `cancel(job_id, ...)` admin call (which trips the
@@ -696,6 +809,16 @@ impl AgentLoop {
                 .await;
             }
 
+            // Refresh the checklist reminder (in `ContextManager`) BEFORE the
+            // compression gate, so the gate charges the reminder's tokens to the
+            // budget and the list rides this request's tail. Only fires on
+            // iteration 1 and after a checklist mutation; cheap indexed read.
+            if task_reminder_dirty {
+                self.refresh_task_reminder(session, delta_tx.as_ref(), inject_task_reminder)
+                    .await;
+                task_reminder_dirty = false;
+            }
+
             // Proactive compression before building the ChatRequest.
             self.compress_if_needed(
                 session,
@@ -729,6 +852,8 @@ impl AgentLoop {
             // would persist and reach the client over the wire yet never
             // render. Streaming each iteration keeps that answer visible.
             let iter_delta_tx = delta_tx.as_ref();
+
+            let tool_uses_before = accumulated_tool_uses.len();
 
             let outcome = crate::runtime::scope::with_step(
                 span_recorder.as_ref(),
@@ -785,7 +910,20 @@ impl AgentLoop {
                 IterationOutcome::Continue => {
                     // Continue to the next LLM iteration; `run_iteration`
                     // has already appended each tool's result to the
-                    // context.
+                    // context. If a checklist-mutating tool ran this
+                    // iteration, the persisted list changed — reload it
+                    // before the next LLM call. (Safe slice: the Final path
+                    // drains `accumulated_tool_uses`, but that path returns
+                    // above; on Continue it only grew.)
+                    if accumulated_tool_uses[tool_uses_before..]
+                        .iter()
+                        .any(is_task_mutating_tool_use)
+                    {
+                        task_reminder_dirty = true;
+                        // Reset the throttle's "turns since task management"
+                        // anchor: the model just touched the list, so don't nag.
+                        self.last_task_management_turn = self.turn_counter;
+                    }
                 }
             }
         }
@@ -2385,6 +2523,67 @@ fn trim_response_text_edges(response: &mut LlmResponse) {
                 *t = trimmed.to_string();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod task_reminder_throttle_tests {
+    use super::{TURNS_BETWEEN_REMINDERS, TURNS_SINCE_WRITE, should_inject_task_reminder};
+
+    #[test]
+    fn holds_during_the_start_of_session_grace_window() {
+        // Fresh session: counters at 0 ⇒ no reminder until TURNS_SINCE_WRITE.
+        for turn in 1..TURNS_SINCE_WRITE {
+            assert!(
+                !should_inject_task_reminder(turn, 0, 0),
+                "turn {turn} is inside the grace window"
+            );
+        }
+        assert!(should_inject_task_reminder(TURNS_SINCE_WRITE, 0, 0));
+    }
+
+    #[test]
+    fn recent_task_management_suppresses_the_reminder() {
+        // Managed at turn 8: the write gate isn't met until TURNS_SINCE_WRITE
+        // turns have passed since, no matter how late in the session.
+        let last_tm = 8;
+        assert!(!should_inject_task_reminder(
+            last_tm + TURNS_SINCE_WRITE - 1,
+            last_tm,
+            0
+        ));
+        assert!(should_inject_task_reminder(
+            last_tm + TURNS_SINCE_WRITE,
+            last_tm,
+            0
+        ));
+    }
+
+    #[test]
+    fn reminders_are_spaced_by_turns_between_reminders() {
+        // Idle on tasks (last_tm = 0), reminded at turn 10: the next reminder
+        // waits TURNS_BETWEEN_REMINDERS even though the write gate stays open.
+        let last_rem = 10;
+        assert!(!should_inject_task_reminder(
+            last_rem + TURNS_BETWEEN_REMINDERS - 1,
+            0,
+            last_rem
+        ));
+        assert!(should_inject_task_reminder(
+            last_rem + TURNS_BETWEEN_REMINDERS,
+            0,
+            last_rem
+        ));
+    }
+
+    #[test]
+    fn both_gates_must_hold() {
+        // Write gate open but reminded recently → suppressed.
+        assert!(!should_inject_task_reminder(100, 0, 95));
+        // Reminder gate open but managed recently → suppressed.
+        assert!(!should_inject_task_reminder(100, 95, 0));
+        // Both open → inject.
+        assert!(should_inject_task_reminder(100, 0, 0));
     }
 }
 

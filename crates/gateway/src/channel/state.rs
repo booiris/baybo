@@ -12,7 +12,7 @@ use aura_agent::SessionManager;
 use aura_channels::{ChannelRegistry, IncomingMessage};
 use aura_pairing::PairingService;
 use aura_security::SecretVault;
-use aura_store::{BlobStore, ChannelBotStore};
+use aura_store::{BlobStore, ChannelBotStore, TaskStore};
 
 use tokio::sync::mpsc;
 
@@ -85,6 +85,10 @@ pub struct WsChannelState {
     /// fetch outbound bytes back. The wire only carries `blob_id`s; this
     /// store is the source of truth for the actual bytes.
     pub blob_store: Arc<dyn BlobStore>,
+    /// Per-session planning checklist. Read on `Subscribe` to hydrate the
+    /// client's `Frame::TaskList` snapshot, so a reload / reconnect / view-cache
+    /// eviction recovers the durable list without waiting for the next turn.
+    pub task_store: Arc<dyn TaskStore>,
     /// Recent-window dedup for sidecar-supplied
     /// `(channel_type, bot_id, platform_msg_id)` triples. Sidecars that
     /// replay their long-poll buffer after a restart hit this and the
@@ -120,6 +124,7 @@ impl WsChannelState {
             bot_reconciler: Arc::clone(&deps.bot_reconciler),
             pairing,
             blob_store: deps.stores.blob.clone(),
+            task_store: deps.stores.task.clone(),
             inbound_dedup: Arc::new(InboundDedup::new()),
         }
     }

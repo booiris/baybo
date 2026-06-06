@@ -349,6 +349,11 @@ fn map_frame(
             // still render them off the same wire frame.
             None
         }
+        Frame::TaskList { .. } => {
+            // The TUI has no live-checklist panel; the planning list is
+            // surfaced on the web dashboard. Drop it here like Reasoning.
+            None
+        }
         Frame::ToolStarted {
             session_id,
             call_id,

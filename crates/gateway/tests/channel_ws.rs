@@ -236,6 +236,95 @@ async fn web_token_attaches_subscribes_and_receives_dispatch() {
     let _ = server_handle.await;
 }
 
+/// A reconnecting / freshly-opening client recovers the durable planning
+/// checklist: the gateway ships a `TaskList` snapshot right after `Subscribe`
+/// (without waiting for an agent turn), so a reload / WS reset / cache eviction
+/// re-hydrates the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscribe_hydrates_durable_task_list_snapshot() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let port_file =
+        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let cfg = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+
+    // Seed a session with one durable task.
+    let user = User {
+        id: WEB_OPERATOR_USER_ID.into(),
+        name: None,
+        channel: ChannelType::http(),
+    };
+    let session = tg
+        .deps
+        .session_manager
+        .create_session(user, ChannelType::http())
+        .await
+        .expect("create session");
+    let now = chrono::Utc::now();
+    let task = aura_model::Task {
+        id: aura_model::TaskId::new(),
+        subject: "write the table".into(),
+        description: "create session_tasks".into(),
+        status: aura_model::TaskStatus::InProgress,
+        depends_on: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    };
+    tg.deps
+        .stores
+        .task
+        .create(&session.id, &task)
+        .await
+        .expect("seed task");
+
+    let channel_tokens = tg.channel_tokens.clone();
+    let shutdown = tg.shutdown.clone();
+    let server =
+        ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone()).expect("bind server");
+    let port = server.port();
+    let server_shutdown = shutdown.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run(server_shutdown).await;
+    });
+
+    let (token, _handle) = mint_web_token(&channel_tokens, "tab-a");
+    let mut client = connect_register(port, &token, ChannelType::http())
+        .await
+        .expect("WS handshake");
+
+    send_frame(
+        &mut client,
+        Frame::Subscribe {
+            session_id: session.id.clone(),
+            since_ordinal: None,
+        },
+    )
+    .await
+    .expect("send Subscribe");
+
+    // After the empty pending snapshot, the gateway hydrates the checklist.
+    expect_empty_pending_snapshot(&mut client, session.id.as_str()).await;
+    let frame = recv_frame_skip_activity(&mut client, Duration::from_secs(1))
+        .await
+        .expect("TaskList snapshot after Subscribe");
+    match frame {
+        Frame::TaskList {
+            session_id, tasks, ..
+        } => {
+            assert_eq!(session_id, session.id);
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].subject, "write the table");
+            assert_eq!(tasks[0].status, "in_progress");
+        }
+        other => panic!("expected TaskList, got {other:?}"),
+    }
+
+    drop(client);
+    shutdown.trigger();
+    let _ = server_handle.await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_subscribers_to_same_session_both_receive_dispatch() {
     let tempdir = tempfile::tempdir().expect("tempdir");

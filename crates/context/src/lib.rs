@@ -220,6 +220,19 @@ pub struct ContextManager {
     /// `last_summary_anchor = Some(messages.len())`, so skipping the
     /// now-`None` lookup preserves the more-conservative anchor.
     last_synced_cursor: Option<i64>,
+    /// Transient per-turn planning-checklist reminder (`Task*`),
+    /// rendered from the durable `session_tasks` list and refreshed by the
+    /// agent loop via [`Self::refresh_task_reminder`]. Kept OUT of
+    /// `self.messages` so it is never persisted and survives compaction for
+    /// free; [`Self::messages_for_llm`] appends it at the tail through the same
+    /// coalescing path as the stored rows. `None` when the session has no tasks.
+    task_reminder: Option<ChatMessage>,
+    /// Cached raw tokenizer count of `task_reminder` (0 when `None`). The
+    /// reminder rides in the real request but is **not** in `self.messages`, so
+    /// [`Self::count_tokens`] adds this to the budget estimate (charging the
+    /// reminder to the compression decision) and [`Self::record_call_actual`]
+    /// subtracts it so the provider-anchored baseline stays messages-only.
+    task_reminder_raw: usize,
 }
 
 /// Required dependencies for [`ContextManager::from_config`]. Plain
@@ -279,6 +292,8 @@ impl ContextManager {
             session_log: config.session_log,
             last_summary_anchor: None,
             last_synced_cursor: None,
+            task_reminder: None,
+            task_reminder_raw: 0,
         }
     }
 
@@ -312,13 +327,42 @@ impl ContextManager {
                     | aura_model::MessageSource::RecalledMemory
             )
         });
-        if needs_framing {
-            merge_for_llm(&frame_recalled_memories(&frame_interjections(
-                &self.messages,
-            )))
+        // The task reminder is appended at the tail (after framing, before
+        // coalescing) so adjacent-role merging applies to it like any other
+        // row. The no-framing / no-reminder path stays clone-free.
+        let mut base = if needs_framing {
+            frame_recalled_memories(&frame_interjections(&self.messages))
+        } else if self.task_reminder.is_some() {
+            self.messages.clone()
         } else {
-            merge_for_llm(&self.messages)
+            return merge_for_llm(&self.messages);
+        };
+        if let Some(reminder) = &self.task_reminder {
+            base.push(reminder.clone());
         }
+        merge_for_llm(&base)
+    }
+
+    /// Set (or clear) the transient planning-checklist reminder injected at the
+    /// tail of every LLM request. Built from the durable `session_tasks` list
+    /// the agent loop passes in. An empty `tasks` slice clears it. Never
+    /// persisted and never added to `self.messages`, so it survives compaction
+    /// for free and keeps the prompt-cache prefix stable.
+    pub fn refresh_task_reminder(&mut self, tasks: &[aura_model::Task]) {
+        self.task_reminder = if tasks.is_empty() {
+            None
+        } else {
+            Some(ChatMessage::agent_context(vec![ContentBlock::Text(
+                crate::prompts::tasks::render_task_list(tasks),
+            )]))
+        };
+        self.task_reminder_raw = self
+            .task_reminder
+            .as_ref()
+            .map_or(0, |m| self.tokenizer.count_message(m));
+        // Charge the (possibly resized) reminder to the budget now so the
+        // compression gate this turn sees the real request size.
+        self.budget.update(self.count_tokens());
     }
 
     /// Resolve the system prompt to seed the leading `Role::System` row. The
@@ -597,12 +641,19 @@ impl ContextManager {
         if actual_input_tokens == 0 {
             return;
         }
+        // The provider's count includes the transient task reminder (it's in the
+        // request), but `count_tokens` re-adds the *current* reminder on top of
+        // the baseline. Subtract it here so the baseline tracks the stored
+        // transcript only — otherwise a large checklist is counted twice. Only
+        // the main-turn call records actuals; the compression call (no reminder)
+        // never reaches here.
+        let actual_messages = actual_input_tokens.saturating_sub(self.task_reminder_raw);
         if let Some(model_id) = self.current_model.read().as_deref() {
             let raw = self.raw_estimate();
-            self.calibration.observe(model_id, raw, actual_input_tokens);
+            self.calibration.observe(model_id, raw, actual_messages);
         }
         *self.baseline.write() = Some(TokenBaseline {
-            actual_tokens: actual_input_tokens,
+            actual_tokens: actual_messages,
             message_count_at_call: self.messages.len(),
         });
     }
@@ -1339,6 +1390,11 @@ impl ContextManager {
     /// cold start, or after compression, or if the message list
     /// shrank below the anchor.
     fn count_tokens(&self) -> usize {
+        // The transient task reminder rides in the real request but isn't a
+        // stored message, so fold its raw count into the estimate (the baseline
+        // is kept reminder-free by `record_call_actual`, so this isn't double
+        // counted).
+        let reminder = self.task_reminder_raw;
         let snapshot = *self.baseline.read();
         if let Some(b) = snapshot
             && self.messages.len() >= b.message_count_at_call
@@ -1347,9 +1403,9 @@ impl ContextManager {
                 .iter()
                 .copied()
                 .sum();
-            return b.actual_tokens + self.calibrate(delta_raw);
+            return b.actual_tokens + self.calibrate(delta_raw + reminder);
         }
-        self.calibrate(self.raw_estimate())
+        self.calibrate(self.raw_estimate() + reminder)
     }
 
     fn calibrate(&self, raw: usize) -> usize {
@@ -2445,6 +2501,63 @@ mod tests {
         let expected_delta =
             ctx.tokenizer.count_message(&new_a) + ctx.tokenizer.count_message(&new_b);
         assert_eq!(ctx.count_tokens(), 5_000 + expected_delta);
+    }
+
+    fn make_task(subject: &str) -> aura_model::Task {
+        let now = chrono::Utc::now();
+        aura_model::Task {
+            id: aura_model::TaskId::new(),
+            subject: subject.into(),
+            description: "body".into(),
+            status: aura_model::TaskStatus::Pending,
+            depends_on: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// The transient task reminder rides in the real request, so its tokens
+    /// must be charged to the budget estimate (the compression gate would
+    /// otherwise under-count and send an over-window request for a big plan).
+    #[tokio::test]
+    async fn task_reminder_is_charged_to_the_budget() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::User, "plan this")).await;
+        let before = ctx.count_tokens();
+
+        ctx.refresh_task_reminder(&[make_task("write the table"), make_task("wire the runtime")]);
+        let reminder_raw = ctx.task_reminder_raw;
+        assert!(reminder_raw > 0, "a non-empty list produces a reminder");
+        assert_eq!(
+            ctx.count_tokens(),
+            before + reminder_raw,
+            "the reminder is charged exactly once"
+        );
+        assert!(ctx.budget().current() >= before + reminder_raw);
+
+        // Clearing the list drops the charge.
+        ctx.refresh_task_reminder(&[]);
+        assert_eq!(ctx.task_reminder_raw, 0);
+        assert_eq!(ctx.count_tokens(), before);
+    }
+
+    /// The provider's actual count includes the reminder, but `count_tokens`
+    /// re-adds the current reminder — so `record_call_actual` must strip it from
+    /// the baseline, leaving the estimate equal to the real request size.
+    #[tokio::test]
+    async fn record_call_actual_does_not_double_count_the_reminder() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::User, "plan this")).await;
+        ctx.refresh_task_reminder(&[make_task("a"), make_task("b")]);
+        assert!(ctx.task_reminder_raw > 0);
+
+        // Provider reported `actual` for a request that included the reminder.
+        let actual = 5_000;
+        ctx.record_call_actual(actual);
+
+        // No new messages since the call ⇒ the estimate equals `actual`
+        // (reminder counted once, not twice).
+        assert_eq!(ctx.count_tokens(), actual);
     }
 
     /// A `UserInterjection` row is sent wrapped in the `<user_interjection>`
