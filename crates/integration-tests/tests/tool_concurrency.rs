@@ -1,14 +1,18 @@
 //! End-to-end coverage for tool-call concurrency scheduling in the
 //! agent loop (`run_iteration`).
 //!
-//! Two guarantees are exercised through a real `AgentActor` driven by a
-//! scripted LLM that emits a batch of tool calls in a single response:
+//! The scheduling guarantees are exercised through a real `AgentActor`
+//! driven by a scripted LLM that emits a batch of tool calls in a single
+//! response:
 //!
 //! 1. `ToolConcurrency::Concurrent` calls (the policy `Read` opts into)
 //!    run in parallel, but never more than `MAX_CONCURRENT_TOOL_CALLS`
 //!    at once.
-//! 2. `ToolConcurrency::Exclusive` calls (every other tool) run alone —
-//!    no other tool call, read or write, overlaps them.
+//! 2. `ToolConcurrency::Exclusive` calls (every mutating tool) run alone
+//!    among pool calls — no other pool call overlaps them.
+//! 3. `ToolConcurrency::Independent` calls (the policy `spawn_subagent`
+//!    uses) acquire no permit: they bypass the cap and overlap even an
+//!    `Exclusive` call, so subagent fan-out stays parallel.
 //!
 //! The probe tool below bumps a shared in-flight counter on entry and
 //! decrements on exit, so the test can observe the actual overlap the
@@ -198,6 +202,81 @@ async fn exclusive_tool_runs_alone() {
     assert!(
         tracker.max_inflight.load(Ordering::SeqCst) >= 2,
         "concurrent reads should still overlap each other"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn independent_tools_bypass_the_pool_cap() {
+    // `Independent` (the policy `spawn_subagent` uses) acquires no permit,
+    // so the per-response cap does not bound it — every dispatched call
+    // overlaps, even past `CAP`. Its real bound is an out-of-band limiter
+    // (the subagent fan-out cap), not the tool pool.
+    let tracker = Arc::new(Tracker::default());
+    let probe = ProbeTool::arc("indep_probe", ToolConcurrency::Independent, tracker.clone());
+    let manifest = probe.manifest();
+
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(probe as Arc<dyn Tool>, manifest)
+        .build();
+
+    const N: usize = CAP + 5;
+    let batch: Vec<StreamEvent> = (0..N).map(|i| call(i, "indep_probe")).collect();
+    harness.stub_llm.push_stream(batch);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("done".into())]);
+
+    harness.send_text("fan out").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let max = tracker.max_inflight.load(Ordering::SeqCst);
+    assert!(
+        max > CAP,
+        "independent calls must bypass the pool cap (saw {max} ≤ {CAP})"
+    );
+    assert_eq!(
+        max, N,
+        "all {N} independent calls should overlap — no permit gating — saw {max}"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn independent_tool_overlaps_an_exclusive_call() {
+    // An `Independent` call holds no permit, so it runs alongside an
+    // `Exclusive` call instead of waiting behind it — the property that
+    // keeps subagent fan-out parallel even next to a mutating tool.
+    let tracker = Arc::new(Tracker::default());
+    let excl = ProbeTool::arc("excl_probe", ToolConcurrency::Exclusive, tracker.clone());
+    let indep = ProbeTool::arc("indep_probe", ToolConcurrency::Independent, tracker.clone());
+    let excl_manifest = excl.manifest();
+    let indep_manifest = indep.manifest();
+
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(excl as Arc<dyn Tool>, excl_manifest)
+        .with_tool(indep as Arc<dyn Tool>, indep_manifest)
+        .build();
+
+    harness
+        .stub_llm
+        .push_stream(vec![call(0, "excl_probe"), call(1, "indep_probe")]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("done".into())]);
+
+    harness
+        .send_text("exclusive plus independent")
+        .await
+        .unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    assert_eq!(
+        tracker.max_inflight.load(Ordering::SeqCst),
+        2,
+        "an Independent call must overlap an Exclusive one (both in flight at once)"
     );
 
     harness.shutdown().await;

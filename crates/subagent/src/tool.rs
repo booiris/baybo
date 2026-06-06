@@ -27,7 +27,7 @@ use aura_model::{
     SystemSpawnRequest, TrustLevel,
 };
 use aura_session::SessionManager;
-use aura_tools::{Tool, ToolContext, ToolError, ToolManifest, ToolOutput};
+use aura_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -478,6 +478,15 @@ impl Tool for SpawnSubagentTool {
 
     fn max_timeout(&self) -> Duration {
         TOOL_WAIT_BACKSTOP
+    }
+
+    /// Independent of the per-response tool pool: a foreground spawn
+    /// blocks on its child for the child's whole lifetime, so holding a
+    /// shared permit would serialize the parent's fan-out. Concurrency
+    /// is bounded out-of-band by the `SubagentDispatchLimiter` (per-root
+    /// fan-out cap), not the loop's permit pool.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Independent
     }
 
     fn progress_label(&self, params: &Value) -> Option<String> {
