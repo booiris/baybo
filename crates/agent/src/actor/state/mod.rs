@@ -97,8 +97,8 @@ pub struct VolatileResources {
     pub supervisor: Option<AgentSupervisor>,
     /// Session-row writer used by handlers whose state mutations must
     /// survive actor eviction. Today only the background-subagent
-    /// path reaches for this — `AgentMessage::SubagentFinished`
-    /// persists `session.state.pending_subagent_results`, and the
+    /// path reaches for this — `AgentMessage::BackgroundJobFinished`
+    /// persists `session.state.pending_background_results`, and the
     /// next-turn drain re-persists the cleared list, so a parent that
     /// the idle reaper eventually reclaims still hands the pending
     /// notifications to the fresh actor on hydration.

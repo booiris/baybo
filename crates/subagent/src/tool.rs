@@ -870,7 +870,7 @@ mod tests {
         // a `SystemSpawnRequest::Subagent` envelope and renders
         // whatever `SubagentResult` the router fills the oneshot
         // with. The router-side branch (use parent_actor_token,
-        // post `AgentMessage::SubagentFinished` on terminal) is
+        // post `AgentMessage::BackgroundJobFinished` on terminal) is
         // tested in the agent crate alongside the supervisor
         // fixtures. Here we just confirm the tool propagates the
         // `background: true` flag and the resulting ack lands as

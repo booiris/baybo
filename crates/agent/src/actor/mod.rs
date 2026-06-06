@@ -13,16 +13,16 @@ use aura_channels::{
     AgentEvent, AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage,
 };
 use aura_job::JobInput;
-use aura_model::{ContentBlock, LlmEntryName, PendingSubagentResult};
+use aura_model::{ContentBlock, LlmEntryName, PendingBackgroundResult};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-/// Hard cap on `session.state.pending_subagent_results`. A parent
+/// Hard cap on `session.state.pending_background_results`. A parent
 /// that stays idle while many background subagents finish would
 /// otherwise grow this vec without bound — both in memory and on
 /// the persisted row. Once the cap is reached the oldest entry is
 /// dropped (its content still lives in the child session's trace).
-const MAX_PENDING_SUBAGENT_RESULTS: usize = 64;
+const MAX_PENDING_BACKGROUND_RESULTS: usize = 64;
 
 /// Exponential-backoff retry schedule for a FAILED `SubagentNotification`
 /// turn. When the turn errors (provider / cost / cancel) and the session is
@@ -67,10 +67,10 @@ pub enum AgentMessage {
     /// A `background: true` subagent dispatched from this session
     /// reached a terminal state. The wait task posts this to the parent
     /// actor's mailbox; it is buffered on
-    /// `session.state.pending_subagent_results` and, once no
+    /// `session.state.pending_background_results` and, once no
     /// higher-priority work is queued, drained into one autonomous
     /// `SubagentNotification` turn.
-    SubagentFinished(Box<PendingSubagentResult>),
+    BackgroundJobFinished(Box<PendingBackgroundResult>),
     /// Re-pin the session's LLM (chat per-session model switch). `llm`
     /// is the `aura.json` entry name to resolve against, or `None` to
     /// revert to `default-llm`. The handler re-pins the live loop in
@@ -81,7 +81,7 @@ pub enum AgentMessage {
     /// `PUT /v1/chat/sessions/{id}/model` via [`AgentSupervisor::route`].
     SetModel { llm: Option<LlmEntryName> },
     /// Stop this actor. Lowest mailbox priority — every queued
-    /// `UserInput` / `SubagentFinished` drains first, then the actor
+    /// `UserInput` / `BackgroundJobFinished` drains first, then the actor
     /// trips its `actor_token` and exits. (The session row lives on; only
     /// the in-memory actor stops.)
     ActorStop,
@@ -95,7 +95,7 @@ impl mailbox::Prioritized for AgentMessage {
             | AgentMessage::CronTrigger { .. }
             | AgentMessage::SubagentSpawned { .. }
             | AgentMessage::SetModel { .. } => MessagePriority::Trigger,
-            AgentMessage::SubagentFinished(_) => MessagePriority::SubagentFinished,
+            AgentMessage::BackgroundJobFinished(_) => MessagePriority::BackgroundJobFinished,
             AgentMessage::ActorStop => MessagePriority::Stop,
         }
     }
@@ -156,7 +156,7 @@ fn is_coalescable_user_input(msg: &AgentMessage) -> bool {
 /// Adapts the actor's mailbox into an
 /// [`InterjectionSource`](crate::runtime::agent_loop::InterjectionSource) for
 /// the running agent loop: drains the leading run of **non-slash** `UserInput`s
-/// queued mid-turn, leaving a queued slash command / `SubagentFinished` /
+/// queued mid-turn, leaving a queued slash command / `BackgroundJobFinished` /
 /// `ActorStop` in place for the actor's normal dispatch. `try_recv_if` stops at
 /// the first non-injectable message, so coalescing boundaries and priority
 /// ordering are preserved. See `docs/mid-turn-user-interjection.md`.
@@ -236,7 +236,7 @@ impl AgentActor {
                 .durable
                 .session
                 .state
-                .pending_subagent_results
+                .pending_background_results
                 .is_empty()
             {
                 tokio::select! {
@@ -248,7 +248,7 @@ impl AgentActor {
                             .durable
                             .session
                             .state
-                            .pending_subagent_results
+                            .pending_background_results
                             .is_empty()
                         {
                             notify_backoff = NOTIFY_RETRY_INITIAL_BACKOFF;
@@ -357,8 +357,8 @@ impl AgentActor {
                     error!(session_id = %session_id, error = %e, "failed to handle subagent spawn");
                 }
             }
-            AgentMessage::SubagentFinished(pending) => {
-                self.handle_subagent_finished(*pending).await;
+            AgentMessage::BackgroundJobFinished(pending) => {
+                self.handle_background_finished(*pending).await;
             }
             AgentMessage::SetModel { llm } => {
                 self.handle_set_model(llm);
@@ -531,31 +531,31 @@ impl AgentActor {
     /// Idempotent on `handle_id` — the wait task can in principle
     /// publish twice (mailbox retry, manual recovery) and we don't
     /// want the notification to list it twice. Capped at
-    /// `MAX_PENDING_SUBAGENT_RESULTS` with drop-oldest semantics so a
+    /// `MAX_PENDING_BACKGROUND_RESULTS` with drop-oldest semantics so a
     /// parent that stays idle while many backgrounds finish can't
     /// grow the persisted row without bound.
-    async fn handle_subagent_finished(&mut self, pending: PendingSubagentResult) {
-        let buffer = &mut self.durable.session.state.pending_subagent_results;
+    async fn handle_background_finished(&mut self, pending: PendingBackgroundResult) {
+        let buffer = &mut self.durable.session.state.pending_background_results;
         if buffer.iter().any(|p| p.handle_id == pending.handle_id) {
             debug!(
                 session_id = %self.durable.session.id,
                 handle_id = %pending.handle_id,
-                "duplicate SubagentFinished for handle; ignoring"
+                "duplicate BackgroundJobFinished for handle; ignoring"
             );
             return;
         }
         debug!(
             session_id = %self.durable.session.id,
             handle_id = %pending.handle_id,
-            subagent_type = %pending.subagent_type,
-            "buffered background subagent result for its notification turn"
+            label = %pending.label,
+            "buffered background job result for its notification turn"
         );
-        if buffer.len() >= MAX_PENDING_SUBAGENT_RESULTS {
+        if buffer.len() >= MAX_PENDING_BACKGROUND_RESULTS {
             let dropped = buffer.remove(0);
             warn!(
                 session_id = %self.durable.session.id,
                 dropped_handle_id = %dropped.handle_id,
-                cap = MAX_PENDING_SUBAGENT_RESULTS,
+                cap = MAX_PENDING_BACKGROUND_RESULTS,
                 "pending subagent buffer full; dropping oldest entry"
             );
         }
@@ -590,7 +590,7 @@ impl AgentActor {
     }
 
     /// Write the actor's current `durable.session` back to the
-    /// session store so the latest `pending_subagent_results` survives
+    /// session store so the latest `pending_background_results` survives
     /// eviction. Called only by the background-subagent paths today.
     /// Logs a warn on storage error rather than failing the surrounding
     /// handler — losing the persisted copy degrades to "delivered to
@@ -618,7 +618,7 @@ impl AgentActor {
 
     /// Surface buffered background-subagent results as their own turn —
     /// but only when no higher-priority work is queued: a `Trigger`
-    /// (UserInput) must run first, and another queued `SubagentFinished`
+    /// (UserInput) must run first, and another queued `BackgroundJobFinished`
     /// is folded in first (merge). An empty queue or a lowest-priority
     /// `ActorStop` means "drain now".
     async fn maybe_run_subagent_notification(
@@ -629,14 +629,14 @@ impl AgentActor {
             .durable
             .session
             .state
-            .pending_subagent_results
+            .pending_background_results
             .is_empty()
         {
             return;
         }
         if matches!(
             mailbox.peek_priority(),
-            Some(p) if p >= mailbox::MessagePriority::SubagentFinished
+            Some(p) if p >= mailbox::MessagePriority::BackgroundJobFinished
         ) {
             return;
         }
@@ -659,7 +659,7 @@ impl AgentActor {
         // delivered completion must not be lost if it fails. The actor is
         // single-threaded, so nothing else mutates the buffer while the
         // turn runs.
-        let pending = std::mem::take(&mut self.durable.session.state.pending_subagent_results);
+        let pending = std::mem::take(&mut self.durable.session.state.pending_background_results);
         if pending.is_empty() {
             return;
         }
@@ -713,8 +713,8 @@ impl AgentActor {
                 // Restore the drained results so the next drain retries them —
                 // the child trace alone would never resurface.
                 let mut restored = pending;
-                restored.append(&mut self.durable.session.state.pending_subagent_results);
-                self.durable.session.state.pending_subagent_results = restored;
+                restored.append(&mut self.durable.session.state.pending_background_results);
+                self.durable.session.state.pending_background_results = restored;
                 self.persist_session_state_after_pending_change("subagent_notification_restore")
                     .await;
             }

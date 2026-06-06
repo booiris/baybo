@@ -43,8 +43,8 @@ pub enum CancelReason {
     /// The user ran `/stop` on the session, cancelling the in-flight turn
     /// and every in-flight subagent it spawned. Distinct from
     /// `ParentCancelled` so the subagent wait task can suppress the
-    /// terminal `SubagentFinished` delivery (a stopped result must not
-    /// repopulate `pending_subagent_results`).
+    /// terminal `BackgroundJobFinished` delivery (a stopped result must not
+    /// repopulate `pending_background_results`).
     UserStopped,
 }
 

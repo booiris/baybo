@@ -36,9 +36,9 @@ pub use session::{
     TriggerKind, TriggerSource, User,
 };
 pub use spawn_protocol::{
-    BACKGROUND_SUBAGENT_HANDLE_PREFIX, PendingSubagentResult, SPAWN_SUBAGENT_TOOL_NAME,
-    SUBAGENT_CHANNEL_TAG, SubagentExitStatus, SubagentParentContext, SubagentResult,
-    SubagentSpawnRequest, SystemSpawnRequest,
+    BACKGROUND_SUBAGENT_HANDLE_PREFIX, BackgroundJobKind, PendingBackgroundResult,
+    SPAWN_SUBAGENT_TOOL_NAME, SUBAGENT_CHANNEL_TAG, SubagentExitStatus, SubagentParentContext,
+    SubagentResult, SubagentSpawnRequest, SystemSpawnRequest,
 };
 pub use task::{
     TASK_CREATE_TOOL_NAME, TASK_GET_TOOL_NAME, TASK_LIST_TOOL_NAME, TASK_MUTATING_TOOL_NAMES,

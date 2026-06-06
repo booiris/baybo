@@ -1647,7 +1647,7 @@ impl AgentLoop {
     }
 
     /// Append the synthetic `SubagentNotification` prompt **in-memory only**.
-    /// It is rebuilt from the durable `pending_subagent_results` buffer on
+    /// It is rebuilt from the durable `pending_background_results` buffer on
     /// every retry, so persisting per-attempt would stack duplicate hidden
     /// rows under the infinite-backoff retry. The caller seeds the system
     /// prompt and snapshots the transcript *before* this so a failed turn can

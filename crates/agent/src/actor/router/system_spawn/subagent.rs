@@ -6,7 +6,7 @@ use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
 use aura_llm::TokenUsage;
 use aura_model::{
     BACKGROUND_SUBAGENT_HANDLE_PREFIX, ChannelType, ChatMessage, ContentBlock, ExternalAgentKind,
-    JobId, Lineage, LineageKind, MessageMetadata, PendingSubagentResult, SUBAGENT_CHANNEL_TAG,
+    JobId, Lineage, LineageKind, MessageMetadata, PendingBackgroundResult, SUBAGENT_CHANNEL_TAG,
     Session, SessionId, SpanId, SubagentBackend, SubagentExitStatus, SubagentResult,
     SubagentSpawnRequest, TriggerKind, User,
 };
@@ -538,7 +538,7 @@ async fn escort_background_terminal(
     // delivery — the reaper must not tear the parent down mid-escort. An
     // absent marker means `/stop` already drained this subagent, so suppress
     // the terminal delivery: a user-stopped result must not repopulate
-    // `pending_subagent_results`.
+    // `pending_background_results`.
     if supervisor.is_background_subagent_in_flight(parent_id, &child_session_id) {
         deliver_background_result(
             supervisor,
@@ -953,18 +953,18 @@ async fn deliver_background_result(
     result: SubagentResult,
 ) {
     let final_text = result.result_text();
-    let pending = PendingSubagentResult {
-        handle_id: handle_id.clone(),
+    let pending = PendingBackgroundResult::subagent(
+        handle_id.clone(),
         subagent_type,
         task_summary,
-        child_session_id: result.child_session_id,
+        result.child_session_id,
         final_text,
-        status: result.status,
-    };
+        result.status,
+    );
     let delivered = supervisor
         .route(
             parent_session_id,
-            AgentMessage::SubagentFinished(Box::new(pending)),
+            AgentMessage::BackgroundJobFinished(Box::new(pending)),
         )
         .await;
     if !delivered {

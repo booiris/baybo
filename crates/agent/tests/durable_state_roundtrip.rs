@@ -117,8 +117,8 @@ async fn rehydrate_after_idle_eviction_preserves_session_state() {
 /// actor's `persist_session_state_after_pending_change` helper is
 /// responsible for upholding.
 #[tokio::test]
-async fn pending_subagent_results_survive_session_round_trip() {
-    use aura_model::{PendingSubagentResult, SessionId, SubagentExitStatus};
+async fn pending_background_results_survive_session_round_trip() {
+    use aura_model::{PendingBackgroundResult, SessionId, SubagentExitStatus};
 
     let session_store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
     let summary_store = Arc::new(MemorySessionSummaryStore::new());
@@ -132,15 +132,15 @@ async fn pending_subagent_results_survive_session_round_trip() {
 
     session
         .state
-        .pending_subagent_results
-        .push(PendingSubagentResult {
-            handle_id: "bg-1".into(),
-            subagent_type: "general-purpose".into(),
-            task_summary: "check the docs".into(),
-            child_session_id: SessionId::from("child-xyz"),
-            final_text: "found three matches".into(),
-            status: SubagentExitStatus::Completed,
-        });
+        .pending_background_results
+        .push(PendingBackgroundResult::subagent(
+            "bg-1",
+            "general-purpose",
+            "check the docs",
+            SessionId::from("child-xyz"),
+            "found three matches",
+            SubagentExitStatus::Completed,
+        ));
     session_store.save(&session).await.expect("persist");
 
     drop(session);
@@ -150,10 +150,15 @@ async fn pending_subagent_results_survive_session_round_trip() {
         .await
         .expect("load")
         .expect("row present");
-    assert_eq!(reloaded.state.pending_subagent_results.len(), 1);
-    let entry = &reloaded.state.pending_subagent_results[0];
+    assert_eq!(reloaded.state.pending_background_results.len(), 1);
+    let entry = &reloaded.state.pending_background_results[0];
     assert_eq!(entry.handle_id, "bg-1");
-    assert_eq!(entry.subagent_type, "general-purpose");
-    assert_eq!(entry.final_text, "found three matches");
+    assert_eq!(entry.label, "check the docs");
+    assert_eq!(entry.summary_text, "found three matches");
+    assert!(matches!(
+        &entry.kind,
+        aura_model::BackgroundJobKind::Subagent { subagent_type, .. }
+            if subagent_type == "general-purpose"
+    ));
     assert!(matches!(entry.status, SubagentExitStatus::Completed));
 }

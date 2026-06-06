@@ -49,7 +49,7 @@ pub struct InFlightSubagent {
 /// [`InFlightSubagent`])`. The idle reaper consults it before shutting an
 /// actor down: a parent with outstanding background work is protected so
 /// its mailbox stays alive to receive the eventual
-/// `AgentMessage::SubagentFinished` when each child terminates. `/stop`
+/// `AgentMessage::BackgroundJobFinished` when each child terminates. `/stop`
 /// drains it to enumerate what to cancel + report, and the removal doubles
 /// as the suppress signal (a wait task whose entry is gone delivers
 /// nothing). Process-local (background dispatches don't survive restart).
@@ -123,7 +123,7 @@ impl AgentSupervisor {
     /// Peek whether a specific background subagent is still tracked. The wait
     /// task calls this BEFORE delivering its terminal result: a `false` means
     /// `/stop` already drained the entry, so the delivery must be suppressed
-    /// (a user-stopped result must not repopulate `pending_subagent_results`).
+    /// (a user-stopped result must not repopulate `pending_background_results`).
     pub fn is_background_subagent_in_flight(
         &self,
         parent_session_id: &SessionId,
@@ -317,7 +317,7 @@ impl AgentSupervisor {
                 // Parent has at least one background `spawn_subagent`
                 // still running; reaping now would kill the mailbox
                 // before the wait task can deliver
-                // `AgentMessage::SubagentFinished`. Skip — the next
+                // `AgentMessage::BackgroundJobFinished`. Skip — the next
                 // tick after every subagent finishes will see the
                 // counter at zero and proceed.
                 debug!(

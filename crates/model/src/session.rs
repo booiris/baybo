@@ -219,15 +219,20 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approved_resources: Vec<ApprovedResource>,
 
-    /// Background `spawn_subagent` results that completed while the
-    /// parent actor was between turns. The agent loop drains this on
-    /// the next user input, prepending them as a System reminder so
-    /// the parent LLM sees the work in time. Persisted with the
-    /// session so an actor evicted by the idle reaper still surfaces
-    /// the deliveries on hydration. See
-    /// `aura_model::spawn_protocol::PendingSubagentResult`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pending_subagent_results: Vec<crate::spawn_protocol::PendingSubagentResult>,
+    /// Background-job results (detached subagents and detached `Bash`
+    /// commands) that reached a terminal state while the parent actor
+    /// was between turns. Drained into a notification turn once no
+    /// higher-priority work is queued. Persisted with the session so an
+    /// actor evicted by the idle reaper still surfaces the deliveries on
+    /// hydration. The `serde` alias keeps an in-flight buffer written by
+    /// an older binary (`pending_subagent_results`) deserializable. See
+    /// `aura_model::spawn_protocol::PendingBackgroundResult`.
+    #[serde(
+        default,
+        alias = "pending_subagent_results",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub pending_background_results: Vec<crate::spawn_protocol::PendingBackgroundResult>,
 
     /// Which backend created this subagent session, plus (for
     /// External) the agent's `workspace_dir` and `resume_key`.
