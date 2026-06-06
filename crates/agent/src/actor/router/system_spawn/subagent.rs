@@ -952,14 +952,13 @@ async fn deliver_background_result(
     task_summary: String,
     result: SubagentResult,
 ) {
-    let parts = result.split_for_parent();
+    let final_text = result.result_text();
     let pending = PendingSubagentResult {
         handle_id: handle_id.clone(),
         subagent_type,
         task_summary,
         child_session_id: result.child_session_id,
-        final_text: parts.text,
-        images: parts.llm_images,
+        final_text,
         status: result.status,
     };
     let delivered = supervisor

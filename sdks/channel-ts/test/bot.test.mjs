@@ -563,6 +563,50 @@ test("double-send keeps typing alive between reply A and reply B (pending-turn c
   assert.equal(typed, beforeReplyB, "no pings after the final reply");
 });
 
+test("onAttachment delivers media via sendMedia and does NOT end the turn", async () => {
+  const fake = makePlatform();
+  const media = [];
+  fake.platform.sendMedia = async (_handle, _chat, payload) => { media.push(payload); };
+  let typed = 0;
+  fake.platform.notifyTyping = async () => { typed++; };
+  const channel = new BotChannel({
+    channelType: "test",
+    logger: stubLogger(),
+    platform: fake.platform,
+    typingRefreshMs: 15,
+    typingSafetyMs: 5000,
+  });
+  await channel.onStartBot({ botId: "b1", token: "t" });
+  fake.emit({ chat: 42, platformUserId: "u", content: "screenshot please" });
+  await new Promise((r) => setTimeout(r, 50));
+  const beforeAttachment = typed;
+  assert.ok(beforeAttachment >= 3, `expected ≥3 typing pings, got ${beforeAttachment}`);
+
+  // A mid-turn attachment lands while the agent is still working.
+  await channel.onAttachment({
+    sessionId: "s",
+    userId: "test_b1_42_u",
+    attachments: [{ kind: "image", blob_id: "sha256:ab", mime_type: "image/png", size: 1 }],
+  });
+  assert.equal(media.length, 1, "sendMedia must deliver the attachment");
+  assert.equal(media[0].attachments.length, 1);
+  assert.equal(media[0].text, "", "a standalone attachment carries no caption");
+
+  // The turn is NOT over: typing must keep pinging (unlike onMessage,
+  // which would terminate it).
+  await new Promise((r) => setTimeout(r, 40));
+  assert.ok(
+    typed > beforeAttachment,
+    `typing must continue after onAttachment (before=${beforeAttachment}, now=${typed})`,
+  );
+
+  // The real terminal reply still ends the turn afterward.
+  const beforeReply = typed;
+  await channel.onMessage({ sessionId: "s", userId: "test_b1_42_u", content: "here it is" });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(typed, beforeReply, "the terminal reply ends the turn");
+});
+
 test("safety cap is not extended by subsequent inbounds from the same user", async () => {
   const fake = makePlatform();
   let typed = 0;

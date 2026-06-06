@@ -118,7 +118,7 @@ async fn rehydrate_after_idle_eviction_preserves_session_state() {
 /// responsible for upholding.
 #[tokio::test]
 async fn pending_subagent_results_survive_session_round_trip() {
-    use aura_model::{ContentBlock, PendingSubagentResult, SessionId, SubagentExitStatus};
+    use aura_model::{PendingSubagentResult, SessionId, SubagentExitStatus};
 
     let session_store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
     let summary_store = Arc::new(MemorySessionSummaryStore::new());
@@ -139,7 +139,6 @@ async fn pending_subagent_results_survive_session_round_trip() {
             task_summary: "check the docs".into(),
             child_session_id: SessionId::from("child-xyz"),
             final_text: "found three matches".into(),
-            images: vec![],
             status: SubagentExitStatus::Completed,
         });
     session_store.save(&session).await.expect("persist");
@@ -157,39 +156,4 @@ async fn pending_subagent_results_survive_session_round_trip() {
     assert_eq!(entry.subagent_type, "general-purpose");
     assert_eq!(entry.final_text, "found three matches");
     assert!(matches!(entry.status, SubagentExitStatus::Completed));
-    assert!(entry.images.is_empty());
-
-    // Round-trip with an image attachment ensures the ContentBlock
-    // serialization in the new field type works too.
-    let mut with_image = reloaded;
-    with_image
-        .state
-        .pending_subagent_results
-        .push(PendingSubagentResult {
-            handle_id: "bg-2".into(),
-            subagent_type: "explorer".into(),
-            task_summary: "screenshot".into(),
-            child_session_id: SessionId::from("child-img"),
-            final_text: "here is the screenshot".into(),
-            images: vec![ContentBlock::Image {
-                blob: aura_model::BlobRef {
-                    blob_id: "blob-1".into(),
-                },
-                mime_type: "image/png".into(),
-            }],
-            status: SubagentExitStatus::Completed,
-        });
-    session_store
-        .save(&with_image)
-        .await
-        .expect("persist with image");
-    let reloaded = sessions
-        .get(&session_id)
-        .await
-        .expect("load")
-        .expect("row present");
-    assert_eq!(reloaded.state.pending_subagent_results.len(), 2);
-    let entry = &reloaded.state.pending_subagent_results[1];
-    assert_eq!(entry.images.len(), 1);
-    assert!(matches!(&entry.images[0], ContentBlock::Image { .. }));
 }

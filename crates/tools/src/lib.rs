@@ -220,6 +220,16 @@ pub enum NoticeLevel {
 /// tools should not `await` notice delivery.
 pub trait SessionNotifier: Send + Sync {
     fn emit(&self, level: NoticeLevel, summary: &str, detail: &str);
+
+    /// Deliver media a tool produced (a sent file, …) to the session's
+    /// channel as its own standalone, out-of-band message — distinct from
+    /// the turn's final reply, so it does not complete the turn. `blocks`
+    /// are media only (`Image` / `Audio` / `File`). Default no-op for
+    /// notifiers with no live channel (cron, tests); the live notifier
+    /// routes it to the channel. Sync, fire-and-forget.
+    fn emit_attachment(&self, blocks: &[aura_model::ContentBlock]) {
+        let _ = blocks;
+    }
 }
 
 /// No-op notifier for tests and for call sites that don't have a

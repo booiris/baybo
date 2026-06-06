@@ -111,7 +111,7 @@ impl Tool for SendFileTool {
             .unwrap_or_default()
     }
 
-    async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
@@ -167,10 +167,20 @@ impl Tool for SendFileTool {
             mime_type: mime.clone(),
         };
 
-        Ok(ToolOutput::WithAttachments {
-            text: format!("Sent {filename} ({size} bytes, {mime}) to user."),
-            attachments: vec![attachment],
-        })
+        // Deliver the file to the user's channel as its own out-of-band
+        // message via the notifier — the live channel on a UserChat turn;
+        // a no-op when there's no live channel (cron / subagent). The
+        // returned text is the LLM-facing confirmation.
+        let text = match &ctx.notifier {
+            Some(notifier) => {
+                notifier.emit_attachment(std::slice::from_ref(&attachment));
+                format!("Sent {filename} ({size} bytes, {mime}) to user.")
+            }
+            None => format!(
+                "Prepared {filename} ({size} bytes, {mime}), but this turn has no live channel to deliver it on."
+            ),
+        };
+        Ok(ToolOutput::Text(text))
     }
 }
 
@@ -254,6 +264,20 @@ mod tests {
         }
     }
 
+    /// Captures the media `SendFile` delivers via `emit_attachment` so a
+    /// test can assert the blocks that reach the channel.
+    #[derive(Default)]
+    struct RecordingNotifier {
+        attachments: parking_lot::Mutex<Vec<ContentBlock>>,
+    }
+
+    impl crate::SessionNotifier for RecordingNotifier {
+        fn emit(&self, _level: crate::NoticeLevel, _summary: &str, _detail: &str) {}
+        fn emit_attachment(&self, blocks: &[ContentBlock]) {
+            self.attachments.lock().extend(blocks.iter().cloned());
+        }
+    }
+
     #[tokio::test]
     async fn sends_pdf_with_inferred_mime() {
         let dir = tempfile::tempdir().unwrap();
@@ -262,10 +286,17 @@ mod tests {
         let mem = Arc::new(MemoryBlobStore::new());
         let tool = SendFileTool::new(Arc::clone(&mem) as Arc<dyn BlobStore>);
 
-        let out = tool.execute(json!({ "path": p }), &ctx()).await.unwrap();
-        let ToolOutput::WithAttachments { text, attachments } = out else {
-            panic!("expected WithAttachments");
+        let recorder = Arc::new(RecordingNotifier::default());
+        let mut cx = ctx();
+        cx.notifier = Some(recorder.clone() as Arc<dyn crate::SessionNotifier>);
+
+        let out = tool.execute(json!({ "path": p }), &cx).await.unwrap();
+        let ToolOutput::Text(text) = out else {
+            panic!("expected Text, got {out:?}");
         };
+        assert!(text.contains("report.pdf"));
+
+        let attachments = recorder.attachments.lock();
         assert_eq!(attachments.len(), 1);
         match &attachments[0] {
             ContentBlock::File {
@@ -278,7 +309,6 @@ mod tests {
             }
             other => panic!("expected File block, got {other:?}"),
         }
-        assert!(text.contains("report.pdf"));
         assert_eq!(mem.len(), 1);
     }
 
@@ -339,20 +369,21 @@ mod tests {
         let store = Arc::new(MemoryBlobStore::new()) as Arc<dyn BlobStore>;
         let tool = SendFileTool::new(store);
 
-        let out = tool
-            .execute(
-                json!({
-                    "path": p,
-                    "filename": "report.bin",
-                    "mime": "application/x-custom"
-                }),
-                &ctx(),
-            )
-            .await
-            .unwrap();
-        let ToolOutput::WithAttachments { attachments, .. } = out else {
-            panic!("expected WithAttachments");
-        };
+        let recorder = Arc::new(RecordingNotifier::default());
+        let mut cx = ctx();
+        cx.notifier = Some(recorder.clone() as Arc<dyn crate::SessionNotifier>);
+
+        tool.execute(
+            json!({
+                "path": p,
+                "filename": "report.bin",
+                "mime": "application/x-custom"
+            }),
+            &cx,
+        )
+        .await
+        .unwrap();
+        let attachments = recorder.attachments.lock();
         match &attachments[0] {
             ContentBlock::File {
                 filename,

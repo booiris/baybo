@@ -585,7 +585,6 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
         task_summary: "find FOO".into(),
         child_session_id: SessionId::from("child-A"),
         final_text: "found FOO at lib/foo.rs:7".into(),
-        images: vec![],
         status: SubagentExitStatus::Completed,
     };
     harness
@@ -684,7 +683,6 @@ async fn subagent_notification_suppresses_empty_reply() {
                 task_summary: "nothing notable".into(),
                 child_session_id: SessionId::from("child-Q"),
                 final_text: "no-op".into(),
-                images: vec![],
                 status: SubagentExitStatus::Completed,
             },
         )))
@@ -738,7 +736,6 @@ async fn subagent_notification_failure_keeps_pending_for_retry() {
                 task_summary: "find X".into(),
                 child_session_id: SessionId::from("child-K"),
                 final_text: "found X".into(),
-                images: vec![],
                 status: SubagentExitStatus::Completed,
             },
         )))
@@ -802,7 +799,6 @@ async fn failed_subagent_notification_retries_until_success() {
                 task_summary: "find X".into(),
                 child_session_id: SessionId::from("child-R"),
                 final_text: "found X".into(),
-                images: vec![],
                 status: SubagentExitStatus::Completed,
             },
         )))
@@ -916,7 +912,6 @@ async fn subagent_finished_dedupes_on_handle_id() {
             task_summary: "dupe".into(),
             child_session_id: SessionId::from("child-D"),
             final_text: "only once".into(),
-            images: vec![],
             status: SubagentExitStatus::Completed,
         }))
     };
@@ -1765,7 +1760,6 @@ async fn memory_hooks_skip_subagent_notification_turn() {
                 task_summary: "find X".into(),
                 child_session_id: SessionId::from("child-X"),
                 final_text: "found X".into(),
-                images: vec![],
                 status: SubagentExitStatus::Completed,
             },
         )))
