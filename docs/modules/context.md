@@ -34,7 +34,7 @@ ContextManager (struct)
 ├── current_model     — Option<String>; written by maybe_compress, used as
 │                       calibration key + baseline-invalidation trigger
 ├── workspace         — Arc<aura_workspace::WorkspacePaths>; resolves
-│                       summary.md (fast-path), the JSONL transcript pointer,
+│                       summary.md (fast-path), the transcript-recovery pointer,
 │                       the identity files (soul assembly), and the
 │                       tool-spills dir (oversize tool output)
 ├── system_prompt     — resolved system prompt for the initial seed (workspace
@@ -95,7 +95,7 @@ self.compress_if_needed(session, span_recorder, job_id, &cancel_token).await?;
 | Token budget (how much room is left) | `TokenBudget`                      | Pure state; agent can query `budget().remaining()` for other decisions                     |
 | When to compress                     | `ContextManager::maybe_compress`   | Caller (agent loop) triggers at the top of each iteration so cost recording can be wrapped |
 | How to compress                      | `compressor.rs` impl block         | Hardcoded 3-stage flow on `ContextManager`; no swappable strategy                          |
-| Per-session paths                    | `Arc<WorkspacePaths>`              | Resolves `summary.md` for the fast-path and the JSONL transcript pointer for the message   |
+| Per-session paths                    | `Arc<WorkspacePaths>`              | Resolves `summary.md` for the fast-path and the transcript-recovery pointer for the message |
 | Token counting                       | `Tokenizer` trait                  | Trait and `TiktokenTokenizer` impl both live here; no LLM-SDK coupling                     |
 | Calibration key (which model)        | `maybe_compress`'s `model_id` arg  | Caller passes the LLM id at compression time; `ContextManager` stores and reuses it        |
 
@@ -108,7 +108,7 @@ self.compress_if_needed(session, span_recorder, job_id, &cancel_token).await?;
 3. **Stage 2 — LLM summary** (`summarize_or_truncate`): send the full conversation + `SUMMARIZE_INSTRUCTION` to the model via the `ChatCallback`. On success, replace with `[system + parsed summary]` and return `Replaced { messages }`.
 4. **Stage 3 — truncate fallback**: only reached when Stage 2 returns an error or empty content. Keep `system + last keep_recent non-system` messages (pair-preserving so tool_use / tool_result stays intact) and return `Replaced { messages }`.
 
-The summary message itself follows Claude Code's continuation-prompt shape: an intro paragraph framing the conversation as resumed from compaction, the summary body (verbatim from `summary.md` for the fast-path; LLM output prefixed with `Summary:` for stage 2), a `read the full transcript at: <path>` pointer to the per-session JSONL log resolved through `WorkspacePaths::session_log_file`, and a closing paragraph instructing the model to resume work without acknowledging the summary. `parse_summary_response` strips both `<analysis>` and `<summary>` tags so the body lands cleanly in either path.
+The summary message itself follows Claude Code's continuation-prompt shape: an intro paragraph framing the conversation as resumed from compaction, the summary body (verbatim from `summary.md` for the fast-path; LLM output prefixed with `Summary:` for stage 2), a `read the full transcript at: <path>` pointer (resolved through `WorkspacePaths::session_log_file`) — a **virtual** path with no file behind it: a `Read` of it is served by a virtual-read resolver (`ReadTool` consults `ctx.virtual_reads` before the filesystem) from the durable `session_messages` transcript (full, including rows compaction has since superseded), and a closing paragraph instructing the model to resume work without acknowledging the summary. `parse_summary_response` strips both `<analysis>` and `<summary>` tags so the body lands cleanly in either path.
 
 Every `Replaced` return triggers `ContextManager` to insert the skill trailer right after the system block (`insert_skill_trailer`). The historical `<system-reminder>` carrying the skill list lives in a `User` message — the summary stages discard it by construction, and the truncate fallback can drop it whenever the reminder lands in the dropped middle. Re-inserting unconditionally is cheaper than tracking whether the kept slice still carries one. Putting it adjacent to the system prompt also keeps the "what tools are available" context lined up for prompt caching.
 
@@ -124,7 +124,7 @@ The context sent to the LLM is organized in descending priority:
 ### Dependency boundaries
 
 - Depends on `aura-llm` for the `ChatRequest` / `LlmResponse` shape used in the `ChatCallback` signature. The compressor does not construct an LLM client itself; the callback is supplied by the caller. Tokenization stays algorithm-only: `TiktokenTokenizer` depends on `tiktoken-rs` (pure BPE), not on any provider SDK.
-- Depends on `aura-workspace` for `WorkspacePaths` so per-session paths (`summary.md`, JSONL transcript) resolve through the same source of truth the rest of the runtime uses.
+- Depends on `aura-workspace` for `WorkspacePaths` so per-session paths (`summary.md`, transcript-recovery pointer) resolve through the same source of truth the rest of the runtime uses.
 - Does **not** depend on `memory` (the agent loop has no automatic memory injection; the `memory` crate only powers the admin REST surface).
 - Does **not** depend on `trace` or `storage` directly — the chat callback is what opens the trace span and records cost; `context` only sees its `Result<LlmResponse, ContextError>`. Persistence of the transcript is brokered through the `Arc<SessionManager>` (from `aura-session`) supplied at construction.
 

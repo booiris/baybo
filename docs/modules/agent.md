@@ -27,10 +27,10 @@ agent/src/
 ├── service.rs                # ShutdownSignal, TaskTracker (process-level)
 ├── runtime/                  # per-turn execution core
 │   ├── agent_loop.rs         # AgentLoop, AgentLoopConfig
-│   ├── tool_executor.rs      # ToolExecutor + approval gate wiring
+│   ├── tool_executor.rs      # ToolExecutor + approval gate; wires virtual-file providers into ToolContext
+│   ├── virtual_read.rs       # SessionTranscriptReader: VirtualReadResolver serving the transcript (ReadTool consults it)
 │   ├── compression.rs        # inline + background compression wiring
 │   ├── soul.rs               # system-prompt + identity assembly
-│   ├── session_log.rs        # JSONL session-message logger
 │   ├── billed_chat.rs        # cost-aware LLM call wrapper
 │   ├── error_recovery.rs     # retry / degrade policy
 │   ├── sandbox.rs            # SandboxAdapter glue for tool exec

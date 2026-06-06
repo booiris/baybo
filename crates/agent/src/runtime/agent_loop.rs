@@ -30,7 +30,6 @@ use crate::runtime::progress_observer::{
     should_fire_observer,
 };
 use crate::runtime::scope::JobSpec;
-use aura_context::{LlmCallOutcome, LlmResponseMeta};
 
 use crate::runtime::tool_executor::ToolExecutor;
 use crate::security::SecurityGateway;
@@ -1317,7 +1316,6 @@ impl AgentLoop {
             },
             None,
             |span| async move {
-                let started_at = std::time::Instant::now();
                 // Bind this call to its `LlmCall` span so the spend lands
                 // on the right span. `BoundBilledLlm` does gate → call →
                 // record internally — no manual `record_call` afterward.
@@ -1334,8 +1332,6 @@ impl AgentLoop {
                         Err(e) => (TokenUsage::default(), Err(e)),
                     },
                 };
-                let latency_ms = started_at.elapsed().as_millis() as u64;
-
                 let (finalize, value_result) = match llm_result {
                     Ok(mut response) => {
                         // Defensive scrub of LLM output.
@@ -1355,14 +1351,6 @@ impl AgentLoop {
                         // whitespace is left intact so markdown paragraphs,
                         // code blocks, and lists are unaffected.
                         trim_response_text_edges(&mut response);
-                        self.write_session_log(
-                            &request,
-                            LlmCallOutcome::Ok {
-                                response: LlmResponseMeta::from_response(&response),
-                                latency_ms,
-                            },
-                        )
-                        .await;
                         let trace_tool_calls: Vec<aura_trace::LlmToolCallRecord> = response
                             .tool_calls
                             .iter()
@@ -1384,24 +1372,6 @@ impl AgentLoop {
                         (finalize, Ok((response, span.span_id)))
                     }
                     Err(e) => {
-                        // Sanitize the JSONL log; return the raw typed
-                        // `LlmError` so `should_retry` can dispatch on
-                        // the variant. The trace's `Failed` reason
-                        // still carries the provider text.
-                        let raw = e.to_string();
-                        let log_msg = self
-                            .security_gateway
-                            .sanitize_error(&raw)
-                            .await
-                            .unwrap_or(raw);
-                        self.write_session_log(
-                            &request,
-                            LlmCallOutcome::Err {
-                                error: log_msg,
-                                latency_ms,
-                            },
-                        )
-                        .await;
                         // Bill the partial-stream tokens so a failed
                         // call still leaves a `cost_records` row.
                         let finalize = LlmCallResult {
@@ -1435,17 +1405,6 @@ impl AgentLoop {
             },
         )
         .await
-    }
-
-    /// Log a single LLM call to the per-session JSONL log. Context owns the
-    /// logger + record format and assembles + writes it; the agent only
-    /// supplies the model identity (from its `BillableLlm`, which context
-    /// doesn't hold) plus the call's request + outcome.
-    async fn write_session_log(&self, request: &ChatRequest, outcome: LlmCallOutcome) {
-        let info = self.llm_client.model_info();
-        self.context_manager
-            .log_llm_call(request, outcome, &info.provider, &info.id)
-            .await;
     }
 
     /// Drain mid-turn user interjections from `src` and append each as a

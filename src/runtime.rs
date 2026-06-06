@@ -30,9 +30,7 @@ use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager};
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_config::{AuraConfig, LlmEntryName};
-use aura_context::{
-    ContextManager, ContextManagerConfig, SessionLlmLogger, TiktokenTokenizer, Tokenizer,
-};
+use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, Tokenizer};
 use aura_cost::{CostManager, SpendingLimits};
 use aura_job::JobLifecycle;
 use aura_llm::BillableLlm;
@@ -613,6 +611,15 @@ pub async fn build_managers(
         work_dir
     });
     info!(path = %sandbox_root.display(), "sandbox FS scope rooted at workspace work/");
+    // Resolver consulted on `Read` before the filesystem: serves the session
+    // transcript from the store for post-compaction recovery, with per-session
+    // access control. `ReadTool` consults it; `None` would disable virtual reads.
+    let virtual_reads: Option<Arc<dyn aura_tools::VirtualReadResolver>> =
+        Some(Arc::new(aura_agent::SessionTranscriptReader::new(
+            Arc::clone(&session_manager) as Arc<dyn aura_agent::SessionTranscript>,
+            workspace_paths.clone(),
+        )));
+
     // `ToolExecutor` doesn't store an LLM handle; the active
     // `BillableLlm` is passed in per `execute` call and bound to the
     // tool span there, so a tool's side-LLM call bills against the
@@ -624,6 +631,7 @@ pub async fn build_managers(
         sandbox_root,
         workspace_paths.clone(),
         sandbox_runner,
+        virtual_reads,
     ));
 
     // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and
@@ -725,11 +733,6 @@ pub struct RouterRunHandle {
 pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let buffer = graph.config.channels.message_buffer_size;
 
-    let session_log_dir =
-        aura_workspace::WorkspacePaths::new(std::path::PathBuf::from(&graph.config.workspace.path))
-            .sessions_log_dir();
-    let session_logger = Arc::new(SessionLlmLogger::new(session_log_dir));
-
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(TiktokenTokenizer::for_model(
         graph.llm_client.model_info().id.as_str(),
     ));
@@ -771,7 +774,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let task_store = graph.stores.task.clone();
         let job_lifecycle = Arc::clone(&graph.job_lifecycle);
         let security_gateway = Arc::clone(&graph.security_gateway);
-        let session_logger = Arc::clone(&session_logger);
         let tokenizer = Arc::clone(&tokenizer);
         let trace_event_stream = trace_event_stream.clone();
         let token_calibration = Arc::clone(&token_calibration);
@@ -825,7 +827,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                             .subagent_type
                             .clone()
                             .map(|name| (Arc::clone(&subagent_registry), name)),
-                        session_log: Some(Arc::clone(&session_logger)),
                     }),
                     max_iterations,
                     security_gateway: Arc::clone(&security_gateway),

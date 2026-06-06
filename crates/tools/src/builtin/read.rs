@@ -7,13 +7,54 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use super::paths::require_absolute;
-use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
+use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput, VirtualReadAccess};
+
+/// Canonical name of the file-reading builtin. A const so `name()` and the
+/// `require_absolute` label share one source of truth for the literal.
+const READ_TOOL_NAME: &str = "Read";
 
 const DEFAULT_LIMIT: usize = 800;
 const MAX_LIMIT: usize = 50_00;
 const MAX_LINE_BYTES: usize = 2000;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_FILE_MIB: u64 = MAX_FILE_BYTES / 1024 / 1024;
+
+/// Format one line of `Read`-style output: a right-aligned 1-based line
+/// number, a tab, then the line truncated to [`MAX_LINE_BYTES`] at a UTF-8
+/// boundary (with a `… [truncated]` marker when cut). Used by both the
+/// filesystem read loop and the virtual-file path below.
+fn format_numbered_line(line_no: usize, line: &str) -> String {
+    let cut = line.floor_char_boundary(MAX_LINE_BYTES);
+    if cut < line.len() {
+        format!("{:>6}\t{}… [truncated]\n", line_no, &line[..cut])
+    } else {
+        format!("{:>6}\t{}\n", line_no, line)
+    }
+}
+
+/// Render an in-memory string as `Read`-style numbered output, honoring the
+/// same 1-based `offset` / `limit` (default [`DEFAULT_LIMIT`], capped at
+/// [`MAX_LIMIT`]) and per-line byte cap as a real read. Used by the
+/// virtual-file path in [`ReadTool::execute`] to present provider content
+/// identically to a file.
+fn paginate_numbered(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    let start = offset.unwrap_or(1).saturating_sub(1);
+    let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+    let end = start.saturating_add(limit);
+    let mut out = String::new();
+    for (idx, line) in content.lines().enumerate() {
+        if idx >= end {
+            break;
+        }
+        if idx >= start {
+            out.push_str(&format_numbered_line(idx + 1, line));
+        }
+    }
+    if out.is_empty() {
+        out.push_str("(empty or range out of bounds)");
+    }
+    out
+}
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
@@ -48,7 +89,7 @@ struct Params {
 #[async_trait]
 impl Tool for ReadTool {
     fn name(&self) -> &str {
-        "Read"
+        READ_TOOL_NAME
     }
 
     fn description(&self) -> String {
@@ -86,11 +127,31 @@ impl Tool for ReadTool {
             .unwrap_or_default()
     }
 
-    async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         let p: Params =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
-        require_absolute(&p.file_path, "Read", "file_path")?;
+        require_absolute(&p.file_path, READ_TOOL_NAME, "file_path")?;
+
+        // A virtual read (no on-disk backing — e.g. the session transcript,
+        // served from the store) is resolved before any filesystem access. The
+        // resolver self-enforces access control; `None` means this path isn't
+        // virtual, so the real read proceeds.
+        if let Some(resolver) = &ctx.virtual_reads {
+            let access = VirtualReadAccess {
+                session_id: &ctx.session_id,
+                user: &ctx.user,
+            };
+            match resolver.resolve(&p.file_path, &access).await {
+                Some(Ok(content)) => {
+                    return Ok(ToolOutput::Text(paginate_numbered(
+                        &content, p.offset, p.limit,
+                    )));
+                }
+                Some(Err(reason)) => return Err(ToolError::Execution(reason)),
+                None => {}
+            }
+        }
 
         if aura_security::is_sensitive_path(&p.file_path) {
             return Err(ToolError::Execution(format!(
@@ -124,12 +185,7 @@ impl Tool for ReadTool {
                 break;
             }
             if idx >= start {
-                let cut = line.floor_char_boundary(MAX_LINE_BYTES);
-                if cut < line.len() {
-                    out.push_str(&format!("{:>6}\t{}… [truncated]\n", idx + 1, &line[..cut]));
-                } else {
-                    out.push_str(&format!("{:>6}\t{}\n", idx + 1, line));
-                }
+                out.push_str(&format_numbered_line(idx + 1, &line));
             }
             idx += 1;
         }
@@ -152,6 +208,7 @@ impl Tool for ReadTool {
 mod tests {
     use super::*;
     use aura_model::{ChannelType, User};
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
@@ -175,6 +232,35 @@ mod tests {
             events: crate::noop_event_sink(),
             llm: None,
             secrets: None,
+            virtual_reads: None,
+        }
+    }
+
+    fn ctx_with(resolver: Arc<dyn crate::VirtualReadResolver>) -> ToolContext {
+        ToolContext {
+            virtual_reads: Some(resolver),
+            ..ctx()
+        }
+    }
+
+    enum StubResolver {
+        Unclaimed,
+        Content(String),
+        Denied,
+    }
+
+    #[async_trait]
+    impl crate::VirtualReadResolver for StubResolver {
+        async fn resolve(
+            &self,
+            _path: &Path,
+            _access: &VirtualReadAccess<'_>,
+        ) -> Option<Result<String, String>> {
+            match self {
+                StubResolver::Unclaimed => None,
+                StubResolver::Content(s) => Some(Ok(s.clone())),
+                StubResolver::Denied => Some(Err("not yours".into())),
+            }
         }
     }
 
@@ -270,5 +356,71 @@ mod tests {
                 .as_deref(),
             Some("/data/aura/crates/tools/src/builtin/read.rs"),
         );
+    }
+
+    #[test]
+    fn paginate_numbers_lines_and_honors_offset_limit() {
+        let out = paginate_numbered("l1\nl2\nl3\nl4", Some(2), Some(2));
+        assert!(out.contains("     2\tl2"));
+        assert!(out.contains("     3\tl3"));
+        assert!(!out.contains("l1"));
+        assert!(!out.contains("l4"));
+    }
+
+    #[test]
+    fn paginate_truncates_long_line_and_reports_empty_range() {
+        let long = "x".repeat(MAX_LINE_BYTES + 50);
+        assert!(paginate_numbered(&long, None, None).contains("… [truncated]"));
+        assert_eq!(
+            paginate_numbered("a\nb", Some(99), Some(1)),
+            "(empty or range out of bounds)"
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_resolver_serves_before_filesystem() {
+        // The path does not exist on disk, but the resolver claims it — Read
+        // returns the resolved content, paginated like a real file.
+        let out = ReadTool
+            .execute(
+                json!({ "file_path": "/no/such/file", "limit": 1 }),
+                &ctx_with(Arc::new(StubResolver::Content("v1\nv2".into()))),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else { panic!() };
+        assert!(s.contains("     1\tv1"));
+        assert!(
+            !s.contains("v2"),
+            "limit=1 must stop before the second line"
+        );
+    }
+
+    #[tokio::test]
+    async fn unclaimed_resolver_falls_through_to_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("real.txt");
+        tokio::fs::write(&p, "from disk\n").await.unwrap();
+        let out = ReadTool
+            .execute(
+                json!({ "file_path": p }),
+                &ctx_with(Arc::new(StubResolver::Unclaimed)),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text(s) = out else { panic!() };
+        assert!(s.contains("from disk"));
+    }
+
+    #[tokio::test]
+    async fn denied_resolver_surfaces_error() {
+        let err = ReadTool
+            .execute(
+                json!({ "file_path": "/whatever" }),
+                &ctx_with(Arc::new(StubResolver::Denied)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Execution(ref m) if m.contains("not yours")));
     }
 }

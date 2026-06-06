@@ -15,3 +15,4 @@ pub mod progress_observer;
 pub mod sandbox;
 pub mod scope;
 pub mod tool_executor;
+pub mod virtual_read;

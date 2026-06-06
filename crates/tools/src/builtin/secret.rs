@@ -239,6 +239,7 @@ mod tests {
             events: crate::noop_event_sink(),
             llm: None,
             secrets,
+            virtual_reads: None,
         }
     }
 

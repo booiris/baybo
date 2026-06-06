@@ -195,6 +195,7 @@ mod tests {
             events: crate::noop_event_sink(),
             llm: None,
             secrets: None,
+            virtual_reads: None,
         };
         let err = AgentTool.execute(json!({}), &ctx).await.unwrap_err();
         assert!(matches!(err, ToolError::NotImplemented(_)));

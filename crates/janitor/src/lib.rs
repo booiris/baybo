@@ -13,9 +13,8 @@ use std::time::{Duration, Instant};
 use aura_store::ChannelPairingStore;
 use aura_workspace::WorkspacePaths;
 
-use fs_sweep::{DirSweep, is_log_file, is_session_log, sweep_directory};
+use fs_sweep::{DirSweep, is_log_file, sweep_directory};
 
-const SESSION_LOG_TTL: Duration = Duration::from_secs(15 * 86_400);
 const LOG_FILE_TTL: Duration = Duration::from_secs(30 * 86_400);
 // Pairing approvals — short-lived auth-flow ephemera, kept long enough
 // for the next channel reload to confirm them, then dropped.
@@ -43,7 +42,6 @@ const SIDECAR_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JanitorReport {
-    pub session_logs_removed: usize,
     pub log_files_removed: usize,
     pub sidecar_dirs_removed: usize,
     pub pairings_purged: u64,
@@ -98,18 +96,6 @@ impl Janitor {
     pub async fn sweep_once(&self) -> JanitorReport {
         let mut report = JanitorReport::default();
 
-        let sessions_dir = self.paths.sessions_log_dir();
-        match sweep_directory(DirSweep {
-            dir: &sessions_dir,
-            ttl: SESSION_LOG_TTL,
-            name_predicate: is_session_log,
-        })
-        .await
-        {
-            Ok(n) => report.session_logs_removed = n,
-            Err(e) => tracing::warn!(error = %e, "session-log sweep failed"),
-        }
-
         let mut logs_total = 0;
         for dir in [self.paths.logs_dir(), self.paths.channel_logs_dir()] {
             match sweep_directory(DirSweep {
@@ -133,7 +119,6 @@ impl Janitor {
         }
 
         tracing::info!(
-            session_logs_removed = report.session_logs_removed,
             log_files_removed = report.log_files_removed,
             pairings_purged = report.pairings_purged,
             "janitor sweep complete",
@@ -267,28 +252,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_log_sweep_removes_old_jsonl_files_only() {
-        let tmp = TempDir::new().unwrap();
-        let paths = workspace_paths(tmp.path());
-        let dir = paths.sessions_log_dir();
-        std::fs::create_dir_all(&dir).unwrap();
-        let stale = dir.join("old-session.jsonl");
-        let fresh = dir.join("new-session.jsonl");
-        let other = dir.join("notes.txt");
-        std::fs::write(&stale, b"{}").unwrap();
-        std::fs::write(&fresh, b"{}").unwrap();
-        std::fs::write(&other, b"keep").unwrap();
-        back_date(&stale, Duration::from_secs(SESSION_LOG_TTL.as_secs() + 60));
-
-        let report = Janitor::new(paths).sweep_once().await;
-
-        assert_eq!(report.session_logs_removed, 1);
-        assert!(!stale.exists());
-        assert!(fresh.exists());
-        assert!(other.exists(), "non-jsonl files must survive");
-    }
-
-    #[tokio::test]
     async fn log_sweep_removes_old_log_files_in_both_dirs() {
         let tmp = TempDir::new().unwrap();
         let paths = workspace_paths(tmp.path());
@@ -389,7 +352,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = workspace_paths(tmp.path());
         let report = Janitor::new(paths).sweep_once().await;
-        assert_eq!(report.session_logs_removed, 0);
         assert_eq!(report.log_files_removed, 0);
     }
 

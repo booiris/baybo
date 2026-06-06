@@ -369,6 +369,7 @@ fn make_tool_context(workspace_paths: &WorkspacePaths, cancel: CancellationToken
         events: aura_tools::noop_event_sink(),
         llm: None,
         secrets: None,
+        virtual_reads: None,
     }
 }
 
