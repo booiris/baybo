@@ -425,6 +425,13 @@ fn map_frame(
             // and are silently dropped.
             None
         }
+        Frame::Attachment { .. } => {
+            // The TUI can't render media, so drop the standalone
+            // attachment frame. Deliberately NOT turned into a
+            // `TransportEvent` — it carries no turn-completion meaning and
+            // must not disturb the spinner / outstanding-response state.
+            None
+        }
         Frame::Register { .. }
         | Frame::RegisterAck { .. }
         | Frame::Subscribe { .. }

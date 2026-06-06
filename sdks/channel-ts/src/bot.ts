@@ -1,4 +1,5 @@
 import type {
+  AgentAttachment,
   AgentDelta,
   AgentMessage,
   AgentNotice,
@@ -727,6 +728,37 @@ export class BotChannel<BotHandle, ChatId>
         sendMediaPath ? "sendMedia failed" : "sendText failed",
         err,
       );
+    }
+  }
+
+  async onAttachment(att: AgentAttachment): Promise<void> {
+    // Mid-turn media: the turn is NOT over (a terminal onMessage follows),
+    // so keep the liveness markers alive instead of completing the turn —
+    // mirrors the transient-notice path, never the onMessage path.
+    this.refreshTypingSafety(att.userId);
+    this.statusCondenser?.touch(att.userId);
+    const route = this.route(att.userId);
+    if (!route) {
+      this.logger.warn(
+        "agent attachment for unknown user or detached bot; dropping",
+        att.userId,
+      );
+      return;
+    }
+    if (att.attachments.length === 0) return;
+    if (this.platform.sendMedia === undefined) {
+      this.logger.warn(
+        `dropping ${att.attachments.length} attachment(s) — platform does not implement sendMedia`,
+      );
+      return;
+    }
+    try {
+      await this.platform.sendMedia(route.handle, route.chat, {
+        text: "",
+        attachments: att.attachments,
+      });
+    } catch (err) {
+      this.logger.error("sendMedia (attachment) failed", err);
     }
   }
 

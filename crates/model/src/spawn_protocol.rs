@@ -166,8 +166,7 @@ pub enum SubagentExitStatus {
 /// `handle_id` is the synthetic identifier the spawning tool minted
 /// and surfaced to the parent LLM as the "dispatched" handle, so
 /// later turn-prepend messages can name the same id the parent saw
-/// at dispatch time. `images` is empty for non-completed exits so
-/// failure noise can't leak attachment context.
+/// at dispatch time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingSubagentResult {
     pub handle_id: String,
@@ -175,29 +174,7 @@ pub struct PendingSubagentResult {
     pub task_summary: String,
     pub child_session_id: SessionId,
     pub final_text: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub images: Vec<ContentBlock>,
     pub status: SubagentExitStatus,
-}
-
-/// Split of a [`SubagentResult`] into the components the parent's
-/// tool boundary needs:
-///  * `text` — the always-non-empty string that will populate the
-///    `tool_result` content the parent LLM sees on its next turn.
-///  * `llm_images` — `ContentBlock::Image` entries from the
-///    completed-subagent's final message that vision-capable parent
-///    LLMs should see. Empty for non-completed terminations.
-///
-/// Lives in `aura-model` because the values are pure data and both
-/// `aura-tools` (the tool boundary that builds `ToolOutput`) and the
-/// router/wait routine reach for them. Non-image, non-text blocks
-/// (thinking, tool_use, tool_result) are intentionally dropped —
-/// they're internal subagent state and don't belong on the
-/// parent-visible boundary.
-#[derive(Debug, Clone, Default)]
-pub struct SubagentReturn {
-    pub text: String,
-    pub llm_images: Vec<ContentBlock>,
 }
 
 impl SubagentResult {
@@ -214,43 +191,30 @@ impl SubagentResult {
         }
     }
 
-    /// Split this result into text + image components for the parent
-    /// tool boundary. See [`SubagentReturn`] for the contract.
-    pub fn split_for_parent(&self) -> SubagentReturn {
+    /// The parent-visible text for this result's `tool_result` content
+    /// (without the resume tail). Always non-empty. Non-text blocks
+    /// (thinking, tool_use, images) are dropped — they're internal
+    /// subagent state; the parent gets the subagent's textual report.
+    pub fn result_text(&self) -> String {
         match (&self.status, &self.final_content) {
             (SubagentExitStatus::Completed, Some(blocks)) => {
-                let mut text = extract_text(blocks);
-                let llm_images: Vec<ContentBlock> = blocks
-                    .iter()
-                    .filter(|b| matches!(b, ContentBlock::Image { .. }))
-                    .cloned()
-                    .collect();
+                let text = extract_text(blocks);
                 if text.is_empty() {
-                    text = if llm_images.is_empty() {
-                        "[subagent completed without producing a final message]".to_string()
-                    } else {
-                        "[subagent returned image attachments only]".to_string()
-                    };
+                    "[subagent completed without producing a final message]".to_string()
+                } else {
+                    text
                 }
-                SubagentReturn { text, llm_images }
             }
-            (SubagentExitStatus::Completed, None) => SubagentReturn {
-                text: "[subagent completed without producing a final message]".to_string(),
-                llm_images: Vec::new(),
-            },
-            (SubagentExitStatus::Cancelled, _) => SubagentReturn {
-                text: "[subagent cancelled by parent before producing a result]".to_string(),
-                llm_images: Vec::new(),
-            },
-            (SubagentExitStatus::Failed { reason }, _) => SubagentReturn {
-                text: format!("[subagent failed: {reason}]"),
-                llm_images: Vec::new(),
-            },
-            (SubagentExitStatus::Timeout, _) => SubagentReturn {
-                text: "[subagent idle timeout — produced no output within the safety window]"
-                    .to_string(),
-                llm_images: Vec::new(),
-            },
+            (SubagentExitStatus::Completed, None) => {
+                "[subagent completed without producing a final message]".to_string()
+            }
+            (SubagentExitStatus::Cancelled, _) => {
+                "[subagent cancelled by parent before producing a result]".to_string()
+            }
+            (SubagentExitStatus::Failed { reason }, _) => format!("[subagent failed: {reason}]"),
+            (SubagentExitStatus::Timeout, _) => {
+                "[subagent idle timeout — produced no output within the safety window]".to_string()
+            }
         }
     }
 
@@ -267,11 +231,11 @@ impl SubagentResult {
     }
 
     /// Flat text rendering for the parent's synthetic `tool_result`:
-    /// [`Self::split_for_parent`]'s text plus the [`Self::resume_tail`]
-    /// suffix on completion. Image attachments are dropped — callers
-    /// that need them reach for `split_for_parent` and apply the tail.
+    /// [`Self::result_text`] plus the [`Self::resume_tail`] suffix on
+    /// completion. Callers that want the body without the tail (e.g. the
+    /// background ack) use [`Self::result_text`] directly.
     pub fn to_tool_result_text(&self) -> String {
-        let mut text = self.split_for_parent().text;
+        let mut text = self.result_text();
         if let Some(tail) = self.resume_tail() {
             text.push_str(&tail);
         }
@@ -324,67 +288,17 @@ mod tests {
     }
 
     #[test]
-    fn split_for_parent_passes_through_image_attachments() {
-        let img = ContentBlock::Image {
-            blob: crate::BlobRef {
-                blob_id: "b-1".into(),
-            },
-            mime_type: "image/png".into(),
-        };
-        let r = SubagentResult {
-            child_session_id: SessionId::from("child-1"),
-            final_content: Some(vec![ContentBlock::Text("found this".into()), img.clone()]),
-            status: SubagentExitStatus::Completed,
-        };
-        let parts = r.split_for_parent();
-        assert_eq!(parts.text, "found this");
-        assert_eq!(parts.llm_images, vec![img]);
-    }
-
-    #[test]
-    fn split_for_parent_image_only_returns_canned_text() {
-        let img = ContentBlock::Image {
-            blob: crate::BlobRef {
-                blob_id: "b-1".into(),
-            },
-            mime_type: "image/png".into(),
-        };
-        let r = SubagentResult {
-            child_session_id: SessionId::from("child-1"),
-            final_content: Some(vec![img.clone()]),
-            status: SubagentExitStatus::Completed,
-        };
-        let parts = r.split_for_parent();
-        assert!(parts.text.contains("image attachments only"));
-        assert_eq!(parts.llm_images, vec![img]);
-    }
-
-    #[test]
-    fn split_for_parent_failure_drops_images() {
-        let img = ContentBlock::Image {
-            blob: crate::BlobRef {
-                blob_id: "b-1".into(),
-            },
-            mime_type: "image/png".into(),
-        };
-        let r = SubagentResult {
-            child_session_id: SessionId::from("child-1"),
-            final_content: Some(vec![img]),
-            status: SubagentExitStatus::Failed {
-                reason: "boom".into(),
-            },
-        };
-        let parts = r.split_for_parent();
-        assert!(parts.text.contains("boom"));
-        assert!(parts.llm_images.is_empty());
-    }
-
-    #[test]
-    fn split_for_parent_drops_non_text_non_image_blocks() {
+    fn result_text_keeps_only_text_blocks() {
         let r = SubagentResult {
             child_session_id: SessionId::from("child-1"),
             final_content: Some(vec![
                 ContentBlock::Text("a".into()),
+                ContentBlock::Image {
+                    blob: crate::BlobRef {
+                        blob_id: "b-1".into(),
+                    },
+                    mime_type: "image/png".into(),
+                },
                 ContentBlock::Thinking {
                     id: None,
                     content: vec![],
@@ -398,9 +312,8 @@ mod tests {
             ]),
             status: SubagentExitStatus::Completed,
         };
-        let parts = r.split_for_parent();
-        assert_eq!(parts.text, "a");
-        assert!(parts.llm_images.is_empty());
+        // Only text reaches the parent — images / thinking / tool_use dropped.
+        assert_eq!(r.result_text(), "a");
     }
 
     #[test]

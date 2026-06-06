@@ -569,6 +569,30 @@ function dispatchFrame(
       );
       return;
     }
+    case "attachment": {
+      // Media a tool produced mid-turn (a sent file, a screenshot),
+      // delivered as its own standalone message. Routed to `onAttachment`
+      // — NOT `onMessage` — because the turn is still running: onMessage
+      // would complete the turn (typing indicator / status bubble) early.
+      if (frame.attachments.length === 0) return;
+      if (!channel.onAttachment) {
+        logger.warn(
+          `channel does not implement onAttachment; dropping ${frame.attachments.length} attachment(s)`,
+        );
+        return;
+      }
+      void safeInvoke(
+        () =>
+          channel.onAttachment!({
+            sessionId: frame.session_id,
+            userId: frame.user_id ?? "",
+            attachments: frame.attachments,
+          }),
+        "onAttachment",
+        logger,
+      );
+      return;
+    }
     case "answer_delta": {
       if (!channel.onDelta) return;
       void safeInvoke(

@@ -5,6 +5,7 @@ export { runRegistration } from "./register.js";
 export type { RegistrationContext, RegistrationResult } from "./register.js";
 export { RunnerError } from "./channel.js";
 export type {
+  AgentAttachment,
   AgentDelta,
   AgentMessage,
   AgentNotice,

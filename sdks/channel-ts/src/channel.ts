@@ -17,6 +17,20 @@ export interface AgentMessage {
 }
 
 /**
+ * Media a tool produced mid-turn (a sent file, a screenshot), to be
+ * delivered as its own standalone message. Distinct from the terminal
+ * `AgentMessage`: it arrives WHILE the turn is still running, so a bot
+ * must keep its "typing"/working indicator alive (like a transient
+ * notice) rather than completing the turn. Bytes are not inline — pull
+ * them via `fetchBlob`.
+ */
+export interface AgentAttachment {
+  sessionId: string;
+  userId: string;
+  attachments: WireAttachment[];
+}
+
+/**
  * One incremental chunk of an in-flight assistant response. Emitted
  * by `onDelta`; sidecars that don't render partial output (Telegram
  * default) ignore it. `userId` mirrors the frame the gateway puts on
@@ -192,6 +206,15 @@ export interface Channel {
   onMessage(msg: AgentMessage): Promise<void>;
 
   onDelta?(delta: AgentDelta): Promise<void>;
+
+  /**
+   * Standalone media delivered mid-turn. Unlike {@link onMessage} this
+   * must NOT complete the turn — the agent is still working and a
+   * terminal `onMessage` will follow. Implementers keep liveness markers
+   * (typing indicator, status bubble) alive. Unimplemented → frame
+   * dropped (and the runner warns).
+   */
+  onAttachment?(att: AgentAttachment): Promise<void>;
 
   onNotice?(notice: AgentNotice): Promise<void>;
 

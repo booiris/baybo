@@ -41,18 +41,6 @@ use tokio_util::sync::CancellationToken;
 /// placeholder is this long, so holding further would be a DoS vector.
 const STREAM_BUFFER_HIGH_WATER: usize = 128;
 
-/// Cap on attachments carried into the final `OutgoingMessage`. Tools
-/// like `browser_screenshot` and `send_local_file` push into a
-/// per-turn `accumulated_attachments` vec; without a cap a chatty
-/// agent (multi-iteration browse, page-each screenshot, …) would
-/// dump every blob produced over the loop into one channel message.
-/// 16 is well above any plausible "user asked for N artifacts" case
-/// and small enough that a runaway loop doesn't drown the channel.
-/// FIFO eviction: keep the newest, drop the oldest — older
-/// screenshots from earlier iterations are typically stale anyway
-/// (page state has moved on).
-const MAX_ATTACHMENTS_PER_TURN: usize = 16;
-
 /// Max characters in a `ToolCompleted` progress summary before it is
 /// truncated with an ellipsis. Presentation-only — the full result still
 /// reaches the LLM (capped separately) and the trace.
@@ -182,22 +170,6 @@ fn skip_leading_whitespace(chunk: &mut String, stripped: &mut bool) -> bool {
     true
 }
 
-/// Append `items` into `dst` while keeping `dst.len() <=
-/// MAX_ATTACHMENTS_PER_TURN` via FIFO eviction. Used for the
-/// per-turn `accumulated_attachments` vec so a runaway loop can't
-/// drown the final `OutgoingMessage` in stale screenshots.
-fn push_bounded<I: IntoIterator<Item = ContentBlock>>(dst: &mut Vec<ContentBlock>, items: I) {
-    for item in items {
-        if dst.len() >= MAX_ATTACHMENTS_PER_TURN {
-            // Stable order: channels render attachments in arrival
-            // order, so FIFO eviction keeps the surviving set
-            // chronologically coherent.
-            dst.remove(0);
-        }
-        dst.push(item);
-    }
-}
-
 /// `try_send` drops on a full channel: notices are non-load-bearing
 /// (the verdict still lands in the trace) and `SessionNotifier::emit`
 /// is sync, so blocking the tool path on backpressure would be worse
@@ -228,6 +200,21 @@ impl aura_tools::SessionNotifier for DeltaTxNotifier {
             event: AgentEvent::Notice { level, text },
         });
     }
+
+    fn emit_attachment(&self, blocks: &[ContentBlock]) {
+        if blocks.is_empty() {
+            return;
+        }
+        // Media carries no free text, so no leak boundary applies. `try_send`
+        // (like `emit`) drops on a full channel rather than blocking the
+        // sync tool path.
+        let _ = self.tx.try_send(AgentOutput {
+            session_id: self.session_id.clone(),
+            user_id: self.user_id.clone(),
+            channel: self.channel.clone(),
+            event: AgentEvent::Attachment(blocks.to_vec()),
+        });
+    }
 }
 
 /// What one `LlmIteration` step's body produced. The terminal-vs-loop
@@ -236,19 +223,15 @@ impl aura_tools::SessionNotifier for DeltaTxNotifier {
 /// and closes the step before the parent loop runs the next thing.
 enum IterationOutcome {
     /// Final assistant response — caller returns this from `run_inner`.
-    /// `outgoing` is the channel-bound message (may include intermediate
-    /// `ToolUse` blocks + channel-only attachments concatenated after the
-    /// reply); `assistant_reply` is the actual persisted assistant turn
-    /// (text / thinking blocks only — what `ChatMessage::assistant(...)`
-    /// was constructed with). The split exists so `Memory::on_job_complete`
-    /// can see the assistant's last turn per its trait contract instead of
-    /// the channel-augmented view.
-    Final {
-        outgoing: OutgoingMessage,
-        assistant_reply: Vec<ContentBlock>,
-    },
-    /// LLM emitted tool calls; loop continues.
-    Continue,
+    /// `outgoing.content` is both the channel-bound reply and the persisted
+    /// assistant turn (text / thinking); tool media was delivered live as it
+    /// was produced, never bundled here.
+    Final { outgoing: OutgoingMessage },
+    /// LLM emitted tool calls; loop continues. `task_mutated` is `true`
+    /// when one of this iteration's tool calls changed the planning
+    /// checklist, so the caller refreshes the reminder before the next
+    /// LLM call.
+    Continue { task_mutated: bool },
 }
 
 /// Captured inputs for the deferred `Memory::on_job_complete` write. Built
@@ -428,17 +411,6 @@ fn should_inject_task_reminder(
 ) -> bool {
     turn_counter.saturating_sub(last_task_management_turn) >= TURNS_SINCE_WRITE
         && turn_counter.saturating_sub(last_reminder_turn) >= TURNS_BETWEEN_REMINDERS
-}
-
-/// `true` when a tool-use block names a checklist-mutating `Task*` tool
-/// (`TaskCreate` / `TaskUpdate`), the signal to reload the
-/// reminder. `TaskList` / `TaskGet` are read-only and excluded.
-fn is_task_mutating_tool_use(block: &ContentBlock) -> bool {
-    matches!(
-        block,
-        ContentBlock::ToolUse { name, .. }
-            if aura_model::TASK_MUTATING_TOOL_NAMES.contains(&name.as_str())
-    )
 }
 
 impl AgentLoop {
@@ -735,16 +707,6 @@ impl AgentLoop {
         let mut iterations = 0;
         let turn_started = std::time::Instant::now();
         let mut observer_state = ObserverState::default();
-        // Tool invocations issued during intermediate iterations. Channels
-        // only receive the terminal `OutgoingMessage`, so without this the
-        // TUI (which renders `ContentBlock::ToolUse`) would never see tool
-        // activity — breaking any channel-side behavior keyed on the tool
-        // call (e.g. the TUI cron-recurring hint).
-        let mut accumulated_tool_uses: Vec<ContentBlock> = Vec::new();
-        // Side-channel attachments emitted by tools (e.g. send_local_file).
-        // Hoisted into the final OutgoingMessage so the channel sidecar
-        // delivers them out-of-band; never echoed back to the LLM.
-        let mut accumulated_attachments: Vec<ContentBlock> = Vec::new();
         // Drives the per-turn planning-checklist reminder: load on the first
         // iteration (to surface tasks a prior turn persisted) and reload after
         // any iteration that ran a checklist-mutating tool, so the web checklist
@@ -860,8 +822,6 @@ impl AgentLoop {
             // render. Streaming each iteration keeps that answer visible.
             let iter_delta_tx = delta_tx.as_ref();
 
-            let tool_uses_before = accumulated_tool_uses.len();
-
             let outcome = crate::runtime::scope::with_step(
                 span_recorder.as_ref(),
                 job_id,
@@ -877,8 +837,6 @@ impl AgentLoop {
                         iter_delta_tx,
                         notifier.clone(),
                         &cancel_token,
-                        &mut accumulated_tool_uses,
-                        &mut accumulated_attachments,
                     );
                     async move { Ok((LifecycleOutcome::Ok, fut.await?)) }
                 },
@@ -886,10 +844,7 @@ impl AgentLoop {
             .await?;
 
             match outcome {
-                IterationOutcome::Final {
-                    outgoing,
-                    assistant_reply,
-                } => {
+                IterationOutcome::Final { outgoing } => {
                     // End-of-job summary-refresh check. The activity
                     // disjunct is satisfied by `job_done = true`;
                     // the tokens / diff conjuncts still apply.
@@ -905,27 +860,20 @@ impl AgentLoop {
                     // `run()` — the actual `spawn_job_complete_write` fires
                     // **after** `with_job` accepts the job, so a cancel-race
                     // in `with_job`'s post-body window can't memorize a
-                    // cancelled turn. `assistant_reply` (not `outgoing.content`)
-                    // is what gets persisted as the assistant row, matching
-                    // the trait contract.
+                    // cancelled turn.
                     let pending = memory_query.is_some().then(|| PendingMemoryWrite {
                         user_input: std::mem::take(&mut job_user_input),
-                        final_output: assistant_reply,
+                        final_output: outgoing.content.clone(),
                     });
                     return Ok((outgoing, pending));
                 }
-                IterationOutcome::Continue => {
+                IterationOutcome::Continue { task_mutated } => {
                     // Continue to the next LLM iteration; `run_iteration`
                     // has already appended each tool's result to the
                     // context. If a checklist-mutating tool ran this
                     // iteration, the persisted list changed — reload it
-                    // before the next LLM call. (Safe slice: the Final path
-                    // drains `accumulated_tool_uses`, but that path returns
-                    // above; on Continue it only grew.)
-                    if accumulated_tool_uses[tool_uses_before..]
-                        .iter()
-                        .any(is_task_mutating_tool_use)
-                    {
+                    // before the next LLM call.
+                    if task_mutated {
                         task_reminder_dirty = true;
                         // Reset the throttle's "turns since task management"
                         // anchor: the model just touched the list, so don't nag.
@@ -935,13 +883,12 @@ impl AgentLoop {
             }
         }
 
-        // If we exhausted iterations, return what we have. Tail-append any
-        // attachments the tools produced so the user still receives the
-        // file even when the agent ran out of reasoning budget.
-        let mut content = vec![ContentBlock::Text(
+        // If we exhausted iterations, return what we have. Any media the
+        // tools produced was already delivered live as it was produced, so
+        // there's nothing to append here.
+        let content = vec![ContentBlock::Text(
             "I've reached the maximum number of processing steps. Please try again with a simpler request.".to_string(),
         )];
-        content.extend(std::mem::take(&mut accumulated_attachments));
         // Max-iterations fallback. No assistant row was persisted at
         // the loop end — the early-return path inside `run_iteration`
         // is the only one that calls `append_context_message`, so
@@ -987,8 +934,6 @@ impl AgentLoop {
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         notifier: Option<Arc<dyn aura_tools::SessionNotifier>>,
         cancel_token: &CancellationToken,
-        accumulated_tool_uses: &mut Vec<ContentBlock>,
-        accumulated_attachments: &mut Vec<ContentBlock>,
     ) -> anyhow::Result<IterationOutcome> {
         let (response, llm_span_id) = self
             .call_llm_with_retry(session, span_recorder, &step, delta_tx)
@@ -1004,14 +949,6 @@ impl AgentLoop {
                 response.content_blocks.clone()
             };
 
-            // Append the tool_use blocks issued during intermediate
-            // iterations after the final narration so channels that key
-            // off them (e.g. the TUI cron hint) can render below the
-            // assistant's reply.
-            let mut final_blocks = response_blocks.clone();
-            final_blocks.extend(std::mem::take(accumulated_tool_uses));
-            final_blocks.extend(std::mem::take(accumulated_attachments));
-
             let final_text = aura_llm::multimodal::extract_text(&response_blocks);
 
             info!(
@@ -1020,16 +957,11 @@ impl AgentLoop {
                 "conversation loop complete"
             );
 
-            // Append only the final response blocks to context —
-            // intermediate tool_use blocks were already appended in
-            // prior iterations. Capture the persisted ordinal so the
-            // channel adapter can stamp it onto the live `Frame::Message`
-            // and reconnecting clients advance their cursor past it.
-            // Also keep a copy for `IterationOutcome::Final.assistant_reply`
-            // so `Memory::on_job_complete` sees the same shape that hits
-            // the transcript, not the channel-augmented `final_blocks`.
-            let assistant_reply = response_blocks.clone();
-            let assistant_msg = ChatMessage::assistant(response_blocks);
+            // The reply blocks are both the channel-bound content and the
+            // persisted assistant row (tool media was delivered live, never
+            // bundled here). Capture the persisted ordinal so the channel
+            // adapter can stamp the live `Frame::Message`.
+            let assistant_msg = ChatMessage::assistant(response_blocks.clone());
             let ordinal = self.context_manager.append(&assistant_msg).await;
 
             return Ok(IterationOutcome::Final {
@@ -1037,12 +969,11 @@ impl AgentLoop {
                     session_id: session.id.clone(),
                     user_id: session.user.id.clone(),
                     channel: session.channel.clone(),
-                    content: final_blocks,
+                    content: response_blocks,
                     reply_to: None,
                     metadata: Default::default(),
                     ordinal,
                 },
-                assistant_reply,
             });
         }
 
@@ -1060,14 +991,12 @@ impl AgentLoop {
             response.content_blocks.clone()
         };
         for tc in &response.tool_calls {
-            let block = ContentBlock::ToolUse {
+            assistant_blocks.push(ContentBlock::ToolUse {
                 id: tc.id.clone(),
                 name: tc.name.clone(),
                 input: tc.arguments.clone(),
                 signature: tc.signature.clone(),
-            };
-            assistant_blocks.push(block.clone());
-            accumulated_tool_uses.push(block);
+            });
         }
         let assistant_msg = ChatMessage::assistant(assistant_blocks);
         self.context_manager.append(&assistant_msg).await;
@@ -1174,26 +1103,16 @@ impl AgentLoop {
             self.emit_tool_completed(delta_tx, session, tool_call.id.clone(), status, raw_summary)
                 .await;
 
-            let mut llm_visible_images: Vec<ContentBlock> = Vec::new();
             let raw_result_text = match &tool_result {
                 Ok(ToolOutput::Text(s)) => s.clone(),
                 Ok(ToolOutput::Json(v)) => {
                     serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
                 }
-                Ok(ToolOutput::WithAttachments { text, attachments }) => {
-                    push_bounded(accumulated_attachments, attachments.iter().cloned());
-                    text.clone()
-                }
-                Ok(ToolOutput::MultiModalText { text, llm_images }) => {
-                    // LLM-visible images go in BOTH directions: a
-                    // follow-up User-role message (so the next turn
-                    // sees them through the standard multimodal user
-                    // path) AND the final OutgoingMessage (so the user
-                    // channel renders them too).
-                    push_bounded(accumulated_attachments, llm_images.iter().cloned());
-                    llm_visible_images.extend(llm_images.iter().cloned());
-                    text.clone()
-                }
+                // A tool that delivers media to the user does so itself via
+                // `ctx.notifier.emit_attachment` (e.g. `SendFile`); the loop
+                // forwards only the text result to the LLM.
+                Ok(ToolOutput::WithAttachments { text, .. })
+                | Ok(ToolOutput::MultiModalText { text, .. }) => text.clone(),
                 Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
                 Err(e) => {
                     if let Some(denied) = e.downcast_ref::<aura_tools::ToolError>()
@@ -1229,31 +1148,16 @@ impl AgentLoop {
             // LLM can correlate results with their originating calls.
             let tool_msg = ChatMessage::tool_result(tool_call.id.clone(), wrapped);
             self.context_manager.append(&tool_msg).await;
-
-            // ToolResult.content is text-only; provider adapters
-            // serialize it as plain text. To get images back into the
-            // LLM's view, follow with a User-role message that carries
-            // the same images plus a marker tying them to this tool
-            // call. Vision-capable providers fetch the blob bytes via
-            // the existing user_content_for_block path; non-vision
-            // providers fall back to a text stub.
-            if !llm_visible_images.is_empty() {
-                let mut content: Vec<ContentBlock> =
-                    Vec::with_capacity(llm_visible_images.len() + 1);
-                content.push(ContentBlock::Text(format!(
-                    "[image attachment(s) returned by tool `{}` (tool_use_id={})]",
-                    tool_call.name, tool_call.id
-                )));
-                content.extend(llm_visible_images);
-                let image_msg = ChatMessage::agent_context(content);
-                self.context_manager.append(&image_msg).await;
-            }
         }
 
         // Flush accumulated approvals back into session state.
         session.state.approved_resources = approved.lock().clone();
 
-        Ok(IterationOutcome::Continue)
+        let task_mutated = response
+            .tool_calls
+            .iter()
+            .any(|tc| aura_model::TASK_MUTATING_TOOL_NAMES.contains(&tc.name.as_str()));
+        Ok(IterationOutcome::Continue { task_mutated })
     }
 
     /// Call the LLM with retry on transient errors using `ErrorHandler`.
@@ -2693,60 +2597,6 @@ mod stream_buffer_tests {
     fn high_water_forces_flush() {
         let s: String = "a".repeat(200) + "[";
         assert_eq!(safe_flush_boundary(&s), s.len());
-    }
-}
-
-#[cfg(test)]
-mod attachment_bound_tests {
-    use super::{MAX_ATTACHMENTS_PER_TURN, push_bounded};
-    use aura_model::{BlobRef, ContentBlock};
-
-    fn img(tag: &str) -> ContentBlock {
-        ContentBlock::Image {
-            blob: BlobRef {
-                blob_id: format!("sha256:{tag}"),
-            },
-            mime_type: "image/png".into(),
-        }
-    }
-
-    #[test]
-    fn under_cap_keeps_everything() {
-        let mut v: Vec<ContentBlock> = Vec::new();
-        push_bounded(&mut v, vec![img("a"), img("b"), img("c")]);
-        assert_eq!(v.len(), 3);
-    }
-
-    #[test]
-    fn over_cap_evicts_oldest_first() {
-        let mut v: Vec<ContentBlock> = Vec::new();
-        let pushed: Vec<ContentBlock> = (0..MAX_ATTACHMENTS_PER_TURN + 5)
-            .map(|i| img(&format!("{i:0>2}")))
-            .collect();
-        push_bounded(&mut v, pushed);
-        assert_eq!(v.len(), MAX_ATTACHMENTS_PER_TURN);
-        // Newest 16 survive; the first 5 (00..04) evicted.
-        match &v[0] {
-            ContentBlock::Image { blob, .. } => {
-                assert!(
-                    blob.blob_id.ends_with("05"),
-                    "oldest survivor should be 05, got {}",
-                    blob.blob_id
-                );
-            }
-            _ => panic!("expected image"),
-        }
-        match v.last().unwrap() {
-            ContentBlock::Image { blob, .. } => {
-                let last = format!("{:0>2}", MAX_ATTACHMENTS_PER_TURN + 4);
-                assert!(
-                    blob.blob_id.ends_with(&last),
-                    "newest should be {last}, got {}",
-                    blob.blob_id
-                );
-            }
-            _ => panic!("expected image"),
-        }
     }
 }
 

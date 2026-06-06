@@ -559,22 +559,16 @@ impl Tool for SpawnSubagentTool {
                 SubagentResult::failed("system spawn channel closed")
             }
         };
-        let parts = result.split_for_parent();
-        let mut text = parts.text;
         // Foreground results carry the resume-id tail; the background ack
         // is a dispatch notice whose escorted delivery surfaces the id
-        // separately, so it stays tail-free.
-        if !background && let Some(tail) = result.resume_tail() {
-            text.push_str(&tail);
-        }
-        Ok(if parts.llm_images.is_empty() {
-            ToolOutput::Text(text)
+        // separately, so it stays tail-free. The parent receives the
+        // subagent's textual report; raw media never crosses the boundary.
+        let text = if background {
+            result.result_text()
         } else {
-            // `multi_modal_text` re-filters to image-only blocks so any
-            // accidental non-image entry the child surfaces is silently
-            // dropped at this boundary.
-            ToolOutput::multi_modal_text(text, parts.llm_images)
-        })
+            result.to_tool_result_text()
+        };
+        Ok(ToolOutput::Text(text))
     }
 }
 
@@ -904,21 +898,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_attachments_surface_as_multi_modal_text() {
+    async fn images_in_result_are_dropped_text_only() {
+        // A subagent hands its parent a textual report, never raw media:
+        // even if its final_content carries an image, the parent boundary
+        // surfaces text only.
         let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(8);
-        let img = aura_model::ContentBlock::Image {
-            blob: aura_model::BlobRef {
-                blob_id: "b-1".into(),
-            },
-            mime_type: "image/png".into(),
-        };
         let router = fake_router(
             rx,
             SubagentResult {
                 child_session_id: aura_model::SessionId::from("child"),
                 final_content: Some(vec![
                     aura_model::ContentBlock::Text("here's what I found".into()),
-                    img.clone(),
+                    aura_model::ContentBlock::Image {
+                        blob: aura_model::BlobRef {
+                            blob_id: "b-1".into(),
+                        },
+                        mime_type: "image/png".into(),
+                    },
                 ]),
                 status: SubagentExitStatus::Completed,
             },
@@ -936,11 +932,8 @@ mod tests {
             .await
             .unwrap();
         match out {
-            ToolOutput::MultiModalText { text, llm_images } => {
-                assert!(text.starts_with("here's what I found"), "got: {text}");
-                assert_eq!(llm_images, vec![img]);
-            }
-            other => panic!("expected MultiModalText, got {other:?}"),
+            ToolOutput::Text(s) => assert!(s.starts_with("here's what I found"), "got: {s}"),
+            other => panic!("expected Text (images dropped at the parent boundary), got {other:?}"),
         }
         let _ = router.await;
     }

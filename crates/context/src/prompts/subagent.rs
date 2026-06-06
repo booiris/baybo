@@ -115,7 +115,6 @@ mod tests {
             task_summary: "do <stuff>".into(),
             child_session_id: aura_model::SessionId::from("child-1"),
             final_text: "result & more".into(),
-            images: Vec::new(),
             status: SubagentExitStatus::Completed,
         }];
         let blocks = build_notification_content(&pending);
