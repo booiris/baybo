@@ -62,9 +62,11 @@ const TOOL_SUMMARY_MAX: usize = 80;
 /// run at once within a single LLM response. A
 /// [`ToolConcurrency::Exclusive`] call (any tool that mutates state)
 /// acquires *all* of these permits, so it runs alone — it waits for
-/// in-flight concurrent calls to drain and blocks any other call until
-/// it returns. Like the per-tool timeout ceiling, the cap lives in code
-/// rather than `aura.json`.
+/// in-flight pool calls to drain and blocks any other pool call until it
+/// returns. A [`ToolConcurrency::Independent`] call (`spawn_subagent`)
+/// acquires no permit and self-bounds out-of-band, so the pool never
+/// throttles subagent fan-out. Like the per-tool timeout ceiling, the
+/// cap lives in code rather than `aura.json`.
 const MAX_CONCURRENT_TOOL_CALLS: usize = 10;
 
 /// Trim and length-cap a single-line summary string. Char-based so a
@@ -966,12 +968,12 @@ impl AgentLoop {
 
     /// One iteration of the agentic loop, scoped to a single
     /// `LlmIteration` step (opened by [`crate::runtime::scope::with_step`] in
-    /// the caller). Calls the LLM, executes any non-subagent tool
-    /// calls, appends their results to context. `spawn_subagent` calls
-    /// are deferred — returned in [`IterationOutcome::Continue`] so
-    /// the caller can dispatch them as **peer** steps once `with_step`
-    /// has closed this iteration's step (steps cannot nest per
-    /// `trace.md`).
+    /// the caller). Calls the LLM, then executes the response's tool
+    /// calls concurrently under the per-response permit pool — each call
+    /// holds permits per its [`ToolConcurrency`] (`spawn_subagent` is
+    /// `Independent`, so it neither waits for nor holds a permit and its
+    /// fan-out runs in parallel) — and appends their results to context
+    /// in declaration order.
     ///
     /// Returns [`IterationOutcome::Final`] when the LLM produced no
     /// tool calls — that's the final assistant response and the loop
@@ -1093,10 +1095,11 @@ impl AgentLoop {
         // `MAX_CONCURRENT_TOOL_CALLS`) gates the futures join_all'd
         // below. A `ToolConcurrency::Concurrent` call (a read-only tool)
         // holds one permit, so up to the cap run at once; a
-        // `ToolConcurrency::Exclusive` call (any tool with side effects) holds
-        // *all* the permits, so it waits for in-flight calls to drain
-        // and then runs alone — no other call (read or write) overlaps
-        // it. The post-execution pass that mutates `session.messages`
+        // `ToolConcurrency::Exclusive` call (any tool with side effects)
+        // holds *all* the permits, so it runs alone among pool calls; a
+        // `ToolConcurrency::Independent` call (`spawn_subagent`) holds
+        // none, so it neither waits nor blocks and self-bounds its own
+        // fan-out. The post-execution pass that mutates `session.messages`
         // is kept SEQUENTIAL — appending tool results in original
         // `tool_calls` order keeps the next turn's context byte-stable
         // (prompt cache hits) and matches provider expectations that
@@ -1132,18 +1135,24 @@ impl AgentLoop {
             let triggering_llm_span = Some(llm_span_id);
             let limiter = Arc::clone(&concurrency_limiter);
             // `Concurrent` → one permit (up to the cap run together);
-            // `Exclusive` → every permit, so the call runs alone once
-            // in-flight calls release. Unknown tools fail safe to
-            // `Exclusive` inside `ToolRegistry::concurrency`.
+            // `Exclusive` → every permit, so the call runs alone among
+            // pool calls; `Independent` → no permit (self-bounded, e.g.
+            // `spawn_subagent`). Unknown tools fail safe to `Exclusive`
+            // inside `ToolRegistry::concurrency`.
             let permits = match registry_for_calls.concurrency(&tool_name) {
-                ToolConcurrency::Concurrent => 1,
-                ToolConcurrency::Exclusive => MAX_CONCURRENT_TOOL_CALLS as u32,
+                ToolConcurrency::Concurrent => Some(1),
+                ToolConcurrency::Exclusive => Some(MAX_CONCURRENT_TOOL_CALLS as u32),
+                ToolConcurrency::Independent => None,
             };
             async move {
-                // Hold a concurrency permit for the whole call. `acquire`
-                // errors only if the semaphore is closed, which never
-                // happens for this per-response limiter.
-                let _permit = limiter.acquire_many_owned(permits).await.ok();
+                // Hold a pool permit for the whole call (none for an
+                // `Independent` call). `acquire` errors only if the
+                // semaphore is closed, which never happens for this
+                // per-response limiter.
+                let _permit = match permits {
+                    Some(n) => limiter.acquire_many_owned(n).await.ok(),
+                    None => None,
+                };
                 debug!(tool = %tool_name, "executing tool call");
                 executor
                     .execute(

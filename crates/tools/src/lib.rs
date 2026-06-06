@@ -33,22 +33,35 @@ pub type Result<T> = std::result::Result<T, ToolError>;
 /// Whether a tool is safe to run concurrently with the sibling tool
 /// calls in the same LLM response.
 ///
-/// The agent loop dispatches every tool call of one response together.
+/// The agent loop dispatches every tool call of one response together
+/// under a per-response permit pool.
 /// A [`Concurrent`](ToolConcurrency::Concurrent) call may overlap other
 /// `Concurrent` calls — the loop runs at most a fixed number at once. An
 /// [`Exclusive`](ToolConcurrency::Exclusive) call runs alone: it waits
-/// for any in-flight calls to drain, then blocks every other call (read
-/// or write) until it returns, so a tool that mutates shared state never
-/// races a concurrent reader.
+/// for any in-flight pool calls to drain, then blocks every other pool
+/// call (read or write) until it returns, so a tool that mutates shared
+/// state never races a concurrent reader. An
+/// [`Independent`](ToolConcurrency::Independent) call opts out of the
+/// pool entirely and governs its own concurrency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolConcurrency {
     /// Safe to run alongside other `Concurrent` calls — a read-only tool
     /// that touches no shared mutable state. Bounded by the agent loop's
     /// concurrency cap.
     Concurrent,
-    /// Must run exclusively; no other tool call overlaps it. The
-    /// conservative default for any tool with side effects.
+    /// Must run exclusively; no other `Concurrent`/`Exclusive` call
+    /// overlaps it. The conservative default for any tool with side
+    /// effects.
     Exclusive,
+    /// Runs independently of the per-response permit pool: acquires no
+    /// permit, so it neither waits for one nor blocks others, and can
+    /// overlap even an `Exclusive` call. For tools that bound their own
+    /// concurrency out-of-band — today only `spawn_subagent`, capped by
+    /// its `SubagentDispatchLimiter` (per-root fan-out). A foreground
+    /// subagent mostly *waits* on its child actor, so holding a shared
+    /// tool slot for the child's whole lifetime would needlessly
+    /// serialize the parent's fan-out and starve its other tools.
+    Independent,
 }
 
 // ---------------------------------------------------------------------------
