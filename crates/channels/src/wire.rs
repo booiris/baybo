@@ -171,6 +171,36 @@ pub struct SlashCommandSpec {
     pub description: String,
 }
 
+/// One task on the wire — a flattened, presentation-only projection of a
+/// `session_tasks` row for the web checklist. `subject` is the title shown in
+/// the list (the `description` body stays server-side). `status` is a
+/// lower-case string (`"pending"` / `"in_progress"` / `"completed"`) so
+/// third-party clients don't need a typed enum.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub struct TaskView {
+    pub id: String,
+    pub subject: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+}
+
+impl From<aura_model::Task> for TaskView {
+    fn from(task: aura_model::Task) -> Self {
+        Self {
+            id: task.id.to_string(),
+            subject: task.subject,
+            status: task.status.as_str().to_string(),
+            depends_on: task.depends_on.iter().map(|d| d.to_string()).collect(),
+        }
+    }
+}
+
 /// Frame envelope. Tagged on the `kind` field so the receive side
 /// never has to guess. Encoded with
 /// [`rmp_serde::to_vec_named`](rmp_serde::to_vec_named) so field names
@@ -327,6 +357,18 @@ pub enum Frame {
         /// terminal notices are byte-identical.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         transient: bool,
+    },
+    /// Server → client: the session's full planning checklist after it changed
+    /// (a `Task*` call) or at turn start. An idempotent snapshot
+    /// that REPLACES the client's prior list for this session — not a delta.
+    /// Empty `tasks` means the list is currently empty. Clients without a
+    /// checklist surface drop it.
+    TaskList {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        tasks: Vec<TaskView>,
     },
     /// Server → client: a tool call is blocked waiting for the
     /// channel's user to approve or deny. Clients with an approval UX

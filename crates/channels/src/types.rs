@@ -148,6 +148,11 @@ pub enum AgentEvent {
     /// `Info` notice. This is the user-facing twin of [`AgentEvent::Status`]
     /// (compaction) but carries free text instead of a coarse phase.
     Progress(String),
+    /// The session's planning checklist (`Task*`) after it
+    /// changed, or at turn start. An idempotent snapshot — channels that
+    /// render a live checklist (the web dashboard) replace their stored list
+    /// for the session; surfaces without one drop it.
+    TaskList(Vec<aura_model::Task>),
 }
 
 /// Outcome of a finished tool call, carried by

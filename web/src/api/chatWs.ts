@@ -67,6 +67,18 @@ export interface SessionPatch {
  *  message, or notice). */
 export type ActivityKind = 'user' | 'assistant';
 
+/** One entry in a session's planning checklist — mirror of Rust
+ *  `TaskView`. `subject` is the title; `status` is one of `pending` /
+ *  `in_progress` / `completed` (kept as a `string` to match the wire,
+ *  narrowed at the render site). `depends_on` lists the ids of tasks
+ *  this one waits on; absent when it has no prerequisites. */
+export interface TaskView {
+  id: string;
+  subject: string;
+  status: string;
+  depends_on?: string[];
+}
+
 export type Frame =
   | { kind: 'register'; token: string; channel_type: string }
   | { kind: 'register_ack'; ok: boolean; reason: string | null }
@@ -93,6 +105,7 @@ export type Frame =
       summary: string;
     }
   | { kind: 'status'; session_id: string; user_id?: string; phase: string }
+  | { kind: 'task_list'; session_id: string; user_id?: string; tasks: TaskView[] }
   | {
       kind: 'notice';
       session_id: string;

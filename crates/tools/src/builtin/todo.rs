@@ -120,31 +120,10 @@ todo_tool!(
     reason = "notebook parsing/serialization is not yet implemented"
 );
 
-// -- Task list ---------------------------------------------------------------
-todo_tool!(
-    TaskCreateTool,
-    name = "TaskCreate",
-    desc = "Create a new task in the session task list.",
-    reason = "session task list is not yet modeled"
-);
-todo_tool!(
-    TaskGetTool,
-    name = "TaskGet",
-    desc = "Retrieve full details for a specific task.",
-    reason = "session task list is not yet modeled"
-);
-todo_tool!(
-    TaskListTool,
-    name = "TaskList",
-    desc = "List all tasks with their current status.",
-    reason = "session task list is not yet modeled"
-);
-todo_tool!(
-    TaskUpdateTool,
-    name = "TaskUpdate",
-    desc = "Update task status, dependencies, or details.",
-    reason = "session task list is not yet modeled"
-);
+// -- Background task management ----------------------------------------------
+// The planning-checklist tools (TaskCreate/Get/List/Update) are implemented in
+// `aura-task` and registered from the runtime. These two operate on
+// already-running background work, which has no model yet.
 todo_tool!(
     TaskStopTool,
     name = "TaskStop",
@@ -156,12 +135,6 @@ todo_tool!(
     name = "TaskOutput",
     desc = "(Deprecated) Retrieve output from a background task.",
     reason = "background task runtime is not yet modeled; prefer Read on the task's output file when implemented"
-);
-todo_tool!(
-    TodoWriteTool,
-    name = "TodoWrite",
-    desc = "Replace the session task checklist in non-interactive mode.",
-    reason = "session task list is not yet modeled"
 );
 
 // -- Tool search -------------------------------------------------------------

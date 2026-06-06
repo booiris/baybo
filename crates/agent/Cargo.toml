@@ -23,6 +23,7 @@ aura-memory = { workspace = true }
 aura-cost = { workspace = true }
 aura-security = { workspace = true }
 aura-sandbox = { workspace = true }
+aura-store = { workspace = true }
 aura-storage = { workspace = true }
 aura-channels = { workspace = true }
 dashmap = { workspace = true }

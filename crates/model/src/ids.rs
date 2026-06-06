@@ -180,6 +180,11 @@ ulid_newtype! {
     CostRecordId
 }
 
+ulid_newtype! {
+    /// Identifier for one task in a session's planning checklist.
+    TaskId
+}
+
 /// Identifier for a parallel-tool batch within a `Step`.
 ///
 /// Spans sharing the same `ParallelGroup` were dispatched concurrently;

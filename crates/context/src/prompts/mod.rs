@@ -9,4 +9,5 @@ pub mod interjection;
 pub mod recalled_memory;
 pub mod soul;
 pub mod subagent;
+pub mod tasks;
 pub mod tool_output;

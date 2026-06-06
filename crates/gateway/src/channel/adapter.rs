@@ -18,7 +18,9 @@
 
 use std::sync::Arc;
 
-use aura_channels::wire::{self, AttachmentKind, Frame, Message as WireMessage, WireAttachment};
+use aura_channels::wire::{
+    self, AttachmentKind, Frame, Message as WireMessage, TaskView, WireAttachment,
+};
 use aura_channels::{
     AgentEvent, AgentOutput, Channel, ChannelError, ChannelRegistry, Connection, ConnectionId,
     ConnectionSink, MessageRole, NoticeLevel, SendOutcome, SessionEvent, ToolStatus, TurnStatus,
@@ -403,6 +405,11 @@ async fn agent_output_to_frame(
             level: "info".to_owned(),
             text,
             transient: true,
+        },
+        AgentEvent::TaskList(tasks) => Frame::TaskList {
+            session_id,
+            user_id,
+            tasks: tasks.into_iter().map(TaskView::from).collect(),
         },
     }
 }

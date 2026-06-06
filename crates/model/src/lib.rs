@@ -12,6 +12,7 @@ mod pricing;
 mod security_types;
 mod session;
 pub mod spawn_protocol;
+mod task;
 
 pub use approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
 pub use cost::{CostRecord, CostSummary, TimeRange};
@@ -20,7 +21,7 @@ pub use external_agent::{
     AURA_BACKEND_TAG, ExternalAgentKind, SubagentBackend, SubagentBackendKind, SubagentBackendTag,
 };
 pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLevel};
-pub use ids::{CostRecordId, JobId, ParallelGroup, SessionId, SpanId, StepId};
+pub use ids::{CostRecordId, JobId, ParallelGroup, SessionId, SpanId, StepId, TaskId};
 pub use llm_entry_name::LlmEntryName;
 pub use message::{
     BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role,
@@ -38,4 +39,8 @@ pub use spawn_protocol::{
     BACKGROUND_SUBAGENT_HANDLE_PREFIX, PendingSubagentResult, SPAWN_SUBAGENT_TOOL_NAME,
     SUBAGENT_CHANNEL_TAG, SubagentExitStatus, SubagentParentContext, SubagentResult,
     SubagentReturn, SubagentSpawnRequest, SystemSpawnRequest,
+};
+pub use task::{
+    TASK_CREATE_TOOL_NAME, TASK_GET_TOOL_NAME, TASK_LIST_TOOL_NAME, TASK_MUTATING_TOOL_NAMES,
+    TASK_UPDATE_TOOL_NAME, Task, TaskStatus,
 };

@@ -38,6 +38,7 @@ aura-skills = { workspace = true }
 aura-storage = { workspace = true, features = ["test-support"] }
 aura-store = { workspace = true }
 aura-subagent = { workspace = true }
+aura-task = { workspace = true, features = ["test-support"] }
 aura-tools = { workspace = true, features = ["test-support"] }
 aura-trace = { workspace = true, features = ["test-support"] }
 aura-workspace = { workspace = true }

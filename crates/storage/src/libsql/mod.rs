@@ -9,6 +9,7 @@ mod secret;
 mod session;
 mod session_summary;
 mod skill_risk;
+mod task;
 mod time;
 mod trace;
 
@@ -23,6 +24,7 @@ pub use secret::LibsqlSecretStore;
 pub use session::LibsqlSessionStore;
 pub use session_summary::LibsqlSessionSummaryStore;
 pub use skill_risk::LibsqlSkillRiskStore;
+pub use task::LibsqlTaskStore;
 pub use trace::LibsqlTraceStore;
 
 use std::sync::Arc;
@@ -225,6 +227,31 @@ impl LibsqlPool {
                     in_flight   INTEGER NOT NULL DEFAULT 0,
                     in_flight_owner TEXT
                 );
+
+                -- The session planning checklist (Task*). One row
+                -- per task; each TaskUpdate is a per-row UPDATE so it never
+                -- clobbers, and is never clobbered by, the full-blob writers
+                -- on the `sessions` row. CASCADE reaps tasks on user-triggered
+                -- session delete; the runtime never sweeps them.
+                CREATE TABLE IF NOT EXISTS session_tasks (
+                    session_id  TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    task_id     TEXT    NOT NULL,
+                    -- Brief title.
+                    subject     TEXT    NOT NULL,
+                    -- Task body (what needs to be done).
+                    description TEXT    NOT NULL,
+                    -- TaskStatus::as_str(); an unrecognized value (future
+                    -- variant) is skipped on read, never 500s the list.
+                    status      TEXT    NOT NULL,
+                    -- JSON array of TaskId strings (advisory ordering).
+                    depends_on  TEXT    NOT NULL DEFAULT '[]',
+                    -- Unix µs (matches the rest of the µs schema).
+                    created_at  INTEGER NOT NULL,
+                    updated_at  INTEGER NOT NULL,
+                    PRIMARY KEY (session_id, task_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_tasks_session
+                    ON session_tasks(session_id);
 
                 CREATE TABLE IF NOT EXISTS secrets (
                     name            TEXT PRIMARY KEY,
