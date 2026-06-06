@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_model::{ChatMessage, ContentBlock, Role, SessionId, ThinkingContent};
+use aura_model::{ChatMessage, ContentBlock, MessageSource, Role, SessionId, ThinkingContent};
 use aura_tools::{VirtualReadAccess, VirtualReadResolver};
 use aura_workspace::WorkspacePaths;
 use aura_workspace::paths::SESSION_LOG_EXTENSION;
@@ -90,21 +90,41 @@ impl VirtualReadResolver for SessionTranscriptReader {
     }
 }
 
+/// Cap on the rendered transcript, mirroring `ReadTool`'s 16 MiB filesystem
+/// scan cap so a pathologically long-lived session can't render tens of MiB
+/// into one allocation on a recovery read. (The underlying `full_transcript`
+/// row load is still O(all rows) — an accepted trade-off on this rare path.)
+const MAX_RENDER_BYTES: usize = 16 * 1024 * 1024;
+
 /// Flatten a transcript into readable, line-oriented text for the
-/// post-compaction recovery read. Each message gets an ordinal/role header and
-/// its blocks expanded verbatim (text, tool calls + args, tool results,
-/// thinking) so the model can recover exact pre-compaction detail; `ReadTool`
-/// paginates the returned text by line, like any file read.
+/// post-compaction recovery read. Each message gets an ordinal/provenance
+/// header and its blocks expanded verbatim (text, tool calls + args, tool
+/// results, thinking) so the model can recover exact pre-compaction detail;
+/// `ReadTool` paginates the returned text by line, like any file read.
 fn render_transcript(messages: &[ChatMessage]) -> String {
     let mut out = String::new();
     for (i, msg) in messages.iter().enumerate() {
-        let role = match msg.role {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::Tool => "tool",
+        if out.len() >= MAX_RENDER_BYTES {
+            out.push_str(&format!(
+                "… [transcript truncated at {} MiB]\n",
+                MAX_RENDER_BYTES / 1024 / 1024
+            ));
+            break;
+        }
+        // Label by role, except for synthesized/framed rows: recalled-memory,
+        // cron, and mid-turn-interjection rows ride the wire as `Role::User`
+        // wrapped in a steering envelope, so labelling them by role alone would
+        // misrepresent them as genuine user turns on the recovery path.
+        let label = match msg.source() {
+            MessageSource::User | MessageSource::Agent => match msg.role {
+                Role::System => "system",
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::Tool => "tool",
+            },
+            framed => framed.as_str(),
         };
-        out.push_str(&format!("====== [{i}] {role} ======\n"));
+        out.push_str(&format!("====== [{i}] {label} ======\n"));
         for block in &msg.content {
             match block {
                 ContentBlock::Text(text) => {
@@ -229,6 +249,24 @@ mod tests {
         // A multi-line tool result stays across separate lines so line-based
         // pagination pages over it instead of the per-line cap clipping it.
         assert!(out.contains("body line A\nbody line B"));
+    }
+
+    #[test]
+    fn render_labels_synthesized_rows_by_provenance() {
+        // Recalled-memory and mid-turn-interjection rows ride the wire as
+        // `Role::User`; the recovery render must mark their provenance so they
+        // aren't read back as genuine user turns.
+        let messages = vec![
+            ChatMessage::user(vec![ContentBlock::Text("genuine".into())]),
+            ChatMessage::recalled_memory(vec![ContentBlock::Text("recalled note".into())]),
+            ChatMessage::user_interjection(vec![ContentBlock::Text("steer left".into())]),
+        ];
+        let out = render_transcript(&messages);
+        assert!(out.contains("[0] user"));
+        assert!(out.contains("[1] recalled_memory"));
+        assert!(out.contains("[2] user_interjection"));
+        // The genuine user row is NOT relabelled.
+        assert!(!out.contains("[0] recalled_memory"));
     }
 
     #[tokio::test]
