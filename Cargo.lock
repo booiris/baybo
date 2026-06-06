@@ -753,6 +753,7 @@ dependencies = [
  "aura-setup",
  "aura-storage",
  "aura-store",
+ "aura-term-harness",
  "aura-workspace",
  "crossterm",
  "hex",
@@ -890,6 +891,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aura-term-harness"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "aura-tools"
 version = "0.1.0"
 dependencies = [
@@ -959,7 +967,9 @@ dependencies = [
  "async-trait",
  "aura-channels",
  "aura-model",
+ "aura-term-harness",
  "aura-tools",
+ "aura-tui",
  "chrono",
  "crossterm",
  "futures",

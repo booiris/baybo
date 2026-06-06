@@ -31,6 +31,7 @@ members = [
     "crates/integration-tests",
     "crates/janitor",
     "crates/setup",
+    "crates/term-harness",
     "bench/memory",
 ]
 exclude = ["crates/security/fuzz"]
@@ -72,6 +73,7 @@ aura-pairing = { path = "crates/pairing" }
 aura-integration-tests = { path = "crates/integration-tests" }
 aura-janitor = { path = "crates/janitor" }
 aura-setup = { path = "crates/setup" }
+aura-term-harness = { path = "crates/term-harness" }
 # External dependencies
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

@@ -138,6 +138,60 @@ Each file pins one cross-cutting contract. New e2e tests should follow
 the pattern: name the file after the contract, group scenarios as
 `#[tokio::test]` functions whose names read as the assertion.
 
+## Real-terminal rendering tests
+
+Terminal rendering — raw crossterm escape sequences, the alternate
+screen, inline-viewport anchoring, and the SIGWINCH/resize reflow path —
+can't be checked by unit tests over the layout math. The
+`aura-term-harness` crate drives the **actual binary** inside a detached
+tmux pane at a forced size and reads back the rendered screen with
+`capture-pane`. tmux interprets escape sequences exactly like a real
+terminal, so the capture is ground truth (a raw PTY would hand the bytes
+back uninterpreted and hide the bugs); this is the same technique that
+caught the setup picker's short-window clamp garble and its resize
+regression.
+
+The harness API: `TmuxSession::launch(LaunchSpec { program, args, width,
+height, env })`, then `send_keys`/`send_text`, `resize`, `capture`, and
+the settle-aware `wait_until` / `wait_stable` / `wait_for_exit` pollers
+(no fixed sleeps). `tmux_available()` lets a test self-skip when tmux is
+absent, so CI without tmux stays green — the same self-skip contract as
+the docker/bwrap-backed tests. CI installs tmux so these actually run.
+
+The probe pattern (used by both suites below):
+
+- The thing under test is launched as a small **probe binary** living in
+  the crate under test (`src/bin/<probe>.rs`), gated with
+  `required-features = ["test-support"]` so it never builds or ships in a
+  release build. The crate enables that feature during its own tests via
+  the dev-dependency self-reference
+  (`aura-foo = { workspace = true, features = ["test-support"] }`), which
+  is what makes cargo build the bin and expose its path to the test as
+  `env!("CARGO_BIN_EXE_<probe>")`. Locating the binary this way avoids a
+  nested `cargo build` at test time (which contends on cargo's target
+  lock and is pathologically slow).
+- A probe that finishes its work and exits would lose its final frame:
+  tmux's `remain-on-exit` keeps the pane but scrolls a row off and
+  overlays a "Pane is dead" footer. So probes **block after their work**
+  (the picker probe reads stdin forever; the chat probe runs until
+  Ctrl+C) and the test captures while the program is still alive. The
+  harness kills the pane on `Drop`.
+
+Current real-terminal suites:
+
+- `crates/setup/tests/picker_render.rs` (probe `picker_probe`) — the
+  single/multi-select picker: cursor movement and wrap, Enter/Escape
+  outcomes, short-window windowing + footer without label garble, and
+  resize re-windowing.
+- `crates/tui/tests/chat_render.rs` (probe `chat_smoke`) — the
+  inline-viewport chat UI driven against an in-process stub gateway that
+  speaks `aura_channels::wire`: banner + input box render, a typed
+  message draws its user line and the scripted assistant reply, the live
+  region survives a resize, and Ctrl+C exits. Assertions stay structural
+  (substring presence, process liveness), not pixel-exact — the
+  inline-viewport resize path has a known, accepted cosmetic ghost frame,
+  so a golden snapshot would be flaky by design.
+
 ## Running tests
 
 ```bash
@@ -145,7 +199,12 @@ cargo test                                              # full workspace
 cargo test -p aura-security                             # one crate
 cargo test -p aura-integration-tests --test security_pipeline   # one file
 cargo test -p aura-integration-tests --test tool_boundary -- --nocapture
+cargo test -p aura-setup --test picker_render           # real-terminal (needs tmux)
+cargo test -p aura-tui   --test chat_render             # real-terminal (needs tmux)
 ```
+
+The real-terminal suites need `tmux` on `PATH`; without it they self-skip
+(pass with a skip note) rather than fail.
 
 CI runs `cargo clippy --all --benches --tests --examples --all-features`
 with zero-warnings; new tests must clear that gate.
