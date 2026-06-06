@@ -1,6 +1,8 @@
 # Bash & Subagent Background Jobs — Timeout-to-Background + Subagent Groups
 
-**Status:** design (not yet built). Grill-resolved decisions captured below.
+**Status:** in progress. Phase 1 (substrate) + Phase 2 (subagent timeout→background)
+are built, tested, and committed on branch `background-jobs`. Phases 3 (bash) and 4
+(groups) remain — see "Phasing" + the open streaming-model question at the end.
 
 ## Goal
 
@@ -224,16 +226,42 @@ runtime/background_jobs.rs sink + command escort), `aura-context`
 
 ## Phasing
 
-1. **Protocol generalization** (rename `PendingSubagentResult` →
-   `PendingBackgroundResult`, `SubagentFinished` → `BackgroundJobFinished`, buffer
-   rename + serde alias). Pure refactor, no behaviour change, no TS ripple (these
-   types are not exposed via ts-rs/openapi).
-2. **Subagent timeout-to-background** (2-min wait + router conversion). Smallest —
-   reuses the existing background path; validates conversion + notification reuse.
-3. **Bash timeout-to-background** (`BackgroundJobSink`, sandbox detached spawn,
-   command escort, file streaming, `JobList`/`JobStop`). The heavy lift.
-4. **Group barrier** (`group` param, `background_groups`, turn-end seal hook,
-   drain filter, 30-min group timer + partial/dissolve).
+1. ✅ **Protocol generalization** — DONE (commit `66c655b8`). `PendingSubagentResult`
+   → `PendingBackgroundResult { handle_id, label, summary_text, status, kind, group }`,
+   `SubagentFinished` → `BackgroundJobFinished`, buffer rename + serde alias,
+   kind-aware `build_notification_content`. Pure refactor, no TS ripple.
+2. ✅ **Subagent timeout-to-background** — DONE (commit `e0b2c840`). `on_timeout`
+   enum param (background|kill), router-side conversion (pinned terminal future
+   across a 2-min `select!`), process-token anchoring for convertible spawns,
+   gated to user-facing parents via `parent_supports_background`. Tested.
+3. ⏳ **Bash timeout-to-background** — `BackgroundJobSink` + `RunningChild` traits,
+   `ExecSandbox`/`SandboxRunner` detached spawn, command escort, output streaming,
+   `JobList`/`JobStop`. The heavy lift — blocked on the streaming-model decision below.
+4. ⏳ **Group barrier** (`group` param, `background_groups`, turn-end seal hook,
+   drain filter, 30-min group timer + partial/dissolve). Builds on Phase 3.
+
+## Open question surfaced while scoping Phase 3 — output streaming model
+
+The current sandbox API (`SandboxRunner::run` / `ExecSandbox::spawn_command`) waits
+internally and returns a finished `SandboxedOutput` with **separate** `stdout` /
+`stderr` — it never hands back a live child. To background a command we must use a
+new detached-spawn path that returns a `RunningChild`. But we can't know in advance
+whether a command will time out, so **every** convertible (user-session) bash call
+would go through the detached path. That forces a choice:
+
+- **(A) Merged log file.** Detached path streams stdout+stderr interleaved into one
+  `logs/background/<job_id>.log`. Simple + natural for a background log + a
+  notification tail. Cost: convertible foreground commands lose the separate
+  stdout/stderr fields in their tool result (behaviour change for the common path).
+- **(B) Dual-stream handoff.** Capture stdout/stderr separately during the
+  foreground window (preserving today's result shape), and on timeout transfer the
+  in-flight readers to the escort to keep streaming. Preserves the contract but the
+  reader-ownership transfer across the foreground→background boundary is fiddly.
+- **(C) Keep `spawn_command` for the foreground window, detached only as fallback.**
+  Not possible with the current sandbox API (it kills internally on timeout).
+
+This is a real product/contract call (does convertible bash keep separate
+stdout/stderr?) and is the right place to check in before building the subsystem.
 
 ## Open items
 
