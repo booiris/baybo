@@ -239,7 +239,6 @@ mod tests {
             root_session_id: SessionId::from(id),
             trigger: TriggerSource::User,
             lineage: None,
-            bound_soul_version: "soul-v1".into(),
             hidden: false,
         }
     }

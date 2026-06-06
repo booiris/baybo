@@ -48,7 +48,6 @@ pub(crate) struct JobSpec {
     pub session_id: SessionId,
     pub session_trigger_kind: TriggerKind,
     pub input: JobInput,
-    pub effective_soul_version: String,
     pub parent_job_id: Option<JobId>,
 }
 
@@ -155,7 +154,6 @@ where
             spec.session_id,
             spec.session_trigger_kind,
             spec.input,
-            spec.effective_soul_version,
             spec.parent_job_id,
         )
         .await?;

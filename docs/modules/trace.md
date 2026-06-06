@@ -52,7 +52,7 @@ pub enum SpanKind {
 
 ### Provenance lives on Span variants, not on Step
 
-Each `SpanKind` variant carries the provenance fields that apply to it (`model_id` and `provider` on `LlmCall`, `tool_artifact_hash` on `ToolCall`). Step is a pure container with no provenance. Soul-version drift between session bind time and job effective time is recorded on `Job.provenance_drift` (see `job.md`).
+Each `SpanKind` variant carries the provenance fields that apply to it (`model_id` and `provider` on `LlmCall`, `tool_artifact_hash` on `ToolCall`). Step is a pure container with no provenance.
 
 ### SpanEvent is sanitize / approval audit, not control flow
 
@@ -140,7 +140,7 @@ Not implemented yet. The schema indexes the half-open lookup (`spans.ended_at IS
 
 ## Constraints
 
-- Depends on `aura-job` (for `JobId`, `CancelReason`, `DriftRecord`) and `aura-model` (for `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.). No dependency on `aura-storage`.
+- Depends on `aura-job` (for `JobId`, `CancelReason`) and `aura-model` (for `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.). No dependency on `aura-storage`.
 - IDs use ULID newtypes (`StepId`, `SpanId`); `SpanEvent` uses a `(span_id, seq)` compound key
 - Storage uses columnar schema: `steps` / `spans` / `span_events` (one row per entity); the `Job > Step > Span` parent chain is encoded by foreign keys, not by embedded child lists
 - All deletes are hard `DELETE FROM` — no `deleted_at` tombstone column (see [storage.md](./storage.md#hard-delete))

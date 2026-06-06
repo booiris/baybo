@@ -54,12 +54,11 @@ Invariant: `session.trigger.kind() == job.kind()` at job creation time. `JobInpu
 
 `Job` is not a passive data struct — it encapsulates the state machine:
 
-- `Job::new(session_id, input, effective_soul_version, parent_job_id)` — constructor with ULID, `Pending` status, timestamps. `kind` is derived from `input.kind()`.
+- `Job::new(session_id, input, parent_job_id)` — constructor with ULID, `Pending` status, timestamps. `kind` is derived from `input.kind()`.
 - `Job::transition(target, ...)` — validates transition, mutates status/timestamps, returns `JobTransition` record. `transition_at(target, ..., at)` / `cancel_at(reason, artifacts, at)` are explicit-timestamp variants reserved for the boot-recovery sweep, which must backdate `ended_at` to the last observed activity rather than the boot wall-clock; live callers use `transition` / `cancel`.
 - Convenience methods: `start()`, `complete(output)`, `fail(reason)`, `cancel(reason, partial_artifacts)`, `stuck(reason)`, `recover()`
 - `Job::is_terminal()` — true for `Completed | Cancelled | Failed`
 - `JobStatus::needs_recovery()` — true for `Pending | InProgress | Stuck` (consumed by admin queries that surface in-flight jobs)
-- Provenance fields: `effective_soul_version: String` (the soul actually loaded at start time) and `provenance_drift: Vec<DriftRecord>` (empty unless the job ran under a soul different from the session's `bound_soul_version`)
 
 Timestamp rules are enforced inside `transition()`:
 - `started_at` is set on first entry to `InProgress` (not on recovery re-entry)

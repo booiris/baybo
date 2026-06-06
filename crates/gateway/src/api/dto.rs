@@ -528,7 +528,6 @@ pub struct Job {
     #[schema(value_type = Option<Object>)]
     pub final_result: Option<serde_json::Value>,
     pub emitted_span_ids: Vec<String>,
-    pub effective_soul_version: String,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
@@ -550,7 +549,6 @@ impl From<aura_job::Job> for Job {
                 .into_iter()
                 .map(|s| s.to_string())
                 .collect(),
-            effective_soul_version: v.effective_soul_version,
             created_at: v.created_at,
             started_at: v.started_at,
             ended_at: v.ended_at,

@@ -25,7 +25,6 @@ pub struct JobRow {
     /// `JobStatusKind` rendered as its snake_case string — drives the
     /// `list_by_status_kind` / `list_recoverable` filters.
     pub status_kind: String,
-    pub effective_soul_version: String,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,

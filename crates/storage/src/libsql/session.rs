@@ -135,9 +135,9 @@ impl SessionStore for LibsqlSessionStore {
         conn.execute(
             "INSERT INTO sessions \
              (id, root_session_id, trigger_kind, parent_session_id, parent_job_id, \
-              parent_span_id, lineage_kind, bound_soul_version, created_at, last_active, \
+              parent_span_id, lineage_kind, created_at, last_active, \
               hidden, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
              ON CONFLICT(id) DO UPDATE SET \
                root_session_id = excluded.root_session_id, \
                trigger_kind = excluded.trigger_kind, \
@@ -145,7 +145,6 @@ impl SessionStore for LibsqlSessionStore {
                parent_job_id = excluded.parent_job_id, \
                parent_span_id = excluded.parent_span_id, \
                lineage_kind = excluded.lineage_kind, \
-               bound_soul_version = excluded.bound_soul_version, \
                created_at = excluded.created_at, \
                last_active = excluded.last_active, \
                data = excluded.data",
@@ -157,7 +156,6 @@ impl SessionStore for LibsqlSessionStore {
                 parent_job,
                 parent_span,
                 lineage_kind,
-                session.bound_soul_version.clone(),
                 super::time::to_us(session.created_at),
                 super::time::to_us(session.last_active),
                 hidden_flag,
@@ -997,7 +995,6 @@ mod tests {
             root_session_id: id,
             trigger: TriggerSource::User,
             lineage: None,
-            bound_soul_version: "soul-v1".into(),
             hidden: false,
         }
     }
@@ -1012,7 +1009,6 @@ mod tests {
         let loaded = store.get(&s.id).await.unwrap().unwrap();
         assert_eq!(loaded.id, s.id);
         assert_eq!(loaded.root_session_id, s.id);
-        assert_eq!(loaded.bound_soul_version, "soul-v1");
 
         store.delete(&s.id).await.unwrap();
         assert!(store.get(&s.id).await.unwrap().is_none());
@@ -1042,8 +1038,7 @@ mod tests {
             "state": {},
             "root_session_id": "good-1",
             "trigger": {"kind": "system", "reason": "background_compression"},
-            "lineage": {"parent_session_id": "good-1", "parent_job_id": "job-x", "kind": "system_maintenance"},
-            "bound_soul_version": "soul-v1"
+            "lineage": {"parent_session_id": "good-1", "parent_job_id": "job-x", "kind": "system_maintenance"}
         }"#;
         assert!(
             serde_json::from_str::<Session>(legacy_blob).is_err(),
@@ -1054,13 +1049,12 @@ mod tests {
             .conn()
             .execute(
                 "INSERT INTO sessions \
-                 (id, root_session_id, trigger_kind, bound_soul_version, created_at, last_active, data) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (id, root_session_id, trigger_kind, created_at, last_active, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 libsql::params![
                     "maint-legacy".to_string(),
                     "good-1".to_string(),
                     "system".to_string(),
-                    "soul-v1".to_string(),
                     super::super::time::to_us(Utc::now()),
                     super::super::time::to_us(Utc::now()),
                     legacy_blob.to_string(),

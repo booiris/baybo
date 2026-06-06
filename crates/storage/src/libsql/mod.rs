@@ -135,7 +135,6 @@ impl LibsqlPool {
                     -- migrated from before this column existed.
                     parent_span_id        TEXT,
                     lineage_kind          TEXT,
-                    bound_soul_version    TEXT NOT NULL,
                     created_at            INTEGER NOT NULL,
                     last_active           INTEGER NOT NULL,
                     -- User-facing chat-list hide flag, set by
@@ -286,7 +285,6 @@ impl LibsqlPool {
                     parent_job_id            TEXT,
                     kind                     TEXT NOT NULL,
                     status_kind              TEXT NOT NULL,
-                    effective_soul_version   TEXT NOT NULL,
                     created_at               INTEGER NOT NULL,
                     started_at               INTEGER,
                     ended_at                 INTEGER,

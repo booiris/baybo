@@ -48,7 +48,6 @@ fn durable_actor_state_json_roundtrip_preserves_all_fields() {
         root_session_id: SessionId::from("session-rt"),
         trigger: aura_model::TriggerSource::User,
         lineage: None,
-        bound_soul_version: "soul-v1".to_string(),
         hidden: false,
     };
 
@@ -59,10 +58,6 @@ fn durable_actor_state_json_roundtrip_preserves_all_fields() {
 
     assert_eq!(restored.session.id, original.session.id);
     assert_eq!(restored.session.state.compression_count, 7);
-    assert_eq!(
-        restored.session.bound_soul_version,
-        original.session.bound_soul_version
-    );
     assert_eq!(restored.session.trigger, original.session.trigger);
 }
 

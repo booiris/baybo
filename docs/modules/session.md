@@ -63,10 +63,6 @@ When a session with an in-flight subagent is deleted, the subagent's cancellatio
 - `last_llm`: per-session LLM pin — the `aura.json` entry name this session's turns resolve against, or `None` to follow `default-llm`. Read by the actor spawner as the loop's `initial_llm`; a live actor is re-pinned via `AgentMessage::SetModel`. Set from the chat UI via `PUT /v1/chat/sessions/:id/model`. See [`agent.md`](agent.md) "Per-session model selection".
 - `extra`: reserved extension fields for experimental features or plugin state.
 
-### Soul-version drift
-
-`Session.bound_soul_version` is locked when the session is created. Each `Job` records its own `effective_soul_version` at start time. If they diverge (hot reload changed the soul mid-session), the job records a `DriftRecord` in `provenance_drift`. The session's contract stays anchored even when the runtime config moves underneath it.
-
 ### Idle actor reaping — never row deletion
 
 Session rows and their transcripts are core user data and are **never** dropped by any background sweep (see CLAUDE.md, "Session data is core data — never delete"). Idleness only evicts the in-memory `AgentActor`, never the durable row:

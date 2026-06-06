@@ -692,7 +692,6 @@ mod tests {
                 parent_span_id: None,
                 kind: LineageKind::Subagent,
             }),
-            bound_soul_version: parent.bound_soul_version.clone(),
             hidden: false,
         };
         sessions.store().save(&child).await.unwrap();

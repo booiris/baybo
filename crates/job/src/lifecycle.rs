@@ -88,10 +88,7 @@ impl JobLifecycle {
         JobCancellationGuard::new(Arc::clone(&self.cancellation), job_id)
     }
 
-    /// Create a new job in `Pending`. The caller chooses the soul
-    /// version (typically `Session.bound_soul_version`, or whatever
-    /// the live agent has actually loaded if drift is being recorded
-    /// upstream).
+    /// Create a new job in `Pending`.
     ///
     /// `session_trigger_kind` is the root trigger kind of the owning
     /// session — used to enforce the `JobKind ↔ TriggerKind` invariant
@@ -110,7 +107,6 @@ impl JobLifecycle {
         session_id: SessionId,
         session_trigger_kind: TriggerKind,
         input: JobInput,
-        effective_soul_version: impl Into<String>,
         parent_job_id: Option<JobId>,
     ) -> Result<Job> {
         let job_kind = input.kind();
@@ -120,7 +116,7 @@ impl JobLifecycle {
                  (see aura_job::kind allowed-for table)"
             )));
         }
-        let job = Job::new(session_id, input, effective_soul_version, parent_job_id);
+        let job = Job::new(session_id, input, parent_job_id);
         self.store.create(&job.to_row()?).await?;
         Ok(job)
     }
@@ -375,7 +371,6 @@ mod tests {
                 SessionId::from("s1"),
                 TriggerKind::User,
                 user_chat_input(),
-                "soul-v1",
                 None,
             )
             .await
@@ -398,7 +393,6 @@ mod tests {
                 SessionId::from("s1"),
                 TriggerKind::User,
                 user_chat_input(),
-                "soul-v1",
                 None,
             )
             .await
@@ -427,7 +421,6 @@ mod tests {
                 SessionId::from("s2"),
                 TriggerKind::User,
                 user_chat_input(),
-                "soul-v1",
                 None,
             )
             .await
@@ -456,7 +449,6 @@ mod tests {
                     JobInput::Spawned {
                         initial_prompt: vec![ContentBlock::Text("task".into())],
                     },
-                    "soul-v1",
                     None,
                 )
                 .await;
@@ -485,7 +477,6 @@ mod tests {
                 JobInput::UserChat {
                     content: vec![ContentBlock::Text("hi".into())],
                 },
-                "soul-v1",
                 None,
             )
             .await
@@ -501,7 +492,6 @@ mod tests {
                 SessionId::from("s1"),
                 TriggerKind::User,
                 user_chat_input(),
-                "soul-v1",
                 None,
             )
             .await
@@ -525,7 +515,6 @@ mod tests {
                 SessionId::from("s1"),
                 TriggerKind::User,
                 user_chat_input(),
-                "soul-v1",
                 None,
             )
             .await

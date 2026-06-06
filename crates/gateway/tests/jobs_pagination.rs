@@ -41,7 +41,7 @@ async fn build_router_with_seeded_jobs(sessions: &[(&str, TriggerKind, usize)]) 
             };
             tg.deps
                 .job_lifecycle
-                .start_job(SessionId::from(*sid), *trigger, input, "soul-v1", None)
+                .start_job(SessionId::from(*sid), *trigger, input, None)
                 .await
                 .expect("seed job");
         }

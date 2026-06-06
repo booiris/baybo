@@ -622,7 +622,6 @@ impl AgentLoop {
             session_id: session.id.clone(),
             session_trigger_kind: session.trigger.kind(),
             input: job_input,
-            effective_soul_version: session.bound_soul_version.clone(),
             parent_job_id,
         };
         // Capture what the post-`with_job` memory spawn needs from `self`
@@ -2326,7 +2325,6 @@ impl AgentLoop {
             session_id: session.id.clone(),
             session_trigger_kind: session.trigger.kind(),
             input: job_input,
-            effective_soul_version: session.bound_soul_version.clone(),
             parent_job_id,
         };
 
@@ -2433,7 +2431,6 @@ impl AgentLoop {
         // traces against this session.
         let session_id = session.id.clone();
         let user_id = session.user.id.clone();
-        let effective_soul_version = session.bound_soul_version.clone();
         let llm_client = self.llm_client.clone();
         let security_gateway = self.security_gateway.clone();
         let tokenizer = Arc::clone(self.context_manager.tokenizer());
@@ -2462,7 +2459,6 @@ impl AgentLoop {
                 input: aura_job::JobInput::System {
                     payload: payload.clone(),
                 },
-                effective_soul_version,
                 // Parent the System job under the triggering turn's job.
                 parent_job_id: Some(current_job_id),
             };
@@ -2941,7 +2937,6 @@ mod session_end_gate_tests {
             root_session_id: id,
             trigger,
             lineage,
-            bound_soul_version: "soul-gate".into(),
             hidden: false,
         }
     }

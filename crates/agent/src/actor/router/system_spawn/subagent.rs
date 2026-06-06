@@ -312,7 +312,6 @@ impl Router {
             cost_manager: Arc::clone(&self.cost_manager),
             user_id: child_session.user.id.clone(),
             trigger_kind: child_session.trigger.kind(),
-            soul_version: child_session.bound_soul_version.clone(),
             parent_job_id,
         };
         let limiter_for_task = Arc::clone(&self.dispatch_limiter);
@@ -641,7 +640,6 @@ struct ExternalJobCtx {
     cost_manager: Arc<CostManager>,
     user_id: String,
     trigger_kind: TriggerKind,
-    soul_version: String,
     parent_job_id: JobId,
 }
 
@@ -674,7 +672,6 @@ async fn run_external_agent_job(
             child_session_id.clone(),
             job_ctx.trigger_kind,
             JobInput::Spawned { initial_prompt },
-            job_ctx.soul_version,
             Some(job_ctx.parent_job_id),
         )
         .await
@@ -1001,7 +998,6 @@ mod resume_validation_tests {
             root_session_id: SessionId::from(id),
             trigger: TriggerSource::User,
             lineage: None,
-            bound_soul_version: "soul-v1".into(),
             hidden: false,
         }
     }

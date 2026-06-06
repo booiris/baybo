@@ -104,7 +104,6 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         "status": job.status.kind().to_string(),
         "status_detail": serde_json::to_value(&job.status).unwrap_or(Value::Null),
         "kind": serde_json::to_value(job.kind).unwrap_or(Value::Null),
-        "effective_soul_version": job.effective_soul_version,
         "created_at": job.created_at.to_rfc3339(),
         "started_at": job.started_at.map(|t| t.to_rfc3339()),
         "ended_at": job.ended_at.map(|t| t.to_rfc3339()),
