@@ -19,10 +19,6 @@ pub struct SessionManager {
     /// production wires the libsql backend; tests pass
     /// `crate::test_support::MemorySessionSummaryStore`.
     summary_store: Arc<dyn SessionSummaryStore>,
-    /// Default soul version stamped on new sessions when the caller
-    /// does not supply one. The agent layer overrides this via
-    /// `create_session_with_options` once it loads the live config.
-    default_soul_version: String,
 }
 
 impl SessionManager {
@@ -30,16 +26,7 @@ impl SessionManager {
         Self {
             store,
             summary_store,
-            default_soul_version: "soul-default".to_owned(),
         }
-    }
-
-    /// Override the soul version stamped on subsequently-created
-    /// sessions. Useful in tests and at startup once the soul
-    /// configuration is known.
-    pub fn with_default_soul_version(mut self, soul_version: impl Into<String>) -> Self {
-        self.default_soul_version = soul_version.into();
-        self
     }
 
     /// Read-only view of the underlying `SessionStore`. Used by
@@ -166,7 +153,6 @@ impl SessionManager {
             // Trigger inherits from root (Q2 design).
             trigger: parent.trigger.clone(),
             lineage: Some(lineage),
-            bound_soul_version: self.default_soul_version.clone(),
             hidden: false,
         };
         self.store.save(&session).await?;
@@ -196,7 +182,6 @@ impl SessionManager {
             root_session_id: id,
             trigger,
             lineage: None,
-            bound_soul_version: self.default_soul_version.clone(),
             hidden: false,
         };
         self.store.save(&session).await?;

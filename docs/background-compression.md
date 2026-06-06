@@ -140,7 +140,6 @@ let handle = tokio::spawn(async move {
         session_id,                                // this session
         session_trigger_kind: TriggerKind::System, // clears JobInput::System's allowed_for gate
         input: JobInput::System { payload },
-        effective_soul_version,
         parent_job_id: Some(current_job_id),      // parent the System job under the triggering turn
     };
     let result = scope::with_job(&job_lifecycle, cancel_token.clone(), spec, move |job_id| async move {

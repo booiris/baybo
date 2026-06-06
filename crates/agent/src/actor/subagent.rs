@@ -254,7 +254,6 @@ mod tests {
                 JobInput::Spawned {
                     initial_prompt: vec![ContentBlock::Text("task".into())],
                 },
-                "soul-v1",
                 None,
             )
             .await

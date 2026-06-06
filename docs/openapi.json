@@ -1104,16 +1104,12 @@
                           "kind",
                           "status",
                           "emitted_span_ids",
-                          "effective_soul_version",
                           "created_at"
                         ],
                         "properties": {
                           "created_at": {
                             "type": "string",
                             "format": "date-time"
-                          },
-                          "effective_soul_version": {
-                            "type": "string"
                           },
                           "emitted_span_ids": {
                             "type": "array",
@@ -2785,16 +2781,12 @@
           "kind",
           "status",
           "emitted_span_ids",
-          "effective_soul_version",
           "created_at"
         ],
         "properties": {
           "created_at": {
             "type": "string",
             "format": "date-time"
-          },
-          "effective_soul_version": {
-            "type": "string"
           },
           "emitted_span_ids": {
             "type": "array",

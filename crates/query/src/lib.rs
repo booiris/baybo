@@ -1480,7 +1480,6 @@ mod tests {
             root_session_id: id,
             trigger: TriggerSource::User,
             lineage: None,
-            bound_soul_version: "soul-test".into(),
             hidden: false,
         }
     }
@@ -1598,36 +1597,18 @@ mod tests {
 
         // Pending (recoverable)
         lifecycle
-            .start_job(
-                SessionId::from("s1"),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(SessionId::from("s1"), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         // InProgress (recoverable)
         let j = lifecycle
-            .start_job(
-                SessionId::from("s1"),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(SessionId::from("s1"), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j.id).await.unwrap();
         // Completed (NOT recoverable)
         let j2 = lifecycle
-            .start_job(
-                SessionId::from("s1"),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(SessionId::from("s1"), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j2.id).await.unwrap();
@@ -1690,25 +1671,13 @@ mod tests {
         let lifecycle = Arc::new(JobLifecycle::new(job_store.clone()));
         // Active child has an InProgress job
         let j_active = lifecycle
-            .start_job(
-                active_child.clone(),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(active_child.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j_active.id).await.unwrap();
         // Done child has a Completed job
         let j_done = lifecycle
-            .start_job(
-                done_child.clone(),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(done_child.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j_done.id).await.unwrap();
@@ -1741,23 +1710,11 @@ mod tests {
         let lifecycle = Arc::new(JobLifecycle::new(job_store));
 
         let _j1 = lifecycle
-            .start_job(
-                s.id.clone(),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         let _j2 = lifecycle
-            .start_job(
-                s.id.clone(),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
 
@@ -1813,13 +1770,7 @@ mod tests {
 
         let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
         let j = lifecycle
-            .start_job(
-                s.id.clone(),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j.id).await.unwrap();
@@ -1963,13 +1914,7 @@ mod tests {
 
         let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
         let j = lifecycle
-            .start_job(
-                s.id.clone(),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j.id).await.unwrap();
@@ -2093,13 +2038,7 @@ mod tests {
 
         let lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
         let j = lifecycle
-            .start_job(
-                s.id.clone(),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j.id).await.unwrap();
@@ -2249,13 +2188,7 @@ mod tests {
         let job_store = Arc::new(MemoryJobStore::new());
         let lifecycle = Arc::new(JobLifecycle::new(job_store));
         let j1 = lifecycle
-            .start_job(
-                s.id.clone(),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j1.id).await.unwrap();
@@ -2337,13 +2270,7 @@ mod tests {
 
         // Second job + span anchored to the post-compaction transcript.
         let j2 = lifecycle
-            .start_job(
-                s.id.clone(),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j2.id).await.unwrap();
@@ -2500,23 +2427,11 @@ mod tests {
         let job_store = Arc::new(MemoryJobStore::new());
         let lifecycle = Arc::new(JobLifecycle::new(job_store));
         let _j1 = lifecycle
-            .start_job(
-                s.id.clone(),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         let _j2 = lifecycle
-            .start_job(
-                s.id.clone(),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
 
@@ -2574,13 +2489,7 @@ mod tests {
         let job_store = Arc::new(MemoryJobStore::new());
         let lifecycle = Arc::new(JobLifecycle::new(job_store));
         let j = lifecycle
-            .start_job(
-                s.id.clone(),
-                TriggerKind::User,
-                user_input(),
-                "soul-v1",
-                None,
-            )
+            .start_job(s.id.clone(), TriggerKind::User, user_input(), None)
             .await
             .unwrap();
         lifecycle.start(&j.id).await.unwrap();

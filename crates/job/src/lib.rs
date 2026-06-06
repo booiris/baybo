@@ -9,7 +9,6 @@
 
 mod cancel;
 mod cancellation_registry;
-mod drift;
 mod error;
 mod kind;
 mod lifecycle;
@@ -25,7 +24,6 @@ use serde::{Deserialize, Serialize};
 pub use aura_store::{JobRow, JobStore, JobTransitionRow};
 pub use cancel::CancelReason;
 pub use cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
-pub use drift::DriftRecord;
 pub use error::JobError;
 pub use kind::{JobInput, JobKind, JobOutput};
 pub use lifecycle::{JobLifecycle, JobTerminalEvent};
@@ -174,15 +172,6 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emitted_span_ids: Vec<SpanId>,
 
-    /// Soul version actually loaded at this job's start time. Compare
-    /// against `Session.bound_soul_version` to detect drift.
-    pub effective_soul_version: String,
-
-    /// Empty unless this job ran under a soul different from the
-    /// session's `bound_soul_version`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub provenance_drift: Vec<DriftRecord>,
-
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
@@ -190,12 +179,7 @@ pub struct Job {
 
 impl Job {
     /// Construct a fresh job in `Pending` status.
-    pub fn new(
-        session_id: SessionId,
-        input: JobInput,
-        effective_soul_version: impl Into<String>,
-        parent_job_id: Option<JobId>,
-    ) -> Self {
+    pub fn new(session_id: SessionId, input: JobInput, parent_job_id: Option<JobId>) -> Self {
         let kind = input.kind();
         Self {
             id: JobId::new(),
@@ -206,8 +190,6 @@ impl Job {
             status: JobStatus::Pending,
             final_result: None,
             emitted_span_ids: Vec::new(),
-            effective_soul_version: effective_soul_version.into(),
-            provenance_drift: Vec::new(),
             created_at: Utc::now(),
             started_at: None,
             ended_at: None,
@@ -405,12 +387,7 @@ mod tests {
     }
 
     fn fresh_job() -> Job {
-        Job::new(
-            SessionId::from("cli-test"),
-            user_chat_input(),
-            "soul-v1",
-            None,
-        )
+        Job::new(SessionId::from("cli-test"), user_chat_input(), None)
     }
 
     fn dummy_output() -> JobOutput {
@@ -489,7 +466,6 @@ mod tests {
             JobInput::Spawned {
                 initial_prompt: vec![],
             },
-            "soul-v1",
             None,
         );
         assert_eq!(j.kind, JobKind::Spawned);

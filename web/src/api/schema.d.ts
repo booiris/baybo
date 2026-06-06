@@ -852,7 +852,6 @@ export interface components {
         Job: {
             /** Format: date-time */
             created_at: string;
-            effective_soul_version: string;
             emitted_span_ids: string[];
             /** Format: date-time */
             ended_at?: string | null;
@@ -2063,7 +2062,6 @@ export interface operations {
                         items: {
                             /** Format: date-time */
                             created_at: string;
-                            effective_soul_version: string;
                             emitted_span_ids: string[];
                             /** Format: date-time */
                             ended_at?: string | null;

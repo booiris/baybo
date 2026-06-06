@@ -16,7 +16,7 @@ impl LibsqlJobStore {
 }
 
 const SELECT_COLS: &str = "id, session_id, parent_job_id, kind, status_kind, \
-     effective_soul_version, created_at, started_at, ended_at, data";
+     created_at, started_at, ended_at, data";
 
 fn col_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
     StorageError::Internal(anyhow::anyhow!("libsql {ctx}: {e}"))
@@ -39,12 +39,11 @@ fn job_row_from(row: &libsql::Row) -> Result<JobRow> {
         parent_job_id: get_os(2)?.map(parse_job_id).transpose()?,
         kind: get_s(3)?,
         status_kind: get_s(4)?,
-        effective_soul_version: get_s(5)?,
-        created_at: super::time::from_us(row.get::<i64>(6).map_err(|e| col_err("get col", e))?)
+        created_at: super::time::from_us(row.get::<i64>(5).map_err(|e| col_err("get col", e))?)
             .ok_or_else(|| col_err("created_at", "out of range"))?,
-        started_at: get_oi(7)?.and_then(super::time::from_us),
-        ended_at: get_oi(8)?.and_then(super::time::from_us),
-        data: get_s(9)?,
+        started_at: get_oi(6)?.and_then(super::time::from_us),
+        ended_at: get_oi(7)?.and_then(super::time::from_us),
+        data: get_s(8)?,
     })
 }
 
@@ -55,16 +54,15 @@ impl JobStore for LibsqlJobStore {
             .conn()
             .execute(
                 "INSERT INTO jobs \
-                 (id, session_id, parent_job_id, kind, status_kind, effective_soul_version, \
+                 (id, session_id, parent_job_id, kind, status_kind, \
                   created_at, started_at, ended_at, data) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 libsql::params![
                     job.id.to_string(),
                     job.session_id.as_str().to_string(),
                     job.parent_job_id.map(|p| p.to_string()),
                     job.kind.clone(),
                     job.status_kind.clone(),
-                    job.effective_soul_version.clone(),
                     super::time::to_us(job.created_at),
                     job.started_at.map(super::time::to_us),
                     job.ended_at.map(super::time::to_us),
@@ -230,7 +228,6 @@ mod tests {
             JobInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
-            "soul-v1",
             None,
         )
     }
@@ -334,7 +331,6 @@ mod tests {
                 JobInput::UserChat {
                     content: vec![ContentBlock::Text("hi".into())],
                 },
-                "soul-v1",
                 None,
             )
         };

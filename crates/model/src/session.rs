@@ -193,11 +193,6 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<Lineage>,
 
-    /// Soul (system prompt / persona) version locked at session creation.
-    /// `Job::effective_soul_version` records what was actually loaded at
-    /// each job's start; divergence is recorded on `Job.provenance_drift`.
-    pub bound_soul_version: String,
-
     /// User-facing "hide from my list" flag. Set via the chat admin
     /// `DELETE /v1/chat/sessions/:id` endpoint, which intentionally
     /// does not remove the row — agent state, transcript, and

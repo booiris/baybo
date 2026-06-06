@@ -59,7 +59,6 @@ fn root_session(id: &str) -> Session {
         root_session_id: SessionId::from(id),
         trigger: TriggerSource::User,
         lineage: None,
-        bound_soul_version: "soul".into(),
         hidden: false,
     }
 }

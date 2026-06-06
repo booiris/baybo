@@ -329,7 +329,6 @@ mod tests {
             JobInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
-            "soul-v1",
             None,
         );
         job.status = JobStatus::InProgress;
@@ -523,7 +522,6 @@ mod tests {
             JobInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
-            "soul-v1",
             None,
         );
         job.created_at = t0;
@@ -548,7 +546,6 @@ mod tests {
             JobInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
-            "soul-v1",
             None,
         );
         job.status = JobStatus::Completed;

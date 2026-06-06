@@ -30,7 +30,6 @@ impl Job {
             parent_job_id: self.parent_job_id,
             kind: job_kind_str(self.kind).to_string(),
             status_kind: self.status.kind().as_snake_case().to_string(),
-            effective_soul_version: self.effective_soul_version.clone(),
             created_at: self.created_at,
             started_at: self.started_at,
             ended_at: self.ended_at,
