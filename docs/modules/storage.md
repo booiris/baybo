@@ -110,6 +110,27 @@ equivalence so the two filters can't drift apart silently. The remaining helpers
 — `latest_session_ordinal`, `count_active_messages`, `active_index_of_ordinal` —
 exist to anchor and validate those references.
 
+**Recovery read — full load today, a deferred bound.** The other consumer of
+`load_session_messages_with_supersede` is the post-compaction transcript
+recovery read: the compaction summary embeds a virtual `logs/sessions/<id>.jsonl`
+path, and a `Read` of it is served by `aura_agent`'s `SessionTranscriptReader`
+(`runtime/virtual_read.rs`) from this full row set — rendered to readable text,
+capped at 16 MiB per read. So the load is O(all rows) on every such read: fine
+for realistic sessions on a rare path, but unbounded for a pathologically
+long-lived one. The deferred optimization is a `LIMIT`-pushdown variant —
+`load_session_messages_with_supersede_prefix(session, max_rows)` (`… ORDER BY
+ordinal LIMIT ?`, supersede-inclusive) plus threading the read's line window
+(`offset + limit`) into the resolver. Because each rendered row is ≥ ~2 lines,
+loading `end = offset + limit` rows always covers an `end`-line window, so
+`limit: 1` loads ~1 row instead of all. It is intentionally **not done**: the
+16 MiB render cap already prevents catastrophic allocation, and even with the
+`LIMIT` a high `offset` still loads O(offset) rows (line offsets don't map to row
+offsets) and sequential full pagination stays O(N²) without a per-session render
+cache — disproportionate for a rare path until real sessions grow large. A true
+libsql row-cursor (`rows.next()` is lazy, stop early) is avoided because the
+`dyn SessionStore` boundary would force `Pin<Box<dyn Stream>>` and the single
+shared `Arc<libsql::Connection>` would be held open across the render.
+
 ### Session planning checklist: the `session_tasks` table
 
 The `Task*` planning checklist (see [`task.md`](task.md)) lives in its own
