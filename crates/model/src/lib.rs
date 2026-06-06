@@ -36,7 +36,7 @@ pub use session::{
     TriggerKind, TriggerSource, User,
 };
 pub use spawn_protocol::{
-    BACKGROUND_SUBAGENT_HANDLE_PREFIX, BackgroundJobKind, PendingBackgroundResult,
+    BACKGROUND_SUBAGENT_HANDLE_PREFIX, BackgroundJobKind, OnTimeout, PendingBackgroundResult,
     SPAWN_SUBAGENT_TOOL_NAME, SUBAGENT_CHANNEL_TAG, SubagentExitStatus, SubagentParentContext,
     SubagentResult, SubagentSpawnRequest, SystemSpawnRequest,
 };

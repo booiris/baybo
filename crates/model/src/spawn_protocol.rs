@@ -78,6 +78,20 @@ pub enum SystemSpawnRequest {
 /// Field naming follows Claude Code's Agent tool: `task_summary` is
 /// the short 3-5 word title surfaced in traces, while `prompt` is the
 /// self-contained brief that becomes the child's first user message.
+/// What to do when a *foreground* subagent exceeds its foreground wait.
+/// Only consulted for foreground spawns from a user-facing session;
+/// `background: true` spawns and non-user parents ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnTimeout {
+    /// Detach and keep running; deliver the result via a notification
+    /// turn when it finishes. The default.
+    #[default]
+    Background,
+    /// Cancel the child and surface a timeout to the parent.
+    Kill,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentSpawnRequest {
     /// Profile name the parent LLM emitted. The child's `ContextManager`
@@ -104,6 +118,12 @@ pub struct SubagentSpawnRequest {
     /// the dispatching turn and escorts its result back later.
     #[serde(default)]
     pub background: bool,
+    /// Policy when a *foreground* spawn exceeds its foreground wait: a
+    /// user-facing session converts to background (default) or kills.
+    /// Ignored for `background: true` and for non-user parents. See
+    /// `docs/todo/background-jobs.md`.
+    #[serde(default)]
+    pub on_timeout: OnTimeout,
     /// Root session id used by the dispatcher's fan-out limiter.
     /// Stamped by `spawn_subagent` after it walks the lineage chain
     /// (and reserves a slot in the limiter), so the router's wait
