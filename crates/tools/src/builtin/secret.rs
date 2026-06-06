@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::{SecretAccess, Tool, ToolContext, ToolError, ToolOutput};
+use crate::{SecretAccess, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput};
 
 /// Borrow the secret accessor or fail closed when the context has none wired.
 fn secrets(ctx: &ToolContext) -> crate::Result<&dyn SecretAccess> {
@@ -83,6 +83,11 @@ impl Tool for SecretListTool {
         "SecretList"
     }
 
+    /// Read-only (names only) — safe to run concurrently.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Concurrent
+    }
+
     fn description(&self) -> String {
         "List the names of stored user secrets (names only — values are never returned). Use \
          these names with SecretCheck or the Bash tool's `secret_env`."
@@ -110,6 +115,11 @@ struct CheckParams {
 impl Tool for SecretCheckTool {
     fn name(&self) -> &str {
         "SecretCheck"
+    }
+
+    /// Read-only existence check — safe to run concurrently.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Concurrent
     }
 
     fn description(&self) -> String {

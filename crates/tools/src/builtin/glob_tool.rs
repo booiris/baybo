@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::paths::require_absolute;
-use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
+use crate::{ResourceAccess, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput};
 
 const MAX_RESULTS: usize = 1000;
 const SCAN_CAP: usize = MAX_RESULTS * 2;
@@ -42,6 +42,11 @@ struct Params {
 impl Tool for GlobTool {
     fn name(&self) -> &str {
         "Glob"
+    }
+
+    /// Read-only filesystem walk — safe to run concurrently.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Concurrent
     }
 
     fn description(&self) -> String {

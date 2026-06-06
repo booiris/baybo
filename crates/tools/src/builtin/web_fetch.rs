@@ -77,7 +77,9 @@ use serde_json::{Value, json};
 
 use aura_trace::ToolEventPayload;
 
-use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput, start_timer};
+use crate::{
+    ResourceAccess, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput, start_timer,
+};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
@@ -289,6 +291,11 @@ struct Params {
 impl Tool for WebFetchTool {
     fn name(&self) -> &str {
         "WebFetch"
+    }
+
+    /// Read-only network fetch — safe to run concurrently.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Concurrent
     }
 
     fn description(&self) -> String {

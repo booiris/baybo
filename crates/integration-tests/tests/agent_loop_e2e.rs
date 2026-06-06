@@ -437,7 +437,7 @@ mod sleep_tool {
 
     use async_trait::async_trait;
     use aura_model::TrustLevel;
-    use aura_tools::{Tool, ToolContext, ToolManifest, ToolOutput};
+    use aura_tools::{Tool, ToolConcurrency, ToolContext, ToolManifest, ToolOutput};
     use parking_lot::Mutex;
     use serde_json::{Value, json};
 
@@ -481,6 +481,13 @@ mod sleep_tool {
         }
         fn parameters_schema(&self) -> Value {
             json!({"type": "object", "additionalProperties": true})
+        }
+        // Declares `Concurrent` so the dispatch loop is allowed to run
+        // two of these in parallel — the property this test asserts.
+        // Exclusive tools (the default) are serialized by the loop's
+        // concurrency limiter, which a separate suite covers.
+        fn concurrency(&self) -> ToolConcurrency {
+            ToolConcurrency::Concurrent
         }
         async fn execute(
             &self,

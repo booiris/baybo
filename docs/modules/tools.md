@@ -244,6 +244,15 @@ Current overrides:
 
 All other builtins (`Read`, `Write`, `Edit`, `Echo`, `Now`, `CronCreate`, `CronDelete`, `CronList`, `SkillUninstall`, every `todo` stub) use the default — they're either pure data ops or fail fast.
 
+### Per-tool concurrency
+
+The agent loop dispatches every tool call in one LLM response together. Each `Tool` declares whether it is safe to overlap its siblings via `fn concurrency(&self) -> ToolConcurrency` (default `Exclusive`). `ToolRegistry::concurrency(name)` exposes the lookup (unknown tools fail safe to `Exclusive`).
+
+- **`ToolConcurrency::Concurrent`** — safe to run alongside other concurrent calls; declared by the read-only builtins: `Read`, `Glob`, `Grep`, `WebFetch`, `Now`, `Skill`, `CronList`, `TaskGet`, `TaskList`, `SecretList`, `SecretCheck`. They read (filesystem, network, or a store) and mutate no shared state, so parallel calls within a turn cannot race. `SendFile` stays exclusive — staging a blob to send is an outward-facing write, kept on the clean "concurrent = pure read" side of the line.
+- **`ToolConcurrency::Exclusive`** (the default) — runs alone. Every mutating builtin (`Write`, `Edit`, `Bash`, `SecretAdd`, `Cron{Create,Delete}`, `Skill{Install,Uninstall}`, `Task{Create,Update}`), every MCP/dynamic tool, and any tool the registry can't classify falls here. A tool with side effects must never overlap a reader (read-while-write race) or another writer.
+
+The loop enforces this with a per-response `tokio::sync::Semaphore` sized to `MAX_CONCURRENT_TOOL_CALLS` (10, a code const like the timeout ceiling — no `aura.json` knob). It is used as a read/write lock: a `Concurrent` call acquires **one** permit (so at most 10 run at once), while an `Exclusive` call acquires **all** permits, so it waits for in-flight calls to drain and then runs alone, blocking every other call until it returns. The semaphore is fair (FIFO), so an exclusive call is never starved by a stream of reads. The limiter is scoped to a single response because that is the only place tool calls overlap — `ToolExecutor` is process-global and shared across sessions, so a limiter there would wrongly couple unrelated sessions. The post-execution pass that appends tool results stays sequential in `tool_calls` order regardless, keeping the next turn's context byte-stable.
+
 ### Output control
 
 Tool output should prefer structured `Json`, use `LargeText` for long text with truncation, and be sanitized before entering Job or Trace.

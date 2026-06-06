@@ -30,6 +30,27 @@ pub use virtual_read::{VirtualReadAccess, VirtualReadResolver};
 
 pub type Result<T> = std::result::Result<T, ToolError>;
 
+/// Whether a tool is safe to run concurrently with the sibling tool
+/// calls in the same LLM response.
+///
+/// The agent loop dispatches every tool call of one response together.
+/// A [`Concurrent`](ToolConcurrency::Concurrent) call may overlap other
+/// `Concurrent` calls — the loop runs at most a fixed number at once. An
+/// [`Exclusive`](ToolConcurrency::Exclusive) call runs alone: it waits
+/// for any in-flight calls to drain, then blocks every other call (read
+/// or write) until it returns, so a tool that mutates shared state never
+/// races a concurrent reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolConcurrency {
+    /// Safe to run alongside other `Concurrent` calls — a read-only tool
+    /// that touches no shared mutable state. Bounded by the agent loop's
+    /// concurrency cap.
+    Concurrent,
+    /// Must run exclusively; no other tool call overlaps it. The
+    /// conservative default for any tool with side effects.
+    Exclusive,
+}
+
 // ---------------------------------------------------------------------------
 // Tool trait
 // ---------------------------------------------------------------------------
@@ -83,6 +104,16 @@ pub trait Tool: Send + Sync {
     /// deadline.
     fn max_timeout(&self) -> Duration {
         Duration::from_secs(30)
+    }
+
+    /// Whether this tool may run concurrently with the other tool calls
+    /// in the same LLM response. Defaults to
+    /// [`ToolConcurrency::Exclusive`] — only read-only tools that touch
+    /// no shared mutable state should override to
+    /// [`ToolConcurrency::Concurrent`]. See [`ToolConcurrency`] for how
+    /// the agent loop schedules each variant.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Exclusive
     }
 
     async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput>;

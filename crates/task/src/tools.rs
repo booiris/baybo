@@ -12,7 +12,7 @@ use aura_model::{
     TaskId, TaskStatus,
 };
 use aura_store::task::{TaskPatch, TaskStore};
-use aura_tools::{Tool, ToolContext, ToolError, ToolManifest, ToolOutput};
+use aura_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -291,6 +291,11 @@ impl Tool for TaskListTool {
         TASK_LIST_TOOL_NAME
     }
 
+    /// Read-only listing — safe to run concurrently.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Concurrent
+    }
+
     fn description(&self) -> String {
         "List this session's planning-checklist tasks with their status — the \
          at-a-glance progress view. Optionally filter by `status`."
@@ -340,6 +345,11 @@ struct IdParams {
 impl Tool for TaskGetTool {
     fn name(&self) -> &str {
         TASK_GET_TOOL_NAME
+    }
+
+    /// Read-only lookup — safe to run concurrently.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Concurrent
     }
 
     fn description(&self) -> String {

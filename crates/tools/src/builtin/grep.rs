@@ -24,7 +24,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use super::paths::require_absolute;
-use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
+use crate::{ResourceAccess, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput};
 
 const MAX_HITS: usize = 500;
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -75,6 +75,11 @@ fn default_output_mode() -> String {
 impl Tool for GrepTool {
     fn name(&self) -> &str {
         "Grep"
+    }
+
+    /// Read-only content search — safe to run concurrently.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Concurrent
     }
 
     fn description(&self) -> String {

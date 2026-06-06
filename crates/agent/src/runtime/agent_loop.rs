@@ -17,7 +17,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use aura_model::{LineageKind, Session, TriggerSource};
-use aura_tools::{ToolOutput, ToolRegistry};
+use aura_tools::{ToolConcurrency, ToolOutput, ToolRegistry};
 use aura_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
 };
@@ -57,6 +57,15 @@ const MAX_ATTACHMENTS_PER_TURN: usize = 16;
 /// truncated with an ellipsis. Presentation-only — the full result still
 /// reaches the LLM (capped separately) and the trace.
 const TOOL_SUMMARY_MAX: usize = 80;
+
+/// Upper bound on how many [`ToolConcurrency::Concurrent`] tool calls
+/// run at once within a single LLM response. A
+/// [`ToolConcurrency::Exclusive`] call (any tool that mutates state)
+/// acquires *all* of these permits, so it runs alone — it waits for
+/// in-flight concurrent calls to drain and blocks any other call until
+/// it returns. Like the per-tool timeout ceiling, the cap lives in code
+/// rather than `aura.json`.
+const MAX_CONCURRENT_TOOL_CALLS: usize = 10;
 
 /// Trim and length-cap a single-line summary string. Char-based so a
 /// multibyte boundary is never split.
@@ -1073,17 +1082,22 @@ impl AgentLoop {
                 .await;
         }
 
-        // Execute tool calls concurrently. Approved resources are shared
-        // via a Mutex so concurrent calls see each other's grants
-        // immediately. Wrapped in an `Arc` so that any persist-always
-        // closure injected into `ToolContext` mid-execution can clone
-        // its handle into the executor boundary without a borrow
-        // escape.
+        // Execute tool calls under a bounded-concurrency limiter.
+        // Approved resources are shared via a Mutex so concurrent calls
+        // see each other's grants immediately. Wrapped in an `Arc` so
+        // that any persist-always closure injected into `ToolContext`
+        // mid-execution can clone its handle into the executor boundary
+        // without a borrow escape.
         //
-        // Concurrency note: every tool call inside a single LLM
-        // response runs in parallel via `futures::future::join_all`.
-        // The post-execution pass that mutates `session.messages` is
-        // kept SEQUENTIAL — appending tool results in original
+        // Concurrency model: a per-response `Semaphore` (sized to
+        // `MAX_CONCURRENT_TOOL_CALLS`) gates the futures join_all'd
+        // below. A `ToolConcurrency::Concurrent` call (a read-only tool)
+        // holds one permit, so up to the cap run at once; a
+        // `ToolConcurrency::Exclusive` call (any tool with side effects) holds
+        // *all* the permits, so it waits for in-flight calls to drain
+        // and then runs alone — no other call (read or write) overlaps
+        // it. The post-execution pass that mutates `session.messages`
+        // is kept SEQUENTIAL — appending tool results in original
         // `tool_calls` order keeps the next turn's context byte-stable
         // (prompt cache hits) and matches provider expectations that
         // tool_use ↔ tool_result pairs land in declaration order. The
@@ -1100,6 +1114,8 @@ impl AgentLoop {
         let step_for_calls = step.clone();
         let notifier_for_calls = notifier.clone();
         let llm_for_calls = Arc::clone(&self.llm_client);
+        let registry_for_calls = Arc::clone(&self.tool_registry);
+        let concurrency_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS));
         let exec_futures = response.tool_calls.iter().map(|tc| {
             let executor = Arc::clone(&executor);
             let session_id = session_id_for_calls.clone();
@@ -1114,7 +1130,20 @@ impl AgentLoop {
             let arguments = tc.arguments.clone();
             let tool_use_id = tc.id.clone();
             let triggering_llm_span = Some(llm_span_id);
+            let limiter = Arc::clone(&concurrency_limiter);
+            // `Concurrent` → one permit (up to the cap run together);
+            // `Exclusive` → every permit, so the call runs alone once
+            // in-flight calls release. Unknown tools fail safe to
+            // `Exclusive` inside `ToolRegistry::concurrency`.
+            let permits = match registry_for_calls.concurrency(&tool_name) {
+                ToolConcurrency::Concurrent => 1,
+                ToolConcurrency::Exclusive => MAX_CONCURRENT_TOOL_CALLS as u32,
+            };
             async move {
+                // Hold a concurrency permit for the whole call. `acquire`
+                // errors only if the semaphore is closed, which never
+                // happens for this per-response limiter.
+                let _permit = limiter.acquire_many_owned(permits).await.ok();
                 debug!(tool = %tool_name, "executing tool call");
                 executor
                     .execute(
