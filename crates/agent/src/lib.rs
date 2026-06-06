@@ -34,6 +34,7 @@ pub use runtime::error_recovery;
 pub use runtime::llm_pool;
 pub use runtime::sandbox;
 pub use runtime::tool_executor;
+pub use runtime::virtual_read;
 
 pub use agent_loop::AgentLoop;
 pub use aura_cron::{CronScheduler, CronTriggerEvent};
@@ -45,3 +46,4 @@ pub use security::{LeakRuleSummary, SecretVaultSummary, SecurityAuditReport, Sec
 pub use service::{ShutdownSignal, TaskTracker};
 pub use supervisor::AgentSupervisor;
 pub use tool_executor::ToolExecutor;
+pub use virtual_read::{SessionTranscript, SessionTranscriptReader};

@@ -4,6 +4,7 @@ pub mod error;
 pub mod mcp;
 pub mod progress;
 pub mod registry;
+pub mod virtual_read;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -25,6 +26,7 @@ pub use approval::{
     ApprovedResource, AutoDenyGate, ChannelApprovalGate, HostPattern, ResourceAccess,
 };
 pub use error::ToolError;
+pub use virtual_read::{VirtualReadAccess, VirtualReadResolver};
 
 pub type Result<T> = std::result::Result<T, ToolError>;
 
@@ -151,6 +153,12 @@ pub struct ToolContext {
     /// check. `None` when not wired (argv-mode boots, tests that don't
     /// exercise secrets); consumers must fail-closed.
     pub secrets: Option<Arc<dyn SecretAccess>>,
+    /// Optional resolver for **virtual** reads (paths with no on-disk backing,
+    /// e.g. the session transcript). [`builtin::read::ReadTool`] consults it
+    /// before the filesystem; `None` (most call sites) means every `Read` hits
+    /// the real filesystem. The resolver self-enforces access control via
+    /// [`VirtualReadAccess`].
+    pub virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
 }
 
 /// Severity of a [`SessionNotifier`] event. Matches

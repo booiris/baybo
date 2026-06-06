@@ -92,7 +92,7 @@ An `LlmCall` span records what the model saw in `begin.input_messages`
 (`LlmCallInputs`), which has two shapes:
 
 - **`Inline(Vec<ChatMessage>)`** — messages embedded directly. Used only when the
-  input is genuinely not in any session log. Self-contained (cannot desync) but
+  input is genuinely not in `session_messages`. Self-contained (cannot desync) but
   costs the full message bytes per span.
 - **`Persisted { last_ordinal, prefix_len, suffix }`** — a *reference* to the
   `session_messages` active-as-of-`last_ordinal` slice (the ordinal log in

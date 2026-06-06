@@ -361,6 +361,25 @@ impl AgentTestHarnessBuilder {
         let tool_registry = Arc::new(tool_registry);
         let skill_registry = Arc::new(SkillRegistry::new());
         let approval_gates = Arc::new(ApprovalGateMap::new());
+        let memory_session_store = Arc::new(aura_session::test_support::MemorySessionStore::new());
+        // Mirror production's "session row exists before the actor spawns"
+        // shape so cross-session lookups (`on_session_end` →
+        // `SessionManager::history`, and the transcript-read intercept →
+        // `SessionManager::full_transcript`) find the row instead of NotFound-ing.
+        memory_session_store.seed_session(&session);
+        let session_store =
+            Arc::clone(&memory_session_store) as Arc<dyn aura_session::SessionStore>;
+        let summary_store = Arc::new(aura_session::test_support::MemorySessionSummaryStore::new())
+            as Arc<dyn aura_session::SessionSummaryStore>;
+        let session_manager = Arc::new(aura_agent::SessionManager::new(
+            session_store,
+            summary_store,
+        ));
+        let virtual_reads: Option<Arc<dyn aura_tools::VirtualReadResolver>> =
+            Some(Arc::new(aura_agent::SessionTranscriptReader::new(
+                Arc::clone(&session_manager) as Arc<dyn aura_agent::SessionTranscript>,
+                aura_workspace::WorkspacePaths::new(std::path::PathBuf::from("/tmp")),
+            )));
         let tool_executor = Arc::new(ToolExecutor::new(
             tool_registry.clone(),
             approval_gates,
@@ -368,6 +387,7 @@ impl AgentTestHarnessBuilder {
             std::path::PathBuf::from("/tmp"),
             aura_workspace::WorkspacePaths::new(std::path::PathBuf::from("/tmp")),
             None,
+            virtual_reads,
         ));
 
         // Tokenizer model id must match the LLM client's so
@@ -384,19 +404,6 @@ impl AgentTestHarnessBuilder {
         let keep_recent = self.keep_recent.unwrap_or(50);
         let compression_threshold = self.compression_threshold.unwrap_or(0.95);
         let token_calibration = Arc::new(aura_context::TokenCalibration::new());
-        let memory_session_store = Arc::new(aura_session::test_support::MemorySessionStore::new());
-        // Mirror production's "session row exists before the actor spawns"
-        // shape so cross-session lookups (today: `on_session_end` →
-        // `SessionManager::history`) find the row instead of NotFound-ing.
-        memory_session_store.seed_session(&session);
-        let session_store =
-            Arc::clone(&memory_session_store) as Arc<dyn aura_session::SessionStore>;
-        let summary_store = Arc::new(aura_session::test_support::MemorySessionSummaryStore::new())
-            as Arc<dyn aura_session::SessionSummaryStore>;
-        let session_manager = Arc::new(aura_agent::SessionManager::new(
-            session_store,
-            summary_store,
-        ));
         let soul_text = self
             .soul_prompt
             .unwrap_or_else(|| "You are Aura, a test assistant.".into());
@@ -425,7 +432,6 @@ impl AgentTestHarnessBuilder {
             session_id: session.id.clone(),
             sessions: Arc::clone(&session_manager),
             subagent_profile: Some((subagent_registry, "harness".to_string())),
-            session_log: None,
         });
 
         let guarded_llm = aura_llm::BillableLlm::new(

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `janitor` crate (`aura-janitor`) runs best-effort, cadence-driven maintenance **outside** the agent loop: three filesystem TTL sweeps and one database retention sweep. It does **not** do storage compaction (there is no `VACUUM`); the only table it touches is `channel_pairings`.
+The `janitor` crate (`aura-janitor`) runs best-effort, cadence-driven maintenance **outside** the agent loop: two filesystem TTL sweeps and one database retention sweep. It does **not** do storage compaction (there is no `VACUUM`); the only table it touches is `channel_pairings`.
 
 A single `Janitor` struct holds the `WorkspacePaths` plus two optional dependencies wired by builders — the pairing store and the sidecar-cache view. `Janitor::run(shutdown)` sweeps once at boot, then ticks every `TICK_INTERVAL` (12h) until `shutdown` resolves. Each sweep is best-effort: a failure in one is logged and the others still run.
 
@@ -10,7 +10,6 @@ A single `Janitor` struct holds the `WorkspacePaths` plus two optional dependenc
 
 | Sweep | TTL | Target | Cadence |
 |-------|-----|--------|---------|
-| Session logs | `SESSION_LOG_TTL` = 15 days | `WorkspacePaths::sessions_log_dir()`, `*.jsonl` (`is_session_log`) | every `TICK_INTERVAL` (12h) |
 | Log files | `LOG_FILE_TTL` = 30 days | `logs_dir()` + `channel_logs_dir()` (`is_log_file`) | every `TICK_INTERVAL` (12h) |
 | Pairing rows | `PAIRING_APPROVAL_TTL` = 7 days (approved) | `channel_pairings` via `ChannelPairingStore::purge_expired` | every `PAIRING_SWEEP_INTERVAL` (1h), plus once per 12h tick |
 | Sidecar cache | `SIDECAR_CACHE_TTL` = 7 days | `$XDG_CACHE_HOME/aura/sidecars/` stale `<name>-<hash>` dirs | every `SIDECAR_SWEEP_INTERVAL` (24h) |
@@ -18,7 +17,7 @@ A single `Janitor` struct holds the `WorkspacePaths` plus two optional dependenc
 ### Public surface
 
 - **`Janitor`** — `new(paths)`; builders `with_pairing_store(Arc<dyn ChannelPairingStore>)` and `with_sidecar_cache(SidecarCache)`; sweep entry points `sweep_once()`, `sweep_pairings_once(now)`, `sweep_sidecar_cache()`; and the `run(shutdown)` loop.
-- **`JanitorReport`** — per-sweep counts (`session_logs_removed`, `log_files_removed`, `sidecar_dirs_removed`, `pairings_purged`).
+- **`JanitorReport`** — per-sweep counts (`log_files_removed`, `sidecar_dirs_removed`, `pairings_purged`).
 - **`SidecarCache`** — `cache_root: PathBuf` + `live_dirs: HashSet<String>` (the `<name>-<hash>` set the running Aura currently has materialised).
 - **`JanitorError`** — single `Filesystem { path, source }` variant.
 

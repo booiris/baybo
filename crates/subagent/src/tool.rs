@@ -631,6 +631,7 @@ mod tests {
             events: aura_tools::noop_event_sink(),
             llm: None,
             secrets: None,
+            virtual_reads: None,
         }
     }
 

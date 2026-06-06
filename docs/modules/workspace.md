@@ -21,7 +21,7 @@ The workspace root is the single **project root** for the entire runtime: every 
   agents/          # standalone git repo: subagent profile definitions
   state/           # not version-controlled: storage.db, aura.lock, channel.port, browser/profile
   work/            # not version-controlled: .uv/ (uv cache + downloaded pythons + tools), future scratch
-  logs/            # not version-controlled: aura.log.<date>, channel/<type>.log.<date>, sessions/<id>.jsonl
+  logs/            # not version-controlled: aura.log.<date>, channel/<type>.log.<date> (sessions/<id>.jsonl is a virtual path, never written)
 ```
 
 | Field            | Default | Role                                        |
@@ -46,7 +46,7 @@ checkout rather than polluting the real user home.
 | uv state         | `<workspace.path>/work/.uv/{cache,python,tools,bin}/` |
 | gateway logs     | `<workspace.path>/logs/aura.log.<date>`    |
 | channel logs     | `<workspace.path>/logs/channel/<channel_type>.log.<date>` |
-| session logs     | `<workspace.path>/logs/sessions/<session_id>.jsonl` |
+| session transcript (virtual) | `<workspace.path>/logs/sessions/<session_id>.jsonl` (no file; the compaction recovery pointer, served from `session_messages` on read) |
 
 New subsystem files belong as a method on `WorkspacePaths`, not as another `workspace_root.join("…")` call site.
 

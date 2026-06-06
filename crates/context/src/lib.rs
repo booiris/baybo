@@ -4,7 +4,6 @@ pub mod calibration;
 pub mod compressor;
 pub mod error;
 pub mod prompts;
-pub mod session_log;
 pub mod tokenizer;
 
 pub use background_summary::{
@@ -16,9 +15,6 @@ pub use calibration::TokenCalibration;
 pub use compressor::{CompressOutput, parse_summary_response};
 pub use error::ContextError;
 pub use prompts::compression::SUMMARIZE_INSTRUCTION;
-pub use session_log::{
-    LlmCallOutcome, LlmCallRecord, LlmRequestMeta, LlmResponseMeta, SessionLlmLogger,
-};
 pub use tokenizer::{TiktokenTokenizer, Tokenizer};
 
 // ---------------------------------------------------------------------------
@@ -200,10 +196,6 @@ pub struct ContextManager {
     /// `reseed_system_row` after each compaction, so a source edit (workspace
     /// soul *or* subagent profile) lands on the next compaction.
     subagent_profile: Option<(Arc<aura_subagent::SubagentRegistry>, String)>,
-    /// Per-session JSONL logger. [`Self::append`] mirrors each persisted message
-    /// here; the owning `AgentLoop` reaches it via [`Self::session_log`] to log
-    /// LLM calls. `None` in tests / single-shot harnesses that don't wire one.
-    session_log: Option<Arc<SessionLlmLogger>>,
     /// Boundary the trigger gate measures from. Set to `messages.len()`
     /// after every compression apply and reconstructed from
     /// `session_summaries.cursor` on cold start.
@@ -262,10 +254,6 @@ pub struct ContextManagerConfig {
     /// resolving it to a prompt is context's job, so an edited profile is
     /// picked up like an edited workspace soul.
     pub subagent_profile: Option<(Arc<aura_subagent::SubagentRegistry>, String)>,
-    /// Per-session JSONL event logger (messages + LLM calls). `None` in tests /
-    /// single-shot harnesses. [`ContextManager::append`] logs messages to it;
-    /// `AgentLoop` logs LLM calls via [`ContextManager::session_log`].
-    pub session_log: Option<Arc<SessionLlmLogger>>,
 }
 
 impl ContextManager {
@@ -289,7 +277,6 @@ impl ContextManager {
             session_id: config.session_id,
             sessions: config.sessions,
             subagent_profile: config.subagent_profile,
-            session_log: config.session_log,
             last_summary_anchor: None,
             last_synced_cursor: None,
             task_reminder: None,
@@ -704,9 +691,7 @@ impl ContextManager {
         self.messages.push(msg.clone());
         self.per_message_tokens.push(count);
         self.budget.update(self.count_tokens());
-        let ordinal = self.persist_appended(msg).await;
-        self.log_message_to_session_log(msg).await;
-        ordinal
+        self.persist_appended(msg).await
     }
 
     /// Append a mid-turn user interjection as a faithful user-bubble row. The
@@ -758,63 +743,6 @@ impl ContextManager {
                 .cloned(),
         );
         self.tokenizer.count_message(&ChatMessage::user(framed))
-    }
-
-    /// Read-only access to the session JSONL logger so the owning `AgentLoop`
-    /// can record LLM calls against the same per-session file. `None` when no
-    /// logger is wired (tests / single-shot harnesses).
-    pub fn session_log(&self) -> Option<&Arc<SessionLlmLogger>> {
-        self.session_log.as_ref()
-    }
-
-    /// Mirror a persisted message to the session JSONL log, if one is wired.
-    /// Best-effort: the durable transcript lives in `session_messages`, so a
-    /// log-write error is warned and swallowed.
-    async fn log_message_to_session_log(&self, msg: &ChatMessage) {
-        if let Some(logger) = &self.session_log
-            && let Err(e) = logger.log_message(&self.session_id, msg).await
-        {
-            warn!(
-                session_id = %self.session_id,
-                error = %e,
-                "failed to append session message log"
-            );
-        }
-    }
-
-    /// Assemble + append an LLM-call record to the session JSONL log. No-op
-    /// without a logger. The owning `AgentLoop` calls this on its LLM-call path
-    /// with the call's request/outcome + the model info from its `BillableLlm`
-    /// (which context doesn't hold) — so the record format + the write live
-    /// here, while the model identity stays the agent's to supply.
-    pub async fn log_llm_call(
-        &self,
-        request: &ChatRequest,
-        outcome: LlmCallOutcome,
-        provider: &str,
-        model: &str,
-    ) {
-        let Some(logger) = &self.session_log else {
-            return;
-        };
-        let request = match LlmRequestMeta::from_request(request) {
-            Ok(meta) => meta,
-            Err(e) => {
-                warn!(error = %e, "failed to summarize llm request for session log");
-                return;
-            }
-        };
-        let record = LlmCallRecord {
-            timestamp: chrono::Utc::now(),
-            session_id: self.session_id.clone(),
-            provider: provider.to_string(),
-            model: model.to_string(),
-            request,
-            outcome,
-        };
-        if let Err(e) = logger.log_llm_call(&record).await {
-            warn!(error = %e, "failed to append session llm log");
-        }
     }
 
     /// Append a message to the in-memory transcript + token budget
@@ -2141,7 +2069,6 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
-            session_log: None,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx
@@ -2322,7 +2249,6 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
-            session_log: None,
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "small seed")).await;
@@ -2385,7 +2311,6 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: Some((Arc::clone(&registry), "test-agent".to_string())),
-            session_log: None,
         });
         ctx.set_active_model_context_window(100_000);
         ctx.append(&make_msg(Role::System, "SUBAGENT_PROFILE"))
@@ -2840,7 +2765,6 @@ mod tests {
             session_id: test_session_id(),
             sessions: test_sessions(),
             subagent_profile: None,
-            session_log: None,
         });
         ctx.set_active_model_context_window(max_tokens);
         ctx

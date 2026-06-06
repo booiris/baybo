@@ -11,7 +11,7 @@ use aura_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
 use aura_tools::{
     ApprovalDecision, ApprovalGateMap, ApprovalHandle, ApprovalRequest, ApprovedResource,
     ExecSandbox, ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
-    ToolRegistry, approval::preview_params,
+    ToolRegistry, VirtualReadResolver, approval::preview_params,
 };
 use aura_trace::{
     LifecycleOutcome, SpanEventKind, SpanFinalize, SpanKind, SpanRecorder, StepHandle,
@@ -190,6 +190,10 @@ pub struct ToolExecutor {
     /// Forwarded to [`ToolContext::workspace_paths`].
     workspace_paths: aura_workspace::WorkspacePaths,
     sandbox_runner: Option<Arc<dyn SandboxRunner>>,
+    /// Resolver for virtual reads (e.g. the session transcript), forwarded into
+    /// every [`ToolContext`] this executor builds; `ReadTool` consults it before
+    /// the filesystem. `None` ⇒ no virtual reads wired.
+    virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
 }
 
 impl ToolExecutor {
@@ -200,6 +204,7 @@ impl ToolExecutor {
         workspace_root: PathBuf,
         workspace_paths: aura_workspace::WorkspacePaths,
         sandbox_runner: Option<Arc<dyn SandboxRunner>>,
+        virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
     ) -> Self {
         Self {
             tool_registry,
@@ -208,6 +213,7 @@ impl ToolExecutor {
             workspace_root,
             workspace_paths,
             sandbox_runner,
+            virtual_reads,
         }
     }
 
@@ -503,6 +509,9 @@ impl ToolExecutor {
                     secrets: Some(
                         Arc::clone(&self.security_gateway) as Arc<dyn aura_tools::SecretAccess>
                     ),
+                    // `ReadTool` consults this before the filesystem; today
+                    // just the session transcript. Cheap clone (Arc bump).
+                    virtual_reads: self.virtual_reads.clone(),
                 };
 
                 // Reveal placeholders in the tool's arguments just
@@ -515,7 +524,9 @@ impl ToolExecutor {
                     .await
                     .map_err(|e| anyhow::anyhow!("reveal_in_value: {e}"))?;
 
-                // Execute with timeout enforcement.
+                // Execute with timeout enforcement. A `Read` of a virtual path
+                // (e.g. the session transcript) is served inside `ReadTool` from
+                // `ctx.virtual_reads` before it touches the filesystem.
                 let outer_deadline = ctx.timeout + APPROVAL_HEADROOM;
                 let result = tokio::time::timeout(
                     outer_deadline,

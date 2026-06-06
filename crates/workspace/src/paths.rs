@@ -17,7 +17,7 @@
 //!   .key/              # not version-controlled: encryption.key
 //!   state/             # not version-controlled: storage.db, aura.lock, channel.port, browser/profile
 //!   work/              # not version-controlled: sandbox FS scope; .uv/ (uv cache + downloaded pythons + tools), other scratch
-//!   logs/              # not version-controlled: aura.log.YYYY-MM-DD, channel/<type>.log, sessions/<id>.jsonl
+//!   logs/              # not version-controlled: aura.log.YYYY-MM-DD, channel/<type>.log (sessions/<id>.jsonl is virtual — never written)
 //! ```
 //!
 //! `config/`, `profile/`, and `skills/` each get their own `.git` repo on
@@ -160,13 +160,14 @@ pub const LOG_FILE_PREFIX: &str = "aura.log";
 /// (`<channel_type>.log.YYYY-MM-DD`).
 pub const CHANNEL_LOGS_SUBDIR: &str = "channel";
 
-/// Per-session LLM call logs land under [`LOGS_DIR`]`/`[`SESSIONS_LOG_SUBDIR`]
-/// as `<session_id>.jsonl`. One line per LLM call: input messages,
-/// parameters, and the response (or error) plus latency / model metadata.
+/// Subdir under [`LOGS_DIR`] for the virtual per-session transcript path
+/// `<session_id>.jsonl` (see [`WorkspacePaths::session_log_file`]). No file
+/// is written here; the path is the post-compaction recovery pointer the
+/// agent serves from the durable transcript.
 pub const SESSIONS_LOG_SUBDIR: &str = "sessions";
 
-/// Per-session JSONL files inside [`SESSIONS_LOG_SUBDIR`] are named
-/// `<session_id>.<SESSION_LOG_EXTENSION>`.
+/// Extension of the virtual per-session transcript path inside
+/// [`SESSIONS_LOG_SUBDIR`]: `<session_id>.<SESSION_LOG_EXTENSION>`.
 pub const SESSION_LOG_EXTENSION: &str = "jsonl";
 
 // ---------------------------------------------------------------------------
@@ -388,9 +389,9 @@ impl WorkspacePaths {
         self.logs_dir().join(CHANNEL_LOGS_SUBDIR)
     }
 
-    /// Per-session LLM call log directory:
-    /// `<root>/logs/sessions/`. Each session writes one
-    /// `<session_id>.jsonl` file inside this directory.
+    /// Parent of the virtual per-session transcript path:
+    /// `<root>/logs/sessions/`. No files are written here; see
+    /// [`Self::session_log_file`].
     pub fn sessions_log_dir(&self) -> PathBuf {
         self.logs_dir().join(SESSIONS_LOG_SUBDIR)
     }
@@ -464,10 +465,12 @@ impl WorkspacePaths {
         self.session_state_dir(session_id).join(SUMMARY_FILE_TMP)
     }
 
-    /// Per-session JSONL transcript log:
-    /// `<root>/logs/sessions/<sanitized_session_id>.jsonl`. Sanitization
-    /// matches the writer in [`aura_agent::session_log`] so the path
-    /// resolved here is the one the SessionLlmLogger appends to.
+    /// Virtual per-session transcript path:
+    /// `<root>/logs/sessions/<sanitized_session_id>.jsonl`. No file is
+    /// written here — the compaction summary embeds this path as a
+    /// `read the full transcript at <path>` pointer, and a `Read` of it is
+    /// served from the durable `session_messages` transcript (see the
+    /// session-transcript read intercept in `aura-agent`'s tool executor).
     pub fn session_log_file(&self, session_id: &str) -> PathBuf {
         self.sessions_log_dir().join(format!(
             "{}.{}",
@@ -513,11 +516,9 @@ impl WorkspacePaths {
 }
 
 /// Replace any character that isn't `[A-Za-z0-9_\-.]` with `_`, then
-/// prefix `_` if the result is empty or starts with `.`. Used to map
-/// a `SessionId` onto a safe filename component for the per-session
-/// JSONL transcript log. Both [`WorkspacePaths::session_log_file`]
-/// and `aura-agent`'s `SessionLlmLogger` route through this so the
-/// resolved path is identical on both sides.
+/// prefix `_` if the result is empty or starts with `.`. Maps a
+/// `SessionId` onto a safe filename component for the virtual per-session
+/// transcript path ([`WorkspacePaths::session_log_file`]).
 pub fn sanitize_session_id(id: &str) -> String {
     let mut out = String::with_capacity(id.len());
     for ch in id.chars() {

@@ -75,5 +75,6 @@ pub fn tool_context(user_id: &str) -> ToolContext {
         events: aura_tools::noop_event_sink(),
         llm: None,
         secrets: None,
+        virtual_reads: None,
     }
 }

@@ -127,6 +127,7 @@ mod tests {
             events: crate::noop_event_sink(),
             llm: None,
             secrets: None,
+            virtual_reads: None,
         }
     }
 
