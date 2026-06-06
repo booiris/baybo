@@ -6,6 +6,22 @@ edition.workspace = true
 [lib]
 doctest = false
 
+[features]
+# Gates the `chat_smoke` test probe (see `[[bin]]` below) so it never
+# builds or ships in a release build. `cargo test` turns it on via the
+# dev-dependency self-reference, which makes `CARGO_BIN_EXE_chat_smoke`
+# available to `tests/chat_render.rs`.
+test-support = []
+
+# Stub-WS chat-TUI probe driven by `tests/chat_render.rs` inside a tmux
+# pane. Test-only; built only when `test-support` is enabled.
+[[bin]]
+name = "chat_smoke"
+path = "src/bin/chat_smoke.rs"
+required-features = ["test-support"]
+test = false
+bench = false
+
 [dependencies]
 aura-model = { workspace = true }
 aura-tools = { workspace = true }
@@ -26,3 +42,9 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }
 shell-words = { workspace = true }
+
+[dev-dependencies]
+# Self-reference enables `test-support` while building this crate's tests,
+# which is what makes the `chat_smoke` bin (and its CARGO_BIN_EXE) exist.
+aura-tui = { workspace = true, features = ["test-support"] }
+aura-term-harness = { workspace = true }

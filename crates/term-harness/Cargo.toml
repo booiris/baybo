@@ -1,0 +1,10 @@
+[package]
+name = "aura-term-harness"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+thiserror = { workspace = true }

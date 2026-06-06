@@ -6,6 +6,17 @@ edition.workspace = true
 [lib]
 doctest = false
 
+# Test-only probe driven by `tests/picker_render.rs` inside a tmux pane.
+# Gated on `test-support` so it never builds (or ships) in a release build;
+# `cargo test` turns the feature on via the dev-dependency below, which is
+# what makes `CARGO_BIN_EXE_picker_probe` available to the test.
+[[bin]]
+name = "picker_probe"
+path = "src/bin/picker_probe.rs"
+required-features = ["test-support"]
+test = false
+bench = false
+
 [dependencies]
 aura-agent = { workspace = true }
 aura-channels = { workspace = true }
@@ -36,5 +47,6 @@ test-support = []
 [dev-dependencies]
 aura-setup = { workspace = true, features = ["test-support"] }
 aura-storage = { workspace = true, features = ["test-support"] }
+aura-term-harness = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
