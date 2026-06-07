@@ -4,11 +4,11 @@
 (`66c655b8`, `e0b2c840`, `425f108d`, `6d1d495d`), plus the `JobList`/`JobStop` tools
 (`6a18eca2`) and boot-time output-file retention (`7d449eb1`). The Phase-3 streaming
 question was resolved with a third option (two files, format-preserving) — see below.
-Not yet merged to master. **Remaining:** the Docker and sandbox-exec detached-spawn
-backends — neither builds/runs on a Linux host (sandbox-exec is `#![cfg(macos)]`;
-Docker needs `docker kill` + container-id capture, not a `kill_on_drop` of the
-`docker run` client), so they keep the safe kill-on-timeout fallback until done in a
-macOS / Docker environment. bwrap (the Linux default) is fully implemented.
+Not yet merged to master. Detached-spawn backends: **bwrap** (Linux default) and
+**Docker** (`48ac2f2a`, verified live against dockerd 29.4.1 via `--ignored` tests)
+are implemented; **sandbox-exec** (macOS) still falls back to kill-on-timeout — its
+per-call scratch tempdir (Workspace policy) can't outlive a detached child, and the
+file is `#![cfg(macos)]` so it can't be built/verified on a Linux host.
 
 ## Goal
 
@@ -273,7 +273,8 @@ fallback — impossible (the sandbox kills internally on timeout).
 - ✅ Output-file retention — DONE (`7d449eb1`): boot-time prune of
   `logs/background/*` older than 7 days.
 - ✅ `JobList` / `JobStop` — DONE (`6a18eca2`).
-- Docker / sandbox-exec detached backends (see Status) — kill-fallback today.
+- ✅ Docker detached backend — DONE (`48ac2f2a`). sandbox-exec (macOS) still
+  kill-fallback (see Status).
 - `JobStop` only reaches user-facing sessions (its `background_control` is gated
   like the sink); non-user sessions rely on `/stop`/shutdown. Likely leave as-is.
 - A per-session concurrency cap on detached commands (currently unbounded beyond
