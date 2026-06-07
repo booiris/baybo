@@ -1,8 +1,10 @@
 # Bash & Subagent Background Jobs — Timeout-to-Background + Subagent Groups
 
-**Status:** in progress. Phase 1 (substrate) + Phase 2 (subagent timeout→background)
-are built, tested, and committed on branch `background-jobs`. Phases 3 (bash) and 4
-(groups) remain — see "Phasing" + the open streaming-model question at the end.
+**Status:** implemented on branch `background-jobs` (commits `66c655b8`, `e0b2c840`,
+`425f108d`, `6d1d495d`). All four phases built + tested. The Phase-3 streaming
+question was resolved with a third option (two files, format-preserving) — see below.
+Not yet merged to master. Follow-ups: `JobList`/`JobStop` tools, the Docker/sandbox-exec
+detached-spawn backends, output-file retention.
 
 ## Goal
 
@@ -234,34 +236,33 @@ runtime/background_jobs.rs sink + command escort), `aura-context`
    enum param (background|kill), router-side conversion (pinned terminal future
    across a 2-min `select!`), process-token anchoring for convertible spawns,
    gated to user-facing parents via `parent_supports_background`. Tested.
-3. ⏳ **Bash timeout-to-background** — `BackgroundJobSink` + `RunningChild` traits,
-   `ExecSandbox`/`SandboxRunner` detached spawn, command escort, output streaming,
-   `JobList`/`JobStop`. The heavy lift — blocked on the streaming-model decision below.
-4. ⏳ **Group barrier** (`group` param, `background_groups`, turn-end seal hook,
-   drain filter, 30-min group timer + partial/dissolve). Builds on Phase 3.
+3. ✅ **Bash timeout-to-background** — DONE (commit `425f108d`). `BackgroundJobSink`
+   + `RunningChild` + `TokioRunningChild`, `ExecSandbox`/`SandboxRunner` detached
+   spawn (bwrap; docker/sandbox-exec fall back to kill), `BackgroundJobManager`
+   escort, per-job two-file output streaming, `on_timeout` param, user-facing gate
+   via `Session::supports_background_jobs()`. `JobList`/`JobStop` deferred.
+4. ✅ **Group barrier** — DONE (commit `6d1d495d`). `group` param (forces background),
+   `SessionState.background_groups` + `GroupState`, agent-loop member counting,
+   turn-end seal, `check_groups` release of complete/timed-out cohorts, 30-min
+   partial-fire + dissolve, idle-loop timeout enforcement.
 
-## Open question surfaced while scoping Phase 3 — output streaming model
+## Resolved: output streaming model — chose two files (format-preserving)
 
-The current sandbox API (`SandboxRunner::run` / `ExecSandbox::spawn_command`) waits
-internally and returns a finished `SandboxedOutput` with **separate** `stdout` /
-`stderr` — it never hands back a live child. To background a command we must use a
-new detached-spawn path that returns a `RunningChild`. But we can't know in advance
-whether a command will time out, so **every** convertible (user-session) bash call
-would go through the detached path. That forces a choice:
+The dilemma below was resolved with a third option not in the original list:
 
-- **(A) Merged log file.** Detached path streams stdout+stderr interleaved into one
-  `logs/background/<job_id>.log`. Simple + natural for a background log + a
-  notification tail. Cost: convertible foreground commands lose the separate
-  stdout/stderr fields in their tool result (behaviour change for the common path).
-- **(B) Dual-stream handoff.** Capture stdout/stderr separately during the
-  foreground window (preserving today's result shape), and on timeout transfer the
-  in-flight readers to the escort to keep streaming. Preserves the contract but the
-  reader-ownership transfer across the foreground→background boundary is fiddly.
-- **(C) Keep `spawn_command` for the foreground window, detached only as fallback.**
-  Not possible with the current sandbox API (it kills internally on timeout).
+**Two files (chosen).** The detached path streams stdout and stderr to *separate*
+capped files (`logs/background/<id>.{out,err}`) via `tokio::io::copy`. A command that
+completes in the foreground window reads both back → its result keeps the normal
+separate `{exit_code, stdout, stderr}` shape (**no behaviour change**); one that
+overruns hands the live child + the two copy-task handles to the escort. This avoids
+both the merged-log behaviour change (A) and the fiddly reader-ownership transfer (B),
+and streaming-to-disk (capped at 10 MiB/stream) keeps a long job's output unbounded by
+memory while a runaway producer still gets EPIPE.
 
-This is a real product/contract call (does convertible bash keep separate
-stdout/stderr?) and is the right place to check in before building the subsystem.
+For the record, the rejected options were: (A) merged interleaved log — simplest but
+changed the foreground result shape; (B) dual-stream in-flight handoff — preserved the
+shape but needed reader-ownership transfer across the boundary; (C) detached only as a
+fallback — impossible (the sandbox kills internally on timeout).
 
 ## Open items
 
