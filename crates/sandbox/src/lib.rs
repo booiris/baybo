@@ -29,6 +29,23 @@ pub trait SandboxRunner: Send + Sync {
     async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError>;
     fn backend(&self) -> Backend;
 
+    /// Spawn the command **detached**: return a live `tokio::process::Child`
+    /// immediately instead of running it to completion. The caller owns the
+    /// foreground wait, timeout, and output streaming — used by the agent's
+    /// "Bash timeout → background" path. `spec.timeout` is ignored (the
+    /// caller times out). Default: unsupported; the agent's `SandboxAdapter`
+    /// surfaces the error and the tool falls back to the blocking `run`
+    /// (kill-on-timeout). Backends that own a `tokio::process::Child`
+    /// (bwrap, sandbox-exec) override this; the Docker backend does not.
+    async fn spawn_detached(
+        &self,
+        _spec: SandboxSpec,
+    ) -> Result<tokio::process::Child, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "detached spawn is not supported by this sandbox backend".into(),
+        ))
+    }
+
     /// Optional readiness step run once at gateway startup before any
     /// `run()` calls. The Docker backend uses it to ensure the
     /// configured image is present locally and to pin its digest, so

@@ -7,7 +7,9 @@ use aura_sandbox::{
     EnvPolicy, FilesystemPolicy, NetworkPolicy, ResourceLimits, SandboxRunner, SandboxSpec,
     StdinSource,
 };
-use aura_tools::{ExecSandbox, SandboxedOutput, SpawnOpts, ToolError};
+use aura_tools::{
+    ExecSandbox, RunningChild, SandboxedOutput, SpawnOpts, TokioRunningChild, ToolError,
+};
 
 pub struct SandboxAdapter {
     runner: Arc<dyn SandboxRunner>,
@@ -96,16 +98,17 @@ impl SandboxAdapter {
         self.readable_paths = paths.into_iter().filter(|p| p.exists()).collect();
         self
     }
-}
 
-#[async_trait]
-impl ExecSandbox for SandboxAdapter {
-    async fn spawn_command(
+    /// Validate the cwd and build the [`SandboxSpec`] — shared by the
+    /// blocking [`ExecSandbox::spawn_command`] and the detached
+    /// [`ExecSandbox::spawn_command_detached`] so both enforce the same
+    /// FS scope and policy.
+    fn build_spec(
         &self,
         program: &Path,
         args: &[String],
         opts: SpawnOpts,
-    ) -> Result<SandboxedOutput, ToolError> {
+    ) -> Result<SandboxSpec, ToolError> {
         if let Some(requested) = opts.cwd.as_deref()
             && self.cwd_must_be_in_workspace
         {
@@ -139,7 +142,7 @@ impl ExecSandbox for SandboxAdapter {
                 extra: opts.extra_env,
             }
         };
-        let spec = SandboxSpec {
+        Ok(SandboxSpec {
             program: program.to_path_buf(),
             args: args.to_vec(),
             cwd: opts.cwd,
@@ -156,7 +159,19 @@ impl ExecSandbox for SandboxAdapter {
             timeout: opts.timeout,
             resource_limits: self.resource_limits,
             filesystem_policy: self.filesystem_policy.clone(),
-        };
+        })
+    }
+}
+
+#[async_trait]
+impl ExecSandbox for SandboxAdapter {
+    async fn spawn_command(
+        &self,
+        program: &Path,
+        args: &[String],
+        opts: SpawnOpts,
+    ) -> Result<SandboxedOutput, ToolError> {
+        let spec = self.build_spec(program, args, opts)?;
 
         match self.runner.run(spec).await {
             Ok(out) => Ok(SandboxedOutput {
@@ -171,6 +186,19 @@ impl ExecSandbox for SandboxAdapter {
                 stderr: Vec::new(),
                 timed_out: true,
             }),
+            Err(e) => Err(ToolError::Execution(e.to_string())),
+        }
+    }
+
+    async fn spawn_command_detached(
+        &self,
+        program: &Path,
+        args: &[String],
+        opts: SpawnOpts,
+    ) -> Result<Box<dyn RunningChild>, ToolError> {
+        let spec = self.build_spec(program, args, opts)?;
+        match self.runner.spawn_detached(spec).await {
+            Ok(child) => Ok(Box::new(TokioRunningChild(child))),
             Err(e) => Err(ToolError::Execution(e.to_string())),
         }
     }

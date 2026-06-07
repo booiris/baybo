@@ -1042,6 +1042,10 @@ impl AgentLoop {
         let executor = Arc::clone(&self.tool_executor);
         let session_id_for_calls = session.id.clone();
         let user_for_calls = session.user.clone();
+        // Gate (Copy, captured per closure): only a user-facing session may
+        // background a slow command — keeps cron / nested-subagent bash on
+        // kill-on-timeout. Mirrors the subagent-conversion gate.
+        let background_eligible = session.supports_background_jobs();
         let recorder_for_calls = Arc::clone(span_recorder);
         let step_for_calls = step.clone();
         let notifier_for_calls = notifier.clone();
@@ -1099,6 +1103,7 @@ impl AgentLoop {
                         cancel,
                         notifier,
                         Some(&bind_source),
+                        background_eligible,
                     )
                     .await
             }

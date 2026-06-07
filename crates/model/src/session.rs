@@ -204,6 +204,23 @@ pub struct Session {
     pub hidden: bool,
 }
 
+impl Session {
+    /// Whether this session can host background jobs (detached subagents
+    /// or detached `Bash` commands). Only a live, registered, top-level
+    /// **user** session can run the autonomous notification turn that
+    /// delivers a background result, so cron sessions (one-shot +
+    /// unregistered) and subagent sessions (their turn ends with the
+    /// child) are out of scope and keep blocking / kill-on-timeout
+    /// behaviour. See `docs/todo/background-jobs.md`.
+    pub fn supports_background_jobs(&self) -> bool {
+        matches!(self.trigger, TriggerSource::User)
+            && match &self.lineage {
+                None => true,
+                Some(l) => !matches!(l.kind, LineageKind::Subagent),
+            }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionState {
     /// Number of context compressions performed in this session.

@@ -393,6 +393,7 @@ mod tests {
             llm: None,
             secrets: None,
             virtual_reads: None,
+            background_jobs: None,
         }
     }
 

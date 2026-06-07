@@ -9,7 +9,7 @@ use aura_model::{
     BACKGROUND_SUBAGENT_HANDLE_PREFIX, ChannelType, ChatMessage, ContentBlock, ExternalAgentKind,
     JobId, Lineage, LineageKind, MessageMetadata, OnTimeout, PendingBackgroundResult,
     SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend, SubagentExitStatus,
-    SubagentResult, SubagentSpawnRequest, TriggerKind, TriggerSource, User,
+    SubagentResult, SubagentSpawnRequest, TriggerKind, User,
 };
 use chrono::Utc;
 use futures::StreamExt;
@@ -37,18 +37,12 @@ const SUBAGENT_OUTPUT_BUFFER: usize = 64;
 /// or kill). Fixed — see `docs/todo/background-jobs.md`.
 const SUBAGENT_FOREGROUND_WAIT: Duration = Duration::from_secs(120);
 
-/// Whether a parent session can host a background job: only a live,
-/// registered, top-level **user** session can run the autonomous
-/// notification turn that delivers a converted subagent's result. Cron
-/// sessions are one-shot + unregistered, and nested-subagent parents end
-/// with their own turn, so neither is a valid notification target — they
-/// keep the block-until-terminal foreground behaviour.
+/// Whether a parent session can host a background job — delegates to the
+/// shared [`aura_model::Session::supports_background_jobs`] so the router
+/// (subagent conversion) and the agent loop (bash sink injection) gate on
+/// one definition.
 fn parent_supports_background(session: &Session) -> bool {
-    matches!(session.trigger, TriggerSource::User)
-        && match &session.lineage {
-            None => true,
-            Some(l) => !matches!(l.kind, LineageKind::Subagent),
-        }
+    session.supports_background_jobs()
 }
 
 impl Router {

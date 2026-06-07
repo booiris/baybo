@@ -129,6 +129,10 @@ pub struct ManagerGraph {
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
     pub tool_executor: Arc<ToolExecutor>,
+    /// Deferred supervisor handle for the background-job manager (built
+    /// with the `tool_executor`, before the supervisor exists). `wire_router`
+    /// sets it once the supervisor is built so command escorts can route.
+    pub bg_supervisor_slot: Arc<std::sync::OnceLock<AgentSupervisor>>,
     /// Subagent profile registry — `wire_router` hands it to a spawned
     /// subagent's `ContextManager`, which resolves the child's system prompt
     /// from it by profile name.
@@ -620,6 +624,14 @@ pub async fn build_managers(
             workspace_paths.clone(),
         )));
 
+    // Background-job sink for "Bash timeout → background". The manager
+    // routes completion notifications via the supervisor, which is built
+    // further down, so it holds it behind a `OnceLock` set right after.
+    let bg_supervisor_slot = Arc::new(std::sync::OnceLock::new());
+    let background_jobs: Option<Arc<dyn aura_tools::BackgroundJobSink>> = Some(Arc::new(
+        aura_agent::BackgroundJobManager::new(Arc::clone(&bg_supervisor_slot)),
+    ));
+
     // `ToolExecutor` doesn't store an LLM handle; the active
     // `BillableLlm` is passed in per `execute` call and bound to the
     // tool span there, so a tool's side-LLM call bills against the
@@ -632,6 +644,7 @@ pub async fn build_managers(
         workspace_paths.clone(),
         sandbox_runner,
         virtual_reads,
+        background_jobs,
     ));
 
     // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and
@@ -684,6 +697,7 @@ pub async fn build_managers(
         job_lifecycle,
         cron_scheduler,
         security_gateway,
+        bg_supervisor_slot,
         skill_registry,
         tool_registry,
         tool_executor,
@@ -747,6 +761,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let (response_tx, response_rx) = mpsc::channel(buffer);
 
     let supervisor = AgentSupervisor::new(response_tx);
+    // Hand the now-built supervisor to the background-job manager so its
+    // escorts can route completion notifications back to parent sessions.
+    let _ = graph.bg_supervisor_slot.set(supervisor.clone());
 
     // Process-wide trace event bus. Stays for trace observers
     // (WebUI live stream etc.); `CostManager` no longer subscribes

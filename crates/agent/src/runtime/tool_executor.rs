@@ -194,9 +194,15 @@ pub struct ToolExecutor {
     /// every [`ToolContext`] this executor builds; `ReadTool` consults it before
     /// the filesystem. `None` ⇒ no virtual reads wired.
     virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
+    /// Runtime hook for backgrounding a slow command. Forwarded into a
+    /// [`ToolContext`] **only when the call is `background_eligible`** (a
+    /// user-facing session) — see [`Self::execute`]. `None` ⇒ no manager
+    /// wired (argv-mode boots, tests), so commands keep kill-on-timeout.
+    background_jobs: Option<Arc<dyn aura_tools::BackgroundJobSink>>,
 }
 
 impl ToolExecutor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tool_registry: Arc<ToolRegistry>,
         gate_map: Arc<ApprovalGateMap>,
@@ -205,6 +211,7 @@ impl ToolExecutor {
         workspace_paths: aura_workspace::WorkspacePaths,
         sandbox_runner: Option<Arc<dyn SandboxRunner>>,
         virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
+        background_jobs: Option<Arc<dyn aura_tools::BackgroundJobSink>>,
     ) -> Self {
         Self {
             tool_registry,
@@ -214,6 +221,7 @@ impl ToolExecutor {
             workspace_paths,
             sandbox_runner,
             virtual_reads,
+            background_jobs,
         }
     }
 
@@ -315,6 +323,9 @@ impl ToolExecutor {
         notifier: Option<Arc<dyn aura_tools::SessionNotifier>>,
         // `None` ⇒ tool's `ctx.llm` is unset (argv-mode / older tests).
         bind_source: Option<&Arc<BillableLlm>>,
+        // Whether this session may background work (user-facing session).
+        // Gates whether the [`BackgroundJobSink`] reaches the tool's ctx.
+        background_eligible: bool,
     ) -> anyhow::Result<ToolOutput> {
         debug!(tool = tool_name, "executing tool");
 
@@ -512,6 +523,14 @@ impl ToolExecutor {
                     // `ReadTool` consults this before the filesystem; today
                     // just the session transcript. Cheap clone (Arc bump).
                     virtual_reads: self.virtual_reads.clone(),
+                    // Gate: the background-job sink reaches a tool only for
+                    // user-facing sessions, so a command can convert to
+                    // background on timeout only there.
+                    background_jobs: if background_eligible {
+                        self.background_jobs.clone()
+                    } else {
+                        None
+                    },
                 };
 
                 // Reveal placeholders in the tool's arguments just

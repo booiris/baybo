@@ -250,6 +250,7 @@ mod tests {
             llm: None,
             secrets,
             virtual_reads: None,
+            background_jobs: None,
         }
     }
 
