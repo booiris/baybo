@@ -1,22 +1,41 @@
-//! Real-terminal smoke test for the inline-viewport chat TUI
+//! Real-terminal smoke + scenario test for the inline-viewport chat TUI
 //! (`crates/tui`).
 //!
-//! Unlike the picker, the chat UI needs a gateway to render anything, so
-//! the `chat_smoke` probe stands up an in-process stub that speaks
-//! `aura_channels::wire` and drives the *real* `TuiAdapter` + `WsTransport`
-//! against it. This test launches that probe in a tmux pane and asserts on
-//! the captured frames: the banner + input box render, a typed message
-//! draws its user line and the scripted assistant reply, the live region
-//! survives a resize, and Ctrl+C exits the process.
+//! The chat UI needs a gateway to render, so the `chat_smoke` probe stands
+//! up an in-process stub that speaks `aura_channels::wire` and drives the
+//! *real* `TuiAdapter` + `WsTransport`. This test launches that probe in a
+//! tmux pane and asserts on the captured frames in two complementary
+//! styles:
 //!
-//! Assertions stay structural (substring presence, process liveness)
-//! rather than pixel-exact — the inline-viewport resize path has a known,
-//! accepted cosmetic ghost frame, so a golden snapshot would be flaky by
-//! design. Each test self-skips when tmux is absent.
+//! - **Golden snapshots** (`tests/snapshots/*.snap`) for the clean, stable
+//!   frames (initial banner, a plain reply) — normalized to mask the
+//!   version string and the volatile working-indicator timer, so they
+//!   catch *unanticipated* visual drift. Regenerate after an intentional
+//!   UI change with `UPDATE_CHAT_SNAPSHOT=1 cargo test -p aura-tui --test
+//!   chat_render`.
+//! - **Structural assertions** for the dynamic scenarios (tool call,
+//!   subagent-as-tool, approval modal, dropped task list), where a golden
+//!   would be flaky or where the contract is "this must NOT render".
+//!
+//! ## The retry wrapper
+//!
+//! Driving the chat UI exposes a known, accepted race ([the resize-reflow
+//! notes]): a non-keyboard viewport rebuild queries cursor position
+//! (`ESC[6n`), and because dropping crossterm's `EventStream` doesn't
+//! synchronously stop its reader thread, a lingering blocking `stdin` read
+//! can steal the reply — the query then times out and the TUI process
+//! exits mid-turn. That race is orthogonal to what these tests check
+//! (rendering correctness), so [`run_chat`] retries a scenario on a fresh
+//! process when it *dies*, while a genuine render mismatch (process alive,
+//! output wrong/absent) still fails fast.
+//!
+//! Each test self-skips when tmux is absent so CI without tmux stays green.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
-use aura_term_harness::{Key, LaunchSpec, TmuxSession, tmux_available};
+use aura_term_harness::{HarnessError, Key, LaunchSpec, TmuxSession, tmux_available};
+use aura_tui::smoke_contract::*;
 
 /// Cargo builds the `chat_smoke` bin (its `test-support` required-feature
 /// is on during `cargo test`) and hands us its path — no nested cargo
@@ -25,107 +44,285 @@ const SMOKE_BIN: &str = env!("CARGO_BIN_EXE_chat_smoke");
 /// Heavier than the picker probe (links the full TUI graph and dials a WS),
 /// so allow extra startup slack before declaring a hang.
 const WAIT: Duration = Duration::from_secs(15);
+/// Fixed pane size so the golden snapshots are deterministic.
+const COLS: u16 = 90;
+const ROWS: u16 = 24;
+/// Fresh-process attempts before giving up — see the module note on the
+/// cursor-position race. Genuine render failures don't consume these (they
+/// panic immediately).
+const ATTEMPTS: usize = 4;
 
-/// Launch the chat smoke at a roomy size and wait for the first rendered
-/// frame, or return `None` when tmux is unavailable so the caller skips.
-fn launched() -> Option<TmuxSession> {
+/// Launch the probe, wait for the first frame, run `body`, and retry on a
+/// process death from the known cursor-position race. Self-skips without
+/// tmux. A render mismatch inside `body` panics and is *not* retried.
+fn run_chat<F>(name: &str, body: F)
+where
+    F: Fn(&TmuxSession) -> Result<(), String>,
+{
     if !tmux_available() {
-        eprintln!("skipping chat_render: tmux not on PATH");
-        return None;
+        eprintln!("skipping chat_render::{name}: tmux not on PATH");
+        return;
     }
-    let session =
-        TmuxSession::launch(LaunchSpec::new(SMOKE_BIN, 90, 24)).expect("launch chat_smoke");
-    session
-        .wait_until(WAIT, "chat banner + input box", |c| {
+    let mut last = String::new();
+    for attempt in 1..=ATTEMPTS {
+        let session =
+            TmuxSession::launch(LaunchSpec::new(SMOKE_BIN, COLS, ROWS)).expect("launch chat_smoke");
+        let result = wait_render(&session, "chat banner + input box", |c| {
             c.contains("Aura TUI") && c.contains("input")
         })
-        .expect("chat UI should render its first frame");
-    Some(session)
+        .and_then(|_| body(&session));
+        match result {
+            Ok(()) => return,
+            Err(e) => {
+                last = e;
+                eprintln!("chat_render::{name}: attempt {attempt}/{ATTEMPTS} died: {last}");
+            }
+        }
+    }
+    panic!("chat_render::{name}: failed after {ATTEMPTS} attempts: {last}");
+}
+
+/// Wait for `pred`. The harness tells death (`ProcessDied`, the known race
+/// → `Err` so the caller retries) apart from a real render failure
+/// (`Timeout` — process alive but output never appeared → panic, fail fast).
+fn wait_render(
+    session: &TmuxSession,
+    what: &str,
+    pred: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    match session.wait_until(WAIT, what, &pred) {
+        Ok(frame) => Ok(frame),
+        Err(HarnessError::ProcessDied { .. }) => Err(format!("process died waiting for {what}")),
+        Err(e) => panic!("render failure waiting for {what}: {e}"),
+    }
+}
+
+/// `wait_stable` with the same death-vs-real-failure split as [`wait_render`].
+fn settle(session: &TmuxSession) -> Result<String, String> {
+    match session.wait_stable(WAIT) {
+        Ok(frame) => Ok(frame),
+        Err(HarnessError::ProcessDied { .. }) => {
+            Err("process died while the screen settled".to_string())
+        }
+        Err(e) => panic!("screen never settled: {e}"),
+    }
+}
+
+/// Type a line and submit it.
+fn say(session: &TmuxSession, text: &str) {
+    session.send_text(text).expect("type message");
+    session.send_key(Key::Enter).expect("submit");
+}
+
+// ---- golden snapshot plumbing ----
+
+/// Mask the two volatile bits so a captured frame is byte-stable: the
+/// banner version (`v0.1.0` -> `vX.Y.Z`) and the working-indicator elapsed
+/// timer line (`● cooked for 0s`), then trim trailing blank rows.
+fn normalize(capture: &str) -> String {
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let mut lines: Vec<String> = capture
+        .lines()
+        .filter(|l| !l.contains("cooked for"))
+        .map(|l| l.replace(&version, "vX.Y.Z").trim_end().to_string())
+        .collect();
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn snapshot_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/snapshots")
+        .join(format!("{name}.snap"))
+}
+
+/// Compare `normalized` against the committed `.snap`, or rewrite it when
+/// `UPDATE_CHAT_SNAPSHOT=1` is set.
+fn assert_snapshot(name: &str, normalized: &str) {
+    let path = snapshot_path(name);
+    if std::env::var_os("UPDATE_CHAT_SNAPSHOT").is_some() {
+        std::fs::create_dir_all(path.parent().expect("snapshot dir")).expect("create snapshot dir");
+        std::fs::write(&path, normalized).expect("write snapshot");
+        return;
+    }
+    let expected = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!("missing snapshot `{name}`; regenerate with UPDATE_CHAT_SNAPSHOT=1")
+    });
+    assert_eq!(
+        normalized,
+        expected.trim_end_matches('\n'),
+        "snapshot `{name}` mismatch — if this UI change is intentional, regenerate with \
+         UPDATE_CHAT_SNAPSHOT=1\n--- got ---\n{normalized}\n--- end ---"
+    );
+}
+
+// ---- golden snapshot tests (clean, stable frames) ----
+
+#[test]
+fn snapshot_initial_frame() {
+    run_chat("snapshot_initial_frame", |s| {
+        let frame = settle(s)?;
+        assert_snapshot("chat_initial", &normalize(&frame));
+        Ok(())
+    });
 }
 
 #[test]
+fn snapshot_echo_reply_frame() {
+    run_chat("snapshot_echo_reply_frame", |s| {
+        let reply = format!("{REPLY_PREFIX}hello there");
+        say(s, "hello there");
+        wait_render(s, "reply", |c| c.contains(&reply))?;
+        let frame = settle(s)?;
+        assert_snapshot("chat_echo_reply", &normalize(&frame));
+        Ok(())
+    });
+}
+
+// ---- structural smoke tests ----
+
+#[test]
 fn chat_ui_renders_banner_and_input_box() {
-    let Some(session) = launched() else {
-        return;
-    };
-    let frame = session.capture().expect("capture");
-    assert!(frame.contains("Aura TUI"), "banner header:\n{frame}");
-    assert!(
-        frame.contains("session: smoke-session"),
-        "banner shows the pinned session:\n{frame}"
-    );
-    assert!(frame.contains("input"), "input box title:\n{frame}");
+    run_chat("chat_ui_renders_banner_and_input_box", |s| {
+        let frame = s.capture().map_err(|e| e.to_string())?;
+        assert!(frame.contains("Aura TUI"), "banner header:\n{frame}");
+        assert!(
+            frame.contains("session: smoke-session"),
+            "banner shows the pinned session:\n{frame}"
+        );
+        assert!(frame.contains("input"), "input box title:\n{frame}");
+        Ok(())
+    });
 }
 
 #[test]
 fn user_message_streams_an_assistant_reply() {
-    let Some(session) = launched() else {
-        return;
-    };
-    session.send_text("hello there").expect("type message");
-    session
-        .wait_until(WAIT, "typed input", |c| c.contains("hello there"))
-        .expect("input box echoes typing");
-
-    session.send_key(Key::Enter).expect("submit");
-    let frame = session
-        .wait_until(WAIT, "assistant reply", |c| {
-            c.contains("stub-reply for: hello there")
-        })
-        .expect("scripted reply should render");
-    assert!(
-        frame.contains("hello there"),
-        "user line committed to the transcript:\n{frame}"
-    );
-
-    // The transcript commits into the terminal's own scrollback
-    // (insert_before), so a scrollback capture must recover it too.
-    let history = session
-        .capture_with_scrollback(200)
-        .expect("scrollback capture");
-    assert!(
-        history.contains("stub-reply for: hello there"),
-        "reply present in scrollback:\n{history}"
-    );
+    run_chat("user_message_streams_an_assistant_reply", |s| {
+        let reply = format!("{REPLY_PREFIX}hello there");
+        say(s, "hello there");
+        let frame = wait_render(s, "assistant reply", |c| c.contains(&reply))?;
+        assert!(
+            frame.contains("hello there"),
+            "user line committed to the transcript:\n{frame}"
+        );
+        let history = s.capture_with_scrollback(200).map_err(|e| e.to_string())?;
+        assert!(
+            history.contains(&reply),
+            "reply present in scrollback:\n{history}"
+        );
+        Ok(())
+    });
 }
 
 #[test]
 fn live_region_survives_a_resize() {
-    let Some(session) = launched() else {
-        return;
-    };
-    session.send_text("hi").expect("type");
-    session.send_key(Key::Enter).expect("submit");
-    session
-        .wait_until(WAIT, "reply before resize", |c| {
-            c.contains("stub-reply for: hi")
-        })
-        .expect("reply rendered");
+    run_chat("live_region_survives_a_resize", |s| {
+        let reply = format!("{REPLY_PREFIX}hi");
+        say(s, "hi");
+        wait_render(s, "reply before resize", |c| c.contains(&reply))?;
 
-    session.resize(70, 16).expect("resize");
-    // Smoke-level: the inline-viewport resize may leave a known cosmetic
-    // ghost above the input, so assert only that the live region rebuilt
-    // and the transcript is still readable — not a pixel-exact layout.
-    let frame = session
-        .wait_stable(WAIT)
-        .expect("screen settles after resize");
-    assert!(
-        frame.contains("input"),
-        "input box re-rendered after resize:\n{frame}"
-    );
-    assert!(
-        frame.contains("stub-reply for: hi"),
-        "transcript survives the resize:\n{frame}"
-    );
+        s.resize(70, 16).expect("resize");
+        // Smoke-level: the inline-viewport resize may leave a known cosmetic
+        // ghost above the input, so assert only that the live region rebuilt
+        // and the transcript is still readable — not a pixel-exact layout.
+        let frame = settle(s)?;
+        assert!(
+            frame.contains("input"),
+            "input box re-rendered after resize:\n{frame}"
+        );
+        assert!(
+            frame.contains(&reply),
+            "transcript survives the resize:\n{frame}"
+        );
+        Ok(())
+    });
 }
 
 #[test]
 fn ctrl_c_on_empty_prompt_exits() {
-    let Some(session) = launched() else {
-        return;
-    };
-    session.send_key(Key::Ctrl('c')).expect("send Ctrl+C");
-    session
-        .wait_for_exit(WAIT)
-        .expect("Ctrl+C on an empty prompt should exit the process");
+    run_chat("ctrl_c_on_empty_prompt_exits", |s| {
+        s.send_key(Key::Ctrl('c')).expect("send Ctrl+C");
+        s.wait_for_exit(WAIT).map(|_| ()).map_err(|e| e.to_string())
+    });
+}
+
+// ---- scenario tests (dynamic frames) ----
+
+#[test]
+fn tool_call_renders_a_tool_line() {
+    run_chat("tool_call_renders_a_tool_line", |s| {
+        say(s, SAY_TOOL);
+        let frame = wait_render(s, "tool reply", |c| c.contains(TOOL_REPLY))?;
+        assert!(
+            frame.contains(&format!("{TOOL_NAME}({TOOL_LABEL})")),
+            "tool call line `Read(src/lib.rs)`:\n{frame}"
+        );
+        assert!(
+            frame.contains(TOOL_SUMMARY),
+            "tool result summary:\n{frame}"
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn subagent_spawn_renders_as_a_task_tool() {
+    run_chat("subagent_spawn_renders_as_a_task_tool", |s| {
+        say(s, SAY_SUBAGENT);
+        let frame = wait_render(s, "subagent reply", |c| c.contains(SUBAGENT_REPLY))?;
+        assert!(
+            frame.contains(&format!("{SUBAGENT_TOOL}({SUBAGENT_LABEL})")),
+            "subagent surfaces as a Task tool line:\n{frame}"
+        );
+        assert!(
+            frame.contains(SUBAGENT_SUMMARY),
+            "subagent summary:\n{frame}"
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn tool_approval_modal_renders_and_resolves() {
+    run_chat("tool_approval_modal_renders_and_resolves", |s| {
+        say(s, SAY_APPROVAL);
+        let modal = wait_render(s, "approval modal", |c| c.contains("wants to run"))?;
+        assert!(
+            modal.contains(APPROVAL_TOOL),
+            "modal names the tool:\n{modal}"
+        );
+        assert!(
+            modal.contains(APPROVAL_COMMAND),
+            "modal shows the command:\n{modal}"
+        );
+        assert!(
+            modal.contains("[a] Approve") && modal.contains("[d] Deny"),
+            "modal offers approve/deny:\n{modal}"
+        );
+
+        // Approve it; the TUI sends ResolveApproval, the stub replies.
+        s.send_key(Key::Char('a')).expect("approve");
+        let resolved = wait_render(s, "approval resolved", |c| c.contains(APPROVAL_REPLY))?;
+        assert!(
+            resolved.contains(&format!("approved: {APPROVAL_TOOL}")),
+            "resolved line shows the approved tool:\n{resolved}"
+        );
+        Ok(())
+    });
+}
+
+#[test]
+fn task_list_is_not_rendered_in_the_tui() {
+    run_chat("task_list_is_not_rendered_in_the_tui", |s| {
+        say(s, SAY_TASK);
+        // The reply lands but the TaskList frame is dropped (web-dashboard-only).
+        let frame = wait_render(s, "task reply", |c| c.contains(TASK_REPLY))?;
+        assert!(
+            !frame.contains(TASK_SUBJECT),
+            "TaskList must not render in the TUI, but the subject appeared:\n{frame}"
+        );
+        Ok(())
+    });
 }

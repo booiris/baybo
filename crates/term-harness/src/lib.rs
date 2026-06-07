@@ -50,6 +50,13 @@ pub enum HarnessError {
         what: String,
         last: String,
     },
+    /// The child exited before the awaited condition held. Separated from
+    /// [`HarnessError::Timeout`] so a caller can tell "the program died" (a
+    /// crash to retry/handle) from "the program is alive but never produced
+    /// what I waited for" (a genuine assertion failure) without burning the
+    /// whole timeout polling a dead pane.
+    #[error("process exited before {what} held\n--- last capture ---\n{last}\n--- end capture ---")]
+    ProcessDied { what: String, last: String },
 }
 
 pub type Result<T> = std::result::Result<T, HarnessError>;
@@ -297,8 +304,11 @@ impl TmuxSession {
     }
 
     /// Poll the pane until `pred` holds against a fresh capture, then
-    /// return that capture. Errors with [`HarnessError::Timeout`] (last
-    /// capture attached) if `timeout` elapses first.
+    /// return that capture. Returns [`HarnessError::ProcessDied`] if the
+    /// child exits before `pred` holds (don't keep polling a dead pane) and
+    /// [`HarnessError::Timeout`] if `timeout` elapses while it's still
+    /// alive. `pred` is checked before the death check, so output the child
+    /// emitted just before exiting still counts.
     pub fn wait_until<F>(&self, timeout: Duration, what: &str, pred: F) -> Result<String>
     where
         F: Fn(&str) -> bool,
@@ -309,6 +319,12 @@ impl TmuxSession {
             last = self.capture().unwrap_or(last);
             if pred(&last) {
                 return Ok(last);
+            }
+            if self.is_dead() {
+                return Err(HarnessError::ProcessDied {
+                    what: what.to_string(),
+                    last,
+                });
             }
             if Instant::now() >= deadline {
                 return Err(HarnessError::Timeout {
@@ -324,12 +340,21 @@ impl TmuxSession {
     /// Poll until two consecutive captures (one `POLL_INTERVAL` apart) are
     /// identical, i.e. the screen has stopped changing, then return it.
     /// Use after a resize/keystroke burst before asserting, so a redraw
-    /// in flight isn't sampled mid-frame.
+    /// in flight isn't sampled mid-frame. Bails with
+    /// [`HarnessError::ProcessDied`] if the child exits first, so a dead
+    /// (and therefore trivially "stable") pane isn't mistaken for a settled
+    /// frame.
     pub fn wait_stable(&self, timeout: Duration) -> Result<String> {
         let deadline = Instant::now() + timeout;
         let mut prev = self.capture()?;
         loop {
             std::thread::sleep(POLL_INTERVAL);
+            if self.is_dead() {
+                return Err(HarnessError::ProcessDied {
+                    what: "screen to settle".to_string(),
+                    last: self.capture().unwrap_or(prev),
+                });
+            }
             let cur = self.capture()?;
             if cur == prev {
                 return Ok(cur);

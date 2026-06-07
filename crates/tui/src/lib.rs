@@ -25,6 +25,9 @@ pub mod client;
 mod dashboard;
 pub(crate) mod event;
 mod keymap;
+/// Scenario contract shared by the `chat_smoke` probe and its render test.
+#[cfg(any(test, feature = "test-support"))]
+pub mod smoke_contract;
 pub mod transport;
 
 pub use aura_tools::ApprovalQueue;
