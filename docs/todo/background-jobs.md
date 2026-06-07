@@ -4,11 +4,11 @@
 (`66c655b8`, `e0b2c840`, `425f108d`, `6d1d495d`), plus the `JobList`/`JobStop` tools
 (`6a18eca2`) and boot-time output-file retention (`7d449eb1`). The Phase-3 streaming
 question was resolved with a third option (two files, format-preserving) — see below.
-Not yet merged to master. Detached-spawn backends: **bwrap** (Linux default) and
-**Docker** (`48ac2f2a`, verified live against dockerd 29.4.1 via `--ignored` tests)
-are implemented; **sandbox-exec** (macOS) still falls back to kill-on-timeout — its
-per-call scratch tempdir (Workspace policy) can't outlive a detached child, and the
-file is `#![cfg(macos)]` so it can't be built/verified on a Linux host.
+Not yet merged to master. **All three detached-spawn backends are implemented:**
+bwrap (Linux default), Docker (`48ac2f2a`, verified live against dockerd 29.4.1 via
+`--ignored` tests), and sandbox-exec (`42d250cb`, macOS — the `DetachedChild` holds
+the per-call scratch tempdir so it outlives the child; verified by cross-compiling,
+`cargo clippy --target aarch64-apple-darwin`, since the file is `#![cfg(macos)]`).
 
 ## Goal
 
@@ -273,8 +273,9 @@ fallback — impossible (the sandbox kills internally on timeout).
 - ✅ Output-file retention — DONE (`7d449eb1`): boot-time prune of
   `logs/background/*` older than 7 days.
 - ✅ `JobList` / `JobStop` — DONE (`6a18eca2`).
-- ✅ Docker detached backend — DONE (`48ac2f2a`). sandbox-exec (macOS) still
-  kill-fallback (see Status).
+- ✅ Docker detached backend — DONE (`48ac2f2a`, live-verified).
+- ✅ sandbox-exec (macOS) detached backend — DONE (`42d250cb`, cross-compile-verified;
+  runtime behaviour to confirm on a real macOS host).
 - `JobStop` only reaches user-facing sessions (its `background_control` is gated
   like the sink); non-user sessions rely on `/stop`/shutdown. Likely leave as-is.
 - A per-session concurrency cap on detached commands (currently unbounded beyond
