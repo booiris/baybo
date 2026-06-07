@@ -7,9 +7,7 @@ use aura_sandbox::{
     EnvPolicy, FilesystemPolicy, NetworkPolicy, ResourceLimits, SandboxRunner, SandboxSpec,
     StdinSource,
 };
-use aura_tools::{
-    ExecSandbox, RunningChild, SandboxedOutput, SpawnOpts, TokioRunningChild, ToolError,
-};
+use aura_tools::{ExecSandbox, RunningChild, SandboxedOutput, SpawnOpts, ToolError};
 
 pub struct SandboxAdapter {
     runner: Arc<dyn SandboxRunner>,
@@ -198,9 +196,30 @@ impl ExecSandbox for SandboxAdapter {
     ) -> Result<Box<dyn RunningChild>, ToolError> {
         let spec = self.build_spec(program, args, opts)?;
         match self.runner.spawn_detached(spec).await {
-            Ok(child) => Ok(Box::new(TokioRunningChild(child))),
+            Ok(detached) => Ok(Box::new(DetachedChildAdapter(detached))),
             Err(e) => Err(ToolError::Execution(e.to_string())),
         }
+    }
+}
+
+/// Bridges a backend's [`aura_sandbox::DetachedChild`] to the tool layer's
+/// [`RunningChild`] (identical shape; the two traits live in different crates
+/// to keep `aura-sandbox` free of an `aura-tools` dependency).
+struct DetachedChildAdapter(Box<dyn aura_sandbox::DetachedChild>);
+
+#[async_trait]
+impl RunningChild for DetachedChildAdapter {
+    fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.0.take_stdout()
+    }
+    fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.0.take_stderr()
+    }
+    async fn wait(&mut self) -> i32 {
+        self.0.wait().await
+    }
+    fn start_kill(&mut self) {
+        self.0.start_kill()
     }
 }
 

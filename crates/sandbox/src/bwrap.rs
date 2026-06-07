@@ -232,7 +232,7 @@ impl SandboxRunner for BwrapRunner {
     async fn spawn_detached(
         &self,
         spec: SandboxSpec,
-    ) -> Result<tokio::process::Child, SandboxError> {
+    ) -> Result<Box<dyn crate::DetachedChild>, SandboxError> {
         if !spec.allowed_hosts.is_empty() {
             tracing::warn!(
                 hosts = ?spec.allowed_hosts,
@@ -242,7 +242,8 @@ impl SandboxRunner for BwrapRunner {
         // No internal timeout: the caller owns the foreground wait + the
         // detached escort. `kill_on_drop` + the child's process group still
         // bound it on shutdown.
-        self.spawn_child(&spec)
+        let child = self.spawn_child(&spec)?;
+        Ok(Box::new(crate::TokioDetachedChild(child)))
     }
 
     fn backend(&self) -> Backend {

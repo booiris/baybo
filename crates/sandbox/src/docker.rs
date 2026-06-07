@@ -332,6 +332,60 @@ impl SandboxRunner for DockerRunner {
         }
     }
 
+    async fn spawn_detached(
+        &self,
+        spec: SandboxSpec,
+    ) -> Result<Box<dyn crate::DetachedChild>, SandboxError> {
+        if !spec.allowed_hosts.is_empty() {
+            tracing::warn!(
+                hosts = ?spec.allowed_hosts,
+                "docker backend ignores allowed_hosts; egress is still all-or-nothing per network_policy."
+            );
+        }
+        let workspace_symlink_mount = spec
+            .cwd
+            .as_deref()
+            .and_then(|cwd| crate::workspace_symlink_mount_for(cwd, &spec.workspace_root));
+        let container_name = unique_container_name();
+        let argv = build_docker_argv(
+            &spec,
+            workspace_symlink_mount.as_ref(),
+            self.effective_image(),
+            &container_name,
+        );
+        let mut cmd = Command::new(&self.binary);
+        cmd.args(&argv)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        cmd.stdin(match spec.stdin {
+            StdinSource::Null => Stdio::null(),
+            StdinSource::Inherit => Stdio::inherit(),
+            StdinSource::Bytes(_) => Stdio::piped(),
+        });
+        // The cleanup guard removes the container on drop (process shutdown
+        // without an explicit kill); `DockerDetachedChild` disarms it on a
+        // clean exit (`--rm` already removed it) or on `start_kill` (which
+        // removes the container itself — a SIGKILL of the `docker run` client
+        // would otherwise orphan it).
+        let cleanup = ContainerCleanupGuard::new(self.binary.clone(), container_name.clone());
+        let mut child = cmd.spawn()?;
+        if let StdinSource::Bytes(bytes) = &spec.stdin
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            let bytes = bytes.clone();
+            tokio::spawn(async move {
+                let _ = stdin.write_all(&bytes).await;
+            });
+        }
+        Ok(Box::new(DockerDetachedChild {
+            child,
+            binary: self.binary.clone(),
+            container_name,
+            cleanup,
+        }))
+    }
+
     fn backend(&self) -> Backend {
         Backend::Docker
     }
@@ -343,6 +397,60 @@ impl SandboxRunner for DockerRunner {
     }
 }
 
+/// A detached `docker run` child. Killing it must remove the container by
+/// name (SIGKILL of the `docker run` client orphans it); on a clean exit
+/// `--rm` already removed it, so the drop guard is disarmed.
+struct DockerDetachedChild {
+    child: tokio::process::Child,
+    binary: PathBuf,
+    container_name: String,
+    cleanup: ContainerCleanupGuard,
+}
+
+#[async_trait]
+impl crate::DetachedChild for DockerDetachedChild {
+    fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
+    }
+    fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
+    }
+    async fn wait(&mut self) -> i32 {
+        let code = self
+            .child
+            .wait()
+            .await
+            .ok()
+            .and_then(|s| s.code())
+            .unwrap_or(-1);
+        // Clean exit: `--rm` removed the container; no drop-time `rm` needed.
+        self.cleanup.disarm();
+        code
+    }
+    fn start_kill(&mut self) {
+        // Remove the container (the client SIGKILL won't stop it), then kill
+        // the client. Disarm the drop guard so we don't double-`rm`.
+        let binary = self.binary.clone();
+        let name = self.container_name.clone();
+        tokio::spawn(async move {
+            let _ = Command::new(binary)
+                .args(["rm", "-f", &name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        });
+        self.cleanup.disarm();
+        let _ = self.child.start_kill();
+    }
+}
+
 fn unique_container_name() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -351,4 +459,81 @@ fn unique_container_name() -> String {
         .unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     format!("aura-sandbox-{}-{nanos:x}-{seq:x}", std::process::id())
+}
+
+#[cfg(test)]
+mod detached_tests {
+    use super::*;
+    use crate::spec::{EnvPolicy, FilesystemPolicy, NetworkPolicy, ResourceLimits, StdinSource};
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    /// A runner pinned to a tiny image, or `None` when docker / the image is
+    /// unavailable (the test then skips). Pre-pulls busybox so the run isn't
+    /// at the mercy of a mid-test pull.
+    async fn runner_or_skip() -> Option<DockerRunner> {
+        let runner = DockerRunner::discover().ok()?.with_image("busybox:latest");
+        let pulled = Command::new("docker")
+            .args(["pull", "busybox:latest"])
+            .output()
+            .await
+            .ok()?;
+        pulled.status.success().then_some(runner)
+    }
+
+    fn spec(cmd: &str) -> SandboxSpec {
+        SandboxSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), cmd.into()],
+            cwd: None,
+            workspace_root: std::env::temp_dir(),
+            readable_paths: vec![],
+            writable_paths: vec![],
+            allowed_hosts: BTreeSet::new(),
+            network_policy: NetworkPolicy::None,
+            env: EnvPolicy::Baseline,
+            stdin: StdinSource::Null,
+            timeout: Duration::from_secs(30),
+            resource_limits: ResourceLimits::unlimited(),
+            filesystem_policy: FilesystemPolicy::default(),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon + network; run with --ignored"]
+    async fn detached_docker_streams_output_and_exits() {
+        let Some(runner) = runner_or_skip().await else {
+            eprintln!("docker unavailable; skipping");
+            return;
+        };
+        let mut child = runner
+            .spawn_detached(spec("echo detached-ok"))
+            .await
+            .expect("spawn_detached");
+        let mut stdout = child.take_stdout().expect("stdout pipe");
+        let code = child.wait().await;
+        let mut buf = String::new();
+        stdout.read_to_string(&mut buf).await.expect("read stdout");
+        assert_eq!(code, 0, "clean exit");
+        assert!(buf.contains("detached-ok"), "stdout was: {buf:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running docker daemon + network; run with --ignored"]
+    async fn detached_docker_start_kill_stops_the_run() {
+        let Some(runner) = runner_or_skip().await else {
+            eprintln!("docker unavailable; skipping");
+            return;
+        };
+        let mut child = runner
+            .spawn_detached(spec("sleep 60"))
+            .await
+            .expect("spawn_detached");
+        child.start_kill();
+        // The killed `docker run` client must return promptly (not hang for
+        // the full 60s sleep); `docker rm -f` tears the container down.
+        let waited = tokio::time::timeout(Duration::from_secs(20), child.wait()).await;
+        assert!(waited.is_ok(), "start_kill must let wait() return promptly");
+    }
 }
