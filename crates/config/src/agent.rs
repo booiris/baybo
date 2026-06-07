@@ -22,6 +22,13 @@ pub struct AgentConfig {
     /// root session, surfacing as
     /// `ToolError::SubagentFanoutExceeded`. Independent of depth.
     pub max_subagents_per_root: u32,
+    /// Global concurrency budget for *background* subagent dispatches. A
+    /// background child holds its prompt (does no LLM work) until a slot
+    /// is free, so this caps how many background children run at once
+    /// process-wide; over the cap, fresh dispatches queue (FIFO) rather
+    /// than being rejected. Foreground subagents and detached `Bash`
+    /// commands are not gated by it. See `docs/todo/job-pool.md`.
+    pub max_concurrent_background_jobs: u32,
     /// Maps coarse `ModelTier` (Fast / Balanced / Deep) to a concrete
     /// `llm[*].name`. Consumed by `spawn_subagent`'s tier resolution
     /// when neither the call's explicit `llm` override nor the
@@ -38,6 +45,7 @@ impl Default for AgentConfig {
             context: ContextConfig::default(),
             max_subagent_depth: 3,
             max_subagents_per_root: 8,
+            max_concurrent_background_jobs: 8,
             model_tiers: HashMap::new(),
         }
     }

@@ -37,6 +37,12 @@ pub struct InFlightSubagent {
     /// subagent dispatched-but-not-yet-running is still stopped — a job-store
     /// lookup would miss it in that window and let it run to completion.
     pub cancel_token: CancellationToken,
+    /// `false` while a fresh background subagent is *queued* (built but
+    /// holding its prompt, waiting on a job-budget slot); `true` once it has
+    /// a slot and its agent loop is running. Commands and converted
+    /// foreground subagents are already running, so they're marked `true`
+    /// at registration. Surfaced as the `JobList` state.
+    pub running: bool,
 }
 
 /// Manages AgentActor instances, one per active session.
@@ -98,8 +104,29 @@ impl AgentSupervisor {
                     task_summary: task_summary.to_string(),
                     handle: handle.to_string(),
                     cancel_token,
+                    // Fresh dispatches start queued; the gated task flips this
+                    // once it takes a budget slot. Already-running registrants
+                    // (commands, converted foreground) call `mark_*_running`.
+                    running: false,
                 },
             );
+    }
+
+    /// Flip a queued background subagent to running, once it has taken a
+    /// job-budget slot and been fed its prompt. A no-op if `/stop` already
+    /// drained the entry.
+    pub fn mark_background_subagent_running(
+        &self,
+        parent_session_id: &SessionId,
+        child_session_id: &SessionId,
+    ) {
+        if let Some(mut parent) = self
+            .in_flight_background_subagents
+            .get_mut(parent_session_id)
+            && let Some(info) = parent.get_mut(child_session_id)
+        {
+            info.running = true;
+        }
     }
 
     /// Counterpart to [`Self::note_background_subagent_started`]. Removes the
@@ -837,6 +864,37 @@ mod tests {
             sup.cancel_in_flight_background(&parent, "bg-nope")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn mark_background_subagent_running_flips_queued_to_running() {
+        let sup = make_supervisor();
+        let parent = SessionId::from("parent");
+        let child = SessionId::from("child");
+        sup.note_background_subagent_started(
+            &parent,
+            &child,
+            "explorer",
+            "t",
+            "bg-h",
+            CancellationToken::new(),
+        );
+        // A fresh background dispatch starts queued (awaiting a budget slot).
+        let queued = sup.list_in_flight_background(&parent);
+        assert_eq!(queued.len(), 1);
+        assert!(
+            !queued[0].1.running,
+            "fresh dispatch is queued, not running"
+        );
+        // Taking a slot flips it to running.
+        sup.mark_background_subagent_running(&parent, &child);
+        assert!(
+            sup.list_in_flight_background(&parent)[0].1.running,
+            "now running"
+        );
+        // Unknown parent / child are no-ops (must not panic).
+        sup.mark_background_subagent_running(&parent, &SessionId::from("ghost"));
+        sup.mark_background_subagent_running(&SessionId::from("ghost"), &child);
     }
 
     #[tokio::test]

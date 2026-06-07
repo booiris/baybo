@@ -19,10 +19,12 @@ impl Tool for JobListTool {
 
     fn description(&self) -> String {
         "List the background jobs (detached subagents and Bash commands) still \
-         running for this conversation. Each entry has a handle, a kind, and a \
-         summary. A detached command's output streams to \
-         logs/background/<handle>.out (and .err) — Read it for live progress. \
-         Returns an empty list when nothing is in flight."
+         running for this conversation. Each entry has a handle, a kind, a \
+         summary, and a state (running, or queued when waiting for a \
+         concurrency-budget slot). When a budget is configured the response \
+         also carries background_budget {running, total}. A detached command's \
+         output streams to logs/background/<handle>.out (and .err) — Read it \
+         for live progress. Returns an empty list when nothing is in flight."
             .to_string()
     }
 
@@ -31,15 +33,21 @@ impl Tool for JobListTool {
     }
 
     async fn execute(&self, _params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
-        let jobs = match &ctx.background_control {
-            Some(c) => c.list(&ctx.session_id).await,
-            None => Vec::new(),
+        let (jobs, budget) = match &ctx.background_control {
+            Some(c) => (c.list(&ctx.session_id).await, c.budget().await),
+            None => (Vec::new(), None),
         };
         let items: Vec<Value> = jobs
             .into_iter()
-            .map(|j| json!({ "handle": j.handle, "kind": j.kind, "summary": j.summary }))
+            .map(|j| {
+                json!({ "handle": j.handle, "kind": j.kind, "summary": j.summary, "state": j.state })
+            })
             .collect();
-        Ok(ToolOutput::Json(json!({ "jobs": items })))
+        let mut out = json!({ "jobs": items });
+        if let Some((running, total)) = budget {
+            out["background_budget"] = json!({ "running": running, "total": total });
+        }
+        Ok(ToolOutput::Json(out))
     }
 }
 
@@ -108,6 +116,7 @@ mod tests {
                 handle: "bg-1".into(),
                 kind: "command".into(),
                 summary: "sleep 30".into(),
+                state: "running",
             }]
         }
         async fn stop(&self, _session_id: &SessionId, handle: &str) -> bool {

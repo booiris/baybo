@@ -364,6 +364,7 @@ mod tests {
                     task_summary: "find X".to_string(),
                     handle: "bg-c1".to_string(),
                     cancel_token: CancellationToken::new(),
+                    running: true,
                 },
             ),
             (
@@ -373,6 +374,7 @@ mod tests {
                     task_summary: "draft Y".to_string(),
                     handle: "bg-c2".to_string(),
                     cancel_token: CancellationToken::new(),
+                    running: false,
                 },
             ),
         ];

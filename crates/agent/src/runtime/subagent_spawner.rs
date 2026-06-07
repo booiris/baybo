@@ -28,6 +28,7 @@ use crate::external_agent::{
     EXTERNAL_SUBAGENT_TIMEOUT, ExternalAgent, ExternalAgentEvent, ExternalAgentRegistry,
     ExternalAgentRequest,
 };
+use crate::runtime::job_budget::JobBudget;
 use crate::runtime::llm_pool::LlmPoolHandle;
 
 /// `output_tx` buffer for a subagent's actor. Intentionally smaller than
@@ -63,6 +64,7 @@ pub struct SubagentSpawnerConfig {
     pub llm_pool: LlmPoolHandle,
     pub workspace_paths: Arc<WorkspacePaths>,
     pub actor_spawner: ActorSpawner,
+    pub job_budget: Arc<JobBudget>,
 }
 
 /// Actor-backed [`aura_subagent::SubagentSpawner`]: materialises a child
@@ -82,6 +84,7 @@ pub struct ActorSubagentSpawner {
     llm_pool: LlmPoolHandle,
     workspace_paths: Arc<WorkspacePaths>,
     actor_spawner: ActorSpawner,
+    job_budget: Arc<JobBudget>,
 }
 
 impl ActorSubagentSpawner {
@@ -97,6 +100,7 @@ impl ActorSubagentSpawner {
             llm_pool,
             workspace_paths,
             actor_spawner,
+            job_budget,
         } = config;
         Self {
             session_manager,
@@ -109,6 +113,7 @@ impl ActorSubagentSpawner {
             llm_pool,
             workspace_paths,
             actor_spawner,
+            job_budget,
         }
     }
 }
@@ -301,18 +306,10 @@ impl ActorSubagentSpawner {
             output_tx,
         );
 
-        if let Err(e) = mailbox
-            .send(AgentMessage::SubagentSpawned {
-                initial_message: Box::new(incoming),
-                parent_job_id,
-            })
-            .await
-        {
-            let _ = result_tx.send(SubagentResult::failed(format!("dispatch child input: {e}")));
-            self.release_fan_out_slot(&fan_out_root);
-            return Ok(());
-        }
-
+        // The prompt (`SubagentSpawned`) kicks the parked child actor into
+        // real work. A background spawn holds it until a job-budget slot
+        // frees — the built-but-unfed actor just parks on its mailbox
+        // meanwhile, so the budget bounds *running* background children.
         if background {
             let handle_id = self
                 .ack_background_dispatch(
@@ -329,16 +326,41 @@ impl ActorSubagentSpawner {
             let parent_id_for_task = parent.id.clone();
             let fan_out_root_for_task = fan_out_root.clone();
             let limiter_for_task = Arc::clone(&self.dispatch_limiter);
+            let budget = Arc::clone(&self.job_budget);
             tokio::spawn(async move {
-                let result = await_subagent_terminal(
-                    child_session_id.clone(),
-                    output_rx,
-                    terminal_rx,
-                    mailbox,
-                    actor_token,
-                    job_lifecycle,
-                )
-                .await;
+                // Queue here (the budget's FIFO wait). A `/stop` while queued
+                // cancels `actor_token` — honour it without taking a slot.
+                let permit = tokio::select! {
+                    biased;
+                    _ = actor_token.cancelled() => None,
+                    p = budget.acquire() => p,
+                };
+                let Some(_permit) = permit else {
+                    supervisor
+                        .note_background_subagent_finished(&parent_id_for_task, &child_session_id);
+                    release_reserved_slot(limiter_for_task.as_ref(), &fan_out_root_for_task);
+                    return;
+                };
+                supervisor.mark_background_subagent_running(&parent_id_for_task, &child_session_id);
+                let result = if let Err(e) = mailbox
+                    .send(AgentMessage::SubagentSpawned {
+                        initial_message: Box::new(incoming),
+                        parent_job_id,
+                    })
+                    .await
+                {
+                    SubagentResult::failed(format!("dispatch child input: {e}"))
+                } else {
+                    await_subagent_terminal(
+                        child_session_id.clone(),
+                        output_rx,
+                        terminal_rx,
+                        mailbox,
+                        actor_token,
+                        job_lifecycle,
+                    )
+                    .await
+                };
                 escort_background_terminal(
                     &supervisor,
                     &parent_id_for_task,
@@ -351,7 +373,22 @@ impl ActorSubagentSpawner {
                     &fan_out_root_for_task,
                 )
                 .await;
+                // `_permit` drops here → releases the budget slot.
             });
+            return Ok(());
+        }
+
+        // Foreground / nested: feed the prompt now (parked actor → running),
+        // then wait on the terminal.
+        if let Err(e) = mailbox
+            .send(AgentMessage::SubagentSpawned {
+                initial_message: Box::new(incoming),
+                parent_job_id,
+            })
+            .await
+        {
+            let _ = result_tx.send(SubagentResult::failed(format!("dispatch child input: {e}")));
+            self.release_fan_out_slot(&fan_out_root);
             return Ok(());
         }
 
@@ -551,7 +588,22 @@ impl ActorSubagentSpawner {
             let task_summary = request.task_summary.clone();
             let group = request.group.clone();
             let fan_out_root_for_task = fan_out_root.clone();
+            let budget = Arc::clone(&self.job_budget);
+            let cancel_for_queue = external_request.cancel.clone();
             tokio::spawn(async move {
+                // Queue for a budget slot; honour a `/stop` while queued.
+                let permit = tokio::select! {
+                    biased;
+                    _ = cancel_for_queue.cancelled() => None,
+                    p = budget.acquire() => p,
+                };
+                let Some(_permit) = permit else {
+                    supervisor
+                        .note_background_subagent_finished(&parent_id_for_task, &child_session_id);
+                    release_reserved_slot(limiter_for_task.as_ref(), &fan_out_root_for_task);
+                    return;
+                };
+                supervisor.mark_background_subagent_running(&parent_id_for_task, &child_session_id);
                 let result = run_external_agent_job(
                     agent,
                     kind,
@@ -573,6 +625,7 @@ impl ActorSubagentSpawner {
                     &fan_out_root_for_task,
                 )
                 .await;
+                // `_permit` drops here → releases the budget slot.
             });
             return Ok(());
         }
@@ -823,6 +876,9 @@ async fn convert_foreground_to_background(
         &handle_id,
         child_token,
     );
+    // A converted foreground subagent has been running all along — it never
+    // queued — so it's running, not queued, in the registry.
+    supervisor.mark_background_subagent_running(parent_id, child_session_id);
     if let Err(e) = session_manager.touch(parent_id).await {
         warn!(
             parent_session_id = %parent_id,

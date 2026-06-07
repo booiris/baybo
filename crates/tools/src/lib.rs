@@ -583,6 +583,9 @@ pub struct BackgroundJobInfo {
     pub kind: String,
     /// The task summary (subagent) or the command line (command).
     pub summary: String,
+    /// `"running"` or `"queued"` — a fresh background subagent waits for a
+    /// concurrency-budget slot before running; commands run immediately.
+    pub state: &'static str,
 }
 
 /// Per-session view + control of in-flight background jobs (detached
@@ -596,6 +599,12 @@ pub trait BackgroundJobControl: Send + Sync {
     async fn list(&self, session_id: &SessionId) -> Vec<BackgroundJobInfo>;
     /// Kill one in-flight job by handle. `true` if it was running.
     async fn stop(&self, session_id: &SessionId, handle: &str) -> bool;
+    /// Global background-subagent concurrency budget as `(running, total)`,
+    /// or `None` if the backend doesn't track one. `running` counts children
+    /// holding a slot; entries beyond it in `list` are queued.
+    async fn budget(&self) -> Option<(usize, usize)> {
+        None
+    }
 }
 
 /// Tool-side access to user-managed secrets, injected by the agent layer

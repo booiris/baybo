@@ -21,6 +21,7 @@ use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;
 use crate::actor::supervisor::AgentSupervisor;
+use crate::runtime::job_budget::JobBudget;
 
 /// In-flight-registry label for a detached command (the registry is shared
 /// with background subagents, which use the subagent profile name here).
@@ -37,11 +38,18 @@ const COMMAND_OUTPUT_TAIL_BYTES: u64 = 8 * 1024;
 /// the supervisor is built.
 pub struct BackgroundJobManager {
     supervisor: Arc<OnceLock<AgentSupervisor>>,
+    /// The background-subagent concurrency budget — read-only here, only to
+    /// surface `(running, total)` in `JobList`. Commands don't draw on it
+    /// (they're already running when they detach).
+    job_budget: Arc<JobBudget>,
 }
 
 impl BackgroundJobManager {
-    pub fn new(supervisor: Arc<OnceLock<AgentSupervisor>>) -> Self {
-        Self { supervisor }
+    pub fn new(supervisor: Arc<OnceLock<AgentSupervisor>>, job_budget: Arc<JobBudget>) -> Self {
+        Self {
+            supervisor,
+            job_budget,
+        }
     }
 }
 
@@ -63,6 +71,9 @@ impl BackgroundJobSink for BackgroundJobManager {
                 &handle_id,
                 cancel.clone(),
             );
+            // A detached command is already running (it ran foreground until
+            // it overran), so it's never queued — mark it running at once.
+            sup.mark_background_subagent_running(&parent_id, &registry_id);
         } else {
             warn!(
                 %handle_id,
@@ -93,8 +104,13 @@ impl BackgroundJobControl for BackgroundJobManager {
                 handle: info.handle,
                 kind: info.subagent_type,
                 summary: info.task_summary,
+                state: if info.running { "running" } else { "queued" },
             })
             .collect()
+    }
+
+    async fn budget(&self) -> Option<(usize, usize)> {
+        Some((self.job_budget.running(), self.job_budget.total()))
     }
 
     async fn stop(&self, session_id: &SessionId, handle: &str) -> bool {
