@@ -185,12 +185,33 @@ Current real-terminal suites:
   resize re-windowing.
 - `crates/tui/tests/chat_render.rs` (probe `chat_smoke`) — the
   inline-viewport chat UI driven against an in-process stub gateway that
-  speaks `aura_channels::wire`: banner + input box render, a typed
-  message draws its user line and the scripted assistant reply, the live
-  region survives a resize, and Ctrl+C exits. Assertions stay structural
-  (substring presence, process liveness), not pixel-exact — the
-  inline-viewport resize path has a known, accepted cosmetic ghost frame,
-  so a golden snapshot would be flaky by design.
+  speaks `aura_channels::wire`. The stub dispatches on the typed message
+  (`aura_tui::smoke_contract`) so one probe covers many scenarios:
+  - **Golden snapshots** for the clean, stable frames — the initial
+    banner and a plain reply — stored under `tests/snapshots/*.snap` and
+    compared after `normalize()` masks the version string (`vX.Y.Z`) and
+    drops the volatile working-indicator timer line. Regenerate after an
+    intentional UI change with `UPDATE_CHAT_SNAPSHOT=1 cargo test -p
+    aura-tui --test chat_render`. These catch *unanticipated* visual
+    drift the structural asserts would miss.
+  - **Structural assertions** for the dynamic scenarios: a tool-call line
+    (`Read(src/lib.rs)` + `⎿` result), a subagent surfacing as a `Task`
+    tool call, the tool-approval modal (`wants to run` … `[a] Approve` /
+    `[d] Deny`) and its resolution, and the contract that `Frame::TaskList`
+    is **dropped** by the TUI (the planning checklist is web-dashboard
+    only, so the task subject must *not* appear). The post-resize frame
+    stays structural too — the inline-viewport resize has a known,
+    accepted cosmetic ghost frame, so a golden there would be flaky.
+
+  Driving the chat UI exposes a known, accepted race: a non-keyboard
+  viewport rebuild queries cursor position (`ESC[6n`), and because
+  dropping crossterm's `EventStream` doesn't synchronously stop its reader
+  thread, a lingering `stdin` read can steal the reply, time out, and exit
+  the process mid-turn. That's orthogonal to rendering correctness, so the
+  harness returns a distinct `HarnessError::ProcessDied` (rather than
+  burning the whole timeout on a dead pane) and the test retries the
+  scenario on a fresh process; a genuine render mismatch (process alive,
+  output wrong) still fails fast.
 
 ## Running tests
 
