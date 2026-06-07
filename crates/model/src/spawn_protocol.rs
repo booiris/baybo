@@ -30,10 +30,19 @@ pub const SUBAGENT_CHANNEL_TAG: &str = "subagent";
 /// Prefix the router stamps on a background subagent's `handle_id` so
 /// trace viewers and the parent LLM can recognise the dispatch mode at
 /// a glance. Surfaced as a const because the same id flows into
-/// `PendingSubagentResult.handle_id` and the parent's notification
+/// `PendingBackgroundResult.handle_id` and the parent's notification
 /// preamble — two sites at minimum, three when the CLI starts listing
 /// in-flight handles.
 pub const BACKGROUND_SUBAGENT_HANDLE_PREFIX: &str = "bg-";
+
+/// Leading marker of the tool result a *successful* background subagent
+/// dispatch returns (the ack with its `bg-…` handle). The agent loop matches
+/// it to count grouped members: a router-side dispatch failure comes back as
+/// a `[subagent failed: …]` result instead, which must NOT inflate the group's
+/// expected count (no escorted result will ever arrive for it). Single source
+/// of truth — the producer (`ack_background_dispatch`) and the consumer (the
+/// agent loop's group counter) both reference it.
+pub const BACKGROUND_DISPATCH_ACK_PREFIX: &str = "[background subagent dispatched]";
 
 /// Request emitted by the `spawn_subagent` tool, consumed by `Router`'s
 /// `system_trigger_rx` arm. Senders push onto an
@@ -78,6 +87,20 @@ pub enum SystemSpawnRequest {
 /// Field naming follows Claude Code's Agent tool: `task_summary` is
 /// the short 3-5 word title surfaced in traces, while `prompt` is the
 /// self-contained brief that becomes the child's first user message.
+/// What to do when a *foreground* subagent exceeds its foreground wait.
+/// Only consulted for foreground spawns from a user-facing session;
+/// `background: true` spawns and non-user parents ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnTimeout {
+    /// Detach and keep running; deliver the result via a notification
+    /// turn when it finishes. The default.
+    #[default]
+    Background,
+    /// Cancel the child and surface a timeout to the parent.
+    Kill,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentSpawnRequest {
     /// Profile name the parent LLM emitted. The child's `ContextManager`
@@ -104,6 +127,12 @@ pub struct SubagentSpawnRequest {
     /// the dispatching turn and escorts its result back later.
     #[serde(default)]
     pub background: bool,
+    /// Policy when a *foreground* spawn exceeds its foreground wait: a
+    /// user-facing session converts to background (default) or kills.
+    /// Ignored for `background: true` and for non-user parents. See
+    /// `docs/todo/background-jobs.md`.
+    #[serde(default)]
+    pub on_timeout: OnTimeout,
     /// Root session id used by the dispatcher's fan-out limiter.
     /// Stamped by `spawn_subagent` after it walks the lineage chain
     /// (and reserves a slot in the limiter), so the router's wait
@@ -123,6 +152,13 @@ pub struct SubagentSpawnRequest {
     /// routing the new task into the existing child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<SessionId>,
+    /// Barrier cohort. When set, this subagent runs in the background and
+    /// its result is held until every member of the group reaches a
+    /// terminal state, then the whole group delivers in one merged
+    /// notification. Tagged onto the escorted `PendingBackgroundResult`.
+    /// See `docs/todo/background-jobs.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// Parent-side context the tool builds from its `ToolContext` and
@@ -158,23 +194,97 @@ pub enum SubagentExitStatus {
     Timeout,
 }
 
-/// Persistent record of a `background: true` subagent that completed
-/// while the parent actor was between turns. Held on
-/// [`crate::SessionState::pending_subagent_results`] until the next
-/// user input drains it.
+/// Persistent record of a background job — a `background` (or
+/// timeout-converted) subagent, or a detached `Bash` command — that
+/// reached a terminal state while the parent actor was between turns.
+/// Held on [`crate::SessionState::pending_background_results`] until
+/// drained into a notification turn.
 ///
-/// `handle_id` is the synthetic identifier the spawning tool minted
-/// and surfaced to the parent LLM as the "dispatched" handle, so
-/// later turn-prepend messages can name the same id the parent saw
-/// at dispatch time.
+/// `handle_id` is the synthetic identifier the spawning tool minted and
+/// surfaced to the parent LLM as the "dispatched" handle, so a later
+/// notification can name the same id the parent saw at dispatch time.
+/// `label` is a short display title (the subagent task summary, or the
+/// command line); `summary_text` is the result body shown in the
+/// notification (the subagent's report, or the command's output tail).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingSubagentResult {
+pub struct PendingBackgroundResult {
     pub handle_id: String,
-    pub subagent_type: String,
-    pub task_summary: String,
-    pub child_session_id: SessionId,
-    pub final_text: String,
+    pub label: String,
+    pub summary_text: String,
     pub status: SubagentExitStatus,
+    pub kind: BackgroundJobKind,
+    /// Barrier cohort this result belongs to, if the spawning subagent
+    /// carried a `group`. Grouped results are held in the buffer until
+    /// their group is ready (sealed + all members terminal) or its group
+    /// timeout dissolves it. `None` for ungrouped jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+/// Which kind of background job a [`PendingBackgroundResult`] reports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "job", rename_all = "snake_case")]
+pub enum BackgroundJobKind {
+    /// A `background` (or timeout-converted) subagent.
+    Subagent {
+        child_session_id: SessionId,
+        subagent_type: String,
+    },
+    /// A detached `Bash` command. `output_path` is where the full output
+    /// streamed; the agent `Read`s it for detail beyond `summary_text`.
+    Command {
+        command: String,
+        exit_code: i32,
+        output_path: String,
+    },
+}
+
+impl PendingBackgroundResult {
+    /// Build a result for a finished background subagent.
+    pub fn subagent(
+        handle_id: impl Into<String>,
+        subagent_type: impl Into<String>,
+        task_summary: impl Into<String>,
+        child_session_id: SessionId,
+        final_text: impl Into<String>,
+        status: SubagentExitStatus,
+    ) -> Self {
+        Self {
+            handle_id: handle_id.into(),
+            label: task_summary.into(),
+            summary_text: final_text.into(),
+            status,
+            kind: BackgroundJobKind::Subagent {
+                child_session_id,
+                subagent_type: subagent_type.into(),
+            },
+            group: None,
+        }
+    }
+
+    /// Build a result for a finished detached command.
+    pub fn command(
+        handle_id: impl Into<String>,
+        command: impl Into<String>,
+        exit_code: i32,
+        output_path: impl Into<String>,
+        output_tail: impl Into<String>,
+        status: SubagentExitStatus,
+    ) -> Self {
+        let command = command.into();
+        Self {
+            handle_id: handle_id.into(),
+            label: command.clone(),
+            summary_text: output_tail.into(),
+            status,
+            kind: BackgroundJobKind::Command {
+                command,
+                exit_code,
+                output_path: output_path.into(),
+            },
+            group: None,
+        }
+    }
 }
 
 impl SubagentResult {

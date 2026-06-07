@@ -46,8 +46,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::paths::require_absolute;
+use std::sync::Arc;
+
+use aura_model::BACKGROUND_SUBAGENT_HANDLE_PREFIX;
+
 use crate::{
-    ApprovalDecision, ResourceAccess, SpawnOpts, Tool, ToolContext, ToolError, ToolOutput,
+    ApprovalDecision, BackgroundJobSink, DetachedCommand, ResourceAccess, RunningChild, SpawnOpts,
+    TokioRunningChild, Tool, ToolContext, ToolError, ToolOutput,
 };
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
@@ -300,6 +305,12 @@ struct Params {
     cwd: Option<PathBuf>,
     #[serde(default)]
     secret_env: Vec<String>,
+    /// `"background"` (default) or `"kill"`: in a user chat, what to do
+    /// when the command exceeds its timeout. `background` detaches it
+    /// (you get a handle + a completion notification); `kill` keeps the
+    /// old kill-on-timeout behaviour. Ignored outside user sessions.
+    #[serde(default)]
+    on_timeout: Option<String>,
 }
 
 #[async_trait]
@@ -319,7 +330,8 @@ impl Tool for BashTool {
                 "command":    { "type": "string", "description": "The shell command to run" },
                 "timeout_ms": { "type": "integer", "minimum": 1, "description": "Per-command timeout in ms (falls back to the tool context timeout)" },
                 "cwd":        { "type": "string", "description": "Working directory for the command" },
-                "secret_env": { "type": "array", "items": { "type": "string" }, "description": "Names of stored user secrets to inject as environment variables for THIS command only. Values are pulled from the vault, never shown to you, and scrubbed from the output. Discover names with SecretList / SecretCheck." }
+                "secret_env": { "type": "array", "items": { "type": "string" }, "description": "Names of stored user secrets to inject as environment variables for THIS command only. Values are pulled from the vault, never shown to you, and scrubbed from the output. Discover names with SecretList / SecretCheck." },
+                "on_timeout": { "type": "string", "enum": ["background", "kill"], "description": "What to do if the command exceeds its timeout in a user chat. 'background' (default) detaches it — you get a handle now and a notification when it finishes, with full output streamed to a file you can Read — so a long build/test never blocks you or loses its work. 'kill' keeps the old behaviour (terminate + return a timeout error). Ignored in cron / nested-subagent sessions, which always kill on timeout." }
             },
             "required": ["command"]
         })
@@ -465,6 +477,36 @@ impl Tool for BashTool {
 
         let args = vec!["-c".into(), self.wrap_command(&command)];
 
+        // Convertible path: in a user session (sink present) the default
+        // `on_timeout` detaches a command that overruns its budget instead
+        // of killing it. `run_detached` returns `Some` on success (completed
+        // in-window, or backgrounded) and `None` if it couldn't detach
+        // (sandbox backend without detached support), in which case we fall
+        // through to the blocking kill-on-timeout path below.
+        // Never background a command that injected `secret_env`: the detached
+        // path streams RAW output to files + the notification, and the escort
+        // has no secret handle to exact-redact with (the blocking path below
+        // does). Falling through keeps such a command on kill-on-timeout with
+        // redaction rather than leaking an echoed secret to disk / the turn.
+        let convert_on_timeout = !matches!(p.on_timeout.as_deref().map(str::trim), Some("kill"));
+        if convert_on_timeout
+            && extra_env.is_empty()
+            && let Some(sink) = ctx.background_jobs.clone()
+            && let Some(output) = run_detached(
+                &command,
+                &args,
+                cwd_ref,
+                &extra_env,
+                timeout,
+                ctx,
+                &sink,
+                matches!(aura_resolution, AuraResolution::Bypass),
+            )
+            .await?
+        {
+            return Ok(output);
+        }
+
         let out = if matches!(aura_resolution, AuraResolution::Bypass) {
             // The OS sandbox masks `~/.aura`/`$AURA_HOME`, so a
             // sandboxed `aura …` call can't reach the gateway's
@@ -527,30 +569,256 @@ impl Tool for BashTool {
             return Err(ToolError::Timeout(format!("Bash exceeded {timeout:?}")));
         }
 
-        let mut stdout = truncate_utf8(&out.stdout, MAX_OUTPUT_BYTES);
-        let mut stderr = truncate_utf8(&out.stderr, MAX_OUTPUT_BYTES);
-        // Scrub injected secret values out of the output before it reaches the
-        // agent / LLM / trace — the leak detector only catches known formats,
-        // so arbitrary user tokens are redacted here by exact match.
-        if !extra_env.is_empty()
-            && let Some(handle) = ctx.secrets.as_deref()
-        {
-            let values: Vec<String> = extra_env.iter().map(|(_, v)| v.clone()).collect();
-            stdout = handle.redact(&stdout, &values).await?;
-            stderr = handle.redact(&stderr, &values).await?;
-        }
-
-        let mut result = json!({
-            "exit_code": out.exit_code,
-            "stdout": stdout,
-            "stderr": stderr,
-        });
-        if let Some(hint) = interpret_exit(&command, out.exit_code) {
-            result["return_code_interpretation"] = Value::String(hint.into());
-        }
-
-        Ok(ToolOutput::Json(result))
+        format_command_result(
+            &command,
+            out.exit_code,
+            &out.stdout,
+            &out.stderr,
+            &extra_env,
+            ctx,
+        )
+        .await
     }
+}
+
+/// Format a finished command into the tool result the LLM sees: truncated
+/// stdout/stderr (secret values redacted), the exit code, and an optional
+/// hint for well-known non-zero exits. Shared by the blocking path and the
+/// detached path's foreground-completion case.
+async fn format_command_result(
+    command: &str,
+    exit_code: i32,
+    stdout_bytes: &[u8],
+    stderr_bytes: &[u8],
+    extra_env: &[(String, String)],
+    ctx: &ToolContext,
+) -> crate::Result<ToolOutput> {
+    let mut stdout = truncate_utf8(stdout_bytes, MAX_OUTPUT_BYTES);
+    let mut stderr = truncate_utf8(stderr_bytes, MAX_OUTPUT_BYTES);
+    // Scrub injected secret values out of the output before it reaches the
+    // agent / LLM / trace — the leak detector only catches known formats,
+    // so arbitrary user tokens are redacted here by exact match.
+    if !extra_env.is_empty()
+        && let Some(handle) = ctx.secrets.as_deref()
+    {
+        let values: Vec<String> = extra_env.iter().map(|(_, v)| v.clone()).collect();
+        stdout = handle.redact(&stdout, &values).await?;
+        stderr = handle.redact(&stderr, &values).await?;
+    }
+    let mut result = json!({
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+    });
+    if let Some(hint) = interpret_exit(command, exit_code) {
+        result["return_code_interpretation"] = Value::String(hint.into());
+    }
+    Ok(ToolOutput::Json(result))
+}
+
+/// Per-stream cap for a detached command's output file. Mirrors the
+/// blocking path's in-memory cap: once a stream hits this, the reader is
+/// dropped, closing the pipe so a runaway producer gets EPIPE and exits
+/// rather than filling the disk.
+const MAX_BACKGROUND_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Directory a detached command's output files (`<handle>.out` / `.err`)
+/// stream to. Single source of truth for the tool, the notification (which
+/// surfaces the path), and the boot-time pruner.
+pub fn background_output_dir(workspace_paths: &WorkspacePaths) -> PathBuf {
+    workspace_paths.logs_dir().join("background")
+}
+
+/// Delete background-command output files older than `max_age`. Called once
+/// at boot so completed-but-never-cleaned detached outputs (the agent reads
+/// them shortly after the completion notification) don't accumulate forever.
+/// Best-effort: unreadable entries are skipped. Returns the count removed.
+pub fn prune_background_outputs(dir: &Path, max_age: Duration) -> usize {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(max_age)
+        .unwrap_or(std::time::UNIX_EPOCH);
+    prune_outputs_before(dir, cutoff)
+}
+
+fn prune_outputs_before(dir: &Path, cutoff: std::time::SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut pruned = 0;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_file()
+            && meta.modified().is_ok_and(|m| m < cutoff)
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            pruned += 1;
+        }
+    }
+    pruned
+}
+
+enum DetachedOutcome {
+    Cancelled,
+    Completed(i32),
+    Backgrounded,
+}
+
+/// Run a command on the detached path: spawn it live, stream stdout/stderr
+/// to per-job files, and wait up to the foreground budget. If it finishes
+/// in time, return the normal result; if it overruns, hand the still-running
+/// child to the [`BackgroundJobSink`] and return a "moved to background"
+/// notice. Returns `Ok(None)` when the command couldn't be detached (sandbox
+/// backend without detached support / spawn failure) so the caller falls
+/// back to the blocking kill-on-timeout path.
+#[allow(clippy::too_many_arguments)]
+async fn run_detached(
+    command: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    extra_env: &[(String, String)],
+    timeout: Duration,
+    ctx: &ToolContext,
+    sink: &Arc<dyn BackgroundJobSink>,
+    bypass: bool,
+) -> crate::Result<Option<ToolOutput>> {
+    let mut child: Box<dyn RunningChild> = if bypass {
+        use std::process::Stdio;
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(args);
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+            cmd.env("PWD", dir);
+        }
+        cmd.envs(extra_env.iter().cloned());
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+        match cmd.spawn() {
+            Ok(c) => Box::new(TokioRunningChild(c)),
+            Err(_) => return Ok(None),
+        }
+    } else {
+        let Some(sandbox) = ctx.sandbox.as_ref() else {
+            return Ok(None);
+        };
+        match sandbox
+            .spawn_command_detached(
+                Path::new("sh"),
+                args,
+                SpawnOpts {
+                    cwd: cwd.map(Path::to_path_buf),
+                    stdin: None,
+                    extra_env: extra_env.to_vec(),
+                    timeout,
+                },
+            )
+            .await
+        {
+            Ok(c) => c,
+            // Backend can't detach (or setup failed) — fall back to the
+            // blocking path (which carries its own sandbox-failure retry).
+            Err(_) => return Ok(None),
+        }
+    };
+
+    // One id shared by the output files, the handle returned to the LLM, and
+    // the eventual completion notification.
+    let handle_id = format!(
+        "{}{}",
+        BACKGROUND_SUBAGENT_HANDLE_PREFIX,
+        uuid::Uuid::new_v4()
+    );
+    let bg_dir = background_output_dir(&ctx.workspace_paths);
+    let _ = tokio::fs::create_dir_all(&bg_dir).await;
+    let stdout_path = bg_dir.join(format!("{handle_id}.out"));
+    let stderr_path = bg_dir.join(format!("{handle_id}.err"));
+
+    // The file IS the capture: a backgrounded command's output isn't bounded
+    // by memory, and a completed one is read back below.
+    let copy_tasks = vec![
+        spawn_copy_to_file(child.take_stdout(), stdout_path.clone()),
+        spawn_copy_to_file(child.take_stderr(), stderr_path.clone()),
+    ];
+
+    // Wait up to the foreground budget. The wait future is scoped so its
+    // `&mut` borrow of `child` ends before the backgrounded arm moves it.
+    let outcome = {
+        let exit_fut = child.wait();
+        tokio::pin!(exit_fut);
+        tokio::select! {
+            biased;
+            _ = ctx.cancellation_token.cancelled() => DetachedOutcome::Cancelled,
+            code = &mut exit_fut => DetachedOutcome::Completed(code),
+            _ = tokio::time::sleep(timeout) => DetachedOutcome::Backgrounded,
+        }
+    };
+
+    match outcome {
+        DetachedOutcome::Cancelled => {
+            child.start_kill();
+            let _ = child.wait().await;
+            for t in copy_tasks {
+                let _ = t.await;
+            }
+            let _ = tokio::fs::remove_file(&stdout_path).await;
+            let _ = tokio::fs::remove_file(&stderr_path).await;
+            Err(ToolError::Execution("cancelled".into()))
+        }
+        DetachedOutcome::Completed(exit_code) => {
+            for t in copy_tasks {
+                let _ = t.await;
+            }
+            let stdout = tokio::fs::read(&stdout_path).await.unwrap_or_default();
+            let stderr = tokio::fs::read(&stderr_path).await.unwrap_or_default();
+            // Transient foreground capture — drop the files now that the
+            // result carries the output.
+            let _ = tokio::fs::remove_file(&stdout_path).await;
+            let _ = tokio::fs::remove_file(&stderr_path).await;
+            Ok(Some(
+                format_command_result(command, exit_code, &stdout, &stderr, extra_env, ctx).await?,
+            ))
+        }
+        DetachedOutcome::Backgrounded => {
+            let display_path = stdout_path.display().to_string();
+            let job = DetachedCommand {
+                handle_id: handle_id.clone(),
+                session_id: ctx.session_id.clone(),
+                command: command.to_string(),
+                child,
+                copy_tasks,
+                stdout_path,
+                stderr_path,
+            };
+            let returned = sink.detach_command(job).await;
+            Ok(Some(ToolOutput::Text(format!(
+                "Command still running after {timeout:?}; moved to the background as `{returned}`. \
+                 Output is streaming to `{display_path}` (Read it for progress). You'll get a \
+                 notification when it finishes — keep working in the meantime."
+            ))))
+        }
+    }
+}
+
+/// Stream a child pipe to its output file, capped at
+/// [`MAX_BACKGROUND_OUTPUT_BYTES`] so a runaway producer can't fill the disk.
+fn spawn_copy_to_file(
+    reader: Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    path: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Some(reader) = reader else {
+            return;
+        };
+        if let Ok(mut file) = tokio::fs::File::create(&path).await {
+            let mut limited = reader.take(MAX_BACKGROUND_OUTPUT_BYTES);
+            let _ = tokio::io::copy(&mut limited, &mut file).await;
+            let _ = file.flush().await;
+        }
+    })
 }
 
 /// Reject an absolute path that lives inside the workspace root but
@@ -1830,6 +2098,8 @@ mod tests {
             llm: None,
             secrets: None,
             virtual_reads: None,
+            background_jobs: None,
+            background_control: None,
         }
     }
 
@@ -1841,6 +2111,122 @@ mod tests {
         let cache: Arc<Mutex<Vec<ApprovedResource>>> = Arc::new(Mutex::new(Vec::new()));
         ctx.approval = Some(ApprovalHandle::new(gate, cache));
         ctx
+    }
+
+    /// A `BackgroundJobSink` that records `(handle_id, command)` and drains
+    /// the handed-off child so the test doesn't leak it.
+    struct RecordingSink {
+        seen: Arc<Mutex<Option<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl crate::BackgroundJobSink for RecordingSink {
+        async fn detach_command(&self, mut job: crate::DetachedCommand) -> String {
+            job.child.start_kill();
+            let _ = job.child.wait().await;
+            for t in job.copy_tasks.drain(..) {
+                let _ = t.await;
+            }
+            let handle = job.handle_id.clone();
+            *self.seen.lock() = Some((handle.clone(), job.command.clone()));
+            handle
+        }
+    }
+
+    /// A ctx whose `workspace_paths` point at a unique temp dir (so
+    /// `logs_dir()/background` is writable) with a recording sink wired in.
+    #[allow(clippy::type_complexity)]
+    fn ctx_for_detached() -> (ToolContext, Arc<Mutex<Option<(String, String)>>>) {
+        let tmp = std::env::temp_dir().join(format!("aura-bgtest-{}", uuid::Uuid::new_v4()));
+        let mut ctx = ctx_with(None);
+        ctx.workspace_paths = aura_workspace::WorkspacePaths::new(&tmp);
+        let seen = Arc::new(Mutex::new(None));
+        ctx.background_jobs = Some(Arc::new(RecordingSink {
+            seen: Arc::clone(&seen),
+        }));
+        (ctx, seen)
+    }
+
+    #[tokio::test]
+    async fn detached_command_completing_in_window_returns_normal_result() {
+        let (ctx, seen) = ctx_for_detached();
+        let sink = ctx.background_jobs.clone().unwrap();
+        let args = vec!["-c".into(), "echo hi".into()];
+        let out = run_detached(
+            "echo hi",
+            &args,
+            None,
+            &[],
+            Duration::from_secs(5),
+            &ctx,
+            &sink,
+            true, // unsandboxed, so the test needs no OS sandbox
+        )
+        .await
+        .expect("run_detached ok");
+        let Some(ToolOutput::Json(v)) = out else {
+            panic!("expected a completed Json result, got {out:?}");
+        };
+        assert_eq!(v["exit_code"], 0);
+        assert!(v["stdout"].as_str().unwrap().contains("hi"));
+        assert!(
+            seen.lock().is_none(),
+            "a fast command must NOT be handed to the background sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_command_overrunning_budget_goes_to_background() {
+        let (ctx, seen) = ctx_for_detached();
+        let sink = ctx.background_jobs.clone().unwrap();
+        let args = vec!["-c".into(), "sleep 30".into()];
+        let out = run_detached(
+            "sleep 30",
+            &args,
+            None,
+            &[],
+            Duration::from_millis(150),
+            &ctx,
+            &sink,
+            true,
+        )
+        .await
+        .expect("run_detached ok");
+        let Some(ToolOutput::Text(text)) = out else {
+            panic!("expected a background notice, got {out:?}");
+        };
+        assert!(text.contains("background"), "notice: {text}");
+        let recorded = seen.lock().clone();
+        assert_eq!(
+            recorded.map(|(_, cmd)| cmd),
+            Some("sleep 30".to_string()),
+            "an overrunning command must be handed to the sink"
+        );
+    }
+
+    #[test]
+    fn prune_outputs_respects_cutoff() {
+        use std::time::{Duration as Dur, SystemTime};
+        let dir = std::env::temp_dir().join(format!("aura-prune-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("job.out");
+        std::fs::write(&f, b"x").unwrap();
+
+        // Cutoff in the past → the just-written file is newer → kept.
+        assert_eq!(
+            prune_outputs_before(&dir, SystemTime::now() - Dur::from_secs(3600)),
+            0
+        );
+        assert!(f.exists(), "a fresh file must not be pruned");
+
+        // Cutoff in the future → the file is older than it → pruned.
+        assert_eq!(
+            prune_outputs_before(&dir, SystemTime::now() + Dur::from_secs(3600)),
+            1
+        );
+        assert!(!f.exists(), "an aged-out file must be pruned");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn fake_with_response(

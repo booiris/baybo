@@ -748,7 +748,7 @@ impl ContextManager {
     /// Append a message to the in-memory transcript + token budget
     /// **without** persisting it to `session_messages`. The
     /// subagent-notification turn rebuilds its synthetic prompt from the
-    /// durable `pending_subagent_results` buffer on every retry, so a
+    /// durable `pending_background_results` buffer on every retry, so a
     /// persisted row would be duplicated on each failed attempt under the
     /// infinite-backoff retry. The buffer is the source of truth; only the
     /// model's proactive reply (if any) is persisted. The caller rolls this

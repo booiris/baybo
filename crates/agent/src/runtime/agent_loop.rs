@@ -1042,6 +1042,10 @@ impl AgentLoop {
         let executor = Arc::clone(&self.tool_executor);
         let session_id_for_calls = session.id.clone();
         let user_for_calls = session.user.clone();
+        // Gate (Copy, captured per closure): only a user-facing session may
+        // background a slow command — keeps cron / nested-subagent bash on
+        // kill-on-timeout. Mirrors the subagent-conversion gate.
+        let background_eligible = session.supports_background_jobs();
         let recorder_for_calls = Arc::clone(span_recorder);
         let step_for_calls = step.clone();
         let notifier_for_calls = notifier.clone();
@@ -1099,6 +1103,7 @@ impl AgentLoop {
                         cancel,
                         notifier,
                         Some(&bind_source),
+                        background_eligible,
                     )
                     .await
             }
@@ -1111,6 +1116,34 @@ impl AgentLoop {
             let (status, raw_summary) = tool_completion_summary(&tool_result);
             self.emit_tool_completed(delta_tx, session, tool_call.id.clone(), status, raw_summary)
                 .await;
+
+            // Count a grouped subagent spawn into its barrier cohort so the
+            // turn-end seal knows the member total. Only a *successful
+            // dispatch* counts — a router-side failure (unregistered backend,
+            // closed channel, …) comes back as `Ok("[subagent failed: …]")`
+            // with no escorted result to ever arrive, so `is_ok()` is too
+            // broad: counting it would stall the cohort until its group
+            // timeout. A real dispatch returns the ack with its `bg-…` handle.
+            let dispatched = matches!(
+                &tool_result,
+                Ok(ToolOutput::Text(t)) if t.starts_with(aura_model::BACKGROUND_DISPATCH_ACK_PREFIX)
+            );
+            if tool_call.name == aura_model::SPAWN_SUBAGENT_TOOL_NAME
+                && dispatched
+                && let Some(group) = tool_call
+                    .arguments
+                    .get("group")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            {
+                session
+                    .state
+                    .background_groups
+                    .entry(group.to_string())
+                    .or_default()
+                    .expected += 1;
+            }
 
             let raw_result_text = match &tool_result {
                 Ok(ToolOutput::Text(s)) => s.clone(),
@@ -1647,7 +1680,7 @@ impl AgentLoop {
     }
 
     /// Append the synthetic `SubagentNotification` prompt **in-memory only**.
-    /// It is rebuilt from the durable `pending_subagent_results` buffer on
+    /// It is rebuilt from the durable `pending_background_results` buffer on
     /// every retry, so persisting per-attempt would stack duplicate hidden
     /// rows under the infinite-backoff retry. The caller seeds the system
     /// prompt and snapshots the transcript *before* this so a failed turn can

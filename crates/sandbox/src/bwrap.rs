@@ -135,21 +135,15 @@ pub(crate) fn build_systemd_run_prefix(limits: &ResourceLimits) -> Vec<OsString>
     argv
 }
 
-#[async_trait]
-impl SandboxRunner for BwrapRunner {
-    async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError> {
-        validate_spec(&spec, self.systemd_run.is_some())?;
-        if !spec.allowed_hosts.is_empty() {
-            tracing::warn!(
-                hosts = ?spec.allowed_hosts,
-                "bwrap backend ignores allowed_hosts; egress is still all-or-nothing per network_policy. Per-host enforcement is deferred — see docs/todo/sandbox-os-isolation.md"
-            );
-        }
+impl BwrapRunner {
+    /// Build the (unspawned) `Command` for a spec — shared by the blocking
+    /// [`SandboxRunner::run`] and the detached [`SandboxRunner::spawn_detached`].
+    fn build_command(&self, spec: &SandboxSpec) -> Command {
         let workspace_symlink_mount = spec
             .cwd
             .as_deref()
             .and_then(|cwd| crate::workspace_symlink_mount_for(cwd, &spec.workspace_root));
-        let bwrap_argv = build_bwrap_argv(&spec, workspace_symlink_mount.as_ref());
+        let bwrap_argv = build_bwrap_argv(spec, workspace_symlink_mount.as_ref());
 
         let limits_set = spec.resource_limits.memory_max_bytes.is_some()
             || spec.resource_limits.pids_max.is_some();
@@ -176,10 +170,15 @@ impl SandboxRunner for BwrapRunner {
             StdinSource::Inherit => Stdio::inherit(),
             StdinSource::Bytes(_) => Stdio::piped(),
         });
+        cmd
+    }
 
-        let started = Instant::now();
+    /// Validate + spawn the child, wiring `Bytes` stdin via a writer task.
+    /// The shared spawn path for `run` and `spawn_detached`.
+    fn spawn_child(&self, spec: &SandboxSpec) -> Result<tokio::process::Child, SandboxError> {
+        validate_spec(spec, self.systemd_run.is_some())?;
+        let mut cmd = self.build_command(spec);
         let mut child = cmd.spawn()?;
-
         if let StdinSource::Bytes(bytes) = &spec.stdin
             && let Some(mut stdin) = child.stdin.take()
         {
@@ -188,7 +187,21 @@ impl SandboxRunner for BwrapRunner {
                 let _ = stdin.write_all(&bytes).await;
             });
         }
+        Ok(child)
+    }
+}
 
+#[async_trait]
+impl SandboxRunner for BwrapRunner {
+    async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError> {
+        if !spec.allowed_hosts.is_empty() {
+            tracing::warn!(
+                hosts = ?spec.allowed_hosts,
+                "bwrap backend ignores allowed_hosts; egress is still all-or-nothing per network_policy. Per-host enforcement is deferred — see docs/todo/sandbox-os-isolation.md"
+            );
+        }
+        let started = Instant::now();
+        let child = self.spawn_child(&spec)?;
         let wait = child.wait_with_output();
         let result = tokio::time::timeout(spec.timeout, wait).await;
         let elapsed = started.elapsed();
@@ -214,6 +227,23 @@ impl SandboxRunner for BwrapRunner {
             Ok(Err(e)) => Err(SandboxError::Io(e)),
             Err(_) => Err(SandboxError::Timeout(spec.timeout)),
         }
+    }
+
+    async fn spawn_detached(
+        &self,
+        spec: SandboxSpec,
+    ) -> Result<Box<dyn crate::DetachedChild>, SandboxError> {
+        if !spec.allowed_hosts.is_empty() {
+            tracing::warn!(
+                hosts = ?spec.allowed_hosts,
+                "bwrap backend ignores allowed_hosts; egress is still all-or-nothing per network_policy."
+            );
+        }
+        // No internal timeout: the caller owns the foreground wait + the
+        // detached escort. `kill_on_drop` + the child's process group still
+        // bound it on shutdown.
+        let child = self.spawn_child(&spec)?;
+        Ok(Box::new(crate::TokioDetachedChild(child)))
     }
 
     fn backend(&self) -> Backend {

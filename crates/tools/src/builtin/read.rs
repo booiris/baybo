@@ -241,12 +241,16 @@ mod tests {
             llm: None,
             secrets: None,
             virtual_reads: None,
+            background_jobs: None,
+            background_control: None,
         }
     }
 
     fn ctx_with(resolver: Arc<dyn crate::VirtualReadResolver>) -> ToolContext {
         ToolContext {
             virtual_reads: Some(resolver),
+            background_jobs: None,
+            background_control: None,
             ..ctx()
         }
     }

@@ -34,66 +34,43 @@ impl SandboxExecRunner {
             version,
         })
     }
-}
 
-/// Pure validation of a `SandboxSpec` against sandbox-exec's
-/// enforcement capabilities. SBPL has no equivalent for cgroup
-/// memory/pid caps, so any non-`unlimited()` `resource_limits` is
-/// unenforceable here. Refuse rather than silently downgrade — the
-/// caller has either set caps deliberately and needs them, or has
-/// not thought about it and should be made aware.
-pub(crate) fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
-    if !spec.resource_limits.is_unlimited() {
-        return Err(SandboxError::Unenforceable {
-            backend: "sandbox-exec",
-            what: format!(
-                "resource_limits {:?} (SBPL has no cgroup equivalent)",
-                spec.resource_limits
-            ),
-            hint: "use the bwrap (Linux) or docker backend, layer a launchd MemoryHighWaterMark, or pass `ResourceLimits::unlimited()`",
-        });
-    }
-    Ok(())
-}
-
-#[async_trait]
-impl SandboxRunner for SandboxExecRunner {
-    async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError> {
-        validate_spec(&spec)?;
-        let workspace_symlink_mount = spec
-            .cwd
-            .as_deref()
-            .and_then(|cwd| crate::workspace_symlink_mount_for(cwd, &spec.workspace_root));
-        let profile = render_sbpl_profile(&spec, workspace_symlink_mount.as_ref());
-        // Workspace policy: SBPL allows writes only inside the
-        // workspace. Carve out a per-invocation scratch dir under
-        // the workspace and route `$TMPDIR` / `$TMP` / `$TEMP` there
-        // so callers respecting those env vars stay inside the bind.
-        // The TempDir handle is held until `run()` returns; Drop
-        // removes the directory.
-        //
-        // Permissive policy (Bash): the SBPL profile already grants
-        // RW on `/private/tmp`, matching the bwrap `--bind /tmp /tmp`
-        // shape on Linux. Skip the scratch dir and point `$TMPDIR`
-        // straight at host `/tmp` so files persist across calls and
-        // hardcoded `/tmp` writers work.
-        let (scratch_handle, tmpdir) = match &spec.filesystem_policy {
+    /// Per-call scratch dir + the `$TMPDIR` to route at. Workspace policy
+    /// carves a tempdir under the workspace (the handle is returned so the
+    /// caller keeps it alive for the whole run / detached child); Permissive
+    /// points straight at host `/tmp` (no handle — `/tmp`'s lifetime is the
+    /// host's). Shared by `run` and `spawn_detached`.
+    fn make_scratch(
+        &self,
+        spec: &SandboxSpec,
+    ) -> Result<(Option<tempfile::TempDir>, PathBuf), SandboxError> {
+        match &spec.filesystem_policy {
             FilesystemPolicy::Workspace => {
                 let scratch = tempfile::Builder::new()
                     .prefix(".aura-sandbox-")
                     .tempdir_in(&spec.workspace_root)?;
                 let path = scratch.path().to_path_buf();
-                (Some(scratch), path)
+                Ok((Some(scratch), path))
             }
-            FilesystemPolicy::Permissive { .. } => (None, PathBuf::from("/tmp")),
-        };
+            FilesystemPolicy::Permissive { .. } => Ok((None, PathBuf::from("/tmp"))),
+        }
+    }
 
+    /// Build the (unspawned) sandbox-exec `Command` for a spec + rendered SBPL
+    /// profile, routing temp env vars at `tmpdir`. Shared by `run` and
+    /// `spawn_detached`.
+    fn build_command(
+        &self,
+        spec: &SandboxSpec,
+        profile: &str,
+        tmpdir: &std::path::Path,
+    ) -> Command {
         let mut cmd = Command::new(&self.binary);
-        cmd.arg("-p").arg(&profile);
+        cmd.arg("-p").arg(profile);
         cmd.arg("env").arg("-i");
         cmd.arg("PATH=/usr/bin:/bin:/usr/sbin:/sbin");
         cmd.arg(format!("HOME={}", spec.workspace_root.display()));
-        cmd.arg(format!("PWD={}", effective_pwd(&spec)));
+        cmd.arg(format!("PWD={}", effective_pwd(spec)));
         cmd.arg(format!("TMPDIR={}", tmpdir.display()));
         cmd.arg(format!("TMP={}", tmpdir.display()));
         cmd.arg(format!("TEMP={}", tmpdir.display()));
@@ -131,28 +108,72 @@ impl SandboxRunner for SandboxExecRunner {
             StdinSource::Inherit => Stdio::inherit(),
             StdinSource::Bytes(_) => Stdio::piped(),
         });
+        cmd
+    }
 
-        let started = Instant::now();
+    /// Spawn the command, wiring `Bytes` stdin via a writer task. Shared by
+    /// `run` and `spawn_detached`.
+    fn spawn_with_stdin(
+        &self,
+        mut cmd: Command,
+        stdin: &StdinSource,
+    ) -> Result<tokio::process::Child, SandboxError> {
         let mut child = cmd.spawn()?;
-
-        if let StdinSource::Bytes(bytes) = &spec.stdin
-            && let Some(mut stdin) = child.stdin.take()
+        if let StdinSource::Bytes(bytes) = stdin
+            && let Some(mut handle) = child.stdin.take()
         {
             let bytes = bytes.clone();
             tokio::spawn(async move {
-                let _ = stdin.write_all(&bytes).await;
+                let _ = handle.write_all(&bytes).await;
             });
         }
+        Ok(child)
+    }
+}
+
+/// Pure validation of a `SandboxSpec` against sandbox-exec's
+/// enforcement capabilities. SBPL has no equivalent for cgroup
+/// memory/pid caps, so any non-`unlimited()` `resource_limits` is
+/// unenforceable here. Refuse rather than silently downgrade — the
+/// caller has either set caps deliberately and needs them, or has
+/// not thought about it and should be made aware.
+pub(crate) fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
+    if !spec.resource_limits.is_unlimited() {
+        return Err(SandboxError::Unenforceable {
+            backend: "sandbox-exec",
+            what: format!(
+                "resource_limits {:?} (SBPL has no cgroup equivalent)",
+                spec.resource_limits
+            ),
+            hint: "use the bwrap (Linux) or docker backend, layer a launchd MemoryHighWaterMark, or pass `ResourceLimits::unlimited()`",
+        });
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl SandboxRunner for SandboxExecRunner {
+    async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError> {
+        validate_spec(&spec)?;
+        let workspace_symlink_mount = spec
+            .cwd
+            .as_deref()
+            .and_then(|cwd| crate::workspace_symlink_mount_for(cwd, &spec.workspace_root));
+        let profile = render_sbpl_profile(&spec, workspace_symlink_mount.as_ref());
+        // Workspace policy carves a per-call scratch dir under the workspace
+        // and routes `$TMPDIR`/`$TMP`/`$TEMP` there (the handle is held until
+        // `run()` returns; Drop removes it). Permissive (Bash) points
+        // `$TMPDIR` straight at host `/tmp` — no handle. See `make_scratch`.
+        let (scratch_handle, tmpdir) = self.make_scratch(&spec)?;
+        let cmd = self.build_command(&spec, &profile, &tmpdir);
+
+        let started = Instant::now();
+        let child = self.spawn_with_stdin(cmd, &spec.stdin)?;
 
         let wait = child.wait_with_output();
         let result = tokio::time::timeout(spec.timeout, wait).await;
         let elapsed = started.elapsed();
 
-        // Hold `scratch_handle` (when present) until after the child
-        // has been awaited so the per-call tempdir lives for the full
-        // lifetime of the sandboxed call. Permissive mode has no
-        // handle (`/tmp` is the host directory; lifetime is the
-        // host's problem).
         let outcome = match result {
             Ok(Ok(out)) => Ok(SandboxOutput {
                 exit_code: out.status.code().unwrap_or(-1),
@@ -164,12 +185,71 @@ impl SandboxRunner for SandboxExecRunner {
             Ok(Err(e)) => Err(SandboxError::Io(e)),
             Err(_) => Err(SandboxError::Timeout(spec.timeout)),
         };
+        // Hold `scratch_handle` until after the child is awaited so the
+        // per-call tempdir lives for the full lifetime of the sandboxed call.
         drop(scratch_handle);
         outcome
     }
 
+    async fn spawn_detached(
+        &self,
+        spec: SandboxSpec,
+    ) -> Result<Box<dyn crate::DetachedChild>, SandboxError> {
+        validate_spec(&spec)?;
+        let workspace_symlink_mount = spec
+            .cwd
+            .as_deref()
+            .and_then(|cwd| crate::workspace_symlink_mount_for(cwd, &spec.workspace_root));
+        let profile = render_sbpl_profile(&spec, workspace_symlink_mount.as_ref());
+        // The per-call scratch tempdir (Workspace policy) must outlive the
+        // detached child, so the returned `DetachedChild` holds the handle
+        // instead of dropping it when this returns.
+        let (scratch_handle, tmpdir) = self.make_scratch(&spec)?;
+        let cmd = self.build_command(&spec, &profile, &tmpdir);
+        let child = self.spawn_with_stdin(cmd, &spec.stdin)?;
+        Ok(Box::new(SandboxExecDetachedChild {
+            child,
+            _scratch: scratch_handle,
+        }))
+    }
+
     fn backend(&self) -> Backend {
         Backend::SandboxExec
+    }
+}
+
+/// A detached sandbox-exec child. Holds the per-call scratch tempdir
+/// (Workspace policy) so it outlives the child rather than being removed when
+/// `spawn_detached` returns.
+struct SandboxExecDetachedChild {
+    child: tokio::process::Child,
+    _scratch: Option<tempfile::TempDir>,
+}
+
+#[async_trait]
+impl crate::DetachedChild for SandboxExecDetachedChild {
+    fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
+    }
+    fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
+    }
+    async fn wait(&mut self) -> i32 {
+        self.child
+            .wait()
+            .await
+            .ok()
+            .and_then(|s| s.code())
+            .unwrap_or(-1)
+    }
+    fn start_kill(&mut self) {
+        let _ = self.child.start_kill();
     }
 }
 

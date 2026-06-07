@@ -32,13 +32,14 @@ pub use money::{MicroUsd, usd_decimal_option};
 pub use pricing::LlmPricingOverride;
 pub use security_types::{PlaceholderId, SecretKind};
 pub use session::{
-    BackgroundCompressionPayload, ChannelType, Lineage, LineageKind, Session, SessionState,
-    TriggerKind, TriggerSource, User,
+    BackgroundCompressionPayload, ChannelType, GroupState, Lineage, LineageKind, Session,
+    SessionState, TriggerKind, TriggerSource, User,
 };
 pub use spawn_protocol::{
-    BACKGROUND_SUBAGENT_HANDLE_PREFIX, PendingSubagentResult, SPAWN_SUBAGENT_TOOL_NAME,
-    SUBAGENT_CHANNEL_TAG, SubagentExitStatus, SubagentParentContext, SubagentResult,
-    SubagentSpawnRequest, SystemSpawnRequest,
+    BACKGROUND_DISPATCH_ACK_PREFIX, BACKGROUND_SUBAGENT_HANDLE_PREFIX, BackgroundJobKind,
+    OnTimeout, PendingBackgroundResult, SPAWN_SUBAGENT_TOOL_NAME, SUBAGENT_CHANNEL_TAG,
+    SubagentExitStatus, SubagentParentContext, SubagentResult, SubagentSpawnRequest,
+    SystemSpawnRequest,
 };
 pub use task::{
     TASK_CREATE_TOOL_NAME, TASK_GET_TOOL_NAME, TASK_LIST_TOOL_NAME, TASK_MUTATING_TOOL_NAMES,

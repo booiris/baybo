@@ -29,6 +29,23 @@ pub trait SandboxRunner: Send + Sync {
     async fn run(&self, spec: SandboxSpec) -> Result<SandboxOutput, SandboxError>;
     fn backend(&self) -> Backend;
 
+    /// Spawn the command **detached**: return a live [`DetachedChild`]
+    /// immediately instead of running it to completion. The caller owns the
+    /// foreground wait, timeout, and output streaming — used by the agent's
+    /// "Bash timeout → background" path. `spec.timeout` is ignored (the
+    /// caller times out). Default: unsupported; the agent's `SandboxAdapter`
+    /// surfaces the error and the tool falls back to the blocking `run`
+    /// (kill-on-timeout). bwrap and Docker override this; sandbox-exec does
+    /// not (its per-call scratch tempdir can't outlive a detached child).
+    async fn spawn_detached(
+        &self,
+        _spec: SandboxSpec,
+    ) -> Result<Box<dyn DetachedChild>, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "detached spawn is not supported by this sandbox backend".into(),
+        ))
+    }
+
     /// Optional readiness step run once at gateway startup before any
     /// `run()` calls. The Docker backend uses it to ensure the
     /// configured image is present locally and to pin its digest, so
@@ -51,6 +68,57 @@ pub trait SandboxRunner: Send + Sync {
     /// better override this.
     fn default_resource_limits(&self) -> spec::ResourceLimits {
         spec::ResourceLimits::unlimited()
+    }
+}
+
+/// A live, detached sandboxed child the caller streams + awaits out of band
+/// (the agent's "Bash timeout → background" path). Mirrors
+/// `aura_tools::RunningChild` — the agent's `SandboxAdapter` wraps one in the
+/// other — and is defined here so `aura-sandbox` stays free of an `aura-tools`
+/// dependency. Backends own the kill semantics: bwrap just signals the child;
+/// the Docker backend must `docker rm -f` the container (a SIGKILL of the
+/// `docker run` client would orphan it).
+#[async_trait]
+pub trait DetachedChild: Send {
+    /// Take the child's stdout reader (once); `None` if already taken.
+    fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>;
+    /// Take the child's stderr reader (once).
+    fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>;
+    /// Wait for the child to exit; returns its exit code (or -1).
+    async fn wait(&mut self) -> i32;
+    /// Terminate the child (best-effort) — used by `/stop` / `JobStop`.
+    fn start_kill(&mut self);
+}
+
+/// [`DetachedChild`] over a plain `tokio::process::Child` — bwrap (and the
+/// container-less backends). The Docker backend uses its own type that also
+/// removes the container on kill.
+pub struct TokioDetachedChild(pub tokio::process::Child);
+
+#[async_trait]
+impl DetachedChild for TokioDetachedChild {
+    fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.0
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
+    }
+    fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.0
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
+    }
+    async fn wait(&mut self) -> i32 {
+        self.0
+            .wait()
+            .await
+            .ok()
+            .and_then(|s| s.code())
+            .unwrap_or(-1)
+    }
+    fn start_kill(&mut self) {
+        let _ = self.0.start_kill();
     }
 }
 

@@ -1,53 +1,74 @@
-//! Framing for the autonomous `SubagentNotification` turn — the synthetic
-//! prompt the parent session runs when one or more background subagents
-//! finish. Built here (pure) so the framing lives with the rest of the
-//! prompt-injection text; the agent actor appends the result **in-memory
-//! only** (rebuilt from the durable `pending_subagent_results` buffer on
-//! every retry) and never persists it.
+//! Framing for the autonomous notification turn — the synthetic prompt the
+//! parent session runs when one or more background jobs (detached subagents
+//! and detached `Bash` commands) finish. Built here (pure) so the framing
+//! lives with the rest of the prompt-injection text; the agent actor appends
+//! the result **in-memory only** (rebuilt from the durable
+//! `pending_background_results` buffer on every retry) and never persists it.
 
-use aura_model::{ContentBlock, PendingSubagentResult, SubagentExitStatus};
+use aura_model::{BackgroundJobKind, ContentBlock, PendingBackgroundResult, SubagentExitStatus};
 
-/// Opening framing for a `SubagentNotification` turn's content. Lives in
-/// per-turn content (never the system prompt) so the prompt-cache prefix
-/// is identical to a normal main-path turn. Cron-style: report proactively.
-const SUBAGENT_NOTIFICATION_FRAMING: &str = "[background subagent task(s) finished since your last turn — report the outcome to the user as a fresh, proactive message.]";
+/// Opening framing for a notification turn's content. Lives in per-turn
+/// content (never the system prompt) so the prompt-cache prefix is identical
+/// to a normal main-path turn. Cron-style: report proactively.
+const BACKGROUND_NOTIFICATION_FRAMING: &str = "[background task(s) finished since your last turn — report the outcome to the user as a fresh, proactive message.]";
 
-/// Per-result element of the nested `<subagent_results>` block. Metadata
-/// rides as attributes; `task` / `output` are child elements so multi-line
-/// free text with quotes needs no attribute escaping.
-const SUBAGENT_RESULT_TEMPLATE: &str = r#"  <result handle="{{handle}}" type="{{type}}" status="{{status}}">
+/// Per-result element of the nested `<background_results>` block. Metadata
+/// rides as attributes; `task` / `output` (and the kind-specific `detail`)
+/// are child elements so multi-line free text with quotes needs no attribute
+/// escaping.
+const BACKGROUND_RESULT_TEMPLATE: &str = r#"  <result handle="{{handle}}" type="{{type}}" status="{{status}}">
     <task>{{task}}</task>
     <output>{{output}}</output>
-    <child_session>{{child_session}}</child_session>
-  </result>
+{{detail}}  </result>
 "#;
 
-/// Render pending background-subagent results into nested-XML content for one
-/// `SubagentNotification` turn. Pure — the caller owns the buffer so it can
-/// restore the results if the turn fails. The framing rides in this per-turn
-/// content (never the system prompt) so the prompt-cache prefix stays
-/// identical to a normal main-path turn.
-pub fn build_notification_content(pending: &[PendingSubagentResult]) -> Vec<ContentBlock> {
-    let mut xml = String::from(SUBAGENT_NOTIFICATION_FRAMING);
-    xml.push_str("\n\n<subagent_results>\n");
+/// Render pending background-job results into nested-XML content for one
+/// notification turn. Pure — the caller owns the buffer so it can restore the
+/// results if the turn fails. The framing rides in this per-turn content
+/// (never the system prompt) so the prompt-cache prefix stays identical to a
+/// normal main-path turn.
+pub fn build_notification_content(pending: &[PendingBackgroundResult]) -> Vec<ContentBlock> {
+    let mut xml = String::from(BACKGROUND_NOTIFICATION_FRAMING);
+    xml.push_str("\n\n<background_results>\n");
     for p in pending {
+        let (type_attr, detail) = match &p.kind {
+            BackgroundJobKind::Subagent {
+                child_session_id,
+                subagent_type,
+            } => (
+                subagent_type.clone(),
+                format!(
+                    "    <child_session>{}</child_session>\n",
+                    xml_escape(child_session_id.as_ref())
+                ),
+            ),
+            BackgroundJobKind::Command {
+                exit_code,
+                output_path,
+                ..
+            } => (
+                "command".to_string(),
+                format!(
+                    "    <exit_code>{}</exit_code>\n    <output_file>{}</output_file>\n",
+                    exit_code,
+                    xml_escape(output_path)
+                ),
+            ),
+        };
         xml.push_str(
-            &SUBAGENT_RESULT_TEMPLATE
+            &BACKGROUND_RESULT_TEMPLATE
                 .replace("{{handle}}", &xml_escape(&p.handle_id))
-                .replace("{{type}}", &xml_escape(&p.subagent_type))
+                .replace("{{type}}", &xml_escape(&type_attr))
                 .replace("{{status}}", pending_status_label(&p.status))
-                .replace("{{task}}", &xml_escape(&p.task_summary))
+                .replace("{{task}}", &xml_escape(&p.label))
                 .replace(
                     "{{output}}",
-                    &xml_escape(&truncate_for_notice(&p.final_text)),
+                    &xml_escape(&truncate_for_notice(&p.summary_text)),
                 )
-                .replace(
-                    "{{child_session}}",
-                    &xml_escape(p.child_session_id.as_ref()),
-                ),
+                .replace("{{detail}}", &detail),
         );
     }
-    xml.push_str("</subagent_results>");
+    xml.push_str("</background_results>");
     vec![ContentBlock::Text(xml)]
 }
 
@@ -60,15 +81,16 @@ fn pending_status_label(status: &SubagentExitStatus) -> &'static str {
     }
 }
 
-/// Cap a result's free text so one chatty subagent can't blow the notification
-/// turn's budget; the full text stays in the child session transcript.
+/// Cap a result's free text so one chatty job can't blow the notification
+/// turn's budget; the full text stays in the child session transcript (for a
+/// subagent) or the job's output file (for a command).
 fn truncate_for_notice(text: &str) -> String {
     const MAX: usize = 1024;
     if text.chars().count() <= MAX {
         return text.to_string();
     }
     let truncated: String = text.chars().take(MAX).collect();
-    format!("{truncated}… [truncated; full text in child session transcript]")
+    format!("{truncated}… [truncated; full text in the job's transcript / output file]")
 }
 
 fn xml_escape(s: &str) -> String {
@@ -108,25 +130,46 @@ mod tests {
     }
 
     #[test]
-    fn build_notification_frames_and_escapes() {
-        let pending = vec![PendingSubagentResult {
-            handle_id: "h1".into(),
-            subagent_type: "claude".into(),
-            task_summary: "do <stuff>".into(),
-            child_session_id: aura_model::SessionId::from("child-1"),
-            final_text: "result & more".into(),
-            status: SubagentExitStatus::Completed,
-        }];
+    fn build_notification_frames_and_escapes_subagent() {
+        let pending = vec![PendingBackgroundResult::subagent(
+            "h1",
+            "claude",
+            "do <stuff>",
+            aura_model::SessionId::from("child-1"),
+            "result & more",
+            SubagentExitStatus::Completed,
+        )];
         let blocks = build_notification_content(&pending);
         let ContentBlock::Text(xml) = &blocks[0] else {
             panic!("expected text block");
         };
-        assert!(xml.starts_with(SUBAGENT_NOTIFICATION_FRAMING));
-        assert!(xml.contains("<subagent_results>"));
+        assert!(xml.starts_with(BACKGROUND_NOTIFICATION_FRAMING));
+        assert!(xml.contains("<background_results>"));
         assert!(xml.contains("status=\"completed\""));
+        assert!(xml.contains("type=\"claude\""));
         // Free text is XML-escaped.
         assert!(xml.contains("do &lt;stuff&gt;"));
         assert!(xml.contains("result &amp; more"));
         assert!(xml.contains("<child_session>child-1</child_session>"));
+    }
+
+    #[test]
+    fn build_notification_renders_command_kind() {
+        let pending = vec![PendingBackgroundResult::command(
+            "bg-cmd-1",
+            "cargo build --release",
+            0,
+            "logs/background/bg-cmd-1.log",
+            "Compiling…\nFinished",
+            SubagentExitStatus::Completed,
+        )];
+        let blocks = build_notification_content(&pending);
+        let ContentBlock::Text(xml) = &blocks[0] else {
+            panic!("expected text block");
+        };
+        assert!(xml.contains("type=\"command\""));
+        assert!(xml.contains("<exit_code>0</exit_code>"));
+        assert!(xml.contains("<output_file>logs/background/bg-cmd-1.log</output_file>"));
+        assert!(xml.contains("cargo build --release"));
     }
 }

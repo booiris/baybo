@@ -1,7 +1,7 @@
 //! The session planning checklist: the durable value types behind the
 //! `Task*` tool family.
 //!
-//! Pure data, shared one-way (mirrors [`crate::spawn_protocol::PendingSubagentResult`]):
+//! Pure data, shared one-way (mirrors [`crate::spawn_protocol::PendingBackgroundResult`]):
 //! `aura-task` (the tool boundary) and `aura-context` (the per-turn
 //! re-injection renderer) both reach for these. Persistence lives in the
 //! dedicated `session_tasks` table behind `aura_store::TaskStore`.

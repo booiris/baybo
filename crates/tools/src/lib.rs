@@ -203,6 +203,15 @@ pub struct ToolContext {
     /// the real filesystem. The resolver self-enforces access control via
     /// [`VirtualReadAccess`].
     pub virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
+    /// Runtime hook for detaching a slow command into the background.
+    /// `Some` **only for user-facing sessions** (the runtime gates the
+    /// injection), so its presence is the "may this command convert to
+    /// background on timeout" signal. `None` for cron / nested-subagent
+    /// sessions and argv-mode boots — those keep kill-on-timeout.
+    pub background_jobs: Option<Arc<dyn BackgroundJobSink>>,
+    /// View + control of this session's in-flight background jobs, for the
+    /// `JobList` / `JobStop` tools. Gated like [`Self::background_jobs`].
+    pub background_control: Option<Arc<dyn BackgroundJobControl>>,
 }
 
 /// Severity of a [`SessionNotifier`] event. Matches
@@ -457,6 +466,24 @@ pub trait ExecSandbox: Send + Sync {
         args: &[String],
         opts: SpawnOpts,
     ) -> crate::Result<SandboxedOutput>;
+
+    /// Spawn a command **detached**: return a live [`RunningChild`]
+    /// immediately instead of waiting. The caller owns the foreground
+    /// wait + timeout, and can hand the still-running child to a
+    /// [`BackgroundJobSink`] to keep it alive past the tool call. The
+    /// `opts.timeout` is ignored (the caller times out). Backends that
+    /// can't expose a live child return an error and the caller falls
+    /// back to the blocking [`Self::spawn_command`] (kill-on-timeout).
+    async fn spawn_command_detached(
+        &self,
+        _program: &Path,
+        _args: &[String],
+        _opts: SpawnOpts,
+    ) -> crate::Result<Box<dyn RunningChild>> {
+        Err(crate::ToolError::Execution(
+            "detached spawn is not supported by this sandbox backend".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -465,6 +492,110 @@ pub struct SandboxedOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub timed_out: bool,
+}
+
+/// A live, detached child process the runtime keeps streaming and awaits
+/// out-of-band. Backs the "Bash timeout → background" path: the tool takes
+/// the stdout/stderr readers (to stream them to files), then hands the
+/// child to a [`BackgroundJobSink`] which awaits [`Self::wait`] and routes
+/// a completion notification. `/stop` / `JobStop` trip the escort's cancel
+/// token, which calls [`Self::start_kill`].
+#[async_trait]
+pub trait RunningChild: Send {
+    /// Take the child's stdout reader (once). `None` if already taken or
+    /// not piped.
+    fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>;
+    /// Take the child's stderr reader (once).
+    fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>;
+    /// Wait for the child to exit; returns its exit code (or -1 if it was
+    /// killed by signal / produced no code).
+    async fn wait(&mut self) -> i32;
+    /// Request termination (best-effort). The escort calls this on cancel.
+    fn start_kill(&mut self);
+}
+
+/// [`RunningChild`] over a plain [`tokio::process::Child`] — the
+/// unsandboxed path, and what the sandbox adapter wraps the bwrap child in.
+pub struct TokioRunningChild(pub tokio::process::Child);
+
+#[async_trait]
+impl RunningChild for TokioRunningChild {
+    fn take_stdout(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.0
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
+    }
+    fn take_stderr(&mut self) -> Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        self.0
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)
+    }
+    async fn wait(&mut self) -> i32 {
+        self.0
+            .wait()
+            .await
+            .ok()
+            .and_then(|s| s.code())
+            .unwrap_or(-1)
+    }
+    fn start_kill(&mut self) {
+        let _ = self.0.start_kill();
+    }
+}
+
+/// What a tool hands to the runtime when a command crosses into the
+/// background: the still-running child plus the in-flight stdout/stderr →
+/// file copy tasks (the escort awaits them so the files are fully flushed
+/// before it reads their tails for the completion notification).
+pub struct DetachedCommand {
+    /// Minted by the tool so the output file names, the handle returned to
+    /// the LLM, and the eventual completion notification all share one id.
+    pub handle_id: String,
+    pub session_id: SessionId,
+    pub command: String,
+    pub child: Box<dyn RunningChild>,
+    pub copy_tasks: Vec<tokio::task::JoinHandle<()>>,
+    pub stdout_path: std::path::PathBuf,
+    pub stderr_path: std::path::PathBuf,
+}
+
+/// Runtime hook that takes ownership of a [`DetachedCommand`], streams it
+/// to completion off the tool call, and routes a background-job completion
+/// notification to the parent session. Implemented by the agent layer
+/// (`aura-agent`) and injected via [`ToolContext::background_jobs`], which
+/// the runtime populates **only for user-facing sessions** — so the
+/// presence of the sink is itself the "is this conversation eligible to
+/// background work" gate.
+#[async_trait]
+pub trait BackgroundJobSink: Send + Sync {
+    /// Take the detached command; return the handle id the tool surfaces
+    /// to the LLM. Returns promptly (registers + spawns an escort task) —
+    /// it does NOT await the command.
+    async fn detach_command(&self, job: DetachedCommand) -> String;
+}
+
+/// One in-flight background job, as surfaced by the `JobList` tool.
+pub struct BackgroundJobInfo {
+    pub handle: String,
+    /// Subagent profile name, or `"command"` for a detached `Bash` command.
+    pub kind: String,
+    /// The task summary (subagent) or the command line (command).
+    pub summary: String,
+}
+
+/// Per-session view + control of in-flight background jobs (detached
+/// subagents and commands), backing the `JobList` / `JobStop` tools.
+/// Injected via [`ToolContext::background_control`] only for user-facing
+/// sessions (mirrors [`BackgroundJobSink`]); the same runtime component
+/// implements both.
+#[async_trait]
+pub trait BackgroundJobControl: Send + Sync {
+    /// In-flight background jobs dispatched from `session_id`.
+    async fn list(&self, session_id: &SessionId) -> Vec<BackgroundJobInfo>;
+    /// Kill one in-flight job by handle. `true` if it was running.
+    async fn stop(&self, session_id: &SessionId, handle: &str) -> bool;
 }
 
 /// Tool-side access to user-managed secrets, injected by the agent layer

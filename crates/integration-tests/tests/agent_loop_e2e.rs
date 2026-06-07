@@ -32,7 +32,7 @@ use aura_llm::{LlmError, LlmResponse, ModelPricing, StreamEvent, TokenUsage, Too
 use aura_memory::test_support::RecordingMemory;
 use aura_memory::{Memory, RecalledMemory};
 use aura_model::{
-    ContentBlock, MessageMetadata, MicroUsd, PendingSubagentResult, Role, SessionId,
+    ContentBlock, MessageMetadata, MicroUsd, PendingBackgroundResult, Role, SessionId,
     SubagentExitStatus, ThinkingContent, TriggerSource,
 };
 use aura_tools::test_support::RecordingTool;
@@ -579,19 +579,19 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
         thinking: None,
     });
 
-    let pending = PendingSubagentResult {
-        handle_id: "bg-42".into(),
-        subagent_type: "explorer".into(),
-        task_summary: "find FOO".into(),
-        child_session_id: SessionId::from("child-A"),
-        final_text: "found FOO at lib/foo.rs:7".into(),
-        status: SubagentExitStatus::Completed,
-    };
+    let pending = PendingBackgroundResult::subagent(
+        "bg-42",
+        "explorer",
+        "find FOO",
+        SessionId::from("child-A"),
+        "found FOO at lib/foo.rs:7",
+        SubagentExitStatus::Completed,
+    );
     harness
         .mailbox
-        .send(AgentMessage::SubagentFinished(Box::new(pending)))
+        .send(AgentMessage::BackgroundJobFinished(Box::new(pending)))
         .await
-        .expect("inject SubagentFinished");
+        .expect("inject BackgroundJobFinished");
 
     // No user turn: the actor fires the notification turn on its own.
     let outputs = harness.drain_outputs(Duration::from_millis(500)).await;
@@ -613,7 +613,7 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
         })
         .expect("text block on notice");
     assert!(
-        text.contains("<subagent_results>"),
+        text.contains("<background_results>"),
         "XML notice missing: {text}"
     );
     assert!(text.contains("bg-42"));
@@ -638,7 +638,7 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
         .expect("load session")
         .expect("row present");
     assert!(
-        stored.state.pending_subagent_results.is_empty(),
+        stored.state.pending_background_results.is_empty(),
         "notification turn must clear the persisted buffer"
     );
 
@@ -676,18 +676,18 @@ async fn subagent_notification_suppresses_empty_reply() {
 
     harness
         .mailbox
-        .send(AgentMessage::SubagentFinished(Box::new(
-            PendingSubagentResult {
-                handle_id: "bg-quiet".into(),
-                subagent_type: "explorer".into(),
-                task_summary: "nothing notable".into(),
-                child_session_id: SessionId::from("child-Q"),
-                final_text: "no-op".into(),
-                status: SubagentExitStatus::Completed,
-            },
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            PendingBackgroundResult::subagent(
+                "bg-quiet",
+                "explorer",
+                "nothing notable",
+                SessionId::from("child-Q"),
+                "no-op",
+                SubagentExitStatus::Completed,
+            ),
         )))
         .await
-        .expect("inject SubagentFinished");
+        .expect("inject BackgroundJobFinished");
 
     let outputs = harness.drain_outputs(Duration::from_millis(500)).await;
 
@@ -729,18 +729,18 @@ async fn subagent_notification_failure_keeps_pending_for_retry() {
 
     harness
         .mailbox
-        .send(AgentMessage::SubagentFinished(Box::new(
-            PendingSubagentResult {
-                handle_id: "bg-keep".into(),
-                subagent_type: "explorer".into(),
-                task_summary: "find X".into(),
-                child_session_id: SessionId::from("child-K"),
-                final_text: "found X".into(),
-                status: SubagentExitStatus::Completed,
-            },
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            PendingBackgroundResult::subagent(
+                "bg-keep",
+                "explorer",
+                "find X",
+                SessionId::from("child-K"),
+                "found X",
+                SubagentExitStatus::Completed,
+            ),
         )))
         .await
-        .expect("inject SubagentFinished");
+        .expect("inject BackgroundJobFinished");
 
     let _ = harness.drain_outputs(Duration::from_millis(500)).await;
 
@@ -754,12 +754,12 @@ async fn subagent_notification_failure_keeps_pending_for_retry() {
         .expect("load session")
         .expect("row present");
     assert_eq!(
-        stored.state.pending_subagent_results.len(),
+        stored.state.pending_background_results.len(),
         1,
         "failed notification turn must keep the pending result"
     );
     assert_eq!(
-        stored.state.pending_subagent_results[0].handle_id,
+        stored.state.pending_background_results[0].handle_id,
         "bg-keep"
     );
 
@@ -792,18 +792,18 @@ async fn failed_subagent_notification_retries_until_success() {
 
     harness
         .mailbox
-        .send(AgentMessage::SubagentFinished(Box::new(
-            PendingSubagentResult {
-                handle_id: "bg-retry".into(),
-                subagent_type: "explorer".into(),
-                task_summary: "find X".into(),
-                child_session_id: SessionId::from("child-R"),
-                final_text: "found X".into(),
-                status: SubagentExitStatus::Completed,
-            },
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            PendingBackgroundResult::subagent(
+                "bg-retry",
+                "explorer",
+                "find X",
+                SessionId::from("child-R"),
+                "found X",
+                SubagentExitStatus::Completed,
+            ),
         )))
         .await
-        .expect("inject SubagentFinished");
+        .expect("inject BackgroundJobFinished");
 
     // Long enough that auto-advance steps past the first retry backoff (60s)
     // and the retry's reply reaches the channel.
@@ -823,7 +823,7 @@ async fn failed_subagent_notification_retries_until_success() {
         .expect("load session")
         .expect("row present");
     assert!(
-        stored.state.pending_subagent_results.is_empty(),
+        stored.state.pending_background_results.is_empty(),
         "a successful retry must drain the buffer"
     );
     // … and the retry's reply reached the channel.
@@ -906,14 +906,14 @@ async fn subagent_finished_dedupes_on_handle_id() {
     });
 
     let make = || {
-        AgentMessage::SubagentFinished(Box::new(PendingSubagentResult {
-            handle_id: "bg-dupe".into(),
-            subagent_type: "explorer".into(),
-            task_summary: "dupe".into(),
-            child_session_id: SessionId::from("child-D"),
-            final_text: "only once".into(),
-            status: SubagentExitStatus::Completed,
-        }))
+        AgentMessage::BackgroundJobFinished(Box::new(PendingBackgroundResult::subagent(
+            "bg-dupe",
+            "explorer",
+            "dupe",
+            SessionId::from("child-D"),
+            "only once",
+            SubagentExitStatus::Completed,
+        )))
     };
     for _ in 0..3 {
         harness.mailbox.send(make()).await.expect("inject");
@@ -947,7 +947,7 @@ async fn subagent_finished_dedupes_on_handle_id() {
         .await
         .expect("load session")
         .expect("row present");
-    assert!(stored.state.pending_subagent_results.is_empty());
+    assert!(stored.state.pending_background_results.is_empty());
 
     harness.shutdown().await;
 }
@@ -1753,18 +1753,18 @@ async fn memory_hooks_skip_subagent_notification_turn() {
 
     harness
         .mailbox
-        .send(AgentMessage::SubagentFinished(Box::new(
-            PendingSubagentResult {
-                handle_id: "bg-1".into(),
-                subagent_type: "explorer".into(),
-                task_summary: "find X".into(),
-                child_session_id: SessionId::from("child-X"),
-                final_text: "found X".into(),
-                status: SubagentExitStatus::Completed,
-            },
+        .send(AgentMessage::BackgroundJobFinished(Box::new(
+            PendingBackgroundResult::subagent(
+                "bg-1",
+                "explorer",
+                "find X",
+                SessionId::from("child-X"),
+                "found X",
+                SubagentExitStatus::Completed,
+            ),
         )))
         .await
-        .expect("inject SubagentFinished");
+        .expect("inject BackgroundJobFinished");
 
     let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
     // Give any (wrongly-spawned) detached write a chance to land before asserting 0.

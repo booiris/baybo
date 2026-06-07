@@ -196,6 +196,8 @@ mod tests {
             llm: None,
             secrets: None,
             virtual_reads: None,
+            background_jobs: None,
+            background_control: None,
         };
         let err = AgentTool.execute(json!({}), &ctx).await.unwrap_err();
         assert!(matches!(err, ToolError::NotImplemented(_)));

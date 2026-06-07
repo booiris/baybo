@@ -154,13 +154,13 @@ impl Router {
     /// subagents that already *completed* but haven't been reported yet are
     /// left untouched — `/stop` only stops what's still running, so those
     /// notify normally once the cancelled turn returns and the actor drains
-    /// `pending_subagent_results`. Idempotent and safe on an idle session
+    /// `pending_background_results`. Idempotent and safe on an idle session
     /// (everything degrades to a no-op).
     async fn handle_stop(&self, session_id: &SessionId, user_id: &str, channel: &ChannelType) {
         // Drain the in-flight background subagents first: the removal both
         // gives us the cancel targets + ack summaries AND suppresses each
         // child's terminal delivery (its wait task sees the entry gone), so a
-        // stopped result can't repopulate `pending_subagent_results`.
+        // stopped result can't repopulate `pending_background_results`.
         let background = self
             .supervisor
             .take_in_flight_background_subagents(session_id);
@@ -212,8 +212,8 @@ impl Router {
             info.cancel_token.cancel();
         }
 
-        // Note: we deliberately do NOT touch `pending_subagent_results` or
-        // drain queued `SubagentFinished`. Those hold results from subagents
+        // Note: we deliberately do NOT touch `pending_background_results` or
+        // drain queued `BackgroundJobFinished`. Those hold results from subagents
         // that already finished; `/stop` stops running work, it doesn't discard
         // completed work — so once the cancelled turn returns, the actor reports
         // them via the normal notification path.
@@ -362,6 +362,7 @@ mod tests {
                 InFlightSubagent {
                     subagent_type: "explorer".to_string(),
                     task_summary: "find X".to_string(),
+                    handle: "bg-c1".to_string(),
                     cancel_token: CancellationToken::new(),
                 },
             ),
@@ -370,6 +371,7 @@ mod tests {
                 InFlightSubagent {
                     subagent_type: "planner".to_string(),
                     task_summary: "draft Y".to_string(),
+                    handle: "bg-c2".to_string(),
                     cancel_token: CancellationToken::new(),
                 },
             ),

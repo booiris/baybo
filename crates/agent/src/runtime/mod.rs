@@ -7,6 +7,7 @@
 //! companion to the inline compression flow is [`compression`].
 
 pub mod agent_loop;
+pub mod background_jobs;
 pub mod billed_chat;
 pub mod compression;
 pub mod error_recovery;

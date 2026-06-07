@@ -1,7 +1,7 @@
 //! Bounded, single-consumer **priority** mailbox for the actor.
 //!
 //! Replaces the plain FIFO `tokio::mpsc` the actor used, so a live
-//! `UserInput` is served ahead of a queued `SubagentFinished` while a
+//! `UserInput` is served ahead of a queued `BackgroundJobFinished` while a
 //! lowest-priority `ActorStop` only runs once all real work has drained.
 //! It mirrors the slice of the `mpsc` API the actor + supervisor rely on
 //! (`send` / `try_send` / `recv` / `try_recv`, `Clone`, and
@@ -31,14 +31,14 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 pub const DEFAULT_CAPACITY: usize = 4096;
 
 /// Priority class of a mailbox message; higher is served first. The
-/// derived `Ord` follows declaration order, so `Trigger > SubagentFinished
+/// derived `Ord` follows declaration order, so `Trigger > BackgroundJobFinished
 /// > Stop`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum MessagePriority {
     /// Lowest — drain every real message first, then stop the actor.
     Stop,
     /// Autonomous reaction to a finished background subagent.
-    SubagentFinished,
+    BackgroundJobFinished,
     /// Triggering work: live user input, cron fire, subagent spawn,
     /// background-compression dispatch.
     Trigger,
@@ -231,7 +231,7 @@ impl<T> MailboxReceiver<T> {
     /// blocks the pop even when a matching entry sits lower, which is exactly
     /// what the agent loop wants: it drains the *leading run* of injectable user
     /// interjections at a tool boundary and stops at the first non-injectable
-    /// message (a queued slash command, a `SubagentFinished`, an `ActorStop`),
+    /// message (a queued slash command, a `BackgroundJobFinished`, an `ActorStop`),
     /// leaving everything behind it for the actor's normal dispatch.
     ///
     /// `pred` runs **while the queue mutex is held**, so it must be a pure,
@@ -341,16 +341,16 @@ mod tests {
         }
     }
 
-    use MessagePriority::{Stop, SubagentFinished, Trigger};
+    use MessagePriority::{BackgroundJobFinished, Stop, Trigger};
 
     #[tokio::test]
     async fn pops_highest_priority_first() {
         let (tx, mut rx) = channel::<Msg>(8);
         tx.send(Msg::new(Stop, 1)).await.unwrap();
         tx.send(Msg::new(Trigger, 2)).await.unwrap();
-        tx.send(Msg::new(SubagentFinished, 3)).await.unwrap();
+        tx.send(Msg::new(BackgroundJobFinished, 3)).await.unwrap();
         assert_eq!(rx.recv().await.unwrap().id, 2); // Trigger
-        assert_eq!(rx.recv().await.unwrap().id, 3); // SubagentFinished
+        assert_eq!(rx.recv().await.unwrap().id, 3); // BackgroundJobFinished
         assert_eq!(rx.recv().await.unwrap().id, 1); // Stop
     }
 
@@ -416,12 +416,12 @@ mod tests {
     #[tokio::test]
     async fn try_recv_if_only_considers_the_top_priority_entry() {
         let (tx, mut rx) = channel::<Msg>(8);
-        // A lower-priority SubagentFinished queued behind a Trigger.
-        tx.send(Msg::new(SubagentFinished, 1)).await.unwrap();
+        // A lower-priority BackgroundJobFinished queued behind a Trigger.
+        tx.send(Msg::new(BackgroundJobFinished, 1)).await.unwrap();
         tx.send(Msg::new(Trigger, 2)).await.unwrap();
         // Top is the Trigger: a Trigger-only predicate pops it.
         assert_eq!(rx.try_recv_if(|m| m.pri == Trigger).unwrap().id, 2);
-        // Now the top is the SubagentFinished: a Trigger-only predicate leaves it.
+        // Now the top is the BackgroundJobFinished: a Trigger-only predicate leaves it.
         assert!(rx.try_recv_if(|m| m.pri == Trigger).is_none());
         // Still queued, served by a normal recv.
         assert_eq!(rx.recv().await.unwrap().id, 1);
