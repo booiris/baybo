@@ -199,6 +199,9 @@ pub struct ToolExecutor {
     /// user-facing session) — see [`Self::execute`]. `None` ⇒ no manager
     /// wired (argv-mode boots, tests), so commands keep kill-on-timeout.
     background_jobs: Option<Arc<dyn aura_tools::BackgroundJobSink>>,
+    /// Control surface for the `JobList` / `JobStop` tools. Gated like
+    /// [`Self::background_jobs`] (same runtime component implements both).
+    background_control: Option<Arc<dyn aura_tools::BackgroundJobControl>>,
 }
 
 impl ToolExecutor {
@@ -212,6 +215,7 @@ impl ToolExecutor {
         sandbox_runner: Option<Arc<dyn SandboxRunner>>,
         virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
         background_jobs: Option<Arc<dyn aura_tools::BackgroundJobSink>>,
+        background_control: Option<Arc<dyn aura_tools::BackgroundJobControl>>,
     ) -> Self {
         Self {
             tool_registry,
@@ -222,6 +226,7 @@ impl ToolExecutor {
             sandbox_runner,
             virtual_reads,
             background_jobs,
+            background_control,
         }
     }
 
@@ -528,6 +533,11 @@ impl ToolExecutor {
                     // background on timeout only there.
                     background_jobs: if background_eligible {
                         self.background_jobs.clone()
+                    } else {
+                        None
+                    },
+                    background_control: if background_eligible {
+                        self.background_control.clone()
                     } else {
                         None
                     },

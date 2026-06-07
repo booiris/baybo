@@ -242,6 +242,7 @@ mod tests {
             secrets: None,
             virtual_reads: None,
             background_jobs: None,
+            background_control: None,
         }
     }
 
@@ -249,6 +250,7 @@ mod tests {
         ToolContext {
             virtual_reads: Some(resolver),
             background_jobs: None,
+            background_control: None,
             ..ctx()
         }
     }

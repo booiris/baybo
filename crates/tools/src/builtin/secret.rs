@@ -251,6 +251,7 @@ mod tests {
             secrets,
             virtual_reads: None,
             background_jobs: None,
+            background_control: None,
         }
     }
 

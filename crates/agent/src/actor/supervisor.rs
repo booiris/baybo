@@ -157,6 +157,48 @@ impl AgentSupervisor {
             .unwrap_or_default()
     }
 
+    /// Non-draining snapshot of every in-flight background job (subagents +
+    /// detached commands) for a parent — backs the `JobList` tool. Returns
+    /// `(handle, info)` pairs; the handle is the registry's child-session key
+    /// (a real child session id for a subagent, the synthetic command handle
+    /// for a command).
+    pub fn list_in_flight_background(
+        &self,
+        parent_session_id: &SessionId,
+    ) -> Vec<(SessionId, InFlightSubagent)> {
+        self.in_flight_background_subagents
+            .get(parent_session_id)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    /// Cancel and drop ONE in-flight background job by handle — backs the
+    /// `JobStop` tool. Cancels the token (the escort kills the child) and
+    /// removes the entry, which doubles as the suppress signal (the escort
+    /// finds its entry gone and drops delivery). Returns the dropped info, or
+    /// `None` if no such job is in flight for this parent.
+    pub fn cancel_in_flight_background(
+        &self,
+        parent_session_id: &SessionId,
+        handle: &SessionId,
+    ) -> Option<InFlightSubagent> {
+        use dashmap::mapref::entry::Entry;
+        let mut removed = None;
+        if let Entry::Occupied(mut entry) = self
+            .in_flight_background_subagents
+            .entry(parent_session_id.clone())
+        {
+            if let Some(info) = entry.get_mut().remove(handle) {
+                info.cancel_token.cancel();
+                removed = Some(info);
+            }
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
+        removed
+    }
+
     /// Send a message to the actor for a given session.
     /// Returns false if the actor doesn't exist.
     pub async fn route(&self, session_id: &SessionId, message: AgentMessage) -> bool {

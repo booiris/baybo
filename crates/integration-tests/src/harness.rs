@@ -389,6 +389,7 @@ impl AgentTestHarnessBuilder {
             None,
             virtual_reads,
             None,
+            None,
         ));
 
         // Tokenizer model id must match the LLM client's so

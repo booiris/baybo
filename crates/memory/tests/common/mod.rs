@@ -77,5 +77,6 @@ pub fn tool_context(user_id: &str) -> ToolContext {
         secrets: None,
         virtual_reads: None,
         background_jobs: None,
+        background_control: None,
     }
 }

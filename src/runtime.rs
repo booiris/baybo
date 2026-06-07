@@ -628,9 +628,11 @@ pub async fn build_managers(
     // routes completion notifications via the supervisor, which is built
     // further down, so it holds it behind a `OnceLock` set right after.
     let bg_supervisor_slot = Arc::new(std::sync::OnceLock::new());
-    let background_jobs: Option<Arc<dyn aura_tools::BackgroundJobSink>> = Some(Arc::new(
-        aura_agent::BackgroundJobManager::new(Arc::clone(&bg_supervisor_slot)),
-    ));
+    let bg_manager = Arc::new(aura_agent::BackgroundJobManager::new(Arc::clone(
+        &bg_supervisor_slot,
+    )));
+    let background_jobs: Option<Arc<dyn aura_tools::BackgroundJobSink>> = Some(bg_manager.clone());
+    let background_control: Option<Arc<dyn aura_tools::BackgroundJobControl>> = Some(bg_manager);
 
     // `ToolExecutor` doesn't store an LLM handle; the active
     // `BillableLlm` is passed in per `execute` call and bound to the
@@ -645,6 +647,7 @@ pub async fn build_managers(
         sandbox_runner,
         virtual_reads,
         background_jobs,
+        background_control,
     ));
 
     // --- MCP reconciler — re-reads <workspace>/.mcp.json every 5s and

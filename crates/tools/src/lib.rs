@@ -209,6 +209,9 @@ pub struct ToolContext {
     /// background on timeout" signal. `None` for cron / nested-subagent
     /// sessions and argv-mode boots — those keep kill-on-timeout.
     pub background_jobs: Option<Arc<dyn BackgroundJobSink>>,
+    /// View + control of this session's in-flight background jobs, for the
+    /// `JobList` / `JobStop` tools. Gated like [`Self::background_jobs`].
+    pub background_control: Option<Arc<dyn BackgroundJobControl>>,
 }
 
 /// Severity of a [`SessionNotifier`] event. Matches
@@ -571,6 +574,28 @@ pub trait BackgroundJobSink: Send + Sync {
     /// to the LLM. Returns promptly (registers + spawns an escort task) —
     /// it does NOT await the command.
     async fn detach_command(&self, job: DetachedCommand) -> String;
+}
+
+/// One in-flight background job, as surfaced by the `JobList` tool.
+pub struct BackgroundJobInfo {
+    pub handle: String,
+    /// Subagent profile name, or `"command"` for a detached `Bash` command.
+    pub kind: String,
+    /// The task summary (subagent) or the command line (command).
+    pub summary: String,
+}
+
+/// Per-session view + control of in-flight background jobs (detached
+/// subagents and commands), backing the `JobList` / `JobStop` tools.
+/// Injected via [`ToolContext::background_control`] only for user-facing
+/// sessions (mirrors [`BackgroundJobSink`]); the same runtime component
+/// implements both.
+#[async_trait]
+pub trait BackgroundJobControl: Send + Sync {
+    /// In-flight background jobs dispatched from `session_id`.
+    async fn list(&self, session_id: &SessionId) -> Vec<BackgroundJobInfo>;
+    /// Kill one in-flight job by handle. `true` if it was running.
+    async fn stop(&self, session_id: &SessionId, handle: &str) -> bool;
 }
 
 /// Tool-side access to user-managed secrets, injected by the agent layer

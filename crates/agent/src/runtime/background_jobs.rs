@@ -15,7 +15,7 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use aura_model::{PendingBackgroundResult, SessionId, SubagentExitStatus};
-use aura_tools::{BackgroundJobSink, DetachedCommand};
+use aura_tools::{BackgroundJobControl, BackgroundJobInfo, BackgroundJobSink, DetachedCommand};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -74,6 +74,31 @@ impl BackgroundJobSink for BackgroundJobManager {
             escort_command(supervisor, parent_id, registry_id, handle_id, cancel, job).await;
         });
         returned
+    }
+}
+
+#[async_trait]
+impl BackgroundJobControl for BackgroundJobManager {
+    async fn list(&self, session_id: &SessionId) -> Vec<BackgroundJobInfo> {
+        let Some(sup) = self.supervisor.get() else {
+            return Vec::new();
+        };
+        sup.list_in_flight_background(session_id)
+            .into_iter()
+            .map(|(handle, info)| BackgroundJobInfo {
+                handle: handle.as_ref().to_string(),
+                kind: info.subagent_type,
+                summary: info.task_summary,
+            })
+            .collect()
+    }
+
+    async fn stop(&self, session_id: &SessionId, handle: &str) -> bool {
+        let Some(sup) = self.supervisor.get() else {
+            return false;
+        };
+        sup.cancel_in_flight_background(session_id, &SessionId::from(handle))
+            .is_some()
     }
 }
 

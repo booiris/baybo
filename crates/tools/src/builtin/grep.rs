@@ -394,6 +394,7 @@ mod tests {
             secrets: None,
             virtual_reads: None,
             background_jobs: None,
+            background_control: None,
         }
     }
 

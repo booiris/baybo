@@ -29,6 +29,7 @@ use aura_workspace::WorkspacePaths;
 
 use crate::{Tool, ToolCapability, ToolManifest};
 
+pub mod background_jobs;
 pub mod bash;
 pub mod edit;
 pub mod glob_tool;
@@ -45,6 +46,7 @@ pub mod write;
 #[cfg(debug_assertions)]
 pub mod echo;
 
+pub use background_jobs::{JobListTool, JobStopTool};
 pub use bash::BashTool;
 #[cfg(debug_assertions)]
 pub use echo::EchoTool;
@@ -100,6 +102,8 @@ pub fn default_tools(
         trusted(secret::SecretAddTool, vec![]),
         trusted(secret::SecretListTool, vec![]),
         trusted(secret::SecretCheckTool, vec![]),
+        trusted(JobListTool, vec![]),
+        trusted(JobStopTool, vec![]),
     ];
     #[cfg(debug_assertions)]
     tools.push(trusted(echo::EchoTool, vec![]));

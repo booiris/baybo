@@ -371,6 +371,7 @@ fn make_tool_context(workspace_paths: &WorkspacePaths, cancel: CancellationToken
         secrets: None,
         virtual_reads: None,
         background_jobs: None,
+        background_control: None,
     }
 }
 
