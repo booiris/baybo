@@ -9,8 +9,11 @@ use aura_model::{
     BACKGROUND_DISPATCH_ACK_PREFIX, BACKGROUND_SUBAGENT_HANDLE_PREFIX, ChannelType, ChatMessage,
     ContentBlock, ExternalAgentKind, JobId, Lineage, LineageKind, MessageMetadata, OnTimeout,
     PendingBackgroundResult, SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend,
-    SubagentExitStatus, SubagentResult, SubagentSpawnRequest, TriggerKind, User,
+    SubagentExitStatus, SubagentParentContext, SubagentResult, SubagentSpawnRequest, TriggerKind,
+    User,
 };
+use aura_session::SessionManager;
+use aura_workspace::WorkspacePaths;
 use chrono::Utc;
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
@@ -18,12 +21,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;
-use crate::actor::router::Router;
+use crate::actor::router::{ActorSpawner, build_oneshot_actor};
 use crate::actor::subagent::await_subagent_terminal;
 use crate::actor::supervisor::AgentSupervisor;
 use crate::external_agent::{
-    EXTERNAL_SUBAGENT_TIMEOUT, ExternalAgent, ExternalAgentEvent, ExternalAgentRequest,
+    EXTERNAL_SUBAGENT_TIMEOUT, ExternalAgent, ExternalAgentEvent, ExternalAgentRegistry,
+    ExternalAgentRequest,
 };
+use crate::runtime::llm_pool::LlmPoolHandle;
 
 /// `output_tx` buffer for a subagent's actor. Intentionally smaller than
 /// the operator-configured channel size for top-level actors — a child
@@ -45,9 +50,104 @@ fn parent_supports_background(session: &Session) -> bool {
     session.supports_background_jobs()
 }
 
-impl Router {
-    pub(super) async fn handle_subagent_spawn(
-        &mut self,
+/// Construction bundle for [`ActorSubagentSpawner`] — every field is
+/// required; call sites populate it via struct literal.
+pub struct SubagentSpawnerConfig {
+    pub session_manager: Arc<SessionManager>,
+    pub supervisor: AgentSupervisor,
+    pub dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
+    pub cost_manager: Arc<CostManager>,
+    pub job_lifecycle: Arc<JobLifecycle>,
+    pub actor_parent_token: CancellationToken,
+    pub external_agents: Arc<ExternalAgentRegistry>,
+    pub llm_pool: LlmPoolHandle,
+    pub workspace_paths: Arc<WorkspacePaths>,
+    pub actor_spawner: ActorSpawner,
+}
+
+/// Actor-backed [`aura_subagent::SubagentSpawner`]: materialises a child
+/// `AgentActor` (or routes to an external backend) for each
+/// `spawn_subagent` call. Lifted out of the router so the tool reaches it
+/// directly — there is no cross-actor channel. The child's agent loop
+/// still self-drives on its own task; `actor_spawner` just hands back a
+/// mailbox.
+pub struct ActorSubagentSpawner {
+    session_manager: Arc<SessionManager>,
+    supervisor: AgentSupervisor,
+    dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
+    cost_manager: Arc<CostManager>,
+    job_lifecycle: Arc<JobLifecycle>,
+    actor_parent_token: CancellationToken,
+    external_agents: Arc<ExternalAgentRegistry>,
+    llm_pool: LlmPoolHandle,
+    workspace_paths: Arc<WorkspacePaths>,
+    actor_spawner: ActorSpawner,
+}
+
+impl ActorSubagentSpawner {
+    pub fn from_config(config: SubagentSpawnerConfig) -> Self {
+        let SubagentSpawnerConfig {
+            session_manager,
+            supervisor,
+            dispatch_limiter,
+            cost_manager,
+            job_lifecycle,
+            actor_parent_token,
+            external_agents,
+            llm_pool,
+            workspace_paths,
+            actor_spawner,
+        } = config;
+        Self {
+            session_manager,
+            supervisor,
+            dispatch_limiter,
+            cost_manager,
+            job_lifecycle,
+            actor_parent_token,
+            external_agents,
+            llm_pool,
+            workspace_paths,
+            actor_spawner,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl aura_subagent::SubagentSpawner for ActorSubagentSpawner {
+    async fn spawn(
+        &self,
+        parent: SubagentParentContext,
+        request: SubagentSpawnRequest,
+    ) -> SubagentResult {
+        // The cross-actor envelope + channel are gone — `spawn` runs on the
+        // tool's own task. The fan-out wait still runs on a detached task (a
+        // convertible foreground child outlives this call once it converts),
+        // so an internal oneshot bridges its terminal — or the immediate
+        // background ack — back to this return.
+        let (result_tx, result_rx) = oneshot::channel();
+        if let Err(e) = self
+            .handle_subagent_spawn(
+                parent.session_id,
+                parent.job_id,
+                parent.span_id,
+                parent.cancel_token,
+                request,
+                result_tx,
+            )
+            .await
+        {
+            return SubagentResult::failed(format!("subagent spawn dispatch error: {e}"));
+        }
+        result_rx.await.unwrap_or_else(|_| {
+            SubagentResult::failed("subagent result channel closed before delivery")
+        })
+    }
+}
+
+impl ActorSubagentSpawner {
+    async fn handle_subagent_spawn(
+        &self,
         parent_session_id: SessionId,
         parent_job_id: JobId,
         parent_span_id: SpanId,
@@ -107,7 +207,7 @@ impl Router {
     /// Supports `background` fire-and-forget dispatch (result escorted
     /// back to the parent's mailbox) and resume of a prior Aura child.
     async fn spawn_aura_subagent(
-        &mut self,
+        &self,
         parent: Session,
         parent_job_id: JobId,
         parent_span_id: SpanId,
@@ -193,8 +293,13 @@ impl Router {
         };
 
         let (output_tx, output_rx) = mpsc::channel::<AgentOutput>(SUBAGENT_OUTPUT_BUFFER);
-        let (mailbox, actor_token) =
-            self.spawn_oneshot_actor(child_session, llm, output_tx, &effective_parent_token);
+        let (mailbox, actor_token) = build_oneshot_actor(
+            &self.actor_spawner,
+            &effective_parent_token,
+            child_session,
+            llm,
+            output_tx,
+        );
 
         if let Err(e) = mailbox
             .send(AgentMessage::SubagentSpawned {
@@ -351,7 +456,7 @@ impl Router {
     /// built; the agent's event stream is driven to a terminal result.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_external_subagent(
-        &mut self,
+        &self,
         parent: Session,
         parent_job_id: JobId,
         parent_span_id: SpanId,
@@ -542,7 +647,7 @@ impl Router {
     /// `LineageKind::Subagent` row. Backend-mismatch + parent +
     /// hidden + lineage checks all run on the resume path.
     async fn resolve_child_session(
-        &mut self,
+        &self,
         parent: &Session,
         parent_job_id: JobId,
         parent_span_id: SpanId,

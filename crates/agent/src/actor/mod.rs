@@ -296,9 +296,9 @@ impl AgentActor {
                     );
                     // Cancelling our `actor_token` cascades into every
                     // child we spawned — a subagent actor derives its
-                    // `actor_token` from ours via the `parent_actor_token`
-                    // carried in its `SystemSpawnRequest`, so parent
-                    // shutdown reaches it with no explicit dispatch.
+                    // `actor_token` from ours via the parent context the
+                    // spawner threads through, so parent shutdown reaches
+                    // it with no explicit dispatch.
                     self.volatile.actor_token.cancel();
                     break;
                 }

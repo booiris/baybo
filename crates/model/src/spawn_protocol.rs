@@ -1,21 +1,17 @@
 //! Cross-crate spawn protocol types.
 //!
-//! `aura-tools` (the `spawn_subagent` builtin) and `aura-agent` (the
-//! router, agent loop, and child wait routine) both need to construct
-//! and pattern-match these values. They live here in `aura-model` so
-//! the dependency direction stays one-way (`aura-tools` →
-//! `aura-model` ← `aura-agent`) without an intermediate trait + sink.
+//! `aura-subagent` (the `spawn_subagent` tool) and `aura-agent` (the
+//! actor-backed spawner, agent loop, and child wait routine) both need to
+//! construct and pattern-match these values. They live here in
+//! `aura-model` so the dependency direction stays one-way without an
+//! intermediate trait.
 //!
-//! Two value families share this module:
-//!  * [`SystemSpawnRequest`] — the envelope the router consumes on its
-//!    `system_trigger_rx` arm. Today its sole variant covers
-//!    child-subagent dispatch.
-//!  * `Subagent*` — the per-spawn request / parent-context / result /
-//!    exit-status quadruple the LLM-facing `spawn_subagent` tool
-//!    exchanges with the router.
+//! The `Subagent*` family — the per-spawn request / parent-context /
+//! result / exit-status quadruple — is what the LLM-facing
+//! `spawn_subagent` tool hands to the `aura_subagent::SubagentSpawner`
+//! capability (its actor-backed impl lives in `aura-agent`).
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::{ContentBlock, JobId, ModelTier, SessionId, SpanId, SubagentBackend};
@@ -43,37 +39,6 @@ pub const BACKGROUND_SUBAGENT_HANDLE_PREFIX: &str = "bg-";
 /// of truth — the producer (`ack_background_dispatch`) and the consumer (the
 /// agent loop's group counter) both reference it.
 pub const BACKGROUND_DISPATCH_ACK_PREFIX: &str = "[background subagent dispatched]";
-
-/// Request emitted by the `spawn_subagent` tool, consumed by `Router`'s
-/// `system_trigger_rx` arm. Senders push onto an
-/// `mpsc::Sender<SystemSpawnRequest>`; the router does the
-/// session-create + actor-spawn + mailbox-dispatch.
-///
-/// `parent_actor_token` is the lifetime token of whatever component
-/// owns this spawn (parent per-job token for subagent dispatch). The
-/// router derives the spawned actor's `actor_token` as a child of it,
-/// so cancelling the parent cascades into the child via the
-/// `tokio_util` token tree — no explicit `Shutdown` mailbox dance
-/// required.
-#[derive(Debug)]
-pub enum SystemSpawnRequest {
-    Subagent {
-        parent_session_id: SessionId,
-        parent_job_id: JobId,
-        /// `ToolCall(spawn_subagent)` span the parent emitted this
-        /// request from — recorded on the child's `Lineage` so trace
-        /// viewers can hop from the parent's tool span to the child's
-        /// session, and so multiple sibling subagents from one parent
-        /// job stay distinguishable.
-        parent_span_id: SpanId,
-        parent_actor_token: CancellationToken,
-        /// Boxed to keep the channel message small — the inline request
-        /// is large, so the box keeps `SystemSpawnRequest` cheap to move
-        /// onto the `mpsc` queue (`clippy::large_enum_variant`).
-        request: Box<SubagentSpawnRequest>,
-        result_tx: oneshot::Sender<SubagentResult>,
-    },
-}
 
 /// What the parent LLM asks for when it calls `spawn_subagent`.
 ///
