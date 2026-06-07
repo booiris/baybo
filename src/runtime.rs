@@ -624,6 +624,22 @@ pub async fn build_managers(
             workspace_paths.clone(),
         )));
 
+    // Prune stale detached-command output files left under logs/background/
+    // (the agent reads them shortly after the completion notification, so a
+    // week's retention is generous). Off the boot path — blocking fs.
+    {
+        let dir = aura_tools::builtin::bash::background_output_dir(&workspace_paths);
+        tokio::task::spawn_blocking(move || {
+            let pruned = aura_tools::builtin::bash::prune_background_outputs(
+                &dir,
+                std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            );
+            if pruned > 0 {
+                info!(pruned, "pruned stale background-command output files");
+            }
+        });
+    }
+
     // Background-job sink for "Bash timeout → background". The manager
     // routes completion notifications via the supervisor, which is built
     // further down, so it holds it behind a `OnceLock` set right after.

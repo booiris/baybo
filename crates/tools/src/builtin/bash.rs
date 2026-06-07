@@ -616,6 +616,43 @@ async fn format_command_result(
 /// rather than filling the disk.
 const MAX_BACKGROUND_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 
+/// Directory a detached command's output files (`<handle>.out` / `.err`)
+/// stream to. Single source of truth for the tool, the notification (which
+/// surfaces the path), and the boot-time pruner.
+pub fn background_output_dir(workspace_paths: &WorkspacePaths) -> PathBuf {
+    workspace_paths.logs_dir().join("background")
+}
+
+/// Delete background-command output files older than `max_age`. Called once
+/// at boot so completed-but-never-cleaned detached outputs (the agent reads
+/// them shortly after the completion notification) don't accumulate forever.
+/// Best-effort: unreadable entries are skipped. Returns the count removed.
+pub fn prune_background_outputs(dir: &Path, max_age: Duration) -> usize {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(max_age)
+        .unwrap_or(std::time::UNIX_EPOCH);
+    prune_outputs_before(dir, cutoff)
+}
+
+fn prune_outputs_before(dir: &Path, cutoff: std::time::SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut pruned = 0;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_file()
+            && meta.modified().is_ok_and(|m| m < cutoff)
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            pruned += 1;
+        }
+    }
+    pruned
+}
+
 enum DetachedOutcome {
     Cancelled,
     Completed(i32),
@@ -688,7 +725,7 @@ async fn run_detached(
         BACKGROUND_SUBAGENT_HANDLE_PREFIX,
         uuid::Uuid::new_v4()
     );
-    let bg_dir = ctx.workspace_paths.logs_dir().join("background");
+    let bg_dir = background_output_dir(&ctx.workspace_paths);
     let _ = tokio::fs::create_dir_all(&bg_dir).await;
     let stdout_path = bg_dir.join(format!("{handle_id}.out"));
     let stderr_path = bg_dir.join(format!("{handle_id}.err"));
@@ -2159,6 +2196,31 @@ mod tests {
             Some("sleep 30".to_string()),
             "an overrunning command must be handed to the sink"
         );
+    }
+
+    #[test]
+    fn prune_outputs_respects_cutoff() {
+        use std::time::{Duration as Dur, SystemTime};
+        let dir = std::env::temp_dir().join(format!("aura-prune-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("job.out");
+        std::fs::write(&f, b"x").unwrap();
+
+        // Cutoff in the past → the just-written file is newer → kept.
+        assert_eq!(
+            prune_outputs_before(&dir, SystemTime::now() - Dur::from_secs(3600)),
+            0
+        );
+        assert!(f.exists(), "a fresh file must not be pruned");
+
+        // Cutoff in the future → the file is older than it → pruned.
+        assert_eq!(
+            prune_outputs_before(&dir, SystemTime::now() + Dur::from_secs(3600)),
+            1
+        );
+        assert!(!f.exists(), "an aged-out file must be pruned");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn fake_with_response(
