@@ -1,8 +1,8 @@
 # Execution Pool — Unified Job Admission for Subagents & Detached Commands
 
-**Status:** Phases 1–2 **built** on branch `job-pool-design` (commits
-`7628a35f`, `5b1104dc`), atop merged background-jobs (#80). Phase 3 (WebUI
-dashboard) is the remaining fast-follow.
+**Status:** Phases 1–3 **built** on branch `job-pool-design` (commits
+`7628a35f`, `5b1104dc`, `627aed27`), atop merged background-jobs (#80).
+Only the explicitly-deferred design extensions remain (see Deferred / open).
 
 ## As built (vs the proposal below)
 
@@ -212,8 +212,11 @@ routed through it).
    state + `mark_background_subagent_running`; `JobList` shows per-job state +
    `background_budget {running, total}`. Commands tracked-not-queued; the
    `SubagentDispatchLimiter` stays separate (not absorbed).
-3. **WebUI dashboard** — *remaining fast-follow*: budget gauge + cross-session
-   job list.
+3. **WebUI dashboard** — **DONE** (`627aed27`): `GET /v1/background-jobs`
+   (cross-session list + budget, backed by `list_all_in_flight_background`)
+   and a `JobsPage` (budget gauge + auto-polling table, `/jobs` route +
+   sidebar nav). Read-only — `JobStop` stays the agent-driven per-session
+   tool; no admin cancel endpoint.
 
 ## Risks & test plan
 
