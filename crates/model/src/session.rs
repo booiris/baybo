@@ -241,14 +241,16 @@ pub struct SessionState {
     /// was between turns. Drained into a notification turn once no
     /// higher-priority work is queued. Persisted with the session so an
     /// actor evicted by the idle reaper still surfaces the deliveries on
-    /// hydration. The `serde` alias keeps an in-flight buffer written by
-    /// an older binary (`pending_subagent_results`) deserializable. See
-    /// `aura_model::spawn_protocol::PendingBackgroundResult`.
-    #[serde(
-        default,
-        alias = "pending_subagent_results",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    /// hydration. See `aura_model::spawn_protocol::PendingBackgroundResult`.
+    ///
+    /// No `serde(alias)` for the old `pending_subagent_results`: that field
+    /// held the *old* element shape, which can't deserialize as the new type
+    /// — aliasing it would make a whole `Session` row fail to load. Without
+    /// the alias serde just ignores the old field (no `deny_unknown_fields`)
+    /// and this defaults empty, so an upgrade drops only the transient
+    /// in-flight buffer (the results also live in the child trace) rather
+    /// than breaking hydration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_background_results: Vec<crate::spawn_protocol::PendingBackgroundResult>,
 
     /// Barrier cohorts for grouped subagents (`spawn_subagent(group=…)`),
@@ -368,6 +370,26 @@ mod tests {
         let complete = group(2, true, 2);
         assert!(complete.is_ready(now, t));
         assert!(!complete.is_partial());
+    }
+
+    #[test]
+    fn old_pending_subagent_results_field_is_ignored_not_fatal() {
+        // A row persisted by the previous binary carried the OLD element shape
+        // under the OLD field name `pending_subagent_results`. The new type
+        // can't deserialize those, so the field must be *ignored* (no serde
+        // alias) — the row still loads, dropping only the transient buffer.
+        let old = r#"{
+            "pending_subagent_results": [
+                {"handle_id":"bg-1","subagent_type":"explorer","task_summary":"t",
+                 "child_session_id":"c","final_text":"r","status":{"kind":"completed"}}
+            ]
+        }"#;
+        let state: SessionState =
+            serde_json::from_str(old).expect("an old-shape row must still deserialize");
+        assert!(
+            state.pending_background_results.is_empty(),
+            "the old buffer is dropped, not mis-migrated"
+        );
     }
 
     #[test]

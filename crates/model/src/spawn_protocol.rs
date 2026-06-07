@@ -35,6 +35,15 @@ pub const SUBAGENT_CHANNEL_TAG: &str = "subagent";
 /// in-flight handles.
 pub const BACKGROUND_SUBAGENT_HANDLE_PREFIX: &str = "bg-";
 
+/// Leading marker of the tool result a *successful* background subagent
+/// dispatch returns (the ack with its `bg-…` handle). The agent loop matches
+/// it to count grouped members: a router-side dispatch failure comes back as
+/// a `[subagent failed: …]` result instead, which must NOT inflate the group's
+/// expected count (no escorted result will ever arrive for it). Single source
+/// of truth — the producer (`ack_background_dispatch`) and the consumer (the
+/// agent loop's group counter) both reference it.
+pub const BACKGROUND_DISPATCH_ACK_PREFIX: &str = "[background subagent dispatched]";
+
 /// Request emitted by the `spawn_subagent` tool, consumed by `Router`'s
 /// `system_trigger_rx` arm. Senders push onto an
 /// `mpsc::Sender<SystemSpawnRequest>`; the router does the

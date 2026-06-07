@@ -1118,11 +1118,18 @@ impl AgentLoop {
                 .await;
 
             // Count a grouped subagent spawn into its barrier cohort so the
-            // turn-end seal knows the member total. Only a successful dispatch
-            // (the background ack) counts — a rejected spawn produces no result,
-            // so counting it would stall the barrier until its group timeout.
+            // turn-end seal knows the member total. Only a *successful
+            // dispatch* counts — a router-side failure (unregistered backend,
+            // closed channel, …) comes back as `Ok("[subagent failed: …]")`
+            // with no escorted result to ever arrive, so `is_ok()` is too
+            // broad: counting it would stall the cohort until its group
+            // timeout. A real dispatch returns the ack with its `bg-…` handle.
+            let dispatched = matches!(
+                &tool_result,
+                Ok(ToolOutput::Text(t)) if t.starts_with(aura_model::BACKGROUND_DISPATCH_ACK_PREFIX)
+            );
             if tool_call.name == aura_model::SPAWN_SUBAGENT_TOOL_NAME
-                && tool_result.is_ok()
+                && dispatched
                 && let Some(group) = tool_call
                     .arguments
                     .get("group")

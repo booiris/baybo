@@ -362,6 +362,7 @@ mod tests {
                 InFlightSubagent {
                     subagent_type: "explorer".to_string(),
                     task_summary: "find X".to_string(),
+                    handle: "bg-c1".to_string(),
                     cancel_token: CancellationToken::new(),
                 },
             ),
@@ -370,6 +371,7 @@ mod tests {
                 InFlightSubagent {
                     subagent_type: "planner".to_string(),
                     task_summary: "draft Y".to_string(),
+                    handle: "bg-c2".to_string(),
                     cancel_token: CancellationToken::new(),
                 },
             ),

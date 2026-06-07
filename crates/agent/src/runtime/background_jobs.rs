@@ -60,6 +60,7 @@ impl BackgroundJobSink for BackgroundJobManager {
                 &registry_id,
                 COMMAND_JOB_LABEL,
                 &job.command,
+                &handle_id,
                 cancel.clone(),
             );
         } else {
@@ -85,8 +86,11 @@ impl BackgroundJobControl for BackgroundJobManager {
         };
         sup.list_in_flight_background(session_id)
             .into_iter()
-            .map(|(handle, info)| BackgroundJobInfo {
-                handle: handle.as_ref().to_string(),
+            // Report the advertised handle, not the registry key — for a
+            // subagent the key is its child session id, but the agent only
+            // knows the `bg-…` handle from the dispatch notice.
+            .map(|(_, info)| BackgroundJobInfo {
+                handle: info.handle,
                 kind: info.subagent_type,
                 summary: info.task_summary,
             })
@@ -97,7 +101,7 @@ impl BackgroundJobControl for BackgroundJobManager {
         let Some(sup) = self.supervisor.get() else {
             return false;
         };
-        sup.cancel_in_flight_background(session_id, &SessionId::from(handle))
+        sup.cancel_in_flight_background(session_id, handle)
             .is_some()
     }
 }

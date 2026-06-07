@@ -483,8 +483,14 @@ impl Tool for BashTool {
         // in-window, or backgrounded) and `None` if it couldn't detach
         // (sandbox backend without detached support), in which case we fall
         // through to the blocking kill-on-timeout path below.
+        // Never background a command that injected `secret_env`: the detached
+        // path streams RAW output to files + the notification, and the escort
+        // has no secret handle to exact-redact with (the blocking path below
+        // does). Falling through keeps such a command on kill-on-timeout with
+        // redaction rather than leaking an echoed secret to disk / the turn.
         let convert_on_timeout = !matches!(p.on_timeout.as_deref().map(str::trim), Some("kill"));
         if convert_on_timeout
+            && extra_env.is_empty()
             && let Some(sink) = ctx.background_jobs.clone()
             && let Some(output) = run_detached(
                 &command,

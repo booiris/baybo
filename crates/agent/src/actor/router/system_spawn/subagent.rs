@@ -6,10 +6,10 @@ use aura_cost::CostManager;
 use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
 use aura_llm::TokenUsage;
 use aura_model::{
-    BACKGROUND_SUBAGENT_HANDLE_PREFIX, ChannelType, ChatMessage, ContentBlock, ExternalAgentKind,
-    JobId, Lineage, LineageKind, MessageMetadata, OnTimeout, PendingBackgroundResult,
-    SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend, SubagentExitStatus,
-    SubagentResult, SubagentSpawnRequest, TriggerKind, User,
+    BACKGROUND_DISPATCH_ACK_PREFIX, BACKGROUND_SUBAGENT_HANDLE_PREFIX, ChannelType, ChatMessage,
+    ContentBlock, ExternalAgentKind, JobId, Lineage, LineageKind, MessageMetadata, OnTimeout,
+    PendingBackgroundResult, SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend,
+    SubagentExitStatus, SubagentResult, SubagentSpawnRequest, TriggerKind, User,
 };
 use chrono::Utc;
 use futures::StreamExt;
@@ -512,7 +512,7 @@ impl Router {
             uuid::Uuid::new_v4()
         );
         let ack_text = format!(
-            "[background subagent dispatched]\n- handle: {handle_id}\n- subagent_type: {subagent_type}\n- child_session: {child_session_id}\n\nThe runtime will surface the subagent's final message as a system reminder prepended to your next user turn."
+            "{BACKGROUND_DISPATCH_ACK_PREFIX}\n- handle: {handle_id}\n- subagent_type: {subagent_type}\n- child_session: {child_session_id}\n\nThe runtime will surface the subagent's final message as a system reminder prepended to your next user turn."
         );
         let _ = result_tx.send(SubagentResult {
             child_session_id: child_session_id.clone(),
@@ -524,6 +524,7 @@ impl Router {
             child_session_id,
             subagent_type,
             task_summary,
+            &handle_id,
             cancel_token,
         );
         if let Err(e) = self.session_manager.touch(parent_id).await {
@@ -699,7 +700,13 @@ async fn convert_foreground_to_background(
         SUBAGENT_FOREGROUND_WAIT.as_secs()
     );
     let _ = result_tx.send(SubagentResult {
-        child_session_id: child_session_id.clone(),
+        // Empty child id: this ack must NOT carry a resume tail — the child is
+        // still running in the background, so the parent can't resume it. The
+        // foreground tool path appends `[subagent_session_id: …]` only for a
+        // Completed result with a non-empty id; `ack_text` names the child
+        // session for reference, and the escorted terminal surfaces the real
+        // resume id later.
+        child_session_id: SessionId::from(""),
         final_content: Some(vec![ContentBlock::Text(ack_text)]),
         status: SubagentExitStatus::Completed,
     });
@@ -708,6 +715,7 @@ async fn convert_foreground_to_background(
         child_session_id,
         subagent_type,
         task_summary,
+        &handle_id,
         child_token,
     );
     if let Err(e) = session_manager.touch(parent_id).await {
