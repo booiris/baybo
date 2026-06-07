@@ -1,10 +1,14 @@
 # Bash & Subagent Background Jobs — Timeout-to-Background + Subagent Groups
 
-**Status:** implemented on branch `background-jobs` (commits `66c655b8`, `e0b2c840`,
-`425f108d`, `6d1d495d`). All four phases built + tested. The Phase-3 streaming
+**Status:** implemented on branch `background-jobs`. All four phases built + tested
+(`66c655b8`, `e0b2c840`, `425f108d`, `6d1d495d`), plus the `JobList`/`JobStop` tools
+(`6a18eca2`) and boot-time output-file retention (`7d449eb1`). The Phase-3 streaming
 question was resolved with a third option (two files, format-preserving) — see below.
-Not yet merged to master. Follow-ups: `JobList`/`JobStop` tools, the Docker/sandbox-exec
-detached-spawn backends, output-file retention.
+Not yet merged to master. **Remaining:** the Docker and sandbox-exec detached-spawn
+backends — neither builds/runs on a Linux host (sandbox-exec is `#![cfg(macos)]`;
+Docker needs `docker kill` + container-id capture, not a `kill_on_drop` of the
+`docker run` client), so they keep the safe kill-on-timeout fallback until done in a
+macOS / Docker environment. bwrap (the Linux default) is fully implemented.
 
 ## Goal
 
@@ -266,7 +270,13 @@ fallback — impossible (the sandbox kills internally on timeout).
 
 ## Open items
 
-- Output-file retention/cleanup policy (deferred).
-- Whether `JobStop` should also work in non-UserChat sessions (today only
-  `/stop`/shutdown reach those; likely leave as-is).
-- Exact concurrency-cap values once we see real fan-out.
+- ✅ Output-file retention — DONE (`7d449eb1`): boot-time prune of
+  `logs/background/*` older than 7 days.
+- ✅ `JobList` / `JobStop` — DONE (`6a18eca2`).
+- Docker / sandbox-exec detached backends (see Status) — kill-fallback today.
+- `JobStop` only reaches user-facing sessions (its `background_control` is gated
+  like the sink); non-user sessions rely on `/stop`/shutdown. Likely leave as-is.
+- A per-session concurrency cap on detached commands (currently unbounded beyond
+  the OS) — revisit once real fan-out is observed.
+- e2e coverage for the group barrier is at the `GroupState` predicate level
+  (unit-tested); a full spawn→barrier→one-notification harness test is a nice add.
