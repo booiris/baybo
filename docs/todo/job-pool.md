@@ -1,8 +1,39 @@
 # Execution Pool — Unified Job Admission for Subagents & Detached Commands
 
-**Status:** proposed (design). Builds on the background-jobs work (PR #80);
-assumes that lands first (`BackgroundJobManager`, `JobList`/`JobStop`,
-`PendingBackgroundResult`, the `BackgroundJobFinished` notification path).
+**Status:** Phases 1–2 **built** on branch `job-pool-design` (commits
+`7628a35f`, `5b1104dc`), atop merged background-jobs (#80). Phase 3 (WebUI
+dashboard) is the remaining fast-follow.
+
+## As built (vs the proposal below)
+
+The shipped design is leaner than the original "single `JobPool` front door"
+sketch — the same value with less churn:
+
+- **`SubagentSpawner` is a trait in `aura-subagent`** (leaf crate, no cycle);
+  the actor-backed `ActorSubagentSpawner` impl is in `aura-agent`. The tool
+  holds an `Arc<OnceLock<Arc<dyn SubagentSpawner>>>` slot, filled in
+  `wire_router`. `SystemSpawnRequest` + the router arm are deleted. **One
+  divergence:** `spawn()` is a single method (not split fg/bg) and keeps a
+  *private* oneshot internally to bridge the convertible-foreground wait —
+  the cross-actor channel/oneshot are gone, but it didn't fully vanish.
+- **No unified `JobPool` god-component / `ctx.jobs`.** Instead a focused
+  `JobBudget` (`runtime/job_budget.rs`, an `Arc<Semaphore>`) is shared
+  between the spawner (acquires for background subagents) and the existing
+  `BackgroundJobManager` (reports `(running, total)` in `JobList`). The
+  subagent tool keeps its spawner slot; bash keeps `BackgroundJobSink`. The
+  `SubagentDispatchLimiter` (foreground reject-cap) is *not* absorbed — it
+  stays as-is.
+- **Budget gates by holding the prompt, not deferring the build.** A
+  background child's actor is built but parks on its mailbox doing no LLM
+  work until it's fed `SubagentSpawned`; the spawner holds that prompt behind
+  `budget.acquire()`. The `Semaphore`'s FIFO wait *is* the queue (no separate
+  structure / admit worker).
+- **Config knob is `agent.max_concurrent_background_jobs`** (default 8,
+  validated, restart-only) — not `jobs.max_concurrent`.
+- **Deferred:** the `priority: i8` hook (queue is plain FIFO), per-root
+  fairness, durable queue, true command queueing — see Deferred / open.
+
+The original proposal follows for rationale.
 
 ## Motivation
 
@@ -171,16 +202,18 @@ routed through it).
 
 ## Phases
 
-1. **Extract `SubagentSpawner`** (no behavior change): `Box`→`Arc` ActorSpawner;
-   lift the spawn bodies out of the Router into the service; the subagent tool
-   calls the spawner via a thin `Arc<dyn>` in ToolContext; delete
-   `SystemSpawnRequest` + the Router arm; foreground `oneshot` → direct return.
-   All existing subagent tests green.
-2. **Grow `JobPool`**: add the global semaphore + in-memory queue + admit worker;
-   route background subagents through it; register + count commands; absorb
-   `SubagentDispatchLimiter`. Add `Queued|Running` to the registry; `JobList`/
-   `JobStop` show state + budget.
-3. **(fast-follow PR)** WebUI: budget gauge + cross-session job list.
+1. **Extract `SubagentSpawner`** — **DONE** (`7628a35f`): `Box`→`Arc`
+   ActorSpawner; spawn bodies lifted into the service; tool calls it via an
+   `Arc<OnceLock>` slot; `SystemSpawnRequest` + the router arm deleted. (The
+   foreground oneshot became a private impl detail rather than vanishing.)
+2. **Concurrency budget** — **DONE** (`5b1104dc`): `JobBudget` (`Semaphore`)
+   gates background subagent dispatches (Aura + external) by holding the
+   prompt; `max_concurrent_background_jobs` config; `Queued|Running` registry
+   state + `mark_background_subagent_running`; `JobList` shows per-job state +
+   `background_budget {running, total}`. Commands tracked-not-queued; the
+   `SubagentDispatchLimiter` stays separate (not absorbed).
+3. **WebUI dashboard** — *remaining fast-follow*: budget gauge + cross-session
+   job list.
 
 ## Risks & test plan
 
