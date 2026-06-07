@@ -800,9 +800,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let cost_manager = Arc::clone(&graph.cost_manager);
     let llm_pool = Arc::clone(&graph.llm_pool);
 
-    // Single boxed factory owned by the router: used for top-level
-    // user/cron actors AND `SystemSpawnRequest::Subagent` child
-    // materialisation.
+    // Single `Arc`-shared actor factory: used by the router for top-level
+    // user/cron actors and by the subagent spawner for child actors.
     let spawn_actor_for: aura_agent::router::ActorSpawner = {
         let llm_pool = Arc::clone(&llm_pool);
         let tool_registry = Arc::clone(&graph.tool_registry);

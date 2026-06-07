@@ -45,6 +45,14 @@ pub struct InFlightSubagent {
     pub running: bool,
 }
 
+impl InFlightSubagent {
+    /// The `JobList` / `/v1/background-jobs` state string — the single source
+    /// of truth so the tool and the dashboard never disagree.
+    pub fn state_str(&self) -> &'static str {
+        if self.running { "running" } else { "queued" }
+    }
+}
+
 /// Manages AgentActor instances, one per active session.
 ///
 /// Cheap to clone: the actor registry is a [`DashMap`] behind an `Arc`,

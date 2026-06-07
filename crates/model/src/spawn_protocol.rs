@@ -126,8 +126,8 @@ pub struct SubagentSpawnRequest {
     pub group: Option<String>,
 }
 
-/// Parent-side context the tool builds from its `ToolContext` and
-/// places on the `SystemSpawnRequest::Subagent` envelope.
+/// Parent-side context the tool builds from its `ToolContext` and passes to
+/// the `SubagentSpawner` alongside the `SubagentSpawnRequest`.
 #[derive(Debug, Clone)]
 pub struct SubagentParentContext {
     pub session_id: SessionId,

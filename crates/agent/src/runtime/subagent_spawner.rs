@@ -16,7 +16,7 @@ use aura_session::SessionManager;
 use aura_workspace::WorkspacePaths;
 use chrono::Utc;
 use futures::StreamExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -239,9 +239,11 @@ impl ActorSubagentSpawner {
             }
         };
 
-        // Subscribe to terminal events BEFORE dispatch so a child whose
-        // actor exits synchronously cannot terminate between
-        // dispatch and the receiver being open.
+        // Foreground/nested spawns subscribe to terminal events BEFORE the
+        // build+dispatch so a child that exits synchronously can't slip its
+        // terminal past us. Background spawns subscribe inside their gated task
+        // (after the budget wait) instead — see the `if background` arm — so
+        // this receiver is consumed only on the foreground paths below.
         let terminal_rx = self.job_lifecycle.subscribe_terminal_events();
 
         let now = Utc::now();
@@ -328,20 +330,25 @@ impl ActorSubagentSpawner {
             let limiter_for_task = Arc::clone(&self.dispatch_limiter);
             let budget = Arc::clone(&self.job_budget);
             tokio::spawn(async move {
-                // Queue here (the budget's FIFO wait). A `/stop` while queued
-                // cancels `actor_token` — honour it without taking a slot.
-                let permit = tokio::select! {
-                    biased;
-                    _ = actor_token.cancelled() => None,
-                    p = budget.acquire() => p,
-                };
-                let Some(_permit) = permit else {
-                    supervisor
-                        .note_background_subagent_finished(&parent_id_for_task, &child_session_id);
-                    release_reserved_slot(limiter_for_task.as_ref(), &fan_out_root_for_task);
+                let Some(_permit) = acquire_background_slot(
+                    &budget,
+                    &actor_token,
+                    &supervisor,
+                    &parent_id_for_task,
+                    &child_session_id,
+                    &limiter_for_task,
+                    &fan_out_root_for_task,
+                )
+                .await
+                else {
                     return;
                 };
-                supervisor.mark_background_subagent_running(&parent_id_for_task, &child_session_id);
+                // Subscribe to terminal events now — past the budget wait,
+                // before feeding the prompt — so a queued child doesn't park an
+                // idle receiver buffering every session's terminal events for
+                // the whole queue wait. The parked actor can't terminate until
+                // fed, so nothing slips past.
+                let terminal_rx = job_lifecycle.subscribe_terminal_events();
                 let result = if let Err(e) = mailbox
                     .send(AgentMessage::SubagentSpawned {
                         initial_message: Box::new(incoming),
@@ -591,19 +598,19 @@ impl ActorSubagentSpawner {
             let budget = Arc::clone(&self.job_budget);
             let cancel_for_queue = external_request.cancel.clone();
             tokio::spawn(async move {
-                // Queue for a budget slot; honour a `/stop` while queued.
-                let permit = tokio::select! {
-                    biased;
-                    _ = cancel_for_queue.cancelled() => None,
-                    p = budget.acquire() => p,
-                };
-                let Some(_permit) = permit else {
-                    supervisor
-                        .note_background_subagent_finished(&parent_id_for_task, &child_session_id);
-                    release_reserved_slot(limiter_for_task.as_ref(), &fan_out_root_for_task);
+                let Some(_permit) = acquire_background_slot(
+                    &budget,
+                    &cancel_for_queue,
+                    &supervisor,
+                    &parent_id_for_task,
+                    &child_session_id,
+                    &limiter_for_task,
+                    &fan_out_root_for_task,
+                )
+                .await
+                else {
                     return;
                 };
-                supervisor.mark_background_subagent_running(&parent_id_for_task, &child_session_id);
                 let result = run_external_agent_job(
                     agent,
                     kind,
@@ -781,6 +788,41 @@ fn release_reserved_slot(
 ) {
     if let Some(id) = root {
         limiter.release(id);
+    }
+}
+
+/// Admission gate shared by both background backends: queue on the budget
+/// (its FIFO wait) until a slot frees, honouring a `/stop` while queued. If
+/// `cancel` fires before a slot does, the not-yet-resolved `acquire` future
+/// is dropped (tokio takes no permit), the in-flight marker is cleared, the
+/// fan-out slot is released, and `None` is returned so the caller bails
+/// without ever running the child. On success the registry entry flips to
+/// running and the held permit (released when dropped at the child's
+/// terminal) is returned.
+async fn acquire_background_slot(
+    budget: &JobBudget,
+    cancel: &CancellationToken,
+    supervisor: &AgentSupervisor,
+    parent_id: &SessionId,
+    child_session_id: &SessionId,
+    limiter: &Arc<dyn aura_subagent::SubagentDispatchLimiter>,
+    fan_out_root: &Option<SessionId>,
+) -> Option<OwnedSemaphorePermit> {
+    let permit = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        p = budget.acquire() => p,
+    };
+    match permit {
+        Some(p) => {
+            supervisor.mark_background_subagent_running(parent_id, child_session_id);
+            Some(p)
+        }
+        None => {
+            supervisor.note_background_subagent_finished(parent_id, child_session_id);
+            release_reserved_slot(limiter.as_ref(), fan_out_root);
+            None
+        }
     }
 }
 

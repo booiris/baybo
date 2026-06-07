@@ -101,10 +101,10 @@ impl BackgroundJobControl for BackgroundJobManager {
             // subagent the key is its child session id, but the agent only
             // knows the `bg-…` handle from the dispatch notice.
             .map(|(_, info)| BackgroundJobInfo {
+                state: info.state_str(),
                 handle: info.handle,
                 kind: info.subagent_type,
                 summary: info.task_summary,
-                state: if info.running { "running" } else { "queued" },
             })
             .collect()
     }
