@@ -235,6 +235,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         channel_registry,
         llm_pool,
         supervisor,
+        job_budget: aura_agent::runtime::job_budget::JobBudget::new(8),
         config_reloader: Arc::new(StubConfigReloader),
         admin_token: TEST_ADMIN_TOKEN.to_string(),
         log_buffer: LogBuffer::new(256),

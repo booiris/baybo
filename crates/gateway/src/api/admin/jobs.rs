@@ -7,7 +7,9 @@ use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::api::dto::{ErrorBody, Job, ListResponse};
+use crate::api::dto::{
+    BackgroundBudget, BackgroundJob, BackgroundJobsResponse, ErrorBody, Job, ListResponse,
+};
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
@@ -16,6 +18,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(list_jobs))
         .routes(routes!(get_job))
         .routes(routes!(cancel_job))
+        .routes(routes!(list_background_jobs))
 }
 
 /// Default page size when `?limit=` is omitted. Picked to be small
@@ -105,6 +108,40 @@ async fn list_jobs(
         None
     };
     Ok(Json(ListResponse::with_next_cursor(page, next_cursor)))
+}
+
+/// Cross-session view of in-flight background jobs (detached subagents +
+/// `Bash` commands) plus the concurrency budget — the dashboard twin of the
+/// per-session `JobList` tool.
+#[utoipa::path(
+    get,
+    path = "/background-jobs",
+    tag = "jobs",
+    responses(
+        (status = 200, description = "In-flight background jobs + budget", body = BackgroundJobsResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
+async fn list_background_jobs(State(state): State<AdminState>) -> Json<BackgroundJobsResponse> {
+    let jobs = state
+        .supervisor
+        .list_all_in_flight_background()
+        .into_iter()
+        .map(|(parent, info)| BackgroundJob {
+            handle: info.handle,
+            session_id: parent.as_ref().to_string(),
+            kind: info.subagent_type,
+            summary: info.task_summary,
+            state: if info.running { "running" } else { "queued" }.to_string(),
+        })
+        .collect();
+    Json(BackgroundJobsResponse {
+        jobs,
+        budget: BackgroundBudget {
+            running: state.job_budget.running(),
+            total: state.job_budget.total(),
+        },
+    })
 }
 
 #[utoipa::path(

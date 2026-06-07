@@ -113,6 +113,39 @@ pub struct StatusResponse {
     pub jobs_in_flight: usize,
 }
 
+/// One in-flight background job (detached subagent or `Bash` command),
+/// across all sessions — the cross-session twin of the `JobList` tool.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BackgroundJob {
+    /// User-facing handle (`bg-…`), as shown by `JobList`/`JobStop`.
+    pub handle: String,
+    /// Parent session that dispatched it.
+    pub session_id: String,
+    /// Subagent profile name, or `"command"` for a detached `Bash` command.
+    pub kind: String,
+    /// Task summary (subagent) or the command line (command).
+    pub summary: String,
+    /// `"running"`, or `"queued"` while a background subagent waits for a
+    /// concurrency-budget slot.
+    pub state: String,
+}
+
+/// Global background-subagent concurrency budget.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BackgroundBudget {
+    /// Background children currently holding a slot.
+    pub running: usize,
+    /// Total slots (`agent.max_concurrent_background_jobs`).
+    pub total: usize,
+}
+
+/// Response body for `GET /v1/background-jobs`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BackgroundJobsResponse {
+    pub jobs: Vec<BackgroundJob>,
+    pub budget: BackgroundBudget,
+}
+
 /// Response body for `PUT` / `DELETE /v1/config`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MutateResponse {

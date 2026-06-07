@@ -109,6 +109,7 @@ async fn router_with_seed() -> (axum::Router, Arc<aura_gateway::log_buffer::LogB
         channel_registry: Arc::clone(&tg.deps.channel_registry),
         llm_pool: tg.deps.llm_pool.clone(),
         supervisor: tg.deps.supervisor.clone(),
+        job_budget: tg.deps.job_budget.clone(),
         config_reloader: tg.deps.config_reloader.clone(),
         log_buffer: Arc::clone(&tg.deps.log_buffer),
         channel_bot_store: tg.deps.stores.channel_bot.clone(),

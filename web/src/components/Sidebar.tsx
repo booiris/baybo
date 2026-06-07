@@ -7,6 +7,7 @@ import {
   RiFileList3Line,
   RiGitMergeLine,
   RiLogoutBoxRLine,
+  RiStackLine,
 } from 'react-icons/ri';
 import { useAuth } from '../api/auth';
 
@@ -45,6 +46,13 @@ export function Sidebar({ version }: { version?: string }) {
         >
           <RiAlarmLine className="text-xl" />
           Cron
+        </NavLink>
+        <NavLink
+          to="/jobs"
+          className={({ isActive }) => `${navItem} ${isActive ? navItemActive : ''}`}
+        >
+          <RiStackLine className="text-xl" />
+          Jobs
         </NavLink>
         <NavLink
           to="/analytics"

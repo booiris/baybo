@@ -85,6 +85,9 @@ pub struct GatewayDeps {
     /// route an `AgentMessage::SetModel` to a live actor (re-pin in
     /// place). Cheap to clone — backed by an `Arc<DashMap>`.
     pub supervisor: AgentSupervisor,
+    /// Background-subagent concurrency budget, surfaced by
+    /// `/v1/background-jobs`.
+    pub job_budget: Arc<aura_agent::runtime::job_budget::JobBudget>,
     /// Triggers an in-process config hot-reload; held so admin endpoints
     /// and the SIGHUP handler can call it. See docs/config-hot-reload.md.
     pub config_reloader: Arc<dyn ConfigReloader>,
@@ -154,6 +157,9 @@ pub struct AdminState {
     /// Actor registry — lets the chat model-switch endpoint re-pin a
     /// live session's LLM via `AgentMessage::SetModel`.
     pub supervisor: AgentSupervisor,
+    /// Background-subagent concurrency budget, surfaced by
+    /// `/v1/background-jobs`.
+    pub job_budget: Arc<aura_agent::runtime::job_budget::JobBudget>,
     pub config_reloader: Arc<dyn ConfigReloader>,
     pub log_buffer: Arc<LogBuffer>,
     pub channel_bot_store: Arc<dyn ChannelBotStore>,
@@ -213,6 +219,7 @@ impl AdminState {
             channel_registry: Arc::clone(&deps.channel_registry),
             llm_pool: Arc::clone(&deps.llm_pool),
             supervisor: deps.supervisor.clone(),
+            job_budget: Arc::clone(&deps.job_budget),
             config_reloader: Arc::clone(&deps.config_reloader),
             log_buffer: Arc::clone(&deps.log_buffer),
             channel_bot_store: Arc::clone(&deps.stores.channel_bot),

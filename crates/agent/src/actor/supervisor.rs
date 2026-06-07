@@ -206,6 +206,24 @@ impl AgentSupervisor {
             .unwrap_or_default()
     }
 
+    /// Every in-flight background job across all parents, as
+    /// `(parent_session_id, InFlightSubagent)` — backs the cross-session
+    /// `/v1/background-jobs` dashboard. Snapshots into a `Vec` so no shard
+    /// lock is held past the call.
+    pub fn list_all_in_flight_background(&self) -> Vec<(SessionId, InFlightSubagent)> {
+        self.in_flight_background_subagents
+            .iter()
+            .flat_map(|parent| {
+                let parent_id = parent.key().clone();
+                parent
+                    .value()
+                    .values()
+                    .map(move |info| (parent_id.clone(), info.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Cancel and drop ONE in-flight background job by its user-facing
     /// `handle` (`bg-…`) — backs the `JobStop` tool. Scans the parent's
     /// entries by `InFlightSubagent::handle` (the registry key differs for
@@ -895,6 +913,45 @@ mod tests {
         // Unknown parent / child are no-ops (must not panic).
         sup.mark_background_subagent_running(&parent, &SessionId::from("ghost"));
         sup.mark_background_subagent_running(&SessionId::from("ghost"), &child);
+    }
+
+    #[test]
+    fn list_all_in_flight_background_spans_parents() {
+        let sup = make_supervisor();
+        let p1 = SessionId::from("p1");
+        let p2 = SessionId::from("p2");
+        sup.note_background_subagent_started(
+            &p1,
+            &SessionId::from("c1"),
+            "explorer",
+            "a",
+            "bg-1",
+            CancellationToken::new(),
+        );
+        sup.note_background_subagent_started(
+            &p1,
+            &SessionId::from("c2"),
+            "planner",
+            "b",
+            "bg-2",
+            CancellationToken::new(),
+        );
+        sup.note_background_subagent_started(
+            &p2,
+            &SessionId::from("c3"),
+            "reviewer",
+            "c",
+            "bg-3",
+            CancellationToken::new(),
+        );
+        let all = sup.list_all_in_flight_background();
+        assert_eq!(all.len(), 3, "collects across both parents");
+        let mut handles: Vec<_> = all.iter().map(|(_, info)| info.handle.clone()).collect();
+        handles.sort();
+        assert_eq!(handles, vec!["bg-1", "bg-2", "bg-3"]);
+        // Both parent ids are represented.
+        assert!(all.iter().any(|(p, _)| p == &p1));
+        assert!(all.iter().any(|(p, _)| p == &p2));
     }
 
     #[tokio::test]

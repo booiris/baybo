@@ -20,6 +20,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/background-jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Cross-session view of in-flight background jobs (detached subagents +
+         *     `Bash` commands) plus the concurrency budget — the dashboard twin of the
+         *     per-session `JobList` tool.
+         */
+        get: operations["list_background_jobs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/channels": {
         parameters: {
             query?: never;
@@ -546,6 +567,37 @@ export interface components {
              * @description Exclusive upper bound used for the aggregation (UTC).
              */
             until: string;
+        };
+        /** @description Global background-subagent concurrency budget. */
+        BackgroundBudget: {
+            /** @description Background children currently holding a slot. */
+            running: number;
+            /** @description Total slots (`agent.max_concurrent_background_jobs`). */
+            total: number;
+        };
+        /**
+         * @description One in-flight background job (detached subagent or `Bash` command),
+         *     across all sessions — the cross-session twin of the `JobList` tool.
+         */
+        BackgroundJob: {
+            /** @description User-facing handle (`bg-…`), as shown by `JobList`/`JobStop`. */
+            handle: string;
+            /** @description Subagent profile name, or `"command"` for a detached `Bash` command. */
+            kind: string;
+            /** @description Parent session that dispatched it. */
+            session_id: string;
+            /**
+             * @description `"running"`, or `"queued"` while a background subagent waits for a
+             *     concurrency-budget slot.
+             */
+            state: string;
+            /** @description Task summary (subagent) or the command line (command). */
+            summary: string;
+        };
+        /** @description Response body for `GET /v1/background-jobs`. */
+        BackgroundJobsResponse: {
+            budget: components["schemas"]["BackgroundBudget"];
+            jobs: components["schemas"]["BackgroundJob"][];
         };
         /**
          * @description Admin-surface mirror of [`aura_model::ChannelType`]. Transparent
@@ -1252,6 +1304,35 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AnalyticsResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_background_jobs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description In-flight background jobs + budget */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BackgroundJobsResponse"];
                 };
             };
             /** @description Unauthorized */
