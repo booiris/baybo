@@ -143,6 +143,13 @@ pub struct SubagentSpawnRequest {
     /// routing the new task into the existing child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<SessionId>,
+    /// Barrier cohort. When set, this subagent runs in the background and
+    /// its result is held until every member of the group reaches a
+    /// terminal state, then the whole group delivers in one merged
+    /// notification. Tagged onto the escorted `PendingBackgroundResult`.
+    /// See `docs/todo/background-jobs.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// Parent-side context the tool builds from its `ToolContext` and

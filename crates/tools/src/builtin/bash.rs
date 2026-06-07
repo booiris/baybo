@@ -2091,6 +2091,7 @@ mod tests {
 
     /// A ctx whose `workspace_paths` point at a unique temp dir (so
     /// `logs_dir()/background` is writable) with a recording sink wired in.
+    #[allow(clippy::type_complexity)]
     fn ctx_for_detached() -> (ToolContext, Arc<Mutex<Option<(String, String)>>>) {
         let tmp = std::env::temp_dir().join(format!("aura-bgtest-{}", uuid::Uuid::new_v4()));
         let mut ctx = ctx_with(None);

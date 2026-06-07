@@ -251,6 +251,14 @@ pub struct SessionState {
     )]
     pub pending_background_results: Vec<crate::spawn_protocol::PendingBackgroundResult>,
 
+    /// Barrier cohorts for grouped subagents (`spawn_subagent(group=…)`),
+    /// keyed by group name. A member's result is held in its group until
+    /// the group is complete (sealed + every member terminal) or its
+    /// timeout dissolves it, then released into `pending_background_results`
+    /// for one merged notification. See `docs/todo/background-jobs.md`.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub background_groups: std::collections::HashMap<String, GroupState>,
+
     /// Which backend created this subagent session, plus (for
     /// External) the agent's `workspace_dir` and `resume_key`.
     /// `None` for non-subagent sessions (top-level user, cron) and
@@ -284,9 +292,92 @@ pub struct SessionState {
     pub extra: HashMap<String, Value>,
 }
 
+/// A barrier cohort of grouped subagents. Members' results accumulate in
+/// `results` until the group is complete (`sealed` and `results.len() ==
+/// expected`) or its timeout elapses, then release into
+/// `pending_background_results` as one merged notification.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GroupState {
+    /// Member count the dispatching turn issued. The agent loop bumps it
+    /// per grouped `spawn_subagent` call; the barrier fires when
+    /// `results.len()` reaches it (and the group is sealed).
+    pub expected: usize,
+    /// Sealed at the end of the dispatching turn — membership is then
+    /// final, so the barrier may fire.
+    #[serde(default)]
+    pub sealed: bool,
+    /// Seal time, for the group timeout. `None` until sealed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Held results for members that have reached a terminal state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub results: Vec<crate::spawn_protocol::PendingBackgroundResult>,
+}
+
+impl GroupState {
+    /// Whether the cohort may fire: sealed, and either every member has a
+    /// result (complete) or the group timeout has elapsed since sealing.
+    pub fn is_ready(&self, now: chrono::DateTime<chrono::Utc>, timeout: chrono::Duration) -> bool {
+        self.sealed
+            && (self.results.len() >= self.expected
+                || self.sealed_at.is_some_and(|t| now - t >= timeout))
+    }
+
+    /// Whether a firing cohort is partial — it timed out before every
+    /// member finished, so the stragglers will deliver individually.
+    pub fn is_partial(&self) -> bool {
+        self.results.len() < self.expected
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn group(expected: usize, sealed: bool, results: usize) -> GroupState {
+        GroupState {
+            expected,
+            sealed,
+            sealed_at: sealed.then(chrono::Utc::now),
+            results: (0..results)
+                .map(|i| {
+                    crate::spawn_protocol::PendingBackgroundResult::subagent(
+                        format!("h{i}"),
+                        "explorer",
+                        "t",
+                        SessionId::from("c"),
+                        "r",
+                        crate::SubagentExitStatus::Completed,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn group_not_ready_until_sealed_and_complete() {
+        let now = chrono::Utc::now();
+        let t = chrono::Duration::minutes(30);
+        // Unsealed: never ready even if all results are in.
+        assert!(!group(2, false, 2).is_ready(now, t));
+        // Sealed but incomplete (1/2): not ready, and would fire partial.
+        let partial = group(2, true, 1);
+        assert!(!partial.is_ready(now, t));
+        assert!(partial.is_partial());
+        // Sealed and complete (2/2): ready, not partial.
+        let complete = group(2, true, 2);
+        assert!(complete.is_ready(now, t));
+        assert!(!complete.is_partial());
+    }
+
+    #[test]
+    fn group_times_out_into_partial_fire() {
+        // Sealed long ago, still incomplete → ready (timed out) + partial.
+        let mut g = group(3, true, 1);
+        g.sealed_at = Some(chrono::Utc::now() - chrono::Duration::minutes(31));
+        assert!(g.is_ready(chrono::Utc::now(), chrono::Duration::minutes(30)));
+        assert!(g.is_partial());
+    }
 
     #[test]
     fn channel_type_tui_round_trip() {

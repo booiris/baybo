@@ -1117,6 +1117,27 @@ impl AgentLoop {
             self.emit_tool_completed(delta_tx, session, tool_call.id.clone(), status, raw_summary)
                 .await;
 
+            // Count a grouped subagent spawn into its barrier cohort so the
+            // turn-end seal knows the member total. Only a successful dispatch
+            // (the background ack) counts — a rejected spawn produces no result,
+            // so counting it would stall the barrier until its group timeout.
+            if tool_call.name == aura_model::SPAWN_SUBAGENT_TOOL_NAME
+                && tool_result.is_ok()
+                && let Some(group) = tool_call
+                    .arguments
+                    .get("group")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            {
+                session
+                    .state
+                    .background_groups
+                    .entry(group.to_string())
+                    .or_default()
+                    .expected += 1;
+            }
+
             let raw_result_text = match &tool_result {
                 Ok(ToolOutput::Text(s)) => s.clone(),
                 Ok(ToolOutput::Json(v)) => {

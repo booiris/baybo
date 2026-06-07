@@ -165,6 +165,9 @@ impl Router {
         let on_timeout = request.on_timeout;
         let subagent_type = request.subagent_type.clone();
         let task_summary = request.task_summary.clone();
+        // Barrier cohort (background-from-start spawns only). Tagged onto the
+        // escorted result so the parent holds it until the group completes.
+        let group = request.group.clone();
 
         // A foreground subagent from a live user session converts to
         // background after a fixed foreground wait (unless `on_timeout`
@@ -237,6 +240,7 @@ impl Router {
                     handle_id,
                     subagent_type,
                     task_summary,
+                    group,
                     result,
                     &limiter_for_task,
                     &fan_out_root_for_task,
@@ -314,6 +318,9 @@ impl Router {
                             handle_id,
                             subagent_type,
                             task_summary,
+                            // A converted foreground subagent is never grouped
+                            // (grouped spawns are background-from-start).
+                            None,
                             result,
                             &limiter_for_task,
                             &fan_out_root_for_task,
@@ -437,6 +444,7 @@ impl Router {
             let parent_id_for_task = parent.id.clone();
             let subagent_type = request.subagent_type.clone();
             let task_summary = request.task_summary.clone();
+            let group = request.group.clone();
             let fan_out_root_for_task = fan_out_root.clone();
             tokio::spawn(async move {
                 let result = run_external_agent_job(
@@ -454,6 +462,7 @@ impl Router {
                     handle_id,
                     subagent_type,
                     task_summary,
+                    group,
                     result,
                     &limiter_for_task,
                     &fan_out_root_for_task,
@@ -628,6 +637,7 @@ async fn escort_background_terminal(
     handle_id: String,
     subagent_type: String,
     task_summary: String,
+    group: Option<String>,
     result: SubagentResult,
     limiter: &Arc<dyn aura_subagent::SubagentDispatchLimiter>,
     fan_out_root: &Option<SessionId>,
@@ -645,6 +655,7 @@ async fn escort_background_terminal(
             handle_id,
             subagent_type,
             task_summary,
+            group,
             result,
         )
         .await;
@@ -1093,16 +1104,18 @@ async fn persist_resume_key(
 /// the trace tree and the child's session row. On the actor side the
 /// pending result is persisted on receipt, so a parent reaped AFTER
 /// delivery still surfaces it on the next hydration.
+#[allow(clippy::too_many_arguments)]
 async fn deliver_background_result(
     supervisor: &AgentSupervisor,
     parent_session_id: &SessionId,
     handle_id: String,
     subagent_type: String,
     task_summary: String,
+    group: Option<String>,
     result: SubagentResult,
 ) {
     let final_text = result.result_text();
-    let pending = PendingBackgroundResult::subagent(
+    let mut pending = PendingBackgroundResult::subagent(
         handle_id.clone(),
         subagent_type,
         task_summary,
@@ -1110,6 +1123,7 @@ async fn deliver_background_result(
         final_text,
         result.status,
     );
+    pending.group = group;
     let delivered = supervisor
         .route(
             parent_session_id,

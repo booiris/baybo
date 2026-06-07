@@ -154,6 +154,11 @@ struct SpawnParams {
     on_timeout: Option<String>,
     #[serde(default)]
     resume_session_id: Option<String>,
+    /// Barrier cohort. Subagents sharing a `group` (spawned together in one
+    /// turn) run in the background and deliver one merged notification only
+    /// once they all finish.
+    #[serde(default)]
+    group: Option<String>,
 }
 
 /// Outcome of parameter parsing — the fully-built request, or a
@@ -249,13 +254,23 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
         }
     };
 
+    let group = p
+        .group
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    // A grouped subagent is background-from-start: its result is barrier-held
+    // and delivered with the whole group, so it never blocks the turn.
+    let background = p.background || group.is_some();
+
     Ok(ParsedSpawn {
         request: SubagentSpawnRequest {
             subagent_type: profile.name.clone(),
             task_summary: p.description,
             prompt: p.prompt,
             model_tier,
-            background: p.background,
+            background,
             on_timeout,
             // Filled in by the tool after the lineage walk; the
             // synthesized request leaves it `None` so test fixtures
@@ -264,6 +279,7 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
             fan_out_root: None,
             backend,
             resume_session_id,
+            group,
         },
     })
 }
@@ -473,6 +489,10 @@ fn parameters_schema() -> Value {
                 "type": "string",
                 "enum": ["background", "kill"],
                 "description": "What to do if a foreground (background=false) subagent is still running after a 2-minute foreground wait. 'background' (default) detaches it — you get a handle now and a notification when it finishes — so a slow subagent never blocks you. 'kill' cancels it and returns a timeout instead. Only applies to foreground spawns from a top-level user chat; ignored when background=true."
+            },
+            "group": {
+                "type": "string",
+                "description": "Barrier cohort name. Spawn several subagents with the SAME group in one turn to run them in parallel and get a SINGLE merged notification only once they ALL finish — instead of a separate notification per subagent. Grouped subagents always run in the background (they never block this turn). Use when you fan out a batch of related tasks and want to react to the whole set at once."
             },
             "resume_session_id": {
                 "type": "string",
@@ -1339,6 +1359,37 @@ mod tests {
             "on_timeout": "explode",
         });
         assert!(parse_spawn_request(&v, &reg).is_err());
+    }
+
+    #[test]
+    fn parse_spawn_request_group_forces_background() {
+        let reg = registry_with_builtins();
+        let v = json!({
+            "subagent_type": "general-purpose",
+            "description": "x",
+            "prompt": "x",
+            "group": "research",
+        });
+        let req = parse_spawn_request(&v, &reg).unwrap().request;
+        assert_eq!(req.group.as_deref(), Some("research"));
+        assert!(
+            req.background,
+            "a grouped subagent must run in the background"
+        );
+    }
+
+    #[test]
+    fn parse_spawn_request_blank_group_is_none() {
+        let reg = registry_with_builtins();
+        let v = json!({
+            "subagent_type": "general-purpose",
+            "description": "x",
+            "prompt": "x",
+            "group": "   ",
+        });
+        let req = parse_spawn_request(&v, &reg).unwrap().request;
+        assert_eq!(req.group, None);
+        assert!(!req.background, "blank group must not force background");
     }
 
     #[test]
