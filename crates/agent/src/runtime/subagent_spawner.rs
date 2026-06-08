@@ -358,7 +358,6 @@ impl ActorSubagentSpawner {
                     &fan_out_root_for_task,
                 )
                 .await;
-                // `_permit` drops here → releases the budget slot.
             });
             return Ok(());
         }
@@ -377,99 +376,35 @@ impl ActorSubagentSpawner {
             return Ok(());
         }
 
-        let job_lifecycle = Arc::clone(&self.job_lifecycle);
-        let limiter_for_task = Arc::clone(&self.dispatch_limiter);
-        let fan_out_root_for_task = fan_out_root.clone();
-
-        if !user_facing {
-            // Nested-subagent / cron parent: no foreground-wait timer.
-            // Background conversion + its notification turn only work for
-            // a live, registered user session, so block until terminal.
-            tokio::spawn(async move {
-                let result = await_subagent_terminal(
-                    child_session_id,
-                    output_rx,
-                    terminal_rx,
-                    mailbox,
-                    actor_token,
-                    job_lifecycle,
-                )
-                .await;
-                let _ = result_tx.send(result);
-                release_reserved_slot(limiter_for_task.as_ref(), &fan_out_root_for_task);
-            });
-            return Ok(());
-        }
-
-        // User-facing parent: wait up to the foreground budget, then apply
-        // the `on_timeout` policy. The terminal-watch future is pinned and
-        // resumed across the `select!` boundary so it is never consumed
-        // twice — on conversion we keep awaiting it to escort the eventual
-        // result as a background completion.
-        let supervisor = self.supervisor.clone();
-        let session_manager = Arc::clone(&self.session_manager);
-        let parent_id_for_task = parent.id.clone();
-        tokio::spawn(async move {
-            let terminal_fut = await_subagent_terminal(
-                child_session_id.clone(),
-                output_rx,
-                terminal_rx,
-                mailbox,
-                actor_token.clone(),
-                job_lifecycle,
-            );
-            tokio::pin!(terminal_fut);
-            tokio::select! {
-                result = &mut terminal_fut => {
-                    // Finished within the foreground window — normal result.
-                    let _ = result_tx.send(result);
-                    release_reserved_slot(limiter_for_task.as_ref(), &fan_out_root_for_task);
-                }
-                _ = tokio::time::sleep(SUBAGENT_FOREGROUND_WAIT) => match on_timeout {
-                    OnTimeout::Background => {
-                        let handle_id = convert_foreground_to_background(
-                            &supervisor,
-                            &session_manager,
-                            &parent_id_for_task,
-                            &child_session_id,
-                            &subagent_type,
-                            &task_summary,
-                            actor_token,
-                            result_tx,
-                        )
-                        .await;
-                        let result = terminal_fut.await;
-                        escort_background_terminal(
-                            &supervisor,
-                            &parent_id_for_task,
-                            handle_id,
-                            subagent_type,
-                            task_summary,
-                            // A converted foreground subagent is never grouped
-                            // (grouped spawns are background-from-start).
-                            None,
-                            result,
-                            &limiter_for_task,
-                            &fan_out_root_for_task,
-                        )
-                        .await;
-                    }
-                    OnTimeout::Kill => {
-                        // Force-kill: cancel the child, let the wait routine
-                        // observe it (and `ActorStop` the child), then
-                        // surface a timeout on the foreground oneshot.
-                        actor_token.cancel();
-                        let _ = terminal_fut.await;
-                        let _ = result_tx.send(SubagentResult {
-                            child_session_id: child_session_id.clone(),
-                            final_content: None,
-                            status: SubagentExitStatus::Timeout,
-                        });
-                        release_reserved_slot(limiter_for_task.as_ref(), &fan_out_root_for_task);
-                    }
-                },
-            }
-        });
+        // Foreground dispatch under the shared wait/convert/kill policy. The
+        // terminal future is the Aura actor's terminal observer; the policy
+        // (block for nested, or wait-then-convert/kill for a user parent) is
+        // backend-agnostic and lives in `run_foreground_job`.
+        let fut = await_subagent_terminal(
+            child_session_id.clone(),
+            output_rx,
+            terminal_rx,
+            mailbox,
+            actor_token.clone(),
+            Arc::clone(&self.job_lifecycle),
+        );
+        tokio::spawn(run_foreground_job(
+            ForegroundJob {
+                user_facing,
+                on_timeout,
+                child_session_id,
+                subagent_type,
+                task_summary,
+                child_token: actor_token,
+                result_tx,
+                fan_out_root,
+            },
+            fut,
+            self.supervisor.clone(),
+            Arc::clone(&self.session_manager),
+            parent.id.clone(),
+            Arc::clone(&self.dispatch_limiter),
+        ));
         Ok(())
     }
 
@@ -529,11 +464,17 @@ impl ActorSubagentSpawner {
             .join(kind.as_str())
             .join(dir_name);
 
-        // Background external runs anchor to the process-wide token so
-        // they outlive the dispatching turn (claude/codex runs are long
-        // — that's the point of background here); the foreground path
-        // stays bound to the parent's per-job token.
-        let actor_token = if request.background {
+        // Background — and convertible-foreground — external runs anchor to the
+        // process-wide token so they outlive the dispatching turn (claude/codex
+        // runs are long; a converted one keeps running past the turn that
+        // spawned it). A non-convertible foreground run stays on the parent's
+        // per-job token (cancelled at the foreground-wait mark, or ends with the
+        // turn). Mirrors the Aura backend's anchoring.
+        let user_facing = parent_supports_background(&parent);
+        let convertible = user_facing
+            && !request.background
+            && matches!(request.on_timeout, OnTimeout::Background);
+        let actor_token = if request.background || convertible {
             self.actor_parent_token.child_token()
         } else {
             parent_actor_token.child_token()
@@ -595,24 +536,42 @@ impl ActorSubagentSpawner {
                     &fan_out_root_for_task,
                 )
                 .await;
-                // `_permit` drops here → releases the budget slot.
             });
             return Ok(());
         }
 
-        tokio::spawn(async move {
-            let result = run_external_agent_job(
-                agent,
-                kind,
-                external_request,
-                child_session_id.clone(),
-                session_manager,
-                job_ctx,
-            )
-            .await;
-            let _ = result_tx.send(result);
-            release_reserved_slot(limiter_for_task.as_ref(), &fan_out_root);
-        });
+        // Foreground external run under the shared wait/convert/kill policy: a
+        // user parent gets the same foreground-wait → convert-to-background
+        // behaviour as the Aura backend; a nested/cron parent blocks until the
+        // run finishes (or hits `EXTERNAL_SUBAGENT_TIMEOUT`). The cancel token
+        // is the foreground job's `child_token` so a `/stop` or `Kill`-timeout
+        // reaches the in-flight subprocess.
+        let child_token = external_request.cancel.clone();
+        let fut = run_external_agent_job(
+            agent,
+            kind,
+            external_request,
+            child_session_id.clone(),
+            Arc::clone(&session_manager),
+            job_ctx,
+        );
+        tokio::spawn(run_foreground_job(
+            ForegroundJob {
+                user_facing,
+                on_timeout: request.on_timeout,
+                child_session_id,
+                subagent_type: request.subagent_type.clone(),
+                task_summary: request.task_summary.clone(),
+                child_token,
+                result_tx,
+                fan_out_root,
+            },
+            fut,
+            self.supervisor.clone(),
+            session_manager,
+            parent.id.clone(),
+            limiter_for_task,
+        ));
         Ok(())
     }
 
@@ -797,6 +756,116 @@ async fn escort_background_terminal(
     }
     supervisor.note_background_subagent_finished(parent_id, &child_session_id);
     release_reserved_slot(limiter.as_ref(), fan_out_root);
+}
+
+/// Everything [`run_foreground_job`] needs that isn't the terminal future.
+struct ForegroundJob {
+    /// Whether the parent can host the background-conversion notification
+    /// turn ([`Session::supports_background_jobs`]). A non-user parent blocks
+    /// until terminal with no foreground-wait timer.
+    user_facing: bool,
+    on_timeout: OnTimeout,
+    child_session_id: SessionId,
+    subagent_type: String,
+    task_summary: String,
+    /// Cancels the underlying work — the child actor for the Aura backend, the
+    /// external subprocess for the External one. Registered on conversion so
+    /// `/stop` reaches the now-background job, and fired directly on `Kill`.
+    child_token: CancellationToken,
+    result_tx: oneshot::Sender<SubagentResult>,
+    fan_out_root: Option<SessionId>,
+}
+
+/// Run a foreground subagent's terminal `fut` under the foreground-wait
+/// policy — the half of foreground dispatch that's identical across backends
+/// (only `fut` differs: an Aura actor terminal vs an external-subprocess run,
+/// both resolving to a [`SubagentResult`]).
+///
+/// A non-user parent blocks until terminal (no timer). A user-facing parent
+/// waits up to [`SUBAGENT_FOREGROUND_WAIT`]; on overrun it either converts the
+/// still-running job to background (acking now, escorting its eventual
+/// terminal as a notification turn) or force-cancels it, per `on_timeout`. The
+/// future is pinned and resumed across the `select!` boundary so it is never
+/// polled to completion twice.
+async fn run_foreground_job(
+    job: ForegroundJob,
+    fut: impl std::future::Future<Output = SubagentResult>,
+    supervisor: AgentSupervisor,
+    session_manager: Arc<aura_session::SessionManager>,
+    parent_id: SessionId,
+    limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
+) {
+    let ForegroundJob {
+        user_facing,
+        on_timeout,
+        child_session_id,
+        subagent_type,
+        task_summary,
+        child_token,
+        result_tx,
+        fan_out_root,
+    } = job;
+    tokio::pin!(fut);
+
+    if !user_facing {
+        // Cron / nested-subagent parent: conversion + its notification turn
+        // only work for a live, registered user session, so block until
+        // terminal with no foreground-wait timer.
+        let result = fut.await;
+        let _ = result_tx.send(result);
+        release_reserved_slot(limiter.as_ref(), &fan_out_root);
+        return;
+    }
+
+    tokio::select! {
+        result = &mut fut => {
+            // Finished within the foreground window — normal result.
+            let _ = result_tx.send(result);
+            release_reserved_slot(limiter.as_ref(), &fan_out_root);
+        }
+        _ = tokio::time::sleep(SUBAGENT_FOREGROUND_WAIT) => match on_timeout {
+            OnTimeout::Background => {
+                let handle_id = convert_foreground_to_background(
+                    &supervisor,
+                    &session_manager,
+                    &parent_id,
+                    &child_session_id,
+                    &subagent_type,
+                    &task_summary,
+                    child_token,
+                    result_tx,
+                )
+                .await;
+                let result = fut.await;
+                escort_background_terminal(
+                    &supervisor,
+                    &parent_id,
+                    handle_id,
+                    subagent_type,
+                    task_summary,
+                    // A converted foreground subagent is never grouped
+                    // (grouped spawns are background-from-start).
+                    None,
+                    result,
+                    &limiter,
+                    &fan_out_root,
+                )
+                .await;
+            }
+            OnTimeout::Kill => {
+                // Force-cancel the underlying work, let it observe the cancel
+                // and drain, then surface a timeout on the foreground oneshot.
+                child_token.cancel();
+                let _ = fut.await;
+                let _ = result_tx.send(SubagentResult {
+                    child_session_id,
+                    final_content: None,
+                    status: SubagentExitStatus::Timeout,
+                });
+                release_reserved_slot(limiter.as_ref(), &fan_out_root);
+            }
+        }
+    }
 }
 
 /// Convert a still-running foreground subagent into a background one once
@@ -1486,5 +1555,150 @@ mod resume_validation_tests {
         child.state.subagent_type = Some("planner".into());
         validate_resume_session(&child, &parent, aura_request(), "planner")
             .expect("matching subagent_type must accept");
+    }
+}
+
+#[cfg(test)]
+mod foreground_job_tests {
+    //! Backend-agnostic foreground-wait policy ([`run_foreground_job`]), shared
+    //! by the Aura and External backends. The terminal future is faked here;
+    //! the convert/escort plumbing it calls is exercised end-to-end by the
+    //! integration suite.
+    use super::*;
+    use aura_session::test_support::{MemorySessionStore, MemorySessionSummaryStore};
+
+    fn test_supervisor() -> AgentSupervisor {
+        let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
+        AgentSupervisor::new(tx)
+    }
+
+    fn test_session_manager() -> Arc<SessionManager> {
+        Arc::new(SessionManager::new(
+            Arc::new(MemorySessionStore::new()),
+            Arc::new(MemorySessionSummaryStore::new()),
+        ))
+    }
+
+    fn completed(text: &str) -> SubagentResult {
+        SubagentResult {
+            child_session_id: SessionId::from("child"),
+            final_content: Some(vec![ContentBlock::Text(text.to_string())]),
+            status: SubagentExitStatus::Completed,
+        }
+    }
+
+    fn job(
+        user_facing: bool,
+        on_timeout: OnTimeout,
+        child_token: CancellationToken,
+        result_tx: oneshot::Sender<SubagentResult>,
+    ) -> ForegroundJob {
+        ForegroundJob {
+            user_facing,
+            on_timeout,
+            child_session_id: SessionId::from("child"),
+            subagent_type: "general-purpose".into(),
+            task_summary: "t".into(),
+            child_token,
+            result_tx,
+            fan_out_root: None,
+        }
+    }
+
+    fn spawn_job(
+        j: ForegroundJob,
+        fut: impl std::future::Future<Output = SubagentResult> + Send + 'static,
+    ) {
+        tokio::spawn(run_foreground_job(
+            j,
+            fut,
+            test_supervisor(),
+            test_session_manager(),
+            SessionId::from("parent"),
+            aura_subagent::unbounded_limiter(),
+        ));
+    }
+
+    // Finishes inside the foreground window → the result passes straight
+    // through, no conversion.
+    #[tokio::test(start_paused = true)]
+    async fn passes_through_when_fut_completes_in_time() {
+        let (tx, rx) = oneshot::channel();
+        spawn_job(
+            job(true, OnTimeout::Background, CancellationToken::new(), tx),
+            async { completed("the answer") },
+        );
+        let result = rx.await.expect("result");
+        assert!(matches!(result.status, SubagentExitStatus::Completed));
+        assert_eq!(result.result_text(), "the answer");
+    }
+
+    // User parent + `Background` + a run that overruns the foreground wait →
+    // the foreground oneshot gets the tail-free conversion ack (the child keeps
+    // running in the background).
+    #[tokio::test(start_paused = true)]
+    async fn converts_to_background_on_overrun() {
+        let (tx, rx) = oneshot::channel();
+        // Never resolves on its own → forces the foreground-wait timeout, which
+        // paused time auto-advances to.
+        spawn_job(
+            job(true, OnTimeout::Background, CancellationToken::new(), tx),
+            std::future::pending::<SubagentResult>(),
+        );
+        let ack = rx.await.expect("conversion ack");
+        assert!(
+            ack.result_text().contains("converted to background"),
+            "got: {}",
+            ack.result_text()
+        );
+        // Empty child id → no resume tail on the ack (the child is still
+        // running, so the parent can't resume it).
+        assert!(ack.resume_tail().is_none());
+    }
+
+    // User parent + `Kill` + a run that overruns → the run's token is cancelled
+    // and a `Timeout` surfaces on the foreground oneshot.
+    #[tokio::test(start_paused = true)]
+    async fn kills_on_overrun_when_policy_is_kill() {
+        let (tx, rx) = oneshot::channel();
+        let token = CancellationToken::new();
+        let observe = token.clone();
+        // Resolves only once cancelled — mirrors a real run observing the kill.
+        let fut = async move {
+            observe.cancelled().await;
+            SubagentResult {
+                child_session_id: SessionId::from("child"),
+                final_content: None,
+                status: SubagentExitStatus::Cancelled,
+            }
+        };
+        spawn_job(job(true, OnTimeout::Kill, token.clone(), tx), fut);
+        let result = rx.await.expect("timeout result");
+        assert!(matches!(result.status, SubagentExitStatus::Timeout));
+        assert!(token.is_cancelled(), "the kill cancelled the run's token");
+    }
+
+    // A non-user parent (cron / nested subagent) has no foreground-wait timer:
+    // it blocks until terminal and never converts, even on a long run.
+    #[tokio::test(start_paused = true)]
+    async fn non_user_parent_blocks_without_conversion() {
+        let (tx, mut rx) = oneshot::channel();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let gate2 = Arc::clone(&gate);
+        let fut = async move {
+            gate2.notified().await;
+            completed("nested done")
+        };
+        spawn_job(
+            job(false, OnTimeout::Background, CancellationToken::new(), tx),
+            fut,
+        );
+        // Well past the foreground wait, still no conversion ack (no timer).
+        tokio::time::advance(SUBAGENT_FOREGROUND_WAIT * 3).await;
+        assert!(rx.try_recv().is_err(), "a non-user parent must not convert");
+        // It delivers only when the run actually finishes.
+        gate.notify_one();
+        let result = rx.await.expect("result after the run finishes");
+        assert_eq!(result.result_text(), "nested done");
     }
 }
