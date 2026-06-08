@@ -174,10 +174,12 @@ struct ParsedSpawn {
     request: SubagentSpawnRequest,
 }
 
-/// Output of [`SpawnSubagentTool::lineage_summary`]: parent's depth
-/// plus the root session id. The fan-out gate keys on the root, the
-/// depth gate compares against the cap directly.
-struct LineageSummary {
+/// The two subagent-admission gate inputs [`SpawnSubagentTool::lineage_gate_inputs`]
+/// derives from the parent: the parent's `depth` (the depth gate compares it
+/// against the nesting cap) and the `root_session_id` (the fan-out gate keys
+/// on it). Only `depth` needs the lineage walk; the root is denormalized on
+/// the parent row.
+struct LineageGateInputs {
     depth: u32,
     root_session_id: SessionId,
 }
@@ -346,10 +348,10 @@ impl SpawnSubagentTool {
     /// exceeds [`MAX_LINEAGE_WALK_HOPS`] surfaces as
     /// `ToolError::Execution` so the LLM sees a clean failure
     /// instead of hanging the executor.
-    async fn lineage_summary(
+    async fn lineage_gate_inputs(
         &self,
         parent_session_id: &SessionId,
-    ) -> aura_tools::Result<LineageSummary> {
+    ) -> aura_tools::Result<LineageGateInputs> {
         let parent = self
             .sessions
             .get(parent_session_id)
@@ -384,7 +386,7 @@ impl SpawnSubagentTool {
                     })?,
             };
             let Some(parent_link) = session.lineage else {
-                return Ok(LineageSummary {
+                return Ok(LineageGateInputs {
                     depth,
                     root_session_id,
                 });
@@ -554,10 +556,10 @@ impl Tool for SpawnSubagentTool {
         let ParsedSpawn { request } =
             parse_spawn_request(&params, &self.registry).map_err(ToolError::InvalidParams)?;
 
-        let LineageSummary {
+        let LineageGateInputs {
             depth,
             root_session_id,
-        } = self.lineage_summary(&ctx.session_id).await?;
+        } = self.lineage_gate_inputs(&ctx.session_id).await?;
         if depth >= self.max_depth {
             return Err(ToolError::SubagentDepthExceeded {
                 current_depth: depth,
