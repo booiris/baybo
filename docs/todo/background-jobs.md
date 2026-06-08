@@ -280,5 +280,10 @@ fallback — impossible (the sandbox kills internally on timeout).
   like the sink); non-user sessions rely on `/stop`/shutdown. Likely leave as-is.
 - A per-session concurrency cap on detached commands (currently unbounded beyond
   the OS) — revisit once real fan-out is observed.
-- e2e coverage for the group barrier is at the `GroupState` predicate level
-  (unit-tested); a full spawn→barrier→one-notification harness test is a nice add.
+- ✅ e2e coverage for the group barrier — DONE: a spawn→barrier→one-notification
+  harness test (`grouped_subagents_deliver_one_merged_notification` in
+  `crates/integration-tests/tests/agent_loop_e2e.rs`) drives a turn that
+  dispatches two grouped `spawn_subagent` calls, then delivers their two
+  `BackgroundJobFinished`s one at a time — asserting the cohort HOLDS the first
+  member (no notification) and fires exactly ONE merged notification once the
+  second completes (mutation-verified: breaking the cohort counter fails it).

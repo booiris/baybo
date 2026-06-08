@@ -32,8 +32,9 @@ use aura_llm::{LlmError, LlmResponse, ModelPricing, StreamEvent, TokenUsage, Too
 use aura_memory::test_support::RecordingMemory;
 use aura_memory::{Memory, RecalledMemory};
 use aura_model::{
-    ContentBlock, MessageMetadata, MicroUsd, PendingBackgroundResult, Role, SessionId,
-    SubagentExitStatus, ThinkingContent, TriggerSource,
+    BACKGROUND_DISPATCH_ACK_PREFIX, ContentBlock, MessageMetadata, MicroUsd,
+    PendingBackgroundResult, Role, SPAWN_SUBAGENT_TOOL_NAME, SessionId, SubagentExitStatus,
+    ThinkingContent, TriggerSource,
 };
 use aura_tools::test_support::RecordingTool;
 use aura_tools::{Tool, ToolOutput};
@@ -1941,6 +1942,137 @@ async fn task_tools_persist_and_emit_checklist_to_the_channel() {
     let list3 = last_task_list(&outs3).expect("a TaskList event after the delete");
     assert_eq!(list3.len(), 1);
     assert_eq!(list3[0].subject, "write the table");
+
+    harness.shutdown().await;
+}
+
+/// End-to-end subagent-group barrier: a turn that dispatches two grouped
+/// `spawn_subagent` calls, followed by two `BackgroundJobFinished` deliveries,
+/// must surface **exactly one** merged notification — not one per member. This
+/// covers the integration the `GroupState` predicate unit tests don't: the
+/// agent loop's grouped-member counting → turn-end seal → cohort fill →
+/// single drained notification.
+#[tokio::test]
+async fn grouped_subagents_deliver_one_merged_notification() {
+    // Stand-in `spawn_subagent` tool: returns the background-dispatch ack so
+    // the agent loop's grouped-member counter fires (it keys on the tool name
+    // + the ack prefix). The real spawn tool's internals are covered by its
+    // own unit tests; this exercises the barrier path.
+    let spawn = Arc::new(RecordingTool::new(SPAWN_SUBAGENT_TOOL_NAME));
+    spawn.set_response(ToolOutput::Text(format!(
+        "{BACKGROUND_DISPATCH_ACK_PREFIX}\n- handle: bg-stub"
+    )));
+    let manifest = spawn.manifest();
+
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(spawn.clone() as Arc<dyn Tool>, manifest)
+        .build();
+
+    // Turn 1: two grouped spawns in one iteration (same `group: "g"`), then a
+    // final answer. The loop counts both into cohort "g" (expected = 2); the
+    // turn-end hook seals it.
+    let grouped_call = |id: &str, label: &str| {
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: id.into(),
+            name: SPAWN_SUBAGENT_TOOL_NAME.into(),
+            arguments: json!({
+                "subagent_type": "general-purpose",
+                "description": label,
+                "prompt": label,
+                "group": "g",
+            }),
+            signature: None,
+        })
+    };
+    harness.stub_llm.push_stream(vec![
+        grouped_call("call-a", "a"),
+        grouped_call("call-b", "b"),
+    ]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("dispatched two".into())]);
+
+    harness.send_text("spawn a group of two").await.unwrap();
+    let turn_outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(spawn.invocations().len(), 2, "both grouped spawns ran");
+    let dispatch_answers = turn_outs
+        .iter()
+        .filter(|o| matches!(o.event, AgentEvent::Message(_)))
+        .count();
+    assert_eq!(
+        dispatch_answers, 1,
+        "the dispatching turn answers once and the barrier holds — no notification yet: {turn_outs:?}"
+    );
+
+    // The notification turn runs with `delta_tx = None`, so it takes the
+    // non-streaming `chat` path — queue `push_response`s, not streams. Two,
+    // so a broken barrier (a notification per member) surfaces as two Message
+    // outputs rather than erroring on an empty LLM queue.
+    let notif_response = |text: &str| LlmResponse {
+        content: text.into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        },
+        thinking: None,
+    };
+    harness
+        .stub_llm
+        .push_response(notif_response("group complete"));
+    harness
+        .stub_llm
+        .push_response(notif_response("second (must not happen)"));
+
+    let finish = |handle: &str, label: &str| {
+        let mut pending = PendingBackgroundResult::subagent(
+            handle,
+            "general-purpose",
+            label,
+            SessionId::from(format!("child-{handle}")),
+            format!("{label} result"),
+            SubagentExitStatus::Completed,
+        );
+        pending.group = Some("g".into());
+        AgentMessage::BackgroundJobFinished(Box::new(pending))
+    };
+    let count_answers = |outs: &[AgentOutput]| {
+        outs.iter()
+            .filter(|o| matches!(o.event, AgentEvent::Message(_)))
+            .count()
+    };
+
+    // First member finishes ALONE (nothing else queued). The barrier must HOLD
+    // it — without the cohort, the result would buffer and notify right here.
+    // This is the assertion that distinguishes a working barrier from none.
+    harness
+        .mailbox
+        .send(finish("bg-1", "a"))
+        .await
+        .expect("mailbox open");
+    let after_first = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(
+        count_answers(&after_first),
+        0,
+        "the barrier holds the first member — no notification until the cohort completes: {after_first:?}"
+    );
+
+    // Last member finishes → the cohort completes → exactly one merged
+    // notification, not one per member.
+    harness
+        .mailbox
+        .send(finish("bg-2", "b"))
+        .await
+        .expect("mailbox open");
+    let after_second = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(
+        count_answers(&after_second),
+        1,
+        "the completed cohort fires exactly one merged notification: {after_second:?}"
+    );
 
     harness.shutdown().await;
 }
