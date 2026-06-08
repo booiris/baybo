@@ -208,11 +208,6 @@ pub struct ManagerGraph {
     /// `Arc`; otherwise the limiter on the tool and the one on the
     /// router could diverge silently.
     pub subagent_dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
-
-    /// Global background-subagent concurrency budget, shared between the
-    /// job manager (built in [`build_managers`]) and the subagent spawner
-    /// (built in [`wire_router`]).
-    pub job_budget: Arc<aura_agent::runtime::job_budget::JobBudget>,
 }
 
 /// Resolve every domain manager, tying them together with the shared
@@ -632,22 +627,13 @@ pub async fn build_managers(
         });
     }
 
-    // Global concurrency budget for background subagent dispatches. Shared
-    // between the subagent spawner (which acquires a slot before a
-    // background child runs) and the job manager (which surfaces
-    // `(running, total)` in `JobList`).
-    let job_budget = aura_agent::runtime::job_budget::JobBudget::new(
-        config.agent.max_concurrent_background_jobs as usize,
-    );
-
     // Background-job sink for "Bash timeout → background". The manager
     // routes completion notifications via the supervisor, which is built
     // further down, so it holds it behind a `OnceLock` set right after.
     let bg_supervisor_slot = Arc::new(std::sync::OnceLock::new());
-    let bg_manager = Arc::new(aura_agent::BackgroundJobManager::new(
-        Arc::clone(&bg_supervisor_slot),
-        Arc::clone(&job_budget),
-    ));
+    let bg_manager = Arc::new(aura_agent::BackgroundJobManager::new(Arc::clone(
+        &bg_supervisor_slot,
+    )));
     let background_jobs: Option<Arc<dyn aura_tools::BackgroundJobSink>> = Some(bg_manager.clone());
     let background_control: Option<Arc<dyn aura_tools::BackgroundJobControl>> = Some(bg_manager);
 
@@ -736,7 +722,6 @@ pub async fn build_managers(
         subagent_spawner_slot,
         actor_parent_token,
         subagent_dispatch_limiter,
-        job_budget,
     })
 }
 
@@ -955,7 +940,6 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 llm_pool: Arc::clone(&llm_pool),
                 workspace_paths: Arc::clone(&workspace_paths_for_router),
                 actor_spawner: Arc::clone(&spawn_actor_for),
-                job_budget: Arc::clone(&graph.job_budget),
             },
         ),
     ));

@@ -121,17 +121,6 @@ fn validate_agent(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
             "must be <= 256 (caps higher than this rarely reflect deliberate design and trade safety for cost)",
         ));
     }
-    if agent.max_concurrent_background_jobs == 0 {
-        errors.push(ValidationError::new(
-            "agent.max_concurrent_background_jobs",
-            "must be >= 1 (0 would queue every background subagent forever)",
-        ));
-    } else if agent.max_concurrent_background_jobs > 256 {
-        errors.push(ValidationError::new(
-            "agent.max_concurrent_background_jobs",
-            "must be <= 256 (a budget this large defeats the purpose of bounding concurrency)",
-        ));
-    }
 }
 
 fn validate_channels(channels: &ChannelsConfig, errors: &mut Vec<ValidationError>) {

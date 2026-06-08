@@ -174,35 +174,24 @@ function generateMockCrons(count: number): components['schemas']['CronJob'][] {
 export const MOCK_CRONS = import.meta.env.DEV ? generateMockCrons(20) : [];
 
 export const MOCK_BACKGROUND_JOBS: components['schemas']['BackgroundJobsResponse'] = {
-  budget: { running: 2, total: 8 },
   jobs: [
     {
       handle: 'bg-7f3a',
       session_id: 'sess-mock-1',
       kind: 'explorer',
       summary: 'Map the auth subsystem',
-      state: 'running',
-    },
-    {
-      handle: 'bg-91cd',
-      session_id: 'sess-mock-1',
-      kind: 'reviewer',
-      summary: 'Adversarially verify the migration',
-      state: 'running',
     },
     {
       handle: 'bg-2e10',
       session_id: 'sess-mock-2',
       kind: 'command',
       summary: 'cargo test --workspace',
-      state: 'running',
     },
     {
       handle: 'bg-aa44',
       session_id: 'sess-mock-2',
       kind: 'planner',
       summary: 'Draft the rollout plan',
-      state: 'queued',
     },
   ],
 };

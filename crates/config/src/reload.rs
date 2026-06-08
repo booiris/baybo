@@ -112,7 +112,6 @@ pub fn hot_reload_diff(old: &AuraConfig, new: &AuraConfig) -> Result<()> {
         context,
         max_subagent_depth,
         max_subagents_per_root,
-        max_concurrent_background_jobs,
         // Hot.
         model_tiers: _,
     } = agent;
@@ -127,12 +126,6 @@ pub fn hot_reload_diff(old: &AuraConfig, new: &AuraConfig) -> Result<()> {
     }
     if &old.agent.max_subagents_per_root != max_subagents_per_root {
         return Err(not_hot("agent.max_subagents_per_root"));
-    }
-    // The budget is a `Semaphore` sized at boot; resizing it live (esp.
-    // shrinking below in-flight permits) isn't supported, so a change
-    // needs a restart.
-    if &old.agent.max_concurrent_background_jobs != max_concurrent_background_jobs {
-        return Err(not_hot("agent.max_concurrent_background_jobs"));
     }
 
     Ok(())

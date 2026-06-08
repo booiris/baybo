@@ -568,13 +568,6 @@ export interface components {
              */
             until: string;
         };
-        /** @description Global background-subagent concurrency budget. */
-        BackgroundBudget: {
-            /** @description Background children currently holding a slot. */
-            running: number;
-            /** @description Total slots (`agent.max_concurrent_background_jobs`). */
-            total: number;
-        };
         /**
          * @description One in-flight background job (detached subagent or `Bash` command),
          *     across all sessions — the cross-session twin of the `JobList` tool.
@@ -586,17 +579,11 @@ export interface components {
             kind: string;
             /** @description Parent session that dispatched it. */
             session_id: string;
-            /**
-             * @description `"running"`, or `"queued"` while a background subagent waits for a
-             *     concurrency-budget slot.
-             */
-            state: string;
             /** @description Task summary (subagent) or the command line (command). */
             summary: string;
         };
         /** @description Response body for `GET /v1/background-jobs`. */
         BackgroundJobsResponse: {
-            budget: components["schemas"]["BackgroundBudget"];
             jobs: components["schemas"]["BackgroundJob"][];
         };
         /**

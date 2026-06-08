@@ -2353,26 +2353,6 @@
           }
         }
       },
-      "BackgroundBudget": {
-        "type": "object",
-        "description": "Global background-subagent concurrency budget.",
-        "required": [
-          "running",
-          "total"
-        ],
-        "properties": {
-          "running": {
-            "type": "integer",
-            "description": "Background children currently holding a slot.",
-            "minimum": 0
-          },
-          "total": {
-            "type": "integer",
-            "description": "Total slots (`agent.max_concurrent_background_jobs`).",
-            "minimum": 0
-          }
-        }
-      },
       "BackgroundJob": {
         "type": "object",
         "description": "One in-flight background job (detached subagent or `Bash` command),\nacross all sessions — the cross-session twin of the `JobList` tool.",
@@ -2380,8 +2360,7 @@
           "handle",
           "session_id",
           "kind",
-          "summary",
-          "state"
+          "summary"
         ],
         "properties": {
           "handle": {
@@ -2396,10 +2375,6 @@
             "type": "string",
             "description": "Parent session that dispatched it."
           },
-          "state": {
-            "type": "string",
-            "description": "`\"running\"`, or `\"queued\"` while a background subagent waits for a\nconcurrency-budget slot."
-          },
           "summary": {
             "type": "string",
             "description": "Task summary (subagent) or the command line (command)."
@@ -2410,13 +2385,9 @@
         "type": "object",
         "description": "Response body for `GET /v1/background-jobs`.",
         "required": [
-          "jobs",
-          "budget"
+          "jobs"
         ],
         "properties": {
-          "budget": {
-            "$ref": "#/components/schemas/BackgroundBudget"
-          },
           "jobs": {
             "type": "array",
             "items": {

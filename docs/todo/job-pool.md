@@ -1,13 +1,24 @@
 # Execution Pool — Unified Job Admission for Subagents & Detached Commands
 
-**Status:** Phases 1–3 **built** on branch `job-pool-design` (commits
-`7628a35f`, `5b1104dc`, `627aed27`), atop merged background-jobs (#80).
-Only the explicitly-deferred design extensions remain (see Deferred / open).
+**Status:** built on branch `job-pool-design`, atop merged background-jobs
+(#80):
+
+- **Phase 1 — `SubagentSpawner` extraction + `SystemSpawnRequest` deletion**
+  (`7628a35f`): shipped, kept.
+- **Phase 2 — global concurrency budget** (`5b1104dc`): built, then **removed
+  at the user's request** — background subagents now run **unbounded** (no
+  budget, no queue, no queued/running state). The fan-out reject-cap
+  (`SubagentDispatchLimiter`, per-root, foreground) is the only remaining
+  subagent concurrency guard.
+- **Phase 3 — cross-session jobs dashboard** (`627aed27`): shipped. The budget
+  gauge + per-job state were dropped with Phase 2; the `/v1/background-jobs`
+  list (handle / session / kind / summary) + `JobsPage` remain.
 
 ## As built (vs the proposal below)
 
 The shipped design is leaner than the original "single `JobPool` front door"
-sketch — the same value with less churn:
+sketch — the same value with less churn. (Phase 2's budget was later removed;
+the description below is retained as the proposal record.)
 
 - **`SubagentSpawner` is a trait in `aura-subagent`** (leaf crate, no cycle);
   the actor-backed `ActorSubagentSpawner` impl is in `aura-agent`. The tool

@@ -14,18 +14,7 @@ const POLL_MS = 4000;
 const thCell =
   'px-6 py-4 text-left font-bold text-[0.85rem] uppercase tracking-wider border-b-2 border-black sticky top-0 z-10 bg-white';
 
-const EMPTY: BackgroundJobsResponse = { jobs: [], budget: { running: 0, total: 0 } };
-
-function stateBadge(state: string) {
-  const style = state === 'running' ? 'bg-ok text-white' : 'bg-warning text-white';
-  return (
-    <span
-      className={`inline-flex items-center px-2 py-1 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black shadow-brutal-xs ${style}`}
-    >
-      {state}
-    </span>
-  );
-}
+const EMPTY: BackgroundJobsResponse = { jobs: [] };
 
 function kindBadge(kind: string) {
   const isCommand = kind === 'command';
@@ -38,33 +27,6 @@ function kindBadge(kind: string) {
       )}
       {kind}
     </span>
-  );
-}
-
-function BudgetGauge({ running, total }: { running: number; total: number }) {
-  // total === 0 shouldn't happen (config validates >= 1) but guard the bar math.
-  const slots = Math.max(total, running, 1);
-  return (
-    <div className="bg-white border-[3px] border-black rounded-md shadow-brutal px-5 py-4 mb-4">
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-[0.8rem] font-bold uppercase tracking-wider text-ink-soft">
-          Background subagent budget
-        </span>
-        <span className="font-mono text-[0.95rem] font-bold">
-          {running} / {total} running
-        </span>
-      </div>
-      <div className="flex gap-1">
-        {Array.from({ length: slots }).map((_, i) => (
-          <div
-            key={i}
-            className={`h-4 flex-1 border-2 border-black rounded-sm ${
-              i < running ? 'bg-brand' : 'bg-gray-100'
-            }`}
-          />
-        ))}
-      </div>
-    </div>
   );
 }
 
@@ -126,7 +88,6 @@ export function JobsPage() {
   }, [isMock]);
 
   const jobs: BackgroundJob[] = data.jobs;
-  const queued = jobs.filter((j) => j.state === 'queued').length;
 
   return (
     <div className="p-5 h-full flex flex-col overflow-hidden">
@@ -141,8 +102,6 @@ export function JobsPage() {
         </Button>
       </div>
 
-      <BudgetGauge running={data.budget.running} total={data.budget.total} />
-
       {error && (
         <div className="mb-4 bg-white border-[3px] border-err text-err rounded-md shadow-brutal-sm px-4 py-3 font-mono text-sm">
           {error}
@@ -154,7 +113,6 @@ export function JobsPage() {
           <table className="w-full border-separate border-spacing-0">
             <thead>
               <tr>
-                <th className={`${thCell} w-[160px]`}>State</th>
                 <th className={`${thCell} w-[180px]`}>Kind</th>
                 <th className={thCell}>Summary</th>
                 <th className={`${thCell} w-[220px]`}>Session</th>
@@ -164,7 +122,7 @@ export function JobsPage() {
             <tbody>
               {jobs.length === 0 && !loading && (
                 <tr>
-                  <td colSpan={5} className="px-6 py-10 text-center text-ink-soft text-[0.9rem]">
+                  <td colSpan={4} className="px-6 py-10 text-center text-ink-soft text-[0.9rem]">
                     No background jobs in flight.
                   </td>
                 </tr>
@@ -173,7 +131,6 @@ export function JobsPage() {
                 const cell = 'px-6 py-4 align-middle border-b border-black';
                 return (
                   <tr key={job.handle} className="hover:bg-gray-50">
-                    <td className={cell}>{stateBadge(job.state)}</td>
                     <td className={cell}>{kindBadge(job.kind)}</td>
                     <td className={cell}>
                       <span className="text-[0.9rem] line-clamp-1">{job.summary}</span>
@@ -200,7 +157,7 @@ export function JobsPage() {
                 <RiLoader4Line className="animate-spin" /> Loading…
               </span>
             ) : (
-              `${jobs.length} in flight · ${queued} queued`
+              `${jobs.length} in flight`
             )}
           </span>
         </div>

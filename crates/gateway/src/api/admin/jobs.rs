@@ -7,9 +7,7 @@ use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::api::dto::{
-    BackgroundBudget, BackgroundJob, BackgroundJobsResponse, ErrorBody, Job, ListResponse,
-};
+use crate::api::dto::{BackgroundJob, BackgroundJobsResponse, ErrorBody, Job, ListResponse};
 use crate::server::AdminState;
 use crate::{GatewayError, Result};
 
@@ -128,20 +126,13 @@ async fn list_background_jobs(State(state): State<AdminState>) -> Json<Backgroun
         .list_all_in_flight_background()
         .into_iter()
         .map(|(parent, info)| BackgroundJob {
-            state: info.state_str().to_string(),
             handle: info.handle,
             session_id: parent.as_ref().to_string(),
             kind: info.subagent_type,
             summary: info.task_summary,
         })
         .collect();
-    Json(BackgroundJobsResponse {
-        jobs,
-        budget: BackgroundBudget {
-            running: state.job_budget.running(),
-            total: state.job_budget.total(),
-        },
-    })
+    Json(BackgroundJobsResponse { jobs })
 }
 
 #[utoipa::path(
