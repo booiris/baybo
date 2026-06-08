@@ -27,7 +27,7 @@ const MAX_PENDING_BACKGROUND_RESULTS: usize = 64;
 /// How long after sealing a subagent group the barrier waits for all
 /// members before firing partial + dissolving the cohort (still-running
 /// members then deliver individually). Generous — group members are real
-/// background subagents. See `docs/todo/background-jobs.md`.
+/// background subagents.
 const GROUP_TIMEOUT_MINUTES: i64 = 30;
 
 /// Exponential-backoff retry schedule for a FAILED `SubagentNotification`

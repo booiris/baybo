@@ -39,7 +39,7 @@ const SUBAGENT_OUTPUT_BUFFER: usize = 64;
 
 /// How long a foreground subagent from a user-facing session blocks the
 /// parent before its `on_timeout` policy kicks in (convert to background,
-/// or kill). Fixed — see `docs/todo/background-jobs.md`.
+/// or kill). Fixed, no per-call knob.
 const SUBAGENT_FOREGROUND_WAIT: Duration = Duration::from_secs(120);
 
 /// Whether a parent session can host a background job — delegates to the

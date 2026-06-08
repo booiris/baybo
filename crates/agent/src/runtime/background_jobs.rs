@@ -8,7 +8,6 @@
 //! idle reaper while the command runs, and `/stop` suppression — `/stop`
 //! cancels the registered token and drains the entry, so the escort kills
 //! the child and skips delivery (a user-stopped result must not surface).
-//! See `docs/todo/background-jobs.md`.
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};

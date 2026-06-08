@@ -94,8 +94,7 @@ pub struct SubagentSpawnRequest {
     pub background: bool,
     /// Policy when a *foreground* spawn exceeds its foreground wait: a
     /// user-facing session converts to background (default) or kills.
-    /// Ignored for `background: true` and for non-user parents. See
-    /// `docs/todo/background-jobs.md`.
+    /// Ignored for `background: true` and for non-user parents.
     #[serde(default)]
     pub on_timeout: OnTimeout,
     /// Root session id used by the dispatcher's fan-out limiter.
@@ -121,7 +120,6 @@ pub struct SubagentSpawnRequest {
     /// its result is held until every member of the group reaches a
     /// terminal state, then the whole group delivers in one merged
     /// notification. Tagged onto the escorted `PendingBackgroundResult`.
-    /// See `docs/todo/background-jobs.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
 }

@@ -211,7 +211,7 @@ impl Session {
     /// delivers a background result, so cron sessions (one-shot +
     /// unregistered) and subagent sessions (their turn ends with the
     /// child) are out of scope and keep blocking / kill-on-timeout
-    /// behaviour. See `docs/todo/background-jobs.md`.
+    /// behaviour.
     pub fn supports_background_jobs(&self) -> bool {
         matches!(self.trigger, TriggerSource::User)
             && match &self.lineage {
@@ -257,7 +257,7 @@ pub struct SessionState {
     /// keyed by group name. A member's result is held in its group until
     /// the group is complete (sealed + every member terminal) or its
     /// timeout dissolves it, then released into `pending_background_results`
-    /// for one merged notification. See `docs/todo/background-jobs.md`.
+    /// for one merged notification.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub background_groups: std::collections::HashMap<String, GroupState>,
 
