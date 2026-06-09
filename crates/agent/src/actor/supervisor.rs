@@ -19,13 +19,16 @@ pub struct ActorHandle {
     pub sender: MailboxSender<AgentMessage>,
 }
 
-/// Per-parent record of one in-flight background subagent — enough for
-/// `/stop` to enumerate it (cancel it, report what it was doing) and for the
-/// idle reaper to know the parent has outstanding work, without a job-store
-/// lineage walk. Keyed by the child session id in the registry.
+/// Per-parent record of one in-flight background job — a background subagent
+/// or a detached `Bash` command — enough for `/stop` to enumerate it (cancel
+/// it, report what it was doing) and for the idle reaper to know the parent has
+/// outstanding work, without a job-store lineage walk. Keyed by the child
+/// session id (subagents) or the `bg-…` handle (commands) in the registry.
 #[derive(Clone)]
-pub struct InFlightSubagent {
-    pub subagent_type: String,
+pub struct InFlightJob {
+    /// What's running: a subagent's profile name, or `"command"` for a
+    /// detached `Bash` command.
+    pub kind: String,
     pub task_summary: String,
     /// The user-facing handle the dispatch/conversion notice advertised
     /// (`bg-…`). The registry is keyed by `child_session_id` (subagents) or
@@ -51,7 +54,7 @@ pub struct InFlightSubagent {
 ///
 /// `in_flight_background_subagents` tracks background subagents still
 /// running per parent session — `parent_session → (child_session →
-/// [`InFlightSubagent`])`. The idle reaper consults it before shutting an
+/// [`InFlightJob`])`. The idle reaper consults it before shutting an
 /// actor down: a parent with outstanding background work is protected so
 /// its mailbox stays alive to receive the eventual
 /// `AgentMessage::BackgroundJobFinished` when each child terminates. `/stop`
@@ -62,7 +65,7 @@ pub struct InFlightSubagent {
 pub struct AgentSupervisor {
     actors: Arc<DashMap<SessionId, ActorHandle>>,
     response_tx: mpsc::Sender<AgentOutput>,
-    in_flight_background_subagents: Arc<DashMap<SessionId, HashMap<SessionId, InFlightSubagent>>>,
+    in_flight_background_subagents: Arc<DashMap<SessionId, HashMap<SessionId, InFlightJob>>>,
 }
 
 impl AgentSupervisor {
@@ -83,7 +86,7 @@ impl AgentSupervisor {
         &self,
         parent_session_id: &SessionId,
         child_session_id: &SessionId,
-        subagent_type: &str,
+        kind: &str,
         task_summary: &str,
         handle: &str,
         cancel_token: CancellationToken,
@@ -93,8 +96,8 @@ impl AgentSupervisor {
             .or_default()
             .insert(
                 child_session_id.clone(),
-                InFlightSubagent {
-                    subagent_type: subagent_type.to_string(),
+                InFlightJob {
+                    kind: kind.to_string(),
                     task_summary: task_summary.to_string(),
                     handle: handle.to_string(),
                     cancel_token,
@@ -157,7 +160,7 @@ impl AgentSupervisor {
     pub fn take_in_flight_background_subagents(
         &self,
         parent_session_id: &SessionId,
-    ) -> Vec<(SessionId, InFlightSubagent)> {
+    ) -> Vec<(SessionId, InFlightJob)> {
         self.in_flight_background_subagents
             .remove(parent_session_id)
             .map(|(_, children)| children.into_iter().collect())
@@ -172,7 +175,7 @@ impl AgentSupervisor {
     pub fn list_in_flight_background(
         &self,
         parent_session_id: &SessionId,
-    ) -> Vec<(SessionId, InFlightSubagent)> {
+    ) -> Vec<(SessionId, InFlightJob)> {
         self.in_flight_background_subagents
             .get(parent_session_id)
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -180,10 +183,10 @@ impl AgentSupervisor {
     }
 
     /// Every in-flight background job across all parents, as
-    /// `(parent_session_id, InFlightSubagent)` — backs the cross-session
+    /// `(parent_session_id, InFlightJob)` — backs the cross-session
     /// `/v1/background-jobs` dashboard. Snapshots into a `Vec` so no shard
     /// lock is held past the call.
-    pub fn list_all_in_flight_background(&self) -> Vec<(SessionId, InFlightSubagent)> {
+    pub fn list_all_in_flight_background(&self) -> Vec<(SessionId, InFlightJob)> {
         self.in_flight_background_subagents
             .iter()
             .flat_map(|parent| {
@@ -199,7 +202,7 @@ impl AgentSupervisor {
 
     /// Cancel and drop ONE in-flight background job by its user-facing
     /// `handle` (`bg-…`) — backs the `JobStop` tool. Scans the parent's
-    /// entries by `InFlightSubagent::handle` (the registry key differs for
+    /// entries by `InFlightJob::handle` (the registry key differs for
     /// subagents), cancels the token (the escort kills the child), and removes
     /// the entry, which doubles as the suppress signal (the escort finds its
     /// entry gone and drops delivery). Returns the dropped info, or `None` if
@@ -208,7 +211,7 @@ impl AgentSupervisor {
         &self,
         parent_session_id: &SessionId,
         handle: &str,
-    ) -> Option<InFlightSubagent> {
+    ) -> Option<InFlightJob> {
         use dashmap::mapref::entry::Entry;
         let mut removed = None;
         if let Entry::Occupied(mut entry) = self

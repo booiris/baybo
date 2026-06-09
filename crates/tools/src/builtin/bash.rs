@@ -48,7 +48,7 @@ use serde_json::{Value, json};
 use super::paths::require_absolute;
 use std::sync::Arc;
 
-use aura_model::BACKGROUND_SUBAGENT_HANDLE_PREFIX;
+use aura_model::new_background_handle;
 
 use crate::{
     ApprovalDecision, BackgroundJobSink, DetachedCommand, ResourceAccess, RunningChild, SpawnOpts,
@@ -730,11 +730,7 @@ async fn run_detached(
 
     // One id shared by the output files, the handle returned to the LLM, and
     // the eventual completion notification.
-    let handle_id = format!(
-        "{}{}",
-        BACKGROUND_SUBAGENT_HANDLE_PREFIX,
-        uuid::Uuid::new_v4()
-    );
+    let handle_id = new_background_handle();
     let bg_dir = background_output_dir(&ctx.workspace_paths);
     let _ = tokio::fs::create_dir_all(&bg_dir).await;
     let stdout_path = bg_dir.join(format!("{handle_id}.out"));

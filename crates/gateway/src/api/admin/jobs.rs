@@ -127,7 +127,7 @@ async fn list_background_jobs(State(state): State<AdminState>) -> Json<Backgroun
         .map(|(parent, info)| BackgroundJob {
             handle: info.handle,
             session_id: parent.as_ref().to_string(),
-            kind: info.subagent_type,
+            kind: info.kind,
             summary: info.task_summary,
         })
         .collect();

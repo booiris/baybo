@@ -6,11 +6,10 @@ use aura_cost::CostManager;
 use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
 use aura_llm::TokenUsage;
 use aura_model::{
-    BACKGROUND_DISPATCH_ACK_PREFIX, BACKGROUND_SUBAGENT_HANDLE_PREFIX, ChannelType, ChatMessage,
-    ContentBlock, ExternalAgentKind, JobId, Lineage, LineageKind, MessageMetadata, OnTimeout,
-    PendingBackgroundResult, SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend,
-    SubagentExitStatus, SubagentParentContext, SubagentResult, SubagentSpawnRequest, TriggerKind,
-    User,
+    BACKGROUND_DISPATCH_ACK_PREFIX, ChannelType, ChatMessage, ContentBlock, ExternalAgentKind,
+    JobId, Lineage, LineageKind, MessageMetadata, OnTimeout, PendingBackgroundResult,
+    SUBAGENT_CHANNEL_TAG, Session, SessionId, SpanId, SubagentBackend, SubagentExitStatus,
+    SubagentParentContext, SubagentResult, SubagentSpawnRequest, TriggerKind, User,
 };
 use aura_session::SessionManager;
 use aura_workspace::WorkspacePaths;
@@ -613,11 +612,7 @@ impl ActorSubagentSpawner {
         cancel_token: CancellationToken,
         result_tx: oneshot::Sender<SubagentResult>,
     ) -> String {
-        let handle_id = format!(
-            "{}{}",
-            BACKGROUND_SUBAGENT_HANDLE_PREFIX,
-            uuid::Uuid::new_v4()
-        );
+        let handle_id = aura_model::new_background_handle();
         let ack_text = format!(
             "{BACKGROUND_DISPATCH_ACK_PREFIX}\n- handle: {handle_id}\n- subagent_type: {subagent_type}\n- child_session: {child_session_id}\n\nThe runtime will surface the subagent's final message as a system reminder prepended to your next user turn."
         );
@@ -932,11 +927,7 @@ async fn convert_foreground_to_background(
     child_token: CancellationToken,
     result_tx: oneshot::Sender<SubagentResult>,
 ) -> String {
-    let handle_id = format!(
-        "{}{}",
-        BACKGROUND_SUBAGENT_HANDLE_PREFIX,
-        uuid::Uuid::new_v4()
-    );
+    let handle_id = aura_model::new_background_handle();
     let ack_text = format!(
         "[foreground subagent exceeded its {}s foreground wait — converted to background]\n- handle: {handle_id}\n- subagent_type: {subagent_type}\n- child_session: {child_session_id}\n\nIt keeps running; the runtime will surface its final message as a system reminder on a later turn.",
         SUBAGENT_FOREGROUND_WAIT.as_secs()

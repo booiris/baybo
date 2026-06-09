@@ -31,6 +31,17 @@ pub const SUBAGENT_CHANNEL_TAG: &str = "subagent";
 /// in-flight handles.
 pub const BACKGROUND_SUBAGENT_HANDLE_PREFIX: &str = "bg-";
 
+/// Mint a fresh background-job handle (`bg-…`) — the single id shared by a
+/// detached command's (or background subagent's) output, its dispatch ack, and
+/// its completion notification. One source of truth for the handle shape so the
+/// dispatch, conversion, and bash-detach sites can't drift.
+pub fn new_background_handle() -> String {
+    format!(
+        "{BACKGROUND_SUBAGENT_HANDLE_PREFIX}{}",
+        uuid::Uuid::new_v4()
+    )
+}
+
 /// Leading marker of the tool result a *successful* background subagent
 /// dispatch returns (the ack with its `bg-…` handle). The agent loop matches
 /// it to count grouped members: a router-side dispatch failure comes back as

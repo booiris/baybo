@@ -90,7 +90,7 @@ impl BackgroundJobControl for BackgroundJobManager {
             // knows the `bg-…` handle from the dispatch notice.
             .map(|(_, info)| BackgroundJobInfo {
                 handle: info.handle,
-                kind: info.subagent_type,
+                kind: info.kind,
                 summary: info.task_summary,
             })
             .collect()
