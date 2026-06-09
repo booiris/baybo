@@ -186,7 +186,14 @@ fn snapshot_echo_reply_frame() {
     run_chat("snapshot_echo_reply_frame", |s| {
         let reply = format!("{REPLY_PREFIX}hello there");
         say(s, "hello there");
-        wait_render(s, "reply", |c| c.contains(&reply))?;
+        // Require the input box back too, not just the reply: the inline
+        // viewport redraws it a tick after the reply scrolls in, and a capture
+        // in that gap settles on a transient frame missing the bottom panel
+        // (an intermittent CI snapshot mismatch). `run_chat` gates the banner
+        // on the same `input` marker.
+        wait_render(s, "reply + input box", |c| {
+            c.contains(&reply) && c.contains("input")
+        })?;
         let frame = settle(s)?;
         assert_snapshot("chat_echo_reply", &normalize(&frame));
         Ok(())
