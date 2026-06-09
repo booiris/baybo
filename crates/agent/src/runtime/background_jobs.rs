@@ -138,9 +138,11 @@ async fn escort_command(
     // this command, so suppress delivery; the clear happens below.
     if sup.is_background_subagent_in_flight(&parent_id, &registry_id) {
         let tail = read_command_tail(&job.stdout_path, &job.stderr_path).await;
-        let status = if cancel.is_cancelled() {
-            SubagentExitStatus::Cancelled
-        } else if exit_code == 0 {
+        // No `Cancelled` arm: a `/stop` (or `JobStop`) cancels the token AND
+        // drains the in-flight marker, so a cancelled command fails the peek
+        // above and is suppressed — it never reaches this delivery branch.
+        // Here the child ran to a real exit.
+        let status = if exit_code == 0 {
             SubagentExitStatus::Completed
         } else {
             SubagentExitStatus::Failed {

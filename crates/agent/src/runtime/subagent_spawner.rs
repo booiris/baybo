@@ -410,6 +410,7 @@ impl ActorSubagentSpawner {
                 subagent_type,
                 task_summary,
                 child_token: actor_token,
+                parent_cancel: parent_actor_token.clone(),
                 result_tx,
                 fan_out_root,
             },
@@ -581,6 +582,7 @@ impl ActorSubagentSpawner {
                 subagent_type: request.subagent_type.clone(),
                 task_summary: request.task_summary.clone(),
                 child_token,
+                parent_cancel: parent_actor_token.clone(),
                 result_tx,
                 fan_out_root,
             },
@@ -790,6 +792,13 @@ struct ForegroundJob {
     /// external subprocess for the External one. Registered on conversion so
     /// `/stop` reaches the now-background job, and fired directly on `Kill`.
     child_token: CancellationToken,
+    /// The parent turn's cancel scope. A convertible child is anchored to the
+    /// process-wide token (so it survives the dispatching turn once it
+    /// converts), so the parent's `/stop` does NOT cascade to it during the
+    /// foreground window. `run_foreground_job` watches this to cancel a
+    /// still-foreground child when the parent turn is stopped, so a stopped
+    /// turn can't leave a subagent running on to convert and notify.
+    parent_cancel: CancellationToken,
     result_tx: oneshot::Sender<SubagentResult>,
     fan_out_root: Option<SessionId>,
 }
@@ -820,6 +829,7 @@ async fn run_foreground_job(
         subagent_type,
         task_summary,
         child_token,
+        parent_cancel,
         result_tx,
         fan_out_root,
     } = job;
@@ -835,10 +845,27 @@ async fn run_foreground_job(
         return;
     }
 
+    // A convertible child runs on the process-wide token, so the parent's
+    // `/stop` won't cascade to it — watch the parent's cancel scope here so a
+    // stopped turn tears the still-foreground child down instead of letting it
+    // convert and notify later.
+    let stop_token = child_token.clone();
     tokio::select! {
         result = &mut fut => {
             // Finished within the foreground window — normal result.
             let _ = result_tx.send(result);
+            release_reserved_slot(limiter.as_ref(), &fan_out_root);
+        }
+        _ = parent_cancel.cancelled() => {
+            // `/stop` during the foreground window: cancel the child, let it
+            // observe the cancel and drain, then surface a cancelled result.
+            stop_token.cancel();
+            let _ = fut.await;
+            let _ = result_tx.send(SubagentResult {
+                child_session_id,
+                final_content: None,
+                status: SubagentExitStatus::Cancelled,
+            });
             release_reserved_slot(limiter.as_ref(), &fan_out_root);
         }
         _ = tokio::time::sleep(SUBAGENT_FOREGROUND_WAIT) => match on_timeout {
@@ -1618,6 +1645,8 @@ mod foreground_job_tests {
             subagent_type: "general-purpose".into(),
             task_summary: "t".into(),
             child_token,
+            // Never-cancelled by default; the parent-stop test overrides it.
+            parent_cancel: CancellationToken::new(),
             result_tx,
             fan_out_root: None,
         }
@@ -1718,5 +1747,36 @@ mod foreground_job_tests {
         gate.notify_one();
         let result = rx.await.expect("result after the run finishes");
         assert_eq!(result.result_text(), "nested done");
+    }
+
+    // `/stop` during the foreground window must cancel a convertible child even
+    // though that child is anchored to the process-wide token (not the parent's
+    // per-call scope), so a stopped turn can't leave it running on to convert
+    // and notify. Without the parent-stop watch this would convert at the 2-min
+    // mark and surface a Completed conversion ack instead.
+    #[tokio::test(start_paused = true)]
+    async fn parent_stop_during_window_cancels_the_child() {
+        let (tx, rx) = oneshot::channel();
+        let child_token = CancellationToken::new();
+        let observe = child_token.clone();
+        let check = child_token.clone();
+        let mut j = job(true, OnTimeout::Background, child_token, tx);
+        let parent_cancel = CancellationToken::new();
+        j.parent_cancel = parent_cancel.clone();
+        // The terminal resolves only once the child is cancelled — a real
+        // convertible child is not reached by the parent's own cancel scope.
+        spawn_job(j, async move {
+            observe.cancelled().await;
+            SubagentResult {
+                child_session_id: SessionId::from("child"),
+                final_content: None,
+                status: SubagentExitStatus::Cancelled,
+            }
+        });
+        // Stop the parent turn before the foreground wait elapses.
+        parent_cancel.cancel();
+        let result = rx.await.expect("result");
+        assert!(matches!(result.status, SubagentExitStatus::Cancelled));
+        assert!(check.is_cancelled(), "the parent stop cancelled the child");
     }
 }

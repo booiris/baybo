@@ -364,10 +364,10 @@ impl SandboxRunner for DockerRunner {
             StdinSource::Bytes(_) => Stdio::piped(),
         });
         // The cleanup guard removes the container on drop (process shutdown
-        // without an explicit kill); `DockerDetachedChild` disarms it on a
-        // clean exit (`--rm` already removed it) or on `start_kill` (which
-        // removes the container itself — a SIGKILL of the `docker run` client
-        // would otherwise orphan it).
+        // without an explicit `wait`). `DockerDetachedChild::wait` disarms it
+        // once the container is gone — removed by `--rm` on a clean exit, or by
+        // an explicit awaited `docker rm -f` when `start_kill` SIGKILLed the
+        // client (which would otherwise orphan the daemon-side container).
         let cleanup = ContainerCleanupGuard::new(self.binary.clone(), container_name.clone());
         let mut child = cmd.spawn()?;
         if let StdinSource::Bytes(bytes) = &spec.stdin
@@ -383,6 +383,7 @@ impl SandboxRunner for DockerRunner {
             binary: self.binary.clone(),
             container_name,
             cleanup,
+            kill_requested: false,
         }))
     }
 
@@ -405,6 +406,9 @@ struct DockerDetachedChild {
     binary: PathBuf,
     container_name: String,
     cleanup: ContainerCleanupGuard,
+    /// Set by `start_kill`: the `docker run` client was SIGKILLed, which
+    /// orphans the daemon-side container, so `wait` must `docker rm -f` it.
+    kill_requested: bool,
 }
 
 #[async_trait]
@@ -429,24 +433,29 @@ impl crate::DetachedChild for DockerDetachedChild {
             .ok()
             .and_then(|s| s.code())
             .unwrap_or(-1);
-        // Clean exit: `--rm` removed the container; no drop-time `rm` needed.
-        self.cleanup.disarm();
-        code
-    }
-    fn start_kill(&mut self) {
-        // Remove the container (the client SIGKILL won't stop it), then kill
-        // the client. Disarm the drop guard so we don't double-`rm`.
-        let binary = self.binary.clone();
-        let name = self.container_name.clone();
-        tokio::spawn(async move {
-            let _ = Command::new(binary)
-                .args(["rm", "-f", &name])
+        if self.kill_requested {
+            // The `start_kill` SIGKILL stops only the local client; the
+            // daemon-side container outlives it. Remove it explicitly and
+            // AWAIT the `rm` so a caller that proceeds straight to shutdown
+            // can't race a detached cleanup into an orphaned container.
+            let _ = Command::new(&self.binary)
+                .args(["rm", "-f", &self.container_name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
                 .await;
-        });
+        }
+        // Removed just above (on kill) or by `--rm` (clean exit) — no
+        // drop-time `rm` needed.
         self.cleanup.disarm();
+        code
+    }
+    fn start_kill(&mut self) {
+        // SIGKILL the local `docker run` client and flag the container for
+        // removal in `wait` (awaited, race-free). The drop guard stays ARMED
+        // until `wait` disarms it, so a child dropped without `wait` still gets
+        // a best-effort cleanup instead of leaking the container.
+        self.kill_requested = true;
         let _ = self.child.start_kill();
     }
 }

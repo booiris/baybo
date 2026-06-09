@@ -225,3 +225,55 @@ async fn network_none_blocks_dns() {
         "DNS must fail under NetworkPolicy::None (stdout was {stdout:?})"
     );
 }
+
+/// The DETACHED path (`spawn_detached` → `DockerDetachedChild`): a
+/// `start_kill` followed by an awaited `wait` must remove the daemon-side
+/// container (a SIGKILL of the `docker run` client alone orphans it), so the
+/// workload's later write never reaches the workspace bind. Covers the
+/// detached kill path the `run()`-based cleanup tests don't reach.
+#[tokio::test]
+async fn detached_start_kill_then_wait_removes_container() {
+    if !docker_reachable() {
+        eprintln!("skipping: docker daemon not reachable");
+        return;
+    }
+    let runner: Arc<dyn SandboxRunner> = Arc::new(DockerRunner::discover().expect("docker runner"));
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let marker = tmp.path().join("post-kill-marker");
+    let marker_in_container = marker.to_string_lossy().to_string();
+
+    let mut child = runner
+        .spawn_detached(SandboxSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".into(),
+                format!("sleep 4 && touch {marker_in_container}"),
+            ],
+            cwd: None,
+            workspace_root: tmp.path().to_path_buf(),
+            readable_paths: vec![],
+            writable_paths: vec![],
+            allowed_hosts: BTreeSet::new(),
+            network_policy: NetworkPolicy::None,
+            env: EnvPolicy::Baseline,
+            stdin: StdinSource::Null,
+            timeout: Duration::from_secs(60), // ignored by the detached path
+            resource_limits: ResourceLimits::default(),
+            filesystem_policy: aura_sandbox::FilesystemPolicy::default(),
+        })
+        .await
+        .expect("spawn_detached");
+
+    // Let the container start, then kill it well before the `touch` fires.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    child.start_kill();
+    let _ = child.wait().await;
+
+    // Past when the workload's `sleep 4` would have completed: a surviving
+    // container would have written the marker into the workspace bind.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(
+        !marker.exists(),
+        "container survived detached start_kill+wait: marker `{marker_in_container}` was written",
+    );
+}
