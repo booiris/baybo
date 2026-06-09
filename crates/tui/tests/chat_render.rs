@@ -36,6 +36,15 @@ use std::time::Duration;
 
 use aura_term_harness::{HarnessError, Key, LaunchSpec, TmuxSession, tmux_available};
 use aura_tui::smoke_contract::*;
+use parking_lot::Mutex;
+
+/// Serializes the scenarios below. Each spins a full TUI + WS probe in a tmux
+/// pane; libtest runs the 10 test fns on its thread pool, and 10 heavy probes
+/// at once starved each other's renders enough to blow the 15s capture timeout
+/// (a flaky CI failure). They're I/O/timing-bound, so running them one at a
+/// time costs little wall-clock and makes each render deterministic. `parking_lot`
+/// doesn't poison, so a panicking (failing) scenario still frees it for the next.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Cargo builds the `chat_smoke` bin (its `test-support` required-feature
 /// is on during `cargo test`) and hands us its path — no nested cargo
@@ -63,6 +72,9 @@ where
         eprintln!("skipping chat_render::{name}: tmux not on PATH");
         return;
     }
+    // Held for the whole scenario (all retry attempts) so probes run one at a
+    // time — see `SERIAL`.
+    let _serial = SERIAL.lock();
     let mut last = String::new();
     for attempt in 1..=ATTEMPTS {
         let session =

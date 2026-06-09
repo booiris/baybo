@@ -12,9 +12,11 @@
 //! [`tmux_available`]) so a CI runner without tmux stays green, the same
 //! way the workspace's docker/bwrap-backed tests self-skip.
 //!
-//! The harness never touches global/server tmux options — every option it
-//! sets is scoped to the session it created, so it is safe to run inside
-//! the developer's own tmux server.
+//! Each session runs on its own dedicated tmux server (a private `-L`
+//! socket), so concurrent tests can't contend on a single server's command
+//! queue — that contention surfaced as `capture-pane` polls timing out
+//! under `cargo test`'s parallelism. The developer's own tmux server is
+//! never touched.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -28,8 +30,9 @@ use thiserror::Error;
 /// a settled screen, long enough not to spin the tmux server.
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
 
-/// Counter feeding unique session names so concurrently-running tests
-/// (cargo runs test fns on multiple threads) never collide on a name.
+/// Counter feeding each session's unique id — used as BOTH its private tmux
+/// socket name (`-L`) and its session name — so concurrently-running tests
+/// (cargo runs test fns on multiple threads) never collide or share a server.
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
@@ -162,9 +165,12 @@ impl LaunchSpec {
     }
 }
 
-/// A live detached tmux session running one child. Dropping it kills the
-/// session, so a panicking test never leaks a pane.
+/// A live detached tmux session running one child on its own private tmux
+/// server (a dedicated `-L` socket named after the session). Dropping it kills
+/// that server, so a panicking test never leaks a pane or socket.
 pub struct TmuxSession {
+    /// Unique id used as BOTH the private tmux socket (`-L`) and the session
+    /// name (`-s`).
     name: String,
 }
 
@@ -199,7 +205,7 @@ impl TmuxSession {
         args.push(spec.program.to_string_lossy().into_owned());
         args.extend(spec.args.iter().cloned());
 
-        run_tmux(&args)?;
+        run_tmux(&name, &args)?;
         let session = Self { name };
 
         // Window-scoped, never global: keep the last frame after the
@@ -214,7 +220,10 @@ impl TmuxSession {
         for key in keys {
             match key.token() {
                 Some(token) => {
-                    run_tmux(&["send-keys".into(), "-t".into(), self.name.clone(), token])?;
+                    run_tmux(
+                        &self.name,
+                        &["send-keys".into(), "-t".into(), self.name.clone(), token],
+                    )?;
                 }
                 None => {
                     if let Key::Char(c) = key {
@@ -233,16 +242,19 @@ impl TmuxSession {
 
     /// Type a literal string into the pane (no key-name interpretation).
     pub fn send_text(&self, text: &str) -> Result<()> {
-        run_tmux(&[
-            "send-keys".into(),
-            "-t".into(),
-            self.name.clone(),
-            "-l".into(),
-            // `--` stops option parsing so text starting with `-` is
-            // still treated as literal keys.
-            "--".into(),
-            text.into(),
-        ])
+        run_tmux(
+            &self.name,
+            &[
+                "send-keys".into(),
+                "-t".into(),
+                self.name.clone(),
+                "-l".into(),
+                // `--` stops option parsing so text starting with `-` is
+                // still treated as literal keys.
+                "--".into(),
+                text.into(),
+            ],
+        )
         .map(|_| ())
     }
 
@@ -250,15 +262,18 @@ impl TmuxSession {
     /// `resize-window` flips the session to manual sizing, so the new
     /// dimensions stick for subsequent captures.
     pub fn resize(&self, width: u16, height: u16) -> Result<()> {
-        run_tmux(&[
-            "resize-window".into(),
-            "-t".into(),
-            self.name.clone(),
-            "-x".into(),
-            width.to_string(),
-            "-y".into(),
-            height.to_string(),
-        ])
+        run_tmux(
+            &self.name,
+            &[
+                "resize-window".into(),
+                "-t".into(),
+                self.name.clone(),
+                "-x".into(),
+                width.to_string(),
+                "-y".into(),
+                height.to_string(),
+            ],
+        )
         .map(|_| ())
     }
 
@@ -266,39 +281,48 @@ impl TmuxSession {
     /// tmux). For a child in the alternate screen this is the alt-screen
     /// content; otherwise it is the main screen.
     pub fn capture(&self) -> Result<String> {
-        run_tmux(&[
-            "capture-pane".into(),
-            "-p".into(),
-            "-t".into(),
-            self.name.clone(),
-        ])
+        run_tmux(
+            &self.name,
+            &[
+                "capture-pane".into(),
+                "-p".into(),
+                "-t".into(),
+                self.name.clone(),
+            ],
+        )
     }
 
     /// Capture the visible pane plus `extra` lines of scrollback above it.
     /// Reveals frames that scrolled off the top (stacking / garble that a
     /// single visible capture would miss).
     pub fn capture_with_scrollback(&self, extra: u32) -> Result<String> {
-        run_tmux(&[
-            "capture-pane".into(),
-            "-p".into(),
-            "-t".into(),
-            self.name.clone(),
-            "-S".into(),
-            format!("-{extra}"),
-        ])
+        run_tmux(
+            &self.name,
+            &[
+                "capture-pane".into(),
+                "-p".into(),
+                "-t".into(),
+                self.name.clone(),
+                "-S".into(),
+                format!("-{extra}"),
+            ],
+        )
     }
 
     /// `true` once the child process has exited (the pane is in its
     /// `remain-on-exit` dead state).
     pub fn is_dead(&self) -> bool {
-        run_tmux(&[
-            "display-message".into(),
-            "-p".into(),
-            "-t".into(),
-            self.name.clone(),
-            "-F".into(),
-            "#{pane_dead}".into(),
-        ])
+        run_tmux(
+            &self.name,
+            &[
+                "display-message".into(),
+                "-p".into(),
+                "-t".into(),
+                self.name.clone(),
+                "-F".into(),
+                "#{pane_dead}".into(),
+            ],
+        )
         .map(|s| s.trim() == "1")
         .unwrap_or(true)
     }
@@ -394,28 +418,37 @@ impl TmuxSession {
     }
 
     fn set_window_option(&self, option: &str, value: &str) -> Result<()> {
-        run_tmux(&[
-            "set-option".into(),
-            "-w".into(),
-            "-t".into(),
-            self.name.clone(),
-            option.into(),
-            value.into(),
-        ])
+        run_tmux(
+            &self.name,
+            &[
+                "set-option".into(),
+                "-w".into(),
+                "-t".into(),
+                self.name.clone(),
+                option.into(),
+                value.into(),
+            ],
+        )
         .map(|_| ())
     }
 }
 
 impl Drop for TmuxSession {
     fn drop(&mut self) {
+        // One session per private server, so kill the whole server — that also
+        // removes its `-L` socket file instead of leaking it.
         let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &self.name])
+            .args(["-L", &self.name, "kill-server"])
             .output();
     }
 }
 
-fn run_tmux(args: &[String]) -> Result<String> {
+fn run_tmux(socket: &str, args: &[String]) -> Result<String> {
+    // Every command targets this session's private server (`-L <socket>`), so
+    // parallel tests never share one server's command queue.
     let output = Command::new("tmux")
+        .arg("-L")
+        .arg(socket)
         .args(args)
         .output()
         .map_err(HarnessError::Spawn)?;
