@@ -488,7 +488,11 @@ impl Tool for BashTool {
         // has no secret handle to exact-redact with (the blocking path below
         // does). Falling through keeps such a command on kill-on-timeout with
         // redaction rather than leaking an echoed secret to disk / the turn.
-        let convert_on_timeout = !matches!(p.on_timeout.as_deref().map(str::trim), Some("kill"));
+        let convert_on_timeout = !p
+            .on_timeout
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| s.eq_ignore_ascii_case("kill"));
         if convert_on_timeout
             && extra_env.is_empty()
             && let Some(sink) = ctx.background_jobs.clone()

@@ -109,14 +109,13 @@ async fn list_jobs(
 }
 
 /// Cross-session view of in-flight background jobs (detached subagents +
-/// `Bash` commands) plus the concurrency budget — the dashboard twin of the
-/// per-session `JobList` tool.
+/// `Bash` commands) — the dashboard twin of the per-session `JobList` tool.
 #[utoipa::path(
     get,
     path = "/background-jobs",
     tag = "jobs",
     responses(
-        (status = 200, description = "In-flight background jobs + budget", body = BackgroundJobsResponse),
+        (status = 200, description = "In-flight background jobs", body = BackgroundJobsResponse),
         (status = 401, description = "Unauthorized", body = ErrorBody),
     )
 )]

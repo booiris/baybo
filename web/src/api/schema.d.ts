@@ -29,8 +29,7 @@ export interface paths {
         };
         /**
          * Cross-session view of in-flight background jobs (detached subagents +
-         *     `Bash` commands) plus the concurrency budget — the dashboard twin of the
-         *     per-session `JobList` tool.
+         *     `Bash` commands) — the dashboard twin of the per-session `JobList` tool.
          */
         get: operations["list_background_jobs"];
         put?: never;
@@ -1313,7 +1312,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description In-flight background jobs + budget */
+            /** @description In-flight background jobs */
             200: {
                 headers: {
                     [name: string]: unknown;

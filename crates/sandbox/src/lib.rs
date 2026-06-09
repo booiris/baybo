@@ -35,8 +35,8 @@ pub trait SandboxRunner: Send + Sync {
     /// "Bash timeout → background" path. `spec.timeout` is ignored (the
     /// caller times out). Default: unsupported; the agent's `SandboxAdapter`
     /// surfaces the error and the tool falls back to the blocking `run`
-    /// (kill-on-timeout). bwrap and Docker override this; sandbox-exec does
-    /// not (its per-call scratch tempdir can't outlive a detached child).
+    /// (kill-on-timeout). bwrap, Docker, and sandbox-exec all override this
+    /// (the sandbox-exec child holds its per-call scratch tempdir alive).
     async fn spawn_detached(
         &self,
         _spec: SandboxSpec,
