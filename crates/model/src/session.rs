@@ -211,7 +211,7 @@ impl Session {
     /// delivers a background result, so cron sessions (one-shot +
     /// unregistered) and subagent sessions (their turn ends with the
     /// child) are out of scope and keep blocking / kill-on-timeout
-    /// behaviour. See `docs/todo/background-jobs.md`.
+    /// behaviour.
     pub fn supports_background_jobs(&self) -> bool {
         matches!(self.trigger, TriggerSource::User)
             && match &self.lineage {
@@ -257,7 +257,7 @@ pub struct SessionState {
     /// keyed by group name. A member's result is held in its group until
     /// the group is complete (sealed + every member terminal) or its
     /// timeout dissolves it, then released into `pending_background_results`
-    /// for one merged notification. See `docs/todo/background-jobs.md`.
+    /// for one merged notification.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub background_groups: std::collections::HashMap<String, GroupState>,
 
@@ -330,6 +330,16 @@ impl GroupState {
     pub fn is_partial(&self) -> bool {
         self.results.len() < self.expected
     }
+
+    /// Cohort key for [`SessionState::background_groups`]. The dispatching
+    /// turn's `job_id` namespaces the LLM-chosen group name so that reusing
+    /// the same name in a later turn starts a fresh cohort instead of
+    /// extending the prior (still-draining) one. Both the agent loop (when
+    /// counting a grouped spawn) and the spawner (when stamping the escorted
+    /// member's `group`) derive the key through here, so the two always agree.
+    pub fn cohort_key(job_id: JobId, group: &str) -> String {
+        format!("{job_id}::{group}")
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +380,28 @@ mod tests {
         let complete = group(2, true, 2);
         assert!(complete.is_ready(now, t));
         assert!(!complete.is_partial());
+    }
+
+    #[test]
+    fn cohort_key_namespaces_group_by_job() {
+        let j1 = JobId::new();
+        let j2 = JobId::new();
+        // Deterministic per (job, name): same inputs → same key.
+        assert_eq!(
+            GroupState::cohort_key(j1, "g"),
+            GroupState::cohort_key(j1, "g")
+        );
+        // Reusing a name in a different turn (job) yields a distinct cohort —
+        // the property that stops a later turn from extending a prior cohort.
+        assert_ne!(
+            GroupState::cohort_key(j1, "g"),
+            GroupState::cohort_key(j2, "g")
+        );
+        // Distinct names within one turn stay distinct.
+        assert_ne!(
+            GroupState::cohort_key(j1, "a"),
+            GroupState::cohort_key(j1, "b")
+        );
     }
 
     #[test]

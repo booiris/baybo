@@ -39,7 +39,7 @@ pub use spawn_protocol::{
     BACKGROUND_DISPATCH_ACK_PREFIX, BACKGROUND_SUBAGENT_HANDLE_PREFIX, BackgroundJobKind,
     OnTimeout, PendingBackgroundResult, SPAWN_SUBAGENT_TOOL_NAME, SUBAGENT_CHANNEL_TAG,
     SubagentExitStatus, SubagentParentContext, SubagentResult, SubagentSpawnRequest,
-    SystemSpawnRequest,
+    new_background_handle,
 };
 pub use task::{
     TASK_CREATE_TOOL_NAME, TASK_GET_TOOL_NAME, TASK_LIST_TOOL_NAME, TASK_MUTATING_TOOL_NAMES,

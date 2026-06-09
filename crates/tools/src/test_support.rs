@@ -101,6 +101,7 @@ pub struct RecordingTool {
     name: String,
     invocations: Arc<Mutex<Vec<Value>>>,
     response: Arc<Mutex<ToolOutput>>,
+    last_job_id: Arc<Mutex<Option<aura_model::JobId>>>,
 }
 
 impl RecordingTool {
@@ -109,6 +110,7 @@ impl RecordingTool {
             name: name.into(),
             invocations: Arc::new(Mutex::new(Vec::new())),
             response: Arc::new(Mutex::new(ToolOutput::Text(String::new()))),
+            last_job_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -121,6 +123,13 @@ impl RecordingTool {
     /// All `params` values seen so far, in arrival order.
     pub fn invocations(&self) -> Vec<Value> {
         self.invocations.lock().to_vec()
+    }
+
+    /// The `job_id` of the most recent `execute()` call — lets a test
+    /// reconstruct the per-turn cohort key (`GroupState::cohort_key`) that a
+    /// grouped `spawn_subagent` running in that turn would have produced.
+    pub fn last_job_id(&self) -> Option<aura_model::JobId> {
+        *self.last_job_id.lock()
     }
 
     pub fn manifest(&self) -> ToolManifest {
@@ -145,8 +154,9 @@ impl Tool for RecordingTool {
     fn parameters_schema(&self) -> Value {
         json!({"type": "object", "additionalProperties": true})
     }
-    async fn execute(&self, params: Value, _ctx: &ToolContext) -> crate::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> crate::Result<ToolOutput> {
         self.invocations.lock().push(params);
+        *self.last_job_id.lock() = Some(ctx.job_id);
         Ok(self.response.lock().clone())
     }
 }

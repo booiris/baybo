@@ -8,7 +8,7 @@ use aura_model::{ChannelType, ContentBlock, JobId, MessageMetadata, SessionId};
 use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;
-use crate::actor::supervisor::InFlightSubagent;
+use crate::actor::supervisor::InFlightJob;
 
 use super::Router;
 
@@ -294,7 +294,7 @@ fn is_stop_command(content: &[ContentBlock]) -> bool {
 /// Compose the `/stop` acknowledgement: confirm what was cancelled and list
 /// each background task by its type + summary so the user sees exactly what
 /// was dropped. Idle session → a plain "nothing to stop".
-fn build_stop_notice(cancelled_turn: bool, background: &[(SessionId, InFlightSubagent)]) -> String {
+fn build_stop_notice(cancelled_turn: bool, background: &[(SessionId, InFlightJob)]) -> String {
     if !cancelled_turn && background.is_empty() {
         return "Nothing in progress to stop.".to_string();
     }
@@ -308,10 +308,7 @@ fn build_stop_notice(cancelled_turn: bool, background: &[(SessionId, InFlightSub
             background.len()
         ));
         for (_child, info) in background {
-            lines.push(format!(
-                "  • [{}] {}",
-                info.subagent_type, info.task_summary
-            ));
+            lines.push(format!("  • [{}] {}", info.kind, info.task_summary));
         }
     }
     lines.join("\n")
@@ -359,8 +356,8 @@ mod tests {
         let bg = vec![
             (
                 SessionId::from("c1"),
-                InFlightSubagent {
-                    subagent_type: "explorer".to_string(),
+                InFlightJob {
+                    kind: "explorer".to_string(),
                     task_summary: "find X".to_string(),
                     handle: "bg-c1".to_string(),
                     cancel_token: CancellationToken::new(),
@@ -368,8 +365,8 @@ mod tests {
             ),
             (
                 SessionId::from("c2"),
-                InFlightSubagent {
-                    subagent_type: "planner".to_string(),
+                InFlightJob {
+                    kind: "planner".to_string(),
                     task_summary: "draft Y".to_string(),
                     handle: "bg-c2".to_string(),
                     cancel_token: CancellationToken::new(),

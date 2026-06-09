@@ -35,7 +35,6 @@ use aura_cost::{CostManager, SpendingLimits};
 use aura_job::JobLifecycle;
 use aura_llm::BillableLlm;
 use aura_memory::Memory;
-use aura_model::SystemSpawnRequest;
 use aura_security::{LeakDetectionRule, LeakDetector};
 use aura_skills::SkillRegistry;
 use aura_skills_assessor::SkillAssessor;
@@ -190,13 +189,12 @@ pub struct ManagerGraph {
     /// out a dummy receiver.
     pub cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
 
-    /// Receiving half of the system-spawn channel. The sender is held by
-    /// the `spawn_subagent` tool (cloned at build time); only the router
-    /// needs the receiver, taken on [`wire_router`]. Same `Option` +
-    /// `take`-on-wire pattern as `cron_trigger_rx` — calling
-    /// `wire_router` twice panics rather than silently dropping
-    /// system-spawn requests.
-    pub system_spawn_rx: Option<mpsc::Receiver<SystemSpawnRequest>>,
+    /// Late-set slot for the actor-backed subagent spawner. The
+    /// `spawn_subagent` tool holds a clone (taken at build time, before the
+    /// supervisor exists); [`wire_router`] fills it once the spawner is
+    /// built. An empty slot at tool-call time surfaces as a failed spawn,
+    /// not a panic.
+    pub subagent_spawner_slot: aura_subagent::tool::SubagentSpawnerSlot,
 
     /// Process-wide parent token for `AgentActor`s. Bridged to the
     /// shared `ShutdownSignal` in [`build_managers`]; cancelling it
@@ -461,21 +459,12 @@ pub async fn build_managers(
         cron_trigger_tx,
         Arc::new(shutdown.clone()) as Arc<dyn aura_cron::Shutdown>,
     ));
-    // System-spawn channel: the `spawn_subagent` tool (sender end) ↔
-    // router's `system_trigger_rx` arm (receiver end).
-    //
-    // `SystemSpawnRequest` carries a single variant (`Subagent`), so the
-    // queue depth is bounded by the number of concurrent `spawn_subagent`
-    // dispatches awaiting the router, which the per-root fan-out limiter
-    // already caps. Each
-    // request is small — the bulky `SubagentSpawnRequest` is boxed, so
-    // the inline message is `SessionId` + `JobId` + `SpanId` +
-    // `CancellationToken` + `Box<SubagentSpawnRequest>` +
-    // `oneshot::Sender<SubagentResult>` (a few hundred bytes). 1024 slots
-    // gives a multi-user gateway comfortable headroom, so a `try_send`
-    // failure is a real backpressure alarm rather than routine bursty
-    // drops. Bump further if a deployment regularly trips it.
-    let (system_spawn_tx, system_spawn_rx) = mpsc::channel::<SystemSpawnRequest>(1024);
+    // Late-set slot for the actor-backed subagent spawner. The
+    // `spawn_subagent` tool (built below while the registry is assembled)
+    // gets a clone now and reads it on first use; the runtime fills it in
+    // `wire_router`, once the supervisor + actor spawner exist.
+    let subagent_spawner_slot: aura_subagent::tool::SubagentSpawnerSlot =
+        Arc::new(std::sync::OnceLock::new());
     for (tool, manifest) in aura_cron::tools::agent_tools(Arc::clone(&cron_scheduler)) {
         tool_registry.register(tool, manifest);
     }
@@ -489,19 +478,17 @@ pub async fn build_managers(
     }
 
     // `spawn_subagent` is just another tool from the LLM's perspective.
-    // It ferries the spawn request to the router via the system-spawn
-    // channel (now the channel's sole producer); the router does the
-    // session-create + actor-spawn + wait, and ships the final
-    // `SubagentResult` back through a oneshot the tool blocks on.
-    // The fan-out limiter is constructed here so it can be shared
-    // between the tool (reserves at dispatch) and the router (releases
-    // on terminal) — both will hold the same `Arc<FanOutLimiter>`.
+    // It calls the actor-backed `SubagentSpawner` directly (via the
+    // late-set slot above) to materialise the child; the spawner does the
+    // session-create + actor-spawn + wait. The fan-out limiter is shared
+    // between the tool (reserves at dispatch) and the spawner (releases on
+    // terminal) — both hold the same `Arc<FanOutLimiter>`.
     let subagent_dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter> =
         Arc::new(aura_subagent::FanOutLimiter::new());
     {
         let (tool, manifest) =
             aura_subagent::tool::make(aura_subagent::tool::SpawnSubagentToolConfig {
-                system_spawn_tx: system_spawn_tx.clone(),
+                spawner: Arc::clone(&subagent_spawner_slot),
                 registry: Arc::clone(&subagent_registry),
                 sessions: Arc::clone(&session_manager),
                 dispatch_limiter: Arc::clone(&subagent_dispatch_limiter),
@@ -732,7 +719,7 @@ pub async fn build_managers(
         stores,
         memory,
         cron_trigger_rx: Some(cron_trigger_rx),
-        system_spawn_rx: Some(system_spawn_rx),
+        subagent_spawner_slot,
         actor_parent_token,
         subagent_dispatch_limiter,
     })
@@ -798,9 +785,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     let cost_manager = Arc::clone(&graph.cost_manager);
     let llm_pool = Arc::clone(&graph.llm_pool);
 
-    // Single boxed factory owned by the router: used for top-level
-    // user/cron actors AND `SystemSpawnRequest::Subagent` child
-    // materialisation.
+    // Single `Arc`-shared actor factory: used by the router for top-level
+    // user/cron actors and by the subagent spawner for child actors.
     let spawn_actor_for: aura_agent::router::ActorSpawner = {
         let llm_pool = Arc::clone(&llm_pool);
         let tool_registry = Arc::clone(&graph.tool_registry);
@@ -827,7 +813,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         // below; `None` keeps the no-op path (every memory hook skipped,
         // nothing billed).
         let memory: Option<Arc<dyn Memory>> = graph.memory.clone();
-        Box::new(
+        Arc::new(
             move |session: aura_model::Session,
                   initial_llm: Option<LlmEntryName>,
                   response_tx: mpsc::Sender<AgentOutput>,
@@ -901,18 +887,13 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         )
     };
 
-    // `take` cron + system rxs eagerly — a caller who forgot to plumb
-    // either would silently drop every cron-fired turn / maintenance
-    // trigger. Calling `wire_router` twice panics here loudly rather
-    // than silently handing out a dummy receiver.
+    // `take` the cron rx eagerly — a caller who forgot to plumb it would
+    // silently drop every cron-fired turn. Calling `wire_router` twice
+    // panics here loudly rather than silently handing out a dummy receiver.
     let cron_trigger_rx = graph
         .cron_trigger_rx
         .take()
         .expect("wire_router called twice; cron_trigger_rx already consumed");
-    let system_trigger_rx = graph
-        .system_spawn_rx
-        .take()
-        .expect("wire_router called twice; system_spawn_rx already consumed");
 
     // Idle actor reaper: shuts down registered actors whose sessions
     // have been idle. Hydration on the next user message rebuilds the
@@ -935,10 +916,33 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     // NOT a trust signal — registration would expose the LLM to a
     // host-execution channel that bypasses aura's sandbox + approval
     // gate.
-    let external_agents = aura_agent::external_agent::build_registry(
+    let external_agents = Arc::new(aura_agent::external_agent::build_registry(
         graph.config.external_agents.boot_entries(),
         boot::proxy_settings(&graph.config),
-    );
+    ));
+
+    // Actor-backed subagent spawner: the `spawn_subagent` tool calls it
+    // directly via the slot wired at build time. Built here — after the
+    // supervisor + actor spawner exist — sharing the fan-out limiter with
+    // the tool plus the same actor-spawn closure the router's cron path
+    // uses. A double-set is impossible: the cron `take` above panics first
+    // if `wire_router` runs twice.
+    let _ = graph.subagent_spawner_slot.set(Arc::new(
+        aura_agent::runtime::subagent_spawner::ActorSubagentSpawner::from_config(
+            aura_agent::runtime::subagent_spawner::SubagentSpawnerConfig {
+                session_manager: Arc::clone(&graph.session_manager),
+                supervisor: supervisor.clone(),
+                dispatch_limiter: Arc::clone(&graph.subagent_dispatch_limiter),
+                cost_manager: Arc::clone(&cost_manager),
+                job_lifecycle: Arc::clone(&graph.job_lifecycle),
+                actor_parent_token: graph.actor_parent_token.clone(),
+                external_agents: Arc::clone(&external_agents),
+                llm_pool: Arc::clone(&llm_pool),
+                workspace_paths: Arc::clone(&workspace_paths_for_router),
+                actor_spawner: Arc::clone(&spawn_actor_for),
+            },
+        ),
+    ));
 
     // Hand a clone to the gateway before the router takes ownership, so
     // the chat model-switch endpoint can re-pin live actors.
@@ -951,14 +955,9 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         cost_manager: Arc::clone(&cost_manager),
         actor_spawner: spawn_actor_for,
         job_lifecycle: Arc::clone(&graph.job_lifecycle),
-        llm_pool: Arc::clone(&llm_pool),
-        dispatch_limiter: Arc::clone(&graph.subagent_dispatch_limiter),
         cron_trigger_rx,
-        system_trigger_rx,
         actor_parent_token: graph.actor_parent_token.clone(),
         rate_limit: Arc::clone(&graph.rate_limit),
-        external_agents: Arc::new(external_agents),
-        workspace_paths: workspace_paths_for_router,
     });
 
     RouterRunHandle {

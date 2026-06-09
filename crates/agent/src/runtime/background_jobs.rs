@@ -8,7 +8,6 @@
 //! idle reaper while the command runs, and `/stop` suppression — `/stop`
 //! cancels the registered token and drains the entry, so the escort kills
 //! the child and skips delivery (a user-stopped result must not surface).
-//! See `docs/todo/background-jobs.md`.
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -91,7 +90,7 @@ impl BackgroundJobControl for BackgroundJobManager {
             // knows the `bg-…` handle from the dispatch notice.
             .map(|(_, info)| BackgroundJobInfo {
                 handle: info.handle,
-                kind: info.subagent_type,
+                kind: info.kind,
                 summary: info.task_summary,
             })
             .collect()
@@ -139,9 +138,11 @@ async fn escort_command(
     // this command, so suppress delivery; the clear happens below.
     if sup.is_background_subagent_in_flight(&parent_id, &registry_id) {
         let tail = read_command_tail(&job.stdout_path, &job.stderr_path).await;
-        let status = if cancel.is_cancelled() {
-            SubagentExitStatus::Cancelled
-        } else if exit_code == 0 {
+        // No `Cancelled` arm: a `/stop` (or `JobStop`) cancels the token AND
+        // drains the in-flight marker, so a cancelled command fails the peek
+        // above and is suppressed — it never reaches this delivery branch.
+        // Here the child ran to a real exit.
+        let status = if exit_code == 0 {
             SubagentExitStatus::Completed
         } else {
             SubagentExitStatus::Failed {

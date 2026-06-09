@@ -48,7 +48,7 @@ use serde_json::{Value, json};
 use super::paths::require_absolute;
 use std::sync::Arc;
 
-use aura_model::BACKGROUND_SUBAGENT_HANDLE_PREFIX;
+use aura_model::new_background_handle;
 
 use crate::{
     ApprovalDecision, BackgroundJobSink, DetachedCommand, ResourceAccess, RunningChild, SpawnOpts,
@@ -488,7 +488,11 @@ impl Tool for BashTool {
         // has no secret handle to exact-redact with (the blocking path below
         // does). Falling through keeps such a command on kill-on-timeout with
         // redaction rather than leaking an echoed secret to disk / the turn.
-        let convert_on_timeout = !matches!(p.on_timeout.as_deref().map(str::trim), Some("kill"));
+        let convert_on_timeout = !p
+            .on_timeout
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| s.eq_ignore_ascii_case("kill"));
         if convert_on_timeout
             && extra_env.is_empty()
             && let Some(sink) = ctx.background_jobs.clone()
@@ -726,11 +730,7 @@ async fn run_detached(
 
     // One id shared by the output files, the handle returned to the LLM, and
     // the eventual completion notification.
-    let handle_id = format!(
-        "{}{}",
-        BACKGROUND_SUBAGENT_HANDLE_PREFIX,
-        uuid::Uuid::new_v4()
-    );
+    let handle_id = new_background_handle();
     let bg_dir = background_output_dir(&ctx.workspace_paths);
     let _ = tokio::fs::create_dir_all(&bg_dir).await;
     let stdout_path = bg_dir.join(format!("{handle_id}.out"));

@@ -6,7 +6,7 @@ The `subagent` crate (`aura-subagent`) owns the typed-subagent domain end to end
 
 A `SubagentProfile` declares the `system_prompt` + default model tier for a single `subagent_type` value the parent LLM can emit when calling `spawn_subagent`. The profile's `system_prompt` **fully replaces the parent's Soul** for the spawned child actor — the profile author owns the child's identity, security, and output contracts; base Soul is not threaded through.
 
-The cross-actor spawn protocol types (`SubagentSpawnRequest`, `SubagentResult`, `SubagentBackend`, `SubagentParentContext`, `SystemSpawnRequest`, `SPAWN_SUBAGENT_TOOL_NAME`) live in `aura-model`; this crate consumes them. Profiles are loaded from a single `<workspace>/agents/<name>.md` markdown file (frontmatter + system-prompt body).
+The spawn protocol types (`SubagentSpawnRequest`, `SubagentResult`, `SubagentBackend`, `SubagentParentContext`, `SPAWN_SUBAGENT_TOOL_NAME`) live in `aura-model`; this crate consumes them. The `SubagentSpawner` capability trait lives here in `aura-subagent` (leaf crate, no cycle); its actor-backed impl is in `aura-agent`. Profiles are loaded from a single `<workspace>/agents/<name>.md` markdown file (frontmatter + system-prompt body).
 
 ### Public surface
 
@@ -39,9 +39,9 @@ A child actor boots with an empty context, the profile's `system_prompt` as its 
 1. Resolves `subagent_type` against the registry — an unknown type returns a hard `ToolError::InvalidParams` listing the catalogue (no soft fallback).
 2. Walks the parent's lineage via `SessionManager` to compute depth (the root session id is read off the denormalized `Session.root_session_id`; depth still needs the walk, capped at `MAX_LINEAGE_WALK_HOPS = 128` against corrupt chains). Depth `>= max_depth` → `ToolError::SubagentDepthExceeded`.
 3. Reserves a fan-out slot under the root via the dispatch limiter **before** shipping. Over cap → `ToolError::SubagentFanoutExceeded`.
-4. Ships a `SystemSpawnRequest::Subagent` envelope (carrying the parent's session/job/span ids + cancel token + a boxed `SubagentSpawnRequest` + a `oneshot` `result_tx`) onto the runtime's system-spawn channel and awaits the child's terminal `SubagentResult`.
+4. Hands the `SubagentSpawnRequest` (plus a `SubagentParentContext` carrying the parent's session/job/span ids + cancel token) to the actor-backed `SubagentSpawner` — reached via a late-set slot, since the tool is built before the spawner exists — and returns the `SubagentResult`: the child's terminal for a foreground spawn, or the dispatch ack for a background one.
 
-The tool is registered by the runtime wiring code (`src/runtime.rs`), **not** by `aura_tools::builtin::default_tools`, because it needs the runtime-owned `system_spawn_tx` sender and the live `SubagentRegistry` for its per-turn description. Its manifest carries `TrustLevel::Trusted` and an empty capability set.
+The tool is registered by the runtime wiring code (`src/runtime.rs`), **not** by `aura_tools::builtin::default_tools`, because it needs the runtime-owned spawner slot and the live `SubagentRegistry` for its per-turn description. Its manifest carries `TrustLevel::Trusted` and an empty capability set.
 
 **Caps** (constructor-overridable defaults): `DEFAULT_MAX_SUBAGENT_DEPTH = 3` bounds the lineage chain; `DEFAULT_MAX_SUBAGENTS_PER_ROOT = 8` bounds concurrent breadth under one root. The tool requires a `max_timeout`, so it uses a 30-day `TOOL_WAIT_BACKSTOP` that never fires in practice — subagent execution is no longer wall-clock-bounded (aura subagents stop at `max_iterations`, external ones at their own internal safety timeout).
 
@@ -76,9 +76,9 @@ Four profiles are compiled into the binary via `include_str!` (`builtin/*.md`) a
 
 | Module | Role |
 |--------|------|
-| `agent` | `src/runtime.rs` constructs the `SubagentRegistry` (`new` → `register_builtins` → `load_dir(workspace_paths.agents_dir())`), the `FanOutLimiter`, and the `spawn_subagent` tool via `tool::make`. The router (`actor/router/system_spawn/`, `actor/subagent.rs`) consumes `SystemSpawnRequest::Subagent`, spawns/links the child actor, and releases the fan-out slot on the child's terminal event |
+| `agent` | `src/runtime.rs` constructs the `SubagentRegistry` (`new` → `register_builtins` → `load_dir(workspace_paths.agents_dir())`), the `FanOutLimiter`, and the `spawn_subagent` tool via `tool::make`. The `runtime::subagent_spawner::ActorSubagentSpawner` (with the wait routine in `actor/subagent.rs`) builds/links the child actor and releases the fan-out slot on the child's terminal event |
 | `context` | `ContextManager` holds an optional `(Arc<SubagentRegistry>, subagent_type)`; on seed it resolves the type back to the profile's `system_prompt` and uses it as the child's system row in place of Soul |
-| `model` | Owns the spawn protocol (`SubagentSpawnRequest` / `SubagentResult` / `SubagentBackend` / `SystemSpawnRequest` / `SPAWN_SUBAGENT_TOOL_NAME`) plus `ModelTier`, `ArtifactSource`, `TrustLevel` |
+| `model` | Owns the spawn protocol (`SubagentSpawnRequest` / `SubagentResult` / `SubagentBackend` / `SPAWN_SUBAGENT_TOOL_NAME`) plus `ModelTier`, `ArtifactSource`, `TrustLevel` |
 | `tools` | Provides the `Tool` trait + `ToolContext` / `ToolManifest` the `spawn_subagent` tool implements |
 | `session` | `SessionManager` backs the lineage walk that powers the depth cap |
 | `workspace` | `WorkspacePaths::agents_dir()` resolves the `<workspace>/agents/` profile directory (a standalone git repo, created and `git init`-ed by `ensure_layout`) |

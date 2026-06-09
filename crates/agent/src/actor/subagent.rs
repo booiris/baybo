@@ -1,9 +1,8 @@
-//! Agent-side wait routine the router runs after spawning the child
-//! actor for a `SystemSpawnRequest::Subagent`. All protocol value
-//! types live in `aura_model::spawn_protocol`; the tool that emits
-//! the request lives in `aura_tools::builtin::spawn_subagent` and
-//! sends directly on the same `mpsc::Sender<SystemSpawnRequest>` the
-//! router consumes.
+//! Agent-side wait routine the [`crate::runtime::subagent_spawner`] runs
+//! after spawning a child subagent actor. All protocol value types live
+//! in `aura_model::spawn_protocol`; the `spawn_subagent` tool
+//! (`aura_subagent::tool`) hands its request to the spawner through the
+//! `aura_subagent::SubagentSpawner` capability.
 
 use std::sync::Arc;
 

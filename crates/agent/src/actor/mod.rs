@@ -27,7 +27,7 @@ const MAX_PENDING_BACKGROUND_RESULTS: usize = 64;
 /// How long after sealing a subagent group the barrier waits for all
 /// members before firing partial + dissolving the cohort (still-running
 /// members then deliver individually). Generous — group members are real
-/// background subagents. See `docs/todo/background-jobs.md`.
+/// background subagents.
 const GROUP_TIMEOUT_MINUTES: i64 = 30;
 
 /// Exponential-backoff retry schedule for a FAILED `SubagentNotification`
@@ -254,8 +254,15 @@ impl AgentActor {
                     m = mailbox.recv() => m,
                     _ = tokio::time::sleep(notify_backoff) => {
                         // Release any cohort that completed or hit its timeout
-                        // into the buffer, then drain.
-                        self.check_groups();
+                        // into the buffer, then drain. A cohort that times out
+                        // with zero results buffers nothing, so the
+                        // notification's own persist won't fire — persist the
+                        // group-map change here so the sweep survives a later
+                        // rehydration.
+                        if self.check_groups() {
+                            self.persist_session_state_after_pending_change("group_swept")
+                                .await;
+                        }
                         self.run_subagent_notification().await;
                         if self
                             .durable
@@ -296,9 +303,9 @@ impl AgentActor {
                     );
                     // Cancelling our `actor_token` cascades into every
                     // child we spawned — a subagent actor derives its
-                    // `actor_token` from ours via the `parent_actor_token`
-                    // carried in its `SystemSpawnRequest`, so parent
-                    // shutdown reaches it with no explicit dispatch.
+                    // `actor_token` from ours via the parent context the
+                    // spawner threads through, so parent shutdown reaches
+                    // it with no explicit dispatch.
                     self.volatile.actor_token.cancel();
                     break;
                 }
@@ -653,7 +660,7 @@ impl AgentActor {
     /// (its finished members) and dissolves — still-running members revert to
     /// individual delivery, since their later result finds no cohort and
     /// buffers directly. No-op while a cohort is still filling.
-    fn check_groups(&mut self) {
+    fn check_groups(&mut self) -> bool {
         let now = chrono::Utc::now();
         let timeout = chrono::Duration::minutes(GROUP_TIMEOUT_MINUTES);
         let ready: Vec<String> = self
@@ -665,6 +672,7 @@ impl AgentActor {
             .filter(|(_, g)| g.is_ready(now, timeout))
             .map(|(name, _)| name.clone())
             .collect();
+        let removed = !ready.is_empty();
         for name in ready {
             let Some(g) = self.durable.session.state.background_groups.remove(&name) else {
                 continue;
@@ -682,6 +690,7 @@ impl AgentActor {
                 self.buffer_pending_result(r);
             }
         }
+        removed
     }
 
     /// Re-pin this session's LLM in place (chat per-session model switch)

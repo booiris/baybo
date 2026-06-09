@@ -7,32 +7,38 @@
 //! 2. Packs the resolved profile name (`subagent_type`) and the parent's
 //!    `prompt` brief into a [`SubagentSpawnRequest`]; the child's
 //!    `ContextManager` resolves the name back to a system prompt.
-//! 3. Ships a [`SystemSpawnRequest::Subagent`] envelope onto the agent
-//!    runtime's system-spawn channel and awaits the child's terminal
-//!    [`SubagentResult`].
+//! 3. Hands the [`SubagentSpawnRequest`] to the actor-backed
+//!    [`crate::SubagentSpawner`] (impl in `aura-agent`) via a late-set
+//!    slot, and returns the [`SubagentResult`] it produces — the child's
+//!    terminal for a foreground spawn, or the dispatch ack for a
+//!    background one.
 //!
 //! Registered by the runtime wiring code (not
 //! [`aura_tools::builtin::default_tools`]) because it needs the
-//! runtime-owned `system_spawn_tx` sender AND the live
-//! `SubagentRegistry` so its description can enumerate available
-//! types every LLM turn.
+//! runtime-owned spawner slot AND the live `SubagentRegistry` so its
+//! description can enumerate available types every LLM turn.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use aura_model::{
     AURA_BACKEND_TAG, ExternalAgentKind, ModelTier, OnTimeout, SPAWN_SUBAGENT_TOOL_NAME, SessionId,
-    SubagentBackend, SubagentParentContext, SubagentResult, SubagentSpawnRequest,
-    SystemSpawnRequest, TrustLevel,
+    SubagentBackend, SubagentParentContext, SubagentResult, SubagentSpawnRequest, TrustLevel,
 };
 use aura_session::SessionManager;
 use aura_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
 
-use crate::{SubagentDispatchLimiter, SubagentRegistry};
+use crate::{SubagentDispatchLimiter, SubagentRegistry, SubagentSpawner};
+
+/// Late-set handle to the actor-backed spawner. The tool is built while
+/// the tool registry is assembled (before the supervisor + actor spawner
+/// exist), so the runtime injects an empty slot here and fills it once the
+/// spawner is constructed. Mirrors how the background-job manager receives
+/// its supervisor.
+pub type SubagentSpawnerSlot = Arc<OnceLock<Arc<dyn SubagentSpawner>>>;
 
 /// Default recursion cap. A typed subagent that itself dispatches a
 /// subagent is fine (`parent → child → grandchild`), but past depth 3
@@ -168,10 +174,12 @@ struct ParsedSpawn {
     request: SubagentSpawnRequest,
 }
 
-/// Output of [`SpawnSubagentTool::lineage_summary`]: parent's depth
-/// plus the root session id. The fan-out gate keys on the root, the
-/// depth gate compares against the cap directly.
-struct LineageSummary {
+/// The two subagent-admission gate inputs [`SpawnSubagentTool::lineage_gate_inputs`]
+/// derives from the parent: the parent's `depth` (the depth gate compares it
+/// against the nesting cap) and the `root_session_id` (the fan-out gate keys
+/// on it). Only `depth` needs the lineage walk; the root is denormalized on
+/// the parent row.
+struct LineageGateInputs {
     depth: u32,
     root_session_id: SessionId,
 }
@@ -290,7 +298,7 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
 /// config struct makes every required value show up by name at the
 /// call site.
 pub struct SpawnSubagentToolConfig {
-    pub system_spawn_tx: mpsc::Sender<SystemSpawnRequest>,
+    pub spawner: SubagentSpawnerSlot,
     pub registry: Arc<SubagentRegistry>,
     pub sessions: Arc<SessionManager>,
     pub dispatch_limiter: Arc<dyn SubagentDispatchLimiter>,
@@ -299,7 +307,7 @@ pub struct SpawnSubagentToolConfig {
 }
 
 pub struct SpawnSubagentTool {
-    system_spawn_tx: mpsc::Sender<SystemSpawnRequest>,
+    spawner: SubagentSpawnerSlot,
     registry: Arc<SubagentRegistry>,
     sessions: Arc<SessionManager>,
     dispatch_limiter: Arc<dyn SubagentDispatchLimiter>,
@@ -316,7 +324,7 @@ pub struct SpawnSubagentTool {
 impl SpawnSubagentTool {
     pub fn from_config(config: SpawnSubagentToolConfig) -> Self {
         let SpawnSubagentToolConfig {
-            system_spawn_tx,
+            spawner,
             registry,
             sessions,
             dispatch_limiter,
@@ -324,7 +332,7 @@ impl SpawnSubagentTool {
             max_subagents_per_root,
         } = config;
         Self {
-            system_spawn_tx,
+            spawner,
             registry,
             sessions,
             dispatch_limiter,
@@ -340,10 +348,10 @@ impl SpawnSubagentTool {
     /// exceeds [`MAX_LINEAGE_WALK_HOPS`] surfaces as
     /// `ToolError::Execution` so the LLM sees a clean failure
     /// instead of hanging the executor.
-    async fn lineage_summary(
+    async fn lineage_gate_inputs(
         &self,
         parent_session_id: &SessionId,
-    ) -> aura_tools::Result<LineageSummary> {
+    ) -> aura_tools::Result<LineageGateInputs> {
         let parent = self
             .sessions
             .get(parent_session_id)
@@ -378,7 +386,7 @@ impl SpawnSubagentTool {
                     })?,
             };
             let Some(parent_link) = session.lineage else {
-                return Ok(LineageSummary {
+                return Ok(LineageGateInputs {
                     depth,
                     root_session_id,
                 });
@@ -548,10 +556,10 @@ impl Tool for SpawnSubagentTool {
         let ParsedSpawn { request } =
             parse_spawn_request(&params, &self.registry).map_err(ToolError::InvalidParams)?;
 
-        let LineageSummary {
+        let LineageGateInputs {
             depth,
             root_session_id,
-        } = self.lineage_summary(&ctx.session_id).await?;
+        } = self.lineage_gate_inputs(&ctx.session_id).await?;
         if depth >= self.max_depth {
             return Err(ToolError::SubagentDepthExceeded {
                 current_depth: depth,
@@ -585,27 +593,15 @@ impl Tool for SpawnSubagentTool {
         // is a dispatch notice, not a final result — its escorted
         // delivery surfaces the id separately, so it stays tail-free.
         let background = request.background;
-        let (result_tx, result_rx) = oneshot::channel();
-        let envelope = SystemSpawnRequest::Subagent {
-            parent_session_id: parent.session_id,
-            parent_job_id: parent.job_id,
-            parent_span_id: parent.span_id,
-            parent_actor_token: parent.cancel_token,
-            request: Box::new(request),
-            result_tx,
-        };
-        let result = match self.system_spawn_tx.send(envelope).await {
-            Ok(()) => result_rx.await.unwrap_or_else(|_| {
-                // Channel closed before delivery: the router never
-                // produced a terminal, so its wait task will never
-                // release. Release here so the count doesn't leak.
+        let result = match self.spawner.get() {
+            // The spawner reserves nothing and releases the fan-out slot on
+            // the child's terminal (every path inside `spawn`). The tool
+            // reserved above; only the not-yet-wired case below needs the
+            // tool to release, since `spawn` is never reached.
+            Some(spawner) => spawner.spawn(parent, request).await,
+            None => {
                 self.dispatch_limiter.release(&root_session_id);
-                SubagentResult::failed("subagent result channel closed before delivery")
-            }),
-            Err(_) => {
-                // Envelope never reached the router. Release here.
-                self.dispatch_limiter.release(&root_session_id);
-                SubagentResult::failed("system spawn channel closed")
+                SubagentResult::failed("subagent spawner not wired")
             }
         };
         // Foreground results carry the resume-id tail; the background ack
@@ -761,9 +757,9 @@ mod tests {
     /// `TEST_PARENT_SESSION` and instantiates the tool with the
     /// defaults plus an `UnboundedDispatchLimiter` so test runs can't
     /// trip the fan-out cap.
-    async fn tool_with_default(tx: mpsc::Sender<SystemSpawnRequest>) -> SpawnSubagentTool {
+    async fn tool_with_default(spawner: SubagentSpawnerSlot) -> SpawnSubagentTool {
         SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
-            system_spawn_tx: tx,
+            spawner,
             registry: registry_with_builtins(),
             sessions: sessions_with_root().await,
             dispatch_limiter: unbounded_limiter(),
@@ -776,14 +772,14 @@ mod tests {
     /// limiter / max_depth / max fan-out — every other knob falls
     /// back to the same defaults `tool_with_default` uses.
     async fn tool_with(
-        tx: mpsc::Sender<SystemSpawnRequest>,
+        spawner: SubagentSpawnerSlot,
         sessions: Arc<SessionManager>,
         dispatch_limiter: Arc<dyn SubagentDispatchLimiter>,
         max_depth: u32,
         max_subagents_per_root: u32,
     ) -> SpawnSubagentTool {
         SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
-            system_spawn_tx: tx,
+            spawner,
             registry: registry_with_builtins(),
             sessions,
             dispatch_limiter,
@@ -792,40 +788,54 @@ mod tests {
         })
     }
 
-    /// Spin a fake router: pull one `SystemSpawnRequest::Subagent` off
-    /// the channel and reply on its oneshot with the supplied result.
-    fn fake_router(
-        mut rx: mpsc::Receiver<SystemSpawnRequest>,
+    type CapturedSpawn = Arc<parking_lot::Mutex<Option<(SubagentSpawnRequest, SessionId)>>>;
+
+    /// Stand-in for the actor-backed spawner: records the (request, parent
+    /// session id) it was handed and returns a canned result.
+    struct FakeSubagentSpawner {
         response: SubagentResult,
-    ) -> tokio::task::JoinHandle<Option<(SubagentSpawnRequest, aura_model::SessionId)>> {
-        tokio::spawn(async move {
-            let envelope = rx.recv().await?;
-            // `SystemSpawnRequest` has a single variant (`Subagent`); the
-            // destructure is irrefutable.
-            let SystemSpawnRequest::Subagent {
-                request,
-                parent_session_id,
-                result_tx,
-                ..
-            } = envelope;
-            let _ = result_tx.send(response);
-            Some((*request, parent_session_id))
-        })
+        captured: CapturedSpawn,
+    }
+
+    #[async_trait]
+    impl SubagentSpawner for FakeSubagentSpawner {
+        async fn spawn(
+            &self,
+            parent: SubagentParentContext,
+            request: SubagentSpawnRequest,
+        ) -> SubagentResult {
+            *self.captured.lock() = Some((request, parent.session_id));
+            self.response.clone()
+        }
+    }
+
+    /// A slot pre-filled with a fake spawner, plus the capture handle a test
+    /// reads after `execute` to assert what reached the spawner.
+    fn fake_spawner(response: SubagentResult) -> (SubagentSpawnerSlot, CapturedSpawn) {
+        let captured: CapturedSpawn = Arc::new(parking_lot::Mutex::new(None));
+        let slot: SubagentSpawnerSlot = Arc::new(OnceLock::new());
+        let _ = slot.set(Arc::new(FakeSubagentSpawner {
+            response,
+            captured: Arc::clone(&captured),
+        }));
+        (slot, captured)
+    }
+
+    /// A slot that was never filled — models the tool being called before
+    /// the runtime wired the spawner.
+    fn unwired_spawner() -> SubagentSpawnerSlot {
+        Arc::new(OnceLock::new())
     }
 
     #[tokio::test]
     async fn forwards_resolved_profile_and_brief_to_channel() {
-        let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(8);
-        let router = fake_router(
-            rx,
-            SubagentResult {
-                child_session_id: aura_model::SessionId::from("child-1"),
-                final_content: Some(vec![aura_model::ContentBlock::Text("done".into())]),
-                status: SubagentExitStatus::Completed,
-            },
-        );
+        let (spawner, captured) = fake_spawner(SubagentResult {
+            child_session_id: aura_model::SessionId::from("child-1"),
+            final_content: Some(vec![aura_model::ContentBlock::Text("done".into())]),
+            status: SubagentExitStatus::Completed,
+        });
 
-        let tool = tool_with_default(tx).await;
+        let tool = tool_with_default(spawner).await;
         let out = tool
             .execute(
                 json!({
@@ -848,7 +858,7 @@ mod tests {
             }
             _ => panic!("expected Text output"),
         }
-        let (req, parent_id) = router.await.unwrap().expect("router saw a Subagent frame");
+        let (req, parent_id) = captured.lock().take().expect("spawner saw a request");
         assert_eq!(req.subagent_type, "general-purpose");
         assert_eq!(req.task_summary, "look up X");
         assert_eq!(req.prompt, "Investigate X and report what you find.");
@@ -864,8 +874,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_subagent_type_returns_helpful_error() {
-        let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
-        let tool = tool_with_default(tx).await;
+        let tool = tool_with_default(unwired_spawner()).await;
         let err = tool
             .execute(
                 json!({
@@ -888,8 +897,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_required_fields_surface_as_tool_error() {
-        let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
-        let tool = tool_with_default(tx).await;
+        let tool = tool_with_default(unwired_spawner()).await;
 
         let cases = [
             json!({"description": "x", "prompt": "x"}), // missing subagent_type
@@ -907,27 +915,20 @@ mod tests {
 
     #[tokio::test]
     async fn background_flag_routes_through_envelope() {
-        // The tool surface for background mode is identical to
-        // foreground from the *tool's* perspective — it still sends
-        // a `SystemSpawnRequest::Subagent` envelope and renders
-        // whatever `SubagentResult` the router fills the oneshot
-        // with. The router-side branch (use parent_actor_token,
-        // post `AgentMessage::BackgroundJobFinished` on terminal) is
-        // tested in the agent crate alongside the supervisor
-        // fixtures. Here we just confirm the tool propagates the
-        // `background: true` flag and the resulting ack lands as
-        // Text output.
-        let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(1);
+        // The tool surface for background mode is identical to foreground
+        // from the *tool's* perspective — it hands the request to the
+        // spawner and renders whatever `SubagentResult` comes back. The
+        // spawner-side branch (background dispatch ack + escorted
+        // `BackgroundJobFinished` on terminal) is tested in the agent crate
+        // alongside the supervisor fixtures. Here we just confirm the tool
+        // propagates `background: true` and the ack lands as Text output.
         let ack_text = "[background subagent dispatched]";
-        let router = fake_router(
-            rx,
-            SubagentResult {
-                child_session_id: aura_model::SessionId::from("child"),
-                final_content: Some(vec![aura_model::ContentBlock::Text(ack_text.into())]),
-                status: SubagentExitStatus::Completed,
-            },
-        );
-        let tool = tool_with_default(tx).await;
+        let (spawner, captured) = fake_spawner(SubagentResult {
+            child_session_id: aura_model::SessionId::from("child"),
+            final_content: Some(vec![aura_model::ContentBlock::Text(ack_text.into())]),
+            status: SubagentExitStatus::Completed,
+        });
+        let tool = tool_with_default(spawner).await;
         let out = tool
             .execute(
                 json!({
@@ -944,7 +945,7 @@ mod tests {
             ToolOutput::Text(s) => assert_eq!(s, ack_text),
             other => panic!("expected Text, got {other:?}"),
         }
-        let (req, _) = router.await.unwrap().expect("router saw an envelope");
+        let (req, _) = captured.lock().take().expect("spawner saw a request");
         assert!(req.background, "tool must propagate background=true");
     }
 
@@ -953,24 +954,20 @@ mod tests {
         // A subagent hands its parent a textual report, never raw media:
         // even if its final_content carries an image, the parent boundary
         // surfaces text only.
-        let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(8);
-        let router = fake_router(
-            rx,
-            SubagentResult {
-                child_session_id: aura_model::SessionId::from("child"),
-                final_content: Some(vec![
-                    aura_model::ContentBlock::Text("here's what I found".into()),
-                    aura_model::ContentBlock::Image {
-                        blob: aura_model::BlobRef {
-                            blob_id: "b-1".into(),
-                        },
-                        mime_type: "image/png".into(),
+        let (spawner, _captured) = fake_spawner(SubagentResult {
+            child_session_id: aura_model::SessionId::from("child"),
+            final_content: Some(vec![
+                aura_model::ContentBlock::Text("here's what I found".into()),
+                aura_model::ContentBlock::Image {
+                    blob: aura_model::BlobRef {
+                        blob_id: "b-1".into(),
                     },
-                ]),
-                status: SubagentExitStatus::Completed,
-            },
-        );
-        let tool = tool_with_default(tx).await;
+                    mime_type: "image/png".into(),
+                },
+            ]),
+            status: SubagentExitStatus::Completed,
+        });
+        let tool = tool_with_default(spawner).await;
         let out = tool
             .execute(
                 json!({
@@ -986,21 +983,16 @@ mod tests {
             ToolOutput::Text(s) => assert!(s.starts_with("here's what I found"), "got: {s}"),
             other => panic!("expected Text (images dropped at the parent boundary), got {other:?}"),
         }
-        let _ = router.await;
     }
 
     #[tokio::test]
     async fn text_only_result_stays_as_text_variant() {
-        let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(8);
-        let router = fake_router(
-            rx,
-            SubagentResult {
-                child_session_id: aura_model::SessionId::from("child"),
-                final_content: Some(vec![aura_model::ContentBlock::Text("just text".into())]),
-                status: SubagentExitStatus::Completed,
-            },
-        );
-        let tool = tool_with_default(tx).await;
+        let (spawner, _captured) = fake_spawner(SubagentResult {
+            child_session_id: aura_model::SessionId::from("child"),
+            final_content: Some(vec![aura_model::ContentBlock::Text("just text".into())]),
+            status: SubagentExitStatus::Completed,
+        });
+        let tool = tool_with_default(spawner).await;
         let out = tool
             .execute(
                 json!({
@@ -1016,14 +1008,14 @@ mod tests {
             ToolOutput::Text(s) => assert!(s.starts_with("just text"), "got: {s}"),
             other => panic!("expected Text, got {other:?}"),
         }
-        let _ = router.await;
     }
 
     #[tokio::test]
-    async fn channel_closed_renders_failed_result() {
-        let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(1);
-        drop(rx);
-        let tool = tool_with_default(tx).await;
+    async fn unwired_spawner_renders_failed_result() {
+        // The slot is never filled (the tool was called before the runtime
+        // wired the spawner) — the spawn surfaces as a failed result, not a
+        // panic or a hang.
+        let tool = tool_with_default(unwired_spawner()).await;
         let out = tool
             .execute(
                 json!({
@@ -1036,15 +1028,13 @@ mod tests {
             .await
             .unwrap();
         match out {
-            ToolOutput::Text(s) => assert!(s.contains("system spawn channel closed")),
+            ToolOutput::Text(s) => assert!(s.contains("subagent spawner not wired"), "got: {s}"),
             _ => panic!("expected Text output"),
         }
     }
 
     #[tokio::test]
     async fn lineage_depth_at_cap_rejects_spawn() {
-        let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(1);
-        let _router_drop = rx;
         let sessions = sessions_with_root().await;
         // Build a chain: parent → c1 → c2 → c3.  Depth of c3 is 3.
         save_child_session(&sessions, "c1", TEST_PARENT_SESSION).await;
@@ -1052,7 +1042,7 @@ mod tests {
         save_child_session(&sessions, "c3", "c2").await;
 
         let tool = tool_with(
-            tx,
+            unwired_spawner(),
             sessions,
             unbounded_limiter(),
             /* max_depth */ 3,
@@ -1081,20 +1071,16 @@ mod tests {
 
     #[tokio::test]
     async fn lineage_depth_below_cap_is_accepted() {
-        let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(8);
-        let router = fake_router(
-            rx,
-            SubagentResult {
-                child_session_id: aura_model::SessionId::from("grandchild"),
-                final_content: Some(vec![aura_model::ContentBlock::Text("done".into())]),
-                status: SubagentExitStatus::Completed,
-            },
-        );
+        let (spawner, _captured) = fake_spawner(SubagentResult {
+            child_session_id: aura_model::SessionId::from("grandchild"),
+            final_content: Some(vec![aura_model::ContentBlock::Text("done".into())]),
+            status: SubagentExitStatus::Completed,
+        });
         let sessions = sessions_with_root().await;
         save_child_session(&sessions, "c1", TEST_PARENT_SESSION).await;
         // Spawning from c1 with cap=3 must succeed (depth 1 < 3).
         let tool = tool_with(
-            tx,
+            spawner,
             sessions,
             unbounded_limiter(),
             /* max_depth */ 3,
@@ -1116,14 +1102,12 @@ mod tests {
             ToolOutput::Text(s) => assert!(s.starts_with("done"), "got: {s}"),
             _ => panic!("expected Text output"),
         }
-        let _ = router.await;
     }
 
     #[tokio::test]
     async fn unknown_parent_session_surfaces_as_execution_error() {
-        let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
         let tool = tool_with(
-            tx,
+            unwired_spawner(),
             empty_session_manager(),
             unbounded_limiter(),
             DEFAULT_MAX_SUBAGENT_DEPTH,
@@ -1146,9 +1130,8 @@ mod tests {
 
     #[test]
     fn description_appends_type_catalogue() {
-        let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
         let tool = SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
-            system_spawn_tx: tx,
+            spawner: unwired_spawner(),
             registry: registry_with_builtins(),
             sessions: empty_session_manager(),
             dispatch_limiter: unbounded_limiter(),
@@ -1231,10 +1214,9 @@ mod tests {
 
     #[tokio::test]
     async fn fan_out_cap_rejects_with_helpful_error() {
-        let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
         let limiter = Arc::new(RecordingLimiter::new(/* deny_after */ 0));
         let tool = tool_with(
-            tx,
+            unwired_spawner(),
             sessions_with_root().await,
             limiter.clone() as Arc<dyn SubagentDispatchLimiter>,
             DEFAULT_MAX_SUBAGENT_DEPTH,
@@ -1265,12 +1247,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_closed_after_reserve_releases_slot() {
-        let (tx, rx) = mpsc::channel::<SystemSpawnRequest>(1);
-        drop(rx);
+    async fn unwired_spawner_after_reserve_releases_slot() {
         let limiter = Arc::new(RecordingLimiter::new(/* deny_after */ 8));
         let tool = tool_with(
-            tx,
+            unwired_spawner(),
             sessions_with_root().await,
             limiter.clone() as Arc<dyn SubagentDispatchLimiter>,
             DEFAULT_MAX_SUBAGENT_DEPTH,
@@ -1288,10 +1268,9 @@ mod tests {
             )
             .await
             .unwrap();
-        // Reserve happened, then the envelope send failed (channel
-        // closed). The tool's local fallback path must release the
-        // slot itself — the router never saw the envelope, so its
-        // wait task will never release.
+        // Reserve happened, then the spawner was missing (slot empty). The
+        // tool's fallback must release the slot itself — `spawn` was never
+        // reached, so nothing else will release.
         assert_eq!(limiter.events(), vec!["reserve", "release"]);
     }
 
@@ -1411,9 +1390,8 @@ mod tests {
 
     #[test]
     fn description_handles_empty_registry() {
-        let (tx, _rx) = mpsc::channel::<SystemSpawnRequest>(1);
         let tool = SpawnSubagentTool::from_config(SpawnSubagentToolConfig {
-            system_spawn_tx: tx,
+            spawner: unwired_spawner(),
             registry: Arc::new(SubagentRegistry::new()),
             sessions: empty_session_manager(),
             dispatch_limiter: unbounded_limiter(),

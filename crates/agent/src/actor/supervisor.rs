@@ -19,13 +19,16 @@ pub struct ActorHandle {
     pub sender: MailboxSender<AgentMessage>,
 }
 
-/// Per-parent record of one in-flight background subagent — enough for
-/// `/stop` to enumerate it (cancel it, report what it was doing) and for the
-/// idle reaper to know the parent has outstanding work, without a job-store
-/// lineage walk. Keyed by the child session id in the registry.
+/// Per-parent record of one in-flight background job — a background subagent
+/// or a detached `Bash` command — enough for `/stop` to enumerate it (cancel
+/// it, report what it was doing) and for the idle reaper to know the parent has
+/// outstanding work, without a job-store lineage walk. Keyed by the child
+/// session id (subagents) or the `bg-…` handle (commands) in the registry.
 #[derive(Clone)]
-pub struct InFlightSubagent {
-    pub subagent_type: String,
+pub struct InFlightJob {
+    /// What's running: a subagent's profile name, or `"command"` for a
+    /// detached `Bash` command.
+    pub kind: String,
     pub task_summary: String,
     /// The user-facing handle the dispatch/conversion notice advertised
     /// (`bg-…`). The registry is keyed by `child_session_id` (subagents) or
@@ -51,7 +54,7 @@ pub struct InFlightSubagent {
 ///
 /// `in_flight_background_subagents` tracks background subagents still
 /// running per parent session — `parent_session → (child_session →
-/// [`InFlightSubagent`])`. The idle reaper consults it before shutting an
+/// [`InFlightJob`])`. The idle reaper consults it before shutting an
 /// actor down: a parent with outstanding background work is protected so
 /// its mailbox stays alive to receive the eventual
 /// `AgentMessage::BackgroundJobFinished` when each child terminates. `/stop`
@@ -62,7 +65,7 @@ pub struct InFlightSubagent {
 pub struct AgentSupervisor {
     actors: Arc<DashMap<SessionId, ActorHandle>>,
     response_tx: mpsc::Sender<AgentOutput>,
-    in_flight_background_subagents: Arc<DashMap<SessionId, HashMap<SessionId, InFlightSubagent>>>,
+    in_flight_background_subagents: Arc<DashMap<SessionId, HashMap<SessionId, InFlightJob>>>,
 }
 
 impl AgentSupervisor {
@@ -83,7 +86,7 @@ impl AgentSupervisor {
         &self,
         parent_session_id: &SessionId,
         child_session_id: &SessionId,
-        subagent_type: &str,
+        kind: &str,
         task_summary: &str,
         handle: &str,
         cancel_token: CancellationToken,
@@ -93,8 +96,8 @@ impl AgentSupervisor {
             .or_default()
             .insert(
                 child_session_id.clone(),
-                InFlightSubagent {
-                    subagent_type: subagent_type.to_string(),
+                InFlightJob {
+                    kind: kind.to_string(),
                     task_summary: task_summary.to_string(),
                     handle: handle.to_string(),
                     cancel_token,
@@ -157,7 +160,7 @@ impl AgentSupervisor {
     pub fn take_in_flight_background_subagents(
         &self,
         parent_session_id: &SessionId,
-    ) -> Vec<(SessionId, InFlightSubagent)> {
+    ) -> Vec<(SessionId, InFlightJob)> {
         self.in_flight_background_subagents
             .remove(parent_session_id)
             .map(|(_, children)| children.into_iter().collect())
@@ -172,16 +175,34 @@ impl AgentSupervisor {
     pub fn list_in_flight_background(
         &self,
         parent_session_id: &SessionId,
-    ) -> Vec<(SessionId, InFlightSubagent)> {
+    ) -> Vec<(SessionId, InFlightJob)> {
         self.in_flight_background_subagents
             .get(parent_session_id)
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default()
     }
 
+    /// Every in-flight background job across all parents, as
+    /// `(parent_session_id, InFlightJob)` — backs the cross-session
+    /// `/v1/background-jobs` dashboard. Snapshots into a `Vec` so no shard
+    /// lock is held past the call.
+    pub fn list_all_in_flight_background(&self) -> Vec<(SessionId, InFlightJob)> {
+        self.in_flight_background_subagents
+            .iter()
+            .flat_map(|parent| {
+                let parent_id = parent.key().clone();
+                parent
+                    .value()
+                    .values()
+                    .map(move |info| (parent_id.clone(), info.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Cancel and drop ONE in-flight background job by its user-facing
     /// `handle` (`bg-…`) — backs the `JobStop` tool. Scans the parent's
-    /// entries by `InFlightSubagent::handle` (the registry key differs for
+    /// entries by `InFlightJob::handle` (the registry key differs for
     /// subagents), cancels the token (the escort kills the child), and removes
     /// the entry, which doubles as the suppress signal (the escort finds its
     /// entry gone and drops delivery). Returns the dropped info, or `None` if
@@ -190,7 +211,7 @@ impl AgentSupervisor {
         &self,
         parent_session_id: &SessionId,
         handle: &str,
-    ) -> Option<InFlightSubagent> {
+    ) -> Option<InFlightJob> {
         use dashmap::mapref::entry::Entry;
         let mut removed = None;
         if let Entry::Occupied(mut entry) = self
@@ -837,6 +858,45 @@ mod tests {
             sup.cancel_in_flight_background(&parent, "bg-nope")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn list_all_in_flight_background_spans_parents() {
+        let sup = make_supervisor();
+        let p1 = SessionId::from("p1");
+        let p2 = SessionId::from("p2");
+        sup.note_background_subagent_started(
+            &p1,
+            &SessionId::from("c1"),
+            "explorer",
+            "a",
+            "bg-1",
+            CancellationToken::new(),
+        );
+        sup.note_background_subagent_started(
+            &p1,
+            &SessionId::from("c2"),
+            "planner",
+            "b",
+            "bg-2",
+            CancellationToken::new(),
+        );
+        sup.note_background_subagent_started(
+            &p2,
+            &SessionId::from("c3"),
+            "reviewer",
+            "c",
+            "bg-3",
+            CancellationToken::new(),
+        );
+        let all = sup.list_all_in_flight_background();
+        assert_eq!(all.len(), 3, "collects across both parents");
+        let mut handles: Vec<_> = all.iter().map(|(_, info)| info.handle.clone()).collect();
+        handles.sort();
+        assert_eq!(handles, vec!["bg-1", "bg-2", "bg-3"]);
+        // Both parent ids are represented.
+        assert!(all.iter().any(|(p, _)| p == &p1));
+        assert!(all.iter().any(|(p, _)| p == &p2));
     }
 
     #[tokio::test]

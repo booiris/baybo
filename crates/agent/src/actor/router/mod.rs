@@ -1,22 +1,20 @@
-//! Routes inbound messages, cron fires, and system-spawn requests
-//! to per-session [`AgentActor`](crate::actor::AgentActor) instances,
-//! and fans actor-emitted [`AgentOutput`] back out through registered
-//! channels.
+//! Routes inbound messages and cron fires to per-session
+//! [`AgentActor`](crate::actor::AgentActor) instances, and fans
+//! actor-emitted [`AgentOutput`] back out through registered channels.
 //!
 //! Each handler lives in its own submodule:
 //! - [`user_input`] — user input from channel sidecars
 //! - [`cron`] — scheduled cron-trigger events
-//! - [`system_spawn`] — system-initiated actor spawns, with one
-//!   submodule per [`aura_model::SystemSpawnRequest`] variant
 //! - [`output`] — actor → channel fan-out + egress sanitization
 //!
 //! The `Router` struct itself, its `select!`-driven [`Router::run`]
-//! loop, and the one-shot actor spawn helper used by the cron /
-//! system_spawn paths live here in [`mod@self`].
+//! loop, and the one-shot actor spawn helper ([`build_oneshot_actor`])
+//! used by the cron path live here in [`mod@self`]. Subagent spawns are
+//! handled out-of-band by [`crate::runtime::subagent_spawner`], which the
+//! `spawn_subagent` tool calls directly.
 
 mod cron;
 mod output;
-mod system_spawn;
 mod user_input;
 
 use std::collections::HashMap;
@@ -26,7 +24,7 @@ use std::time::Instant;
 
 use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
 use aura_cron::CronTriggerEvent;
-use aura_model::{LlmEntryName, Session, SystemSpawnRequest};
+use aura_model::{LlmEntryName, Session};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -124,7 +122,7 @@ impl RateLimiter {
 /// soul. So the spawner needs no prompt argument — the `Session` carries it.
 ///
 /// [`AgentActor`]: crate::actor::AgentActor
-pub type ActorSpawner = Box<
+pub type ActorSpawner = Arc<
     dyn Fn(
             Session,
             /* initial_llm */ Option<LlmEntryName>,
@@ -135,6 +133,26 @@ pub type ActorSpawner = Box<
         + Sync,
 >;
 
+/// Build a one-shot actor: derive a child `actor_token` from
+/// `parent_token`, hand the session to `actor_spawner` (which spawns the
+/// actor's run loop on its own task), and return the mailbox + token.
+/// Shared by the router's cron path and the subagent spawner — neither
+/// registers the handle with the supervisor (one-shot sessions have no
+/// follow-up traffic, so registering would just accumulate dangling
+/// handles). The persistent counterpart for user sessions lives in
+/// [`AgentSupervisor::route_or_spawn`].
+pub(crate) fn build_oneshot_actor(
+    actor_spawner: &ActorSpawner,
+    parent_token: &CancellationToken,
+    session: Session,
+    initial_llm: Option<LlmEntryName>,
+    response_tx: mpsc::Sender<AgentOutput>,
+) -> (MailboxSender<AgentMessage>, CancellationToken) {
+    let actor_token = parent_token.child_token();
+    let mailbox = actor_spawner(session, initial_llm, response_tx, actor_token.clone());
+    (mailbox, actor_token)
+}
+
 /// Routes incoming messages to the appropriate AgentActor.
 pub struct Router {
     session_manager: Arc<SessionManager>,
@@ -144,37 +162,18 @@ pub struct Router {
     cost_manager: Arc<CostManager>,
     rate_limiter: RateLimiter,
     actor_spawner: ActorSpawner,
-    /// Job lifecycle handle. Needed to subscribe to terminal-event
-    /// broadcasts when waiting on a subagent child to terminate, and
-    /// to reconcile via the store on broadcast lag.
+    /// Job lifecycle handle — subscribe to terminal-event broadcasts and
+    /// reconcile via the store on broadcast lag.
     job_lifecycle: Arc<JobLifecycle>,
-    /// LLM pool — held so the subagent handler can resolve
-    /// `request.model_tier` to a concrete entry name before spawning
-    /// the child actor. Other handlers ignore it (top-level / cron /
-    /// maintenance spawns always run on `default-llm`).
-    pub(crate) llm_pool: crate::runtime::llm_pool::LlmPoolHandle,
-    /// Fan-out limiter shared with the `spawn_subagent` tool. The
-    /// router doesn't reserve (the tool does that before sending the
-    /// envelope) but it MUST release on every terminal path — the
-    /// tool's local fallback only handles the "envelope never
-    /// reached the router" case. Wait tasks call `release` exactly
-    /// once when the child reaches a terminal state.
-    pub(crate) dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
-    /// Stored as `Option<Receiver>` so `run()` can `take()` them out of
-    /// `self` to drive in `select!` arms; populated unconditionally
-    /// from `RouterConfig` at construction.
+    /// Stored as `Option<Receiver>` so `run()` can `take()` it out of
+    /// `self` to drive in a `select!` arm; populated unconditionally from
+    /// `RouterConfig` at construction.
     cron_trigger_rx: Option<mpsc::Receiver<CronTriggerEvent>>,
-    system_trigger_rx: Option<mpsc::Receiver<SystemSpawnRequest>>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream;
     /// each actor derives its `actor_token` as a child of this so
     /// process shutdown cascades into every in-flight job.
     actor_parent_token: CancellationToken,
-    /// External-agent backends registered at boot.
-    pub(crate) external_agents: Arc<crate::external_agent::ExternalAgentRegistry>,
-    /// Workspace paths; used to compute external-agent working dirs
-    /// (`<root>/work/<kind>/<name-or-session>/`).
-    pub(crate) workspace_paths: Arc<aura_workspace::WorkspacePaths>,
 }
 
 /// Construction bundle for [`Router`]. Every field is required — call
@@ -188,10 +187,7 @@ pub struct RouterConfig {
     pub cost_manager: Arc<CostManager>,
     pub actor_spawner: ActorSpawner,
     pub job_lifecycle: Arc<JobLifecycle>,
-    pub llm_pool: crate::runtime::llm_pool::LlmPoolHandle,
-    pub dispatch_limiter: Arc<dyn aura_subagent::SubagentDispatchLimiter>,
     pub cron_trigger_rx: mpsc::Receiver<CronTriggerEvent>,
-    pub system_trigger_rx: mpsc::Receiver<SystemSpawnRequest>,
     /// Cancellation parent passed to every top-level actor the router
     /// spawns. Bridged to the process-wide `ShutdownSignal` upstream.
     pub actor_parent_token: CancellationToken,
@@ -200,8 +196,6 @@ pub struct RouterConfig {
     /// rebuilding the router. Production wiring sources it from config;
     /// tests build one from whatever values they want.
     pub rate_limit: Arc<LiveRateLimit>,
-    pub external_agents: Arc<crate::external_agent::ExternalAgentRegistry>,
-    pub workspace_paths: Arc<aura_workspace::WorkspacePaths>,
 }
 
 impl Router {
@@ -214,14 +208,9 @@ impl Router {
             cost_manager,
             actor_spawner,
             job_lifecycle,
-            llm_pool,
-            dispatch_limiter,
             cron_trigger_rx,
-            system_trigger_rx,
             actor_parent_token,
             rate_limit,
-            external_agents,
-            workspace_paths,
         } = config;
         Self {
             session_manager,
@@ -232,13 +221,8 @@ impl Router {
             rate_limiter: RateLimiter::new(rate_limit),
             actor_spawner,
             job_lifecycle,
-            llm_pool,
-            dispatch_limiter,
             cron_trigger_rx: Some(cron_trigger_rx),
-            system_trigger_rx: Some(system_trigger_rx),
             actor_parent_token,
-            external_agents,
-            workspace_paths,
         }
     }
 
@@ -252,7 +236,6 @@ impl Router {
         info!(channel_count, "router starting");
 
         let mut cron_rx = self.cron_trigger_rx.take();
-        let mut system_rx = self.system_trigger_rx.take();
 
         loop {
             tokio::select! {
@@ -274,16 +257,6 @@ impl Router {
                         error!(error = %e, "failed to handle cron trigger");
                     }
                 }
-                Some(request) = async {
-                    match system_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    if let Err(e) = self.handle_system_spawn(request).await {
-                        error!(error = %e, "failed to handle system-spawn request");
-                    }
-                }
                 else => {
                     info!("router channels closed, shutting down");
                     break;
@@ -294,17 +267,8 @@ impl Router {
         self.supervisor.shutdown_all().await;
     }
 
-    /// Spawn a **one-shot** actor: build the mailbox + actor_token, but
-    /// do NOT register the handle with the supervisor. Used by cron,
-    /// maintenance, and subagent spawns where the session has no
-    /// follow-up traffic and registering would just accumulate dangling
-    /// handles. Callers drive shutdown via `Shutdown` mailbox dispatch,
-    /// `actor_token` cancellation, or by dropping the sender so the
-    /// mailbox closes naturally.
-    ///
-    /// The persistent counterpart for user sessions lives in
-    /// [`AgentSupervisor::route_or_spawn`], which folds the build +
-    /// atomic register into one call.
+    /// Thin instance wrapper over [`build_oneshot_actor`] for the cron
+    /// path, which has `&self` in hand.
     fn spawn_oneshot_actor(
         &self,
         session: Session,
@@ -312,9 +276,13 @@ impl Router {
         response_tx: mpsc::Sender<AgentOutput>,
         parent_token: &CancellationToken,
     ) -> (MailboxSender<AgentMessage>, CancellationToken) {
-        let actor_token = parent_token.child_token();
-        let mailbox = (self.actor_spawner)(session, initial_llm, response_tx, actor_token.clone());
-        (mailbox, actor_token)
+        build_oneshot_actor(
+            &self.actor_spawner,
+            parent_token,
+            session,
+            initial_llm,
+            response_tx,
+        )
     }
 }
 
