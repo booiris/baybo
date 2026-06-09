@@ -330,6 +330,16 @@ impl GroupState {
     pub fn is_partial(&self) -> bool {
         self.results.len() < self.expected
     }
+
+    /// Cohort key for [`SessionState::background_groups`]. The dispatching
+    /// turn's `job_id` namespaces the LLM-chosen group name so that reusing
+    /// the same name in a later turn starts a fresh cohort instead of
+    /// extending the prior (still-draining) one. Both the agent loop (when
+    /// counting a grouped spawn) and the spawner (when stamping the escorted
+    /// member's `group`) derive the key through here, so the two always agree.
+    pub fn cohort_key(job_id: JobId, group: &str) -> String {
+        format!("{job_id}::{group}")
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +380,28 @@ mod tests {
         let complete = group(2, true, 2);
         assert!(complete.is_ready(now, t));
         assert!(!complete.is_partial());
+    }
+
+    #[test]
+    fn cohort_key_namespaces_group_by_job() {
+        let j1 = JobId::new();
+        let j2 = JobId::new();
+        // Deterministic per (job, name): same inputs → same key.
+        assert_eq!(
+            GroupState::cohort_key(j1, "g"),
+            GroupState::cohort_key(j1, "g")
+        );
+        // Reusing a name in a different turn (job) yields a distinct cohort —
+        // the property that stops a later turn from extending a prior cohort.
+        assert_ne!(
+            GroupState::cohort_key(j1, "g"),
+            GroupState::cohort_key(j2, "g")
+        );
+        // Distinct names within one turn stay distinct.
+        assert_ne!(
+            GroupState::cohort_key(j1, "a"),
+            GroupState::cohort_key(j1, "b")
+        );
     }
 
     #[test]

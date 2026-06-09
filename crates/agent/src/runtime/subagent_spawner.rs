@@ -160,6 +160,15 @@ impl ActorSubagentSpawner {
         // no-op). Production spawns always carry a root because the
         // tool reserved a slot before sending the envelope.
         let fan_out_root = request.fan_out_root.clone();
+        // Namespace a grouped spawn's cohort tag by the dispatching turn's
+        // `job_id` (see `GroupState::cohort_key`). The agent loop counts the
+        // member into the same job-scoped cohort, so reusing a group name in a
+        // later turn opens a fresh cohort instead of extending a prior turn's
+        // still-draining one. No-op for ungrouped spawns.
+        let mut request = request;
+        if let Some(group) = request.group.take() {
+            request.group = Some(aura_model::GroupState::cohort_key(parent_job_id, &group));
+        }
         let parent = match self.session_manager.get(&parent_session_id).await {
             Ok(Some(p)) => p,
             Ok(None) => {
@@ -236,9 +245,9 @@ impl ActorSubagentSpawner {
 
         // Foreground/nested spawns subscribe to terminal events BEFORE the
         // build+dispatch so a child that exits synchronously can't slip its
-        // terminal past us. Background spawns subscribe inside their gated task
-        // (after the budget wait) instead — see the `if background` arm — so
-        // this receiver is consumed only on the foreground paths below.
+        // terminal past us. Background spawns subscribe inside their detached
+        // task instead — see the `if background` arm — so this receiver is
+        // consumed only on the foreground paths below.
         let terminal_rx = self.job_lifecycle.subscribe_terminal_events();
 
         let now = Utc::now();
@@ -263,7 +272,6 @@ impl ActorSubagentSpawner {
         let llm = request
             .model_tier
             .and_then(|t| self.llm_pool.read().resolve_tier(t));
-        let background = request.background;
         let on_timeout = request.on_timeout;
         let subagent_type = request.subagent_type.clone();
         let task_summary = request.task_summary.clone();
@@ -277,6 +285,12 @@ impl ActorSubagentSpawner {
         // their notification turn can't be delivered — so they keep the
         // block-until-terminal behaviour with no timer.
         let user_facing = parent_supports_background(&parent);
+        // A non-user parent can't host the notification turn that surfaces a
+        // background result, so an explicit `background=true` / grouped spawn
+        // from one is downgraded to a blocking foreground run (its result is
+        // returned inline) rather than dispatched to a notification that would
+        // be dropped on delivery. `convertible` is already user-only.
+        let background = request.background && user_facing;
         let convertible = user_facing && !background && matches!(on_timeout, OnTimeout::Background);
 
         // Background subagents — and convertible foreground ones, which
@@ -471,10 +485,14 @@ impl ActorSubagentSpawner {
         // per-job token (cancelled at the foreground-wait mark, or ends with the
         // turn). Mirrors the Aura backend's anchoring.
         let user_facing = parent_supports_background(&parent);
-        let convertible = user_facing
-            && !request.background
-            && matches!(request.on_timeout, OnTimeout::Background);
-        let actor_token = if request.background || convertible {
+        // Non-user parents can't deliver a background notification, so an
+        // explicit background / grouped external run from one is downgraded to
+        // a blocking foreground run (result returned inline). Mirrors the Aura
+        // backend's gate.
+        let background = request.background && user_facing;
+        let convertible =
+            user_facing && !background && matches!(request.on_timeout, OnTimeout::Background);
+        let actor_token = if background || convertible {
             self.actor_parent_token.child_token()
         } else {
             parent_actor_token.child_token()
@@ -497,7 +515,7 @@ impl ActorSubagentSpawner {
             timeout: EXTERNAL_SUBAGENT_TIMEOUT,
         };
 
-        if request.background {
+        if background {
             let handle_id = self
                 .ack_background_dispatch(
                     &parent.id,

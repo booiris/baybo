@@ -1995,6 +1995,15 @@ async fn grouped_subagents_deliver_one_merged_notification() {
     harness.send_text("spawn a group of two").await.unwrap();
     let turn_outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
     assert_eq!(spawn.invocations().len(), 2, "both grouped spawns ran");
+    // The cohort is keyed by the dispatching turn's `job_id`
+    // (`GroupState::cohort_key`), so a delivered member must carry the same
+    // job-scoped group to route into it — exactly as the real spawner stamps it.
+    let cohort_group = aura_model::GroupState::cohort_key(
+        spawn
+            .last_job_id()
+            .expect("the spawn tool ran, so it captured the turn's job_id"),
+        "g",
+    );
     let dispatch_answers = turn_outs
         .iter()
         .filter(|o| matches!(o.event, AgentEvent::Message(_)))
@@ -2036,7 +2045,7 @@ async fn grouped_subagents_deliver_one_merged_notification() {
             format!("{label} result"),
             SubagentExitStatus::Completed,
         );
-        pending.group = Some("g".into());
+        pending.group = Some(cohort_group.clone());
         AgentMessage::BackgroundJobFinished(Box::new(pending))
     };
     let count_answers = |outs: &[AgentOutput]| {
@@ -2072,6 +2081,128 @@ async fn grouped_subagents_deliver_one_merged_notification() {
         count_answers(&after_second),
         1,
         "the completed cohort fires exactly one merged notification: {after_second:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+/// Regression for cross-turn group-name reuse: two turns that both name their
+/// group `"g"` — while the first cohort is still draining — must NOT merge into
+/// one barrier. The cohort key is namespaced by the dispatching turn's
+/// `job_id`, so each turn forms its own cohort and fires its own notification.
+/// (Before the fix, the second turn's `expected += 1` landed on the first,
+/// still-sealed cohort, holding the first member hostage and merging the two.)
+#[tokio::test]
+async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
+    let spawn = Arc::new(RecordingTool::new(SPAWN_SUBAGENT_TOOL_NAME));
+    spawn.set_response(ToolOutput::Text(format!(
+        "{BACKGROUND_DISPATCH_ACK_PREFIX}\n- handle: bg-stub"
+    )));
+    let manifest = spawn.manifest();
+    let mut harness = AgentTestHarness::builder()
+        .with_tool(spawn.clone() as Arc<dyn Tool>, manifest)
+        .build();
+
+    let grouped_call = |id: &str| {
+        StreamEvent::ToolCall(ToolCallInfo {
+            id: id.into(),
+            name: SPAWN_SUBAGENT_TOOL_NAME.into(),
+            arguments: json!({
+                "subagent_type": "general-purpose",
+                "description": id,
+                "prompt": id,
+                "group": "g",
+            }),
+            signature: None,
+        })
+    };
+
+    // Turn 1: one grouped spawn (cohort A, expected = 1), then an answer.
+    harness.stub_llm.push_stream(vec![grouped_call("call-a")]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("dispatched A".into())]);
+    harness.send_text("first batch").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let job_a = spawn.last_job_id().expect("turn 1 captured a job_id");
+
+    // Turn 2: another grouped spawn with the SAME name "g" (cohort B), while
+    // cohort A's member is still in flight.
+    harness.stub_llm.push_stream(vec![grouped_call("call-b")]);
+    harness
+        .stub_llm
+        .push_stream(vec![StreamEvent::Text("dispatched B".into())]);
+    harness.send_text("second batch").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let job_b = spawn.last_job_id().expect("turn 2 captured a job_id");
+    assert_ne!(job_a, job_b, "the two turns ran under distinct jobs");
+
+    // Notification turns run with `delta_tx = None` → the non-streaming `chat`
+    // path. Two responses: a merge bug would surface as a single notification.
+    let notif = |text: &str| LlmResponse {
+        content: text.into(),
+        content_blocks: vec![],
+        tool_calls: vec![],
+        usage: TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        },
+        thinking: None,
+    };
+    harness.stub_llm.push_response(notif("A complete"));
+    harness.stub_llm.push_response(notif("B complete"));
+
+    let finish = |handle: &str, group: String| {
+        let mut pending = PendingBackgroundResult::subagent(
+            handle,
+            "general-purpose",
+            handle,
+            SessionId::from(format!("child-{handle}")),
+            format!("{handle} result"),
+            SubagentExitStatus::Completed,
+        );
+        pending.group = Some(group);
+        AgentMessage::BackgroundJobFinished(Box::new(pending))
+    };
+    let count_answers = |outs: &[AgentOutput]| {
+        outs.iter()
+            .filter(|o| matches!(o.event, AgentEvent::Message(_)))
+            .count()
+    };
+
+    // Cohort A completes on its OWN member and fires immediately — it is not
+    // held waiting for turn 2's member (the pre-fix merge bug).
+    harness
+        .mailbox
+        .send(finish(
+            "bg-a",
+            aura_model::GroupState::cohort_key(job_a, "g"),
+        ))
+        .await
+        .expect("mailbox open");
+    let after_a = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(
+        count_answers(&after_a),
+        1,
+        "cohort A fires on its own member, not merged with the later turn: {after_a:?}"
+    );
+
+    // Cohort B then fires its own separate notification.
+    harness
+        .mailbox
+        .send(finish(
+            "bg-b",
+            aura_model::GroupState::cohort_key(job_b, "g"),
+        ))
+        .await
+        .expect("mailbox open");
+    let after_b = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    assert_eq!(
+        count_answers(&after_b),
+        1,
+        "cohort B fires its own notification: {after_b:?}"
     );
 
     harness.shutdown().await;

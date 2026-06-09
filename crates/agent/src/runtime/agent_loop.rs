@@ -1137,10 +1137,15 @@ impl AgentLoop {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
             {
+                // Namespace the cohort by this turn's `job_id` so reusing a
+                // group name in a later turn opens a fresh cohort rather than
+                // extending the prior (still-sealed, still-draining) one. The
+                // spawner stamps the escorted member's `group` through the
+                // same helper, so routing back into the cohort agrees.
                 session
                     .state
                     .background_groups
-                    .entry(group.to_string())
+                    .entry(aura_model::GroupState::cohort_key(job_id, group))
                     .or_default()
                     .expected += 1;
             }
