@@ -289,6 +289,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aura-bench-swe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "aura-channels"
 version = "0.1.0"
 dependencies = [
