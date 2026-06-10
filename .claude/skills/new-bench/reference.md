@@ -261,20 +261,19 @@ bench generates the config, so it fixes `api_key_env: "AURA_API_KEY"` in the
 `aura.json` it writes and injects the value under `AURA_API_KEY` — the env-var name
 is an internal constant, not a user choice. The user only supplies the *value*; to
 reuse a key already in another var, set `AURA_API_KEY=$DEEPSEEK_API_KEY` in `.env`
-(it's shell-sourced, so it expands).
+(it's shell-sourced, so it expands). This holds even for an external-harness adapter:
+`bench/terminal` drives Terminal-Bench yet still uses the bare `AURA_API_KEY` /
+`AURA_MODEL` / `AURA_BASE_URL` (+ `AURA_BIN` for the binary) — no sub-namespace,
+since nothing else owns `AURA_*`.
 
-Extend the set only for a real reason — keeping the `AURA_` prefix on any extra
-vars — and the two cases that already exist:
-- **a second LLM role** → keep each role's key in its own named var (so one key can
-  serve both — the one case where naming the var earns its place). `bench/memory`
-  reads its LLM-judge key from `DEEPSEEK_API_KEY` always, and gives the *answer*
-  model its own `ANSWER_PROVIDER` / `ANSWER_MODEL` / `ANSWER_API_KEY_ENV` /
-  `ANSWER_BASE_URL`, with `ANSWER_API_KEY_ENV` defaulting to that same
-  `DEEPSEEK_API_KEY` so one key covers both.
-- **an external-harness adapter** → add a sub-namespace so the vars can't collide
-  with the harness's own env. `bench/terminal` uses `AURA_TB_API_KEY` /
-  `AURA_TB_MODEL` / `AURA_TB_BASE_URL`, deriving the config's `api_key_env` from the
-  provider.
+Extend the set only when a bench genuinely has **more than one LLM role** — keep the
+`AURA_` prefix and give each role its own descriptive vars, so one key can serve both
+(the one case where naming the key's env-var earns its place). `bench/memory`
+benchmarks memory backends with a fixed *answer* model **and** an LLM judge: the
+answerer gets `AURA_ANSWER_PROVIDER` / `AURA_ANSWER_MODEL` / `AURA_ANSWER_API_KEY_ENV`
+/ `AURA_ANSWER_BASE_URL` (the env knob defaulting to the judge's `DEEPSEEK_API_KEY` so
+one key covers both), while the judge stays on `DEEPSEEK_API_KEY` and the backends on
+`OPENVIKING_*` / `MEM0_*` — provider/infra config has no canonical form.
 
 Bench-specific backend/server config (endpoints, dims, auth tokens — e.g. memory's
 `OPENVIKING_*` / `MEM0_*`) is added on top; it has no canonical form.

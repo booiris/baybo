@@ -56,23 +56,23 @@ cp .env.example .env && $EDITOR .env   # set the API key (+ optional model/base_
 ```
 
 `run.sh` builds the `bench-passthrough` musl binary on first use
-(`AURA_TB_REBUILD=1` forces a rebuild), then runs the equivalent of — no global
+(`AURA_REBUILD=1` forces a rebuild), then runs the equivalent of — no global
 install, no `PYTHONPATH`, env from the lockfile:
 
 ```bash
 uv run tb run --agent-import-path tb_adapter.aura_agent:AuraAgent \
-  --model "$AURA_TB_MODEL" -d terminal-bench-core==0.1.1 …
+  --model "$AURA_MODEL" -d terminal-bench-core==0.1.1 …
 ```
 
 Adapter configuration (all via env — see [`.env.example`](.env.example)):
 
-- **API key** (the one required value) — `AURA_TB_API_KEY` (provider-agnostic) or
+- **API key** (the one required value) — `AURA_API_KEY` (provider-agnostic) or
   the provider's own env var (`DEEPSEEK_API_KEY` / `OPENAI_API_KEY` /
   `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY`).
 - **Model** — `--model <provider>/<model>` (CLI flag, wins; also used by the
-  harness for run naming) or `AURA_TB_MODEL`. Known providers: `deepseek`,
+  harness for run naming) or `AURA_MODEL`. Known providers: `deepseek`,
   `openai`, `anthropic`, `gemini`/`google`, `openrouter`.
-- **Base URL** — `AURA_TB_BASE_URL` (optional): a custom / OpenAI-compatible
+- **Base URL** — `AURA_BASE_URL` (optional): a custom / OpenAI-compatible
   endpoint, proxy, or gateway; empty = the provider's built-in URL.
 - Pick a capable model — weak tool-callers (e.g. `deepseek-chat`) intermittently
   claim completion without invoking tools, which tanks scores independent of the

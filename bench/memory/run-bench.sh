@@ -53,10 +53,10 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 : "${AURA_BIN:=$REPO_ROOT/target/release/aura}"   # built with the bench feature below
 # Self-contained answer model — the model Aura answers with (ignored when
 # AURA_CONFIG is set). Defaults = DeepSeek; repoint at any provider to compare.
-: "${ANSWER_MODEL:=deepseek-chat}"
-: "${ANSWER_PROVIDER:=deepseek}"
-: "${ANSWER_API_KEY_ENV:=DEEPSEEK_API_KEY}"   # env var holding the provider key
-: "${ANSWER_BASE_URL:=}"                       # empty = provider's built-in endpoint
+: "${AURA_ANSWER_MODEL:=deepseek-chat}"
+: "${AURA_ANSWER_PROVIDER:=deepseek}"
+: "${AURA_ANSWER_API_KEY_ENV:=DEEPSEEK_API_KEY}"   # env var holding the provider key
+: "${AURA_ANSWER_BASE_URL:=}"                       # empty = provider's built-in endpoint
 LOCOMO_URL="https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
 PKG="aura-bench-memory"
 # ---------------------------------------------------------------------------
@@ -73,8 +73,8 @@ if [ -n "$AURA_CONFIG" ]; then CFG_ARG="--aura-config $AURA_CONFIG"; fi
 # Self-contained answer model → CLI flags (skipped under --aura-config: yours wins).
 ANSWER_ARG=""
 if [ -z "$AURA_CONFIG" ]; then
-  ANSWER_ARG="--answer-model $ANSWER_MODEL --answer-provider $ANSWER_PROVIDER --answer-api-key-env $ANSWER_API_KEY_ENV"
-  [ -n "$ANSWER_BASE_URL" ] && ANSWER_ARG="$ANSWER_ARG --answer-base-url $ANSWER_BASE_URL"
+  ANSWER_ARG="--answer-model $AURA_ANSWER_MODEL --answer-provider $AURA_ANSWER_PROVIDER --answer-api-key-env $AURA_ANSWER_API_KEY_ENV"
+  [ -n "$AURA_ANSWER_BASE_URL" ] && ANSWER_ARG="$ANSWER_ARG --answer-base-url $AURA_ANSWER_BASE_URL"
 fi
 # Optional --allow-unsettled (run QA even if extraction never settled).
 UNSETTLED_ARG=""
@@ -108,8 +108,8 @@ if [ "$DRY_RUN" != "1" ]; then
   : "${DEEPSEEK_API_KEY:?required — used by the judge model}"
   # Self-contained answer model needs its provider's API key present too.
   if [ -z "$AURA_CONFIG" ]; then
-    answer_key="${!ANSWER_API_KEY_ENV:-}"
-    : "${answer_key:?required — \$$ANSWER_API_KEY_ENV holds the $ANSWER_PROVIDER answer-model key (or set AURA_CONFIG to use your own)}"
+    answer_key="${!AURA_ANSWER_API_KEY_ENV:-}"
+    : "${answer_key:?required — \$$AURA_ANSWER_API_KEY_ENV holds the $AURA_ANSWER_PROVIDER answer-model key (or set AURA_CONFIG to use your own)}"
   fi
   for arm in $ARMS; do
     case "$arm" in

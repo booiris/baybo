@@ -11,7 +11,7 @@ Two things make aura work in-container:
     `sandbox.mode = passthrough` (its Bash runs commands directly — no bwrap,
     no work-dir jail). That mode only exists in an aura built with the
     `bench-passthrough` feature (see the repo root `Cargo.toml`), which is
-    exactly the binary you point `AURA_TB_BINARY` at — the analog of Codex's
+    exactly the binary you point `AURA_BIN` at — the analog of Codex's
     `--sandbox danger-full-access`.
 
 Use it via the harness's custom-agent flag (no fork of terminal-bench). The env
@@ -46,7 +46,7 @@ _KEY_PATH = f"{_CONTAINER_DIR}/enc.key"
 
 # The bench-passthrough aura binary copied into each container. Defaults to the
 # musl build output (repo-root-relative: this file is bench/terminal/tb_adapter/);
-# AURA_TB_BINARY overrides it (e.g. a glibc build or a custom path).
+# AURA_BIN overrides it (e.g. a glibc build or a custom path).
 _DEFAULT_BINARY = (
     Path(__file__).resolve().parents[3]
     / "target"
@@ -74,11 +74,11 @@ class AuraAgent(AbstractInstalledAgent):
 
     def __init__(self, model_name: str | None = None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Model: `--model <provider>/<model>` (harness flag) or AURA_TB_MODEL.
-        model_name = model_name or os.environ.get("AURA_TB_MODEL")
+        # Model: `--model <provider>/<model>` (harness flag) or AURA_MODEL.
+        model_name = model_name or os.environ.get("AURA_MODEL")
         if not model_name:
             raise RuntimeError(
-                "no model selected: pass `--model <provider>/<model>` or set AURA_TB_MODEL"
+                "no model selected: pass `--model <provider>/<model>` or set AURA_MODEL"
             )
         provider, sep, model = model_name.partition("/")
         if not sep:
@@ -94,34 +94,34 @@ class AuraAgent(AbstractInstalledAgent):
                 f"known providers: {sorted(_PROVIDER_KEY_ENV)}"
             )
         self._key_env = key_env
-        # API key value: AURA_TB_API_KEY (provider-agnostic) wins, else the
+        # API key value: AURA_API_KEY (provider-agnostic) wins, else the
         # provider's own env var. aura.json references it by name (`api_key_env`)
         # and `_env` injects this value under that name — never written to disk.
-        self._key_value = os.environ.get("AURA_TB_API_KEY") or os.environ.get(key_env)
+        self._key_value = os.environ.get("AURA_API_KEY") or os.environ.get(key_env)
         if not self._key_value:
             raise RuntimeError(
-                f"set AURA_TB_API_KEY or ${key_env} to run the aura agent for "
+                f"set AURA_API_KEY or ${key_env} to run the aura agent for "
                 f"provider '{provider}'"
             )
 
         # Optional custom endpoint (proxy / self-hosted / gateway). Empty = the
         # provider's built-in base URL.
-        self._base_url = os.environ.get("AURA_TB_BASE_URL") or None
+        self._base_url = os.environ.get("AURA_BASE_URL") or None
 
-        # Defaults to the musl build output; AURA_TB_BINARY overrides.
-        self._aura_bin = Path(os.environ.get("AURA_TB_BINARY") or _DEFAULT_BINARY)
+        # Defaults to the musl build output; AURA_BIN overrides.
+        self._aura_bin = Path(os.environ.get("AURA_BIN") or _DEFAULT_BINARY)
         if not self._aura_bin.is_file():
             raise RuntimeError(
                 f"aura binary not found at {self._aura_bin}. Build it with "
                 "`cargo build --release --target x86_64-unknown-linux-musl "
-                "--features bench-passthrough`, or set AURA_TB_BINARY to your binary."
+                "--features bench-passthrough`, or set AURA_BIN to your binary."
             )
 
     @property
     def _env(self) -> dict[str, str]:
         # The provider key, sourced into the tmux session before install so it
         # persists for the `aura prompt` run. aura.json names this env var
-        # (`api_key_env`); the value (from AURA_TB_API_KEY or the provider's own
+        # (`api_key_env`); the value (from AURA_API_KEY or the provider's own
         # env var) is injected here under that name and never written to disk.
         return {self._key_env: self._key_value}
 
