@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Show the memory aura actually recalled while answering each bench question.
 
-Each QA question runs in its own aura session whose transcript is saved at
-  aura-ws/aura-bench-ws-<run_id>-<arm>/logs/sessions/qa-<run_id>-<arm>-c<conv>-q<idx>.jsonl
-Inside it, the backend's recall lands as messages with role=user,
-source="recalled_memory". This tool prints, per question: the question + gold +
-correct (from the results JSON), every recalled_memory block, and aura's final
-answer — so you can tell whether a wrong answer was a recall miss (the fact was
-never recalled) or an integration failure (it was recalled but unused).
+Each QA question runs in its own aura session, exported (default-on; NO_TRACE=1
+disables) by run-bench.sh to
+  trace/<run_id>/<arm>/qa-<run_id>-<arm>-c<conv>-q<idx>.messages.json
+— the JSON that `aura session history --include-superseded --json` emits. Inside
+it the backend's recall rides as a `role=user`, `source="recalled_memory"`
+message. This tool prints, per question: the question + gold + correct (from the
+results JSON), every recalled_memory block, and aura's final answer — so you can
+tell whether a wrong answer was a recall miss (the fact was never recalled) or an
+integration failure (it was recalled but unused).
 
 Usage:
   python3 bench/memory/trace_recall.py <arm> <run_id> [--conv N] [--q I] [--incorrect] [--limit N] [--chars K]
@@ -24,27 +26,29 @@ from pathlib import Path
 BENCH = Path(__file__).resolve().parent
 
 
+def _text(content):
+    """Concatenate a message's Text blocks. ContentBlock is externally tagged, so
+    a text block is `{"Text": "..."}`; non-text blocks (ToolUse / Thinking / …)
+    are skipped."""
+    if isinstance(content, list):
+        parts = [x["Text"] for x in content if isinstance(x, dict) and "Text" in x]
+        return "\n".join(parts) if parts else json.dumps(content)
+    return str(content)
+
+
 def session_recall(path):
-    """Return (recall_blocks, final_answer) from one session transcript."""
+    """Return (recall_blocks, final_answer) from one session's exported transcript
+    — the single object `aura session history --include-superseded --json` emits:
+    `{"session", "messages": [{"ordinal", "superseded_by", "message"}, …]}`."""
     blocks, answer = [], None
-    for line in open(path):
-        o = json.loads(line)
-        if o.get("type") != "message":
-            continue
-        m = o["message"]
+    data = json.load(open(path))
+    for entry in data.get("messages", []):
+        m = entry.get("message", entry)
         content = m.get("content")
         if m.get("source") == "recalled_memory":
-            if isinstance(content, list):
-                blocks.append("\n".join(
-                    x.get("Text", str(x)) if isinstance(x, dict) else str(x) for x in content
-                ))
-            else:
-                blocks.append(str(content))
+            blocks.append(_text(content))
         elif m.get("role") == "assistant":
-            if isinstance(content, list) and content and isinstance(content[0], dict):
-                answer = content[0].get("Text", str(content))
-            else:
-                answer = str(content)
+            answer = _text(content)
     return blocks, answer
 
 
@@ -59,7 +63,12 @@ def main():
     ap.add_argument("--chars", type=int, default=500, help="chars per recall block (0 = full)")
     args = ap.parse_args()
 
-    sessions = BENCH / f"aura-ws/aura-bench-ws-{args.run_id}-{args.arm}/logs/sessions"
+    sessions = BENCH / "trace" / args.run_id / args.arm
+    if not sessions.is_dir():
+        raise SystemExit(
+            f"no traces at {sessions} — re-run with trace export on (the default; "
+            f"unset NO_TRACE) for arm={args.arm}, run_id={args.run_id}"
+        )
     res = json.load(open(BENCH / "results" / f"results-{args.arm}-{args.run_id}.json"))
     by_conv = {}
     for r in res["results"]:
@@ -69,7 +78,7 @@ def main():
         return tuple(int(x) for x in re.search(r"-c(\d+)-q(\d+)", p.name).groups())
 
     shown = 0
-    for f in sorted(sessions.glob(f"qa-{args.run_id}-{args.arm}-c*-q*.jsonl"), key=key):
+    for f in sorted(sessions.glob(f"qa-{args.run_id}-{args.arm}-c*-q*.messages.json"), key=key):
         conv, qi = key(f)
         if args.conv is not None and conv != args.conv:
             continue

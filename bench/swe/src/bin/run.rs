@@ -18,8 +18,8 @@ use aura_bench_swe::agent::{self, AgentModel, RunOpts};
 use aura_bench_swe::grader::{self, GraderConfig, Predictions};
 use aura_bench_swe::report::{InstanceResult, ReportMeta, aggregate, print_table};
 use aura_bench_swe::{
-    SweInstance, arm_model_name, default_run_id, load_instances, parse_model, prediction_line,
-    predictions_jsonl,
+    AURA_API_KEY_ENV, SweInstance, arm_model_name, default_run_id, load_instances, parse_model,
+    prediction_line, predictions_jsonl,
 };
 use clap::{Parser, ValueEnum};
 use futures::{StreamExt, stream};
@@ -83,14 +83,18 @@ struct Args {
     /// assumes the `deepseek` provider. (agent arm)
     #[arg(long, default_value = "deepseek/deepseek-v4-flash")]
     model: String,
-    /// Env var holding the agent's API key (provider-agnostic). Override only to
-    /// read the key from a different variable.
-    #[arg(long, default_value = "API_KEY")]
-    api_key_env: String,
     /// Custom LLM base URL (proxy / self-hosted / gateway). Empty => the
     /// provider's built-in endpoint.
     #[arg(long)]
     base_url: Option<String>,
+
+    /// Base dir for per-run transcripts + call-tree traces
+    /// (`<dir>/<run_id>/<arm>/<instance>.{messages,trace}.json`). (agent arm)
+    #[arg(long, default_value = "trace")]
+    trace_dir: PathBuf,
+    /// Disable transcript/trace export (default: export every agent run).
+    #[arg(long)]
+    no_trace: bool,
 
     /// Eval containers run concurrently (agent arm).
     #[arg(long, default_value_t = 4)]
@@ -108,9 +112,14 @@ struct Args {
     #[arg(long)]
     run_id: Option<String>,
 
-    /// Directory for predictions, the harness report, and the results JSON.
+    /// Directory for the final results JSON report only.
     #[arg(long, default_value = "results")]
     results_dir: PathBuf,
+
+    /// Directory for the run's working artifacts — predictions, the swebench
+    /// harness report, and its per-instance logs (kept out of `results/`).
+    #[arg(long, default_value = "runs")]
+    runs_dir: PathBuf,
 
     /// `python` interpreter that has `swebench` installed.
     #[arg(long, default_value = "python")]
@@ -158,10 +167,16 @@ async fn main() -> Result<()> {
 
     std::fs::create_dir_all(&args.results_dir)
         .with_context(|| format!("create results dir {}", args.results_dir.display()))?;
+    std::fs::create_dir_all(&args.runs_dir)
+        .with_context(|| format!("create runs dir {}", args.runs_dir.display()))?;
     let results_dir = args
         .results_dir
         .canonicalize()
         .unwrap_or_else(|_| args.results_dir.clone());
+    let runs_dir = args
+        .runs_dir
+        .canonicalize()
+        .unwrap_or_else(|_| args.runs_dir.clone());
     let instance_ids: Vec<String> = instances.iter().map(|i| i.instance_id.clone()).collect();
 
     // Agent arm: run aura per instance → patches. Other arms have no run metrics.
@@ -185,8 +200,7 @@ async fn main() -> Result<()> {
                     prediction_line(&inst.instance_id, model_name, patch)
                 })
                 .collect();
-            let path =
-                results_dir.join(format!("predictions-{}-{run_id}.jsonl", args.arm.as_str()));
+            let path = runs_dir.join(format!("predictions-{}-{run_id}.jsonl", args.arm.as_str()));
             std::fs::write(&path, predictions_jsonl(&lines))
                 .with_context(|| format!("write predictions {}", path.display()))?;
             tracing::info!(path = %path.display(), "predictions written");
@@ -202,7 +216,7 @@ async fn main() -> Result<()> {
             run_id: run_id.clone(),
             max_workers: args.max_workers,
             model_name: model_name.to_string(),
-            results_dir: results_dir.clone(),
+            runs_dir: runs_dir.clone(),
             instance_ids: instance_ids.clone(),
             namespace: args.namespace.clone(),
         },
@@ -273,10 +287,10 @@ async fn run_agent(
     if !aura_bin.exists() {
         bail!("aura binary not found at {}", aura_bin.display());
     }
-    // Split `<provider>/<model>`; read the key from `--api-key-env` (default
-    // `API_KEY`, provider-agnostic).
+    // Split `<provider>/<model>`; read the key from the canonical `AURA_API_KEY`
+    // (the bench fixes the env-var name — it's not a user knob).
     let (provider, model) = parse_model(&args.model);
-    let api_key_env = args.api_key_env.clone();
+    let api_key_env = AURA_API_KEY_ENV.to_string();
     let key_value = std::env::var(&api_key_env).map_err(|_| {
         anyhow::anyhow!("the agent arm needs the model key in ${api_key_env} (set it in .env)")
     })?;
@@ -325,6 +339,9 @@ async fn run_agent(
     let key_val = &key_value;
     let timeout = args.prompt_timeout;
     let run_id_ref = run_id;
+    let trace_arm_dir: Option<PathBuf> =
+        (!args.no_trace).then(|| args.trace_dir.join(run_id).join(args.arm.as_str()));
+    let trace_ref = trace_arm_dir.as_deref();
     tracing::info!(
         instances = instances.len(),
         concurrency = args.concurrency,
@@ -342,6 +359,7 @@ async fn run_agent(
                 session_id: format!("swe-{run_id_ref}-{}", inst.instance_id),
                 container_name: format!("aura-swe-{run_id_ref}-{}", inst.instance_id),
                 prompt_timeout_secs: timeout,
+                trace_dir: trace_ref,
             };
             let run = agent::run_instance(opts).await;
             if let Some(err) = &run.error {

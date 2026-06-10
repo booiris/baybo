@@ -17,6 +17,12 @@ pub mod agent;
 pub mod grader;
 pub mod report;
 
+/// Canonical env var the agent arm reads the model's API key from. The bench
+/// generates the in-container `aura.json`, so the env-var name is fixed here
+/// (written into `api_key_env` and injected via `docker run -e`) rather than a
+/// user knob — matching the `new-bench` skill's canonical `AURA_API_KEY`.
+pub const AURA_API_KEY_ENV: &str = "AURA_API_KEY";
+
 /// One normalized SWE-bench task instance, as exported by `swe_export.py`.
 ///
 /// `image_key` is the Docker image the **official** harness uses for this

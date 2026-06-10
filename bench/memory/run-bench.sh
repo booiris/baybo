@@ -45,7 +45,8 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 : "${OUTDIR:=$BENCH_DIR/bench-out}"   # bench scratch (gitignored): dataset + manifests
 : "${DATASET:=$OUTDIR/locomo10.json}"
 : "${RESULTS_DIR:=$BENCH_DIR/results}"   # per-run result JSONs — tracked in git (sibling of bench-out)
-: "${WS_ROOT:=$BENCH_DIR/aura-ws}"    # per-run aura workspaces (gitignored): config + vault + sessions + logs
+: "${TRACE_DIR:=$BENCH_DIR/trace}"       # per-question transcripts + traces (gitignored); NO_TRACE=1 to disable
+: "${WS_ROOT:=$BENCH_DIR/runs}"       # per-run aura workspaces (gitignored): config + vault + sessions + logs
 : "${RUN_ID:=bench-$(date +%Y%m%d-%H%M%S)}"
 : "${RUST_LOG:=aura_bench_memory=info}"; export RUST_LOG
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -53,10 +54,10 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 : "${AURA_BIN:=$REPO_ROOT/target/release/aura}"   # built with the bench feature below
 # Self-contained answer model — the model Aura answers with (ignored when
 # AURA_CONFIG is set). Defaults = DeepSeek; repoint at any provider to compare.
-: "${ANSWER_MODEL:=deepseek-chat}"
-: "${ANSWER_PROVIDER:=deepseek}"
-: "${ANSWER_API_KEY_ENV:=DEEPSEEK_API_KEY}"   # env var holding the provider key
-: "${ANSWER_BASE_URL:=}"                       # empty = provider's built-in endpoint
+: "${AURA_ANSWER_MODEL:=deepseek-chat}"
+: "${AURA_ANSWER_PROVIDER:=deepseek}"
+: "${AURA_ANSWER_API_KEY_ENV:=DEEPSEEK_API_KEY}"   # env var holding the provider key
+: "${AURA_ANSWER_BASE_URL:=}"                       # empty = provider's built-in endpoint
 LOCOMO_URL="https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
 PKG="aura-bench-memory"
 # ---------------------------------------------------------------------------
@@ -73,8 +74,8 @@ if [ -n "$AURA_CONFIG" ]; then CFG_ARG="--aura-config $AURA_CONFIG"; fi
 # Self-contained answer model → CLI flags (skipped under --aura-config: yours wins).
 ANSWER_ARG=""
 if [ -z "$AURA_CONFIG" ]; then
-  ANSWER_ARG="--answer-model $ANSWER_MODEL --answer-provider $ANSWER_PROVIDER --answer-api-key-env $ANSWER_API_KEY_ENV"
-  [ -n "$ANSWER_BASE_URL" ] && ANSWER_ARG="$ANSWER_ARG --answer-base-url $ANSWER_BASE_URL"
+  ANSWER_ARG="--answer-model $AURA_ANSWER_MODEL --answer-provider $AURA_ANSWER_PROVIDER --answer-api-key-env $AURA_ANSWER_API_KEY_ENV"
+  [ -n "$AURA_ANSWER_BASE_URL" ] && ANSWER_ARG="$ANSWER_ARG --answer-base-url $AURA_ANSWER_BASE_URL"
 fi
 # Optional --allow-unsettled (run QA even if extraction never settled).
 UNSETTLED_ARG=""
@@ -82,6 +83,9 @@ if [ "$ALLOW_UNSETTLED" = 1 ]; then UNSETTLED_ARG="--allow-unsettled"; fi
 # mem0 base URL → self-hosted OSS server (empty = managed cloud Platform).
 MEM0_ARG=""
 if [ -n "$MEM0_BASE_URL" ]; then MEM0_ARG="--mem0-base-url $MEM0_BASE_URL"; fi
+# Disable trace export when NO_TRACE is set (default: export every question's transcript + trace).
+TRACE_ARG=""
+if [ -n "${NO_TRACE:-}" ]; then TRACE_ARG="--no-trace"; fi
 
 # Warm the OpenViking embedding endpoint so the first recalls don't hit the
 # model's cold-start (~20s) and time out — that alone swings the score wildly
@@ -108,8 +112,8 @@ if [ "$DRY_RUN" != "1" ]; then
   : "${DEEPSEEK_API_KEY:?required — used by the judge model}"
   # Self-contained answer model needs its provider's API key present too.
   if [ -z "$AURA_CONFIG" ]; then
-    answer_key="${!ANSWER_API_KEY_ENV:-}"
-    : "${answer_key:?required — \$$ANSWER_API_KEY_ENV holds the $ANSWER_PROVIDER answer-model key (or set AURA_CONFIG to use your own)}"
+    answer_key="${!AURA_ANSWER_API_KEY_ENV:-}"
+    : "${answer_key:?required — \$$AURA_ANSWER_API_KEY_ENV holds the $AURA_ANSWER_PROVIDER answer-model key (or set AURA_CONFIG to use your own)}"
   fi
   for arm in $ARMS; do
     case "$arm" in
@@ -172,17 +176,18 @@ run_arm() {
       echo ">> [$arm] QA run -> $results"
       cargo run -q -p "$PKG" --bin run -- \
         --arm "$arm" --dataset "$DATASET" --conversations "$CONVERSATIONS" \
-        --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" $Q_ARG $UNSETTLED_ARG $MEM0_ARG \
+        --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" --run-id "$RUN_ID" $Q_ARG $UNSETTLED_ARG $MEM0_ARG \
         $CFG_ARG $ANSWER_ARG --openviking-endpoint "$OPENVIKING_ENDPOINT" \
         --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" \
-        --manifest "$manifest" --out "$results"
+        --manifest "$manifest" --out "$results" --trace-dir "$TRACE_DIR" $TRACE_ARG
       ;;
     noop | oracle)
       echo ">> [$arm] QA run -> $results"
       cargo run -q -p "$PKG" --bin run -- \
         --arm "$arm" --dataset "$DATASET" --conversations "$CONVERSATIONS" \
-        --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" $Q_ARG \
-        $CFG_ARG $ANSWER_ARG --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" --out "$results"
+        --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" --run-id "$RUN_ID" $Q_ARG \
+        $CFG_ARG $ANSWER_ARG --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" --out "$results" \
+        --trace-dir "$TRACE_DIR" $TRACE_ARG
       ;;
   esac
 }

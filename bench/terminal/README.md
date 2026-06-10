@@ -56,29 +56,34 @@ cp .env.example .env && $EDITOR .env   # set the API key (+ optional model/base_
 ```
 
 `run.sh` builds the `bench-passthrough` musl binary on first use
-(`AURA_TB_REBUILD=1` forces a rebuild), then runs the equivalent of — no global
+(`AURA_REBUILD=1` forces a rebuild), then runs the equivalent of — no global
 install, no `PYTHONPATH`, env from the lockfile:
 
 ```bash
 uv run tb run --agent-import-path tb_adapter.aura_agent:AuraAgent \
-  --model "$AURA_TB_MODEL" -d terminal-bench-core==0.1.1 …
+  --model "$AURA_MODEL" -d terminal-bench-core==0.1.1 …
 ```
 
 Adapter configuration (all via env — see [`.env.example`](.env.example)):
 
-- **API key** (the one required value) — `AURA_TB_API_KEY` (provider-agnostic) or
+- **API key** (the one required value) — `AURA_API_KEY` (provider-agnostic) or
   the provider's own env var (`DEEPSEEK_API_KEY` / `OPENAI_API_KEY` /
   `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY`).
 - **Model** — `--model <provider>/<model>` (CLI flag, wins; also used by the
-  harness for run naming) or `AURA_TB_MODEL`. Known providers: `deepseek`,
+  harness for run naming) or `AURA_MODEL`. Known providers: `deepseek`,
   `openai`, `anthropic`, `gemini`/`google`, `openrouter`.
-- **Base URL** — `AURA_TB_BASE_URL` (optional): a custom / OpenAI-compatible
+- **Base URL** — `AURA_BASE_URL` (optional): a custom / OpenAI-compatible
   endpoint, proxy, or gateway; empty = the provider's built-in URL.
 - Pick a capable model — weak tool-callers (e.g. `deepseek-chat`) intermittently
   claim completion without invoking tools, which tanks scores independent of the
   plumbing.
 - The harness reports `resolved` / accuracy / pass@k and records each run's
-  asciinema cast — the comparable number.
+  asciinema cast — the comparable number. `run.sh` surfaces the run's
+  `results.json` into `results/results-<ts>.json` (the full tb output — casts,
+  logs — stays under `runs/<ts>/`), matching swe/memory's `results/`.
+- Each task also writes aura's **verbatim transcript + call-tree trace** to
+  `trace/<run>/<task>/…/{messages,trace}.json` (mirroring `runs/`), so you can see
+  what the agent did beyond the cast. Default-on; `NO_TRACE=1` disables it.
 
 **Sanity first:** run the harness's own `--agent oracle` on a couple of tasks to
 confirm Docker + the harness work before pointing it at aura.

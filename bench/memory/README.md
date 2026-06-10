@@ -65,9 +65,9 @@ Two phases, coupled by a **manifest**:
 | Var / flag | Used by | Notes |
 | --- | --- | --- |
 | `--aura-config` | `run` | **optional override.** Omit → self-contained config (fresh workspace + minted key + the configurable answer model below). Given → derive from yours (reuse its workspace/keys/llm), overwriting only the `memory` section. |
-| `--answer-model` / `--answer-provider` / `--answer-api-key-env` / `--answer-base-url` (env: `ANSWER_MODEL` / `ANSWER_PROVIDER` / `ANSWER_API_KEY_ENV` / `ANSWER_BASE_URL`) | `run` (self-contained only) | the model Aura answers with. Defaults reproduce the DeepSeek answerer (`deepseek` / `deepseek-chat` / `DEEPSEEK_API_KEY`, provider default endpoint); point them at any Aura-supported provider to benchmark its cost/quality. Ignored with `--aura-config`. |
+| `--answer-model` / `--answer-provider` / `--answer-api-key-env` / `--answer-base-url` (env: `AURA_ANSWER_MODEL` / `AURA_ANSWER_PROVIDER` / `AURA_ANSWER_API_KEY_ENV` / `AURA_ANSWER_BASE_URL`) | `run` (self-contained only) | the model Aura answers with. Defaults reproduce the DeepSeek answerer (`deepseek` / `deepseek-chat` / `DEEPSEEK_API_KEY`, provider default endpoint); point them at any Aura-supported provider to benchmark its cost/quality. Ignored with `--aura-config`. |
 | `--aura-bin` | `run` | the `aura` built with `--features bench-readonly-memory` (default `aura` on PATH). |
-| `DEEPSEEK_API_KEY` | `run` | judge model always; the self-contained answer model when `ANSWER_API_KEY_ENV` is left at its default — the gateway inherits whichever key env you point it at |
+| `DEEPSEEK_API_KEY` | `run` | judge model always; the self-contained answer model when `AURA_ANSWER_API_KEY_ENV` is left at its default — the gateway inherits whichever key env you point it at |
 | `OPENVIKING_API_KEY` | `ingest` + `run` openviking arm | matches `ov.conf`'s root key; the agent resolves it from this env var |
 | `OPENVIKING_ENDPOINT` | `ingest` openviking arm | or `--openviking-endpoint` |
 | `MEM0_BASE_URL` | `ingest`/`run` mem0 arm | self-hosted docker server (default `http://127.0.0.1:8765`, shares OV's DeepSeek+Qwen3 stack); blank it to use the cloud Platform |
@@ -76,7 +76,7 @@ Two phases, coupled by a **manifest**:
 So you write **no `aura.json`** and need no pre-existing `~/.aura` — the bench
 mints a fresh, isolated workspace per arm (so nothing of yours is touched and
 there's no pollution). Those workspaces (config + vault + sessions + logs) go
-under `aura-ws/` (gitignored, override with `WS_ROOT` / `--workspace-root`;
+under `runs/` (gitignored, override with `WS_ROOT` / `--workspace-root`;
 defaults to the system temp dir when the bins are run directly). The **answer
 model** (the model Aura answers with) defaults to DeepSeek `deepseek-chat`, but
 provider, model, key-env, and base URL are all configurable —
@@ -158,6 +158,11 @@ run's artifacts; neither starts a gateway or spends anything. (Run-id suffix:
 `noop`/`oracle` were `full10`, `mem0`/`openviking` were `full10b` — pass whichever
 `<run_id>` produced the results you're reading.)
 
+Alongside, every question writes its **verbatim transcript + call-tree trace** to
+`trace/<run_id>/<arm>/<session>.{messages,trace}.json` (`aura session history` +
+`session export`) — the raw record of what aura recalled, answered, and called per
+question. Default-on; `NO_TRACE=1` disables it; `trace/` is gitignored.
+
 **`trace_incorrect.py` — back to the source dialogue.** Matches each incorrect
 answer (by `conv_idx` + question) to its LOCOMO `evidence` dia_ids and the
 original dialogue turns. LOCOMO's `evidence` often points at a lead-in line while
@@ -170,9 +175,9 @@ python3 bench/memory/trace_incorrect.py oracle full10 --context 1 --limit 15
 python3 bench/memory/trace_incorrect.py openviking full10b --conv 0
 ```
 
-**`trace_recall.py` — what aura actually recalled.** Each question runs in its own
-aura session (`aura-ws/aura-bench-ws-<run_id>-<arm>/logs/sessions/`); the backend's
-recall lands there as `source="recalled_memory"` messages. Prints, per question:
+**`trace_recall.py` — what aura actually recalled.** Reads each question's exported
+transcript (`trace/<run_id>/<arm>/qa-*.messages.json`); the backend's recall rides
+there as a `source="recalled_memory"` message. Prints, per question:
 question + gold + correct, every recalled block, and aura's final answer — pinning
 a wrong answer to a **recall miss** (fact never recalled), an **extraction loss**
 (recalled but the detail was generalized away), or an **integration failure**

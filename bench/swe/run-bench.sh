@@ -15,7 +15,7 @@
 # Quick start — offline floor vs ceiling on the first SWE-bench_Lite instance:
 #   bench/swe/run-bench.sh
 #
-# A few specific instances, all three arms (agent needs API_KEY):
+# A few specific instances, all three arms (agent needs AURA_API_KEY):
 #   ARMS="noop oracle agent" INSTANCE_IDS="sympy__sympy-20590" bench/swe/run-bench.sh
 #
 # Preview the plan (still needs swebench to resolve image keys, but no Docker/spend):
@@ -40,15 +40,16 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 : "${CONCURRENCY:=4}"                           # agent eval containers in parallel
 : "${MAX_WORKERS:=4}"                           # grader harness workers
 : "${PROMPT_TIMEOUT:=1800}"                     # per-instance aura prompt ceiling (s)
-: "${MODEL:=deepseek/deepseek-v4-flash}"       # agent LLM as <provider>/<model>
-: "${API_KEY_ENV:=API_KEY}"                    # env var holding the agent key (provider-agnostic)
-: "${BASE_URL:=}"                              # empty => provider default endpoint
+: "${AURA_MODEL:=deepseek/deepseek-v4-flash}"  # agent LLM as <provider>/<model>
+: "${AURA_BASE_URL:=}"                         # empty => provider default endpoint
 : "${PYTHON:=}"                                # empty => the uv-managed bench/swe/.venv
 : "${DOCKER:=docker}"
 : "${MUSL_TARGET:=x86_64-unknown-linux-musl}"
 : "${AURA_BIN:=}"                              # agent arm; empty => build static musl here
 : "${OUTDIR:=$BENCH_DIR/bench-out}"            # scratch: instances.json (gitignored)
-: "${RESULTS_DIR:=$BENCH_DIR/results}"         # predictions + harness report + results JSON
+: "${RESULTS_DIR:=$BENCH_DIR/results}"         # the final results JSON report only
+: "${RUNS_DIR:=$BENCH_DIR/runs}"               # run working artifacts: predictions, swebench report + logs/
+: "${TRACE_DIR:=$BENCH_DIR/trace}"             # per-run transcripts + traces (gitignored); NO_TRACE=1 to disable
 : "${RUN_ID:=swe-$(date +%Y%m%d-%H%M%S)}"
 : "${DRY_RUN:=0}"
 : "${RUST_LOG:=aura_bench_swe=info}"; export RUST_LOG
@@ -56,7 +57,7 @@ INSTANCES="$OUTDIR/instances.json"
 PKG="aura-bench-swe"
 # ---------------------------------------------------------------------------
 
-mkdir -p "$OUTDIR" "$RESULTS_DIR"
+mkdir -p "$OUTDIR" "$RESULTS_DIR" "$RUNS_DIR"
 
 # ---- preflight ------------------------------------------------------------
 for arm in $ARMS; do
@@ -85,8 +86,7 @@ fi
 if [ "$DRY_RUN" != "1" ]; then
   $DOCKER info >/dev/null 2>&1 || { echo "Docker daemon not reachable ($DOCKER info failed)" >&2; exit 1; }
   if [ "$want_agent" = 1 ]; then
-    key="${!API_KEY_ENV:-}"
-    : "${key:?the agent arm needs the model key in \$$API_KEY_ENV (set it in .env)}"
+    : "${AURA_API_KEY:?the agent arm needs the model key in \$AURA_API_KEY (set it in .env)}"
   fi
 fi
 
@@ -149,16 +149,17 @@ run_arm() {
   local common=(
     --arm "$arm" --instances-json "$INSTANCES"
     --dataset-name "$DATASET_NAME" --split "$SPLIT"
-    --run-id "$RUN_ID" --results-dir "$RESULTS_DIR" --namespace "$NAMESPACE"
+    --run-id "$RUN_ID" --results-dir "$RESULTS_DIR" --runs-dir "$RUNS_DIR" --namespace "$NAMESPACE"
     --max-workers "$MAX_WORKERS" --python-bin "$PYTHON" --docker-bin "$DOCKER"
     --concurrency "$CONCURRENCY"
   )
   if [ "$arm" = agent ]; then
     local agent_args=(
-      --aura-bin "$AURA_BIN" --model "$MODEL" --prompt-timeout "$PROMPT_TIMEOUT"
+      --aura-bin "$AURA_BIN" --model "$AURA_MODEL" --prompt-timeout "$PROMPT_TIMEOUT"
+      --trace-dir "$TRACE_DIR"
     )
-    [ -n "$API_KEY_ENV" ] && agent_args+=(--api-key-env "$API_KEY_ENV")
-    [ -n "$BASE_URL" ] && agent_args+=(--base-url "$BASE_URL")
+    [ -n "$AURA_BASE_URL" ] && agent_args+=(--base-url "$AURA_BASE_URL")
+    [ -n "${NO_TRACE:-}" ] && agent_args+=(--no-trace)
     cargo run -q -p "$PKG" --bin run -- "${common[@]}" "${agent_args[@]}"
   else
     cargo run -q -p "$PKG" --bin run -- "${common[@]}"
