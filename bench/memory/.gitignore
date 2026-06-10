@@ -14,3 +14,5 @@
 # Self-hosted mem0 arm's qdrant vector store (docker volume mount).
 /mem0-data/
 /.env
+# Python bytecode from trace_recall.py / trace_incorrect.py.
+__pycache__/

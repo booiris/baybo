@@ -1,5 +1,6 @@
-# Provider key file, exported into the env for `tb run`. Never commit.
+# Provider key file + any backup (e.g. .env.bak from an env migration). Never commit.
 /.env
+/.env.bak
 
 # Python adapter bytecode (tb_adapter/).
 __pycache__/
