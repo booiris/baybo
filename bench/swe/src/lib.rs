@@ -31,6 +31,12 @@ pub struct SweInstance {
     #[serde(default)]
     pub version: String,
     pub image_key: String,
+    /// Docker `--cap-add` capabilities the grader applies to the eval container
+    /// (`docker_specs.run_args.cap_add` — e.g. Chart.js → `SYS_ADMIN`); empty for
+    /// the common Python instances. Applied to the agent's own container so it
+    /// matches the runtime grading uses (swebench `build_container`).
+    #[serde(default)]
+    pub cap_add: Vec<String>,
 }
 
 /// Read the `instances.json` array produced by `swe_export.py`.
@@ -145,6 +151,7 @@ mod tests {
             problem_statement: "Fix the widget rendering bug.".to_string(),
             version: "4.1".to_string(),
             image_key: "swebench/sweb.eval.x86_64.django__django-12345:latest".to_string(),
+            cap_add: vec![],
         }
     }
 

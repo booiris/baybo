@@ -71,6 +71,10 @@ def main():
         elif args.limit and len(out) >= args.limit:
             break
         spec = make_test_spec(row, namespace=namespace)
+        # The only container run-arg the grader applies (swebench build_container):
+        # docker_specs.run_args.cap_add (e.g. Chart.js -> ["SYS_ADMIN"]). Empty for
+        # the common Python instances.
+        cap_add = spec.docker_specs.get("run_args", {}).get("cap_add", [])
         out.append(
             {
                 "instance_id": row["instance_id"],
@@ -79,6 +83,7 @@ def main():
                 "problem_statement": row["problem_statement"],
                 "version": str(row.get("version", "")),
                 "image_key": spec.instance_image_key,
+                "cap_add": cap_add,
             }
         )
 

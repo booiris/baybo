@@ -171,22 +171,25 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
     let name = opts.container_name.as_str();
     let instance = opts.instance;
 
-    // 1. Start the eval image detached; the API key lives in the container env so
-    //    every exec (incl. the agent) inherits it.
-    let key_env_arg = format!("{}={}", opts.api_key_env, opts.api_key_value);
-    docker(
+    // 1. Start the eval image detached. `--cap-add` mirrors what the grader
+    //    applies (swebench `build_container` reads `docker_specs.run_args.cap_add`),
+    //    so the agent's container matches grading's runtime. The API key is passed
+    //    by NAME only (`-e NAME`, value in the docker process env) so the secret
+    //    never lands in argv / `ps`; the container env then carries it to every exec.
+    let mut run_args: Vec<&str> = vec!["run", "-d", "--name", name];
+    for cap in &instance.cap_add {
+        run_args.push("--cap-add");
+        run_args.push(cap.as_str());
+    }
+    run_args.push("-e");
+    run_args.push(opts.api_key_env);
+    run_args.push(instance.image_key.as_str());
+    run_args.push("sleep");
+    run_args.push("infinity");
+    docker_env(
         opts.docker_bin,
-        &[
-            "run",
-            "-d",
-            "--name",
-            name,
-            "-e",
-            &key_env_arg,
-            &instance.image_key,
-            "sleep",
-            "infinity",
-        ],
+        &run_args,
+        &[(opts.api_key_env, opts.api_key_value)],
     )
     .await
     .with_context(|| format!("docker run {}", instance.image_key))?;
@@ -256,8 +259,9 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
         TESTBED,
         "-e",
         "AURA_CONFIG_PATH=/installed-agent/aura.json",
-        "-e",
-        &key_env_arg,
+        // The API key is NOT re-passed here — the container already has it (from
+        // `docker run -e NAME`), and exec inherits the container env. Keeps the
+        // secret out of this argv too.
         name,
         // `bash -lc '<activate>; exec "$@"' aura <cmd...>`: activate the testbed
         // conda env, then exec aura. The aura command + the framed instruction
@@ -368,8 +372,19 @@ async fn read_cost(docker_bin: &str, name: &str, session: &str) -> Result<(u64, 
 
 /// Run `docker <args>`, capturing stdout; non-zero exit is an error.
 async fn docker(bin: &str, args: &[&str]) -> Result<String> {
-    let out = Command::new(bin)
-        .args(args)
+    docker_env(bin, args, &[]).await
+}
+
+/// `docker` with extra env vars set on the spawned docker process. Lets
+/// `docker run -e NAME` (name only) copy a secret into the container by name —
+/// the value rides in the docker process env, never in argv / `ps`.
+async fn docker_env(bin: &str, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
