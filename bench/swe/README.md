@@ -150,10 +150,12 @@ cargo run -p aura-bench-swe --bin run -- --arm agent \
     --instances-json bench/swe/bench-out/instances.json --dry-run
 ```
 
-Each `run` writes `results/results-<arm>-<run_id>.json` (overall + per-repo
-resolved rate, and every instance's resolved/empty/errored flags, patch size,
-latency, tokens, and cost). `bench-out/` and `results/` are **gitignored**
-(regenerated; results embed full patches).
+Each `run` writes the report to `results/results-<arm>-<run_id>.json` (overall +
+per-repo resolved rate, and every instance's resolved/empty/errored flags, patch
+size, latency, tokens, and cost). Its working artifacts — `predictions-*.jsonl`,
+the swebench harness report (`<model>.<run_id>.json`), and the harness `logs/` —
+go to `runs/`, keeping `results/` to the report alone. `bench-out/`, `results/`,
+and `runs/` are **gitignored** (regenerated; results embed full patches).
 
 Every agent run also writes its **verbatim transcript + call-tree trace** to
 `trace/<run_id>/agent/<instance>.{messages,trace}.json` (`aura session history` +

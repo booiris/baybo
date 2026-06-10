@@ -118,10 +118,13 @@ These hold across all three benches. A new bench that drops one is wrong.
    `Cargo.toml`; all deps `{ workspace = true }` (add the crate to the root
    `[workspace.dependencies]` + `members`); Python tooling is **uv-managed** (own
    `pyproject.toml` + `.python-version`, commit `uv.lock`, gitignore `.venv/` —
-   never `pip install` into the system interpreter); gitignore
-   `bench-out/` + `results/` + `trace/` + per-run workspaces + `.env`. Follow the
-   repo's `CLAUDE.md` style throughout (raw strings for prompts/JSON-ish text, named
-   `const`s not magic numbers, `parking_lot` locks, no `.unwrap()` in non-test code).
+   never `pip install` into the system interpreter). **Output dirs — all
+   gitignored, one job each:** `results/` = the final report JSON *only*; `runs/` =
+   the run environment + working byproducts (the aura workspaces, the grader's
+   intermediates + harness logs); `bench-out/` = prepared inputs (dataset /
+   manifests); `trace/` = transcripts. Follow the repo's `CLAUDE.md` style
+   throughout (raw strings for prompts/JSON-ish text, named `const`s not magic
+   numbers, `parking_lot` locks, no `.unwrap()` in non-test code).
 
 10. **Trace export — every run dumps its verbatim transcript + call tree.**
     Default-on (opt out with `NO_TRACE=1`) so a run is always debuggable after the
@@ -144,7 +147,8 @@ bench/<name>/
   README.md           # measures-what + faithfulness; arms table; the build feature + why; usage; caveats
   run-bench.sh        # one-command driver: .env autoload → config block → preflight → dry-run → build → arms loop → jq table
   .env.example        # the API key (AURA_API_KEY) + optional AURA_MODEL/AURA_BASE_URL overrides
-  .gitignore          # /bench-out/ /results/ /trace/ /.env  (+ per-run workspaces, __pycache__/, /.venv/)
+  .gitignore          # /bench-out/ /results/ /runs/ /trace/ /.env  (+ __pycache__/, /.venv/)
+  results/ runs/ bench-out/ trace/   # generated (gitignored): report · run env+artifacts · inputs · transcripts
   src/
     lib.rs            # PURE IR + helpers + unit tests, no heavy deps:
                       #   the per-item struct, frame_instruction(), scope keys, run-id, parse_model(), metric

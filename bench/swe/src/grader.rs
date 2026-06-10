@@ -38,7 +38,7 @@ pub struct GraderConfig {
     /// stem (`<model_name>.<run_id>.json`). `"gold"` for the oracle arm.
     pub model_name: String,
     /// Directory the harness runs in (so its report + logs land here).
-    pub results_dir: PathBuf,
+    pub runs_dir: PathBuf,
     /// Scope grading to exactly these instances (keeps image build cheap).
     pub instance_ids: Vec<String>,
     /// Image namespace: `"swebench"` pulls prebuilt Hub images (the harness
@@ -74,8 +74,8 @@ impl GradeReport {
 /// fatal — the harness still writes a report when only some instances error;
 /// only a missing report aborts.
 pub async fn grade(cfg: &GraderConfig, predictions: &Predictions) -> Result<GradeReport> {
-    std::fs::create_dir_all(&cfg.results_dir)
-        .with_context(|| format!("create results dir {}", cfg.results_dir.display()))?;
+    std::fs::create_dir_all(&cfg.runs_dir)
+        .with_context(|| format!("create runs dir {}", cfg.runs_dir.display()))?;
 
     let predictions_arg = match predictions {
         Predictions::Gold => "gold".to_string(),
@@ -108,7 +108,7 @@ pub async fn grade(cfg: &GraderConfig, predictions: &Predictions) -> Result<Grad
         args.extend(cfg.instance_ids.iter().cloned());
     }
 
-    // The harness runs in `results_dir` (so its report lands there). A relative
+    // The harness runs in `runs_dir` (so its report lands there). A relative
     // interpreter path (e.g. `bench/swe/.venv/bin/python`) would otherwise
     // resolve against that cwd and vanish — make it absolute first. Join the
     // process cwd rather than canonicalizing: a venv's `python` is a symlink to
@@ -130,7 +130,7 @@ pub async fn grade(cfg: &GraderConfig, predictions: &Predictions) -> Result<Grad
     );
     let status = Command::new(&python)
         .args(&args)
-        .current_dir(&cfg.results_dir)
+        .current_dir(&cfg.runs_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -147,7 +147,7 @@ pub async fn grade(cfg: &GraderConfig, predictions: &Predictions) -> Result<Grad
         tracing::warn!(%status, "swebench harness exited non-zero; reading any report it wrote");
     }
 
-    let report_path = locate_report(&cfg.results_dir, &cfg.model_name, &cfg.run_id)?;
+    let report_path = locate_report(&cfg.runs_dir, &cfg.model_name, &cfg.run_id)?;
     let raw = std::fs::read_to_string(&report_path)
         .with_context(|| format!("read harness report {}", report_path.display()))?;
     parse_report(&raw)
@@ -156,9 +156,9 @@ pub async fn grade(cfg: &GraderConfig, predictions: &Predictions) -> Result<Grad
 /// The harness writes `<model_name>.<run_id>.json` to its working directory.
 /// Look there first, then fall back to the process CWD, so a future harness
 /// tweak that ignores `current_dir` still resolves.
-fn locate_report(results_dir: &Path, model_name: &str, run_id: &str) -> Result<PathBuf> {
+fn locate_report(runs_dir: &Path, model_name: &str, run_id: &str) -> Result<PathBuf> {
     let file = format!("{model_name}.{run_id}.json");
-    let candidates = [results_dir.join(&file), PathBuf::from(&file)];
+    let candidates = [runs_dir.join(&file), PathBuf::from(&file)];
     for c in &candidates {
         if c.exists() {
             return Ok(c.clone());
@@ -167,7 +167,7 @@ fn locate_report(results_dir: &Path, model_name: &str, run_id: &str) -> Result<P
     bail!(
         "harness report `{file}` not found (looked in {} and the current dir) — \
          the harness may have failed before writing it; check its output above",
-        results_dir.display()
+        runs_dir.display()
     )
 }
 

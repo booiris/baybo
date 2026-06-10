@@ -266,10 +266,10 @@ with `#[cfg(feature = "bench-<cap>")]` so it isn't compiled otherwise.
 
 **`.gitignore`:**
 ```gitignore
-/bench-out/     # scratch: exported dataset / manifests (regenerated)
-/results/       # per-run result JSONs (large, regenerated; may embed full patches)
+/bench-out/     # prepared inputs: exported dataset / manifests (regenerated)
+/results/       # the final result JSON report ONLY (regenerated; may embed full patches)
+/runs/          # run env + working artifacts: workspaces / grader intermediates / harness logs
 /trace/         # per-run transcripts + call-tree traces (regenerated; full convos)
-/aura-ws/       # per-run aura workspaces: config + vault + sessions + logs (if generated)
 /.env           # local secrets
 __pycache__/    # if there's Python tooling
 /.venv/         # uv-managed venv (uv.lock / pyproject.toml / .python-version ARE tracked)

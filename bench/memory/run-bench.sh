@@ -46,7 +46,7 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 : "${DATASET:=$OUTDIR/locomo10.json}"
 : "${RESULTS_DIR:=$BENCH_DIR/results}"   # per-run result JSONs — tracked in git (sibling of bench-out)
 : "${TRACE_DIR:=$BENCH_DIR/trace}"       # per-question transcripts + traces (gitignored); NO_TRACE=1 to disable
-: "${WS_ROOT:=$BENCH_DIR/aura-ws}"    # per-run aura workspaces (gitignored): config + vault + sessions + logs
+: "${WS_ROOT:=$BENCH_DIR/runs}"       # per-run aura workspaces (gitignored): config + vault + sessions + logs
 : "${RUN_ID:=bench-$(date +%Y%m%d-%H%M%S)}"
 : "${RUST_LOG:=aura_bench_memory=info}"; export RUST_LOG
 REPO_ROOT="$(git rev-parse --show-toplevel)"

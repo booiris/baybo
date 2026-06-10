@@ -112,9 +112,14 @@ struct Args {
     #[arg(long)]
     run_id: Option<String>,
 
-    /// Directory for predictions, the harness report, and the results JSON.
+    /// Directory for the final results JSON report only.
     #[arg(long, default_value = "results")]
     results_dir: PathBuf,
+
+    /// Directory for the run's working artifacts — predictions, the swebench
+    /// harness report, and its per-instance logs (kept out of `results/`).
+    #[arg(long, default_value = "runs")]
+    runs_dir: PathBuf,
 
     /// `python` interpreter that has `swebench` installed.
     #[arg(long, default_value = "python")]
@@ -162,10 +167,16 @@ async fn main() -> Result<()> {
 
     std::fs::create_dir_all(&args.results_dir)
         .with_context(|| format!("create results dir {}", args.results_dir.display()))?;
+    std::fs::create_dir_all(&args.runs_dir)
+        .with_context(|| format!("create runs dir {}", args.runs_dir.display()))?;
     let results_dir = args
         .results_dir
         .canonicalize()
         .unwrap_or_else(|_| args.results_dir.clone());
+    let runs_dir = args
+        .runs_dir
+        .canonicalize()
+        .unwrap_or_else(|_| args.runs_dir.clone());
     let instance_ids: Vec<String> = instances.iter().map(|i| i.instance_id.clone()).collect();
 
     // Agent arm: run aura per instance → patches. Other arms have no run metrics.
@@ -190,7 +201,7 @@ async fn main() -> Result<()> {
                 })
                 .collect();
             let path =
-                results_dir.join(format!("predictions-{}-{run_id}.jsonl", args.arm.as_str()));
+                runs_dir.join(format!("predictions-{}-{run_id}.jsonl", args.arm.as_str()));
             std::fs::write(&path, predictions_jsonl(&lines))
                 .with_context(|| format!("write predictions {}", path.display()))?;
             tracing::info!(path = %path.display(), "predictions written");
@@ -206,7 +217,7 @@ async fn main() -> Result<()> {
             run_id: run_id.clone(),
             max_workers: args.max_workers,
             model_name: model_name.to_string(),
-            results_dir: results_dir.clone(),
+            runs_dir: runs_dir.clone(),
             instance_ids: instance_ids.clone(),
             namespace: args.namespace.clone(),
         },

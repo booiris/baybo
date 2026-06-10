@@ -47,7 +47,8 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 : "${MUSL_TARGET:=x86_64-unknown-linux-musl}"
 : "${AURA_BIN:=}"                              # agent arm; empty => build static musl here
 : "${OUTDIR:=$BENCH_DIR/bench-out}"            # scratch: instances.json (gitignored)
-: "${RESULTS_DIR:=$BENCH_DIR/results}"         # predictions + harness report + results JSON
+: "${RESULTS_DIR:=$BENCH_DIR/results}"         # the final results JSON report only
+: "${RUNS_DIR:=$BENCH_DIR/runs}"               # run working artifacts: predictions, swebench report + logs/
 : "${TRACE_DIR:=$BENCH_DIR/trace}"             # per-run transcripts + traces (gitignored); NO_TRACE=1 to disable
 : "${RUN_ID:=swe-$(date +%Y%m%d-%H%M%S)}"
 : "${DRY_RUN:=0}"
@@ -56,7 +57,7 @@ INSTANCES="$OUTDIR/instances.json"
 PKG="aura-bench-swe"
 # ---------------------------------------------------------------------------
 
-mkdir -p "$OUTDIR" "$RESULTS_DIR"
+mkdir -p "$OUTDIR" "$RESULTS_DIR" "$RUNS_DIR"
 
 # ---- preflight ------------------------------------------------------------
 for arm in $ARMS; do
@@ -148,7 +149,7 @@ run_arm() {
   local common=(
     --arm "$arm" --instances-json "$INSTANCES"
     --dataset-name "$DATASET_NAME" --split "$SPLIT"
-    --run-id "$RUN_ID" --results-dir "$RESULTS_DIR" --namespace "$NAMESPACE"
+    --run-id "$RUN_ID" --results-dir "$RESULTS_DIR" --runs-dir "$RUNS_DIR" --namespace "$NAMESPACE"
     --max-workers "$MAX_WORKERS" --python-bin "$PYTHON" --docker-bin "$DOCKER"
     --concurrency "$CONCURRENCY"
   )

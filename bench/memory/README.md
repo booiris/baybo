@@ -76,7 +76,7 @@ Two phases, coupled by a **manifest**:
 So you write **no `aura.json`** and need no pre-existing `~/.aura` — the bench
 mints a fresh, isolated workspace per arm (so nothing of yours is touched and
 there's no pollution). Those workspaces (config + vault + sessions + logs) go
-under `aura-ws/` (gitignored, override with `WS_ROOT` / `--workspace-root`;
+under `runs/` (gitignored, override with `WS_ROOT` / `--workspace-root`;
 defaults to the system temp dir when the bins are run directly). The **answer
 model** (the model Aura answers with) defaults to DeepSeek `deepseek-chat`, but
 provider, model, key-env, and base URL are all configurable —
