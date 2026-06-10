@@ -57,9 +57,12 @@ const WAIT: Duration = Duration::from_secs(15);
 const COLS: u16 = 90;
 const ROWS: u16 = 24;
 /// Fresh-process attempts before giving up — see the module note on the
-/// cursor-position race. Genuine render failures don't consume these (they
-/// panic immediately).
-const ATTEMPTS: usize = 4;
+/// cursor-position race. Each death is *fast* (the probe exits early the moment
+/// the race steals the `ESC[6n` reply), so retries cost little wall-clock; 8
+/// keeps the all-attempts-die odds negligible even under heavy CI load (4 lost
+/// every attempt on a contended runner once). Genuine render failures don't
+/// consume these (they panic immediately).
+const ATTEMPTS: usize = 8;
 
 /// Launch the probe, wait for the first frame, run `body`, and retry on a
 /// process death from the known cursor-position race. Self-skips without
@@ -243,18 +246,17 @@ fn live_region_survives_a_resize() {
         wait_render(s, "reply before resize", |c| c.contains(&reply))?;
 
         s.resize(70, 16).expect("resize");
-        // Smoke-level: the inline-viewport resize may leave a known cosmetic
-        // ghost above the input, so assert only that the live region rebuilt
-        // and the transcript is still readable — not a pixel-exact layout.
-        let frame = settle(s)?;
-        assert!(
-            frame.contains("input"),
-            "input box re-rendered after resize:\n{frame}"
-        );
-        assert!(
-            frame.contains(&reply),
-            "transcript survives the resize:\n{frame}"
-        );
+        // Poll until the post-resize reflow shows BOTH the rebuilt input box and
+        // the surviving transcript — rather than snapshotting one `settle()` frame
+        // that can be sampled mid-reflow. The inline-viewport resize momentarily
+        // drops the input box (a known cosmetic ghost), so a single stable capture
+        // could land on a frame without it; `wait_render` keeps polling past that
+        // transient. A genuine miss still times out → fail-fast; a process death
+        // (the cursor-position race) is retried by `run_chat`. Smoke-level: assert
+        // the live region rebuilt + transcript survived, not a pixel-exact layout.
+        wait_render(s, "input box + transcript after resize", |c| {
+            c.contains("input") && c.contains(&reply)
+        })?;
         Ok(())
     });
 }
