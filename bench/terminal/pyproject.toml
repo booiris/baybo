@@ -1,0 +1,15 @@
+[project]
+name = "aura-tb-adapter"
+version = "0.0.0"
+description = "Run the real aura agent inside the Terminal-Bench harness (installed-agent adapter)."
+# terminal-bench 0.2.18 needs Python >=3.12; 3.14 isn't supported yet. uv fetches
+# a match (3.12/3.13) regardless of the system default.
+requires-python = ">=3.12,<3.14"
+dependencies = ["terminal-bench>=0.2.18"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tb_adapter"]

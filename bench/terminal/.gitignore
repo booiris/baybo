@@ -1,0 +1,12 @@
+# Provider key file, exported into the env for `tb run`. Never commit.
+/.env
+
+# Python adapter bytecode (tb_adapter/).
+__pycache__/
+*.pyc
+
+# uv-managed virtualenv (the lockfile IS committed for reproducibility).
+/.venv/
+
+# `tb run` output (results.json + asciinema casts), regenerated each run.
+/runs/
