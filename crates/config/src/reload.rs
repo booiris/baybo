@@ -75,6 +75,8 @@ pub fn hot_reload_diff(old: &AuraConfig, new: &AuraConfig) -> Result<()> {
         external_agents,
         proxy,
         memory,
+        #[cfg(feature = "bench-passthrough")]
+        sandbox,
     } = new;
 
     if &old.channels != channels {
@@ -105,6 +107,12 @@ pub fn hot_reload_diff(old: &AuraConfig, new: &AuraConfig) -> Result<()> {
     }
     if &old.memory != memory {
         return Err(not_hot("memory"));
+    }
+    // Selecting the sandbox mode is a boot-time decision (it wires the tool
+    // executor); a live change requires a restart.
+    #[cfg(feature = "bench-passthrough")]
+    if &old.sandbox != sandbox {
+        return Err(not_hot("sandbox"));
     }
 
     let AgentConfig {

@@ -180,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
         stores.blob.clone(),
         workspace_paths.clone(),
         tool_proxy,
+        false,
     ));
     let workspace = Arc::new(aura_workspace::WorkspaceManager::new(
         workspace_root.clone(),
