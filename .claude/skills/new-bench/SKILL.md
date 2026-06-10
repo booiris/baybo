@@ -166,9 +166,10 @@ bench/<name>/
 `tb_adapter/<agent>.py` (subclass the harness's installed-agent base, copy in the
 musl binary + a rendered `aura.json`, run `aura prompt --json -y`),
 `<setup>.sh.j2` (install binary, mint key, ensure `git`+`ca-certificates`),
-`run.sh` (build the musl binary if missing, load `.env`, exec the harness's
-`run --agent-import-path …`), `pyproject.toml` (uv, pin to the harness's Python
-range). See `bench/terminal/`.
+`run.sh` (build the musl binary if missing, load `.env`, run the harness's
+`run --agent-import-path …`, then surface its `results.json` from `runs/<ts>/`
+into `results/` so the report sits where the other benches' does), `pyproject.toml`
+(uv, pin to the harness's Python range). See `bench/terminal/`.
 
 ---
 

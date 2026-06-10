@@ -31,10 +31,23 @@ set -a; . "$here/.env"; set +a
 
 cd "$here"
 # `tb` keeps the last value when an option repeats, so anything in "$@"
-# (e.g. -m / -d / --n-tasks / -t) overrides these defaults.
-exec uv run tb run \
+# (e.g. -m / -d / --n-tasks / -t) overrides these defaults. tb owns the full run
+# output under runs/<ts>/ (casts, logs, its results.json).
+uv run tb run \
   --agent-import-path tb_adapter.aura_agent:AuraAgent \
   --model "${AURA_MODEL:-gemini/gemini-2.5-flash}" \
   -d terminal-bench-core==0.1.1 \
   --output-path runs \
   "$@"
+rc=$?
+
+# Surface tb's report into results/ so it lands where swe/memory put theirs (the
+# full run output stays under runs/). tb writes a fresh runs/<ts>/ per run — the
+# newest dir is the one we just produced.
+latest="$(ls -dt runs/*/ 2>/dev/null | head -1)"
+if [ -n "$latest" ] && [ -f "${latest}results.json" ]; then
+  mkdir -p results
+  cp "${latest}results.json" "results/results-$(basename "$latest").json"
+  echo "==> report: bench/terminal/results/results-$(basename "$latest").json" >&2
+fi
+exit "$rc"

@@ -9,8 +9,10 @@ __pycache__/
 # uv-managed virtualenv (the lockfile IS committed for reproducibility).
 /.venv/
 
-# `tb run` output (results.json + asciinema casts), regenerated each run.
+# `tb run` output (its results.json + asciinema casts + logs), regenerated each run.
 /runs/
+# The report, surfaced from the newest runs/<ts>/results.json by run.sh.
+/results/
 
 # Per-task aura transcripts + call-tree traces (mirrors the runs/ task path).
 /trace/

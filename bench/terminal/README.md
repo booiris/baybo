@@ -78,7 +78,9 @@ Adapter configuration (all via env — see [`.env.example`](.env.example)):
   claim completion without invoking tools, which tanks scores independent of the
   plumbing.
 - The harness reports `resolved` / accuracy / pass@k and records each run's
-  asciinema cast — the comparable number.
+  asciinema cast — the comparable number. `run.sh` surfaces the run's
+  `results.json` into `results/results-<ts>.json` (the full tb output — casts,
+  logs — stays under `runs/<ts>/`), matching swe/memory's `results/`.
 - Each task also writes aura's **verbatim transcript + call-tree trace** to
   `trace/<run>/<task>/…/{messages,trace}.json` (mirroring `runs/`), so you can see
   what the agent did beyond the cast. Default-on; `NO_TRACE=1` disables it.
