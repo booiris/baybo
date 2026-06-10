@@ -58,11 +58,14 @@ use crate::{
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_KIB: usize = MAX_OUTPUT_BYTES / 1024;
 
-/// Description template. `{{max_output_kib}}`, `{{work_dir}}`, and
-/// `{{platform}}` are filled in by [`BashTool::new`]; the work-dir and
-/// platform live here (not in the agent's system prompt) so they're
-/// adjacent to the tool that actually consumes them — the agent reads
-/// the description right before composing a Bash call.
+/// Shared Bash tool description. Only two sections vary by execution mode —
+/// `{{isolation}}` (OS sandbox vs direct passthrough) and `{{work_dir_scope}}`
+/// (work-dir jail vs container working dir) — substituted by
+/// [`render_description`] along with `{{max_output_kib}}`, `{{work_dir}}`, and
+/// `{{platform}}`. Everything else is identical in both modes on purpose: the
+/// passthrough (benchmark) agent then sees the same contract as production, so
+/// its behavior stays comparable. Work-dir/platform live here, not the system
+/// prompt, so they sit next to the tool that consumes them.
 const DESCRIPTION_TEMPLATE: &str = r#"Execute a shell command in a fresh `sh -c` process. Environment changes and `cd` do not persist across invocations. Each of stdout and stderr is truncated at {{max_output_kib}} KiB.
 
 IMPORTANT: Do NOT use Bash for tasks that have a dedicated tool:
@@ -72,16 +75,16 @@ IMPORTANT: Do NOT use Bash for tasks that have a dedicated tool:
 - To search file contents use `Grep` (not grep/rg)
 - To download a file to disk (`.txt`, `.json`, `.csv`, archives, binaries, scripts, …) use Bash with `curl`/`wget` — WebFetch only returns rendered text into the conversation and never writes to disk.
 
-SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Aura state dir under `~/.aura`/`$AURA_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled.
+{{isolation}}
 
-APPROVAL: sandboxed commands run without prompting by default. The pre-execution approval gate only fires when the command tokens contain a file-delete (`rm`, `rmdir`, `unlink`, `shred`, `srm`, `wipe`, or `find … -delete`) or a destructive `git` operation (`clean -f`, `reset --hard`, `branch -d`/`-D`/`--delete`, `tag -d`, `push -f`/`--force`/`--force-with-lease`/`--delete`/`-d`, `stash drop`/`clear`, `worktree remove`, `update-ref -d`, `filter-branch`, `filter-repo`); a separate prompt also fires if the sandbox refuses the command and an unsandboxed retry is available.
+APPROVAL: Commands run without prompting by default. The pre-execution approval gate only fires when the command tokens contain a file-delete (`rm`, `rmdir`, `unlink`, `shred`, `srm`, `wipe`, or `find … -delete`) or a destructive `git` operation (`clean -f`, `reset --hard`, `branch -d`/`-D`/`--delete`, `tag -d`, `push -f`/`--force`/`--force-with-lease`/`--delete`/`-d`, `stash drop`/`clear`, `worktree remove`, `update-ref -d`, `filter-branch`, `filter-repo`).
 Reserve Bash for system commands, git operations, build/test, and terminal tasks that require shell execution.
 
-DEFAULT CWD: If `cwd` is omitted, Aura runs the command from the workspace work directory and exports `PWD` with the same value.
+DEFAULT CWD: If `cwd` is omitted, Aura runs the command from {{work_dir}} and exports `PWD` with the same value.
 
 PATHS: Any directory or file argument inside the command (cd, ls, mkdir, rm, mv, cp, find, …) MUST be an absolute path. The optional `cwd` parameter MUST also be absolute when provided — relative values are rejected. Always quote file paths that contain spaces with double quotes (e.g. `cd "/path with spaces/file.txt"`).
 
-WORK-DIR SCOPE: Bash writes only inside the workspace work directory ({{work_dir}}). The read-only `skills/` subtree is the one exception you may name in a command — an installed skill's bundled script can be executed in place from there (writes to it still fail). Any other absolute path argument under the workspace root but outside `work/` and `skills/` (the sibling subtrees `profile/`, `config/`, `state/`, `logs/`, `.key/`) is rejected up front, and `cwd` is held to the work-dir rule. Use the dedicated tools (Read, Edit, Write, …) when you genuinely need to read or modify those subtrees; everything else stays under {{work_dir}}.
+{{work_dir_scope}}
 
 BEFORE BROAD SCANS: Do not run `find`, `du`, recursive `ls`, or similar walks against unknown directories without first checking their size with a bounded probe (e.g. `ls -1 <dir> | wc -l`, or a shallow `find -maxdepth 2`). Large trees can hang the process.
 
@@ -90,6 +93,23 @@ PYTHON: `python`, `python3`, and `pip` are shimmed to `uv run python` / `uv pip`
 ENVIRONMENT:
 - Working directory: {{work_dir}}
 - Platform: {{platform}}"#;
+
+/// `{{isolation}}` for the default OS-sandboxed build (bwrap/sandbox-exec).
+const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Aura state dir under `~/.aura`/`$AURA_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled. If the sandbox refuses a command, a prompt offers an unsandboxed retry."#;
+
+/// `{{work_dir_scope}}` for the default OS-sandboxed build (Bash jailed to `work/`).
+const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Bash writes only inside the workspace work directory ({{work_dir}}). The read-only `skills/` subtree is the one exception you may name in a command — an installed skill's bundled script can be executed in place from there (writes to it still fail). Any other absolute path argument under the workspace root but outside `work/` and `skills/` (the sibling subtrees `profile/`, `config/`, `state/`, `logs/`, `.key/`) is rejected up front, and `cwd` is held to the work-dir rule. Use the dedicated tools (Read, Edit, Write, …) when you genuinely need to read or modify those subtrees; everything else stays under {{work_dir}}."#;
+
+/// The two mode-specific sections for a `bench-passthrough` build: aura runs
+/// inside an already-isolated container, so there is no OS sandbox and no
+/// work-dir jail, and `{{work_dir}}` is the inherited cwd (the container
+/// WORKDIR). These are the *only* sections that differ from production, so the
+/// benchmarked agent behaves as it would online apart from these facts.
+#[cfg(feature = "bench-passthrough")]
+const PASSTHROUGH_ISOLATION: &str = r#"EXECUTION: The shell runs directly on the host filesystem with full read+write access — no OS sandbox and no masked paths (this build already runs inside a disposable, isolated container). Network is enabled."#;
+
+#[cfg(feature = "bench-passthrough")]
+const PASSTHROUGH_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: {{work_dir}} is your working directory — create and modify the task's files there, including with the `Write`/`Edit` tools (give them absolute paths under it), since that is where your work is inspected. There is no work-dir jail; just keep task output under {{work_dir}}."#;
 
 pub struct BashTool {
     description: String,
@@ -112,6 +132,14 @@ pub struct BashTool {
     /// ignore the variables — same loose-coupling rationale as
     /// [`inject_aura_env`].
     uv_env_prefix: String,
+    /// Trusted-environment passthrough: run every command directly (no OS
+    /// sandbox), with no work-dir path jail and cwd inherited from the process.
+    /// The field exists only in a `bench-passthrough` build whose config selects
+    /// `sandbox.mode = passthrough` (aura running inside a disposable benchmark
+    /// container); a normal build has no passthrough field and is always
+    /// sandboxed — see [`Self::is_passthrough`].
+    #[cfg(feature = "bench-passthrough")]
+    passthrough: bool,
 }
 
 impl BashTool {
@@ -131,7 +159,49 @@ impl BashTool {
             work_dir,
             skills_dir,
             uv_env_prefix: build_uv_env_exports(&paths, resolve_uv_bin_dir().as_deref()),
+            #[cfg(feature = "bench-passthrough")]
+            passthrough: false,
         }
+    }
+
+    /// Enable trusted-environment passthrough (see the [`passthrough`] field).
+    /// A genuine knob with a secure default (`false`) that virtually every
+    /// caller leaves alone — only the benchmark-container path flips it on.
+    ///
+    /// Re-renders the tool description so the LLM is told its working directory
+    /// is the process's inherited cwd (the container WORKDIR), not the aura
+    /// workspace `work/` dir — otherwise the agent would aim `Write`/`Edit` at
+    /// the wrong place (their absolute paths follow the advertised work dir,
+    /// while passthrough Bash already defaults to the inherited cwd).
+    ///
+    /// [`passthrough`]: Self::passthrough
+    #[cfg(feature = "bench-passthrough")]
+    pub fn with_passthrough(mut self, passthrough: bool) -> Self {
+        self.passthrough = passthrough;
+        if passthrough {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| self.work_dir.clone());
+            self.description = render_description(
+                PASSTHROUGH_ISOLATION,
+                PASSTHROUGH_WORK_DIR_SCOPE,
+                &cwd,
+                std::env::consts::OS,
+            );
+        }
+        self
+    }
+
+    /// Whether commands run in trusted-environment passthrough. The backing
+    /// `passthrough` field only exists in a `bench-passthrough` build, so a
+    /// normal build is unconditionally sandboxed (this returns `false`, letting
+    /// the execute path stay branch-free of `#[cfg]`).
+    #[cfg(feature = "bench-passthrough")]
+    fn is_passthrough(&self) -> bool {
+        self.passthrough
+    }
+
+    #[cfg(not(feature = "bench-passthrough"))]
+    fn is_passthrough(&self) -> bool {
+        false
     }
 
     /// Prefix `command` with the workspace-scoped UV exports and the
@@ -149,7 +219,26 @@ impl BashTool {
 }
 
 fn build_description(work_dir: &Path, platform: &str) -> String {
+    render_description(
+        SANDBOXED_ISOLATION,
+        SANDBOXED_WORK_DIR_SCOPE,
+        work_dir,
+        platform,
+    )
+}
+
+/// Fill the shared [`DESCRIPTION_TEMPLATE`]: the two mode-specific sections
+/// first, then the value placeholders (so a `{{work_dir}}` inside the inserted
+/// `work_dir_scope` is resolved too).
+fn render_description(
+    isolation: &str,
+    work_dir_scope: &str,
+    work_dir: &Path,
+    platform: &str,
+) -> String {
     DESCRIPTION_TEMPLATE
+        .replace("{{isolation}}", isolation)
+        .replace("{{work_dir_scope}}", work_dir_scope)
         .replace("{{max_output_kib}}", &MAX_OUTPUT_KIB.to_string())
         .replace("{{work_dir}}", &work_dir.display().to_string())
         .replace("{{platform}}", platform)
@@ -401,7 +490,9 @@ impl Tool for BashTool {
 
         if let Some(dir) = &p.cwd {
             require_absolute(dir, "Bash", "cwd")?;
-            require_within_work_dir(dir, &self.workspace_root, &self.work_dir, "cwd")?;
+            if !self.is_passthrough() {
+                require_within_work_dir(dir, &self.workspace_root, &self.work_dir, "cwd")?;
+            }
         }
 
         let timeout = p
@@ -410,13 +501,31 @@ impl Tool for BashTool {
             .unwrap_or(ctx.timeout);
 
         let command = p.command;
-        require_command_paths_within_work_dir(
-            &command,
-            &self.workspace_root,
-            &self.work_dir,
-            &self.skills_dir,
-        )?;
-        let cwd_ref: Option<&Path> = Some(p.cwd.as_deref().unwrap_or(ctx.workspace_root.as_path()));
+        if !self.is_passthrough() {
+            require_command_paths_within_work_dir(
+                &command,
+                &self.workspace_root,
+                &self.work_dir,
+                &self.skills_dir,
+            )?;
+        }
+        // In passthrough there is no work-dir jail, so a command with no explicit
+        // `cwd` runs from the process's inherited working directory — the
+        // benchmark container's WORKDIR, where the task files live — rather than
+        // the workspace work dir.
+        let passthrough_cwd = if self.is_passthrough() && p.cwd.is_none() {
+            Some(
+                std::env::current_dir()
+                    .map_err(|e| ToolError::Execution(format!("resolve current dir: {e}")))?,
+            )
+        } else {
+            None
+        };
+        let cwd_ref: Option<&Path> = p
+            .cwd
+            .as_deref()
+            .or(passthrough_cwd.as_deref())
+            .or(Some(ctx.workspace_root.as_path()));
 
         if is_file_tool_redirect(&command) {
             let argv0 = first_token(&command).unwrap_or("?");
@@ -494,6 +603,10 @@ impl Tool for BashTool {
             .map(str::trim)
             .is_some_and(|s| s.eq_ignore_ascii_case("kill"));
         if convert_on_timeout
+            // Passthrough has no sandbox to detach into (`ctx.sandbox` is None in
+            // a benchmark container), so a timeout-to-background overrun would
+            // fail; keep passthrough on the blocking path.
+            && !self.is_passthrough()
             && extra_env.is_empty()
             && let Some(sink) = ctx.background_jobs.clone()
             && let Some(output) = run_detached(
@@ -511,14 +624,17 @@ impl Tool for BashTool {
             return Ok(output);
         }
 
-        let out = if matches!(aura_resolution, AuraResolution::Bypass) {
-            // The OS sandbox masks `~/.aura`/`$AURA_HOME`, so a
-            // sandboxed `aura …` call can't reach the gateway's
-            // config or session store — sandboxing aura's own CLI is
-            // broken by construction. Argv0 is already an absolute
-            // path canonicalising to the gateway binary, so the
-            // unsandboxed `sh -c` execve's our binary directly with
-            // no `$PATH` consultation.
+        let out = if self.is_passthrough() || matches!(aura_resolution, AuraResolution::Bypass) {
+            // Two cases run the command directly via `sh -c`:
+            //  - passthrough: aura is already inside a disposable, isolated
+            //    benchmark container, so there is no OS sandbox to wrap with (and
+            //    wrapping would break the agent's access to the task files);
+            //  - an `aura …` self-invocation: the OS sandbox masks
+            //    `~/.aura`/`$AURA_HOME`, so a sandboxed call can't reach the
+            //    gateway's config or session store — broken by construction.
+            //    Argv0 is already an absolute path canonicalising to the gateway
+            //    binary, so the unsandboxed `sh -c` execve's it directly with no
+            //    `$PATH` consultation.
             tokio::select! {
                 _ = ctx.cancellation_token.cancelled() => {
                     return Err(ToolError::Execution("cancelled".into()));
@@ -2075,6 +2191,80 @@ mod tests {
             classify("/usr/local/bin/aura2 cost", bin),
             AuraResolution::Bypass
         ));
+    }
+
+    #[test]
+    fn sandboxed_description_renders_without_leftover_placeholders() {
+        let d = BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws")).description;
+        assert!(
+            !d.contains("{{"),
+            "unfilled placeholder in description:\n{d}"
+        );
+        assert!(d.contains("SANDBOX:"), "isolation section present");
+        assert!(d.contains("/some/ws/work"), "work dir filled");
+    }
+
+    #[cfg(feature = "bench-passthrough")]
+    #[tokio::test]
+    async fn passthrough_runs_unsandboxed_outside_work_dir_without_a_backend() {
+        // A directory entirely outside any aura workspace/work dir.
+        let dir = std::env::temp_dir().join(format!("aura-passthrough-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // Passthrough Bash + a context with NO sandbox backend: normally this
+        // would (a) reject the out-of-work cwd and (b) error "OS sandbox
+        // unavailable". Passthrough skips the jail and runs directly.
+        let tool =
+            BashTool::new(aura_workspace::WorkspacePaths::new("/tmp")).with_passthrough(true);
+        let ctx = ctx_with(None);
+
+        let params = serde_json::json!({
+            "command": "touch marker.txt",
+            "cwd": dir.to_str().expect("utf8 dir"),
+        });
+        tool.execute(params, &ctx)
+            .await
+            .expect("passthrough exec should succeed without a sandbox backend");
+
+        assert!(
+            dir.join("marker.txt").exists(),
+            "passthrough should run in {dir:?} (outside work/) and create the file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "bench-passthrough")]
+    #[test]
+    fn passthrough_description_targets_inherited_cwd_not_workspace() {
+        let cwd = std::env::current_dir().expect("cwd");
+
+        // Sandboxed (default): advertises the workspace work dir + the masking
+        // it actually enforces.
+        let sandboxed = BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws"));
+        assert!(sandboxed.description.contains("/some/ws/work"));
+        assert!(sandboxed.description.contains("masked with empty tmpfs"));
+
+        // Passthrough: advertises the process's inherited cwd (so Write/Edit and
+        // Bash target the same place) and drops the sandbox/jail claims.
+        let pass =
+            BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws")).with_passthrough(true);
+        assert!(
+            !pass.description.contains("{{"),
+            "unfilled placeholder in passthrough description"
+        );
+        assert!(
+            pass.description.contains(&cwd.display().to_string()),
+            "passthrough description must name the inherited cwd"
+        );
+        assert!(
+            !pass.description.contains("/some/ws/work"),
+            "passthrough description must not advertise the workspace work dir"
+        );
+        assert!(
+            !pass.description.contains("masked with empty tmpfs"),
+            "passthrough description must not claim sandbox masking"
+        );
     }
 
     fn ctx_with(sandbox: Option<Arc<dyn crate::ExecSandbox>>) -> ToolContext {

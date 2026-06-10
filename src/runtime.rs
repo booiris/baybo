@@ -228,6 +228,13 @@ pub async fn build_managers(
     // stays free of per-tool-domain wiring (browser blob upload, etc).
     embedded_mcp_servers: Vec<EmbeddedMcpServer>,
 ) -> anyhow::Result<ManagerGraph> {
+    // Resolve the sandbox mode up front. Passthrough (no OS sandbox, no work-dir
+    // jail) only exists in a `bench-passthrough` build; a normal build is always
+    // sandboxed (a `sandbox` config key there is an ignored unknown field).
+    #[cfg(feature = "bench-passthrough")]
+    let bash_passthrough = matches!(config.sandbox.mode, aura_config::SandboxMode::Passthrough);
+    #[cfg(not(feature = "bench-passthrough"))]
+    let bash_passthrough = false;
     // --- minimal services shared by every mode
     let workspace_paths =
         aura_workspace::WorkspacePaths::new(std::path::PathBuf::from(&config.workspace.path));
@@ -402,6 +409,7 @@ pub async fn build_managers(
         stores.blob.clone(),
         aura_workspace::WorkspacePaths::new(workspace_root.clone()),
         tool_proxy,
+        bash_passthrough,
     );
 
     let assessment_mode = boot::to_assessment_mode(config.skills.risk_check);
@@ -532,31 +540,39 @@ pub async fn build_managers(
         Arc::clone(&secret_vault),
     ));
     let gate_map = channels_registry.approval_gates();
-    let sandbox_runner = match aura_sandbox::current_platform_runner() {
-        Ok(r) => match r.warm().await {
-            Ok(()) => {
-                info!(backend = ?r.backend(), "OS sandbox ready");
-                Some(r)
-            }
-            Err(e) => {
-                error!(
-                    error = %e,
-                    backend = ?r.backend(),
-                    "sandbox warm-up failed; ExecCommand tools will be refused",
-                );
+    let sandbox_runner = if bash_passthrough {
+        // Passthrough runs every command directly (no OS sandbox), so probing
+        // for a backend is pointless — and a benchmark container usually has
+        // none. Skip it silently rather than logging a misleading
+        // "ExecCommand tools will be refused" error for tools that run fine.
+        None
+    } else {
+        match aura_sandbox::current_platform_runner() {
+            Ok(r) => match r.warm().await {
+                Ok(()) => {
+                    info!(backend = ?r.backend(), "OS sandbox ready");
+                    Some(r)
+                }
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        backend = ?r.backend(),
+                        "sandbox warm-up failed; ExecCommand tools will be refused",
+                    );
+                    None
+                }
+            },
+            Err(
+                e @ (aura_sandbox::SandboxError::BackendMissing { .. }
+                | aura_sandbox::SandboxError::BackendUnreachable { .. }
+                | aura_sandbox::SandboxError::NoBackendAvailable),
+            ) => {
+                error!(error = %e, "OS sandbox unavailable; ExecCommand tools will be refused");
                 None
             }
-        },
-        Err(
-            e @ (aura_sandbox::SandboxError::BackendMissing { .. }
-            | aura_sandbox::SandboxError::BackendUnreachable { .. }
-            | aura_sandbox::SandboxError::NoBackendAvailable),
-        ) => {
-            error!(error = %e, "OS sandbox unavailable; ExecCommand tools will be refused");
-            None
-        }
-        Err(e) => {
-            return Err(e.into());
+            Err(e) => {
+                return Err(e.into());
+            }
         }
     };
 
