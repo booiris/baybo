@@ -33,6 +33,7 @@ members = [
     "crates/setup",
     "crates/term-harness",
     "bench/memory",
+    "bench/swe",
 ]
 exclude = ["crates/security/fuzz"]
 

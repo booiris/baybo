@@ -24,6 +24,8 @@ pnpm --filter @aura/channel-sdk test                            # SDK unit + e2e
 scripts/check-ts-bindings.sh                                    # ts-rs regen CI gate
 ```
 
+**Python tooling uses `uv` with a persistent project venv — never bare `pip` or the system interpreter.** Project-side Python (currently the `bench/swe` SWE-bench grader + dataset export) declares its deps in a `pyproject.toml`; `uv sync` materialises a reused on-disk `.venv` **and** provisions a pinned CPython, so the env is built once, reproducible, and independent of whatever `python3` the host ships (the system one is often too new for a given stack — e.g. `swebench`). Run through it — `uv run --project <dir> python …`, or point a tool at `<dir>/.venv/bin/python`. Commit `pyproject.toml` / `uv.lock` / `.python-version`; gitignore `.venv/`. Add a new Python tool the same way (its own `pyproject.toml` + `uv sync`), not with a global `pip install`.
+
 **Zero warnings means zero — including test files.** `--tests` is part of the clippy invocation above on purpose. Don't dismiss a warning as "pre-existing" or "only in a test"; if `cargo clippy` lights it up, fix it as part of the change.
 
 **Pre-commit hook (recommended).** A tracked `.githooks/pre-commit` runs `cargo fmt --all --check` on any commit that stages Rust, so unformatted code is caught locally instead of by the `rustfmt` CI job. Enable it once per clone: `git config core.hooksPath .githooks`. Bypass a one-off with `git commit --no-verify`.
