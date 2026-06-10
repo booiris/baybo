@@ -175,9 +175,9 @@ python3 bench/memory/trace_incorrect.py oracle full10 --context 1 --limit 15
 python3 bench/memory/trace_incorrect.py openviking full10b --conv 0
 ```
 
-**`trace_recall.py` — what aura actually recalled.** Each question runs in its own
-aura session (`aura-ws/aura-bench-ws-<run_id>-<arm>/logs/sessions/`); the backend's
-recall lands there as `source="recalled_memory"` messages. Prints, per question:
+**`trace_recall.py` — what aura actually recalled.** Reads each question's exported
+transcript (`trace/<run_id>/<arm>/qa-*.messages.json`); the backend's recall rides
+there as a `source="recalled_memory"` message. Prints, per question:
 question + gold + correct, every recalled block, and aura's final answer — pinning
 a wrong answer to a **recall miss** (fact never recalled), an **extraction loss**
 (recalled but the detail was generalized away), or an **integration failure**

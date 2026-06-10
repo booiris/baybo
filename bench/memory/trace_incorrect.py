@@ -42,7 +42,7 @@ def lookups(sample):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("arm", help="noop | oracle | mem0 | openviking")
-    ap.add_argument("run_id", nargs="?", default="full10b")
+    ap.add_argument("run_id")
     ap.add_argument("--conv", type=int, help="only this conv_idx (0-9)")
     ap.add_argument("--limit", type=int, default=0, help="max rows to show (0 = all)")
     ap.add_argument("--context", type=int, default=0, help="turns of context around each evidence dia_id")
