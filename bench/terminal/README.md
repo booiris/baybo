@@ -74,9 +74,6 @@ Adapter configuration (all via env — see [`.env.example`](.env.example)):
   `openai`, `anthropic`, `gemini`/`google`, `openrouter`.
 - **Base URL** — `AURA_TB_BASE_URL` (optional): a custom / OpenAI-compatible
   endpoint, proxy, or gateway; empty = the provider's built-in URL.
-- **Binary** — `AURA_TB_BINARY` (optional): defaults to the musl build output
-  (`target/x86_64-unknown-linux-musl/release/aura`); set it only to use a
-  different build (e.g. glibc) or location.
 - Pick a capable model — weak tool-callers (e.g. `deepseek-chat`) intermittently
   claim completion without invoking tools, which tanks scores independent of the
   plumbing.
