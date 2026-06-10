@@ -293,6 +293,61 @@ impl GatewayHandle {
         Ok(last)
     }
 
+    /// Export the session's verbatim transcript + call-tree trace to `dir` as
+    /// `<session>.{messages,trace}.json`. Best-effort: failures warn and are
+    /// dropped — a trace hiccup never fails QA.
+    pub async fn export_trace(&self, session_id: &str, dir: &Path) {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(error = %e, dir = %dir.display(), "trace dir create failed; skipping export");
+            return;
+        }
+        self.write_session_dump(
+            &[
+                "session",
+                "history",
+                session_id,
+                "--include-superseded",
+                "--json",
+            ],
+            &dir.join(format!("{session_id}.messages.json")),
+        )
+        .await;
+        self.write_session_dump(
+            &["session", "export", session_id, "--json"],
+            &dir.join(format!("{session_id}.trace.json")),
+        )
+        .await;
+    }
+
+    /// Run one `aura session …` subcommand (stdout = JSON) and write it to `out`.
+    async fn write_session_dump(&self, args: &[&str], out: &Path) {
+        let output = Command::new(&self.aura_bin)
+            .args(args)
+            .env(AURA_CONFIG_ENV, &self.config_path)
+            // RUST_LOG=off so stdout is only the JSON (a log line would corrupt it).
+            .env("RUST_LOG", "off")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+        match output {
+            Ok(o) if o.status.success() => {
+                if let Err(e) = std::fs::write(out, &o.stdout) {
+                    tracing::warn!(error = %e, path = %out.display(), "write trace file failed");
+                }
+            }
+            Ok(o) => tracing::warn!(
+                path = %out.display(),
+                status = %o.status,
+                "session dump exited non-zero; skipping"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %out.display(), "session dump spawn failed; skipping")
+            }
+        }
+    }
+
     /// Stop the gateway and reap it.
     pub async fn shutdown(mut self) {
         let _ = self.child.start_kill();

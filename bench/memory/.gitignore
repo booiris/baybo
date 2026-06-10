@@ -9,6 +9,8 @@
 # Per-run aura workspaces the bench generates (config + vault + sessions.db +
 # logs). Disposable scratch, regenerated each run.
 /aura-ws/
+# Per-question transcripts + call-tree traces (regenerated; embed full conversations).
+/trace/
 # Self-hosted mem0 arm's qdrant vector store (docker volume mount).
 /mem0-data/
 /.env

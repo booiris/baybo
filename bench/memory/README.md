@@ -158,6 +158,11 @@ run's artifacts; neither starts a gateway or spends anything. (Run-id suffix:
 `noop`/`oracle` were `full10`, `mem0`/`openviking` were `full10b` — pass whichever
 `<run_id>` produced the results you're reading.)
 
+Alongside, every question writes its **verbatim transcript + call-tree trace** to
+`trace/<run_id>/<arm>/<session>.{messages,trace}.json` (`aura session history` +
+`session export`) — the raw record of what aura recalled, answered, and called per
+question. Default-on; `NO_TRACE=1` disables it; `trace/` is gitignored.
+
 **`trace_incorrect.py` — back to the source dialogue.** Matches each incorrect
 answer (by `conv_idx` + question) to its LOCOMO `evidence` dia_ids and the
 original dialogue turns. LOCOMO's `evidence` often points at a lead-in line while

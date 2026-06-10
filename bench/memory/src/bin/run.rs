@@ -179,6 +179,14 @@ struct Args {
     /// Run QA even if the manifest reports extraction did not settle cleanly.
     #[arg(long)]
     allow_unsettled: bool,
+
+    /// Base dir for per-question transcripts + call-tree traces
+    /// (`<dir>/<run_id>/<arm>/<session>.{messages,trace}.json`).
+    #[arg(long, default_value = "trace")]
+    trace_dir: PathBuf,
+    /// Disable transcript/trace export (default: export every question).
+    #[arg(long)]
+    no_trace: bool,
 }
 
 /// One independent QA unit. `convo` is `Some` only for the oracle arm (the
@@ -323,6 +331,9 @@ async fn main() -> Result<()> {
     let gateway_ref = &gateway;
     let judge_ref = &judge_llm;
     let timeout = args.prompt_timeout;
+    let trace_dir: Option<PathBuf> =
+        (!args.no_trace).then(|| args.trace_dir.join(&run_id).join(args.arm.as_str()));
+    let trace_ref = trace_dir.as_deref();
     let collected: Vec<Result<(usize, QuestionResult)>> = stream::iter(tasks)
         .map(|task| async move {
             let prompt = build_prompt(&task.question, task.convo.as_deref().map(String::as_str));
@@ -368,6 +379,10 @@ async fn main() -> Result<()> {
                     (0, 0, 0)
                 }
             };
+
+            if let Some(dir) = trace_ref {
+                gateway_ref.export_trace(&task.session_id, dir).await;
+            }
 
             let verdict = judge(judge_ref, &task.question, &task.gold, &answer)
                 .await

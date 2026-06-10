@@ -79,6 +79,9 @@ Adapter configuration (all via env — see [`.env.example`](.env.example)):
   plumbing.
 - The harness reports `resolved` / accuracy / pass@k and records each run's
   asciinema cast — the comparable number.
+- Each task also writes aura's **verbatim transcript + call-tree trace** to
+  `trace/<run>/<task>/…/{messages,trace}.json` (mirroring `runs/`), so you can see
+  what the agent did beyond the cast. Default-on; `NO_TRACE=1` disables it.
 
 **Sanity first:** run the harness's own `--agent oracle` on a couple of tasks to
 confirm Docker + the harness work before pointing it at aura.

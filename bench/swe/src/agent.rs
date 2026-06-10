@@ -24,6 +24,8 @@ use crate::SweInstance;
 const CONTAINER_AURA_DIR: &str = "/installed-agent";
 const CONTAINER_AURA_BIN: &str = "/installed-agent/aura";
 const CONTAINER_CONFIG: &str = "/installed-agent/aura.json";
+/// `-e` arg pointing aura at the in-container config (mirrors [`CONTAINER_CONFIG`]).
+const CONTAINER_CONFIG_ENV: &str = "AURA_CONFIG_PATH=/installed-agent/aura.json";
 const CONTAINER_KEY_FILE: &str = "/installed-agent/encryption.key";
 const CONTAINER_WORKSPACE: &str = "/aura-home";
 /// SWE-bench eval images check the repo out here.
@@ -116,6 +118,9 @@ pub struct RunOpts<'a> {
     pub session_id: String,
     pub container_name: String,
     pub prompt_timeout_secs: u64,
+    /// Host dir for this run/arm's transcripts (`<base>/<run_id>/<arm>`); `None`
+    /// disables export. Written as `<instance>.{messages,trace}.json`.
+    pub trace_dir: Option<&'a Path>,
 }
 
 /// Whether a Docker image is already present locally.
@@ -258,7 +263,7 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
         "-w",
         TESTBED,
         "-e",
-        "AURA_CONFIG_PATH=/installed-agent/aura.json",
+        CONTAINER_CONFIG_ENV,
         // The API key is NOT re-passed here — the container already has it (from
         // `docker run -e NAME`), and exec inherits the container env. Keeps the
         // secret out of this argv too.
@@ -333,6 +338,19 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
         }
     };
 
+    // 6. Export the session transcript + call tree while the container is alive
+    //    (its DB dies with it). Best-effort: failures warn, never fail the run.
+    if let Some(dir) = opts.trace_dir {
+        export_trace(
+            opts.docker_bin,
+            name,
+            &opts.session_id,
+            dir,
+            &instance.instance_id,
+        )
+        .await;
+    }
+
     Ok(InstanceRun {
         instance_id: instance.instance_id.clone(),
         patch,
@@ -350,7 +368,7 @@ async fn read_cost(docker_bin: &str, name: &str, session: &str) -> Result<(u64, 
         &[
             "exec",
             "-e",
-            "AURA_CONFIG_PATH=/installed-agent/aura.json",
+            CONTAINER_CONFIG_ENV,
             "-e",
             "RUST_LOG=off",
             name,
@@ -364,6 +382,63 @@ async fn read_cost(docker_bin: &str, name: &str, session: &str) -> Result<(u64, 
     )
     .await?;
     parse_cost_summary(&out)
+}
+
+/// Dump the session's verbatim transcript + call-tree trace from inside the
+/// (still-running) container into `dir`, as `<item>.messages.json` /
+/// `<item>.trace.json`. Best-effort: any failure is logged and dropped so a
+/// trace hiccup never fails the graded run. The session DB lives in the
+/// container, so this MUST run before the container is reaped.
+async fn export_trace(docker_bin: &str, container: &str, session: &str, dir: &Path, item: &str) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %e, dir = %dir.display(), "trace dir create failed; skipping export");
+        return;
+    }
+    write_session_dump(
+        docker_bin,
+        container,
+        &[
+            "session",
+            "history",
+            session,
+            "--include-superseded",
+            "--json",
+        ],
+        &dir.join(format!("{item}.messages.json")),
+    )
+    .await;
+    write_session_dump(
+        docker_bin,
+        container,
+        &["session", "export", session, "--json"],
+        &dir.join(format!("{item}.trace.json")),
+    )
+    .await;
+}
+
+/// Run one `aura session …` subcommand in the container (stdout = JSON) and
+/// write it to `out`. Failures warn and return — see [`export_trace`].
+async fn write_session_dump(docker_bin: &str, container: &str, sub: &[&str], out: &Path) {
+    let mut args = vec![
+        "exec",
+        "-e",
+        CONTAINER_CONFIG_ENV,
+        "-e",
+        "RUST_LOG=off",
+        container,
+        CONTAINER_AURA_BIN,
+    ];
+    args.extend_from_slice(sub);
+    match docker(docker_bin, &args).await {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(out, json) {
+                tracing::warn!(error = %e, path = %out.display(), "write trace file failed");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %out.display(), "session dump failed; skipping")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

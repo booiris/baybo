@@ -119,9 +119,20 @@ These hold across all three benches. A new bench that drops one is wrong.
    `[workspace.dependencies]` + `members`); Python tooling is **uv-managed** (own
    `pyproject.toml` + `.python-version`, commit `uv.lock`, gitignore `.venv/` —
    never `pip install` into the system interpreter); gitignore
-   `bench-out/` + `results/` + per-run workspaces + `.env`. Follow the repo's
-   `CLAUDE.md` style throughout (raw strings for prompts/JSON-ish text, named
+   `bench-out/` + `results/` + `trace/` + per-run workspaces + `.env`. Follow the
+   repo's `CLAUDE.md` style throughout (raw strings for prompts/JSON-ish text, named
    `const`s not magic numbers, `parking_lot` locks, no `.unwrap()` in non-test code).
+
+10. **Trace export — every run dumps its verbatim transcript + call tree.**
+    Default-on (opt out with `NO_TRACE=1`) so a run is always debuggable after the
+    fact. Per item, after the turn — and for an **in-container** bench *before*
+    teardown (the session DB dies with the container) — dump both artifacts to
+    `bench/<name>/trace/<run_id>/<arm>/<item>.{messages,trace}.json` (gitignored,
+    mirrors `results/`): the verbatim conversation via `aura session history <id>
+    --include-superseded --json` (incl. compaction-dropped rows) and the
+    jobs/steps/spans call tree via `aura session export <id> --json`. Capture
+    stdout with `RUST_LOG=off`; **best-effort** — a trace failure warns and is
+    dropped, never failing the graded item. See `reference.md` §"Trace export".
 
 ---
 
@@ -132,12 +143,12 @@ bench/<name>/
   Cargo.toml          # publish=false, [lib] doctest=false, workspace deps; header: "NOT a CI target"
   README.md           # measures-what + faithfulness; arms table; the build feature + why; usage; caveats
   run-bench.sh        # one-command driver: .env autoload → config block → preflight → dry-run → build → arms loop → jq table
-  .env.example        # the API key (the one required value) + optional MODEL/BASE_URL overrides
-  .gitignore          # /bench-out/ /results/ /.env  (+ per-run workspaces, __pycache__/, /.venv/)
+  .env.example        # the API key (AURA_API_KEY) + optional AURA_MODEL/AURA_BASE_URL overrides
+  .gitignore          # /bench-out/ /results/ /trace/ /.env  (+ per-run workspaces, __pycache__/, /.venv/)
   src/
     lib.rs            # PURE IR + helpers + unit tests, no heavy deps:
                       #   the per-item struct, frame_instruction(), scope keys, run-id, parse_model(), metric
-    agent.rs          # drive aura as a black box: render config, mint key, run prompt, parse response + cost
+    agent.rs          # drive aura as a black box: render config, mint key, run prompt, parse response + cost + trace export
     report.rs         # InstanceResult + aggregate() → RunReport (overall + per-bucket + means) + print_table() + JSON
     grader.rs         # (if official grader) shell out + parse its report   — OR —
     judge.rs + llm.rs # (if LLM-judge) judge prompt + a minimal OpenAI-compatible ChatClient
@@ -191,9 +202,10 @@ range). See `bench/terminal/`.
 - [ ] aura driven only via its binary (+ at most one concrete backend crate); no agent-stack linkage.
 - [ ] Self-contained `aura.json` + minted key + `rate_limit.max_requests = 1_000_000`.
 - [ ] Cost = `i64` micro-USD from the ledger (`RUST_LOG=off`, poll on `calls`); latency/tokens/cost surfaced per item.
+- [ ] Trace export on by default (`NO_TRACE=1` opts out): per item → `trace/<run_id>/<arm>/<item>.{messages,trace}.json` via `aura session history/export`; in-container benches export before teardown.
 - [ ] Scope keys are `{bench}-{run_id}-{arm}-conv{N}`.
 - [ ] API key by name only — never in argv or written to disk.
 - [ ] `Cargo.toml`: `publish=false`, `[lib] doctest=false`, workspace deps, "NOT a CI target" header; `lib.rs` has unit tests and no heavy deps.
-- [ ] gitignore `bench-out/ results/ .env` (+ workspaces/.venv); Python (if any) is uv-managed with committed `uv.lock`.
+- [ ] gitignore `bench-out/ results/ trace/ .env` (+ workspaces/.venv); Python (if any) is uv-managed with committed `uv.lock`.
 - [ ] `run-bench.sh` (.env autoload, dry-run, jq floor→real→ceiling table) + `README.md` (arms table, the feature + why, caveats).
 - [ ] `cargo fmt`/`clippy --all --tests` clean, `cargo test` green, repo `CLAUDE.md` style followed.

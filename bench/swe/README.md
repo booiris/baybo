@@ -155,6 +155,12 @@ resolved rate, and every instance's resolved/empty/errored flags, patch size,
 latency, tokens, and cost). `bench-out/` and `results/` are **gitignored**
 (regenerated; results embed full patches).
 
+Every agent run also writes its **verbatim transcript + call-tree trace** to
+`trace/<run_id>/agent/<instance>.{messages,trace}.json` (`aura session history` +
+`session export`, captured in-container before teardown) — read these to see
+exactly what the agent did and why it stopped. Default-on; `NO_TRACE=1` (or
+`--no-trace`) disables it; `trace/` is gitignored.
+
 ## Caveats
 
 - **musl build is effectively mandatory for the agent arm.** A glibc `aura`

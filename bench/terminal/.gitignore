@@ -10,3 +10,6 @@ __pycache__/
 
 # `tb run` output (results.json + asciinema casts), regenerated each run.
 /runs/
+
+# Per-task aura transcripts + call-tree traces (mirrors the runs/ task path).
+/trace/

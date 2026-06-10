@@ -48,6 +48,7 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 : "${AURA_BIN:=}"                              # agent arm; empty => build static musl here
 : "${OUTDIR:=$BENCH_DIR/bench-out}"            # scratch: instances.json (gitignored)
 : "${RESULTS_DIR:=$BENCH_DIR/results}"         # predictions + harness report + results JSON
+: "${TRACE_DIR:=$BENCH_DIR/trace}"             # per-run transcripts + traces (gitignored); NO_TRACE=1 to disable
 : "${RUN_ID:=swe-$(date +%Y%m%d-%H%M%S)}"
 : "${DRY_RUN:=0}"
 : "${RUST_LOG:=aura_bench_swe=info}"; export RUST_LOG
@@ -154,8 +155,10 @@ run_arm() {
   if [ "$arm" = agent ]; then
     local agent_args=(
       --aura-bin "$AURA_BIN" --model "$AURA_MODEL" --prompt-timeout "$PROMPT_TIMEOUT"
+      --trace-dir "$TRACE_DIR"
     )
     [ -n "$AURA_BASE_URL" ] && agent_args+=(--base-url "$AURA_BASE_URL")
+    [ -n "${NO_TRACE:-}" ] && agent_args+=(--no-trace)
     cargo run -q -p "$PKG" --bin run -- "${common[@]}" "${agent_args[@]}"
   else
     cargo run -q -p "$PKG" --bin run -- "${common[@]}"

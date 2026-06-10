@@ -4,6 +4,8 @@
 #                the per-run results-<arm>-<run_id>.json (embeds full patches)
 /bench-out/
 /results/
+# Per-run transcripts + call-tree traces (regenerated; embed full conversations).
+/trace/
 # Local secrets / overrides.
 /.env
 # Python bytecode from swe_export.py.

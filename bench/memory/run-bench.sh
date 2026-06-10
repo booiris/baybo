@@ -45,6 +45,7 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 : "${OUTDIR:=$BENCH_DIR/bench-out}"   # bench scratch (gitignored): dataset + manifests
 : "${DATASET:=$OUTDIR/locomo10.json}"
 : "${RESULTS_DIR:=$BENCH_DIR/results}"   # per-run result JSONs — tracked in git (sibling of bench-out)
+: "${TRACE_DIR:=$BENCH_DIR/trace}"       # per-question transcripts + traces (gitignored); NO_TRACE=1 to disable
 : "${WS_ROOT:=$BENCH_DIR/aura-ws}"    # per-run aura workspaces (gitignored): config + vault + sessions + logs
 : "${RUN_ID:=bench-$(date +%Y%m%d-%H%M%S)}"
 : "${RUST_LOG:=aura_bench_memory=info}"; export RUST_LOG
@@ -82,6 +83,9 @@ if [ "$ALLOW_UNSETTLED" = 1 ]; then UNSETTLED_ARG="--allow-unsettled"; fi
 # mem0 base URL → self-hosted OSS server (empty = managed cloud Platform).
 MEM0_ARG=""
 if [ -n "$MEM0_BASE_URL" ]; then MEM0_ARG="--mem0-base-url $MEM0_BASE_URL"; fi
+# Disable trace export when NO_TRACE is set (default: export every question's transcript + trace).
+TRACE_ARG=""
+if [ -n "${NO_TRACE:-}" ]; then TRACE_ARG="--no-trace"; fi
 
 # Warm the OpenViking embedding endpoint so the first recalls don't hit the
 # model's cold-start (~20s) and time out — that alone swings the score wildly
@@ -175,14 +179,15 @@ run_arm() {
         --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" $Q_ARG $UNSETTLED_ARG $MEM0_ARG \
         $CFG_ARG $ANSWER_ARG --openviking-endpoint "$OPENVIKING_ENDPOINT" \
         --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" \
-        --manifest "$manifest" --out "$results"
+        --manifest "$manifest" --out "$results" --trace-dir "$TRACE_DIR" $TRACE_ARG
       ;;
     noop | oracle)
       echo ">> [$arm] QA run -> $results"
       cargo run -q -p "$PKG" --bin run -- \
         --arm "$arm" --dataset "$DATASET" --conversations "$CONVERSATIONS" \
         --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" $Q_ARG \
-        $CFG_ARG $ANSWER_ARG --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" --out "$results"
+        $CFG_ARG $ANSWER_ARG --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" --out "$results" \
+        --trace-dir "$TRACE_DIR" $TRACE_ARG
       ;;
   esac
 }

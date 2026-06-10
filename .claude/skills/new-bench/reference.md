@@ -49,6 +49,35 @@ AURA_CONFIG_PATH=<cfg> RUST_LOG=off aura cost show --session <id> --json
   **poll** (≈8× / 250ms) and treat `calls > 0` as "landed"; degrade to zeros, not
   an error, if it never does.
 
+**Export the session's verbatim transcript + call tree (after each turn):**
+```
+AURA_CONFIG_PATH=<cfg> RUST_LOG=off aura session history <id> --include-superseded --json
+AURA_CONFIG_PATH=<cfg> RUST_LOG=off aura session export  <id> --json
+```
+- `session history --include-superseded --json` → `{"session":…,"messages":[…]}`,
+  every message **incl. ones compaction later dropped** (truly verbatim). Without
+  `--json` you get only a summary; without `--include-superseded`, only what the
+  next turn would see.
+- `session export --json` → `{"session":…,"jobs":[{"steps":[{"spans":…}]}]}`, the
+  full LLM/tool call tree (it also takes `--out <path>`, but capture stdout for
+  uniformity with the in-container case). It keys on the session id, so pass an
+  explicit `--session <id>` to the `prompt` that produced it.
+- Both read the persisted session DB (concurrent SQLite reads are fine alongside a
+  running gateway). Best-effort: a non-zero exit / missing session → skip that file.
+
+**Trace export — per-shape wiring** (default-on; `NO_TRACE=1` opts out). Write both
+files to `bench/<name>/trace/<run_id>/<arm>/<item>.{messages,trace}.json`:
+- **Gateway (memory):** after each turn's cost read, a `GatewayHandle` method runs
+  the two `session` commands against the workspace config and writes the files —
+  clone `bench/memory/src/agent.rs::{export_trace, write_session_dump}`.
+- **In-container (swe):** run them **inside the container before reap** (the session
+  DB dies with it) — clone `bench/swe/src/agent.rs::{export_trace, write_session_dump}`;
+  the `run` bin threads `--trace-dir` (+ `--no-trace`) into `RunOpts.trace_dir`.
+- **External-harness adapter (terminal):** in `perform_task`, after the prompt, use
+  the container handle directly — `session.container.exec_run([...])` captures
+  stdout, no copy-out — mirroring the harness's per-task `runs/` path into `trace/`.
+  See `bench/terminal/tb_adapter/aura_agent.py::_export_trace`.
+
 **Clone these parsers verbatim** (stable, unit-tested) instead of rewriting:
 `bench/swe/src/agent.rs` → `prompt_output_error`, `parse_cost_summary`, the
 `docker*` process helpers; `bench/memory/src/agent.rs` → `parse_response`,
@@ -239,6 +268,7 @@ with `#[cfg(feature = "bench-<cap>")]` so it isn't compiled otherwise.
 ```gitignore
 /bench-out/     # scratch: exported dataset / manifests (regenerated)
 /results/       # per-run result JSONs (large, regenerated; may embed full patches)
+/trace/         # per-run transcripts + call-tree traces (regenerated; full convos)
 /aura-ws/       # per-run aura workspaces: config + vault + sessions + logs (if generated)
 /.env           # local secrets
 __pycache__/    # if there's Python tooling

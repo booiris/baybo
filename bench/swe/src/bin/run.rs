@@ -88,6 +88,14 @@ struct Args {
     #[arg(long)]
     base_url: Option<String>,
 
+    /// Base dir for per-run transcripts + call-tree traces
+    /// (`<dir>/<run_id>/<arm>/<instance>.{messages,trace}.json`). (agent arm)
+    #[arg(long, default_value = "trace")]
+    trace_dir: PathBuf,
+    /// Disable transcript/trace export (default: export every agent run).
+    #[arg(long)]
+    no_trace: bool,
+
     /// Eval containers run concurrently (agent arm).
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
@@ -321,6 +329,9 @@ async fn run_agent(
     let key_val = &key_value;
     let timeout = args.prompt_timeout;
     let run_id_ref = run_id;
+    let trace_arm_dir: Option<PathBuf> =
+        (!args.no_trace).then(|| args.trace_dir.join(run_id).join(args.arm.as_str()));
+    let trace_ref = trace_arm_dir.as_deref();
     tracing::info!(
         instances = instances.len(),
         concurrency = args.concurrency,
@@ -338,6 +349,7 @@ async fn run_agent(
                 session_id: format!("swe-{run_id_ref}-{}", inst.instance_id),
                 container_name: format!("aura-swe-{run_id_ref}-{}", inst.instance_id),
                 prompt_timeout_secs: timeout,
+                trace_dir: trace_ref,
             };
             let run = agent::run_instance(opts).await;
             if let Some(err) = &run.error {
