@@ -58,9 +58,10 @@ use crate::{
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_KIB: usize = MAX_OUTPUT_BYTES / 1024;
 
-/// Shared Bash tool description. Only two sections vary by execution mode —
-/// `{{isolation}}` (OS sandbox vs direct passthrough) and `{{work_dir_scope}}`
-/// (work-dir jail vs container working dir) — substituted by
+/// Shared Bash tool description. Three sections vary by execution mode —
+/// `{{isolation}}` (OS sandbox vs direct passthrough), `{{work_dir_scope}}`
+/// (work-dir jail vs container working dir), and `{{python_runtime}}` (uv-shimmed
+/// vs the container's native `python`/`pip`) — substituted by
 /// [`render_description`] along with `{{max_output_kib}}`, `{{work_dir}}`, and
 /// `{{platform}}`. Everything else is identical in both modes on purpose: the
 /// passthrough (benchmark) agent then sees the same contract as production, so
@@ -88,7 +89,7 @@ PATHS: Any directory or file argument inside the command (cd, ls, mkdir, rm, mv,
 
 BEFORE BROAD SCANS: Do not run `find`, `du`, recursive `ls`, or similar walks against unknown directories without first checking their size with a bounded probe (e.g. `ls -1 <dir> | wc -l`, or a shallow `find -maxdepth 2`). Large trees can hang the process.
 
-PYTHON: `python`, `python3`, and `pip` are shimmed to `uv run python` / `uv pip` inside this shell. For one-file scripts with third-party deps, declare them via PEP 723 inline metadata (`# /// script` block) so `uv run --script my.py` resolves them per-call. The shims are shell functions scoped to the outer `sh -c` — `bash -c '…'` subshells, `/usr/bin/python`, and Python's own `subprocess` calls bypass them.
+{{python_runtime}}
 
 ENVIRONMENT:
 - Working directory: {{work_dir}}
@@ -100,6 +101,9 @@ const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell runs with read+write acc
 /// `{{work_dir_scope}}` for the default OS-sandboxed build (Bash jailed to `work/`).
 const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Bash writes only inside the workspace work directory ({{work_dir}}). The read-only `skills/` subtree is the one exception you may name in a command — an installed skill's bundled script can be executed in place from there (writes to it still fail). Any other absolute path argument under the workspace root but outside `work/` and `skills/` (the sibling subtrees `profile/`, `config/`, `state/`, `logs/`, `.key/`) is rejected up front, and `cwd` is held to the work-dir rule. Use the dedicated tools (Read, Edit, Write, …) when you genuinely need to read or modify those subtrees; everything else stays under {{work_dir}}."#;
 
+/// `{{python_runtime}}` for the default OS-sandboxed build (uv-shimmed python).
+const SANDBOXED_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are shimmed to `uv run python` / `uv pip` inside this shell. For one-file scripts with third-party deps, declare them via PEP 723 inline metadata (`# /// script` block) so `uv run --script my.py` resolves them per-call. The shims are shell functions scoped to the outer `sh -c` — `bash -c '…'` subshells, `/usr/bin/python`, and Python's own `subprocess` calls bypass them."#;
+
 /// The two mode-specific sections for a `bench-passthrough` build: aura runs
 /// inside an already-isolated container, so there is no OS sandbox and no
 /// work-dir jail, and `{{work_dir}}` is the inherited cwd (the container
@@ -110,6 +114,12 @@ const PASSTHROUGH_ISOLATION: &str = r#"EXECUTION: The shell runs directly on the
 
 #[cfg(feature = "bench-passthrough")]
 const PASSTHROUGH_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: {{work_dir}} is your working directory — create and modify the task's files there, including with the `Write`/`Edit` tools (give them absolute paths under it), since that is where your work is inspected. There is no work-dir jail; just keep task output under {{work_dir}}."#;
+
+/// `{{python_runtime}}` for a `bench-passthrough` build. No uv: the container
+/// ships its own interpreters, and the uv shims are skipped (see `wrap_command`),
+/// so `python`/`pip` must be described as plain commands.
+#[cfg(feature = "bench-passthrough")]
+const PASSTHROUGH_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are the container's own interpreters — run them directly. There is no uv shim, so call them as-is (no `uv run` or PEP 723 `--script` needed); the environment is already provisioned."#;
 
 pub struct BashTool {
     description: String,
@@ -183,6 +193,7 @@ impl BashTool {
             self.description = render_description(
                 PASSTHROUGH_ISOLATION,
                 PASSTHROUGH_WORK_DIR_SCOPE,
+                PASSTHROUGH_PYTHON,
                 &cwd,
                 std::env::consts::OS,
             );
@@ -211,6 +222,14 @@ impl BashTool {
     /// drift between them.
     fn wrap_command(&self, command: &str) -> String {
         let injected = inject_aura_env(command);
+        // Passthrough (in-container bench): the eval container ships its own
+        // python/pip and has no `uv`. Skip the workspace uv shims/exports —
+        // otherwise the `python() { uv run python …; }` shim turns every
+        // `python`/`pip` the agent runs into `uv run …` → `uv: not found`,
+        // breaking the agent's ability to run and verify code in place.
+        if self.is_passthrough() {
+            return injected;
+        }
         let mut out = String::with_capacity(self.uv_env_prefix.len() + injected.len());
         out.push_str(&self.uv_env_prefix);
         out.push_str(&injected);
@@ -222,6 +241,7 @@ fn build_description(work_dir: &Path, platform: &str) -> String {
     render_description(
         SANDBOXED_ISOLATION,
         SANDBOXED_WORK_DIR_SCOPE,
+        SANDBOXED_PYTHON,
         work_dir,
         platform,
     )
@@ -233,12 +253,14 @@ fn build_description(work_dir: &Path, platform: &str) -> String {
 fn render_description(
     isolation: &str,
     work_dir_scope: &str,
+    python_runtime: &str,
     work_dir: &Path,
     platform: &str,
 ) -> String {
     DESCRIPTION_TEMPLATE
         .replace("{{isolation}}", isolation)
         .replace("{{work_dir_scope}}", work_dir_scope)
+        .replace("{{python_runtime}}", python_runtime)
         .replace("{{max_output_kib}}", &MAX_OUTPUT_KIB.to_string())
         .replace("{{work_dir}}", &work_dir.display().to_string())
         .replace("{{platform}}", platform)
@@ -2264,6 +2286,45 @@ mod tests {
         assert!(
             !pass.description.contains("masked with empty tmpfs"),
             "passthrough description must not claim sandbox masking"
+        );
+        // Python guidance must match the runtime: passthrough runs the
+        // container's native python (uv shims are skipped in wrap_command), so
+        // the description must not claim the `uv run python` shim.
+        assert!(
+            sandboxed.description.contains("uv run python"),
+            "sandboxed description still describes the uv-shimmed python"
+        );
+        assert!(
+            !pass.description.contains("uv run python"),
+            "passthrough description must not claim uv-shimmed python"
+        );
+        assert!(
+            pass.description.contains("own interpreters"),
+            "passthrough description must describe the container's native python"
+        );
+    }
+
+    #[cfg(feature = "bench-passthrough")]
+    #[test]
+    fn passthrough_skips_uv_shims_in_wrap_command() {
+        // The default build shims `python`→`uv run python`; in a container with
+        // no uv that breaks every `python`/`pip` call. Passthrough must drop it.
+        let sandboxed = BashTool::new(aura_workspace::WorkspacePaths::new("/tmp"));
+        let passthrough =
+            BashTool::new(aura_workspace::WorkspacePaths::new("/tmp")).with_passthrough(true);
+        assert!(
+            sandboxed
+                .wrap_command("python -c 'x'")
+                .contains("uv run python")
+        );
+        let wrapped = passthrough.wrap_command("python -c 'x'");
+        assert!(
+            !wrapped.contains("uv run"),
+            "passthrough leaked uv shim: {wrapped}"
+        );
+        assert!(
+            !wrapped.contains("UV_CACHE_DIR"),
+            "passthrough leaked uv exports: {wrapped}"
         );
     }
 
