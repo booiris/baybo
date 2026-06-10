@@ -176,7 +176,7 @@ run_arm() {
       echo ">> [$arm] QA run -> $results"
       cargo run -q -p "$PKG" --bin run -- \
         --arm "$arm" --dataset "$DATASET" --conversations "$CONVERSATIONS" \
-        --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" $Q_ARG $UNSETTLED_ARG $MEM0_ARG \
+        --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" --run-id "$RUN_ID" $Q_ARG $UNSETTLED_ARG $MEM0_ARG \
         $CFG_ARG $ANSWER_ARG --openviking-endpoint "$OPENVIKING_ENDPOINT" \
         --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" \
         --manifest "$manifest" --out "$results" --trace-dir "$TRACE_DIR" $TRACE_ARG
@@ -185,7 +185,7 @@ run_arm() {
       echo ">> [$arm] QA run -> $results"
       cargo run -q -p "$PKG" --bin run -- \
         --arm "$arm" --dataset "$DATASET" --conversations "$CONVERSATIONS" \
-        --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" $Q_ARG \
+        --concurrency "$CONCURRENCY" --gateway-port "$GATEWAY_PORT" --run-id "$RUN_ID" $Q_ARG \
         $CFG_ARG $ANSWER_ARG --aura-bin "$AURA_BIN" --workspace-root "$WS_ROOT" --out "$results" \
         --trace-dir "$TRACE_DIR" $TRACE_ARG
       ;;
