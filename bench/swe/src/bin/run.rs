@@ -200,8 +200,7 @@ async fn main() -> Result<()> {
                     prediction_line(&inst.instance_id, model_name, patch)
                 })
                 .collect();
-            let path =
-                runs_dir.join(format!("predictions-{}-{run_id}.jsonl", args.arm.as_str()));
+            let path = runs_dir.join(format!("predictions-{}-{run_id}.jsonl", args.arm.as_str()));
             std::fs::write(&path, predictions_jsonl(&lines))
                 .with_context(|| format!("write predictions {}", path.display()))?;
             tracing::info!(path = %path.display(), "predictions written");
