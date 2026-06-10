@@ -97,7 +97,7 @@ grading uses the harness's own hermetic containers. Two separate lifecycles.
 Credentials + overrides live in `bench/swe/.env` (gitignored — copy the template):
 
 ```bash
-cp bench/swe/.env.example bench/swe/.env   # then fill API_KEY for the agent arm
+cp bench/swe/.env.example bench/swe/.env   # then fill AURA_API_KEY for the agent arm
 ```
 
 Easiest — `run-bench.sh` exports the dataset, (for the agent arm) builds the
@@ -109,7 +109,7 @@ for a cheap smoke:
 # offline floor vs ceiling (no key, no aura) — validates Docker + grader:
 bench/swe/run-bench.sh
 
-# all three arms on specific instances (agent needs API_KEY):
+# all three arms on specific instances (agent needs AURA_API_KEY):
 ARMS="noop oracle agent" INSTANCE_IDS="sympy__sympy-20590" bench/swe/run-bench.sh
 
 # preview the plan (resolves image keys via swebench; no Docker/spend):
@@ -141,9 +141,9 @@ cargo run -p aura-bench-swe --bin run -- --arm agent \
     --instances-json bench/swe/bench-out/instances.json --results-dir bench/swe/results \
     --python-bin bench/swe/.venv/bin/python \
     --aura-bin target/x86_64-unknown-linux-musl/release/aura \
-    --model deepseek/deepseek-v4-flash   # <provider>/<model>; key read from $API_KEY
+    --model deepseek/deepseek-v4-flash   # <provider>/<model>; key read from $AURA_API_KEY
     # Other providers: --model openai/gpt-4o, --model anthropic/claude-3-5-sonnet, …
-    # Override the key var or endpoint with --api-key-env <ENV> / --base-url <URL>.
+    # Override the endpoint with --base-url <URL>.
 
 # plan only (no Docker, no keys, no Python):
 cargo run -p aura-bench-swe --bin run -- --arm agent \

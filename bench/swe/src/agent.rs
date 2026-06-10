@@ -527,7 +527,7 @@ mod tests {
         AgentModel {
             provider: "deepseek".to_string(),
             model: "deepseek-v4-flash".to_string(),
-            api_key_env: "API_KEY".to_string(),
+            api_key_env: "AURA_API_KEY".to_string(),
             base_url: None,
         }
     }

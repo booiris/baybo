@@ -18,8 +18,8 @@ use aura_bench_swe::agent::{self, AgentModel, RunOpts};
 use aura_bench_swe::grader::{self, GraderConfig, Predictions};
 use aura_bench_swe::report::{InstanceResult, ReportMeta, aggregate, print_table};
 use aura_bench_swe::{
-    SweInstance, arm_model_name, default_run_id, load_instances, parse_model, prediction_line,
-    predictions_jsonl,
+    AURA_API_KEY_ENV, SweInstance, arm_model_name, default_run_id, load_instances, parse_model,
+    prediction_line, predictions_jsonl,
 };
 use clap::{Parser, ValueEnum};
 use futures::{StreamExt, stream};
@@ -83,10 +83,6 @@ struct Args {
     /// assumes the `deepseek` provider. (agent arm)
     #[arg(long, default_value = "deepseek/deepseek-v4-flash")]
     model: String,
-    /// Env var holding the agent's API key (provider-agnostic). Override only to
-    /// read the key from a different variable.
-    #[arg(long, default_value = "API_KEY")]
-    api_key_env: String,
     /// Custom LLM base URL (proxy / self-hosted / gateway). Empty => the
     /// provider's built-in endpoint.
     #[arg(long)]
@@ -273,10 +269,10 @@ async fn run_agent(
     if !aura_bin.exists() {
         bail!("aura binary not found at {}", aura_bin.display());
     }
-    // Split `<provider>/<model>`; read the key from `--api-key-env` (default
-    // `API_KEY`, provider-agnostic).
+    // Split `<provider>/<model>`; read the key from the canonical `AURA_API_KEY`
+    // (the bench fixes the env-var name — it's not a user knob).
     let (provider, model) = parse_model(&args.model);
-    let api_key_env = args.api_key_env.clone();
+    let api_key_env = AURA_API_KEY_ENV.to_string();
     let key_value = std::env::var(&api_key_env).map_err(|_| {
         anyhow::anyhow!("the agent arm needs the model key in ${api_key_env} (set it in .env)")
     })?;
