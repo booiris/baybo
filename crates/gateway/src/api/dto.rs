@@ -936,6 +936,35 @@ impl From<aura_query::AnalyticsModelBucket> for AnalyticsModelBucket {
     }
 }
 
+/// Per-reason breakdown row for the analytics dashboard. `reason` is the
+/// `CallReason` wire token (`chat`, `compression`, `tool`, …).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AnalyticsReasonBucket {
+    pub reason: String,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
+    /// Spend for the reason, in **micro-USD** (1 USD = 1_000_000).
+    #[schema(value_type = i64)]
+    pub cost_micro_usd: aura_model::MicroUsd,
+    pub call_count: usize,
+}
+
+impl From<aura_query::AnalyticsReasonBucket> for AnalyticsReasonBucket {
+    fn from(v: aura_query::AnalyticsReasonBucket) -> Self {
+        Self {
+            reason: v.reason.to_token().into_owned(),
+            input_tokens: v.input_tokens,
+            output_tokens: v.output_tokens,
+            cached_input_tokens: v.cached_input_tokens,
+            cache_creation_input_tokens: v.cache_creation_input_tokens,
+            cost_micro_usd: v.cost_usd,
+            call_count: v.call_count,
+        }
+    }
+}
+
 /// `GET /v1/analytics` response body.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AnalyticsResponse {
@@ -953,6 +982,7 @@ pub struct AnalyticsResponse {
     pub total_record_count: usize,
     pub daily: Vec<AnalyticsDayBucket>,
     pub by_model: Vec<AnalyticsModelBucket>,
+    pub by_reason: Vec<AnalyticsReasonBucket>,
 }
 
 // ── ToolDefinition ───────────────────────────────────────────────────

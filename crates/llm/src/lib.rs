@@ -47,6 +47,9 @@ pub use crate::providers::{FactoryDefaults, factory_defaults_for};
 pub use crate::registry::{
     LiveModelInfo, LlmPricingOverride, LlmProviderConfig, LlmProviderRegistry,
 };
+/// Re-exported next to [`Attribution`] (which carries it) so call sites
+/// binding an attribution don't need a separate `aura_model` import.
+pub use aura_model::CallReason;
 
 /// Process-wide handle to the default provider registry. Lazily
 /// constructed on first lookup, shared by the metadata-helper fns

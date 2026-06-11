@@ -18,7 +18,7 @@ use std::sync::Arc;
 use aura_config::{AuraConfig, LlmEntry};
 use aura_cost::CostRecord;
 use aura_gateway::test_support::{TEST_ADMIN_TOKEN, build_test_deps};
-use aura_model::{JobId, MicroUsd, SessionId, SpanId};
+use aura_model::{CallReason, JobId, MicroUsd, SessionId, SpanId};
 use axum::body::{self, Body};
 use axum::http::{Request, StatusCode, header};
 use chrono::Utc;
@@ -329,6 +329,7 @@ fn cost_record(model: &str, input: usize, output: usize, cost: MicroUsd) -> Cost
         session_id: SessionId::from("sess-1"),
         job_id: JobId::new(),
         span_id: SpanId::new(),
+        reason: CallReason::Chat,
         model: model.into(),
         input_tokens: input,
         output_tokens: output,

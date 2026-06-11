@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use aura_model::{JobId, MicroUsd, SessionId, SpanId};
+use aura_model::{CallReason, JobId, MicroUsd, SessionId, SpanId};
 use futures::stream::{Stream, StreamExt};
 
 use crate::guard::{BillableLlm, LlmCallGuard};
@@ -36,6 +36,9 @@ pub struct Attribution {
     pub session_id: SessionId,
     pub job_id: JobId,
     pub span_id: SpanId,
+    /// Why this call was made. Recorded onto every `cost_records` row so
+    /// spend is groupable by purpose. See [`CallReason`].
+    pub reason: CallReason,
 }
 
 impl Attribution {
@@ -51,6 +54,7 @@ impl Attribution {
             session_id: SessionId::new(format!("system:{component}")),
             job_id: JobId::new(),
             span_id: SpanId::new(),
+            reason: CallReason::System,
         }
     }
 }
