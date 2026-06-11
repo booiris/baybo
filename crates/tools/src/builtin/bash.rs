@@ -1626,6 +1626,41 @@ impl BashTool {
     }
 }
 
+/// SIGKILLs an entire process group on drop unless disarmed. Paired with
+/// `Command::process_group(0)` below so a timed-out or cancelled `sh -c "…"`
+/// reaps its descendants: tokio's `kill_on_drop`/`start_kill` only signal the
+/// direct child, leaving anything it forked (and their children) orphaned and,
+/// in the worst case, spinning at 100% CPU.
+struct ProcessGroupKiller(Option<i32>);
+
+impl ProcessGroupKiller {
+    /// `child_pid` is the group leader — we spawn with `process_group(0)`, so
+    /// its pgid equals its pid. `None` if the child's id is already gone.
+    fn arm(child_pid: Option<u32>) -> Self {
+        Self(child_pid.map(|p| p as i32))
+    }
+
+    fn kill_group(&self) {
+        if let Some(pgid) = self.0 {
+            // SAFETY: a negative pid signals the whole group; the leader is our
+            // own child, so this only reaps the command's own process tree.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+    }
+
+    /// The child finished on its own (or we already reaped the group), so the
+    /// pgid may be recycled — don't signal it on drop.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ProcessGroupKiller {
+    fn drop(&mut self) {
+        self.kill_group();
+    }
+}
+
 async fn run_unsandboxed(
     program: &str,
     args: &[String],
@@ -1650,10 +1685,19 @@ async fn run_unsandboxed(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
+    // Own process group: a `sh -c "…"` forks descendants, and on timeout/cancel
+    // we must reap the whole tree. `kill_on_drop`/`start_kill` only hit the
+    // direct child, orphaning grandchildren; `process_group(0)` makes the child
+    // the group leader so `ProcessGroupKiller` can SIGKILL `-pgid`.
+    cmd.process_group(0);
 
     let mut child = cmd
         .spawn()
         .map_err(|e| ToolError::Execution(format!("spawn `{program}`: {e}")))?;
+    // Reaps the group on every early-exit path: the timeout arm below, or the
+    // caller dropping this future on cancellation (its select races us against
+    // the cancellation token). Disarmed after a clean finish.
+    let mut group = ProcessGroupKiller::arm(child.id());
 
     let stdout_pipe = child
         .stdout
@@ -1689,11 +1733,18 @@ async fn run_unsandboxed(
             (false, wait.ok().and_then(|s| s.code()).unwrap_or(-1))
         }
         _ = tokio::time::sleep(timeout) => {
-            let _ = child.start_kill();
+            // Reap the whole group, not just `sh`, then collect the leader's
+            // zombie. Descendants reparent to init, which reaps them.
+            group.kill_group();
             let _ = child.wait().await;
             (true, -1)
         }
     };
+    // A select arm completed: the group is already dead (timeout) or the child
+    // exited on its own (a deliberately-backgrounded descendant is left running,
+    // matching the prior contract). The guard still fires if this future is
+    // instead dropped mid-select — the caller's cancellation path.
+    group.disarm();
 
     let stdout = stdout_task.await.unwrap_or_default();
     let stderr = stderr_task.await.unwrap_or_default();
@@ -1735,6 +1786,65 @@ mod tests {
 
     fn cfg(path: &str) -> std::ffi::OsString {
         std::ffi::OsString::from(path)
+    }
+
+    /// A bash command that forks a long-lived descendant must have that whole
+    /// tree reaped when it times out — not just the `sh` we launched. Regression
+    /// guard for the orphaned-process-group leak (descendants reparented to init
+    /// and left spinning) that `process_group(0)` + group-SIGKILL fixes.
+    #[tokio::test]
+    async fn unsandboxed_timeout_reaps_whole_process_group() {
+        let pidfile = std::env::temp_dir().join(format!(
+            "aura-pgkill-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&pidfile);
+
+        // `sleep 30` is the grandchild (aura -> sh -> sleep); it inherits sh's
+        // new process group. `wait` keeps sh alive so the command hits the
+        // timeout instead of exiting on its own.
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let out = run_unsandboxed(
+            "sh",
+            &["-c".to_string(), script],
+            None,
+            &[],
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .expect("run_unsandboxed returns");
+        assert!(out.timed_out, "command should have hit the timeout");
+
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("pidfile written")
+            .trim()
+            .parse()
+            .expect("pid parses");
+        let _ = std::fs::remove_file(&pidfile);
+
+        // `kill(pid, 0)` returns -1/ESRCH once the grandchild is gone. Poll
+        // briefly for the SIGKILL to land.
+        let alive = |pid: i32| unsafe { libc::kill(pid, 0) == 0 };
+        let mut reaped = false;
+        for _ in 0..40 {
+            if !alive(pid) {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if !reaped {
+            // Don't leak the survivor if the fix regressed.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            reaped,
+            "grandchild pid {pid} survived the timeout — process group not reaped"
+        );
     }
 
     #[test]
