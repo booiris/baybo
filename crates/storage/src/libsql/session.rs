@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
-use aura_model::{ChatMessage, LineageKind, LlmEntryName, Session, SessionId};
+use aura_model::{
+    ChatMessage, ControlEvent, ControlEventKind, LineageKind, LlmEntryName, Session, SessionId,
+};
 use aura_store::StorageError;
 use aura_store::session::{Result, SessionStore, StoredMessage};
 
@@ -471,6 +473,102 @@ impl SessionStore for LibsqlSessionStore {
             .get(0)
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ordinal: {e}")))?;
         Ok(ordinal)
+    }
+
+    async fn append_control_event(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+        kind: ControlEventKind,
+        text: &str,
+        created_at: DateTime<Utc>,
+    ) -> Result<i64> {
+        let conn = self.pool.conn();
+        let created_us = super::time::to_us(created_at);
+        let mut rows = conn
+            .query(
+                "INSERT INTO session_control_events \
+             (session_id, seq, after_ordinal, kind, text, created_at) \
+             SELECT ?1, COALESCE(MAX(seq), -1) + 1, ?2, ?3, ?4, ?5 \
+             FROM session_control_events WHERE session_id = ?1 \
+             RETURNING seq",
+                libsql::params![
+                    session_id.as_str().to_string(),
+                    after_ordinal,
+                    kind.as_str().to_string(),
+                    text.to_string(),
+                    created_us,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql append control event: {e}"))
+            })?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+            .ok_or_else(|| {
+                StorageError::Internal(anyhow::anyhow!(
+                    "INSERT … RETURNING returned no rows for session_control_events"
+                ))
+            })?;
+        let seq: i64 = row
+            .get(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get seq: {e}")))?;
+        Ok(seq)
+    }
+
+    async fn list_control_events(&self, session_id: &SessionId) -> Result<Vec<ControlEvent>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT seq, after_ordinal, kind, text, created_at FROM session_control_events \
+                 WHERE session_id = ?1 ORDER BY seq",
+                libsql::params![session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql list control events: {e}"))
+            })?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let seq: i64 = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get seq: {e}")))?;
+            let after_ordinal: i64 = row.get(1).map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql get after_ordinal: {e}"))
+            })?;
+            let kind_str: String = row
+                .get(2)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get kind: {e}")))?;
+            let text: String = row
+                .get(3)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get text: {e}")))?;
+            let created_us: i64 = row.get(4).map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql get created_at: {e}"))
+            })?;
+            let kind = kind_str
+                .parse::<ControlEventKind>()
+                .map_err(StorageError::Storage)?;
+            let created_at = super::time::from_us(created_us).ok_or_else(|| {
+                StorageError::Storage(format!(
+                    "session_control_events.created_at out of range: {created_us}"
+                ))
+            })?;
+            out.push(ControlEvent {
+                seq,
+                after_ordinal,
+                kind,
+                text,
+                created_at,
+            });
+        }
+        Ok(out)
     }
 
     async fn apply_session_compaction(

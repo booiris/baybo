@@ -2595,6 +2595,13 @@
             "$ref": "#/components/schemas/TranscriptItemKind",
             "description": "Message bubble vs. reconstructed work block."
           },
+          "notice_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Severity of a `notice` item (`\"info\"` / `\"warn\"` / `\"error\"`), so a reload\ncolors it the way the live frame did. `None` for `message` / `work` items."
+          },
           "ordinal": {
             "type": "integer",
             "format": "int64",
@@ -3655,7 +3662,8 @@
         "description": "Discriminator for [`ChatTranscriptItem`] — serialized as\n`\"message\"` / `\"work\"`.",
         "enum": [
           "message",
-          "work"
+          "work",
+          "notice"
         ]
       },
       "UnsetConfigRequest": {

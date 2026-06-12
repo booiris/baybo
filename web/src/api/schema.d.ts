@@ -749,6 +749,11 @@ export interface components {
             /** @description Message bubble vs. reconstructed work block. */
             kind: components["schemas"]["TranscriptItemKind"];
             /**
+             * @description Severity of a `notice` item (`"info"` / `"warn"` / `"error"`), so a reload
+             *     colors it the way the live frame did. `None` for `message` / `work` items.
+             */
+            notice_level?: string | null;
+            /**
              * Format: int64
              * @description Absolute `session_messages.ordinal` of this row. Stable for the
              *     lifetime of the session and used both as a React key and as
@@ -1221,7 +1226,7 @@ export interface components {
          *     `"message"` / `"work"`.
          * @enum {string}
          */
-        TranscriptItemKind: "message" | "work";
+        TranscriptItemKind: "message" | "work" | "notice";
         /** @description `DELETE /v1/config` body. */
         UnsetConfigRequest: {
             path: string;

@@ -1297,6 +1297,22 @@ mod tests {
             });
             Ok(ordinal)
         }
+        async fn append_control_event(
+            &self,
+            _id: &SessionId,
+            _after_ordinal: i64,
+            _kind: aura_model::ControlEventKind,
+            _text: &str,
+            _created_at: DateTime<Utc>,
+        ) -> std::result::Result<i64, aura_store::StorageError> {
+            Ok(0)
+        }
+        async fn list_control_events(
+            &self,
+            _id: &SessionId,
+        ) -> std::result::Result<Vec<aura_model::ControlEvent>, aura_store::StorageError> {
+            Ok(Vec::new())
+        }
         async fn apply_session_compaction(
             &self,
             id: &SessionId,

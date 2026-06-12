@@ -71,3 +71,44 @@
 .chat-scroll::-webkit-scrollbar-corner {
   background: transparent;
 }
+
+/* Chat markdown lists: render bullet / number markers in a fixed left slot
+   so a `<ul>` (•) item and an `<ol>` (1. 2. …) item share the same left
+   edge. Native `list-style: outside` markers right-align against the text,
+   so a two-glyph `1.` hangs further left than a single `•` — which reads as
+   inconsistent left padding between a numbered and a bulleted answer. The
+   marker sits at the list's left edge (flush with surrounding paragraph
+   text); the item text is indented past it. */
+.md-list {
+  list-style: none;
+  padding-left: 0;
+}
+
+.md-list > li {
+  position: relative;
+  padding-left: 1.5rem;
+}
+
+.md-list > li::before {
+  position: absolute;
+  left: 0;
+  top: 0;
+  /* leading-relaxed — line up the marker with the item's first text line */
+  line-height: 1.625;
+}
+
+ul.md-list > li::before {
+  content: "•";
+}
+
+ol.md-list {
+  counter-reset: md-ol;
+}
+
+ol.md-list > li {
+  counter-increment: md-ol;
+}
+
+ol.md-list > li::before {
+  content: counter(md-ol) ".";
+}

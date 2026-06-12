@@ -13,7 +13,7 @@ use aura_channels::{
     AgentEvent, AgentOutput, COMPACT_COMMAND, IncomingMessage, NoticeLevel, OutgoingMessage,
 };
 use aura_job::JobInput;
-use aura_model::{ContentBlock, LlmEntryName, PendingBackgroundResult};
+use aura_model::{ContentBlock, ControlEventKind, LlmEntryName, PendingBackgroundResult};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -464,9 +464,12 @@ impl AgentActor {
     }
 
     async fn handle_user_input(&mut self, incoming: IncomingMessage) -> anyhow::Result<()> {
+        let sent_at = incoming.message.timestamp;
         let content = incoming.message.content;
         if is_compact_command(&content) {
-            return self.handle_compact().await;
+            return self
+                .handle_compact(slash_command_text(&content), sent_at)
+                .await;
         }
         // Background `spawn_subagent` results are NOT folded into the
         // user's turn — they run as their own `SubagentNotification` turn
@@ -860,6 +863,16 @@ impl AgentActor {
                 session_id = %self.durable.session.id,
                 "user turn produced an empty reply; surfacing fallback notice"
             );
+            // Record the fallback as an out-of-band control event so a reload
+            // doesn't show a bare user turn with no reply.
+            let after = self.current_after_ordinal().await;
+            self.persist_control_event(
+                after,
+                ControlEventKind::NoticeWarn,
+                EMPTY_USER_REPLY_NOTICE,
+                chrono::Utc::now(),
+            )
+            .await;
             let notice = AgentOutput {
                 session_id: self.durable.session.id.clone(),
                 user_id: self.durable.session.user.id.clone(),
@@ -876,9 +889,15 @@ impl AgentActor {
     }
 
     /// `/compact` is a control command, not an assistant turn, so the
-    /// confirmation goes back as `Notice` (out-of-band, off-transcript)
-    /// rather than `Message`.
-    async fn handle_compact(&mut self) -> anyhow::Result<()> {
+    /// confirmation goes back as a `Notice` rather than an assistant `Message`.
+    /// The command echo and the confirmation are also recorded as out-of-band
+    /// control events (`session_control_events`, kept out of the LLM transcript)
+    /// so a reload shows both. `sent_at` is when the user issued `/compact`.
+    async fn handle_compact(
+        &mut self,
+        command_text: String,
+        sent_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
         let text = self
             .volatile
             .agent_loop
@@ -890,6 +909,19 @@ impl AgentActor {
                 self.volatile.actor_token.child_token(),
             )
             .await?;
+        // Record the `/compact` echo + its confirmation as out-of-band control
+        // events (off the LLM transcript) so a reload shows them, anchored after
+        // the (post-compaction) last row.
+        let after = self.current_after_ordinal().await;
+        self.persist_control_event(after, ControlEventKind::Command, &command_text, sent_at)
+            .await;
+        self.persist_control_event(
+            after,
+            ControlEventKind::NoticeInfo,
+            &text,
+            chrono::Utc::now(),
+        )
+        .await;
         let notice = AgentOutput {
             session_id: self.durable.session.id.clone(),
             user_id: self.durable.session.user.id.clone(),
@@ -941,6 +973,58 @@ impl AgentActor {
             warn!(error = %e, source, "failed to send agent output to channel");
         }
     }
+
+    /// Append an out-of-band control event (slash-command echo / notice) to the
+    /// session's control-event log — separate from the LLM transcript, surfaced
+    /// only on the chat view. Best-effort: a write failure just means it won't
+    /// reappear on reload.
+    async fn persist_control_event(
+        &self,
+        after_ordinal: i64,
+        kind: ControlEventKind,
+        text: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) {
+        if let Err(e) = self
+            .volatile
+            .session_manager
+            .append_control_event(&self.durable.session.id, after_ordinal, kind, text, at)
+            .await
+        {
+            warn!(
+                session_id = %self.durable.session.id,
+                error = %e,
+                "failed to persist control event"
+            );
+        }
+    }
+
+    /// The session's current last `session_messages.ordinal` (`-1` if none) — the
+    /// anchor a control event records so the chat view interleaves it after that
+    /// row even on scroll-up.
+    async fn current_after_ordinal(&self) -> i64 {
+        self.volatile
+            .session_manager
+            .latest_session_ordinal(&self.durable.session.id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(-1)
+    }
+}
+
+/// The plain text of a message's content blocks, space-joined — used to echo a
+/// user's control command (`/stop`, `/compact`) into the control-event log.
+pub(crate) fn slash_command_text(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.trim()),
+            _ => None,
+        })
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]

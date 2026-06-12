@@ -216,6 +216,14 @@ const EMPTY_VIEW: SessionView = {
  *  genuinely roamed across many conversations in one tab session. */
 const VIEW_CACHE_LIMIT = 20;
 
+/* Grace period after the WS reaches `connected` before the "Cancelled"
+ *  badge is allowed to render. On a fresh load the transcript is fetched
+ *  over REST before the socket is up, so its trailing work block looks
+ *  "cancelled" until the live connection delivers the turn's actual
+ *  continuation / catch-up. Holding the badge until the connection has
+ *  settled avoids flashing it during that load→connect window. */
+const CANCELLED_BADGE_SETTLE_MS = 800;
+
 export function ChatPage() {
   const { sessionId } = useParams<{ sessionId?: string }>();
   const navigate = useNavigate();
@@ -279,6 +287,10 @@ export function ChatPage() {
   const [cronInboxRefresh, setCronInboxRefresh] = useState(0);
 
   const [status, setStatus] = useState<ConnectionStatus>({ state: 'connecting' });
+  // Gates the "Cancelled" badge (see CANCELLED_BADGE_SETTLE_MS). False
+  // until the socket has held `connected` for the grace window, so a
+  // freshly-loaded transcript can't flash the badge before live state lands.
+  const [connectionSettled, setConnectionSettled] = useState(false);
   const [composer, setComposer] = useState('');
   const [showSlashHints, setShowSlashHints] = useState(false);
 
@@ -896,6 +908,21 @@ export function ChatPage() {
     }
   }, [status.state]);
 
+  // Drive `connectionSettled`: true only after the socket has held
+  // `connected` for the grace window; reset the moment it drops. Gates the
+  // "Cancelled" badge so the load→connect race can't flash it.
+  useEffect(() => {
+    if (status.state !== 'connected') {
+      setConnectionSettled(false);
+      return;
+    }
+    const t = window.setTimeout(
+      () => setConnectionSettled(true),
+      CANCELLED_BADGE_SETTLE_MS,
+    );
+    return () => window.clearTimeout(t);
+  }, [status.state]);
+
   // Scroll-up pagination: when the user is within `topThresholdPx`
   // of the top *and* the current view still has older rows on the
   // server, fetch one more slice and prepend it. Scroll position is
@@ -1314,6 +1341,7 @@ export function ChatPage() {
                   <MessageBubble key={row.key} row={row} />,
                 ];
                 if (
+                  connectionSettled &&
                   isCancelledWorkAt(
                     arr,
                     i,
@@ -1827,6 +1855,7 @@ function routeInboundFrame(
                 role: 'system',
                 text: '',
                 notice: { level: noticeLevel(frame.level), text: frame.text },
+                createdAt: new Date().toISOString(),
               },
             ],
             // Some turns reply with `AgentOutput::Notice` and never
@@ -2247,16 +2276,20 @@ interface HistoryWorkStepDto {
 interface HistoryRowDto {
   created_at: string;
   ordinal: number;
-  /** `'message'` (default) or `'work'` — see the gateway's
+  /** `'message'` (default), `'work'`, or `'notice'` — see the gateway's
    *  `ChatTranscriptItem`. A `work` row is the server's reconstruction of
-   *  a tool-using turn's collapsed work block. */
-  kind?: 'message' | 'work';
+   *  a tool-using turn's collapsed work block; a `notice` row is a persisted
+   *  out-of-band notice (e.g. a `/compact` confirmation). */
+  kind?: 'message' | 'work' | 'notice';
   role: string;
   text: string;
   has_attachments: boolean;
   steps?: HistoryWorkStepDto[];
   work_started_at?: string | null;
   work_ended_at?: string | null;
+  /** Severity of a `notice` row, so reload colors it like the live frame.
+   *  Normalized through `noticeLevel()` at the call site. */
+  notice_level?: string | null;
 }
 
 /** Translate one server-side transcript row into the local
@@ -2290,6 +2323,17 @@ function historyRowToTranscript(sessionId: string, row: HistoryRowDto): Transcri
         toolStatus: (s.tool_status ?? undefined) as WorkStep['toolStatus'],
         toolSummary: s.tool_summary ?? undefined,
       })),
+    };
+  }
+  if (row.kind === 'notice') {
+    // Persisted out-of-band notice (e.g. a `/compact` confirmation), rendered at
+    // the same severity the live frame carried (`notice_level`).
+    return {
+      key: `hist-${sessionId}-${row.ordinal}`,
+      role: 'system',
+      text: '',
+      notice: { level: noticeLevel(row.notice_level ?? 'info'), text: row.text },
+      createdAt: row.created_at,
     };
   }
   return {
@@ -2590,11 +2634,15 @@ const MARKDOWN_COMPONENTS: Components = {
   h6: ({ children }) => (
     <h6 className="my-2 first:mt-0 last:mb-0 text-sm font-bold">{children}</h6>
   ),
+  // Marker geometry (fixed left-edge bullets / numbers) lives in the
+  // `.md-list` rules in `index.css` — native `outside` markers right-align
+  // to the text, which left a numbered list hanging further left than a
+  // bulleted one. Keep vertical rhythm here in utilities.
   ul: ({ children }) => (
-    <ul className="my-2 first:mt-0 last:mb-0 list-disc pl-5 space-y-1">{children}</ul>
+    <ul className="md-list my-2 first:mt-0 last:mb-0 space-y-1">{children}</ul>
   ),
   ol: ({ children }) => (
-    <ol className="my-2 first:mt-0 last:mb-0 list-decimal pl-5 space-y-1">{children}</ol>
+    <ol className="md-list my-2 first:mt-0 last:mb-0 space-y-1">{children}</ol>
   ),
   li: ({ children }) => <li className="leading-snug">{children}</li>,
   a: ({ href, children }) => (
@@ -2677,10 +2725,20 @@ function MessageBubble({ row }: { row: TranscriptRow }) {
           ? 'bg-warn/10 border-warn text-warn'
           : 'bg-info/10 border-info text-info';
     return (
-      <div
-        className={`border-2 rounded-md px-3 py-2 font-mono text-sm whitespace-pre-wrap ${palette}`}
-      >
-        {row.notice.text}
+      <div className="flex flex-col items-start min-w-0">
+        <div
+          className={`border-2 rounded-md px-3 py-2 font-mono text-sm whitespace-pre-wrap ${palette}`}
+        >
+          {row.notice.text}
+        </div>
+        {row.createdAt ? (
+          <span
+            className="mt-1 px-1 font-mono text-[0.65rem] text-ink-soft tabular-nums"
+            title={formatTimestampTooltip(row.createdAt)}
+          >
+            {formatTimestampShort(row.createdAt)}
+          </span>
+        ) : null}
       </div>
     );
   }

@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use aura_model::{ChannelType, ChatMessage, LineageKind, Session, SessionId};
+use aura_model::{
+    ChannelType, ChatMessage, ControlEvent, ControlEventKind, LineageKind, Session, SessionId,
+};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
@@ -35,6 +37,7 @@ struct StoredMessageRow {
 pub struct MemorySessionStore {
     data: Mutex<HashMap<SessionId, Session>>,
     transcripts: Mutex<HashMap<SessionId, Vec<StoredMessageRow>>>,
+    control_events: Mutex<HashMap<SessionId, Vec<ControlEvent>>>,
 }
 
 impl MemorySessionStore {
@@ -149,6 +152,36 @@ impl SessionStore for MemorySessionStore {
         i64::try_from(ordinal).map_err(|_| {
             StorageError::Internal(anyhow::anyhow!("ordinal {ordinal} exceeds i64::MAX"))
         })
+    }
+
+    async fn append_control_event(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+        kind: ControlEventKind,
+        text: &str,
+        created_at: DateTime<Utc>,
+    ) -> Result<i64> {
+        let mut guard = self.control_events.lock();
+        let log = guard.entry(session_id.clone()).or_default();
+        let seq = log.last().map(|e| e.seq + 1).unwrap_or(0);
+        log.push(ControlEvent {
+            seq,
+            after_ordinal,
+            kind,
+            text: text.to_string(),
+            created_at,
+        });
+        Ok(seq)
+    }
+
+    async fn list_control_events(&self, session_id: &SessionId) -> Result<Vec<ControlEvent>> {
+        Ok(self
+            .control_events
+            .lock()
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn apply_session_compaction(

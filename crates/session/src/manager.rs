@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use aura_model::{
-    ChannelType, ChatMessage, LlmEntryName, Session, SessionId, SessionState, TriggerSource, User,
+    ChannelType, ChatMessage, ControlEvent, ControlEventKind, LlmEntryName, Session, SessionId,
+    SessionState, TriggerSource, User,
 };
 use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, warn};
@@ -347,6 +348,30 @@ impl SessionManager {
     ) -> Result<i64> {
         self.store
             .append_session_message(session_id, message)
+            .await
+            .map_err(SessionError::from)
+    }
+
+    /// Append an out-of-band control/display event (slash-command echo or
+    /// notice) — see [`aura_store::SessionStore::append_control_event`].
+    pub async fn append_control_event(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+        kind: ControlEventKind,
+        text: &str,
+        created_at: DateTime<Utc>,
+    ) -> Result<i64> {
+        self.store
+            .append_control_event(session_id, after_ordinal, kind, text, created_at)
+            .await
+            .map_err(SessionError::from)
+    }
+
+    /// All control events for a session, oldest-first by `seq`.
+    pub async fn list_control_events(&self, session_id: &SessionId) -> Result<Vec<ControlEvent>> {
+        self.store
+            .list_control_events(session_id)
             .await
             .map_err(SessionError::from)
     }

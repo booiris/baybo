@@ -4,7 +4,7 @@ use aura_channels::{
     AgentEvent, AgentOutput, IncomingMessage, NoticeLevel, OutgoingMessage, STOP_COMMAND_NAME,
 };
 use aura_job::{CancelReason, JobStatusKind};
-use aura_model::{ChannelType, ContentBlock, JobId, MessageMetadata, SessionId};
+use aura_model::{ChannelType, ContentBlock, ControlEventKind, JobId, MessageMetadata, SessionId};
 use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;
@@ -64,8 +64,16 @@ impl Router {
         // turn. Recognised before the rate-limit / cost gate so a stop always
         // lands. No `get_or_create`: nothing to stop on a session with no actor.
         if is_stop_command(&incoming.message.content) {
-            self.handle_stop(&SessionId::from(session_id.as_str()), &user.id, &channel)
-                .await;
+            // Carry the command text + send time so the persisted control events
+            // record what the user did and when.
+            self.handle_stop(
+                &SessionId::from(session_id.as_str()),
+                &user.id,
+                &channel,
+                &crate::actor::slash_command_text(&incoming.message.content),
+                incoming.message.timestamp,
+            )
+            .await;
             return Ok(());
         }
 
@@ -156,7 +164,14 @@ impl Router {
     /// notify normally once the cancelled turn returns and the actor drains
     /// `pending_background_results`. Idempotent and safe on an idle session
     /// (everything degrades to a no-op).
-    async fn handle_stop(&self, session_id: &SessionId, user_id: &str, channel: &ChannelType) {
+    async fn handle_stop(
+        &self,
+        session_id: &SessionId,
+        user_id: &str,
+        channel: &ChannelType,
+        command_text: &str,
+        stopped_at: chrono::DateTime<chrono::Utc>,
+    ) {
         // Drain the in-flight background subagents first: the removal both
         // gives us the cancel targets + ack summaries AND suppresses each
         // child's terminal delivery (its wait task sees the entry gone), so a
@@ -217,16 +232,64 @@ impl Router {
         // that already finished; `/stop` stops running work, it doesn't discard
         // completed work — so once the cancelled turn returns, the actor reports
         // them via the normal notification path.
+        let text = build_stop_notice(cancelled_turn, &background);
+        // Record the user's `/stop` echo + the outcome notice as out-of-band
+        // control events (separate from the LLM transcript) so a reload shows
+        // both. Anchor them after the session's current last row so they land
+        // right after this turn's partial rows; `stopped_at` is the send time.
+        let after = self
+            .session_manager
+            .latest_session_ordinal(session_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(-1);
+        self.persist_control_event(
+            session_id,
+            after,
+            ControlEventKind::Command,
+            command_text,
+            stopped_at,
+        )
+        .await;
+        self.persist_control_event(
+            session_id,
+            after,
+            ControlEventKind::NoticeInfo,
+            &text,
+            stopped_at,
+        )
+        .await;
         self.handle_agent_output(AgentOutput {
             session_id: session_id.clone(),
             user_id: user_id.to_string(),
             channel: channel.clone(),
             event: AgentEvent::Notice {
                 level: NoticeLevel::Info,
-                text: build_stop_notice(cancelled_turn, &background),
+                text,
             },
         })
         .await;
+    }
+
+    /// Append an out-of-band control event (slash-command echo / notice) to the
+    /// session's control-event log. Best-effort — a write failure just means it
+    /// won't reappear on reload.
+    async fn persist_control_event(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+        kind: ControlEventKind,
+        text: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) {
+        if let Err(e) = self
+            .session_manager
+            .append_control_event(session_id, after_ordinal, kind, text, at)
+            .await
+        {
+            warn!(%session_id, error = %e, "failed to persist control event");
+        }
     }
 
     /// Cancel every in-flight job in the subtree rooted at `root_job_id`

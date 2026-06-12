@@ -32,8 +32,8 @@ use std::collections::HashMap;
 use aura_agent::actor::AgentMessage;
 use aura_channels::wire::{SessionPatch, SlashCommandSpec};
 use aura_model::{
-    ChannelType, ChatMessage, ContentBlock, LlmEntryName, MessageSource, Role, Session, SessionId,
-    ThinkingContent, TriggerSource, User,
+    ChannelType, ChatMessage, ContentBlock, ControlEvent, ControlEventKind, LlmEntryName,
+    MessageSource, Role, Session, SessionId, ThinkingContent, TriggerSource, User,
 };
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -153,6 +153,11 @@ pub enum TranscriptItemKind {
     Message,
     /// A reconstructed collapsed work block for a tool-using turn.
     Work,
+    /// A persisted out-of-band notice (e.g. a `/compact` confirmation) — the
+    /// durable shadow of a live `AgentEvent::Notice`. Carries [`ChatTranscriptItem::text`];
+    /// the client renders it as a notice, not a bubble. Level isn't persisted,
+    /// so reload renders it at the neutral/info level.
+    Notice,
 }
 
 /// Kind of a reconstructed [`ChatWorkStep`] — serialized as
@@ -210,6 +215,10 @@ pub struct ChatTranscriptItem {
     pub work_started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_ended_at: Option<DateTime<Utc>>,
+    /// Severity of a `notice` item (`"info"` / `"warn"` / `"error"`), so a reload
+    /// colors it the way the live frame did. `None` for `message` / `work` items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice_level: Option<String>,
 }
 
 /// One reconstructed step inside a `work` transcript item — the durable
@@ -558,7 +567,26 @@ async fn get_session(
     // (`channel::route::chat_to_visible_wire_message`) still replays only
     // the message bubbles — a full reload through here is what restores
     // the work blocks.
-    let transcript = reconstruct_transcript(tail);
+    // Out-of-band control events (slash-command echoes + notices) live in their
+    // own table; interleave those whose `after_ordinal` anchor falls within this
+    // page. `upper` is the page's last row; `lower` is its first, except the
+    // oldest page (`!has_more`) extends down to catch `-1` / pre-supersession
+    // anchors. `reconstruct_transcript` places each event right after its anchor.
+    let control_events: Vec<ControlEvent> = match (tail.first(), tail.last()) {
+        (Some(&(first, _, _)), Some(&(last, _, _))) => {
+            let lower = if has_more { first } else { i64::MIN };
+            state
+                .session_manager
+                .list_control_events(&sid)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|ev| ev.after_ordinal >= lower && ev.after_ordinal <= last)
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    let transcript = reconstruct_transcript(tail, control_events);
     Ok(Json(ChatSessionDetail {
         session_id,
         created_at: session.created_at,
@@ -1070,6 +1098,7 @@ impl WorkAccumulator {
                 steps: std::mem::take(&mut self.steps),
                 work_started_at: started,
                 work_ended_at: ended_at.or(self.last).or(started),
+                notice_level: None,
             });
         }
         self.ordinal = None;
@@ -1088,7 +1117,29 @@ impl WorkAccumulator {
 /// reload the same work-block-then-answer shape the live view shows —
 /// turn-progress is otherwise live-only, but every block it needs is
 /// durably persisted, so this is where it's reconstructed.
-fn reconstruct_transcript(tail: Vec<(i64, DateTime<Utc>, ChatMessage)>) -> Vec<ChatTranscriptItem> {
+fn reconstruct_transcript(
+    tail: Vec<(i64, DateTime<Utc>, ChatMessage)>,
+    control_events: Vec<ControlEvent>,
+) -> Vec<ChatTranscriptItem> {
+    // Merge message rows and out-of-band control events into one ordinal-ordered
+    // stream: a control event with `after_ordinal = N` sorts right after the row
+    // at ordinal N (and before N+1), `seq`-ordered among events sharing an
+    // anchor. Folding then runs over the stream unchanged; a control event just
+    // flushes the open work block and emits its own item.
+    enum Entry {
+        Row(i64, DateTime<Utc>, ChatMessage),
+        Control(ControlEvent),
+    }
+    let mut entries: Vec<(i64, u8, i64, Entry)> =
+        Vec::with_capacity(tail.len() + control_events.len());
+    for (ordinal, created_at, msg) in tail {
+        entries.push((ordinal, 0, ordinal, Entry::Row(ordinal, created_at, msg)));
+    }
+    for ev in control_events {
+        entries.push((ev.after_ordinal, 1, ev.seq, Entry::Control(ev)));
+    }
+    entries.sort_by_key(|(anchor, is_control, tiebreak, _)| (*anchor, *is_control, *tiebreak));
+
     let mut items: Vec<ChatTranscriptItem> = Vec::new();
     let mut work = WorkAccumulator::default();
     // Start of the turn currently being folded — the most recent real user
@@ -1097,7 +1148,15 @@ fn reconstruct_transcript(tail: Vec<(i64, DateTime<Utc>, ChatMessage)>) -> Vec<C
     // reconstructed work block spans from here to the answer's timestamp.
     let mut turn_started: Option<DateTime<Utc>> = None;
 
-    for (ordinal, created_at, msg) in tail {
+    for (_, _, _, entry) in entries {
+        let (ordinal, created_at, msg) = match entry {
+            Entry::Control(ev) => {
+                work.flush(&mut items, None);
+                items.push(control_event_item(ev));
+                continue;
+            }
+            Entry::Row(ordinal, created_at, msg) => (ordinal, created_at, msg),
+        };
         match msg.role {
             Role::User if msg.from_user() => {
                 work.flush(&mut items, None);
@@ -1232,7 +1291,51 @@ fn message_item(
         steps: Vec::new(),
         work_started_at: None,
         work_ended_at: None,
+        notice_level: None,
     })
+}
+
+/// Map a [`ControlEvent`] (an out-of-band slash-command echo or notice, stored
+/// outside `session_messages`) into a transcript item: a `command` renders as a
+/// user bubble (what the user typed), a `notice_*` as a colored notice bar. The
+/// negative `ordinal` keeps these in a key space disjoint from real message
+/// ordinals (so React keys never collide) without affecting pagination — they
+/// merge into the page by `created_at` and are never the page's oldest row.
+fn control_event_item(ev: ControlEvent) -> ChatTranscriptItem {
+    let ordinal = -(ev.seq + 1);
+    let base = ChatTranscriptItem {
+        ordinal,
+        kind: TranscriptItemKind::Message,
+        role: String::new(),
+        text: ev.text,
+        has_attachments: false,
+        created_at: ev.created_at,
+        steps: Vec::new(),
+        work_started_at: None,
+        work_ended_at: None,
+        notice_level: None,
+    };
+    match ev.kind {
+        ControlEventKind::Command => ChatTranscriptItem {
+            role: "user".to_owned(),
+            ..base
+        },
+        ControlEventKind::NoticeInfo => ChatTranscriptItem {
+            kind: TranscriptItemKind::Notice,
+            notice_level: Some("info".to_owned()),
+            ..base
+        },
+        ControlEventKind::NoticeWarn => ChatTranscriptItem {
+            kind: TranscriptItemKind::Notice,
+            notice_level: Some("warn".to_owned()),
+            ..base
+        },
+        ControlEventKind::NoticeError => ChatTranscriptItem {
+            kind: TranscriptItemKind::Notice,
+            notice_level: Some("error".to_owned()),
+            ..base
+        },
+    }
 }
 
 /// Concatenate the visible text of a model thinking block (redacted
@@ -1386,7 +1489,7 @@ mod tests {
                 ChatMessage::assistant(vec![text("done, sort of")]),
             ),
         ];
-        let items = reconstruct_transcript(tail);
+        let items = reconstruct_transcript(tail, Vec::new());
         assert_eq!(items.len(), 3);
 
         assert!(matches!(items[0].kind, TranscriptItemKind::Message));
@@ -1430,7 +1533,7 @@ mod tests {
                 ChatMessage::assistant(vec![thinking("let me add"), text("2")]),
             ),
         ];
-        let items = reconstruct_transcript(tail);
+        let items = reconstruct_transcript(tail, Vec::new());
         assert_eq!(items.len(), 3);
 
         assert!(matches!(items[0].kind, TranscriptItemKind::Message));
@@ -1461,7 +1564,7 @@ mod tests {
             (2, ts(2), ChatMessage::user(vec![text("hi")])),
             (3, ts(3), ChatMessage::assistant(vec![text("hello")])),
         ];
-        let items = reconstruct_transcript(tail);
+        let items = reconstruct_transcript(tail, Vec::new());
         assert_eq!(items.len(), 2);
         assert!(
             items
@@ -1490,7 +1593,7 @@ mod tests {
                 ChatMessage::tool_result("c1".to_owned(), "ok output".to_owned()),
             ),
         ];
-        let items = reconstruct_transcript(tail);
+        let items = reconstruct_transcript(tail, Vec::new());
         assert_eq!(items.len(), 2);
         let work = &items[1];
         assert!(matches!(work.kind, TranscriptItemKind::Work));
@@ -1508,7 +1611,7 @@ mod tests {
             (3, ts(3), ChatMessage::user(vec![text("hi")])),
             (4, ts(4), ChatMessage::assistant(vec![text("hello")])),
         ];
-        let items = reconstruct_transcript(tail);
+        let items = reconstruct_transcript(tail, Vec::new());
         assert_eq!(items.len(), 2);
         assert!(
             items
@@ -1530,7 +1633,7 @@ mod tests {
                 serde_json::json!({"command": "ls"}),
             )]),
         )];
-        let items = reconstruct_transcript(tail);
+        let items = reconstruct_transcript(tail, Vec::new());
         assert_eq!(items.len(), 1);
         assert!(items[0].steps[0].tool_summary.is_none());
         assert!(items[0].steps[0].tool_status.is_none());
