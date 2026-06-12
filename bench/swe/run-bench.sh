@@ -50,7 +50,7 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 : "${RESULTS_DIR:=$BENCH_DIR/results}"         # the final results JSON report only
 : "${RUNS_DIR:=$BENCH_DIR/runs}"               # run working artifacts: predictions, swebench report + logs/
 : "${TRACE_DIR:=$BENCH_DIR/trace}"             # per-run transcripts + traces (gitignored); NO_TRACE=1 to disable
-: "${RUN_ID:=swe-$(date +%Y%m%d-%H%M%S)}"
+: "${RUN_ID:=$(date +%Y-%m-%d__%H-%M-%S)}"
 : "${DRY_RUN:=0}"
 : "${RUST_LOG:=aura_bench_swe=info}"; export RUST_LOG
 INSTANCES="$OUTDIR/instances.json"
@@ -167,6 +167,13 @@ run_arm() {
 }
 
 for arm in $ARMS; do run_arm "$arm"; done
+
+# `latest` pointers to this run so you don't scan timestamps (all gitignored).
+[ -d "$TRACE_DIR/$RUN_ID" ] && ln -sfn "$RUN_ID" "$TRACE_DIR/latest"
+for arm in $ARMS; do
+  rf="results-$arm-$RUN_ID.json"
+  [ -f "$RESULTS_DIR/$rf" ] && ln -sfn "$rf" "$RESULTS_DIR/latest-$arm.json"
+done
 
 # ---- comparison table -----------------------------------------------------
 echo

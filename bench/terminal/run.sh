@@ -63,8 +63,13 @@ rc=$?
 # newest dir is the one we just produced.
 latest="$(ls -dt runs/*/ 2>/dev/null | head -1)"
 if [ -n "$latest" ] && [ -f "${latest}results.json" ]; then
+  base="$(basename "$latest")"
   mkdir -p results
-  cp "${latest}results.json" "results/results-$(basename "$latest").json"
-  echo "==> report: bench/terminal/results/results-$(basename "$latest").json" >&2
+  cp "${latest}results.json" "results/results-$base.json"
+  # `latest` pointers to the newest run so you don't scan timestamps (gitignored).
+  ln -sfn "$base" runs/latest
+  ln -sfn "results-$base.json" results/latest.json
+  [ -d "trace/$base" ] && ln -sfn "$base" trace/latest
+  echo "==> report: results/results-$base.json  (runs/latest · results/latest.json · trace/latest)" >&2
 fi
 exit "$rc"
