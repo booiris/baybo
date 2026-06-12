@@ -121,6 +121,7 @@ impl MemoryContext {
             session_id: self.session_id.clone(),
             job_id: self.job_id,
             span_id: span.span_id,
+            reason: aura_llm::CallReason::Memory,
         };
         let (call_result, value) = body(attribution).await;
         let outcome = match &value {

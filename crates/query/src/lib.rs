@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use aura_cost::{CostError, CostStore, CostSummary, TimeRange};
 use aura_job::{Job, JobError, JobKind, JobLifecycle, JobStatus, JobStatusKind};
-use aura_model::{JobId, Lineage, LineageKind, MicroUsd, Session, SessionId, StepId};
+use aura_model::{CallReason, JobId, Lineage, LineageKind, MicroUsd, Session, SessionId, StepId};
 use aura_session::{SessionError, SessionStore, StoredMessage};
 use aura_trace::{Span, SpanEvent, Step, TraceError, TraceStore};
 use chrono::{DateTime, Utc};
@@ -249,6 +249,9 @@ pub struct AnalyticsSummary {
     /// continuous x-axis.
     pub daily: Vec<AnalyticsDayBucket>,
     pub by_model: Vec<AnalyticsModelBucket>,
+    /// One bucket per [`CallReason`], so spend can be read by purpose
+    /// (chat vs compression vs tool vs …). Sorted by token volume, desc.
+    pub by_reason: Vec<AnalyticsReasonBucket>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +270,17 @@ pub struct AnalyticsDayBucket {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyticsModelBucket {
     pub model: String,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub cached_input_tokens: usize,
+    pub cache_creation_input_tokens: usize,
+    pub cost_usd: MicroUsd,
+    pub call_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticsReasonBucket {
+    pub reason: CallReason,
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub cached_input_tokens: usize,
@@ -744,6 +758,7 @@ impl QueryApi {
         let mut total_cost = MicroUsd::ZERO;
         let mut total_records = 0usize;
         let mut by_model: HashMap<String, AnalyticsModelBucket> = HashMap::new();
+        let mut by_reason: HashMap<CallReason, AnalyticsReasonBucket> = HashMap::new();
 
         let records = costs
             .query_records_in_range(range.clone())
@@ -784,6 +799,25 @@ impl QueryApi {
             entry.cache_creation_input_tokens += r.cache_creation_input_tokens;
             entry.cost_usd += r.cost_usd;
             entry.call_count += 1;
+
+            let reason_entry =
+                by_reason
+                    .entry(r.reason.clone())
+                    .or_insert_with(|| AnalyticsReasonBucket {
+                        reason: r.reason.clone(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cached_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                        cost_usd: MicroUsd::ZERO,
+                        call_count: 0,
+                    });
+            reason_entry.input_tokens += r.input_tokens;
+            reason_entry.output_tokens += r.output_tokens;
+            reason_entry.cached_input_tokens += r.cached_input_tokens;
+            reason_entry.cache_creation_input_tokens += r.cache_creation_input_tokens;
+            reason_entry.cost_usd += r.cost_usd;
+            reason_entry.call_count += 1;
         }
 
         // sessions_created per day. Single SessionStore::list_all call;
@@ -803,6 +837,11 @@ impl QueryApi {
             (b.input_tokens + b.output_tokens).cmp(&(a.input_tokens + a.output_tokens))
         });
 
+        let mut reason_buckets: Vec<AnalyticsReasonBucket> = by_reason.into_values().collect();
+        reason_buckets.sort_by(|a, b| {
+            (b.input_tokens + b.output_tokens).cmp(&(a.input_tokens + a.output_tokens))
+        });
+
         Ok(AnalyticsSummary {
             total_input_tokens: total_input,
             total_output_tokens: total_output,
@@ -812,6 +851,7 @@ impl QueryApi {
             total_record_count: total_records,
             daily,
             by_model: model_buckets,
+            by_reason: reason_buckets,
         })
     }
 

@@ -6,6 +6,7 @@ import {
   RiDownloadLine,
   RiHistoryLine,
   RiCpuLine,
+  RiPriceTag3Line,
   RiDatabase2Line,
   RiLoader4Line,
   RiRefreshLine,
@@ -185,6 +186,35 @@ function generateMockAnalytics(days: number): AnalyticsResponse {
         cached_input_tokens: Math.floor(totCached * 0.1),
         cache_creation_input_tokens: 0,
         cost_micro_usd: Math.floor(totCostMicroUsd * 0.15),
+        call_count: Math.floor(totRecords * 0.1),
+      },
+    ],
+    by_reason: [
+      {
+        reason: 'chat',
+        input_tokens: Math.floor(totIn * 0.8),
+        output_tokens: Math.floor(totOut * 0.82),
+        cached_input_tokens: Math.floor(totCached * 0.8),
+        cache_creation_input_tokens: Math.floor(totCacheCreate * 0.8),
+        cost_micro_usd: Math.floor(totCostMicroUsd * 0.78),
+        call_count: Math.floor(totRecords * 0.7),
+      },
+      {
+        reason: 'compression',
+        input_tokens: Math.floor(totIn * 0.15),
+        output_tokens: Math.floor(totOut * 0.1),
+        cached_input_tokens: Math.floor(totCached * 0.15),
+        cache_creation_input_tokens: Math.floor(totCacheCreate * 0.15),
+        cost_micro_usd: Math.floor(totCostMicroUsd * 0.14),
+        call_count: Math.floor(totRecords * 0.2),
+      },
+      {
+        reason: 'tool',
+        input_tokens: Math.floor(totIn * 0.05),
+        output_tokens: Math.floor(totOut * 0.08),
+        cached_input_tokens: Math.floor(totCached * 0.05),
+        cache_creation_input_tokens: 0,
+        cost_micro_usd: Math.floor(totCostMicroUsd * 0.08),
         call_count: Math.floor(totRecords * 0.1),
       },
     ],
@@ -542,6 +572,53 @@ export function AnalyticsPage() {
                         )}
                       </td>
                       <td className={`${tdCell} text-right`}>{formatMicroUsd(m.cost_micro_usd)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="mb-10">
+            <SectionTitle icon={RiPriceTag3Line} title="Per-Reason Breakdown" />
+            <div className="bg-white border-[3px] border-black rounded-md shadow-brutal overflow-hidden">
+              <table className="w-full border-separate border-spacing-0">
+                <thead>
+                  <tr>
+                    <th className={thCell}>Reason</th>
+                    <th className={`${thCell} text-right`}>Calls</th>
+                    <th className={`${thCell} text-right`}>Input</th>
+                    <th className={`${thCell} text-right`}>Output</th>
+                    <th className={`${thCell} text-right`}>Cached</th>
+                    <th className={`${thCell} text-right`}>Cost</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.by_reason.length === 0 && (
+                    <tr>
+                      <td colSpan={6} className="px-6 py-8 text-center text-ink-soft text-[0.85rem]">
+                        No LLM calls recorded in this window.
+                      </td>
+                    </tr>
+                  )}
+                  {data.by_reason.map((r) => (
+                    <tr key={r.reason} className="hover:bg-gray-50">
+                      <td className={tdCell}>
+                        <span className="font-bold">{r.reason}</span>
+                      </td>
+                      <td className={`${tdCell} text-right`}>{r.call_count.toLocaleString()}</td>
+                      <td className={`${tdCell} text-right`}>{formatTokens(totalInput(r))}</td>
+                      <td className={`${tdCell} text-right`}>{formatTokens(r.output_tokens)}</td>
+                      <td className={`${tdCell} text-right`}>
+                        {formatTokens(r.cached_input_tokens)}
+                        {r.cache_creation_input_tokens > 0 && (
+                          <span className="text-ink-soft">
+                            {' '}
+                            (+{formatTokens(r.cache_creation_input_tokens)})
+                          </span>
+                        )}
+                      </td>
+                      <td className={`${tdCell} text-right`}>{formatMicroUsd(r.cost_micro_usd)}</td>
                     </tr>
                   ))}
                 </tbody>

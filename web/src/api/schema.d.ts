@@ -542,9 +542,27 @@ export interface components {
             model: string;
             output_tokens: number;
         };
+        /**
+         * @description Per-reason breakdown row for the analytics dashboard. `reason` is the
+         *     `CallReason` wire token (`chat`, `compression`, `tool`, …).
+         */
+        AnalyticsReasonBucket: {
+            cache_creation_input_tokens: number;
+            cached_input_tokens: number;
+            call_count: number;
+            /**
+             * Format: int64
+             * @description Spend for the reason, in **micro-USD** (1 USD = 1_000_000).
+             */
+            cost_micro_usd: number;
+            input_tokens: number;
+            output_tokens: number;
+            reason: string;
+        };
         /** @description `GET /v1/analytics` response body. */
         AnalyticsResponse: {
             by_model: components["schemas"]["AnalyticsModelBucket"][];
+            by_reason: components["schemas"]["AnalyticsReasonBucket"][];
             daily: components["schemas"]["AnalyticsDayBucket"][];
             /**
              * Format: date-time

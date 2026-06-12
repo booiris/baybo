@@ -1115,6 +1115,7 @@ async fn run_external_agent_job(
             job.session_id.clone(),
             job.id,
             SpanId::default(),
+            aura_llm::CallReason::Chat,
             &format!("{} (external agent)", kind.as_str()),
             usage.input_tokens,
             usage.output_tokens,

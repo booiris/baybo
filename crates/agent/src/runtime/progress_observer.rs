@@ -188,6 +188,7 @@ impl ProgressObserverRunner {
                             session_id: session_id.clone(),
                             job_id,
                             span_id: span.span_id,
+                            reason: aura_llm::CallReason::ProgressObserver,
                         });
                         match bound.chat(&request).await {
                             Ok(billed) => {

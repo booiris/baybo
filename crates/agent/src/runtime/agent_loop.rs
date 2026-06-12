@@ -1304,6 +1304,7 @@ impl AgentLoop {
                     session_id: session.id.clone(),
                     job_id: step.job_id,
                     span_id: span.span_id,
+                    reason: aura_llm::CallReason::Chat,
                 });
                 let (partial_usage, llm_result) = match delta_tx {
                     Some(tx) => self.chat_streaming(&bound, &request, session, tx).await,

@@ -263,6 +263,9 @@ impl LibsqlPool {
                     session_id                      TEXT    NOT NULL,
                     job_id                          TEXT    NOT NULL,
                     span_id                         TEXT    NOT NULL,
+                    -- Call purpose (CallReason). Nullable: rows written before
+                    -- this column read NULL and map to the default reason.
+                    reason                          TEXT,
                     model                           TEXT    NOT NULL,
                     input_tokens                    INTEGER NOT NULL,
                     output_tokens                   INTEGER NOT NULL,
@@ -456,6 +459,7 @@ impl LibsqlPool {
         let migrations: &[&str] = &[
             "ALTER TABLE sessions ADD COLUMN parent_span_id TEXT",
             "ALTER TABLE sessions ADD COLUMN last_llm TEXT",
+            "ALTER TABLE cost_records ADD COLUMN reason TEXT",
         ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {
