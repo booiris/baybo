@@ -32,7 +32,23 @@ fi
 set -a; . "$here/.env"; set +a
 
 cd "$here"
+
+# runs/latest → the job dir harbor creates, so a run is monitorable mid-run via
+# runs/latest/ (harbor names it by timestamp, so detect it in the background).
+# The trace + verdict are already co-located per trial under
+# runs/<ts>/<trial>/{agent,verifier}/, so no extra outcome wiring is needed.
+mkdir -p runs
+prev_job="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
+( for _ in $(seq 1 150); do
+    cur="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
+    if [ -n "$cur" ] && [ "$cur" != "$prev_job" ]; then
+      ln -sfn "$(basename "$cur")" runs/latest; break
+    fi
+    sleep 2
+  done ) &
+
 # Defaults; anything in "$@" (e.g. -t / -l / -n) is appended.
+set +e
 uv run harbor run \
   --dataset terminal-bench/terminal-bench-2 \
   --agent-import-path harbor_adapter.aura_agent:AuraAgent \
@@ -41,3 +57,10 @@ uv run harbor run \
   --jobs-dir runs \
   --yes \
   "$@"
+rc=$?
+set -e
+
+# Re-point runs/latest authoritatively at the job we just produced.
+last_job="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
+[ -n "$last_job" ] && ln -sfn "$(basename "$last_job")" runs/latest
+exit "$rc"
