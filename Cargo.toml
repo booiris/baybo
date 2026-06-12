@@ -186,10 +186,12 @@ bench-readonly-memory = ["aura-memory/bench-readonly-memory"]
 
 # Compile the Bash tool's bench profile: run shell commands raw inside an
 # already-disposable container — no uv shims, no work-dir jail, cwd inherited
-# from the process, and a dedicated prompt. Distinct from the `sandbox.mode =
-# none` config (which only drops the OS sandbox but keeps uv + the work/ jail).
-# Off by default; absent in every prod build. For bench/swe + bench/terminal.
-bench-bash = ["aura-tools/bench-bash"]
+# from the process, and a dedicated prompt. Also skips the workspace
+# identity-repo `git init` (aura-workspace) so a bench container needs no `git`
+# on PATH. Distinct from the `sandbox.mode = none` config (which only drops the
+# OS sandbox but keeps uv + the work/ jail). Off by default; absent in every
+# prod build. For bench/swe + bench/terminal.
+bench-bash = ["aura-tools/bench-bash", "aura-workspace/bench-bash"]
 
 [dependencies]
 aura-model = { workspace = true }

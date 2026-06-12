@@ -106,6 +106,13 @@ impl WorkspaceManager {
 
 /// Initialise a standalone git repository inside `dir` if one isn't
 /// already there. Idempotent — a no-op when `<dir>/.git` exists.
+///
+/// These repos exist only for optional version history of the agent's
+/// skills/profile/agents. The `bench-bash` build skips them (see the no-op
+/// below): the workspace is then an ephemeral, single-task container where that
+/// history is meaningless, and requiring `git` there only forces a slow
+/// per-task `apt-get install git`.
+#[cfg(not(feature = "bench-bash"))]
 async fn ensure_git_repo(dir: &Path) -> anyhow::Result<()> {
     if dir.join(".git").exists() {
         return Ok(());
@@ -123,6 +130,13 @@ async fn ensure_git_repo(dir: &Path) -> anyhow::Result<()> {
             dir.display()
         ));
     }
+    Ok(())
+}
+
+/// Bench builds run inside a disposable container with no `git` on PATH and no
+/// use for the identity-repo history — so the init is a no-op there.
+#[cfg(feature = "bench-bash")]
+async fn ensure_git_repo(_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
