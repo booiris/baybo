@@ -115,14 +115,31 @@ pub(crate) fn reqwest_to_error(e: reqwest::Error, context: impl Into<String>) ->
     }
 }
 
+/// Connect-phase timeout for the LLM HTTP client — a provider that can't be
+/// reached fails fast (as a retriable `Transient`) instead of hanging the turn.
+const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-read (idle) timeout: trips when a *connected* request goes silent for
+/// this long. It resets on every byte, so a long-but-streaming completion is
+/// unaffected — only a stalled connection trips it, and that maps to
+/// `Transient` (retriable). Deliberately not a total `.timeout()`, which would
+/// cut off a legitimately long generation.
+const LLM_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Build a `reqwest::Client` honoring the optional egress proxy, mapping a
 /// proxy/build failure to `LlmError::Config`. Shared by the rig client
 /// builders and by provider live-model discovery so every in-crate HTTP
-/// client picks up the configured proxy uniformly.
+/// client picks up the configured proxy uniformly, plus connect/idle timeouts
+/// so a stalled network surfaces as a retriable error instead of hanging the
+/// agent turn indefinitely.
 pub(crate) fn proxied_client(
     proxy: Option<&aura_security::http::ProxySettings>,
 ) -> Result<reqwest::Client, LlmError> {
-    aura_security::http::client(proxy)
+    aura_security::http::client_builder(proxy)
+        .and_then(|b| {
+            b.connect_timeout(LLM_CONNECT_TIMEOUT)
+                .read_timeout(LLM_READ_TIMEOUT)
+                .build()
+        })
         .map_err(|e| LlmError::Config(format!("build proxied http client: {e}")))
 }
 
