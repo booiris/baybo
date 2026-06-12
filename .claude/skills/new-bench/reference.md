@@ -73,10 +73,18 @@ files to `bench/<name>/trace/<run_id>/<arm>/<item>.{messages,trace}.json`:
 - **In-container (swe):** run them **inside the container before reap** (the session
   DB dies with it) — clone `bench/swe/src/agent.rs::{export_trace, write_session_dump}`;
   the `run` bin threads `--trace-dir` (+ `--no-trace`) into `RunOpts.trace_dir`.
-- **External-harness adapter (terminal):** in `perform_task`, after the prompt, use
-  the container handle directly — `session.container.exec_run([...])` captures
-  stdout, no copy-out — mirroring the harness's per-task `runs/` path into `trace/`.
-  See `bench/terminal/tb_adapter/aura_agent.py::_export_trace`.
+- **External-harness adapter (terminal), two flavors.** *Terminal-Bench 1.0* runs
+  on the legacy `tb` CLI: `bench/terminal/tb_adapter` (`AbstractInstalledAgent`) —
+  in `perform_task`, after the prompt, use the container handle directly
+  (`session.container.exec_run([...])`, no copy-out) and mirror the harness's
+  per-task `runs/` path into `trace/`; see `…::_export_trace`. *Terminal-Bench 2.0*
+  runs on the **Harbor** framework (`harbor run -d terminal-bench/terminal-bench-2`):
+  `bench/terminal-harbor/harbor_adapter` is a `BaseInstalledAgent` — `install()`
+  `environment.upload_file`s the musl binary + a rendered `aura.json` + mints the
+  key (→ chown to the agent user), `run()` runs `aura prompt` and exports the trace
+  into Harbor's per-trial `/logs/agent` dir (which Harbor mounts to
+  `runs/<ts>/<trial>/agent/`, sibling to `verifier/`). Same `aura.json`
+  (`sandbox.mode=none`) + provider/key handling as 1.0; only the harness API differs.
 
 **Clone these parsers verbatim** (stable, unit-tested) instead of rewriting:
 `bench/swe/src/agent.rs` → `prompt_output_error`, `parse_cost_summary`, the
