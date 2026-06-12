@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use super::LibsqlPool;
 use super::time;
-use aura_model::{CostRecord, CostSummary, TimeRange};
+use aura_model::{CallReason, CostRecord, CostSummary, TimeRange};
 use aura_model::{JobId, MicroUsd, SessionId, SpanId};
 use aura_store::StorageError;
 use aura_store::cost::{CostStore, Result as CostResult};
@@ -23,14 +23,15 @@ impl CostStore for LibsqlCostStore {
         let conn = self.pool.conn();
         conn.execute(
             "INSERT INTO cost_records \
-             (user_id, session_id, job_id, span_id, model, input_tokens, output_tokens, \
+             (user_id, session_id, job_id, span_id, reason, model, input_tokens, output_tokens, \
               cached_input_tokens, cache_creation_input_tokens, cost_usd, timestamp) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             libsql::params![
                 record.user_id.clone(),
                 record.session_id.as_str().to_string(),
                 record.job_id.to_string(),
                 record.span_id.to_string(),
+                record.reason.to_token().into_owned(),
                 record.model.clone(),
                 record.input_tokens as i64,
                 record.output_tokens as i64,
@@ -49,7 +50,7 @@ impl CostStore for LibsqlCostStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT user_id, session_id, job_id, span_id, model, input_tokens, \
+                "SELECT user_id, session_id, job_id, span_id, reason, model, input_tokens, \
                         output_tokens, cached_input_tokens, cache_creation_input_tokens, \
                         cost_usd, timestamp \
                  FROM cost_records \
@@ -122,7 +123,7 @@ impl CostStore for LibsqlCostStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT user_id, session_id, job_id, span_id, model, input_tokens, \
+                "SELECT user_id, session_id, job_id, span_id, reason, model, input_tokens, \
                         output_tokens, cached_input_tokens, cache_creation_input_tokens, \
                         cost_usd, timestamp \
                  FROM cost_records \
@@ -198,7 +199,7 @@ fn summary_from_aggregate_row(row: &libsql::Row) -> CostResult<CostSummary> {
 
 fn row_to_cost_record(row: &libsql::Row) -> CostResult<CostRecord> {
     let timestamp_us: i64 = row
-        .get(10)
+        .get(11)
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
     let timestamp = time::from_us(timestamp_us).ok_or_else(|| {
         StorageError::Storage(format!(
@@ -215,6 +216,14 @@ fn row_to_cost_record(row: &libsql::Row) -> CostResult<CostRecord> {
     let span_id_str: String = row
         .get(3)
         .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?;
+    // Rows written before the `reason` column exists read NULL; unknown
+    // tokens (a future variant rolled back) likewise fall back to the
+    // default reason rather than failing the whole query.
+    let reason = row
+        .get::<Option<String>>(4)
+        .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+        .and_then(|s| CallReason::parse(&s))
+        .unwrap_or_default();
 
     Ok(CostRecord {
         user_id: row
@@ -227,27 +236,28 @@ fn row_to_cost_record(row: &libsql::Row) -> CostResult<CostRecord> {
         span_id: span_id_str
             .parse::<SpanId>()
             .map_err(|e| StorageError::Storage(format!("decode span_id: {e}")))?,
+        reason,
         model: row
-            .get(4)
+            .get(5)
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
         input_tokens: row
-            .get::<i64>(5)
-            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
-            as usize,
-        output_tokens: row
             .get::<i64>(6)
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
-        cached_input_tokens: row
+        output_tokens: row
             .get::<i64>(7)
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
-        cache_creation_input_tokens: row
+        cached_input_tokens: row
             .get::<i64>(8)
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
             as usize,
-        cost_usd: row
+        cache_creation_input_tokens: row
             .get::<i64>(9)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?
+            as usize,
+        cost_usd: row
+            .get::<i64>(10)
             .map(MicroUsd::from_micros)
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get error: {e}")))?,
         timestamp,
@@ -265,6 +275,7 @@ mod tests {
             session_id: SessionId::from("sess-1"),
             job_id: JobId::new(),
             span_id: SpanId::new(),
+            reason: CallReason::Chat,
             model: "gpt-4".to_string(),
             input_tokens: 100,
             output_tokens: 50,
@@ -305,5 +316,31 @@ mod tests {
         let summary = store.query_global(wide_range()).await.unwrap();
         assert_eq!(summary.record_count, 2);
         assert_eq!(summary.total_cost_usd, usd(0.30));
+    }
+
+    #[tokio::test]
+    async fn reason_round_trips() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlCostStore::new(pool);
+        let mut rec = test_record("u1", usd(0.05));
+        rec.reason = CallReason::ProgressObserver;
+        store.record(&rec).await.unwrap();
+        let records = store.query_user("u1", wide_range()).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].reason, CallReason::ProgressObserver);
+    }
+
+    /// The `Tool(name)` variant must survive the `tool:<name>` token
+    /// round-trip through the column, name intact.
+    #[tokio::test]
+    async fn tool_reason_round_trips_with_name() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlCostStore::new(pool);
+        let mut rec = test_record("u2", usd(0.05));
+        rec.reason = CallReason::Tool("WebFetch".to_string());
+        store.record(&rec).await.unwrap();
+        let records = store.query_user("u2", wide_range()).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].reason, CallReason::Tool("WebFetch".to_string()));
     }
 }

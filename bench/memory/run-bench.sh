@@ -44,10 +44,10 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 : "${DRY_RUN:=0}"                  # 1 = print plan only (no build, no spend)
 : "${OUTDIR:=$BENCH_DIR/bench-out}"   # bench scratch (gitignored): dataset + manifests
 : "${DATASET:=$OUTDIR/locomo10.json}"
-: "${RESULTS_DIR:=$BENCH_DIR/results}"   # per-run result JSONs — tracked in git (sibling of bench-out)
+: "${RESULTS_DIR:=$BENCH_DIR/results}"   # per-run result JSONs (gitignored; regenerated each run)
 : "${TRACE_DIR:=$BENCH_DIR/trace}"       # per-question transcripts + traces (gitignored); NO_TRACE=1 to disable
 : "${WS_ROOT:=$BENCH_DIR/runs}"       # per-run aura workspaces (gitignored): config + vault + sessions + logs
-: "${RUN_ID:=bench-$(date +%Y%m%d-%H%M%S)}"
+: "${RUN_ID:=$(date +%Y-%m-%d__%H-%M-%S)}"
 : "${RUST_LOG:=aura_bench_memory=info}"; export RUST_LOG
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 : "${AURA_CONFIG:=}"               # base aura.json to derive from; empty = self-contained generated config
@@ -194,6 +194,13 @@ run_arm() {
 
 for arm in $ARMS; do
   run_arm "$arm"
+done
+
+# `latest` pointers to this run so you don't scan timestamps (all gitignored).
+[ -d "$TRACE_DIR/$RUN_ID" ] && ln -sfn "$RUN_ID" "$TRACE_DIR/latest"
+for arm in $ARMS; do
+  rf="results-$arm-$RUN_ID.json"
+  [ -f "$RESULTS_DIR/$rf" ] && ln -sfn "$rf" "$RESULTS_DIR/latest-$arm.json"
 done
 
 # ---- comparison table across arms -----------------------------------------

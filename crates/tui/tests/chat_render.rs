@@ -50,8 +50,10 @@ static SERIAL: Mutex<()> = Mutex::new(());
 /// is on during `cargo test`) and hands us its path — no nested cargo
 /// build at runtime.
 const SMOKE_BIN: &str = env!("CARGO_BIN_EXE_chat_smoke");
-/// Heavier than the picker probe (links the full TUI graph and dials a WS),
-/// so allow extra startup slack before declaring a hang.
+/// No-progress (idle) window for `wait_render`: `wait_until_progress` resets it
+/// on every real frame change, so it's "how long the screen may sit frozen
+/// before we call it hung," not an absolute deadline. Heavier than the picker
+/// probe (full TUI graph + a WS dial), so it needs slack on a loaded box.
 const WAIT: Duration = Duration::from_secs(15);
 /// Fixed pane size so the golden snapshots are deterministic.
 const COLS: u16 = 90;
@@ -105,7 +107,11 @@ fn wait_render(
     what: &str,
     pred: impl Fn(&str) -> bool,
 ) -> Result<String, String> {
-    match session.wait_until(WAIT, what, &pred) {
+    // `normalize` is the progress key: it strips the volatile working-indicator
+    // timer (`● cooked for Ns`) and version, so a turn that's slow under load
+    // still counts as progressing (real content changing) — only a genuinely
+    // stuck render trips the idle window.
+    match session.wait_until_progress(WAIT, what, &pred, normalize) {
         Ok(frame) => Ok(frame),
         Err(HarnessError::ProcessDied { .. }) => Err(format!("process died waiting for {what}")),
         Err(e) => panic!("render failure waiting for {what}: {e}"),

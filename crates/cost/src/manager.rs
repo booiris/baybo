@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use thiserror::Error;
 use tracing::warn;
 
-use aura_model::{CostRecord, TimeRange};
+use aura_model::{CallReason, CostRecord, TimeRange};
 use aura_store::CostStore;
 
 #[derive(Debug, Error)]
@@ -378,6 +378,7 @@ impl CostManager {
         session_id: SessionId,
         job_id: JobId,
         span_id: SpanId,
+        reason: CallReason,
         model_id: &str,
         input_tokens: usize,
         output_tokens: usize,
@@ -406,6 +407,7 @@ impl CostManager {
             session_id,
             job_id,
             span_id,
+            reason,
             model: model_id.to_string(),
             input_tokens,
             output_tokens,
@@ -431,6 +433,7 @@ impl CostManager {
         session_id: SessionId,
         job_id: JobId,
         span_id: SpanId,
+        reason: CallReason,
         model_id: &str,
         input_tokens: usize,
         output_tokens: usize,
@@ -442,6 +445,7 @@ impl CostManager {
             session_id,
             job_id,
             span_id,
+            reason,
             model: model_id.to_string(),
             input_tokens,
             output_tokens,
@@ -539,6 +543,7 @@ fn cost_record_closure(manager: &Arc<CostManager>) -> aura_llm::LlmCostRecorder 
                 attr.session_id.clone(),
                 attr.job_id,
                 attr.span_id,
+                attr.reason.clone(),
                 model_id,
                 usage.input_tokens,
                 usage.output_tokens,
@@ -720,6 +725,7 @@ mod tests {
                 session_id: SessionId::from("s1"),
                 job_id: JobId::new(),
                 span_id: SpanId::new(),
+                reason: CallReason::Chat,
                 model: "m1".into(),
                 input_tokens: 0,
                 output_tokens: 0,
@@ -756,6 +762,7 @@ mod tests {
             SessionId::from("s1"),
             JobId::new(),
             SpanId::new(),
+            CallReason::Chat,
             "m1",
             input_tokens,
             output_tokens,
@@ -798,6 +805,7 @@ mod tests {
             SessionId::from("s1"),
             JobId::new(),
             SpanId::new(),
+            CallReason::Chat,
             "m1",
             1_000,
             0,
@@ -821,6 +829,7 @@ mod tests {
             SessionId::from("s1"),
             JobId::new(),
             SpanId::new(),
+            CallReason::Chat,
             "m1",
             1_000,
             0,
@@ -841,6 +850,7 @@ mod tests {
             SessionId::from("s1"),
             JobId::new(),
             SpanId::new(),
+            CallReason::Chat,
             "m1",
             1_000_000_000,
             0,
@@ -863,6 +873,7 @@ mod tests {
             SessionId::from("s1"),
             JobId::new(),
             SpanId::new(),
+            CallReason::Chat,
             "m1",
             1_000,
             0,

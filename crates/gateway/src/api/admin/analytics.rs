@@ -65,5 +65,6 @@ async fn get_analytics(
         total_record_count: summary.total_record_count,
         daily: summary.daily.into_iter().map(Into::into).collect(),
         by_model: summary.by_model.into_iter().map(Into::into).collect(),
+        by_reason: summary.by_reason.into_iter().map(Into::into).collect(),
     }))
 }

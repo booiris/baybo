@@ -502,6 +502,7 @@ impl ToolExecutor {
                         session_id: session_id.clone(),
                         job_id,
                         span_id: span_handle.span_id,
+                        reason: aura_llm::CallReason::Tool(tool_name_owned.clone()),
                     });
                     Arc::new(crate::runtime::billed_chat::BilledChatRunner::new(
                         bound,

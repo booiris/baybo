@@ -24,7 +24,6 @@ pub mod llm;
 pub mod memory;
 pub mod proxy;
 pub mod reload;
-#[cfg(feature = "bench-passthrough")]
 pub mod sandbox;
 pub mod security;
 pub mod skills;
@@ -49,7 +48,6 @@ pub use crate::llm::{LlmEntry, LlmPricingOverride};
 pub use crate::memory::{MemoryConfig, MemoryProvider};
 pub use crate::proxy::ProxyConfig;
 pub use crate::reload::{ConfigHandle, hot_reload_diff};
-#[cfg(feature = "bench-passthrough")]
 pub use crate::sandbox::{SandboxConfig, SandboxMode};
 pub use crate::security::SecurityConfig;
 pub use crate::skills::{RiskCheckConfig, SkillsConfig};
@@ -86,12 +84,12 @@ pub struct AuraConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyConfig>,
     pub memory: MemoryConfig,
-    /// How shell-out tools are isolated. The `passthrough` mode (run directly,
-    /// no isolation) exists only in a `bench-passthrough` build — for running
-    /// aura inside a disposable benchmark container. A normal build is always
-    /// sandboxed and doesn't compile this field (a `sandbox` config key is then
-    /// an ignored unknown field).
-    #[cfg(feature = "bench-passthrough")]
+    /// How shell-out tools are isolated. `auto` (default) wraps every command in
+    /// the OS sandbox and adds an LLM risk judge that can run a failed command
+    /// unsandboxed when judged safe (else asks); `sandboxed` is the stricter,
+    /// judge-free mode; `none` disables OS isolation entirely (for running aura
+    /// inside an already-disposable environment). Hot-reloadable.
+    #[serde(default)]
     pub sandbox: SandboxConfig,
 }
 

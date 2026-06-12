@@ -66,5 +66,8 @@
   "proxy": {
     "url": "http://YOUR_PROXY_HOST:PORT",
     "no_proxy": ["example.com", ".internal"]
+  },
+  "sandbox": {
+    "mode": "auto"
   }
 }

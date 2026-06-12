@@ -228,6 +228,20 @@ pub fn to_assessment_mode(cfg: RiskCheckConfig) -> AssessmentMode {
     }
 }
 
+/// Map the config-layer sandbox mode onto the tool-layer one. The two are kept
+/// separate so `aura-tools` needn't depend on `aura-config`; this boot/wiring
+/// layer (which has both) is the one place that bridges them. Shared by initial
+/// wiring ([`crate::runtime`]) and hot-reload ([`crate::reload`]) so both map
+/// identically.
+pub fn to_bash_mode(mode: aura_config::SandboxMode) -> aura_tools::builtin::BashSandboxMode {
+    use aura_tools::builtin::BashSandboxMode;
+    match mode {
+        aura_config::SandboxMode::None => BashSandboxMode::None,
+        aura_config::SandboxMode::Sandboxed => BashSandboxMode::Sandboxed,
+        aura_config::SandboxMode::Auto => BashSandboxMode::Auto,
+    }
+}
+
 pub fn build_leak_detector(cfg: &SecurityConfig) -> LeakDetector {
     if cfg.leak_detection_enabled {
         LeakDetector::with_default_rules()

@@ -2288,6 +2288,49 @@
           }
         }
       },
+      "AnalyticsReasonBucket": {
+        "type": "object",
+        "description": "Per-reason breakdown row for the analytics dashboard. `reason` is the\n`CallReason` wire token (`chat`, `compression`, `tool`, …).",
+        "required": [
+          "reason",
+          "input_tokens",
+          "output_tokens",
+          "cached_input_tokens",
+          "cache_creation_input_tokens",
+          "cost_micro_usd",
+          "call_count"
+        ],
+        "properties": {
+          "cache_creation_input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cached_input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "call_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cost_micro_usd": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Spend for the reason, in **micro-USD** (1 USD = 1_000_000)."
+          },
+          "input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
       "AnalyticsResponse": {
         "type": "object",
         "description": "`GET /v1/analytics` response body.",
@@ -2301,13 +2344,20 @@
           "total_cost_micro_usd",
           "total_record_count",
           "daily",
-          "by_model"
+          "by_model",
+          "by_reason"
         ],
         "properties": {
           "by_model": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/AnalyticsModelBucket"
+            }
+          },
+          "by_reason": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AnalyticsReasonBucket"
             }
           },
           "daily": {

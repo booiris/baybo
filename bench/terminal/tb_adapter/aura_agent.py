@@ -8,11 +8,9 @@ task's own pytest. Mirrors the upstream Codex adapter
 Two things make aura work in-container:
   * a one-shot `aura prompt --json -y` runs the full agent loop to completion;
   * the container *is* the sandbox, so aura is configured with
-    `sandbox.mode = passthrough` (its Bash runs commands directly — no bwrap,
-    no work-dir jail). That mode only exists in an aura built with the
-    `bench-passthrough` feature (see the repo root `Cargo.toml`), which is
-    exactly the binary you point `AURA_BIN` at — the analog of Codex's
-    `--sandbox danger-full-access`.
+    `sandbox.mode = none` (its Bash runs commands directly — no bwrap, no
+    work-dir jail). `none` is a regular config mode — no special build needed —
+    the analog of Codex's `--sandbox danger-full-access`.
 
 Use it via the harness's custom-agent flag (no fork of terminal-bench). The env
 is uv-managed (see bench/terminal/pyproject.toml); run from bench/terminal/:
@@ -48,7 +46,7 @@ _KEY_PATH = f"{_CONTAINER_DIR}/enc.key"
 # session's transcript + trace afterwards (each task is its own container).
 _SESSION_ID = "aura-tb"
 
-# The bench-passthrough aura binary copied into each container. Defaults to the
+# The static-musl aura binary copied into each container. Defaults to the
 # musl build output (repo-root-relative: this file is bench/terminal/tb_adapter/);
 # AURA_BIN overrides it (e.g. a glibc build or a custom path).
 _DEFAULT_BINARY = (
@@ -117,8 +115,8 @@ class AuraAgent(AbstractInstalledAgent):
         if not self._aura_bin.is_file():
             raise RuntimeError(
                 f"aura binary not found at {self._aura_bin}. Build it with "
-                "`cargo build --release --target x86_64-unknown-linux-musl "
-                "--features bench-passthrough`, or set AURA_BIN to your binary."
+                "`cargo build --release --target x86_64-unknown-linux-musl --features bench-bash`, "
+                "or set AURA_BIN to your binary."
             )
 
     @property
@@ -134,7 +132,7 @@ class AuraAgent(AbstractInstalledAgent):
         return self._get_templated_script_path("aura-setup.sh.j2")
 
     def _aura_config(self) -> dict:
-        """The aura.json rendered into the container — passthrough sandbox, a
+        """The aura.json rendered into the container — `none` sandbox, a
         self-contained state dir, and the provider/model under test."""
         entry = {
             "name": "agent",
@@ -156,7 +154,7 @@ class AuraAgent(AbstractInstalledAgent):
             # Required to pass config validation even though `aura prompt` runs
             # in-process and never binds.
             "gateway": {"bind_address": "127.0.0.1", "port": 8723},
-            "sandbox": {"mode": "passthrough"},
+            "sandbox": {"mode": "none"},
             "cost": {"rate_limit": {"max_requests": 1_000_000}},
         }
 

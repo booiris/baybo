@@ -32,20 +32,22 @@ This is the faithful, leaderboard-comparable setup:
 Docker + grader pipeline **offline and unpriced** (oracle ≈100%, noop 0%) before
 the agent arm costs anything. Run them first.
 
-## You must build `aura` with `--features bench-passthrough`
+## Build with `--features bench-bash` + `sandbox.mode = none`
 
 The agent runs inside the eval container, where aura's normal OS sandbox (bwrap)
-can't nest. The `bench-passthrough` feature enables a `sandbox.mode =
-passthrough` config that makes the Bash tool run **unsandboxed** (the container
-is the isolation boundary). Without the feature, `mode = passthrough` is a hard
-startup error — it is never silently dropped.
+can't nest. Two knobs make Bash run raw there: the harness writes a
+`sandbox.mode = none` config (drops the OS sandbox) **and** the binary is built
+`--features bench-bash` (the bench profile — also no uv shim, no work-dir jail,
+cwd inherited from `/testbed`). `bench-bash` is off-by-default and compiled out
+of every prod build; `none` on its own (no feature) keeps uv + the work jail, so
+the bench needs both.
 
 The binary is copied into Ubuntu-based eval images, so it must be **static
 musl** (a glibc build from a newer host won't run there). `run-bench.sh` builds
 it for you:
 
 ```bash
-cargo build --release --target x86_64-unknown-linux-musl --features bench-passthrough
+cargo build --release --target x86_64-unknown-linux-musl --features bench-bash
 ```
 
 That needs the musl target (`rustup target add x86_64-unknown-linux-musl`) and a
@@ -79,7 +81,7 @@ libsql's bundled SQLite requires. Point the bench at a prebuilt binary with
    swebench.harness.prepare_images`). The same `--namespace` goes to
    `swe_export.py` (so the image keys line up) and to the grader.
 3. **Agent** (agent arm) — per instance: `docker run` the image, copy in the
-   musl `aura` + a `passthrough` config (workspace `/aura-home`, *outside*
+   musl `aura` + a `sandbox.mode = none` config (workspace `/aura-home`, *outside*
    `/testbed` so aura's own state never pollutes the diff), run `aura prompt
    --json -y` with cwd `/testbed`, then capture `git diff <base_commit>` as the
    prediction and read the turn's cost from aura's ledger. Containers run

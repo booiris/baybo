@@ -30,6 +30,11 @@ use thiserror::Error;
 /// a settled screen, long enough not to spin the tmux server.
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
 
+/// Absolute backstop for the `wait_until*` family: the idle window is the real
+/// signal, but this stops a frame that keeps churning yet never matches `pred`
+/// from wedging a run indefinitely.
+const MAX_TOTAL: Duration = Duration::from_secs(180);
+
 /// Counter feeding each session's unique id — used as BOTH its private tmux
 /// socket name (`-L`) and its session name — so concurrently-running tests
 /// (cargo runs test fns on multiple threads) never collide or share a server.
@@ -327,18 +332,44 @@ impl TmuxSession {
         .unwrap_or(true)
     }
 
-    /// Poll the pane until `pred` holds against a fresh capture, then
-    /// return that capture. Returns [`HarnessError::ProcessDied`] if the
-    /// child exits before `pred` holds (don't keep polling a dead pane) and
-    /// [`HarnessError::Timeout`] if `timeout` elapses while it's still
-    /// alive. `pred` is checked before the death check, so output the child
-    /// emitted just before exiting still counts.
-    pub fn wait_until<F>(&self, timeout: Duration, what: &str, pred: F) -> Result<String>
+    /// Poll the pane until `pred` holds against a fresh capture, then return
+    /// that capture. Returns [`HarnessError::ProcessDied`] if the child exits
+    /// before `pred` holds (don't keep polling a dead pane) and
+    /// [`HarnessError::Timeout`] if the pane makes no progress for `idle` (or
+    /// never matches within the `MAX_TOTAL` backstop). The timeout is a
+    /// *no-progress* window, not an absolute deadline: any frame change resets
+    /// it, so a render that's merely slow (a loaded box) keeps waiting as long
+    /// as it advances. `pred` is checked before the death check, so output
+    /// emitted just before exit still counts. Treats *any* frame change as
+    /// progress — see [`wait_until_progress`](Self::wait_until_progress) when a
+    /// volatile spinner/clock would otherwise mask a hang.
+    pub fn wait_until<F>(&self, idle: Duration, what: &str, pred: F) -> Result<String>
     where
         F: Fn(&str) -> bool,
     {
-        let deadline = Instant::now() + timeout;
+        self.wait_until_progress(idle, what, pred, |frame| frame.to_string())
+    }
+
+    /// [`wait_until`](Self::wait_until) with an explicit progress fingerprint:
+    /// `progress_key` distils a frame down to the bits that mark *real*
+    /// progress, so volatile noise (an animated "working" spinner, a running
+    /// clock) can't keep resetting the idle timer and hide a genuine hang. Pass
+    /// identity for a static UI.
+    pub fn wait_until_progress<F, K>(
+        &self,
+        idle: Duration,
+        what: &str,
+        pred: F,
+        progress_key: K,
+    ) -> Result<String>
+    where
+        F: Fn(&str) -> bool,
+        K: Fn(&str) -> String,
+    {
+        let start = Instant::now();
         let mut last = String::new();
+        let mut last_key = String::new();
+        let mut last_progress = start;
         loop {
             last = self.capture().unwrap_or(last);
             if pred(&last) {
@@ -350,9 +381,17 @@ impl TmuxSession {
                     last,
                 });
             }
-            if Instant::now() >= deadline {
+            let key = progress_key(&last);
+            if key != last_key {
+                last_key = key;
+                last_progress = Instant::now();
+            }
+            let now = Instant::now();
+            // The idle window is the real signal; MAX_TOTAL only backstops a
+            // frame that keeps churning yet never satisfies `pred`.
+            if now.duration_since(last_progress) >= idle || now.duration_since(start) >= MAX_TOTAL {
                 return Err(HarnessError::Timeout {
-                    ms: timeout.as_millis(),
+                    ms: idle.as_millis(),
                     what: what.to_string(),
                     last,
                 });
@@ -510,5 +549,31 @@ mod tests {
             })
             .expect("capture");
         assert!(screen.contains("HARNESS_OK"), "screen was:\n{screen}");
+    }
+
+    /// The wait window tracks *progress*, not an absolute deadline: a program
+    /// that emits slowly (each step well within the window) but whose total
+    /// runtime exceeds it must still be waited out. An absolute deadline would
+    /// have failed at ~`idle` here, long before "DONE" lands.
+    #[test]
+    fn wait_until_tracks_progress_not_a_fixed_deadline() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        // ~15 steps * 0.2s = ~3s total, each step ~0.2s apart.
+        let spec = LaunchSpec::new("/bin/sh", 40, 12).arg("-c").arg(
+            "i=0; while [ $i -lt 15 ]; do printf 'step %s\\n' \"$i\"; \
+             i=$((i+1)); sleep 0.2; done; printf 'DONE\\n'; exec sleep 30",
+        );
+        let session = TmuxSession::launch(spec).expect("launch");
+        // idle window (2s) >> per-step gap (~0.2s) but << total (~3s): only a
+        // progress-tracking wait reaches DONE; an absolute 2s deadline wouldn't.
+        let screen = session
+            .wait_until(Duration::from_secs(2), "DONE after slow steps", |s| {
+                s.contains("DONE")
+            })
+            .expect("idle-based wait should outlast slow-but-progressing output");
+        assert!(screen.contains("DONE"), "screen:\n{screen}");
     }
 }

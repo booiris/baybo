@@ -11,19 +11,19 @@ are run.
 into the container and runs one `aura prompt` per task. There is no fork of
 terminal-bench — it's used via `--agent-import-path`.
 
-> ⚠️ **Branch-only.** This depends on aura's `bench-passthrough` build feature
-> (an in-container agent must disable its own sandbox — the analog of Codex's
-> `--sandbox danger-full-access`). That feature and this adapter live only on the
-> `tb-installed-agent` branch and never ship to master.
+> ⚠️ **Branch-only.** This adapter (an in-container agent runs aura built
+> `--features bench-bash` — the analog of Codex's `--sandbox danger-full-access`)
+> lives only on the `tb-installed-agent` branch and never ships to master.
 
-## Why a special aura build
+## Why `--features bench-bash`
 
 aura normally wraps every shell command in an OS sandbox (bwrap/docker). Inside a
 TB task container there is no bwrap, and the container already *is* the isolation
-boundary — so the adapter configures aura with `sandbox.mode = passthrough`: Bash
-runs commands directly, with no work-dir jail, in the container's working dir
-(where the task files live). A normal aura build **refuses to start** with that
-mode; only a `bench-passthrough` build honors it.
+boundary. So the binary is built `--features bench-bash` (the off-by-default
+bench profile: Bash runs raw — no OS sandbox, no work-dir jail, no uv shim, cwd
+inherited from the container's WORKDIR) and the rendered `aura.json` also sets
+`sandbox.mode = none`. The feature is what lifts the uv shim + work jail; `none`
+alone would keep them.
 
 ## Build the binary
 
@@ -31,12 +31,12 @@ A **static musl** binary runs in any linux task container regardless of glibc:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl     # one-time (+ musl-tools/musl-gcc)
-cargo build --release --target x86_64-unknown-linux-musl --features bench-passthrough
+cargo build --release --target x86_64-unknown-linux-musl --features bench-bash
 # -> target/x86_64-unknown-linux-musl/release/aura
 ```
 
 If the musl build is awkward on your host (e.g. the bundled SQLite in `libsql`),
-a glibc release binary built `--features bench-passthrough` also works when the
+a glibc release binary also works when the
 task container's glibc is compatible — musl is just the safe default.
 
 ## Run
@@ -55,7 +55,7 @@ cp .env.example .env && $EDITOR .env   # set the API key (+ optional model/base_
 ./run.sh --n-tasks 3 -m openai/gpt-4o  # override model / task count / dataset / …
 ```
 
-`run.sh` builds the `bench-passthrough` musl binary on first use
+`run.sh` builds the musl binary on first use
 (`AURA_REBUILD=1` forces a rebuild), then runs the equivalent of — no global
 install, no `PYTHONPATH`, env from the lockfile:
 
@@ -92,7 +92,7 @@ confirm Docker + the harness work before pointing it at aura.
 
 1. The harness builds/starts the task's container.
 2. `AuraAgent.perform_task` copies the `aura` binary **and** a rendered
-   `aura.json` (passthrough sandbox, a self-contained state dir under
+   `aura.json` (`none` sandbox, a self-contained state dir under
    `/installed-agent/aura-home`, the provider/model under test) into
    `/installed-agent`, then the base class sources the provider key and runs
    `aura-setup.sh` — which installs the binary, mints a vault key, and (only when
@@ -106,7 +106,7 @@ confirm Docker + the harness work before pointing it at aura.
 
 - **Network-restricted tasks** (the agent phase normally has bridge networking)
   fail for any API-based agent, not just aura.
-- **Background bash** (timeout-to-background) is unsupported in passthrough — TB
+- **Background bash** (timeout-to-background) is unsupported in `none` mode — TB
   turns are foreground and the harness enforces the agent timeout, so this
   doesn't bite in practice.
 - The provider key is exported into the container's shell for the run; it is

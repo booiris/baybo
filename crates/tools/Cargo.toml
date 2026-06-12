@@ -12,10 +12,10 @@ doctest = false
 #   aura-tools = { workspace = true, features = ["test-support"] }
 # inside the consumer's `[dev-dependencies]`.
 test-support = []
-# Compile in `BashTool`'s trusted-environment passthrough — unsandboxed exec, no
-# work-dir jail, inherited cwd, and its dedicated description. Off by default;
-# see the root crate's `bench-passthrough`.
-bench-passthrough = []
+# `BashTool`'s bench profile — raw exec inside a disposable container (no uv, no
+# work-dir jail, inherited cwd, dedicated prompt). Off by default; see the root
+# crate's `bench-bash`.
+bench-bash = []
 # Emits ts-rs-generated TypeScript definitions for the Aura-specific
 # `_meta.aura.*` annotations the embedded MCP servers carry on each
 # tool descriptor. Kept behind a feature so release builds don't pull
@@ -47,6 +47,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tokio-util = { workspace = true }
+libc = { workspace = true }
 anyhow = { workspace = true }
 glob = { workspace = true }
 shell-words = { workspace = true }

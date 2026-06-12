@@ -99,10 +99,16 @@ and write one of these. Key is referenced **by file**, API key **by env-var name
   "channels": { "cli": { "enabled": true } },
   "security": { "encryption_key_file": "<dir>/encryption.key", "leak_detection_enabled": true },
   "workspace": { "path": "/aura-home" },
-  "sandbox": { "mode": "passthrough" },
+  "sandbox": { "mode": "none" },
   "cost": { "rate_limit": { "max_requests": 1000000 } }
 }
 ```
+- `sandbox.mode = none` drops aura's OS sandbox (Bash runs via `sh -c` directly)
+  but keeps the uv shim + the `work/` jail. For an **in-container** bench (bwrap
+  can't nest) you also build `--features bench-bash` — the off-by-default bench
+  profile that additionally lifts uv + the jail and inherits the container's cwd.
+  Both together = raw exec. Omit the sandbox key (default `auto`) for a host bench
+  with real isolation.
 - `workspace.path` MUST be **outside** the tree you grade (e.g. `/aura-home` while
   the repo is `/testbed`), or aura's vault/sessions/logs pollute the captured diff.
 - Add `"base_url"` to the llm entry only when set (omit → provider default).

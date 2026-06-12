@@ -1,14 +1,15 @@
 //! Drive the REAL aura agent inside each instance's **official SWE-bench Docker
 //! image** — the faithful, leaderboard-comparable way to measure issue
 //! resolution. Per instance we `docker run` the eval image (the repo checked out
-//! at `base_commit` at `/testbed`, all deps installed), copy in an `aura` binary
-//! built with `--features bench-passthrough` plus a `sandbox.mode = passthrough`
-//! config, run `aura prompt` with cwd `/testbed`, then capture `git diff` as the
-//! prediction and read the turn's cost from aura's ledger.
+//! at `base_commit` at `/testbed`, all deps installed), copy in a static-musl
+//! `aura` binary configured with `sandbox.mode = none`, run `aura prompt` with
+//! cwd `/testbed`, then capture `git diff` as the prediction and read the turn's
+//! cost from aura's ledger.
 //!
-//! Passthrough is mandatory here: aura's normal OS sandbox (bwrap) can't nest in
-//! the container, and the container is already the isolation boundary. The grader
-//! runs separately, in its own hermetic containers — see [`crate::grader`].
+//! `mode = none` (no OS sandbox) is mandatory here: aura's normal sandbox (bwrap)
+//! can't nest in the container, and the container is already the isolation
+//! boundary. The grader runs separately, in its own hermetic containers — see
+//! [`crate::grader`].
 
 use std::path::Path;
 use std::process::Stdio;
@@ -51,7 +52,7 @@ pub struct AgentModel {
     pub base_url: Option<String>,
 }
 
-/// Render the in-container `aura.json`: passthrough sandbox, the agent model,
+/// Render the in-container `aura.json`: `none` sandbox, the agent model,
 /// an isolated workspace, and a lifted rate limit. Returned as text to pipe into
 /// the container (no host temp file).
 pub fn render_agent_config(model: &AgentModel) -> String {
@@ -70,8 +71,9 @@ pub fn render_agent_config(model: &AgentModel) -> String {
         "channels": { "cli": { "enabled": true } },
         "security": { "encryption_key_file": CONTAINER_KEY_FILE, "leak_detection_enabled": true },
         "workspace": { "path": CONTAINER_WORKSPACE },
-        // The whole point of this build: run Bash unsandboxed in the container.
-        "sandbox": { "mode": "passthrough" },
+        // The whole point of this run: Bash executes directly in the container
+        // (the container IS the isolation boundary; bwrap can't nest here).
+        "sandbox": { "mode": "none" },
         "cost": { "rate_limit": { "max_requests": BENCH_RATE_LIMIT_MAX_REQUESTS } },
     });
     serde_json::to_string_pretty(&cfg).unwrap_or_else(|_| "{}".to_string())
@@ -108,7 +110,7 @@ impl InstanceRun {
 /// Inputs for one instance's containerized agent run.
 pub struct RunOpts<'a> {
     pub docker_bin: &'a str,
-    /// Host path of the `aura` binary (built `--features bench-passthrough`).
+    /// Host path of the static-musl `aura` binary.
     pub aura_bin_host: &'a Path,
     /// Rendered `aura.json` text (see [`render_agent_config`]).
     pub config_json: &'a str,
@@ -608,9 +610,9 @@ mod tests {
     }
 
     #[test]
-    fn config_has_passthrough_and_isolated_workspace() {
+    fn config_has_none_sandbox_and_isolated_workspace() {
         let cfg: serde_json::Value = serde_json::from_str(&render_agent_config(&model())).unwrap();
-        assert_eq!(cfg["sandbox"]["mode"], "passthrough");
+        assert_eq!(cfg["sandbox"]["mode"], "none");
         // Workspace must be outside /testbed so aura state never pollutes the diff.
         assert_eq!(cfg["workspace"]["path"], CONTAINER_WORKSPACE);
         assert!(

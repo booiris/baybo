@@ -938,6 +938,7 @@ dependencies = [
  "hex",
  "htmd",
  "iana-time-zone",
+ "libc",
  "oauth2",
  "open",
  "parking_lot",

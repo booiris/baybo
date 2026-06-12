@@ -184,14 +184,14 @@ edition.workspace = true
 # `aura_memory::ReadOnlyMemory` (see `src/runtime.rs`). NOT for production.
 bench-readonly-memory = ["aura-memory/bench-readonly-memory"]
 
-# Build a benchmark-only `aura` that compiles in `sandbox.mode = passthrough`
-# support: shell commands run DIRECTLY — no OS sandbox, no work-dir jail, cwd
-# inherited from the process — so aura can act as a Terminal-Bench agent INSIDE a
-# disposable task container (where bwrap is unavailable and double-isolation is
-# pointless). Without this feature the `[sandbox]` config, the passthrough Bash
-# path, and its prompt are NOT compiled at all; a `sandbox` config key is then an
-# unknown field (ignored) → aura stays sandboxed. NOT for production.
-bench-passthrough = ["aura-config/bench-passthrough", "aura-tools/bench-passthrough"]
+# Compile the Bash tool's bench profile: run shell commands raw inside an
+# already-disposable container — no uv shims, no work-dir jail, cwd inherited
+# from the process, and a dedicated prompt. Also skips the workspace
+# identity-repo `git init` (aura-workspace) so a bench container needs no `git`
+# on PATH. Distinct from the `sandbox.mode = none` config (which only drops the
+# OS sandbox but keeps uv + the work/ jail). Off by default; absent in every
+# prod build. For bench/swe + bench/terminal.
+bench-bash = ["aura-tools/bench-bash", "aura-workspace/bench-bash"]
 
 [dependencies]
 aura-model = { workspace = true }

@@ -228,13 +228,12 @@ pub async fn build_managers(
     // stays free of per-tool-domain wiring (browser blob upload, etc).
     embedded_mcp_servers: Vec<EmbeddedMcpServer>,
 ) -> anyhow::Result<ManagerGraph> {
-    // Resolve the sandbox mode up front. Passthrough (no OS sandbox, no work-dir
-    // jail) only exists in a `bench-passthrough` build; a normal build is always
-    // sandboxed (a `sandbox` config key there is an ignored unknown field).
-    #[cfg(feature = "bench-passthrough")]
-    let bash_passthrough = matches!(config.sandbox.mode, aura_config::SandboxMode::Passthrough);
-    #[cfg(not(feature = "bench-passthrough"))]
-    let bash_passthrough = false;
+    // Shared, hot-swappable Bash sandbox mode. A `sandbox` config reload swaps
+    // it live (see `reload.rs`); the handle is held by both the tool registry
+    // and the reloader.
+    let sandbox_mode = std::sync::Arc::new(aura_tools::builtin::LiveSandboxMode::new(
+        boot::to_bash_mode(config.sandbox.mode),
+    ));
     // --- minimal services shared by every mode
     let workspace_paths =
         aura_workspace::WorkspacePaths::new(std::path::PathBuf::from(&config.workspace.path));
@@ -402,6 +401,7 @@ pub async fn build_managers(
             aura_config::ConfigHandle::new(Arc::clone(&config)),
             llm_reloader,
             cost_reloader,
+            Arc::clone(&sandbox_mode),
         ))
     };
 
@@ -409,7 +409,7 @@ pub async fn build_managers(
         stores.blob.clone(),
         aura_workspace::WorkspacePaths::new(workspace_root.clone()),
         tool_proxy,
-        bash_passthrough,
+        Arc::clone(&sandbox_mode),
     );
 
     let assessment_mode = boot::to_assessment_mode(config.skills.risk_check);
@@ -540,11 +540,14 @@ pub async fn build_managers(
         Arc::clone(&secret_vault),
     ));
     let gate_map = channels_registry.approval_gates();
-    let sandbox_runner = if bash_passthrough {
-        // Passthrough runs every command directly (no OS sandbox), so probing
-        // for a backend is pointless — and a benchmark container usually has
+    let sandbox_runner = if matches!(config.sandbox.mode, aura_config::SandboxMode::None) {
+        // `none` mode runs every command directly (no OS sandbox), so probing
+        // for a backend is pointless — and a disposable container usually has
         // none. Skip it silently rather than logging a misleading
         // "ExecCommand tools will be refused" error for tools that run fine.
+        // (A boot in `none` later hot-reloaded to a sandboxed mode would then
+        // find no backend and surface a clear "OS sandbox unavailable" error —
+        // acceptable, since such an environment has no sandbox to offer.)
         None
     } else {
         match aura_sandbox::current_platform_runner() {
