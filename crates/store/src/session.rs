@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use aura_model::{ChannelType, ChatMessage, LineageKind, LlmEntryName, Session, SessionId};
+use aura_model::{
+    ChannelType, ChatMessage, ControlEvent, ControlEventKind, LineageKind, LlmEntryName, Session,
+    SessionId,
+};
 use chrono::{DateTime, Utc};
 
 use crate::StorageError;
@@ -114,6 +117,25 @@ pub trait SessionStore: Send + Sync {
         session_id: &SessionId,
         message: &ChatMessage,
     ) -> Result<i64>;
+
+    /// Append an out-of-band control/display event ([`ControlEvent`]) to the
+    /// session — a slash-command echo or a notice. Stored separately from the
+    /// transcript log (`session_control_events`); assigns the next per-session
+    /// `seq` and returns it. `after_ordinal` is the `session_messages.ordinal`
+    /// the event follows (`-1` if none yet), used to interleave it into the chat
+    /// view; `created_at` is the event's own time (e.g. when the user hit
+    /// `/stop`), shown in the UI.
+    async fn append_control_event(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+        kind: ControlEventKind,
+        text: &str,
+        created_at: DateTime<Utc>,
+    ) -> Result<i64>;
+
+    /// All control events for a session, oldest-first by `seq`.
+    async fn list_control_events(&self, session_id: &SessionId) -> Result<Vec<ControlEvent>>;
 
     /// Apply a `/compact`-style compression: mark every currently-
     /// active row as superseded by the first newly-inserted row, then

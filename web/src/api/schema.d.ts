@@ -689,10 +689,9 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             /**
-             * @description `true` when at least one older active row exists below the
-             *     slice's lowest ordinal — i.e. the client should keep
-             *     scroll-up pagination armed. `false` when the slice already
-             *     includes the session's first message.
+             * @description `true` when at least one older active row exists below this page — i.e.
+             *     the client should keep scroll-up pagination armed. `false` when the slice
+             *     already includes the session's first message.
              */
             has_more: boolean;
             hidden: boolean;
@@ -705,12 +704,23 @@ export interface components {
              *     initial selection. Set via `PUT /v1/chat/sessions/{id}/model`.
              */
             last_llm?: string | null;
+            /** Format: int64 */
+            newest_ordinal?: number | null;
+            /**
+             * Format: int64
+             * @description Lowest / highest real `session_messages.ordinal` in this page (`null` for
+             *     an empty page). The client pages older with `before_ordinal = oldest`,
+             *     and seeds the WS replay cursor from `newest` — both must ignore the
+             *     synthetic ordinals on control-event transcript items.
+             */
+            oldest_ordinal?: number | null;
             session_id: string;
             /**
-             * @description Active transcript slice, oldest-first within the page. The
-             *     server returns at most `limit` rows; older rows are fetched
-             *     by passing the lowest `ordinal` here back as the next
-             *     request's `before_ordinal`.
+             * @description Active transcript slice, oldest-first within the page. Interleaves the
+             *     real message rows with out-of-band control events (slash echoes /
+             *     notices); a control-event item carries a synthetic negative `ordinal`, so
+             *     the client must NOT infer page bounds from transcript items — use
+             *     [`Self::oldest_ordinal`] / [`Self::newest_ordinal`] instead.
              */
             transcript: components["schemas"]["ChatTranscriptItem"][];
         };
@@ -767,12 +777,19 @@ export interface components {
             /** @description Message bubble vs. reconstructed work block. */
             kind: components["schemas"]["TranscriptItemKind"];
             /**
+             * @description Severity of a `notice` item (`"info"` / `"warn"` / `"error"`), so a reload
+             *     colors it the way the live frame did. `None` for `message` / `work` items.
+             */
+            notice_level?: string | null;
+            /**
              * Format: int64
-             * @description Absolute `session_messages.ordinal` of this row. Stable for the
-             *     lifetime of the session and used both as a React key and as
-             *     the `before_ordinal` cursor for the next-older page request. A
-             *     `work` item carries the ordinal of the turn's first intermediate
-             *     message so it sorts just after the user turn that spawned it.
+             * @description React key for the row. For `message` / `work` items it is the
+             *     `session_messages.ordinal` (a `work` item carries the turn's first
+             *     intermediate ordinal so it sorts just after the user turn). For a
+             *     `notice` / control-echo item it is a **synthetic negative value** in a
+             *     key space disjoint from real ordinals — so the client must NOT use it for
+             *     pagination / cursor seeding; see `ChatSessionDetail::oldest_ordinal` /
+             *     `newest_ordinal`.
              */
             ordinal: number;
             /**
@@ -1239,7 +1256,7 @@ export interface components {
          *     `"message"` / `"work"`.
          * @enum {string}
          */
-        TranscriptItemKind: "message" | "work";
+        TranscriptItemKind: "message" | "work" | "notice";
         /** @description `DELETE /v1/config` body. */
         UnsetConfigRequest: {
             path: string;

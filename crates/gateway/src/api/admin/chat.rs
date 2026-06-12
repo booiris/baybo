@@ -32,8 +32,8 @@ use std::collections::HashMap;
 use aura_agent::actor::AgentMessage;
 use aura_channels::wire::{SessionPatch, SlashCommandSpec};
 use aura_model::{
-    ChannelType, ChatMessage, ContentBlock, LlmEntryName, MessageSource, Role, Session, SessionId,
-    ThinkingContent, TriggerSource, User,
+    ChannelType, ChatMessage, ContentBlock, ControlEvent, LlmEntryName, MessageSource, Role,
+    Session, SessionId, ThinkingContent, TriggerSource, User,
 };
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -153,6 +153,12 @@ pub enum TranscriptItemKind {
     Message,
     /// A reconstructed collapsed work block for a tool-using turn.
     Work,
+    /// A persisted out-of-band notice (e.g. a `/compact` confirmation) — the
+    /// durable shadow of a live `AgentEvent::Notice`. Carries
+    /// [`ChatTranscriptItem::text`] and its severity in
+    /// [`ChatTranscriptItem::notice_level`]; the client renders it as a colored
+    /// notice bar, not a bubble.
+    Notice,
 }
 
 /// Kind of a reconstructed [`ChatWorkStep`] — serialized as
@@ -173,11 +179,13 @@ pub enum WorkStepKind {
 /// [`reconstruct_transcript`]).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatTranscriptItem {
-    /// Absolute `session_messages.ordinal` of this row. Stable for the
-    /// lifetime of the session and used both as a React key and as
-    /// the `before_ordinal` cursor for the next-older page request. A
-    /// `work` item carries the ordinal of the turn's first intermediate
-    /// message so it sorts just after the user turn that spawned it.
+    /// React key for the row. For `message` / `work` items it is the
+    /// `session_messages.ordinal` (a `work` item carries the turn's first
+    /// intermediate ordinal so it sorts just after the user turn). For a
+    /// `notice` / control-echo item it is a **synthetic negative value** in a
+    /// key space disjoint from real ordinals — so the client must NOT use it for
+    /// pagination / cursor seeding; see `ChatSessionDetail::oldest_ordinal` /
+    /// `newest_ordinal`.
     pub ordinal: i64,
     /// Message bubble vs. reconstructed work block.
     pub kind: TranscriptItemKind,
@@ -210,6 +218,10 @@ pub struct ChatTranscriptItem {
     pub work_started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_ended_at: Option<DateTime<Utc>>,
+    /// Severity of a `notice` item (`"info"` / `"warn"` / `"error"`), so a reload
+    /// colors it the way the live frame did. `None` for `message` / `work` items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice_level: Option<String>,
 }
 
 /// One reconstructed step inside a `work` transcript item — the durable
@@ -288,16 +300,24 @@ pub struct ChatSessionDetail {
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
     pub hidden: bool,
-    /// Active transcript slice, oldest-first within the page. The
-    /// server returns at most `limit` rows; older rows are fetched
-    /// by passing the lowest `ordinal` here back as the next
-    /// request's `before_ordinal`.
+    /// Active transcript slice, oldest-first within the page. Interleaves the
+    /// real message rows with out-of-band control events (slash echoes /
+    /// notices); a control-event item carries a synthetic negative `ordinal`, so
+    /// the client must NOT infer page bounds from transcript items — use
+    /// [`Self::oldest_ordinal`] / [`Self::newest_ordinal`] instead.
     pub transcript: Vec<ChatTranscriptItem>,
-    /// `true` when at least one older active row exists below the
-    /// slice's lowest ordinal — i.e. the client should keep
-    /// scroll-up pagination armed. `false` when the slice already
-    /// includes the session's first message.
+    /// `true` when at least one older active row exists below this page — i.e.
+    /// the client should keep scroll-up pagination armed. `false` when the slice
+    /// already includes the session's first message.
     pub has_more: bool,
+    /// Lowest / highest real `session_messages.ordinal` in this page (`null` for
+    /// an empty page). The client pages older with `before_ordinal = oldest`,
+    /// and seeds the WS replay cursor from `newest` — both must ignore the
+    /// synthetic ordinals on control-event transcript items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_ordinal: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_ordinal: Option<i64>,
     /// Per-session LLM pin (`session.state.last_llm`): the `aura.json`
     /// entry name this session's turns resolve against, or `null` to
     /// follow `default-llm`. Drives the chat header model picker's
@@ -558,7 +578,32 @@ async fn get_session(
     // (`channel::route::chat_to_visible_wire_message`) still replays only
     // the message bubbles — a full reload through here is what restores
     // the work blocks.
-    let transcript = reconstruct_transcript(tail);
+    // Real page bounds (control-event items carry synthetic negative ordinals,
+    // so the client can't infer these from the transcript — it gets them here).
+    let oldest_ordinal = tail.first().map(|(o, _, _)| *o);
+    let newest_ordinal = tail.last().map(|(o, _, _)| *o);
+    // Out-of-band control events (slash-command echoes + notices) live in their
+    // own table; interleave those whose `after_ordinal` anchor falls within this
+    // page. `upper` is the page's last row; `lower` is its first, except the
+    // oldest page (`!has_more`) extends down to catch `-1` / pre-supersession
+    // anchors. `reconstruct_transcript` places each event right after its anchor.
+    let control_events: Vec<ControlEvent> = match (oldest_ordinal, newest_ordinal) {
+        (Some(first), Some(last)) => {
+            let lower = if has_more { first } else { i64::MIN };
+            match state.session_manager.list_control_events(&sid).await {
+                Ok(events) => events
+                    .into_iter()
+                    .filter(|ev| ev.after_ordinal >= lower && ev.after_ordinal <= last)
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(session_id = %sid, error = %e, "chat: list control events failed");
+                    Vec::new()
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+    let transcript = reconstruct_transcript(tail, control_events);
     Ok(Json(ChatSessionDetail {
         session_id,
         created_at: session.created_at,
@@ -566,6 +611,8 @@ async fn get_session(
         hidden: session.hidden,
         transcript,
         has_more,
+        oldest_ordinal,
+        newest_ordinal,
         last_llm: session.state.last_llm.as_ref().map(|n| n.to_string()),
     }))
 }
@@ -1070,6 +1117,7 @@ impl WorkAccumulator {
                 steps: std::mem::take(&mut self.steps),
                 work_started_at: started,
                 work_ended_at: ended_at.or(self.last).or(started),
+                notice_level: None,
             });
         }
         self.ordinal = None;
@@ -1088,7 +1136,29 @@ impl WorkAccumulator {
 /// reload the same work-block-then-answer shape the live view shows —
 /// turn-progress is otherwise live-only, but every block it needs is
 /// durably persisted, so this is where it's reconstructed.
-fn reconstruct_transcript(tail: Vec<(i64, DateTime<Utc>, ChatMessage)>) -> Vec<ChatTranscriptItem> {
+fn reconstruct_transcript(
+    tail: Vec<(i64, DateTime<Utc>, ChatMessage)>,
+    control_events: Vec<ControlEvent>,
+) -> Vec<ChatTranscriptItem> {
+    // Merge message rows and out-of-band control events into one ordinal-ordered
+    // stream: a control event with `after_ordinal = N` sorts right after the row
+    // at ordinal N (and before N+1), `seq`-ordered among events sharing an
+    // anchor. Folding then runs over the stream unchanged; a control event just
+    // flushes the open work block and emits its own item.
+    enum Entry {
+        Row(i64, DateTime<Utc>, ChatMessage),
+        Control(ControlEvent),
+    }
+    let mut entries: Vec<(i64, u8, i64, Entry)> =
+        Vec::with_capacity(tail.len() + control_events.len());
+    for (ordinal, created_at, msg) in tail {
+        entries.push((ordinal, 0, ordinal, Entry::Row(ordinal, created_at, msg)));
+    }
+    for ev in control_events {
+        entries.push((ev.after_ordinal, 1, ev.seq, Entry::Control(ev)));
+    }
+    entries.sort_by_key(|(anchor, is_control, tiebreak, _)| (*anchor, *is_control, *tiebreak));
+
     let mut items: Vec<ChatTranscriptItem> = Vec::new();
     let mut work = WorkAccumulator::default();
     // Start of the turn currently being folded — the most recent real user
@@ -1097,7 +1167,15 @@ fn reconstruct_transcript(tail: Vec<(i64, DateTime<Utc>, ChatMessage)>) -> Vec<C
     // reconstructed work block spans from here to the answer's timestamp.
     let mut turn_started: Option<DateTime<Utc>> = None;
 
-    for (ordinal, created_at, msg) in tail {
+    for (_, _, _, entry) in entries {
+        let (ordinal, created_at, msg) = match entry {
+            Entry::Control(ev) => {
+                work.flush(&mut items, None);
+                items.push(control_event_item(ev));
+                continue;
+            }
+            Entry::Row(ordinal, created_at, msg) => (ordinal, created_at, msg),
+        };
         match msg.role {
             Role::User if msg.from_user() => {
                 work.flush(&mut items, None);
@@ -1232,7 +1310,36 @@ fn message_item(
         steps: Vec::new(),
         work_started_at: None,
         work_ended_at: None,
+        notice_level: None,
     })
+}
+
+/// Map a [`ControlEvent`] (an out-of-band slash-command echo or notice, stored
+/// outside `session_messages`) into a transcript item: a `command` renders as a
+/// user bubble (what the user typed), a `notice_*` as a colored notice bar. The
+/// negative `ordinal` keeps these in a key space disjoint from real message
+/// ordinals (so React keys never collide); position comes from the
+/// `after_ordinal` anchor in `reconstruct_transcript`, not this field, and the
+/// client reads page bounds from `ChatSessionDetail::{oldest,newest}_ordinal`.
+fn control_event_item(ev: ControlEvent) -> ChatTranscriptItem {
+    // `notice_level()` is `Some` for a notice kind, `None` for a command echo.
+    let level = ev.kind.notice_level();
+    let (kind, role) = match level {
+        Some(_) => (TranscriptItemKind::Notice, String::new()),
+        None => (TranscriptItemKind::Message, "user".to_owned()),
+    };
+    ChatTranscriptItem {
+        ordinal: -(ev.seq + 1),
+        kind,
+        role,
+        text: ev.text,
+        has_attachments: false,
+        created_at: ev.created_at,
+        steps: Vec::new(),
+        work_started_at: None,
+        work_ended_at: None,
+        notice_level: level.map(str::to_owned),
+    }
 }
 
 /// Concatenate the visible text of a model thinking block (redacted
@@ -1358,6 +1465,21 @@ mod tests {
             signature: None,
         }
     }
+    fn ctl(
+        seq: i64,
+        after: i64,
+        kind: aura_model::ControlEventKind,
+        body: &str,
+        secs: i64,
+    ) -> ControlEvent {
+        ControlEvent {
+            seq,
+            after_ordinal: after,
+            kind,
+            text: body.to_owned(),
+            created_at: ts(secs),
+        }
+    }
 
     #[test]
     fn reconstruct_groups_tool_turn_into_work_block_before_answer() {
@@ -1386,7 +1508,7 @@ mod tests {
                 ChatMessage::assistant(vec![text("done, sort of")]),
             ),
         ];
-        let items = reconstruct_transcript(tail);
+        let items = reconstruct_transcript(tail, Vec::new());
         assert_eq!(items.len(), 3);
 
         assert!(matches!(items[0].kind, TranscriptItemKind::Message));
@@ -1418,6 +1540,105 @@ mod tests {
     }
 
     #[test]
+    fn reconstruct_interleaves_control_events_by_anchor() {
+        use aura_model::ControlEventKind::{Command, NoticeInfo, NoticeWarn};
+        // A /stop'd tool turn: user (ord 2) → tool-using assistant (ord 3) →
+        // tool result (ord 4), with no final answer. Control events: a warn
+        // notice anchored before any row (after_ordinal -1), and the /stop echo
+        // + its info notice both anchored after the tail (after_ordinal 4).
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![tool_use(
+                    "c1",
+                    "Bash",
+                    serde_json::json!({"command": "sleep 99"}),
+                )]),
+            ),
+            (
+                4,
+                ts(4),
+                ChatMessage::tool_result("c1".to_owned(), "ok".to_owned()),
+            ),
+        ];
+        // Deliberately out of sorted order to prove reconstruct sorts them.
+        let events = vec![
+            ctl(2, 4, NoticeInfo, "Stopped the current turn", 5),
+            ctl(0, -1, NoticeWarn, "early", 1),
+            ctl(1, 4, Command, "/stop", 5),
+        ];
+        let items = reconstruct_transcript(tail, events);
+
+        // early notice, user, work block, /stop echo, /stop notice
+        assert_eq!(items.len(), 5);
+
+        // after_ordinal -1 sorts before every row.
+        assert!(matches!(items[0].kind, TranscriptItemKind::Notice));
+        assert_eq!(items[0].text, "early");
+        assert_eq!(items[0].notice_level.as_deref(), Some("warn"));
+
+        assert!(matches!(items[1].kind, TranscriptItemKind::Message));
+        assert_eq!(items[1].role, "user");
+        assert_eq!(items[1].text, "go");
+
+        // The tool turn folds into one work block, flushed before the control
+        // events anchored after it.
+        assert!(matches!(items[2].kind, TranscriptItemKind::Work));
+
+        // Same anchor (4): seq orders the echo (Command → user bubble) before
+        // the notice.
+        assert!(matches!(items[3].kind, TranscriptItemKind::Message));
+        assert_eq!(items[3].role, "user");
+        assert_eq!(items[3].text, "/stop");
+        assert_eq!(items[3].notice_level, None);
+
+        assert!(matches!(items[4].kind, TranscriptItemKind::Notice));
+        assert_eq!(items[4].text, "Stopped the current turn");
+        assert_eq!(items[4].notice_level.as_deref(), Some("info"));
+
+        // Control items carry synthetic negative ordinals so they never collide
+        // with (or seed the cursor from) a real session_messages.ordinal.
+        for ctl_item in [&items[0], &items[3], &items[4]] {
+            assert!(ctl_item.ordinal < 0, "control items use negative ordinals");
+        }
+    }
+
+    #[test]
+    fn reconstruct_control_event_mid_block_splits_the_work() {
+        use aura_model::ControlEventKind::NoticeInfo;
+        // A control event anchored at a row *inside* a tool turn (after_ordinal
+        // 3, the intermediate assistant row) flushes the work accumulated so far
+        // before the final answer.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![tool_use(
+                    "c1",
+                    "Bash",
+                    serde_json::json!({"command": "echo hi"}),
+                )]),
+            ),
+            (4, ts(6), ChatMessage::assistant(vec![text("done")])),
+        ];
+        let events = vec![ctl(0, 3, NoticeInfo, "midway", 4)];
+        let items = reconstruct_transcript(tail, events);
+
+        // user, work (the c1 tool step), notice, answer
+        assert_eq!(items.len(), 4);
+        assert!(matches!(items[0].kind, TranscriptItemKind::Message));
+        assert!(matches!(items[1].kind, TranscriptItemKind::Work));
+        assert!(matches!(items[2].kind, TranscriptItemKind::Notice));
+        assert_eq!(items[2].text, "midway");
+        assert!(matches!(items[3].kind, TranscriptItemKind::Message));
+        assert_eq!(items[3].role, "assistant");
+        assert_eq!(items[3].text, "done");
+    }
+
+    #[test]
     fn reconstruct_direct_answer_with_thinking_gets_work_block() {
         // A turn that thinks then answers with no tool calls keeps both rows
         // logically: a `Worked Xs` work block (spanning the user turn → the
@@ -1430,7 +1651,7 @@ mod tests {
                 ChatMessage::assistant(vec![thinking("let me add"), text("2")]),
             ),
         ];
-        let items = reconstruct_transcript(tail);
+        let items = reconstruct_transcript(tail, Vec::new());
         assert_eq!(items.len(), 3);
 
         assert!(matches!(items[0].kind, TranscriptItemKind::Message));
@@ -1461,7 +1682,7 @@ mod tests {
             (2, ts(2), ChatMessage::user(vec![text("hi")])),
             (3, ts(3), ChatMessage::assistant(vec![text("hello")])),
         ];
-        let items = reconstruct_transcript(tail);
+        let items = reconstruct_transcript(tail, Vec::new());
         assert_eq!(items.len(), 2);
         assert!(
             items
@@ -1490,7 +1711,7 @@ mod tests {
                 ChatMessage::tool_result("c1".to_owned(), "ok output".to_owned()),
             ),
         ];
-        let items = reconstruct_transcript(tail);
+        let items = reconstruct_transcript(tail, Vec::new());
         assert_eq!(items.len(), 2);
         let work = &items[1];
         assert!(matches!(work.kind, TranscriptItemKind::Work));
@@ -1508,7 +1729,7 @@ mod tests {
             (3, ts(3), ChatMessage::user(vec![text("hi")])),
             (4, ts(4), ChatMessage::assistant(vec![text("hello")])),
         ];
-        let items = reconstruct_transcript(tail);
+        let items = reconstruct_transcript(tail, Vec::new());
         assert_eq!(items.len(), 2);
         assert!(
             items
@@ -1530,7 +1751,7 @@ mod tests {
                 serde_json::json!({"command": "ls"}),
             )]),
         )];
-        let items = reconstruct_transcript(tail);
+        let items = reconstruct_transcript(tail, Vec::new());
         assert_eq!(items.len(), 1);
         assert!(items[0].steps[0].tool_summary.is_none());
         assert!(items[0].steps[0].tool_status.is_none());

@@ -1,4 +1,5 @@
 pub mod approval;
+mod control_event;
 mod cost;
 mod cron;
 mod external_agent;
@@ -15,6 +16,7 @@ pub mod spawn_protocol;
 mod task;
 
 pub use approval::{ApprovalDecision, ApprovedResource, HostPattern, ResourceAccess};
+pub use control_event::{ControlEvent, ControlEventKind};
 pub use cost::{CallReason, CostRecord, CostSummary, TimeRange};
 pub use cron::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
 pub use external_agent::{

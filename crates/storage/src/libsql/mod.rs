@@ -191,6 +191,29 @@ impl LibsqlPool {
                     ON session_messages(session_id, ordinal)
                     WHERE superseded_by IS NULL;
 
+                -- Out-of-band events shown in the chat transcript but NOT part
+                -- of the LLM conversation: a user's control-command echo
+                -- (`/stop`, `/compact`) and the resulting notices (plus any other
+                -- out-of-band notice). Kept out of `session_messages` on purpose
+                -- so that table stays exactly the LLM context — no filtering,
+                -- intact ordinal/marker invariants, accurate trace inputs. The
+                -- chat view interleaves these by `after_ordinal` (the
+                -- `session_messages.ordinal` the event follows, or -1 if none
+                -- yet) so they land in the right page on scroll-up too. `kind` is
+                -- one of 'command' / 'notice_info' / 'notice_warn' /
+                -- 'notice_error' (`aura_model::ControlEventKind`); `seq` is a
+                -- per-session monotonic id (stable key + same-anchor tiebreak);
+                -- `created_at` is the event's own time, shown in the UI.
+                CREATE TABLE IF NOT EXISTS session_control_events (
+                    session_id    TEXT    NOT NULL,
+                    seq           INTEGER NOT NULL,
+                    after_ordinal INTEGER NOT NULL,
+                    kind          TEXT    NOT NULL,
+                    text          TEXT    NOT NULL,
+                    created_at    INTEGER NOT NULL,
+                    PRIMARY KEY (session_id, seq)
+                );
+
                 -- Per-session summary metadata. Content lives on disk at
                 -- `<workspace>/state/sessions/<session_id>/summary.md`; this
                 -- row is the durable, queryable index. ON DELETE CASCADE

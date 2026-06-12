@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
-use aura_model::{ChatMessage, LineageKind, LlmEntryName, Session, SessionId};
+use aura_model::{
+    ChatMessage, ControlEvent, ControlEventKind, LineageKind, LlmEntryName, Session, SessionId,
+};
 use aura_store::StorageError;
 use aura_store::session::{Result, SessionStore, StoredMessage};
 
@@ -471,6 +473,102 @@ impl SessionStore for LibsqlSessionStore {
             .get(0)
             .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get ordinal: {e}")))?;
         Ok(ordinal)
+    }
+
+    async fn append_control_event(
+        &self,
+        session_id: &SessionId,
+        after_ordinal: i64,
+        kind: ControlEventKind,
+        text: &str,
+        created_at: DateTime<Utc>,
+    ) -> Result<i64> {
+        let conn = self.pool.conn();
+        let created_us = super::time::to_us(created_at);
+        let mut rows = conn
+            .query(
+                "INSERT INTO session_control_events \
+             (session_id, seq, after_ordinal, kind, text, created_at) \
+             SELECT ?1, COALESCE(MAX(seq), -1) + 1, ?2, ?3, ?4, ?5 \
+             FROM session_control_events WHERE session_id = ?1 \
+             RETURNING seq",
+                libsql::params![
+                    session_id.as_str().to_string(),
+                    after_ordinal,
+                    kind.as_str().to_string(),
+                    text.to_string(),
+                    created_us,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql append control event: {e}"))
+            })?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+            .ok_or_else(|| {
+                StorageError::Internal(anyhow::anyhow!(
+                    "INSERT … RETURNING returned no rows for session_control_events"
+                ))
+            })?;
+        let seq: i64 = row
+            .get(0)
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get seq: {e}")))?;
+        Ok(seq)
+    }
+
+    async fn list_control_events(&self, session_id: &SessionId) -> Result<Vec<ControlEvent>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                "SELECT seq, after_ordinal, kind, text, created_at FROM session_control_events \
+                 WHERE session_id = ?1 ORDER BY seq",
+                libsql::params![session_id.as_str().to_string()],
+            )
+            .await
+            .map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql list control events: {e}"))
+            })?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql row: {e}")))?
+        {
+            let seq: i64 = row
+                .get(0)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get seq: {e}")))?;
+            let after_ordinal: i64 = row.get(1).map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql get after_ordinal: {e}"))
+            })?;
+            let kind_str: String = row
+                .get(2)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get kind: {e}")))?;
+            let text: String = row
+                .get(3)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get text: {e}")))?;
+            let created_us: i64 = row.get(4).map_err(|e| {
+                StorageError::Internal(anyhow::anyhow!("libsql get created_at: {e}"))
+            })?;
+            let kind = kind_str
+                .parse::<ControlEventKind>()
+                .map_err(StorageError::Storage)?;
+            let created_at = super::time::from_us(created_us).ok_or_else(|| {
+                StorageError::Storage(format!(
+                    "session_control_events.created_at out of range: {created_us}"
+                ))
+            })?;
+            out.push(ControlEvent {
+                seq,
+                after_ordinal,
+                kind,
+                text,
+                created_at,
+            });
+        }
+        Ok(out)
     }
 
     async fn apply_session_compaction(
@@ -1012,6 +1110,60 @@ mod tests {
 
         store.delete(&s.id).await.unwrap();
         assert!(store.get(&s.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn control_events_round_trip_seq_kind_and_micros() {
+        use aura_model::ControlEventKind;
+
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+        let s = make_root_session("ctl-1");
+        store.save(&s).await.unwrap();
+
+        // Sub-second precision down to the microsecond, to prove `created_at`
+        // survives the µs-granular column round-trip exactly.
+        let at = DateTime::from_timestamp_micros(1_700_000_000_123_456).expect("valid timestamp");
+
+        // `seq` is assigned monotonically from 0, per session.
+        let s0 = store
+            .append_control_event(&s.id, -1, ControlEventKind::Command, "/stop", at)
+            .await
+            .unwrap();
+        let s1 = store
+            .append_control_event(&s.id, 7, ControlEventKind::NoticeInfo, "Stopped", at)
+            .await
+            .unwrap();
+        let s2 = store
+            .append_control_event(&s.id, 7, ControlEventKind::NoticeError, "boom", at)
+            .await
+            .unwrap();
+        assert_eq!((s0, s1, s2), (0, 1, 2));
+
+        let events = store.list_control_events(&s.id).await.unwrap();
+        assert_eq!(events.len(), 3);
+
+        // Ordered by seq; kind strings parse back to the typed enum; anchors,
+        // text and the microsecond timestamp all preserved.
+        assert_eq!(events[0].seq, 0);
+        assert_eq!(events[0].after_ordinal, -1);
+        assert_eq!(events[0].kind, ControlEventKind::Command);
+        assert_eq!(events[0].text, "/stop");
+        assert_eq!(events[0].created_at, at);
+        assert_eq!(events[1].kind, ControlEventKind::NoticeInfo);
+        assert_eq!(events[1].after_ordinal, 7);
+        assert_eq!(events[2].kind, ControlEventKind::NoticeError);
+        assert_eq!(events[2].text, "boom");
+
+        // A different session keeps its own independent seq space.
+        let other = make_root_session("ctl-2");
+        store.save(&other).await.unwrap();
+        let o0 = store
+            .append_control_event(&other.id, 0, ControlEventKind::NoticeWarn, "warn", at)
+            .await
+            .unwrap();
+        assert_eq!(o0, 0, "seq is per-session, not global");
+        assert_eq!(store.list_control_events(&s.id).await.unwrap().len(), 3);
     }
 
     #[tokio::test]
