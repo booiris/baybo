@@ -7,6 +7,7 @@
 #   ./run.sh -t fix-permissions       # a single task
 #   ./run.sh --n-tasks 5 -m openai/gpt-4o
 #   AURA_REBUILD=1 ./run.sh           # force a fresh binary build first
+#   TB_TEST_TIMEOUT_SEC=600 ./run.sh  # raise the per-task test-phase budget (default 300)
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,14 +30,30 @@ fi
 # Load key/model/base_url; uv and the adapter inherit them.
 set -a; . "$here/.env"; set +a
 
+# Pre-bake the test-phase toolchain (curl + uv + warmed pytest cache) into the
+# base images so each task's grader bootstrap runs from local cache instead of
+# re-downloading curl/uv/pytest over the slow network every task (idempotent;
+# first time ~2-3 min). SKIP_BASE_PREP=1 bypasses it.
+if [[ -z "${SKIP_BASE_PREP:-}" ]]; then
+  "$here/prepare-bases.sh"
+fi
+
 cd "$here"
+# Each task's grader (tests/setup-uv-pytest.sh) installs curl + uv + pytest at
+# TEST time; on a slow network that bootstrap overruns tb's stock 60s
+# max_test_timeout_sec, so a task the agent SOLVED still scores `test_timeout`
+# (is_resolved: null). Raise the test-phase budget by default so the grader can
+# bootstrap — the pytest logic itself is untouched. Tune via TB_TEST_TIMEOUT_SEC.
+test_timeout_sec="${TB_TEST_TIMEOUT_SEC:-300}"
+
 # `tb` keeps the last value when an option repeats, so anything in "$@"
-# (e.g. -m / -d / --n-tasks / -t) overrides these defaults. tb owns the full run
-# output under runs/<ts>/ (casts, logs, its results.json).
+# (e.g. -m / -d / --n-tasks / -t / --global-test-timeout-sec) overrides these
+# defaults. tb owns the full run output under runs/<ts>/ (casts, logs, results.json).
 uv run tb run \
   --agent-import-path tb_adapter.aura_agent:AuraAgent \
   --model "${AURA_MODEL:-gemini/gemini-2.5-flash}" \
   -d terminal-bench-core==0.1.1 \
+  --global-test-timeout-sec "$test_timeout_sec" \
   --output-path runs \
   "$@"
 rc=$?
