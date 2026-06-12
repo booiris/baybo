@@ -106,3 +106,4 @@ For non-module-crate topics, read the relevant doc before touching that area:
 - [`docs/modules/storage.md`](docs/modules/storage.md) — libsql storage; all deletable tables use plain `DELETE` (no soft-delete tombstones).
 - [`docs/fuzzing.md`](docs/fuzzing.md) — `aura-security` cargo-fuzz harness and targets.
 - [`docs/testing.md`](docs/testing.md) — test layout, `test-support` gating, shared fixtures.
+- [`docs/external-commands.md`](docs/external-commands.md) — external binaries aura shells out to (`git`/`sh`/`rg`/sandbox backends/`uv`/`bun`), required-vs-optional, and how the in-container benches provide or skip each.

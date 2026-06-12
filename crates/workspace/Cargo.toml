@@ -17,3 +17,7 @@ anyhow = { workspace = true, optional = true }
 # they only need path constants and `WorkspacePaths`.
 default = ["io"]
 io = ["dep:tokio", "dep:anyhow"]
+# Bench builds run inside an ephemeral single-task container: `ensure_layout`
+# skips the identity-repo `git init`, so aura boots without `git` on PATH (no
+# slow per-task `apt-get install git`). Enabled via the root crate's `bench-bash`.
+bench-bash = []
