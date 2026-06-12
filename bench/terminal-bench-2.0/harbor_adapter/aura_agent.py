@@ -6,9 +6,9 @@ leaderboard-comparable way, graded by the task's own verifier. The container
 commands directly — no bwrap, no work-dir jail). Mirrors Harbor's bundled
 installed agents (see harbor/agents/installed/codex.py); the aura.json schema +
 install steps are ported verbatim from the tb/1.0 adapter
-(bench/terminal/tb_adapter/aura_agent.py).
+(bench/terminal-bench-1.0/tb_adapter/aura_agent.py).
 
-Run via Harbor's --agent-import-path (no fork). From bench/terminal-harbor/:
+Run via Harbor's --agent-import-path (no fork). From bench/terminal-bench-2.0/:
 
     uv run harbor run \\
         -d terminal-bench/terminal-bench-2 \\
@@ -37,7 +37,7 @@ _KEY_PATH = f"{_CONTAINER_DIR}/enc.key"
 _SESSION_ID = "aura-tb"
 
 # Static-musl aura binary copied into each container. Repo-root-relative (this
-# file is bench/terminal-harbor/harbor_adapter/); AURA_BIN overrides.
+# file is bench/terminal-bench-2.0/harbor_adapter/); AURA_BIN overrides.
 _DEFAULT_BINARY = (
     Path(__file__).resolve().parents[3]
     / "target"
