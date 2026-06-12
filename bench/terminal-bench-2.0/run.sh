@@ -3,12 +3,12 @@
 # musl aura binary if missing, loads .env, then runs Harbor with the aura
 # installed-agent against the terminal-bench-2 dataset. Extra args pass through:
 #
-#   ./run.sh                      # all TB 2.0 tasks
-#   ./run.sh -t hello-world       # a single named task
-#   ./run.sh -l 1                 # just the first task (quick smoke test)
-#   ./run.sh -n 4                 # 4 concurrent trials
+#   ./run.sh                              # all TB 2.0 tasks
+#   ./run.sh -i terminal-bench/fix-git    # a single named task (org-prefixed name)
+#   ./run.sh -l 1                         # just the first task (quick smoke test)
+#   ./run.sh -n 4                         # 4 concurrent trials
 #   AURA_MODEL=openai/gpt-4o ./run.sh
-#   AURA_REBUILD=1 ./run.sh       # force a fresh binary build first
+#   AURA_REBUILD=1 ./run.sh               # force a fresh binary build first
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,21 +33,95 @@ set -a; . "$here/.env"; set +a
 
 cd "$here"
 
-# runs/latest → the job dir harbor creates, so a run is monitorable mid-run via
-# runs/latest/ (harbor names it by timestamp, so detect it in the background).
-# The trace + verdict are already co-located per trial under
-# runs/<ts>/<trial>/{agent,verifier}/, so no extra outcome wiring is needed.
-mkdir -p runs
+# Harbor writes every trial under runs/<ts>/<trial>/ (agent/{trace,messages}.json +
+# verifier/reward.txt + a per-trial result.json). Mirror that into the trace/ +
+# results/ convention the other benches use (swe, terminal-bench-1.0) so the score
+# and call-tree are discoverable without spelunking into <trial>/agent/ and
+# verifier/reward.txt. The full Harbor output stays under runs/.
+mkdir -p runs results trace
+
+# sync_outcomes <run-id>: (re)build trace/<id>/<task>/<trial>/ (agent-logs/ +
+# result.json) and results/results-<id>.json from runs/<id>/. Idempotent — safe to
+# call repeatedly while harbor grades trials one at a time.
+sync_outcomes() {
+  python3 - "$1" <<'PY'
+import json, os, sys, glob, shutil
+base = sys.argv[1]
+job = f"runs/{base}"
+if not os.path.isdir(job):
+    sys.exit(0)
+results = []
+for td in sorted(glob.glob(f"{job}/*/")):
+    trial = os.path.basename(td.rstrip("/"))
+    reward_f = os.path.join(td, "verifier", "reward.txt")
+    if not os.path.exists(reward_f):
+        continue  # a job-level file, or a trial harbor hasn't finished grading
+    try:
+        reward = float(open(reward_f).read().strip())
+    except Exception:
+        reward = None
+    # task name from the per-trial result.json (strip the dataset org prefix)
+    task = trial
+    rj = os.path.join(td, "result.json")
+    if os.path.exists(rj):
+        try:
+            task = (json.load(open(rj)).get("task_name") or trial).split("/")[-1]
+        except Exception:
+            pass
+    # parser_results: per-test status from the verifier's CTRF report
+    parser = {}
+    ctrf = os.path.join(td, "verifier", "ctrf.json")
+    if os.path.exists(ctrf):
+        try:
+            for t in json.load(open(ctrf)).get("results", {}).get("tests", []):
+                parser[t.get("name", "?")] = t.get("status", "?")
+        except Exception:
+            pass
+    resolved = reward is not None and reward >= 1.0
+    failure_mode = "unset" if resolved else ("test_failed" if reward is not None else "unknown")
+    # mirror the agent transcript + call-tree into trace/<base>/<task>/<trial>/
+    dst = f"trace/{base}/{task}/{trial}"
+    logs = os.path.join(dst, "agent-logs")
+    os.makedirs(logs, exist_ok=True)
+    for fn in ("trace.json", "messages.json"):
+        src, out = os.path.join(td, "agent", fn), os.path.join(logs, fn)
+        if os.path.exists(src) and not os.path.exists(out):
+            try:
+                shutil.copyfile(src, out)
+            except Exception:
+                pass
+    outcome = {"task_id": task, "trial_name": trial, "is_resolved": resolved,
+               "reward": reward, "failure_mode": failure_mode, "parser_results": parser}
+    json.dump(outcome, open(os.path.join(dst, "result.json"), "w"), indent=2)
+    results.append({**outcome,
+                    "trace_path": f"{base}/{task}/{trial}/agent-logs/trace.json"})
+json.dump({"id": base, "results": results},
+          open(f"results/results-{base}.json", "w"), indent=2)
+PY
+}
+
+# --- live monitor (background): point latest at the fresh job dir + sync each
+# trial's outcome into trace/ + results/ as harbor grades it, so a long run is
+# monitorable mid-flight (harbor names the job dir by timestamp → detect it here).
 prev_job="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
-( for _ in $(seq 1 150); do
+( linked=0
+  while :; do
     cur="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
     if [ -n "$cur" ] && [ "$cur" != "$prev_job" ]; then
-      ln -sfn "$(basename "$cur")" runs/latest; break
+      b="$(basename "$cur")"
+      if [ "$linked" = 0 ]; then
+        ln -sfn "$b" runs/latest
+        ln -sfn "$b" trace/latest
+        ln -sfn "results-$b.json" results/latest.json
+        linked=1
+      fi
+      sync_outcomes "$b"
     fi
-    sleep 2
+    sleep 15
   done ) &
+monitor_pid=$!
 
-# Defaults; anything in "$@" (e.g. -t / -l / -n) is appended.
+# Defaults; anything in "$@" (e.g. -i / -l / -n) is appended.
 set +e
 uv run harbor run \
   --dataset terminal-bench/terminal-bench-2 \
@@ -59,8 +133,16 @@ uv run harbor run \
   "$@"
 rc=$?
 set -e
+kill "$monitor_pid" 2>/dev/null || true
 
-# Re-point runs/latest authoritatively at the job we just produced.
-last_job="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
-[ -n "$last_job" ] && ln -sfn "$(basename "$last_job")" runs/latest
+# Final authoritative sync + latest pointers at the job we just produced.
+job="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
+if [ -n "$job" ]; then
+  base="$(basename "$job")"
+  sync_outcomes "$base"
+  ln -sfn "$base" runs/latest
+  [ -f "results/results-$base.json" ] && ln -sfn "results-$base.json" results/latest.json
+  [ -d "trace/$base" ] && ln -sfn "$base" trace/latest
+  echo "==> report: results/results-$base.json  (runs/latest · results/latest.json · trace/latest)" >&2
+fi
 exit "$rc"
