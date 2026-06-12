@@ -96,42 +96,55 @@ ENVIRONMENT:
 - Platform: {{platform}}"#;
 
 /// `{{isolation}}` for the default OS-sandboxed build (bwrap/sandbox-exec).
+// ── Prompt sections for normal builds: none / sandboxed / auto ───────────────
+// `none` only drops the OS sandbox, so it reuses Sandboxed's work-dir / python /
+// approval sections; only the isolation + (for auto) approval sections differ.
+// All compiled out under `bench-bash`, which renders one fixed prompt instead.
+
+#[cfg(not(feature = "bench-bash"))]
 const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Aura state dir under `~/.aura`/`$AURA_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled."#;
 
-/// `{{work_dir_scope}}` for the default OS-sandboxed build (Bash jailed to `work/`).
+#[cfg(not(feature = "bench-bash"))]
 const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Bash writes only inside the workspace work directory ({{work_dir}}). The read-only `skills/` subtree is the one exception you may name in a command — an installed skill's bundled script can be executed in place from there (writes to it still fail). Any other absolute path argument under the workspace root but outside `work/` and `skills/` (the sibling subtrees `profile/`, `config/`, `state/`, `logs/`, `.key/`) is rejected up front, and `cwd` is held to the work-dir rule. Use the dedicated tools (Read, Edit, Write, …) when you genuinely need to read or modify those subtrees; everything else stays under {{work_dir}}."#;
 
-/// `{{python_runtime}}` for the default OS-sandboxed build (uv-shimmed python).
+#[cfg(not(feature = "bench-bash"))]
 const SANDBOXED_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are shimmed to `uv run python` / `uv pip` inside this shell. For one-file scripts with third-party deps, declare them via PEP 723 inline metadata (`# /// script` block) so `uv run --script my.py` resolves them per-call. The shims are shell functions scoped to the outer `sh -c` — `bash -c '…'` subshells, `/usr/bin/python`, and Python's own `subprocess` calls bypass them."#;
 
 /// `{{isolation}}` for `sandbox.mode = none`: only the OS sandbox is dropped (the
 /// work-dir jail and uv shim still apply — described by their own sections).
+#[cfg(not(feature = "bench-bash"))]
 const NONE_ISOLATION: &str = r#"SANDBOX: The OS sandbox is OFF — commands run directly via `sh -c` on the host: no bwrap, no credential-vault masking, no resource caps, and the host filesystem is reachable. Network is enabled."#;
 
-/// The three sections for the `bench-bash` build profile (compiled only into a
-/// benchmark binary): aura runs inside an already-isolated container, so there
-/// is no OS sandbox, no work-dir jail, and no uv shim, and `{{work_dir}}` is the
-/// inherited cwd (the container WORKDIR).
-const BENCH_ISOLATION: &str = r#"EXECUTION: The shell runs directly on the host filesystem with full read+write access — no OS sandbox and no masked paths (this environment is already disposable/isolated). Network is enabled."#;
-
-const BENCH_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: {{work_dir}} is your working directory — create and modify files there, including with the `Write`/`Edit` tools (give them absolute paths under it). There is no work-dir jail; just keep output under {{work_dir}}."#;
-
-const BENCH_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are the host's own interpreters — run them directly. There is no uv shim, so call them as-is (no `uv run` or PEP 723 `--script` needed)."#;
-
-/// `{{approval}}` per mode. Sandboxed AND none use the static destructive-token
-/// gate; auto's LLM risk judge governs destructive commands + failure
-/// escalation; the bench profile has no gate at all.
+/// `{{approval}}` for `none`/`sandboxed`: the static destructive-token gate.
+#[cfg(not(feature = "bench-bash"))]
 const SANDBOXED_APPROVAL: &str = r#"APPROVAL: Commands run without prompting by default. The pre-execution approval gate only fires when the command tokens contain a file-delete (`rm`, `rmdir`, `unlink`, `shred`, `srm`, `wipe`, or `find … -delete`) or a destructive `git` operation (`clean -f`, `reset --hard`, `branch -d`/`-D`/`--delete`, `tag -d`, `push -f`/`--force`/`--force-with-lease`/`--delete`/`-d`, `stash drop`/`clear`, `worktree remove`, `update-ref -d`, `filter-branch`, `filter-repo`)."#;
 
+/// `{{approval}}` for `auto`: the LLM risk judge governs destructive commands +
+/// failure escalation.
+#[cfg(not(feature = "bench-bash"))]
 const AUTO_APPROVAL: &str = r#"APPROVAL: Commands run without prompting by default. A destructive command (file-delete or a history-rewriting `git` op) is risk-judged before it runs — judged safe, it runs sandboxed unprompted; judged risky, you are asked. If a command fails inside the sandbox, the failure may be re-judged: when it looks caused by the sandbox AND safe, it is re-run outside the sandbox automatically; when risky, you are asked. Output from an unsandboxed re-run carries a `sandbox_escalation` field."#;
 
+// ── Prompt sections for the `bench-bash` profile: raw container exec ──────────
+// No OS sandbox, no work-dir jail, no uv shim, inherited cwd, no gate. Compiled
+// only with the feature; the normal-build sections above are absent then.
+
+#[cfg(feature = "bench-bash")]
+const BENCH_ISOLATION: &str = r#"EXECUTION: The shell runs directly on the host filesystem with full read+write access — no OS sandbox and no masked paths (this environment is already disposable/isolated). Network is enabled."#;
+
+#[cfg(feature = "bench-bash")]
+const BENCH_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: {{work_dir}} is your working directory — create and modify files there, including with the `Write`/`Edit` tools (give them absolute paths under it). There is no work-dir jail; just keep output under {{work_dir}}."#;
+
+#[cfg(feature = "bench-bash")]
+const BENCH_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are the host's own interpreters — run them directly. There is no uv shim, so call them as-is (no `uv run` or PEP 723 `--script` needed)."#;
+
+#[cfg(feature = "bench-bash")]
 const BENCH_APPROVAL: &str = r#"APPROVAL: Commands run directly with no approval gate."#;
 
 /// Compile-time switch for the bench profile (the `bench-bash` feature). When
 /// true, the Bash tool ignores `sandbox.mode` for execution shape and always
 /// runs raw — no OS sandbox, no uv shim, no work-dir jail, inherited cwd, the
-/// [`BENCH_ISOLATION`] prompt, and no risk judge. False (every prod build) →
-/// `sandbox.mode` (none/sandboxed/auto) drives behavior.
+/// bench prompt, and no risk judge. False (every prod build) → `sandbox.mode`
+/// (none/sandboxed/auto) drives behavior.
 const BENCH: bool = cfg!(feature = "bench-bash");
 
 /// Whether `mode` runs the command with no OS sandbox (`sh -c` directly): the
@@ -194,11 +207,14 @@ pub struct BashTool {
     /// Tool descriptions pre-rendered per [`BashSandboxMode`], indexed by the
     /// mode's `u8` discriminant. [`Tool::description`] returns the one for the
     /// current (hot-swappable) mode, so a `sandbox.mode` reload re-skins the
-    /// prompt the LLM sees without rebuilding the tool.
+    /// prompt the LLM sees without rebuilding the tool. The `bench-bash` build
+    /// has a single fixed prompt instead (the `bench_description` field).
+    #[cfg(not(feature = "bench-bash"))]
     descriptions: [String; 3],
-    /// The bench-profile description (inherited cwd, no jail, native python),
-    /// returned by [`Tool::description`] when the `bench-bash` feature is on (see
-    /// [`BENCH`]). Always rendered; only read in a bench build.
+    /// The one fixed bench-profile description (inherited cwd, no jail, native
+    /// python). Only exists — and is only rendered — under the `bench-bash`
+    /// feature, which overrides the per-mode descriptions.
+    #[cfg(feature = "bench-bash")]
     bench_description: String,
     /// Absolute workspace root (`<workspace>`). Used together with
     /// [`Self::work_dir`] to reject path arguments that would touch
@@ -236,7 +252,9 @@ impl BashTool {
         let work_dir = paths.work_dir();
         let skills_dir = paths.skills_dir();
         Self {
+            #[cfg(not(feature = "bench-bash"))]
             descriptions: build_descriptions(&work_dir, std::env::consts::OS),
+            #[cfg(feature = "bench-bash")]
             bench_description: render_bench_description(std::env::consts::OS),
             workspace_root,
             work_dir,
@@ -296,11 +314,11 @@ impl BashTool {
     }
 }
 
-/// Render all three [`BashSandboxMode`] descriptions, indexed by the mode's
-/// `u8` discriminant. `Sandboxed` and `Auto` share the OS-sandbox isolation /
-/// work-dir / python sections and differ only in the APPROVAL section; `None`
-/// differs in every section and advertises the process's inherited cwd as the
-/// work dir (there is no work-dir jail), matching where it actually runs.
+/// Render the three [`BashSandboxMode`] descriptions, indexed by the mode's `u8`
+/// discriminant. All three share the work-dir / python sections (none keeps the
+/// jail + uv); only `none`'s isolation and `auto`'s approval differ. Compiled
+/// out under `bench-bash` (which renders one fixed prompt — see `render_bench_description`).
+#[cfg(not(feature = "bench-bash"))]
 fn build_descriptions(work_dir: &Path, platform: &str) -> [String; 3] {
     let mut out: [String; 3] = Default::default();
     // `none` drops only the OS sandbox; the work-dir jail + uv shim stay, so it
@@ -333,8 +351,9 @@ fn build_descriptions(work_dir: &Path, platform: &str) -> [String; 3] {
 }
 
 /// The `bench-bash` profile description: inherited cwd as the work dir, no jail,
-/// native python, no approval gate. Always rendered (cheap); only surfaced when
-/// the `bench-bash` feature is compiled in (see [`BENCH`]).
+/// native python, no approval gate. Compiled (and rendered) only under the
+/// feature — it's the single prompt the bench build advertises.
+#[cfg(feature = "bench-bash")]
 fn render_bench_description(platform: &str) -> String {
     let cwd =
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("(working directory)"));
@@ -534,10 +553,12 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> String {
-        if BENCH {
-            return self.bench_description.clone();
-        }
-        self.descriptions[self.mode() as usize].clone()
+        // Exactly one of the two fields exists per build (see their `#[cfg]`s).
+        #[cfg(feature = "bench-bash")]
+        let out = self.bench_description.clone();
+        #[cfg(not(feature = "bench-bash"))]
+        let out = self.descriptions[self.mode() as usize].clone();
+        out
     }
 
     fn parameters_schema(&self) -> Value {
