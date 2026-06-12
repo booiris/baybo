@@ -52,7 +52,7 @@ use aura_model::new_background_handle;
 
 use crate::{
     ApprovalDecision, BackgroundJobSink, DetachedCommand, NoticeLevel, ResourceAccess,
-    RunningChild, SpawnOpts, TokioRunningChild, Tool, ToolContext, ToolError, ToolOutput,
+    RunningChild, SpawnOpts, Tool, ToolContext, ToolError, ToolOutput,
 };
 
 use super::bash_judge::{PostFail, PreExec, judge_post_fail, judge_pre_exec};
@@ -94,12 +94,6 @@ BEFORE BROAD SCANS: Do not run `find`, `du`, recursive `ls`, or similar walks ag
 ENVIRONMENT:
 - Working directory: {{work_dir}}
 - Platform: {{platform}}"#;
-
-/// `{{isolation}}` for the default OS-sandboxed build (bwrap/sandbox-exec).
-// ── Prompt sections for normal builds: none / sandboxed / auto ───────────────
-// `none` only drops the OS sandbox, so it reuses Sandboxed's work-dir / python /
-// approval sections; only the isolation + (for auto) approval sections differ.
-// All compiled out under `bench-bash`, which renders one fixed prompt instead.
 
 #[cfg(not(feature = "bench-bash"))]
 const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Aura state dir under `~/.aura`/`$AURA_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled."#;
@@ -722,22 +716,6 @@ impl Tool for BashTool {
             )));
         }
 
-        // An absolute-path `aura …` self-invocation runs unsandboxed by
-        // construction (the sandbox masks the state dir); it is never a
-        // sandboxed run, so the auto-mode judge (pre-exec and post-fail) skips
-        // it the same way passthrough does.
-        let bypass = matches!(aura_resolution, AuraResolution::Bypass);
-
-        // Snapshot the (hot-swappable) sandbox mode ONCE for this command, so a
-        // concurrent `sandbox` config reload can't flip the gate / dispatch /
-        // escalation decisions against each other mid-command — the in-flight
-        // command commits to the mode it started with; the reload takes effect on
-        // the next one. (The command is also spawned exactly once, so the running
-        // process never switches sandbox backends underneath itself.)
-        let mode = self.mode();
-        let skip_sandbox = mode_skips_os_sandbox(mode);
-        let judge = mode_runs_judge(mode);
-
         // Resolve any requested user secrets to plaintext for env injection.
         // Fail closed if requested but the secret store isn't wired. The names
         // (never the values) are recorded for audit; the values are scrubbed
@@ -759,11 +737,46 @@ impl Tool for BashTool {
             handle.resolve_env(&p.secret_env).await?
         };
 
+        // An absolute-path `aura …` self-invocation runs unsandboxed by
+        // construction: the OS sandbox masks `~/.aura`/`$AURA_HOME`, so a
+        // sandboxed call can't reach the gateway's config / session store, and
+        // argv0 is already the canonical gateway path so `sh -c` execve's it with
+        // no `$PATH` consultation. It is never a sandboxed run — no judge, no
+        // escalation, no timeout-to-background — so run it directly and return
+        // here, keeping the rest of `execute` free of the `bypass` concept.
+        if matches!(aura_resolution, AuraResolution::Bypass) {
+            let out = self
+                .run_unsandboxed_wrapped(&command, cwd_ref, &extra_env, timeout, ctx)
+                .await?;
+            if out.timed_out {
+                return Err(ToolError::Timeout(format!("Bash exceeded {timeout:?}")));
+            }
+            return format_command_result(
+                &command,
+                out.exit_code,
+                &out.stdout,
+                &out.stderr,
+                &extra_env,
+                ctx,
+                None,
+            )
+            .await;
+        }
+
+        // Snapshot the (hot-swappable) sandbox mode ONCE for this command, so a
+        // concurrent `sandbox` config reload can't flip the gate / dispatch /
+        // escalation decisions against each other mid-command — the in-flight
+        // command commits to the mode it started with; the reload takes effect on
+        // the next one. (The command is also spawned exactly once, so the running
+        // process never switches sandbox backends underneath itself.)
+        let mode = self.mode();
+        let skip_sandbox = mode_skips_os_sandbox(mode);
+        let judge = mode_runs_judge(mode);
+
         // Auto mode, destructive-token command: the LLM judge decides before
         // running whether this needs human approval (replacing the blunt
-        // token→always-prompt gate that `accessed_resources` defers in auto
-        // mode). Skipped for passthrough / aura-bypass (not sandboxed runs).
-        if judge && !bypass && contains_delete_command(&command) {
+        // token→always-prompt gate that `accessed_resources` defers in auto mode).
+        if judge && contains_delete_command(&command) {
             self.pre_exec_gate(&command, cwd_ref, ctx).await?;
         }
 
@@ -792,27 +805,18 @@ impl Tool for BashTool {
             && !skip_sandbox
             && extra_env.is_empty()
             && let Some(sink) = ctx.background_jobs.clone()
-            && let Some(output) = run_detached(
-                self, &command, &args, cwd_ref, &extra_env, timeout, ctx, &sink, bypass, judge,
-            )
-            .await?
+            && let Some(output) =
+                run_detached(self, &command, &args, cwd_ref, &extra_env, timeout, ctx, &sink, judge)
+                    .await?
         {
             return Ok(output);
         }
 
-        let out = if skip_sandbox || bypass {
-            // Cases that run the command directly via `sh -c`:
-            //  - bench profile / `mode = none`: no OS sandbox to wrap with (the
-            //    bench container is already disposable; `none` opts out on host);
-            //  - an `aura …` self-invocation: the OS sandbox masks
-            //    `~/.aura`/`$AURA_HOME`, so a sandboxed call can't reach the
-            //    gateway's config or session store — broken by construction.
-            //  - an `aura …` self-invocation: the OS sandbox masks
-            //    `~/.aura`/`$AURA_HOME`, so a sandboxed call can't reach the
-            //    gateway's config or session store — broken by construction.
-            //    Argv0 is already an absolute path canonicalising to the gateway
-            //    binary, so the unsandboxed `sh -c` execve's it directly with no
-            //    `$PATH` consultation.
+        let out = if skip_sandbox {
+            // The bench profile / `mode = none` run directly via `sh -c` — there
+            // is no OS sandbox to wrap with (the bench container is already
+            // disposable; `none` opts out on the host). (An `aura …`
+            // self-invocation also runs unsandboxed, but it returned early above.)
             tokio::select! {
                 _ = ctx.cancellation_token.cancelled() => {
                     return Err(ToolError::Execution("cancelled".into()));
@@ -870,9 +874,7 @@ impl Tool for BashTool {
         // Auto mode: a failed sandboxed command may be re-run unsandboxed (when
         // the judge deems it safe + sandbox-related) or escalated to the user.
         let (out, escalation) = self
-            .escalate_if_failed(
-                &command, cwd_ref, out, &extra_env, timeout, ctx, bypass, judge,
-            )
+            .escalate_if_failed(&command, cwd_ref, out, &extra_env, timeout, ctx, judge)
             .await?;
 
         format_command_result(
@@ -995,27 +997,12 @@ async fn run_detached(
     timeout: Duration,
     ctx: &ToolContext,
     sink: &Arc<dyn BackgroundJobSink>,
-    bypass: bool,
     judge: bool,
 ) -> crate::Result<Option<ToolOutput>> {
-    let mut child: Box<dyn RunningChild> = if bypass {
-        use std::process::Stdio;
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.args(args);
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-            cmd.env("PWD", dir);
-        }
-        cmd.envs(extra_env.iter().cloned());
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        cmd.kill_on_drop(true);
-        match cmd.spawn() {
-            Ok(c) => Box::new(TokioRunningChild(c)),
-            Err(_) => return Ok(None),
-        }
-    } else {
+    // Only sandboxed runs reach here — the unsandboxed cases (`mode = none` /
+    // bench keep to the blocking path via the caller's `!skip_sandbox` guard;
+    // an `aura …` bypass returned even earlier). So detach via the OS sandbox.
+    let mut child: Box<dyn RunningChild> = {
         let Some(sandbox) = ctx.sandbox.as_ref() else {
             return Ok(None);
         };
@@ -1098,7 +1085,7 @@ async fn run_detached(
                 timed_out: false,
             };
             let (out, escalation) = tool
-                .escalate_if_failed(command, cwd, out, extra_env, timeout, ctx, bypass, judge)
+                .escalate_if_failed(command, cwd, out, extra_env, timeout, ctx, judge)
                 .await?;
             Ok(Some(
                 format_command_result(
@@ -1890,9 +1877,8 @@ impl BashTool {
     /// sandbox's fault), re-run unsandboxed (sandbox-related + safe), or ask the
     /// user (risky). Returns the (possibly re-run) output plus an optional note
     /// for the tool result when an unsandboxed re-run happened. Inert (returns
-    /// the input unchanged) outside auto mode, for passthrough/bypass runs, on
-    /// success, on timeout, or when no judge LLM is wired.
-    #[allow(clippy::too_many_arguments)]
+    /// the input unchanged) when not auto's judge run, on success, on timeout, or
+    /// when no judge LLM is wired.
     #[allow(clippy::too_many_arguments)]
     async fn escalate_if_failed(
         &self,
@@ -1902,13 +1888,12 @@ impl BashTool {
         extra_env: &[(String, String)],
         timeout: Duration,
         ctx: &ToolContext,
-        bypass: bool,
         // The caller's per-command mode snapshot (whether auto's judge governs),
         // passed in rather than re-read so a mid-command reload can't flip it
         // out of step with the dispatch decision.
         judge: bool,
     ) -> crate::Result<(crate::SandboxedOutput, Option<String>)> {
-        if !judge || bypass || out.exit_code == 0 || out.timed_out {
+        if !judge || out.exit_code == 0 || out.timed_out {
             return Ok((out, None));
         }
         let Some(llm) = ctx.llm.as_deref() else {
@@ -2975,16 +2960,7 @@ mod tests {
             timed_out: false,
         };
         let (out, note) = tool
-            .escalate_if_failed(
-                "true",
-                None,
-                ok,
-                &[],
-                Duration::from_secs(5),
-                &ctx,
-                false,
-                true,
-            )
+            .escalate_if_failed("true", None, ok, &[], Duration::from_secs(5), &ctx, true)
             .await
             .unwrap();
         assert_eq!(out.exit_code, 0);
@@ -3003,7 +2979,6 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                false,
                 false, // judge off → escalate is a no-op
             )
             .await
@@ -3024,7 +2999,6 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                false,
                 true,
             )
             .await
@@ -3046,7 +3020,6 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                false,
                 true,
             )
             .await
@@ -3070,36 +3043,12 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                false,
                 true,
             )
             .await
             .unwrap();
         assert_eq!(out.exit_code, 0, "command was re-run outside the sandbox");
         assert!(note.unwrap().contains("outside the OS sandbox"));
-    }
-
-    #[tokio::test]
-    async fn escalate_bypass_never_judges() {
-        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
-        let mut ctx = ctx_with(None);
-        ctx.llm = Some(judge_llm(V_SAFE));
-        // bypass = true (aura self-invocation): already unsandboxed, no judge.
-        let (out, note) = tool
-            .escalate_if_failed(
-                "true",
-                None,
-                failed_out(),
-                &[],
-                Duration::from_secs(5),
-                &ctx,
-                true, // bypass
-                true, // judge on — bypass must still win
-            )
-            .await
-            .unwrap();
-        assert_eq!(out.exit_code, 1);
-        assert!(note.is_none());
     }
 
     #[tokio::test]
@@ -3116,7 +3065,6 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                false,
                 true,
             )
             .await
@@ -3139,7 +3087,6 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                false,
                 true,
             )
             .await
@@ -3161,7 +3108,6 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                false,
                 true,
             )
             .await
@@ -3191,7 +3137,6 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
                 &ctx,
-                false,
                 true, // snapshot judge=true, despite the live mode being none
             )
             .await
@@ -3253,7 +3198,9 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn ctx_for_detached() -> (ToolContext, Arc<Mutex<Option<(String, String)>>>) {
         let tmp = std::env::temp_dir().join(format!("aura-bgtest-{}", uuid::Uuid::new_v4()));
-        let mut ctx = ctx_with(None);
+        // `run_detached` detaches through `ctx.sandbox`; the fake spawns the
+        // command directly so the test needs no real OS sandbox.
+        let mut ctx = ctx_with(Some(Arc::new(FakeExecSandbox::new())));
         ctx.workspace_paths = aura_workspace::WorkspacePaths::new(&tmp);
         let seen = Arc::new(Mutex::new(None));
         ctx.background_jobs = Some(Arc::new(RecordingSink {
@@ -3277,7 +3224,6 @@ mod tests {
             Duration::from_secs(5),
             &ctx,
             &sink,
-            true,  // bypass — unsandboxed, so the test needs no OS sandbox
             false, // judge off
         )
         .await
@@ -3308,7 +3254,6 @@ mod tests {
             Duration::from_millis(150),
             &ctx,
             &sink,
-            true,  // bypass
             false, // judge off
         )
         .await
