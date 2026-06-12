@@ -74,12 +74,12 @@ files to `bench/<name>/trace/<run_id>/<arm>/<item>.{messages,trace}.json`:
   DB dies with it) — clone `bench/swe/src/agent.rs::{export_trace, write_session_dump}`;
   the `run` bin threads `--trace-dir` (+ `--no-trace`) into `RunOpts.trace_dir`.
 - **External-harness adapter (terminal), two flavors.** *Terminal-Bench 1.0* runs
-  on the legacy `tb` CLI: `bench/terminal/tb_adapter` (`AbstractInstalledAgent`) —
+  on the legacy `tb` CLI: `bench/terminal-bench-1.0/tb_adapter` (`AbstractInstalledAgent`) —
   in `perform_task`, after the prompt, use the container handle directly
   (`session.container.exec_run([...])`, no copy-out) and mirror the harness's
   per-task `runs/` path into `trace/`; see `…::_export_trace`. *Terminal-Bench 2.0*
   runs on the **Harbor** framework (`harbor run -d terminal-bench/terminal-bench-2`):
-  `bench/terminal-harbor/harbor_adapter` is a `BaseInstalledAgent` — `install()`
+  `bench/terminal-bench-2.0/harbor_adapter` is a `BaseInstalledAgent` — `install()`
   `environment.upload_file`s the musl binary + a rendered `aura.json` + mints the
   key (→ chown to the agent user), `run()` runs `aura prompt` and exports the trace
   into Harbor's per-trial `/logs/agent` dir (which Harbor mounts to
@@ -122,7 +122,7 @@ and write one of these. Key is referenced **by file**, API key **by env-var name
 - Add `"base_url"` to the llm entry only when set (omit → provider default).
 - An in-process-only run (no gateway) that still fails config validation for a
   missing `gateway` block: add a dummy `"gateway": {"bind_address":"127.0.0.1","port":<any>}`
-  (see `bench/terminal`); it never binds.
+  (see `bench/terminal-bench-1.0`); it never binds.
 
 **Gateway (many prompts over one process):** same, but replace `sandbox` with
 ```json
@@ -306,7 +306,7 @@ bench generates the config, so it fixes `api_key_env: "AURA_API_KEY"` in the
 is an internal constant, not a user choice. The user only supplies the *value*; to
 reuse a key already in another var, set `AURA_API_KEY=$DEEPSEEK_API_KEY` in `.env`
 (it's shell-sourced, so it expands). This holds even for an external-harness adapter:
-`bench/terminal` drives Terminal-Bench yet still uses the bare `AURA_API_KEY` /
+`bench/terminal-bench-1.0` drives Terminal-Bench yet still uses the bare `AURA_API_KEY` /
 `AURA_MODEL` / `AURA_BASE_URL` (+ `AURA_BIN` for the binary) — no sub-namespace,
 since nothing else owns `AURA_*`.
 

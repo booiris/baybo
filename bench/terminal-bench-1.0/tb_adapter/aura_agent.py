@@ -13,7 +13,7 @@ Two things make aura work in-container:
     the analog of Codex's `--sandbox danger-full-access`.
 
 Use it via the harness's custom-agent flag (no fork of terminal-bench). The env
-is uv-managed (see bench/terminal/pyproject.toml); run from bench/terminal/:
+is uv-managed (see bench/terminal-bench-1.0/pyproject.toml); run from bench/terminal-bench-1.0/:
 
     uv run --env-file .env tb run \\
         --agent-import-path tb_adapter.aura_agent:AuraAgent \\
@@ -47,7 +47,7 @@ _KEY_PATH = f"{_CONTAINER_DIR}/enc.key"
 _SESSION_ID = "aura-tb"
 
 # The static-musl aura binary copied into each container. Defaults to the
-# musl build output (repo-root-relative: this file is bench/terminal/tb_adapter/);
+# musl build output (repo-root-relative: this file is bench/terminal-bench-1.0/tb_adapter/);
 # AURA_BIN overrides it (e.g. a glibc build or a custom path).
 _DEFAULT_BINARY = (
     Path(__file__).resolve().parents[3]

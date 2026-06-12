@@ -1,6 +1,6 @@
 ---
 name: new-bench
-description: Scaffold a new benchmark under bench/ for measuring the real Aura agent, following the shared conventions of bench/swe, bench/memory, and bench/terminal. Use when the user wants to add a benchmark, eval, or leaderboard harness for aura.
+description: Scaffold a new benchmark under bench/ for measuring the real Aura agent, following the shared conventions of bench/swe, bench/memory, and bench/terminal-bench-1.0. Use when the user wants to add a benchmark, eval, or leaderboard harness for aura.
 argument-hint: "[what the bench measures, e.g. 'GAIA web-agent tasks']"
 ---
 
@@ -17,7 +17,7 @@ safe-to-merge, and consistent with the others on day one.
 | --- | --- | --- | --- | --- |
 | `bench/swe` | self-hosted Rust harness | **`docker run` per item**, `aura prompt` inside each official eval image | official `swebench` Python harness (shelled out) | `bench-bash` feature + `sandbox.mode=none` · static musl |
 | `bench/memory` | self-hosted Rust harness | **`aura gateway` once per arm**, concurrent `aura prompt` over it | LLM-as-judge (`deepseek`) + deterministic F1 | `bench-readonly-memory` (Cargo feature) |
-| `bench/terminal` | **adapter into an external official harness** (no Rust crate, no fork) | `aura prompt` inside the harness's task container, over tmux | the external harness's own pytest | `bench-bash` feature + `sandbox.mode=none` · static musl |
+| `bench/terminal-bench-1.0` | **adapter into an external official harness** (no Rust crate, no fork) | `aura prompt` inside the harness's task container, over tmux | the external harness's own pytest | `bench-bash` feature + `sandbox.mode=none` · static musl |
 
 `reference.md` (next to this file) holds the copy-paste boilerplate: the
 `run-bench.sh` skeleton, the self-contained `aura.json` shapes, the exact `aura`
@@ -195,7 +195,7 @@ musl binary + a rendered `aura.json`, run `aura prompt --json -y`),
 `run.sh` (build the musl binary if missing, load `.env`, run the harness's
 `run --agent-import-path …`, then surface its `results.json` from `runs/<ts>/`
 into `results/` so the report sits where the other benches' does), `pyproject.toml`
-(uv, pin to the harness's Python range). See `bench/terminal/`.
+(uv, pin to the harness's Python range). See `bench/terminal-bench-1.0/`.
 
 ---
 
