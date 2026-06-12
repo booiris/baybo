@@ -150,6 +150,19 @@ These hold across all three benches. A new bench that drops one is wrong.
     stdout with `RUST_LOG=off`; **best-effort** — a trace failure warns and is
     dropped, never failing the graded item. See `reference.md` §"Trace export".
 
+11. **Run naming + `latest` + self-describing traces (uniform across benches).**
+    `RUN_ID=$(date +%Y-%m-%d__%H-%M-%S)` — the same format the in-container
+    harnesses (tb/Harbor) pick, so dates read identically everywhere. Refresh
+    `latest` pointers so a run is reachable without scanning timestamps:
+    `trace/latest` → the run (set it **up front** — RUN_ID is known — so the run
+    is monitorable mid-run; for harness-timestamped benches like tb/Harbor, a
+    background step points it at the dir the harness creates), plus
+    `results/latest-<arm>.json` per arm and `runs/latest` where runs are per-run
+    dirs. And **co-locate each item's outcome with its trace**: write
+    `<item>.result.json` (the report's per-item entry) next to its
+    `<item>.trace.json`, so a trace is self-describing (pass/fail + details)
+    without cross-referencing `results/`.
+
 ---
 
 ## Layout (self-hosted Rust shape — clone `swe` or `memory`)
@@ -223,6 +236,7 @@ into `results/` so the report sits where the other benches' does), `pyproject.to
 - [ ] Self-contained `aura.json` + minted key + `rate_limit.max_requests = 1_000_000`.
 - [ ] Cost = `i64` micro-USD from the ledger (`RUST_LOG=off`, poll on `calls`); latency/tokens/cost surfaced per item.
 - [ ] Trace export on by default (`NO_TRACE=1` opts out): per item → `trace/<run_id>/<arm>/<item>.{messages,trace}.json` via `aura session history/export`; in-container benches export before teardown.
+- [ ] `RUN_ID=$(date +%Y-%m-%d__%H-%M-%S)`; refresh `latest` pointers (`trace/latest` up front, `results/latest-<arm>.json`, `runs/latest`); co-locate each item's outcome as `<item>.result.json` next to its trace.
 - [ ] Scope keys are `{bench}-{run_id}-{arm}-conv{N}`.
 - [ ] API key by name only — never in argv or written to disk.
 - [ ] `Cargo.toml`: `publish=false`, `[lib] doctest=false`, workspace deps, "NOT a CI target" header; `lib.rs` has unit tests and no heavy deps.

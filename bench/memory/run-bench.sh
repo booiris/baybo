@@ -64,6 +64,10 @@ PKG="aura-bench-memory"
 
 mkdir -p "$OUTDIR" "$RESULTS_DIR" "$WS_ROOT"
 
+# Point trace/latest at this run up front so it's monitorable mid-run (RUN_ID is
+# known here); the bin fills trace/<RUN_ID>/ as it produces traces.
+mkdir -p "$TRACE_DIR/$RUN_ID" && ln -sfn "$RUN_ID" "$TRACE_DIR/latest"
+
 # Optional flag. QUESTIONS is numeric, so unquoted word-splitting is safe and
 # an empty value expands to no argument.
 Q_ARG=""
@@ -201,6 +205,29 @@ done
 for arm in $ARMS; do
   rf="results-$arm-$RUN_ID.json"
   [ -f "$RESULTS_DIR/$rf" ] && ln -sfn "$rf" "$RESULTS_DIR/latest-$arm.json"
+done
+
+# Co-locate each question's full result next to its trace, so a trace is
+# self-describing (correct/score + judge reason) without cross-referencing results/.
+for arm in $ARMS; do
+  rep="$RESULTS_DIR/results-$arm-$RUN_ID.json"
+  [ -f "$rep" ] && python3 - "$rep" "$TRACE_DIR/$RUN_ID" <<'PY'
+import json, sys, os, glob
+rep, td = sys.argv[1], sys.argv[2]
+try:
+    res = json.load(open(rep)).get("results", [])
+except Exception:
+    res = []
+where = {}
+for f in glob.glob(os.path.join(td, "**", "*.trace.json"), recursive=True):
+    where[os.path.basename(f)[: -len(".trace.json")]] = os.path.dirname(f)
+for r in res:
+    iid = next((str(r[k]) for k in
+                ("instance_id", "question_id", "id", "qid", "task_id") if r.get(k)), None)
+    d = where.get(iid) if iid else None
+    if d:
+        json.dump(r, open(os.path.join(d, f"{iid}.result.json"), "w"), indent=2)
+PY
 done
 
 # ---- comparison table across arms -----------------------------------------
