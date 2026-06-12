@@ -46,6 +46,52 @@ cd "$here"
 # bootstrap — the pytest logic itself is untouched. Tune via TB_TEST_TIMEOUT_SEC.
 test_timeout_sec="${TB_TEST_TIMEOUT_SEC:-300}"
 
+# --- live run monitor (background; runs while `tb` runs) ---------------------
+# tb writes each task's results.json as it grades; mirror that outcome
+# (resolved + failure_mode + parser results) into the task's trace dir as
+# result.json, so a task's trace is self-describing. Also point `latest` at the
+# in-flight run so it's monitorable mid-run (run.sh otherwise wires latest only
+# at the end). tb picks the run-id, so the fresh run dir is detected in the bg.
+sync_outcomes() {  # $1 = run-id; mirror each graded task's outcome into its trace dir
+  python3 - "$1" <<'PY'
+import json, sys, glob, os
+b = sys.argv[1]
+try:
+    rl = json.load(open(f"runs/{b}/results.json")).get("results", [])
+except Exception:
+    rl = []
+for r in rl:
+    t = r.get("task_id")
+    if not t:
+        continue
+    for td in glob.glob(f"trace/{b}/{t}/*/"):
+        out = os.path.join(td, "result.json")
+        if os.path.exists(out):
+            continue
+        try:
+            json.dump({k: r.get(k) for k in
+                       ("task_id", "is_resolved", "failure_mode", "parser_results")},
+                      open(out, "w"), indent=2)
+        except Exception:
+            pass
+PY
+}
+
+prev_run="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
+( linked=0
+  while :; do
+    cur="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
+    if [ -n "$cur" ] && [ "$cur" != "$prev_run" ]; then
+      b="$(basename "$cur")"
+      if [ "$linked" = 0 ]; then
+        ln -sfn "$b" runs/latest; mkdir -p trace; ln -sfn "$b" trace/latest; linked=1
+      fi
+      sync_outcomes "$b"
+    fi
+    sleep 15
+  done ) &
+monitor_pid=$!
+
 # `tb` keeps the last value when an option repeats, so anything in "$@"
 # (e.g. -m / -d / --n-tasks / -t / --global-test-timeout-sec) overrides these
 # defaults. tb owns the full run output under runs/<ts>/ (casts, logs, results.json).
@@ -57,13 +103,15 @@ uv run tb run \
   --output-path runs \
   "$@"
 rc=$?
+kill "$monitor_pid" 2>/dev/null || true
 
 # Surface tb's report into results/ so it lands where swe/memory put theirs (the
 # full run output stays under runs/). tb writes a fresh runs/<ts>/ per run — the
 # newest dir is the one we just produced.
-latest="$(ls -dt runs/*/ 2>/dev/null | head -1)"
+latest="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
 if [ -n "$latest" ] && [ -f "${latest}results.json" ]; then
   base="$(basename "$latest")"
+  sync_outcomes "$base"
   mkdir -p results
   cp "${latest}results.json" "results/results-$base.json"
   # `latest` pointers to the newest run so you don't scan timestamps (gitignored).
