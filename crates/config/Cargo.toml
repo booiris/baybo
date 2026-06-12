@@ -6,12 +6,6 @@ edition.workspace = true
 [lib]
 doctest = false
 
-[features]
-# Compile in the `[sandbox] mode = passthrough` config (disables shell isolation;
-# for running aura inside a benchmark container). Off by default — see the root
-# crate's `bench-passthrough`.
-bench-passthrough = []
-
 [dependencies]
 aura-model = { workspace = true }
 aura-workspace = { workspace = true }

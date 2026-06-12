@@ -51,25 +51,26 @@ use std::sync::Arc;
 use aura_model::new_background_handle;
 
 use crate::{
-    ApprovalDecision, BackgroundJobSink, DetachedCommand, ResourceAccess, RunningChild, SpawnOpts,
-    TokioRunningChild, Tool, ToolContext, ToolError, ToolOutput,
+    ApprovalDecision, BackgroundJobSink, DetachedCommand, NoticeLevel, ResourceAccess,
+    RunningChild, SpawnOpts, Tool, ToolContext, ToolError, ToolOutput,
 };
+
+use super::bash_judge::{PostFail, PreExec, judge_post_fail, judge_pre_exec};
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_KIB: usize = MAX_OUTPUT_BYTES / 1024;
 
-/// Shared Bash tool description. Three sections vary by execution mode —
-/// `{{isolation}}` (OS sandbox vs direct passthrough), `{{work_dir_scope}}`
-/// (work-dir jail vs container working dir), and `{{python_runtime}}` (uv-shimmed
-/// vs the container's native `python`/`pip`) — substituted by
-/// [`render_description`] along with `{{max_output_kib}}`, `{{work_dir}}`, and
-/// `{{platform}}`. Everything else is identical in both modes on purpose: the
-/// passthrough (benchmark) agent then sees the same contract as production, so
-/// its behavior stays comparable. Work-dir/platform live here, not the system
-/// prompt, so they sit next to the tool that consumes them.
+/// Shared Bash tool description. Four sections vary by sandbox mode —
+/// `{{isolation}}` (the FS/network surface), `{{approval}}` (the gate),
+/// `{{work_dir_scope}}` (writability), and `{{python_runtime}}` (uv-shimmed vs
+/// native) — substituted by [`render_description`] along with `{{max_output_kib}}`,
+/// `{{work_dir}}`, and `{{platform}}`. Each varying section describes ONLY its own
+/// concern so a mode swap re-skins exactly what changed and nothing is said
+/// twice. Work-dir/platform live here, not the system prompt, so they sit next
+/// to the tool that consumes them.
 const DESCRIPTION_TEMPLATE: &str = r#"Execute a shell command in a fresh `sh -c` process. Environment changes and `cd` do not persist across invocations. Each of stdout and stderr is truncated at {{max_output_kib}} KiB.
 
-IMPORTANT: Do NOT use Bash for tasks that have a dedicated tool:
+Reserve Bash for system commands, git operations, build/test, and terminal tasks that require shell execution. Do NOT use it for tasks with a dedicated tool:
 - File-content viewers (`cat`, `head`, `tail`, `less`, `more`, `tac`) and file-driven text processors (`sed`, `awk`) are REJECTED at this layer when invoked as the leading command — use `Read` for content (`offset`/`limit` cover head/tail), `Edit` for in-place changes (safer than `sed -i`). Stream-mode `sed`/`awk` AFTER a pipe is fine (e.g. `git log | sed 's/.../.../'`) — only `sed <file>` / `awk <file>` is blocked.
 - To write files use `Write` (not echo/cat with redirection)
 - To search file names use `Glob` (not find/ls)
@@ -78,8 +79,7 @@ IMPORTANT: Do NOT use Bash for tasks that have a dedicated tool:
 
 {{isolation}}
 
-APPROVAL: Commands run without prompting by default. The pre-execution approval gate only fires when the command tokens contain a file-delete (`rm`, `rmdir`, `unlink`, `shred`, `srm`, `wipe`, or `find … -delete`) or a destructive `git` operation (`clean -f`, `reset --hard`, `branch -d`/`-D`/`--delete`, `tag -d`, `push -f`/`--force`/`--force-with-lease`/`--delete`/`-d`, `stash drop`/`clear`, `worktree remove`, `update-ref -d`, `filter-branch`, `filter-repo`).
-Reserve Bash for system commands, git operations, build/test, and terminal tasks that require shell execution.
+{{approval}}
 
 DEFAULT CWD: If `cwd` is omitted, Aura runs the command from {{work_dir}} and exports `PWD` with the same value.
 
@@ -95,34 +95,121 @@ ENVIRONMENT:
 - Working directory: {{work_dir}}
 - Platform: {{platform}}"#;
 
-/// `{{isolation}}` for the default OS-sandboxed build (bwrap/sandbox-exec).
-const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Aura state dir under `~/.aura`/`$AURA_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled. If the sandbox refuses a command, a prompt offers an unsandboxed retry."#;
+#[cfg(not(feature = "bench-bash"))]
+const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Aura state dir under `~/.aura`/`$AURA_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled."#;
 
-/// `{{work_dir_scope}}` for the default OS-sandboxed build (Bash jailed to `work/`).
+#[cfg(not(feature = "bench-bash"))]
 const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Bash writes only inside the workspace work directory ({{work_dir}}). The read-only `skills/` subtree is the one exception you may name in a command — an installed skill's bundled script can be executed in place from there (writes to it still fail). Any other absolute path argument under the workspace root but outside `work/` and `skills/` (the sibling subtrees `profile/`, `config/`, `state/`, `logs/`, `.key/`) is rejected up front, and `cwd` is held to the work-dir rule. Use the dedicated tools (Read, Edit, Write, …) when you genuinely need to read or modify those subtrees; everything else stays under {{work_dir}}."#;
 
-/// `{{python_runtime}}` for the default OS-sandboxed build (uv-shimmed python).
+#[cfg(not(feature = "bench-bash"))]
 const SANDBOXED_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are shimmed to `uv run python` / `uv pip` inside this shell. For one-file scripts with third-party deps, declare them via PEP 723 inline metadata (`# /// script` block) so `uv run --script my.py` resolves them per-call. The shims are shell functions scoped to the outer `sh -c` — `bash -c '…'` subshells, `/usr/bin/python`, and Python's own `subprocess` calls bypass them."#;
 
-/// The two mode-specific sections for a `bench-passthrough` build: aura runs
-/// inside an already-isolated container, so there is no OS sandbox and no
-/// work-dir jail, and `{{work_dir}}` is the inherited cwd (the container
-/// WORKDIR). These are the *only* sections that differ from production, so the
-/// benchmarked agent behaves as it would online apart from these facts.
-#[cfg(feature = "bench-passthrough")]
-const PASSTHROUGH_ISOLATION: &str = r#"EXECUTION: The shell runs directly on the host filesystem with full read+write access — no OS sandbox and no masked paths (this build already runs inside a disposable, isolated container). Network is enabled."#;
+/// `{{isolation}}` for `sandbox.mode = none`: only the OS sandbox is dropped (the
+/// work-dir jail and uv shim still apply — described by their own sections).
+#[cfg(not(feature = "bench-bash"))]
+const NONE_ISOLATION: &str = r#"SANDBOX: The OS sandbox is OFF — commands run directly via `sh -c` on the host: no bwrap, no credential-vault masking, no resource caps, and the host filesystem is reachable. Network is enabled."#;
 
-#[cfg(feature = "bench-passthrough")]
-const PASSTHROUGH_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: {{work_dir}} is your working directory — create and modify the task's files there, including with the `Write`/`Edit` tools (give them absolute paths under it), since that is where your work is inspected. There is no work-dir jail; just keep task output under {{work_dir}}."#;
+/// `{{approval}}` for `none`/`sandboxed`: the static destructive-token gate.
+#[cfg(not(feature = "bench-bash"))]
+const SANDBOXED_APPROVAL: &str = r#"APPROVAL: Commands run without prompting by default. The pre-execution approval gate only fires when the command tokens contain a file-delete (`rm`, `rmdir`, `unlink`, `shred`, `srm`, `wipe`, or `find … -delete`) or a destructive `git` operation (`clean -f`, `reset --hard`, `branch -d`/`-D`/`--delete`, `tag -d`, `push -f`/`--force`/`--force-with-lease`/`--delete`/`-d`, `stash drop`/`clear`, `worktree remove`, `update-ref -d`, `filter-branch`, `filter-repo`)."#;
 
-/// `{{python_runtime}}` for a `bench-passthrough` build. No uv: the container
-/// ships its own interpreters, and the uv shims are skipped (see `wrap_command`),
-/// so `python`/`pip` must be described as plain commands.
-#[cfg(feature = "bench-passthrough")]
-const PASSTHROUGH_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are the container's own interpreters — run them directly. There is no uv shim, so call them as-is (no `uv run` or PEP 723 `--script` needed); the environment is already provisioned."#;
+/// `{{approval}}` for `auto`: the LLM risk judge governs destructive commands +
+/// failure escalation.
+#[cfg(not(feature = "bench-bash"))]
+const AUTO_APPROVAL: &str = r#"APPROVAL: Commands run without prompting by default. A destructive command (file-delete or a history-rewriting `git` op) is risk-judged before it runs — judged safe, it runs sandboxed unprompted; judged risky, you are asked. If a command fails inside the sandbox, the failure may be re-judged: when it looks caused by the sandbox AND safe, it is re-run outside the sandbox automatically; when risky, you are asked. Output from an unsandboxed re-run carries a `sandbox_escalation` field."#;
+
+// ── Prompt sections for the `bench-bash` profile: raw container exec ──────────
+// No OS sandbox, no work-dir jail, no uv shim, inherited cwd, no gate. Compiled
+// only with the feature; the normal-build sections above are absent then.
+
+#[cfg(feature = "bench-bash")]
+const BENCH_ISOLATION: &str = r#"EXECUTION: The shell runs directly on the host filesystem with full read+write access — no OS sandbox and no masked paths (this environment is already disposable/isolated). Network is enabled."#;
+
+#[cfg(feature = "bench-bash")]
+const BENCH_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: {{work_dir}} is your working directory — create and modify files there, including with the `Write`/`Edit` tools (give them absolute paths under it). There is no work-dir jail; just keep output under {{work_dir}}."#;
+
+#[cfg(feature = "bench-bash")]
+const BENCH_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are the host's own interpreters — run them directly. There is no uv shim, so call them as-is (no `uv run` or PEP 723 `--script` needed)."#;
+
+#[cfg(feature = "bench-bash")]
+const BENCH_APPROVAL: &str = r#"APPROVAL: Commands run directly with no approval gate."#;
+
+/// Compile-time switch for the bench profile (the `bench-bash` feature). When
+/// true, the Bash tool ignores `sandbox.mode` for execution shape and always
+/// runs raw — no OS sandbox, no uv shim, no work-dir jail, inherited cwd, the
+/// bench prompt, and no risk judge. False (every prod build) → `sandbox.mode`
+/// (none/sandboxed/auto) drives behavior.
+const BENCH: bool = cfg!(feature = "bench-bash");
+
+/// Whether `mode` runs the command with no OS sandbox (`sh -c` directly): the
+/// bench profile, or `sandbox.mode = none`. A free fn (not a method) so
+/// `execute` can derive it from a single mode snapshot.
+fn mode_skips_os_sandbox(mode: BashSandboxMode) -> bool {
+    BENCH || mode == BashSandboxMode::None
+}
+
+/// Whether `mode` runs the on-failure LLM risk judge — auto only, never bench.
+fn mode_runs_judge(mode: BashSandboxMode) -> bool {
+    !BENCH && mode == BashSandboxMode::Auto
+}
+
+/// How the Bash tool isolates a command, mirroring `aura_config::SandboxMode`
+/// without taking a dep on `aura-config`. The wiring layer maps between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BashSandboxMode {
+    /// No OS sandbox: run directly, inherited cwd, no work-dir jail.
+    None = 0,
+    /// OS sandbox, no risk judge.
+    Sandboxed = 1,
+    /// OS sandbox plus the on-failure LLM risk judge.
+    Auto = 2,
+}
+
+impl BashSandboxMode {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => BashSandboxMode::None,
+            1 => BashSandboxMode::Sandboxed,
+            _ => BashSandboxMode::Auto,
+        }
+    }
+}
+
+/// Shared, hot-swappable sandbox mode. A config reload calls [`Self::set`] and
+/// every `BashTool` holding the `Arc` sees it on its next call — both the
+/// execution path and the live-rendered tool description. Lock-free: the mode
+/// is a single byte read on the per-command hot path.
+pub struct LiveSandboxMode(std::sync::atomic::AtomicU8);
+
+impl LiveSandboxMode {
+    pub fn new(mode: BashSandboxMode) -> Self {
+        Self(std::sync::atomic::AtomicU8::new(mode as u8))
+    }
+
+    pub fn get(&self) -> BashSandboxMode {
+        BashSandboxMode::from_u8(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn set(&self, mode: BashSandboxMode) {
+        self.0
+            .store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 pub struct BashTool {
-    description: String,
+    /// Tool descriptions pre-rendered per [`BashSandboxMode`], indexed by the
+    /// mode's `u8` discriminant. [`Tool::description`] returns the one for the
+    /// current (hot-swappable) mode, so a `sandbox.mode` reload re-skins the
+    /// prompt the LLM sees without rebuilding the tool. The `bench-bash` build
+    /// has a single fixed prompt instead (the `bench_description` field).
+    #[cfg(not(feature = "bench-bash"))]
+    descriptions: [String; 3],
+    /// The one fixed bench-profile description (inherited cwd, no jail, native
+    /// python). Only exists — and is only rendered — under the `bench-bash`
+    /// feature, which overrides the per-mode descriptions.
+    #[cfg(feature = "bench-bash")]
+    bench_description: String,
     /// Absolute workspace root (`<workspace>`). Used together with
     /// [`Self::work_dir`] to reject path arguments that would touch
     /// non-`work/` subtrees (`profile/`, `config/`, `state/`, …).
@@ -142,14 +229,9 @@ pub struct BashTool {
     /// ignore the variables — same loose-coupling rationale as
     /// [`inject_aura_env`].
     uv_env_prefix: String,
-    /// Trusted-environment passthrough: run every command directly (no OS
-    /// sandbox), with no work-dir path jail and cwd inherited from the process.
-    /// The field exists only in a `bench-passthrough` build whose config selects
-    /// `sandbox.mode = passthrough` (aura running inside a disposable benchmark
-    /// container); a normal build has no passthrough field and is always
-    /// sandboxed — see [`Self::is_passthrough`].
-    #[cfg(feature = "bench-passthrough")]
-    passthrough: bool,
+    /// Shared, hot-swappable sandbox mode. Read on every call (and by
+    /// [`Tool::description`]); a config reload swaps it via [`LiveSandboxMode::set`].
+    mode: Arc<LiveSandboxMode>,
 }
 
 impl BashTool {
@@ -164,55 +246,45 @@ impl BashTool {
         let work_dir = paths.work_dir();
         let skills_dir = paths.skills_dir();
         Self {
-            description: build_description(&work_dir, std::env::consts::OS),
+            #[cfg(not(feature = "bench-bash"))]
+            descriptions: build_descriptions(&work_dir, std::env::consts::OS),
+            #[cfg(feature = "bench-bash")]
+            bench_description: render_bench_description(std::env::consts::OS),
             workspace_root,
             work_dir,
             skills_dir,
             uv_env_prefix: build_uv_env_exports(&paths, resolve_uv_bin_dir().as_deref()),
-            #[cfg(feature = "bench-passthrough")]
-            passthrough: false,
+            mode: Arc::new(LiveSandboxMode::new(BashSandboxMode::Sandboxed)),
         }
     }
 
-    /// Enable trusted-environment passthrough (see the [`passthrough`] field).
-    /// A genuine knob with a secure default (`false`) that virtually every
-    /// caller leaves alone — only the benchmark-container path flips it on.
-    ///
-    /// Re-renders the tool description so the LLM is told its working directory
-    /// is the process's inherited cwd (the container WORKDIR), not the aura
-    /// workspace `work/` dir — otherwise the agent would aim `Write`/`Edit` at
-    /// the wrong place (their absolute paths follow the advertised work dir,
-    /// while passthrough Bash already defaults to the inherited cwd).
-    ///
-    /// [`passthrough`]: Self::passthrough
-    #[cfg(feature = "bench-passthrough")]
-    pub fn with_passthrough(mut self, passthrough: bool) -> Self {
-        self.passthrough = passthrough;
-        if passthrough {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| self.work_dir.clone());
-            self.description = render_description(
-                PASSTHROUGH_ISOLATION,
-                PASSTHROUGH_WORK_DIR_SCOPE,
-                PASSTHROUGH_PYTHON,
-                &cwd,
-                std::env::consts::OS,
-            );
-        }
+    /// Pin a fixed sandbox mode via a fresh (non-shared) handle. For callers
+    /// that don't participate in hot-reload — mainly tests.
+    #[cfg(test)]
+    pub fn with_mode(mut self, mode: BashSandboxMode) -> Self {
+        self.mode = Arc::new(LiveSandboxMode::new(mode));
         self
     }
 
-    /// Whether commands run in trusted-environment passthrough. The backing
-    /// `passthrough` field only exists in a `bench-passthrough` build, so a
-    /// normal build is unconditionally sandboxed (this returns `false`, letting
-    /// the execute path stay branch-free of `#[cfg]`).
-    #[cfg(feature = "bench-passthrough")]
-    fn is_passthrough(&self) -> bool {
-        self.passthrough
+    /// Share a hot-swappable mode handle (the production path): a config reload
+    /// calls [`LiveSandboxMode::set`] on it and this tool's next call — and its
+    /// next [`Tool::description`] — observe the new mode.
+    pub fn with_mode_handle(mut self, mode: Arc<LiveSandboxMode>) -> Self {
+        self.mode = mode;
+        self
     }
 
-    #[cfg(not(feature = "bench-passthrough"))]
-    fn is_passthrough(&self) -> bool {
-        false
+    fn mode(&self) -> BashSandboxMode {
+        self.mode.get()
+    }
+
+    /// Live read of whether the OS sandbox is skipped. `execute` does NOT call
+    /// this — it snapshots the mode once and derives both flags via
+    /// [`mode_skips_os_sandbox`] / [`mode_runs_judge`] so they stay consistent
+    /// across one command. Kept as a point-in-time accessor for tests.
+    #[cfg(test)]
+    fn skip_os_sandbox(&self) -> bool {
+        mode_skips_os_sandbox(self.mode())
     }
 
     /// Prefix `command` with the workspace-scoped UV exports and the
@@ -222,12 +294,11 @@ impl BashTool {
     /// drift between them.
     fn wrap_command(&self, command: &str) -> String {
         let injected = inject_aura_env(command);
-        // Passthrough (in-container bench): the eval container ships its own
-        // python/pip and has no `uv`. Skip the workspace uv shims/exports —
-        // otherwise the `python() { uv run python …; }` shim turns every
-        // `python`/`pip` the agent runs into `uv run …` → `uv: not found`,
-        // breaking the agent's ability to run and verify code in place.
-        if self.is_passthrough() {
+        // Only the bench profile skips the uv shims/exports: that container ships
+        // its own python/pip and has no `uv`, so the `python() { uv run python …; }`
+        // shim would turn every `python`/`pip` into `uv run …` → `uv: not found`.
+        // `sandbox.mode = none` keeps uv (it only drops the OS sandbox).
+        if BENCH {
             return injected;
         }
         let mut out = String::with_capacity(self.uv_env_prefix.len() + injected.len());
@@ -237,23 +308,67 @@ impl BashTool {
     }
 }
 
-fn build_description(work_dir: &Path, platform: &str) -> String {
-    render_description(
+/// Render the three [`BashSandboxMode`] descriptions, indexed by the mode's `u8`
+/// discriminant. All three share the work-dir / python sections (none keeps the
+/// jail + uv); only `none`'s isolation and `auto`'s approval differ. Compiled
+/// out under `bench-bash` (which renders one fixed prompt — see `render_bench_description`).
+#[cfg(not(feature = "bench-bash"))]
+fn build_descriptions(work_dir: &Path, platform: &str) -> [String; 3] {
+    let mut out: [String; 3] = Default::default();
+    // `none` drops only the OS sandbox; the work-dir jail + uv shim stay, so it
+    // shares Sandboxed's work-dir-scope / python / approval sections.
+    out[BashSandboxMode::None as usize] = render_description(
+        NONE_ISOLATION,
+        SANDBOXED_WORK_DIR_SCOPE,
+        SANDBOXED_PYTHON,
+        SANDBOXED_APPROVAL,
+        work_dir,
+        platform,
+    );
+    out[BashSandboxMode::Sandboxed as usize] = render_description(
         SANDBOXED_ISOLATION,
         SANDBOXED_WORK_DIR_SCOPE,
         SANDBOXED_PYTHON,
+        SANDBOXED_APPROVAL,
         work_dir,
+        platform,
+    );
+    out[BashSandboxMode::Auto as usize] = render_description(
+        SANDBOXED_ISOLATION,
+        SANDBOXED_WORK_DIR_SCOPE,
+        SANDBOXED_PYTHON,
+        AUTO_APPROVAL,
+        work_dir,
+        platform,
+    );
+    out
+}
+
+/// The `bench-bash` profile description: inherited cwd as the work dir, no jail,
+/// native python, no approval gate. Compiled (and rendered) only under the
+/// feature — it's the single prompt the bench build advertises.
+#[cfg(feature = "bench-bash")]
+fn render_bench_description(platform: &str) -> String {
+    let cwd =
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("(working directory)"));
+    render_description(
+        BENCH_ISOLATION,
+        BENCH_WORK_DIR_SCOPE,
+        BENCH_PYTHON,
+        BENCH_APPROVAL,
+        &cwd,
         platform,
     )
 }
 
-/// Fill the shared [`DESCRIPTION_TEMPLATE`]: the two mode-specific sections
-/// first, then the value placeholders (so a `{{work_dir}}` inside the inserted
-/// `work_dir_scope` is resolved too).
+/// Fill the shared [`DESCRIPTION_TEMPLATE`]: the mode-specific sections first,
+/// then the value placeholders (so a `{{work_dir}}` inside an inserted section
+/// is resolved too).
 fn render_description(
     isolation: &str,
     work_dir_scope: &str,
     python_runtime: &str,
+    approval: &str,
     work_dir: &Path,
     platform: &str,
 ) -> String {
@@ -261,6 +376,7 @@ fn render_description(
         .replace("{{isolation}}", isolation)
         .replace("{{work_dir_scope}}", work_dir_scope)
         .replace("{{python_runtime}}", python_runtime)
+        .replace("{{approval}}", approval)
         .replace("{{max_output_kib}}", &MAX_OUTPUT_KIB.to_string())
         .replace("{{work_dir}}", &work_dir.display().to_string())
         .replace("{{platform}}", platform)
@@ -431,7 +547,12 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> String {
-        self.description.clone()
+        // Exactly one of the two fields exists per build (see their `#[cfg]`s).
+        #[cfg(feature = "bench-bash")]
+        let out = self.bench_description.clone();
+        #[cfg(not(feature = "bench-bash"))]
+        let out = self.descriptions[self.mode() as usize].clone();
+        out
     }
 
     fn parameters_schema(&self) -> Value {
@@ -494,6 +615,14 @@ impl Tool for BashTool {
         //
         // FileToolRedirect commands (`cat foo`, `sed -i …`) are rejected
         // before the sandbox spawn — pointless to ask either.
+        //
+        // Auto mode owns the destructive-command gate itself: the LLM judge in
+        // `execute` (pre_exec_gate) replaces the blunt token→always-prompt rule,
+        // so declaring the resource here too would double-gate. The bench profile
+        // has no gate at all. Either way, defer entirely.
+        if BENCH || self.mode() == BashSandboxMode::Auto {
+            return Vec::new();
+        }
         params
             .get("command")
             .and_then(|v| v.as_str())
@@ -512,7 +641,9 @@ impl Tool for BashTool {
 
         if let Some(dir) = &p.cwd {
             require_absolute(dir, "Bash", "cwd")?;
-            if !self.is_passthrough() {
+            // `none` keeps the work-dir jail (only the OS sandbox is dropped);
+            // only the bench profile lifts it.
+            if !BENCH {
                 require_within_work_dir(dir, &self.workspace_root, &self.work_dir, "cwd")?;
             }
         }
@@ -523,7 +654,7 @@ impl Tool for BashTool {
             .unwrap_or(ctx.timeout);
 
         let command = p.command;
-        if !self.is_passthrough() {
+        if !BENCH {
             require_command_paths_within_work_dir(
                 &command,
                 &self.workspace_root,
@@ -531,11 +662,11 @@ impl Tool for BashTool {
                 &self.skills_dir,
             )?;
         }
-        // In passthrough there is no work-dir jail, so a command with no explicit
+        // The bench profile has no work-dir jail, so a command with no explicit
         // `cwd` runs from the process's inherited working directory — the
         // benchmark container's WORKDIR, where the task files live — rather than
         // the workspace work dir.
-        let passthrough_cwd = if self.is_passthrough() && p.cwd.is_none() {
+        let inherited_cwd = if BENCH && p.cwd.is_none() {
             Some(
                 std::env::current_dir()
                     .map_err(|e| ToolError::Execution(format!("resolve current dir: {e}")))?,
@@ -546,7 +677,7 @@ impl Tool for BashTool {
         let cwd_ref: Option<&Path> = p
             .cwd
             .as_deref()
-            .or(passthrough_cwd.as_deref())
+            .or(inherited_cwd.as_deref())
             .or(Some(ctx.workspace_root.as_path()));
 
         if is_file_tool_redirect(&command) {
@@ -606,6 +737,49 @@ impl Tool for BashTool {
             handle.resolve_env(&p.secret_env).await?
         };
 
+        // An absolute-path `aura …` self-invocation runs unsandboxed by
+        // construction: the OS sandbox masks `~/.aura`/`$AURA_HOME`, so a
+        // sandboxed call can't reach the gateway's config / session store, and
+        // argv0 is already the canonical gateway path so `sh -c` execve's it with
+        // no `$PATH` consultation. It is never a sandboxed run — no judge, no
+        // escalation, no timeout-to-background — so run it directly and return
+        // here, keeping the rest of `execute` free of the `bypass` concept.
+        if matches!(aura_resolution, AuraResolution::Bypass) {
+            let out = self
+                .run_unsandboxed_wrapped(&command, cwd_ref, &extra_env, timeout, ctx)
+                .await?;
+            if out.timed_out {
+                return Err(ToolError::Timeout(format!("Bash exceeded {timeout:?}")));
+            }
+            return format_command_result(
+                &command,
+                out.exit_code,
+                &out.stdout,
+                &out.stderr,
+                &extra_env,
+                ctx,
+                None,
+            )
+            .await;
+        }
+
+        // Snapshot the (hot-swappable) sandbox mode ONCE for this command, so a
+        // concurrent `sandbox` config reload can't flip the gate / dispatch /
+        // escalation decisions against each other mid-command — the in-flight
+        // command commits to the mode it started with; the reload takes effect on
+        // the next one. (The command is also spawned exactly once, so the running
+        // process never switches sandbox backends underneath itself.)
+        let mode = self.mode();
+        let skip_sandbox = mode_skips_os_sandbox(mode);
+        let judge = mode_runs_judge(mode);
+
+        // Auto mode, destructive-token command: the LLM judge decides before
+        // running whether this needs human approval (replacing the blunt
+        // token→always-prompt gate that `accessed_resources` defers in auto mode).
+        if judge && contains_delete_command(&command) {
+            self.pre_exec_gate(&command, cwd_ref, ctx).await?;
+        }
+
         let args = vec!["-c".into(), self.wrap_command(&command)];
 
         // Convertible path: in a user session (sink present) the default
@@ -625,38 +799,24 @@ impl Tool for BashTool {
             .map(str::trim)
             .is_some_and(|s| s.eq_ignore_ascii_case("kill"));
         if convert_on_timeout
-            // Passthrough has no sandbox to detach into (`ctx.sandbox` is None in
-            // a benchmark container), so a timeout-to-background overrun would
-            // fail; keep passthrough on the blocking path.
-            && !self.is_passthrough()
+            // An unsandboxed run (bench profile, or `mode = none`) has no sandbox
+            // to detach into, so a timeout-to-background overrun would fail; keep
+            // it on the blocking path.
+            && !skip_sandbox
             && extra_env.is_empty()
             && let Some(sink) = ctx.background_jobs.clone()
-            && let Some(output) = run_detached(
-                &command,
-                &args,
-                cwd_ref,
-                &extra_env,
-                timeout,
-                ctx,
-                &sink,
-                matches!(aura_resolution, AuraResolution::Bypass),
-            )
-            .await?
+            && let Some(output) =
+                run_detached(self, &command, &args, cwd_ref, &extra_env, timeout, ctx, &sink, judge)
+                    .await?
         {
             return Ok(output);
         }
 
-        let out = if self.is_passthrough() || matches!(aura_resolution, AuraResolution::Bypass) {
-            // Two cases run the command directly via `sh -c`:
-            //  - passthrough: aura is already inside a disposable, isolated
-            //    benchmark container, so there is no OS sandbox to wrap with (and
-            //    wrapping would break the agent's access to the task files);
-            //  - an `aura …` self-invocation: the OS sandbox masks
-            //    `~/.aura`/`$AURA_HOME`, so a sandboxed call can't reach the
-            //    gateway's config or session store — broken by construction.
-            //    Argv0 is already an absolute path canonicalising to the gateway
-            //    binary, so the unsandboxed `sh -c` execve's it directly with no
-            //    `$PATH` consultation.
+        let out = if skip_sandbox {
+            // The bench profile / `mode = none` run directly via `sh -c` — there
+            // is no OS sandbox to wrap with (the bench container is already
+            // disposable; `none` opts out on the host). (An `aura …`
+            // self-invocation also runs unsandboxed, but it returned early above.)
             tokio::select! {
                 _ = ctx.cancellation_token.cancelled() => {
                     return Err(ToolError::Execution("cancelled".into()));
@@ -711,6 +871,12 @@ impl Tool for BashTool {
             return Err(ToolError::Timeout(format!("Bash exceeded {timeout:?}")));
         }
 
+        // Auto mode: a failed sandboxed command may be re-run unsandboxed (when
+        // the judge deems it safe + sandbox-related) or escalated to the user.
+        let (out, escalation) = self
+            .escalate_if_failed(&command, cwd_ref, out, &extra_env, timeout, ctx, judge)
+            .await?;
+
         format_command_result(
             &command,
             out.exit_code,
@@ -718,6 +884,7 @@ impl Tool for BashTool {
             &out.stderr,
             &extra_env,
             ctx,
+            escalation.as_deref(),
         )
         .await
     }
@@ -734,6 +901,7 @@ async fn format_command_result(
     stderr_bytes: &[u8],
     extra_env: &[(String, String)],
     ctx: &ToolContext,
+    escalation_note: Option<&str>,
 ) -> crate::Result<ToolOutput> {
     let mut stdout = truncate_utf8(stdout_bytes, MAX_OUTPUT_BYTES);
     let mut stderr = truncate_utf8(stderr_bytes, MAX_OUTPUT_BYTES);
@@ -754,6 +922,11 @@ async fn format_command_result(
     });
     if let Some(hint) = interpret_exit(command, exit_code) {
         result["return_code_interpretation"] = Value::String(hint.into());
+    }
+    // Auto mode: tell the LLM this result came from an unsandboxed re-run so it
+    // reasons about the elevated privilege rather than assuming the sandbox.
+    if let Some(note) = escalation_note {
+        result["sandbox_escalation"] = Value::String(note.to_string());
     }
     Ok(ToolOutput::Json(result))
 }
@@ -816,6 +989,7 @@ enum DetachedOutcome {
 /// back to the blocking kill-on-timeout path.
 #[allow(clippy::too_many_arguments)]
 async fn run_detached(
+    tool: &BashTool,
     command: &str,
     args: &[String],
     cwd: Option<&Path>,
@@ -823,26 +997,12 @@ async fn run_detached(
     timeout: Duration,
     ctx: &ToolContext,
     sink: &Arc<dyn BackgroundJobSink>,
-    bypass: bool,
+    judge: bool,
 ) -> crate::Result<Option<ToolOutput>> {
-    let mut child: Box<dyn RunningChild> = if bypass {
-        use std::process::Stdio;
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.args(args);
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-            cmd.env("PWD", dir);
-        }
-        cmd.envs(extra_env.iter().cloned());
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        cmd.kill_on_drop(true);
-        match cmd.spawn() {
-            Ok(c) => Box::new(TokioRunningChild(c)),
-            Err(_) => return Ok(None),
-        }
-    } else {
+    // Only sandboxed runs reach here — the unsandboxed cases (`mode = none` /
+    // bench keep to the blocking path via the caller's `!skip_sandbox` guard;
+    // an `aura …` bypass returned even earlier). So detach via the OS sandbox.
+    let mut child: Box<dyn RunningChild> = {
         let Some(sandbox) = ctx.sandbox.as_ref() else {
             return Ok(None);
         };
@@ -915,8 +1075,29 @@ async fn run_detached(
             // result carries the output.
             let _ = tokio::fs::remove_file(&stdout_path).await;
             let _ = tokio::fs::remove_file(&stderr_path).await;
+            // A command that completed in-window (the common fast-failing case)
+            // still gets the auto-mode on-failure judge — same as the blocking
+            // path. A command that overran and backgrounded does not (below).
+            let out = crate::SandboxedOutput {
+                exit_code,
+                stdout,
+                stderr,
+                timed_out: false,
+            };
+            let (out, escalation) = tool
+                .escalate_if_failed(command, cwd, out, extra_env, timeout, ctx, judge)
+                .await?;
             Ok(Some(
-                format_command_result(command, exit_code, &stdout, &stderr, extra_env, ctx).await?,
+                format_command_result(
+                    command,
+                    out.exit_code,
+                    &out.stdout,
+                    &out.stderr,
+                    extra_env,
+                    ctx,
+                    escalation.as_deref(),
+                )
+                .await?,
             ))
         }
         DetachedOutcome::Backgrounded => {
@@ -1611,17 +1792,203 @@ impl BashTool {
             .await;
         match decision {
             ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => {
-                let args = ["-c".to_string(), self.wrap_command(command)];
-                tokio::select! {
-                    _ = ctx.cancellation_token.cancelled() => {
-                        Err(ToolError::Execution("cancelled".into()))
-                    }
-                    res = run_unsandboxed("sh", &args, cwd, extra_env, timeout) => res,
-                }
+                self.run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+                    .await
             }
             ApprovalDecision::Deny => Err(ToolError::Execution(format!(
                 "sandboxed run failed and the unsandboxed retry was denied: {sandbox_err}"
             ))),
+        }
+    }
+
+    /// Run `command` unsandboxed via `sh -c` (with the workspace uv/env wrap),
+    /// honoring the cancellation token. Shared by the sandbox-failure retry and
+    /// the auto-mode escalation so both compose the `sh -c` body identically.
+    async fn run_unsandboxed_wrapped(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        extra_env: &[(String, String)],
+        timeout: Duration,
+        ctx: &ToolContext,
+    ) -> crate::Result<crate::SandboxedOutput> {
+        let args = ["-c".to_string(), self.wrap_command(command)];
+        tokio::select! {
+            _ = ctx.cancellation_token.cancelled() => {
+                Err(ToolError::Execution("cancelled".into()))
+            }
+            res = run_unsandboxed("sh", &args, cwd, extra_env, timeout) => res,
+        }
+    }
+
+    /// Auto-mode pre-execution gate for a destructive-token command: the LLM
+    /// judge decides whether it needs human approval before running (sandboxed).
+    /// `Ok(())` proceeds; `Err` aborts (denied / no approval channel). Uses the
+    /// cached approval path so an "approve always" sticks like the legacy gate.
+    async fn pre_exec_gate(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        ctx: &ToolContext,
+    ) -> crate::Result<()> {
+        let decision = match ctx.llm.as_deref() {
+            Some(llm) => judge_pre_exec(llm, command, cwd).await,
+            // No judge wired (argv mode / tests): fall back to requiring
+            // approval, matching the non-auto destructive gate.
+            None => PreExec::Prompt("risk judge unavailable — approval required".to_string()),
+        };
+        let rationale = match decision {
+            PreExec::Proceed => return Ok(()),
+            PreExec::Prompt(rationale) => rationale,
+        };
+        let Some(approval) = ctx.approval.as_ref() else {
+            return Err(ToolError::Execution(format!(
+                "destructive command requires approval but no approval channel is available \
+                 ({rationale})"
+            )));
+        };
+        let preview = format!(
+            "Destructive `Bash` command flagged by the risk judge.\n\
+             Command : {command}\n\
+             Reason  : {rationale}\n\
+             Approve to run it (inside the OS sandbox)."
+        );
+        let decision = approval
+            .request(
+                "Bash",
+                &ctx.session_id,
+                &ctx.user,
+                vec![ResourceAccess::ExecCommand {
+                    command: command.to_string(),
+                }],
+                preview,
+            )
+            .await;
+        match decision {
+            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => Ok(()),
+            ApprovalDecision::Deny => Err(ToolError::Execution(format!(
+                "destructive command denied ({rationale})"
+            ))),
+        }
+    }
+
+    /// Auto-mode on-failure escalation. For a sandboxed command that exited
+    /// non-zero, the judge decides: keep the original failure (not the
+    /// sandbox's fault), re-run unsandboxed (sandbox-related + safe), or ask the
+    /// user (risky). Returns the (possibly re-run) output plus an optional note
+    /// for the tool result when an unsandboxed re-run happened. Inert (returns
+    /// the input unchanged) when not auto's judge run, on success, on timeout, or
+    /// when no judge LLM is wired.
+    #[allow(clippy::too_many_arguments)]
+    async fn escalate_if_failed(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        out: crate::SandboxedOutput,
+        extra_env: &[(String, String)],
+        timeout: Duration,
+        ctx: &ToolContext,
+        // The caller's per-command mode snapshot (whether auto's judge governs),
+        // passed in rather than re-read so a mid-command reload can't flip it
+        // out of step with the dispatch decision.
+        judge: bool,
+    ) -> crate::Result<(crate::SandboxedOutput, Option<String>)> {
+        if !judge || out.exit_code == 0 || out.timed_out {
+            return Ok((out, None));
+        }
+        let Some(llm) = ctx.llm.as_deref() else {
+            // Auto mode but no judge available → behave as plain sandboxed:
+            // return the original failure, no escalation.
+            return Ok((out, None));
+        };
+
+        // Redact injected secret values out of the tails before they reach the
+        // judge LLM (a possibly different provider). The detached path never
+        // carries secrets, but the blocking path can.
+        let mut stdout_s = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mut stderr_s = String::from_utf8_lossy(&out.stderr).into_owned();
+        if !extra_env.is_empty()
+            && let Some(handle) = ctx.secrets.as_deref()
+        {
+            let values: Vec<String> = extra_env.iter().map(|(_, v)| v.clone()).collect();
+            stdout_s = handle.redact(&stdout_s, &values).await?;
+            stderr_s = handle.redact(&stderr_s, &values).await?;
+        }
+
+        match judge_post_fail(llm, command, cwd, out.exit_code, &stdout_s, &stderr_s).await {
+            PostFail::Keep => Ok((out, None)),
+            PostFail::Unsandbox(rationale) => {
+                self.notify_escape(ctx, command, &rationale);
+                let new = self
+                    .run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+                    .await?;
+                Ok((
+                    new,
+                    Some(format!(
+                        "ran outside the OS sandbox after risk check: {rationale}"
+                    )),
+                ))
+            }
+            PostFail::Prompt(rationale) => {
+                let Some(approval) = ctx.approval.as_ref() else {
+                    // Unattended (cron / subagent): no human to ask → return the
+                    // original sandboxed failure rather than escaping.
+                    return Ok((out, None));
+                };
+                let preview = format!(
+                    "Sandboxed `Bash` command failed; the risk judge flagged an unsandboxed \
+                     re-run as risky.\n\
+                     Command : {command}\n\
+                     Reason  : {rationale}\n\
+                     Approve to retry WITHOUT the OS sandbox (full shell, no workspace guard)."
+                );
+                // Uncached: an unsandboxed run is a different, elevated privilege
+                // than any prior sandboxed approval, and never persisted.
+                let decision = approval
+                    .request_uncached(
+                        "Bash",
+                        &ctx.session_id,
+                        &ctx.user,
+                        vec![ResourceAccess::ExecCommand {
+                            command: command.to_string(),
+                        }],
+                        preview,
+                    )
+                    .await;
+                match decision {
+                    ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => {
+                        self.notify_escape(ctx, command, &rationale);
+                        let new = self
+                            .run_unsandboxed_wrapped(command, cwd, extra_env, timeout, ctx)
+                            .await?;
+                        Ok((
+                            new,
+                            Some(format!(
+                                "ran outside the OS sandbox after user approval: {rationale}"
+                            )),
+                        ))
+                    }
+                    ApprovalDecision::Deny => Ok((out, None)),
+                }
+            }
+        }
+    }
+
+    /// Surface an unsandboxed auto-run to the user channel (no-op in cron /
+    /// tests) and the structured log, so a sandbox escape is never silent.
+    fn notify_escape(&self, ctx: &ToolContext, command: &str, rationale: &str) {
+        tracing::warn!(
+            target: "aura::tools::bash",
+            command = %command,
+            rationale = %rationale,
+            "auto mode: running a failed command outside the OS sandbox"
+        );
+        if let Some(notifier) = ctx.notifier.as_ref() {
+            notifier.emit(
+                NoticeLevel::Warn,
+                "Ran a command outside the sandbox",
+                &format!("{command}\n— {rationale}"),
+            );
         }
     }
 }
@@ -2327,7 +2694,7 @@ mod tests {
 
     #[test]
     fn sandboxed_description_renders_without_leftover_placeholders() {
-        let d = BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws")).description;
+        let d = BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws")).description();
         assert!(
             !d.contains("{{"),
             "unfilled placeholder in description:\n{d}"
@@ -2336,106 +2703,160 @@ mod tests {
         assert!(d.contains("/some/ws/work"), "work dir filled");
     }
 
-    #[cfg(feature = "bench-passthrough")]
     #[tokio::test]
-    async fn passthrough_runs_unsandboxed_outside_work_dir_without_a_backend() {
-        // A directory entirely outside any aura workspace/work dir.
-        let dir = std::env::temp_dir().join(format!("aura-passthrough-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
-
-        // Passthrough Bash + a context with NO sandbox backend: normally this
-        // would (a) reject the out-of-work cwd and (b) error "OS sandbox
-        // unavailable". Passthrough skips the jail and runs directly.
-        let tool =
-            BashTool::new(aura_workspace::WorkspacePaths::new("/tmp")).with_passthrough(true);
+    async fn none_runs_without_a_backend_but_keeps_the_jail() {
+        let work = std::path::Path::new("/tmp/work");
+        let _ = std::fs::create_dir_all(work);
+        // `none` Bash + a context with NO sandbox backend: it runs directly (no
+        // OS sandbox), but the work-dir jail is still enforced at the tool layer.
+        let tool = BashTool::new(aura_workspace::WorkspacePaths::new("/tmp"))
+            .with_mode(BashSandboxMode::None);
         let ctx = ctx_with(None);
 
-        let params = serde_json::json!({
-            "command": "touch marker.txt",
-            "cwd": dir.to_str().expect("utf8 dir"),
+        // In-work command runs directly, no sandbox backend required.
+        let marker = work.join(format!("none-marker-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let ok = serde_json::json!({
+            "command": format!("touch {}", marker.display()),
+            "cwd": "/tmp/work",
         });
-        tool.execute(params, &ctx)
+        tool.execute(ok, &ctx)
             .await
-            .expect("passthrough exec should succeed without a sandbox backend");
+            .expect("none runs an in-work command without a sandbox backend");
+        assert!(marker.exists(), "none ran the command directly");
+        let _ = std::fs::remove_file(&marker);
 
+        // But a cwd OUTSIDE work/ is still rejected — unlike the bench profile,
+        // `none` keeps the jail.
+        let outside = serde_json::json!({ "command": "true", "cwd": "/tmp" });
         assert!(
-            dir.join("marker.txt").exists(),
-            "passthrough should run in {dir:?} (outside work/) and create the file"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(feature = "bench-passthrough")]
-    #[test]
-    fn passthrough_description_targets_inherited_cwd_not_workspace() {
-        let cwd = std::env::current_dir().expect("cwd");
-
-        // Sandboxed (default): advertises the workspace work dir + the masking
-        // it actually enforces.
-        let sandboxed = BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws"));
-        assert!(sandboxed.description.contains("/some/ws/work"));
-        assert!(sandboxed.description.contains("masked with empty tmpfs"));
-
-        // Passthrough: advertises the process's inherited cwd (so Write/Edit and
-        // Bash target the same place) and drops the sandbox/jail claims.
-        let pass =
-            BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws")).with_passthrough(true);
-        assert!(
-            !pass.description.contains("{{"),
-            "unfilled placeholder in passthrough description"
-        );
-        assert!(
-            pass.description.contains(&cwd.display().to_string()),
-            "passthrough description must name the inherited cwd"
-        );
-        assert!(
-            !pass.description.contains("/some/ws/work"),
-            "passthrough description must not advertise the workspace work dir"
-        );
-        assert!(
-            !pass.description.contains("masked with empty tmpfs"),
-            "passthrough description must not claim sandbox masking"
-        );
-        // Python guidance must match the runtime: passthrough runs the
-        // container's native python (uv shims are skipped in wrap_command), so
-        // the description must not claim the `uv run python` shim.
-        assert!(
-            sandboxed.description.contains("uv run python"),
-            "sandboxed description still describes the uv-shimmed python"
-        );
-        assert!(
-            !pass.description.contains("uv run python"),
-            "passthrough description must not claim uv-shimmed python"
-        );
-        assert!(
-            pass.description.contains("own interpreters"),
-            "passthrough description must describe the container's native python"
+            tool.execute(outside, &ctx).await.is_err(),
+            "none keeps the work-dir jail (cwd outside work/ rejected)"
         );
     }
 
-    #[cfg(feature = "bench-passthrough")]
     #[test]
-    fn passthrough_skips_uv_shims_in_wrap_command() {
-        // The default build shims `python`→`uv run python`; in a container with
-        // no uv that breaks every `python`/`pip` call. Passthrough must drop it.
-        let sandboxed = BashTool::new(aura_workspace::WorkspacePaths::new("/tmp"));
-        let passthrough =
-            BashTool::new(aura_workspace::WorkspacePaths::new("/tmp")).with_passthrough(true);
+    fn none_description_drops_only_the_os_sandbox() {
+        let none = BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws"))
+            .with_mode(BashSandboxMode::None);
+        let d = none.description();
         assert!(
-            sandboxed
-                .wrap_command("python -c 'x'")
-                .contains("uv run python")
+            !d.contains("{{"),
+            "unfilled placeholder in none description"
         );
-        let wrapped = passthrough.wrap_command("python -c 'x'");
+        // OS-sandbox claims dropped...
         assert!(
-            !wrapped.contains("uv run"),
-            "passthrough leaked uv shim: {wrapped}"
+            !d.contains("masked with empty tmpfs"),
+            "none drops the OS-sandbox masking claim"
         );
         assert!(
-            !wrapped.contains("UV_CACHE_DIR"),
-            "passthrough leaked uv exports: {wrapped}"
+            d.contains("OS sandbox is OFF"),
+            "none says the sandbox is off"
         );
+        // ...but the work-dir jail + uv shim are kept.
+        assert!(
+            d.contains("/some/ws/work"),
+            "none keeps the work-dir scope section"
+        );
+        assert!(
+            d.contains("uv run python"),
+            "none keeps the uv-shimmed python"
+        );
+    }
+
+    #[test]
+    fn auto_description_advertises_the_risk_judge() {
+        let auto = BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws"))
+            .with_mode(BashSandboxMode::Auto);
+        let d = auto.description();
+        assert!(
+            !d.contains("{{"),
+            "unfilled placeholder in auto description"
+        );
+        // Auto shares the sandbox surface with Sandboxed but advertises the
+        // judge in its APPROVAL section.
+        assert!(
+            d.contains("masked with empty tmpfs"),
+            "auto is still sandboxed"
+        );
+        assert!(
+            d.contains("risk-judged") && d.contains("sandbox_escalation"),
+            "auto description must describe the on-failure judge"
+        );
+    }
+
+    #[test]
+    fn mode_hot_swap_reskins_description_and_behavior() {
+        let handle = Arc::new(LiveSandboxMode::new(BashSandboxMode::Sandboxed));
+        let tool = BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws"))
+            .with_mode_handle(Arc::clone(&handle));
+        // Sandboxed: masked surface, OS sandbox on.
+        assert!(tool.description().contains("masked with empty tmpfs"));
+        assert!(!tool.skip_os_sandbox());
+
+        // Hot-swap to none via the shared handle: the SAME tool now skips the OS
+        // sandbox but keeps uv + the work-dir scope — no rebuild.
+        handle.set(BashSandboxMode::None);
+        assert!(tool.skip_os_sandbox());
+        assert!(!tool.description().contains("masked with empty tmpfs"));
+        assert!(tool.description().contains("OS sandbox is OFF"));
+        assert!(tool.description().contains("uv run python"));
+
+        // And to auto: sandboxed surface + the judge note in APPROVAL.
+        handle.set(BashSandboxMode::Auto);
+        assert!(!tool.skip_os_sandbox());
+        assert!(tool.description().contains("risk-judged"));
+    }
+
+    #[test]
+    fn none_keeps_uv_shims_in_wrap_command() {
+        // `none` drops only the OS sandbox; python is still uv-shimmed (unlike
+        // the bench profile). The uv exports + shim must survive.
+        let none = BashTool::new(aura_workspace::WorkspacePaths::new("/tmp"))
+            .with_mode(BashSandboxMode::None);
+        let wrapped = none.wrap_command("python -c 'x'");
+        assert!(
+            wrapped.contains("uv run python"),
+            "none must keep the uv shim: {wrapped}"
+        );
+        assert!(
+            wrapped.contains("UV_CACHE_DIR"),
+            "none must keep the uv exports: {wrapped}"
+        );
+    }
+
+    /// The `bench-bash` profile (compile-time): run `cargo test -p aura-tools
+    /// --features bench-bash bench_profile` to exercise these. They assert the
+    /// raw container behavior the feature switches on; the mode-specific tests
+    /// above assume the feature is OFF (the default `cargo test`).
+    #[cfg(feature = "bench-bash")]
+    mod bench_profile {
+        use super::*;
+
+        #[test]
+        fn description_is_the_raw_bench_prompt() {
+            let cwd = std::env::current_dir().expect("cwd");
+            let d = BashTool::new(aura_workspace::WorkspacePaths::new("/some/ws")).description();
+            assert!(!d.contains("{{"), "unfilled placeholder");
+            assert!(
+                d.contains(&cwd.display().to_string()),
+                "bench advertises the inherited cwd"
+            );
+            assert!(
+                !d.contains("/some/ws/work"),
+                "bench drops the work-dir jail"
+            );
+            assert!(!d.contains("masked with empty tmpfs"));
+            assert!(d.contains("own interpreters"), "bench uses native python");
+        }
+
+        #[test]
+        fn wrap_command_skips_uv() {
+            let w = BashTool::new(aura_workspace::WorkspacePaths::new("/tmp"))
+                .wrap_command("python -c 'x'");
+            assert!(!w.contains("uv run"), "bench leaked uv shim: {w}");
+            assert!(!w.contains("UV_CACHE_DIR"), "bench leaked uv exports: {w}");
+        }
     }
 
     fn ctx_with(sandbox: Option<Arc<dyn crate::ExecSandbox>>) -> ToolContext {
@@ -2494,12 +2915,292 @@ mod tests {
         }
     }
 
+    // ── auto mode (SandboxMode::Auto) ──────────────────────────────────
+
+    /// A `BilledChat` that replies with one canned verdict, for driving the
+    /// risk judge deterministically.
+    fn judge_llm(reply: &str) -> Arc<dyn aura_llm::BilledChat> {
+        use aura_llm::test_support::StubLlm;
+        use aura_llm::{BillableLlm, LlmCompletion, LlmResponse, TokenUsage};
+        let stub = Arc::new(StubLlm::new());
+        stub.push_response(LlmResponse {
+            content: reply.to_string(),
+            content_blocks: vec![],
+            tool_calls: vec![],
+            usage: TokenUsage::default(),
+            thinking: None,
+        });
+        crate::test_support::unbilled_chat(BillableLlm::passthrough(stub as Arc<dyn LlmCompletion>))
+    }
+
+    fn failed_out() -> crate::SandboxedOutput {
+        crate::SandboxedOutput {
+            exit_code: 1,
+            stdout: Vec::new(),
+            stderr: b"boom".to_vec(),
+            timed_out: false,
+        }
+    }
+
+    const V_UNRELATED: &str =
+        r#"{"sandbox_related":false,"risk":"safe","rationale":"compile error"}"#;
+    const V_SAFE: &str = r#"{"sandbox_related":true,"risk":"safe","rationale":"needs ~/.aws"}"#;
+    const V_RISKY: &str =
+        r#"{"sandbox_related":true,"risk":"risky","rationale":"would delete creds"}"#;
+
+    #[tokio::test]
+    async fn escalate_noop_on_success() {
+        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let mut ctx = ctx_with(None);
+        ctx.llm = Some(judge_llm(V_SAFE)); // present but must not be consulted
+        let ok = crate::SandboxedOutput {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+        };
+        let (out, note) = tool
+            .escalate_if_failed("true", None, ok, &[], Duration::from_secs(5), &ctx, true)
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert!(note.is_none());
+    }
+
+    #[tokio::test]
+    async fn escalate_noop_when_not_auto() {
+        let tool = BashTool::for_test(); // auto = false
+        let ctx = ctx_with(None);
+        let (out, note) = tool
+            .escalate_if_failed(
+                "x",
+                None,
+                failed_out(),
+                &[],
+                Duration::from_secs(5),
+                &ctx,
+                false, // judge off → escalate is a no-op
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 1);
+        assert!(note.is_none());
+    }
+
+    #[tokio::test]
+    async fn escalate_noop_without_judge_llm() {
+        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let ctx = ctx_with(None); // ctx.llm = None
+        let (out, note) = tool
+            .escalate_if_failed(
+                "x",
+                None,
+                failed_out(),
+                &[],
+                Duration::from_secs(5),
+                &ctx,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 1);
+        assert!(note.is_none());
+    }
+
+    #[tokio::test]
+    async fn escalate_keeps_when_unrelated() {
+        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let mut ctx = ctx_with(None);
+        ctx.llm = Some(judge_llm(V_UNRELATED));
+        let (out, note) = tool
+            .escalate_if_failed(
+                "cc bad.c",
+                None,
+                failed_out(),
+                &[],
+                Duration::from_secs(5),
+                &ctx,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 1, "unrelated failure returned unchanged");
+        assert!(note.is_none());
+    }
+
+    #[tokio::test]
+    async fn escalate_runs_unsandboxed_when_safe() {
+        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let mut ctx = ctx_with(None);
+        ctx.llm = Some(judge_llm(V_SAFE));
+        // `true` exits 0 unsandboxed, so a flip from the seeded exit 1 proves
+        // the re-run happened.
+        let (out, note) = tool
+            .escalate_if_failed(
+                "true",
+                None,
+                failed_out(),
+                &[],
+                Duration::from_secs(5),
+                &ctx,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0, "command was re-run outside the sandbox");
+        assert!(note.unwrap().contains("outside the OS sandbox"));
+    }
+
+    #[tokio::test]
+    async fn escalate_risky_runs_after_approval() {
+        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
+        let mut ctx = ctx_with_approval(None, gate);
+        ctx.llm = Some(judge_llm(V_RISKY));
+        let (out, note) = tool
+            .escalate_if_failed(
+                "true",
+                None,
+                failed_out(),
+                &[],
+                Duration::from_secs(5),
+                &ctx,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0, "approved → re-run unsandboxed");
+        assert!(note.unwrap().contains("user approval"));
+    }
+
+    #[tokio::test]
+    async fn escalate_risky_kept_when_denied() {
+        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
+        let mut ctx = ctx_with_approval(None, gate);
+        ctx.llm = Some(judge_llm(V_RISKY));
+        let (out, note) = tool
+            .escalate_if_failed(
+                "true",
+                None,
+                failed_out(),
+                &[],
+                Duration::from_secs(5),
+                &ctx,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 1, "denied → original failure kept");
+        assert!(note.is_none());
+    }
+
+    #[tokio::test]
+    async fn escalate_risky_kept_when_unattended() {
+        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let mut ctx = ctx_with(None); // no approval handle (cron / subagent)
+        ctx.llm = Some(judge_llm(V_RISKY));
+        let (out, note) = tool
+            .escalate_if_failed(
+                "true",
+                None,
+                failed_out(),
+                &[],
+                Duration::from_secs(5),
+                &ctx,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out.exit_code, 1,
+            "no human → original failure kept, no escape"
+        );
+        assert!(note.is_none());
+    }
+
+    #[tokio::test]
+    async fn escalate_honors_the_judge_snapshot_not_live_mode() {
+        // Regression for the mid-command reload race: the tool's LIVE mode is
+        // `none` (would never judge), but the per-command snapshot captured
+        // judge=true (the mode was `auto` at execute() entry). escalate must act
+        // on the snapshot it was handed, not re-read the now-swapped mode — so a
+        // reload landing mid-command can't flip the decision against the dispatch.
+        let tool = BashTool::for_test().with_mode(BashSandboxMode::None);
+        let mut ctx = ctx_with(None);
+        ctx.llm = Some(judge_llm(V_SAFE));
+        let (out, note) = tool
+            .escalate_if_failed(
+                "true",
+                None,
+                failed_out(),
+                &[],
+                Duration::from_secs(5),
+                &ctx,
+                true, // snapshot judge=true, despite the live mode being none
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out.exit_code, 0,
+            "escalated per the snapshot, not live mode"
+        );
+        assert!(note.is_some());
+    }
+
+    #[tokio::test]
+    async fn pre_exec_gate_proceeds_when_safe() {
+        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let mut ctx = ctx_with(None);
+        ctx.llm = Some(judge_llm(r#"{"risk":"safe","rationale":"scratch dir"}"#));
+        tool.pre_exec_gate("rm -rf /tmp/scratch", None, &ctx)
+            .await
+            .expect("safe destructive command proceeds without approval");
+    }
+
+    #[tokio::test]
+    async fn pre_exec_gate_denied_errors() {
+        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Deny));
+        let mut ctx = ctx_with_approval(None, gate);
+        ctx.llm = Some(judge_llm(r#"{"risk":"risky","rationale":"rm of source"}"#));
+        let err = tool
+            .pre_exec_gate("rm -rf src", None, &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)));
+    }
+
+    #[tokio::test]
+    async fn pre_exec_gate_errors_when_unattended_and_risky() {
+        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let mut ctx = ctx_with(None); // no approval handle
+        ctx.llm = Some(judge_llm(r#"{"risk":"risky","rationale":"rm of source"}"#));
+        let err = tool
+            .pre_exec_gate("rm -rf src", None, &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)));
+    }
+
+    #[tokio::test]
+    async fn pre_exec_gate_without_llm_requires_approval() {
+        let tool = BashTool::for_test().with_mode(BashSandboxMode::Auto);
+        let gate = Arc::new(FakeApprovalGate::new(ApprovalDecision::Approve));
+        let ctx = ctx_with_approval(None, gate); // ctx.llm = None → fail-closed prompt
+        tool.pre_exec_gate("rm -rf x", None, &ctx)
+            .await
+            .expect("no judge → prompt, approval granted → proceed");
+    }
+
     /// A ctx whose `workspace_paths` point at a unique temp dir (so
     /// `logs_dir()/background` is writable) with a recording sink wired in.
     #[allow(clippy::type_complexity)]
     fn ctx_for_detached() -> (ToolContext, Arc<Mutex<Option<(String, String)>>>) {
         let tmp = std::env::temp_dir().join(format!("aura-bgtest-{}", uuid::Uuid::new_v4()));
-        let mut ctx = ctx_with(None);
+        // `run_detached` detaches through `ctx.sandbox`; the fake spawns the
+        // command directly so the test needs no real OS sandbox.
+        let mut ctx = ctx_with(Some(Arc::new(FakeExecSandbox::new())));
         ctx.workspace_paths = aura_workspace::WorkspacePaths::new(&tmp);
         let seen = Arc::new(Mutex::new(None));
         ctx.background_jobs = Some(Arc::new(RecordingSink {
@@ -2513,7 +3214,9 @@ mod tests {
         let (ctx, seen) = ctx_for_detached();
         let sink = ctx.background_jobs.clone().unwrap();
         let args = vec!["-c".into(), "echo hi".into()];
+        let tool = BashTool::for_test();
         let out = run_detached(
+            &tool,
             "echo hi",
             &args,
             None,
@@ -2521,7 +3224,7 @@ mod tests {
             Duration::from_secs(5),
             &ctx,
             &sink,
-            true, // unsandboxed, so the test needs no OS sandbox
+            false, // judge off
         )
         .await
         .expect("run_detached ok");
@@ -2541,7 +3244,9 @@ mod tests {
         let (ctx, seen) = ctx_for_detached();
         let sink = ctx.background_jobs.clone().unwrap();
         let args = vec!["-c".into(), "sleep 30".into()];
+        let tool = BashTool::for_test();
         let out = run_detached(
+            &tool,
             "sleep 30",
             &args,
             None,
@@ -2549,7 +3254,7 @@ mod tests {
             Duration::from_millis(150),
             &ctx,
             &sink,
-            true,
+            false, // judge off
         )
         .await
         .expect("run_detached ok");

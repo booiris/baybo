@@ -126,9 +126,9 @@ if [ "$want_agent" = 1 ]; then
     [ -n "$musl_cc" ] || {
       echo "musl C compiler missing (Arch: sudo pacman -S musl) — libsql's bundled SQLite needs it" >&2
       exit 1; }
-    echo ">> building static-musl aura (--features bench-passthrough)"
+    echo ">> building static-musl aura (--features bench-bash)"
     CC_x86_64_unknown_linux_musl="$musl_cc" \
-      cargo build --release --target "$MUSL_TARGET" --features bench-passthrough
+      cargo build --release --target "$MUSL_TARGET" --features bench-bash
     AURA_BIN="$REPO_ROOT/target/$MUSL_TARGET/release/aura"
   fi
   [ -x "$AURA_BIN" ] || { echo "aura binary not executable: $AURA_BIN" >&2; exit 1; }

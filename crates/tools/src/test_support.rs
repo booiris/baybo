@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 use aura_llm::{BilledChat, BilledChatResponse};
 
 use crate::{
-    ApprovalDecision, ApprovalGate, ApprovalRequest, ExecSandbox, SandboxedOutput, SpawnOpts, Tool,
-    ToolContext, ToolManifest, ToolOutput,
+    ApprovalDecision, ApprovalGate, ApprovalRequest, ExecSandbox, RunningChild, SandboxedOutput,
+    SpawnOpts, TokioRunningChild, Tool, ToolContext, ToolManifest, ToolOutput,
 };
 
 /// Binds a [`aura_llm::BillableLlm`] to a throwaway system
@@ -219,6 +219,33 @@ impl ExecSandbox for FakeExecSandbox {
             timeout: opts.timeout,
         });
         Ok(self.response.lock().clone())
+    }
+
+    /// Spawn the command directly (no real sandbox) and hand back a live child,
+    /// so tests can exercise `run_detached`'s completion / background handoff
+    /// without bwrap. Mirrors the real backends' detached contract.
+    async fn spawn_command_detached(
+        &self,
+        _program: &Path,
+        args: &[String],
+        opts: SpawnOpts,
+    ) -> crate::Result<Box<dyn RunningChild>> {
+        use std::process::Stdio;
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(args);
+        if let Some(dir) = &opts.cwd {
+            cmd.current_dir(dir);
+            cmd.env("PWD", dir);
+        }
+        cmd.envs(opts.extra_env.iter().cloned());
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+        let child = cmd
+            .spawn()
+            .map_err(|e| crate::ToolError::Execution(format!("fake detached spawn: {e}")))?;
+        Ok(Box::new(TokioRunningChild(child)))
     }
 }
 

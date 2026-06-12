@@ -31,6 +31,7 @@ use crate::{Tool, ToolCapability, ToolManifest};
 
 pub mod background_jobs;
 pub mod bash;
+mod bash_judge;
 pub mod edit;
 pub mod glob_tool;
 pub mod grep;
@@ -47,7 +48,7 @@ pub mod write;
 pub mod echo;
 
 pub use background_jobs::{JobListTool, JobStopTool};
-pub use bash::BashTool;
+pub use bash::{BashSandboxMode, BashTool, LiveSandboxMode};
 #[cfg(debug_assertions)]
 pub use echo::EchoTool;
 pub use edit::EditTool;
@@ -75,7 +76,7 @@ pub fn default_tools(
     blob_store: Arc<dyn BlobStore>,
     workspace_paths: WorkspacePaths,
     proxy: Option<reqwest::Proxy>,
-    bash_passthrough: bool,
+    sandbox_mode: Arc<bash::LiveSandboxMode>,
 ) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     #[allow(unused_mut)]
     let mut tools: Vec<(Arc<dyn Tool>, ToolManifest)> = vec![
@@ -89,7 +90,7 @@ pub fn default_tools(
             vec![ToolCapability::ReadFile, ToolCapability::WriteFile],
         ),
         trusted(
-            make_bash_tool(workspace_paths, bash_passthrough),
+            BashTool::new(workspace_paths).with_mode_handle(sandbox_mode),
             vec![ToolCapability::ExecCommand],
         ),
         trusted(GlobTool, vec![ToolCapability::ReadFile]),
@@ -109,19 +110,6 @@ pub fn default_tools(
     #[cfg(debug_assertions)]
     tools.push(trusted(echo::EchoTool, vec![]));
     tools
-}
-
-/// Construct the Bash tool, applying trusted-environment passthrough only in a
-/// `bench-passthrough` build (where `BashTool::with_passthrough` exists). A
-/// normal build ignores the flag and is unconditionally sandboxed.
-#[cfg(feature = "bench-passthrough")]
-fn make_bash_tool(workspace_paths: WorkspacePaths, passthrough: bool) -> BashTool {
-    BashTool::new(workspace_paths).with_passthrough(passthrough)
-}
-
-#[cfg(not(feature = "bench-passthrough"))]
-fn make_bash_tool(workspace_paths: WorkspacePaths, _passthrough: bool) -> BashTool {
-    BashTool::new(workspace_paths)
 }
 
 pub(crate) fn trusted<T: Tool + 'static>(

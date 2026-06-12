@@ -180,7 +180,11 @@ async fn main() -> anyhow::Result<()> {
         stores.blob.clone(),
         workspace_paths.clone(),
         tool_proxy,
-        false,
+        // argv one-shots (llm/doctor/status) barely touch Bash; a fresh
+        // sandboxed handle with no hot-reload wiring is the safe default.
+        Arc::new(aura_tools::builtin::LiveSandboxMode::new(
+            aura_tools::builtin::BashSandboxMode::Sandboxed,
+        )),
     ));
     let workspace = Arc::new(aura_workspace::WorkspaceManager::new(
         workspace_root.clone(),

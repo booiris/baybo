@@ -165,8 +165,7 @@ struct RawVerdict {
 /// after the JSON body, because real models sometimes add both despite
 /// the system prompt.
 pub(crate) fn parse_verdict(raw: &str) -> Option<(RiskLevel, String)> {
-    let trimmed = strip_fences(raw.trim());
-    let obj = extract_first_json_object(trimmed)?;
+    let obj = aura_llm::extract_json_object(raw)?;
     let parsed: RawVerdict = serde_json::from_str(obj).ok()?;
     let level = RiskLevel::parse(&parsed.level)?;
     let rationale = if parsed.rationale.is_empty() {
@@ -175,48 +174,6 @@ pub(crate) fn parse_verdict(raw: &str) -> Option<(RiskLevel, String)> {
         parsed.rationale
     };
     Some((level, rationale))
-}
-
-fn strip_fences(s: &str) -> &str {
-    let s = s.trim();
-    let Some(rest) = s.strip_prefix("```") else {
-        return s;
-    };
-    // Optional language tag on the opening fence (`json`, `JSON`, `jsonc`…).
-    let after_tag = rest.find('\n').map(|i| &rest[i + 1..]).unwrap_or(rest);
-    after_tag.strip_suffix("```").unwrap_or(after_tag).trim()
-}
-
-fn extract_first_json_object(s: &str) -> Option<&str> {
-    let start = s.find('{')?;
-    let bytes = s.as_bytes();
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escape = false;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if b == b'\\' {
-                escape = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&s[start..=i]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 #[cfg(test)]

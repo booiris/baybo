@@ -305,6 +305,9 @@ pub struct RuntimeConfigReloader {
     reload_lock: tokio::sync::Mutex<()>,
     llm: LlmReloader,
     cost: CostReloader,
+    /// Shared Bash sandbox mode; a hot reload swaps it (see `commit` below) so
+    /// running `BashTool`s pick up the new isolation + description live.
+    sandbox_mode: Arc<aura_tools::builtin::LiveSandboxMode>,
 }
 
 impl RuntimeConfigReloader {
@@ -313,6 +316,7 @@ impl RuntimeConfigReloader {
         handle: ConfigHandle,
         llm: LlmReloader,
         cost: CostReloader,
+        sandbox_mode: Arc<aura_tools::builtin::LiveSandboxMode>,
     ) -> Self {
         Self {
             config_path,
@@ -320,6 +324,7 @@ impl RuntimeConfigReloader {
             reload_lock: tokio::sync::Mutex::new(()),
             llm,
             cost,
+            sandbox_mode,
         }
     }
 }
@@ -375,6 +380,10 @@ impl ConfigReloader for RuntimeConfigReloader {
         // before the pool swap inside `llm.commit`.
         let outcome = self.llm.commit(prepared_llm);
         self.cost.commit(prepared_cost);
+        // Swap the Bash sandbox mode live: the next command (and the next tool
+        // description the LLM sees) observes the new isolation.
+        self.sandbox_mode
+            .set(crate::boot::to_bash_mode(new.sandbox.mode));
         self.handle.store(Arc::clone(&new));
 
         info!(
