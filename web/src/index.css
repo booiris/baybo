@@ -93,8 +93,10 @@
   position: absolute;
   left: 0;
   top: 0;
-  /* leading-relaxed — line up the marker with the item's first text line */
-  line-height: 1.625;
+  /* Inherit the list item's line-height (the `li` uses `leading-relaxed`, which
+     also matches a loose item's paragraph) so the marker sits on the first text
+     line in both tight and loose lists. */
+  line-height: inherit;
 }
 
 ul.md-list > li::before {

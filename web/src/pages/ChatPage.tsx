@@ -782,9 +782,12 @@ export function ChatPage() {
         }
         if (data) {
           const rows = data.transcript.map(historyRowToTranscript.bind(null, sessionId));
-          const oldestOrdinal = data.transcript.length > 0
-            ? data.transcript[0].ordinal
-            : null;
+          // Use the server's real message-ordinal bounds, NOT the transcript
+          // items: control-event items carry synthetic negative ordinals, so
+          // inferring from `transcript[0]` / `transcript[last]` would seed a
+          // bogus cursor (a trailing `/stop` / `/compact` notice is the common
+          // case) — forcing a full replay and duplicating rows.
+          const oldestOrdinal = data.oldest_ordinal ?? null;
           // Seed the WS cursor so a reconnect after a network dip asks
           // the server for anything newer rather than dropping it on
           // the floor. The `-1` sentinel handles a brand-new session
@@ -795,9 +798,8 @@ export function ChatPage() {
           // would be lost. `recordOrdinal` ignores backwards moves so
           // the non-empty branch's higher ordinal still wins.
           wsRef.current?.recordOrdinal(sessionId, -1);
-          if (data.transcript.length > 0) {
-            const newest = data.transcript[data.transcript.length - 1].ordinal;
-            wsRef.current?.recordOrdinal(sessionId, newest);
+          if (data.newest_ordinal != null) {
+            wsRef.current?.recordOrdinal(sessionId, data.newest_ordinal);
           }
           setViews((prev) =>
             mergeView(prev, sessionId, {
@@ -952,9 +954,9 @@ export function ChatPage() {
         return;
       }
       const newRows = data.transcript.map(historyRowToTranscript.bind(null, sessionId));
-      const newOldest = data.transcript.length > 0
-        ? data.transcript[0].ordinal
-        : view.oldestOrdinal;
+      // Real message-ordinal bound from the server (not the transcript items,
+      // which may include synthetic-ordinal control events).
+      const newOldest = data.oldest_ordinal ?? view.oldestOrdinal;
       setViews((prev) => {
         const cur = prev[sessionId] ?? EMPTY_VIEW;
         return {
@@ -2644,7 +2646,10 @@ const MARKDOWN_COMPONENTS: Components = {
   ol: ({ children }) => (
     <ol className="md-list my-2 first:mt-0 last:mb-0 space-y-1">{children}</ol>
   ),
-  li: ({ children }) => <li className="leading-snug">{children}</li>,
+  // `leading-relaxed` (not snug) so a tight list's text line-height matches the
+  // loose list's paragraph and the `.md-list` marker (which inherits it), keeping
+  // the marker on the first text line in both. See `.md-list` in index.css.
+  li: ({ children }) => <li className="leading-relaxed">{children}</li>,
   a: ({ href, children }) => (
     <a
       href={href}

@@ -25,6 +25,18 @@ impl ControlEventKind {
             ControlEventKind::NoticeError => "notice_error",
         }
     }
+
+    /// Notice severity for a `Notice*` kind (`"info"` / `"warn"` / `"error"`), or
+    /// `None` for [`ControlEventKind::Command`]. Single source of truth for the
+    /// level vocabulary the chat surface colors by.
+    pub fn notice_level(&self) -> Option<&'static str> {
+        match self {
+            ControlEventKind::Command => None,
+            ControlEventKind::NoticeInfo => Some("info"),
+            ControlEventKind::NoticeWarn => Some("warn"),
+            ControlEventKind::NoticeError => Some("error"),
+        }
+    }
 }
 
 impl std::str::FromStr for ControlEventKind {
@@ -45,8 +57,8 @@ impl std::str::FromStr for ControlEventKind {
 /// the LLM conversation — a control-command echo (`/stop`, `/compact`) or a
 /// notice (`/stop` / `/compact` confirmation, empty-reply fallback). Persisted
 /// in `session_control_events` (separate from `session_messages`, which stays
-/// exactly the LLM context), merged into the chat view by `created_at`, and
-/// never sent to the model.
+/// exactly the LLM context), interleaved into the chat view by its
+/// `after_ordinal` anchor, and never sent to the model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ControlEvent {
     /// Per-session monotonic id — stable client key and same-anchor tiebreak.

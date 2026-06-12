@@ -237,29 +237,41 @@ impl Router {
         // control events (separate from the LLM transcript) so a reload shows
         // both. Anchor them after the session's current last row so they land
         // right after this turn's partial rows; `stopped_at` is the send time.
-        let after = self
+        // A lookup error skips the persist (best-effort) rather than mis-anchor
+        // it; the live notice below still fires regardless. NOTE: a partial row
+        // landing between this read and the cancel taking effect sorts after the
+        // echo on reload (and can split the turn's work block) — acceptable for a
+        // best-effort display log.
+        match self
             .session_manager
             .latest_session_ordinal(session_id)
             .await
-            .ok()
-            .flatten()
-            .unwrap_or(-1);
-        self.persist_control_event(
-            session_id,
-            after,
-            ControlEventKind::Command,
-            command_text,
-            stopped_at,
-        )
-        .await;
-        self.persist_control_event(
-            session_id,
-            after,
-            ControlEventKind::NoticeInfo,
-            &text,
-            stopped_at,
-        )
-        .await;
+        {
+            Ok(max) => {
+                let after = max.unwrap_or(-1);
+                self.persist_control_event(
+                    session_id,
+                    after,
+                    ControlEventKind::Command,
+                    command_text,
+                    stopped_at,
+                )
+                .await;
+                self.persist_control_event(
+                    session_id,
+                    after,
+                    ControlEventKind::NoticeInfo,
+                    &text,
+                    stopped_at,
+                )
+                .await;
+            }
+            Err(e) => warn!(
+                %session_id,
+                error = %e,
+                "/stop: latest-ordinal lookup failed; skipping control-event persist"
+            ),
+        }
         self.handle_agent_output(AgentOutput {
             session_id: session_id.clone(),
             user_id: user_id.to_string(),

@@ -865,14 +865,15 @@ impl AgentActor {
             );
             // Record the fallback as an out-of-band control event so a reload
             // doesn't show a bare user turn with no reply.
-            let after = self.current_after_ordinal().await;
-            self.persist_control_event(
-                after,
-                ControlEventKind::NoticeWarn,
-                EMPTY_USER_REPLY_NOTICE,
-                chrono::Utc::now(),
-            )
-            .await;
+            if let Some(after) = self.current_after_ordinal().await {
+                self.persist_control_event(
+                    after,
+                    ControlEventKind::NoticeWarn,
+                    EMPTY_USER_REPLY_NOTICE,
+                    chrono::Utc::now(),
+                )
+                .await;
+            }
             let notice = AgentOutput {
                 session_id: self.durable.session.id.clone(),
                 user_id: self.durable.session.user.id.clone(),
@@ -912,16 +913,17 @@ impl AgentActor {
         // Record the `/compact` echo + its confirmation as out-of-band control
         // events (off the LLM transcript) so a reload shows them, anchored after
         // the (post-compaction) last row.
-        let after = self.current_after_ordinal().await;
-        self.persist_control_event(after, ControlEventKind::Command, &command_text, sent_at)
+        if let Some(after) = self.current_after_ordinal().await {
+            self.persist_control_event(after, ControlEventKind::Command, &command_text, sent_at)
+                .await;
+            self.persist_control_event(
+                after,
+                ControlEventKind::NoticeInfo,
+                &text,
+                chrono::Utc::now(),
+            )
             .await;
-        self.persist_control_event(
-            after,
-            ControlEventKind::NoticeInfo,
-            &text,
-            chrono::Utc::now(),
-        )
-        .await;
+        }
         let notice = AgentOutput {
             session_id: self.durable.session.id.clone(),
             user_id: self.durable.session.user.id.clone(),
@@ -1001,15 +1003,25 @@ impl AgentActor {
 
     /// The session's current last `session_messages.ordinal` (`-1` if none) — the
     /// anchor a control event records so the chat view interleaves it after that
-    /// row even on scroll-up.
-    async fn current_after_ordinal(&self) -> i64 {
-        self.volatile
+    /// row even on scroll-up. `None` on a storage error: the caller then skips
+    /// the write rather than mis-anchor it to the top of the oldest page.
+    async fn current_after_ordinal(&self) -> Option<i64> {
+        match self
+            .volatile
             .session_manager
             .latest_session_ordinal(&self.durable.session.id)
             .await
-            .ok()
-            .flatten()
-            .unwrap_or(-1)
+        {
+            Ok(max) => Some(max.unwrap_or(-1)),
+            Err(e) => {
+                warn!(
+                    session_id = %self.durable.session.id,
+                    error = %e,
+                    "control event: latest-ordinal lookup failed; skipping persist"
+                );
+                None
+            }
+        }
     }
 }
 

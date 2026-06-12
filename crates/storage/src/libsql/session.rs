@@ -1113,6 +1113,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_events_round_trip_seq_kind_and_micros() {
+        use aura_model::ControlEventKind;
+
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+        let s = make_root_session("ctl-1");
+        store.save(&s).await.unwrap();
+
+        // Sub-second precision down to the microsecond, to prove `created_at`
+        // survives the µs-granular column round-trip exactly.
+        let at = DateTime::from_timestamp_micros(1_700_000_000_123_456).expect("valid timestamp");
+
+        // `seq` is assigned monotonically from 0, per session.
+        let s0 = store
+            .append_control_event(&s.id, -1, ControlEventKind::Command, "/stop", at)
+            .await
+            .unwrap();
+        let s1 = store
+            .append_control_event(&s.id, 7, ControlEventKind::NoticeInfo, "Stopped", at)
+            .await
+            .unwrap();
+        let s2 = store
+            .append_control_event(&s.id, 7, ControlEventKind::NoticeError, "boom", at)
+            .await
+            .unwrap();
+        assert_eq!((s0, s1, s2), (0, 1, 2));
+
+        let events = store.list_control_events(&s.id).await.unwrap();
+        assert_eq!(events.len(), 3);
+
+        // Ordered by seq; kind strings parse back to the typed enum; anchors,
+        // text and the microsecond timestamp all preserved.
+        assert_eq!(events[0].seq, 0);
+        assert_eq!(events[0].after_ordinal, -1);
+        assert_eq!(events[0].kind, ControlEventKind::Command);
+        assert_eq!(events[0].text, "/stop");
+        assert_eq!(events[0].created_at, at);
+        assert_eq!(events[1].kind, ControlEventKind::NoticeInfo);
+        assert_eq!(events[1].after_ordinal, 7);
+        assert_eq!(events[2].kind, ControlEventKind::NoticeError);
+        assert_eq!(events[2].text, "boom");
+
+        // A different session keeps its own independent seq space.
+        let other = make_root_session("ctl-2");
+        store.save(&other).await.unwrap();
+        let o0 = store
+            .append_control_event(&other.id, 0, ControlEventKind::NoticeWarn, "warn", at)
+            .await
+            .unwrap();
+        assert_eq!(o0, 0, "seq is per-session, not global");
+        assert_eq!(store.list_control_events(&s.id).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
     async fn list_all_skips_undeserializable_legacy_row() {
         // A row written by an older build can carry a `lineage.kind` this
         // build doesn't know (here `"system_maintenance"`). `list_all`
