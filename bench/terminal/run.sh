@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-shot runner for the aura <-> Terminal-Bench adapter. Builds the
-# bench-passthrough binary if missing, then runs the harness in the uv-managed
+# musl binary if missing, then runs the harness in the uv-managed
 # env with .env loaded. Any extra args pass through to `tb run`:
 #
 #   ./run.sh                          # defaults: gemini-2.5-flash, core 0.1.1, all tasks
@@ -13,12 +13,12 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 bin="$root/target/x86_64-unknown-linux-musl/release/aura"
 
-# Build the bench-passthrough musl binary when it's missing (or AURA_REBUILD
+# Build the musl binary when it's missing (or AURA_REBUILD
 # is set). An AURA_BIN override points at your own binary and skips this.
 if [[ -z "${AURA_BIN:-}" ]] && { [[ -n "${AURA_REBUILD:-}" ]] || [[ ! -x "$bin" ]]; }; then
-  echo "==> building bench-passthrough musl aura (cargo; first build ~3 min)…" >&2
+  echo "==> building musl aura (--features bench-bash; first build ~3 min)…" >&2
   ( cd "$root" && cargo build --release --target x86_64-unknown-linux-musl \
-      --features bench-passthrough -p aura )
+      --features bench-bash -p aura )
 fi
 
 if [[ ! -f "$here/.env" ]]; then

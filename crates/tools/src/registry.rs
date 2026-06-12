@@ -43,19 +43,18 @@ impl ToolRegistry {
     /// tool-call's context. `workspace_paths` is forwarded to `Edit`
     /// so its approval-gate bypass for `profile/` writes can bind to
     /// the real workspace rather than a heuristic on the path string.
-    /// `bash_passthrough` flips `BashTool` into trusted-environment passthrough
-    /// (run directly, no OS sandbox, no work-dir jail). Production callers pass
-    /// `false`; only a `bench-passthrough` build running inside a benchmark
-    /// container passes `true`.
+    /// `sandbox_mode` is the shared, hot-swappable handle that drives `BashTool`'s
+    /// isolation (none / sandboxed / auto) and the description it advertises; a
+    /// config reload swaps it live.
     pub fn with_defaults(
         blob_store: Arc<dyn BlobStore>,
         workspace_paths: WorkspacePaths,
         proxy: Option<reqwest::Proxy>,
-        bash_passthrough: bool,
+        sandbox_mode: Arc<crate::builtin::LiveSandboxMode>,
     ) -> Self {
         let mut registry = Self::new();
         for (tool, manifest) in
-            crate::builtin::default_tools(blob_store, workspace_paths, proxy, bash_passthrough)
+            crate::builtin::default_tools(blob_store, workspace_paths, proxy, sandbox_mode)
         {
             registry.register(tool, manifest);
         }
@@ -228,7 +227,9 @@ mod tests {
             blob_store,
             aura_workspace::WorkspacePaths::new("/tmp"),
             None,
-            false,
+            Arc::new(crate::builtin::LiveSandboxMode::new(
+                crate::builtin::BashSandboxMode::Sandboxed,
+            )),
         )
     }
 

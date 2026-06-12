@@ -13,11 +13,11 @@ safe-to-merge, and consistent with the others on day one.
 
 **The three living templates — read the closest one before writing anything:**
 
-| bench | shape | how aura is driven | grader | build feature |
+| bench | shape | how aura is driven | grader | isolation / build feature |
 | --- | --- | --- | --- | --- |
-| `bench/swe` | self-hosted Rust harness | **`docker run` per item**, `aura prompt` inside each official eval image | official `swebench` Python harness (shelled out) | `bench-passthrough` (musl) |
-| `bench/memory` | self-hosted Rust harness | **`aura gateway` once per arm**, concurrent `aura prompt` over it | LLM-as-judge (`deepseek`) + deterministic F1 | `bench-readonly-memory` |
-| `bench/terminal` | **adapter into an external official harness** (no Rust crate, no fork) | `aura prompt` inside the harness's task container, over tmux | the external harness's own pytest | `bench-passthrough` (musl) |
+| `bench/swe` | self-hosted Rust harness | **`docker run` per item**, `aura prompt` inside each official eval image | official `swebench` Python harness (shelled out) | `bench-bash` feature + `sandbox.mode=none` · static musl |
+| `bench/memory` | self-hosted Rust harness | **`aura gateway` once per arm**, concurrent `aura prompt` over it | LLM-as-judge (`deepseek`) + deterministic F1 | `bench-readonly-memory` (Cargo feature) |
+| `bench/terminal` | **adapter into an external official harness** (no Rust crate, no fork) | `aura prompt` inside the harness's task container, over tmux | the external harness's own pytest | `bench-bash` feature + `sandbox.mode=none` · static musl |
 
 `reference.md` (next to this file) holds the copy-paste boilerplate: the
 `run-bench.sh` skeleton, the self-contained `aura.json` shapes, the exact `aura`
@@ -41,10 +41,14 @@ valid framings, or there's a cost/scope tradeoff only the user can weigh.
    adapter shape** (clone `terminal`: thin adapter, no crate, no fork —
    leaderboard-comparable, far less to maintain). Own the loop (clone `swe` /
    `memory`: a Rust crate + `run` bin) only when there's no official harness.
-3. **Build feature** — runs **inside a disposable container**? → `bench-passthrough`
-   (+ static musl). The agent's own loop **writes state that contaminates the
-   measurement** (e.g. memory)? → a `bench-readonly-*` feature. Neither otherwise.
-   Both fail-closed (Invariant 2).
+3. **Isolation + build feature** — runs **inside a disposable container** (bwrap
+   can't nest)? → build `--features bench-bash` (the off-by-default bench profile:
+   raw Bash, no uv, no work-dir jail, inherited cwd) and set `sandbox.mode = none`
+   in the bench's `aura.json` (+ static musl). The agent's own loop **writes state
+   that contaminates the measurement** (e.g. memory)? → a fail-closed
+   `bench-readonly-*` Cargo feature. (Both are fail-closed features per Invariant
+   2. `sandbox.mode = none` on its own — drop the OS sandbox but keep uv + the
+   work jail — is a plain config mode, used by neither alone.) Neither otherwise.
 4. **Driving shape** — **default one-shot** (`aura prompt` per item; `swe` /
    `terminal`). Use **gateway-once then prompt-per-item** (`memory`) only when many
    items share one long-lived aura process/workspace.
@@ -66,15 +70,24 @@ These hold across all three benches. A new bench that drops one is wrong.
    misconfigured — fix that before trusting any real number. `noop` ≈ floor
    (empty patch / memory-off); `oracle` = ceiling (gold patch / whole-context-in-prompt).
 
-2. **The bench build feature is off-by-default and fails-closed.** A new
-   capability that weakens isolation or alters agent behavior for the bench must
-   be a Cargo feature that, **when absent, makes the dangerous config a hard
-   startup error — never a silent downgrade** (see `crates/config/src/sandbox.rs`:
-   `Passthrough` refuses to start without `bench-passthrough`). Declare it in the
-   root `Cargo.toml` `[features]`, forward to the owning crate(s), and gate the
-   code with `#[cfg(feature = "…")]`. This off-by-default lock is exactly what
-   makes the bench safe to merge to `master` while the dangerous path stays
-   uncompiled in every real build.
+2. **A bench-only *behavior hack* is an off-by-default, fail-closed Cargo
+   feature.** If the bench needs the agent to behave differently *purely to make
+   the measurement work* — something with no legitimate production meaning, e.g.
+   memory ingest forced read-only (`bench-readonly-memory`) — gate it behind a
+   Cargo feature that is **off by default** and, when absent, makes the bench
+   config a **hard startup error, never a silent downgrade**. Declare it in the
+   root `Cargo.toml` `[features]`, forward to the owning crate(s), `#[cfg(feature
+   = "…")]` the code. That lock is what keeps the bench safe to merge to `master`
+   with the hack uncompiled in every real build.
+
+   The Bash bench profile (`bench-bash`: raw exec, no uv, no work-dir jail,
+   inherited cwd) is exactly this — a behavior hack with no production meaning, so
+   it's a feature. **Where a *legitimate config axis* already models part of what
+   you need, use the config too, not another feature.** Dropping just the OS
+   sandbox is `sandbox.mode = none` (`crates/config/src/sandbox.rs`) — a
+   first-class, hot-reloadable mode real deployments may also pick — so a
+   container bench sets `none` in its `aura.json` **and** builds `--features
+   bench-bash` (the feature lifts uv + the work jail on top).
 
 3. **Drive aura as a black box.** Exec the `aura` *binary* (`prompt` / `gateway` /
    `cost`); do **not** link aura's agent/context/session/tool stack. The single
@@ -179,9 +192,11 @@ into `results/` so the report sits where the other benches' does), `pyproject.to
    members` and (self-hosted) `[workspace.dependencies]`.
 2. **`lib.rs` first** — the pure IR, framing, scope keys, metric, *with unit
    tests*. `cargo test -p aura-bench-<name>` must pass with zero heavy deps.
-3. **The build feature** (if any) — root `[features]` → forward to owning crate →
-   `#[cfg(feature)]` gate → **hard error when absent** (Invariant 2). Confirm a
-   normal `cargo build` still rejects the dangerous config.
+3. **The build feature** (for a behavior hack, per Invariant 2 — e.g. the Bash
+   bench profile rides the existing `bench-bash`) — root `[features]` → forward to
+   owning crate → `cfg!(feature = "…")` / `#[cfg(feature)]` gate, off by default.
+   (Dropping *just* the OS sandbox is the `sandbox.mode = none` config, not a
+   feature; the full container profile is the feature.)
 4. **`agent.rs`** — clone the driving module from the closest bench; change only
    the config section and the framing. Keep the response/cost parsers verbatim
    (they're stable and unit-tested).
@@ -203,7 +218,7 @@ into `results/` so the report sits where the other benches' does), `pyproject.to
 ## Final checklist
 
 - [ ] `noop` + `oracle` + real arm; oracle ≈100% offline, no key needed for either floor/ceiling.
-- [ ] Dangerous bench capability is a fail-closed, off-by-default Cargo feature; normal build rejects it.
+- [ ] Bench-only *behavior hack* (if any) is a fail-closed, off-by-default Cargo feature (the Bash bench profile = `bench-bash`). Dropping just the OS sandbox is `sandbox.mode = none` config; a container bench uses both.
 - [ ] aura driven only via its binary (+ at most one concrete backend crate); no agent-stack linkage.
 - [ ] Self-contained `aura.json` + minted key + `rate_limit.max_requests = 1_000_000`.
 - [ ] Cost = `i64` micro-USD from the ledger (`RUST_LOG=off`, poll on `calls`); latency/tokens/cost surfaced per item.

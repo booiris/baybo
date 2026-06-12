@@ -2,7 +2,7 @@
 //!
 //! - **agent** — run aura inside each instance's eval image, capture `git diff`,
 //!   grade the predictions with the `swebench` harness. Needs the musl `aura`
-//!   (`--features bench-passthrough`), a model key, and pre-built images.
+//!   (static-musl, `--features bench-bash`), a model key, and pre-built images.
 //! - **oracle** — grade `--predictions_path gold` (the ceiling). No aura, no keys.
 //! - **noop** — grade empty patches (the floor). No aura, no keys.
 //!
@@ -73,7 +73,7 @@ struct Args {
     #[arg(long, num_args = 0..)]
     instance_ids: Vec<String>,
 
-    /// Host path of the `aura` binary built with `--features bench-passthrough`
+    /// Host path of the `aura` binary built `--features bench-bash` (static-musl)
     /// (musl-static recommended). Required for the agent arm.
     #[arg(long)]
     aura_bin: Option<PathBuf>,
@@ -280,10 +280,9 @@ async fn run_agent(
     instances: &[SweInstance],
     run_id: &str,
 ) -> Result<HashMap<String, agent::InstanceRun>> {
-    let aura_bin = args
-        .aura_bin
-        .as_ref()
-        .context("the agent arm requires --aura-bin (the `--features bench-passthrough` build)")?;
+    let aura_bin = args.aura_bin.as_ref().context(
+        "the agent arm requires --aura-bin (the `--features bench-bash` static-musl build)",
+    )?;
     if !aura_bin.exists() {
         bail!("aura binary not found at {}", aura_bin.display());
     }
