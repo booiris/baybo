@@ -190,7 +190,7 @@ bench-readonly-memory = ["aura-memory/bench-readonly-memory"]
 # identity-repo `git init` (aura-workspace) so a bench container needs no `git`
 # on PATH. Distinct from the `sandbox.mode = none` config (which only drops the
 # OS sandbox but keeps uv + the work/ jail). Off by default; absent in every
-# prod build. For bench/swe + bench/terminal.
+# prod build. For bench/swe + bench/terminal-bench-1.0.
 bench-bash = ["aura-tools/bench-bash", "aura-workspace/bench-bash"]
 
 [dependencies]

@@ -47,7 +47,7 @@ isn't supported yet). One command — [`run.sh`](run.sh) builds the binary if it
 missing, loads `.env`, and runs the harness:
 
 ```bash
-cd bench/terminal
+cd bench/terminal-bench-1.0
 cp .env.example .env && $EDITOR .env   # set the API key (+ optional model/base_url)
 
 ./run.sh                               # defaults: gemini-2.5-flash, core 0.1.1, all tasks

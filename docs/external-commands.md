@@ -24,7 +24,7 @@ musl build), `tmux` (`aura-term-harness` tests).
 
 ## Bench environment (`bench-bash` + `sandbox.mode = none`)
 
-The in-container benches (`bench/swe`, `bench/terminal`) run the real agent
+The in-container benches (`bench/swe`, `bench/terminal-bench-1.0`) run the real agent
 *inside* each task's disposable container. Two mechanisms adapt aura to that:
 
 - **Build with `--features bench-bash`** — compiles the bench-only agent prompt
