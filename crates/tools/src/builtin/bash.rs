@@ -60,18 +60,17 @@ use super::bash_judge::{PostFail, PreExec, judge_post_fail, judge_pre_exec};
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_KIB: usize = MAX_OUTPUT_BYTES / 1024;
 
-/// Shared Bash tool description. Three sections vary by execution mode —
-/// `{{isolation}}` (OS sandbox vs direct passthrough), `{{work_dir_scope}}`
-/// (work-dir jail vs container working dir), and `{{python_runtime}}` (uv-shimmed
-/// vs the container's native `python`/`pip`) — substituted by
-/// [`render_description`] along with `{{max_output_kib}}`, `{{work_dir}}`, and
-/// `{{platform}}`. Everything else is identical in both modes on purpose: the
-/// passthrough (benchmark) agent then sees the same contract as production, so
-/// its behavior stays comparable. Work-dir/platform live here, not the system
-/// prompt, so they sit next to the tool that consumes them.
+/// Shared Bash tool description. Four sections vary by sandbox mode —
+/// `{{isolation}}` (the FS/network surface), `{{approval}}` (the gate),
+/// `{{work_dir_scope}}` (writability), and `{{python_runtime}}` (uv-shimmed vs
+/// native) — substituted by [`render_description`] along with `{{max_output_kib}}`,
+/// `{{work_dir}}`, and `{{platform}}`. Each varying section describes ONLY its own
+/// concern so a mode swap re-skins exactly what changed and nothing is said
+/// twice. Work-dir/platform live here, not the system prompt, so they sit next
+/// to the tool that consumes them.
 const DESCRIPTION_TEMPLATE: &str = r#"Execute a shell command in a fresh `sh -c` process. Environment changes and `cd` do not persist across invocations. Each of stdout and stderr is truncated at {{max_output_kib}} KiB.
 
-IMPORTANT: Do NOT use Bash for tasks that have a dedicated tool:
+Reserve Bash for system commands, git operations, build/test, and terminal tasks that require shell execution. Do NOT use it for tasks with a dedicated tool:
 - File-content viewers (`cat`, `head`, `tail`, `less`, `more`, `tac`) and file-driven text processors (`sed`, `awk`) are REJECTED at this layer when invoked as the leading command — use `Read` for content (`offset`/`limit` cover head/tail), `Edit` for in-place changes (safer than `sed -i`). Stream-mode `sed`/`awk` AFTER a pipe is fine (e.g. `git log | sed 's/.../.../'`) — only `sed <file>` / `awk <file>` is blocked.
 - To write files use `Write` (not echo/cat with redirection)
 - To search file names use `Glob` (not find/ls)
@@ -97,7 +96,7 @@ ENVIRONMENT:
 - Platform: {{platform}}"#;
 
 /// `{{isolation}}` for the default OS-sandboxed build (bwrap/sandbox-exec).
-const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Aura state dir under `~/.aura`/`$AURA_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled. If the sandbox refuses a command, a prompt offers an unsandboxed retry."#;
+const SANDBOXED_ISOLATION: &str = r#"SANDBOX: The shell runs with read+write access to the project workspace and `$HOME` (FHS roots `/usr`, `/bin`, `/etc`, … stay readable; nothing outside that union is visible — no full host-root bind). Credential vaults inside `$HOME` (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and the Aura state dir under `~/.aura`/`$AURA_HOME`) are masked with empty tmpfs and look empty inside the sandbox. Host raw devices stay unreachable (`/dev` is a minimal devtmpfs). Network is enabled."#;
 
 /// `{{work_dir_scope}}` for the default OS-sandboxed build (Bash jailed to `work/`).
 const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Bash writes only inside the workspace work directory ({{work_dir}}). The read-only `skills/` subtree is the one exception you may name in a command — an installed skill's bundled script can be executed in place from there (writes to it still fail). Any other absolute path argument under the workspace root but outside `work/` and `skills/` (the sibling subtrees `profile/`, `config/`, `state/`, `logs/`, `.key/`) is rejected up front, and `cwd` is held to the work-dir rule. Use the dedicated tools (Read, Edit, Write, …) when you genuinely need to read or modify those subtrees; everything else stays under {{work_dir}}."#;
@@ -105,9 +104,9 @@ const SANDBOXED_WORK_DIR_SCOPE: &str = r#"WORK-DIR SCOPE: Bash writes only insid
 /// `{{python_runtime}}` for the default OS-sandboxed build (uv-shimmed python).
 const SANDBOXED_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are shimmed to `uv run python` / `uv pip` inside this shell. For one-file scripts with third-party deps, declare them via PEP 723 inline metadata (`# /// script` block) so `uv run --script my.py` resolves them per-call. The shims are shell functions scoped to the outer `sh -c` — `bash -c '…'` subshells, `/usr/bin/python`, and Python's own `subprocess` calls bypass them."#;
 
-/// `{{isolation}}` for `sandbox.mode = none`: only the OS sandbox is dropped —
-/// the tool layer still confines Bash to `work/` and still uv-shims python.
-const NONE_ISOLATION: &str = r#"SANDBOX: The OS sandbox is OFF — commands run directly via `sh -c` on the host (no bwrap, no credential-vault masking, no resource caps). The tool layer still confines Bash to the workspace work directory (absolute paths outside it are rejected) and `python`/`pip` are still uv-shimmed. Network is enabled."#;
+/// `{{isolation}}` for `sandbox.mode = none`: only the OS sandbox is dropped (the
+/// work-dir jail and uv shim still apply — described by their own sections).
+const NONE_ISOLATION: &str = r#"SANDBOX: The OS sandbox is OFF — commands run directly via `sh -c` on the host: no bwrap, no credential-vault masking, no resource caps, and the host filesystem is reachable. Network is enabled."#;
 
 /// The three sections for the `bench-bash` build profile (compiled only into a
 /// benchmark binary): aura runs inside an already-isolated container, so there
@@ -122,14 +121,11 @@ const BENCH_PYTHON: &str = r#"PYTHON: `python`, `python3`, and `pip` are the hos
 /// `{{approval}}` per mode. Sandboxed AND none use the static destructive-token
 /// gate; auto's LLM risk judge governs destructive commands + failure
 /// escalation; the bench profile has no gate at all.
-const SANDBOXED_APPROVAL: &str = r#"APPROVAL: Commands run without prompting by default. The pre-execution approval gate only fires when the command tokens contain a file-delete (`rm`, `rmdir`, `unlink`, `shred`, `srm`, `wipe`, or `find … -delete`) or a destructive `git` operation (`clean -f`, `reset --hard`, `branch -d`/`-D`/`--delete`, `tag -d`, `push -f`/`--force`/`--force-with-lease`/`--delete`/`-d`, `stash drop`/`clear`, `worktree remove`, `update-ref -d`, `filter-branch`, `filter-repo`).
-Reserve Bash for system commands, git operations, build/test, and terminal tasks that require shell execution."#;
+const SANDBOXED_APPROVAL: &str = r#"APPROVAL: Commands run without prompting by default. The pre-execution approval gate only fires when the command tokens contain a file-delete (`rm`, `rmdir`, `unlink`, `shred`, `srm`, `wipe`, or `find … -delete`) or a destructive `git` operation (`clean -f`, `reset --hard`, `branch -d`/`-D`/`--delete`, `tag -d`, `push -f`/`--force`/`--force-with-lease`/`--delete`/`-d`, `stash drop`/`clear`, `worktree remove`, `update-ref -d`, `filter-branch`, `filter-repo`)."#;
 
-const AUTO_APPROVAL: &str = r#"APPROVAL: Commands run without prompting by default. A destructive command (file-delete or a history-rewriting `git` op) is risk-judged before it runs — judged safe, it runs sandboxed unprompted; judged risky, you are asked. If a command fails inside the sandbox, the failure may be re-judged: when it looks caused by the sandbox AND safe, it is re-run outside the sandbox automatically; when risky, you are asked. Output from an unsandboxed re-run carries a `sandbox_escalation` field.
-Reserve Bash for system commands, git operations, build/test, and terminal tasks that require shell execution."#;
+const AUTO_APPROVAL: &str = r#"APPROVAL: Commands run without prompting by default. A destructive command (file-delete or a history-rewriting `git` op) is risk-judged before it runs — judged safe, it runs sandboxed unprompted; judged risky, you are asked. If a command fails inside the sandbox, the failure may be re-judged: when it looks caused by the sandbox AND safe, it is re-run outside the sandbox automatically; when risky, you are asked. Output from an unsandboxed re-run carries a `sandbox_escalation` field."#;
 
-const BENCH_APPROVAL: &str = r#"APPROVAL: Commands run directly with no approval gate.
-Reserve Bash for system commands, git operations, build/test, and terminal tasks that require shell execution."#;
+const BENCH_APPROVAL: &str = r#"APPROVAL: Commands run directly with no approval gate."#;
 
 /// Compile-time switch for the bench profile (the `bench-bash` feature). When
 /// true, the Bash tool ignores `sandbox.mode` for execution shape and always
