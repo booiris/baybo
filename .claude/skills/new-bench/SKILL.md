@@ -1,12 +1,12 @@
 ---
 name: new-bench
-description: Scaffold a new benchmark under bench/ for measuring the real Aura agent, following the shared conventions of bench/swe, bench/memory, and bench/terminal-bench-1.0. Use when the user wants to add a benchmark, eval, or leaderboard harness for aura.
+description: Scaffold a new benchmark under bench/ for measuring the real Aura agent, following the shared conventions of bench/swe, bench/memory, bench/terminal-bench-1.0, and bench/terminal-bench-2.0. Use when the user wants to add a benchmark, eval, or leaderboard harness for aura.
 argument-hint: "[what the bench measures, e.g. 'GAIA web-agent tasks']"
 ---
 
 # Add a new Aura benchmark
 
-You are scaffolding a new benchmark under `bench/<name>/`. Aura already has three,
+You are scaffolding a new benchmark under `bench/<name>/`. Aura already has four,
 and they share a deliberate skeleton — **reuse it; do not reinvent it.** This skill
 captures the cross-cutting decisions and invariants so a new bench is faithful,
 safe-to-merge, and consistent with the others on day one.
@@ -17,7 +17,8 @@ safe-to-merge, and consistent with the others on day one.
 | --- | --- | --- | --- | --- |
 | `bench/swe` | self-hosted Rust harness | **`docker run` per item**, `aura prompt` inside each official eval image | official `swebench` Python harness (shelled out) | `bench-bash` feature + `sandbox.mode=none` · static musl |
 | `bench/memory` | self-hosted Rust harness | **`aura gateway` once per arm**, concurrent `aura prompt` over it | LLM-as-judge (`deepseek`) + deterministic F1 | `bench-readonly-memory` (Cargo feature) |
-| `bench/terminal-bench-1.0` | **adapter into an external official harness** (no Rust crate, no fork) | `aura prompt` inside the harness's task container, over tmux | the external harness's own pytest | `bench-bash` feature + `sandbox.mode=none` · static musl |
+| `bench/terminal-bench-1.0` | **adapter into an external official harness** (legacy `tb` CLI; no Rust crate, no fork) | `aura prompt` inside the harness's task container, over tmux | the external harness's own pytest | `bench-bash` feature + `sandbox.mode=none` · static musl |
+| `bench/terminal-bench-2.0` | **adapter into an external official harness** (Harbor framework; no Rust crate, no fork) | `aura prompt` via a `BaseInstalledAgent` (`upload_file`s musl + `aura.json`) inside Harbor's task container | Harbor's own per-trial verifier (pytest → CTRF/`reward.txt`) | `bench-bash` feature + `sandbox.mode=none` · static musl |
 
 `reference.md` (next to this file) holds the copy-paste boilerplate: the
 `run-bench.sh` skeleton, the self-contained `aura.json` shapes, the exact `aura`
@@ -61,7 +62,7 @@ valid framings, or there's a cost/scope tradeoff only the user can weigh.
 
 ## Invariants (the extracted commonality — keep all of them)
 
-These hold across all three benches. A new bench that drops one is wrong.
+These hold across all four benches. A new bench that drops one is wrong.
 
 1. **Arms = `noop` (floor) + `oracle` (ceiling) + the real arm(s).** `noop` and
    `oracle` need **no aura build and no API key**, so they validate the entire
@@ -163,6 +164,26 @@ These hold across all three benches. A new bench that drops one is wrong.
     `<item>.trace.json`, so a trace is self-describing (pass/fail + details)
     without cross-referencing `results/`.
 
+12. **Cross-run consolidation — collapse the time-split into one scoreboard.**
+    Every invocation mints a fresh `runs/<id>/` and `latest` shows only the newest,
+    so a dataset finished across several runs (e.g. retrying infra-flaky items) ends
+    up split across timestamps with no single "how did the whole set do" view. A
+    `consolidate` step folds **all** runs into one: per item keep the **best attempt**
+    across runs — resolved > graded-but-failed > never-graded (infra) — tie-broken by
+    the newest run, and **recover the never-graded items** (env-start timeout,
+    image-pull failure) by scanning `runs/<id>/` + its `exception.txt`, so the
+    denominator is the true *attempted* set, not just the graded one. Emit
+    `results/merged.json` (one entry per item + `source_run` provenance + summary
+    counts) and a real `trace/merged/` tree built with **hardlinks** — real files,
+    zero extra disk, and the data outlives a later `rm` of a per-run `trace/<id>/`
+    (copy-fallback only when cross-device). Run it **automatically at the end** of
+    `run-bench.sh` / `run.sh`, best-effort so a merge hiccup never masks the run's
+    exit code. Benches with an **arm** dimension (`swe`, `memory`) merge *within* each
+    arm and emit one scoreboard per arm — `results/merged-<arm>.json` +
+    `trace/merged/<arm>/`; for a continuous metric (memory's f1) "best" = highest
+    score, not a binary resolved. Templates: `bench/terminal-bench-2.0/consolidate.sh`
+    (per-task, dir-tree trace) and `bench/swe/consolidate.sh` (per-arm, flat-file trace).
+
 ---
 
 ## Layout (self-hosted Rust shape — clone `swe` or `memory`)
@@ -195,7 +216,8 @@ musl binary + a rendered `aura.json`, run `aura prompt --json -y`),
 `run.sh` (build the musl binary if missing, load `.env`, run the harness's
 `run --agent-import-path …`, then surface its `results.json` from `runs/<ts>/`
 into `results/` so the report sits where the other benches' does), `pyproject.toml`
-(uv, pin to the harness's Python range). See `bench/terminal-bench-1.0/`.
+(uv, pin to the harness's Python range). See `bench/terminal-bench-1.0/` (legacy
+`tb` CLI, over tmux) and `bench/terminal-bench-2.0/` (Harbor, `BaseInstalledAgent`).
 
 ---
 
@@ -237,6 +259,7 @@ into `results/` so the report sits where the other benches' does), `pyproject.to
 - [ ] Cost = `i64` micro-USD from the ledger (`RUST_LOG=off`, poll on `calls`); latency/tokens/cost surfaced per item.
 - [ ] Trace export on by default (`NO_TRACE=1` opts out): per item → `trace/<run_id>/<arm>/<item>.{messages,trace}.json` via `aura session history/export`; in-container benches export before teardown.
 - [ ] `RUN_ID=$(date +%Y-%m-%d__%H-%M-%S)`; refresh `latest` pointers (`trace/latest` up front, `results/latest-<arm>.json`, `runs/latest`); co-locate each item's outcome as `<item>.result.json` next to its trace.
+- [ ] Cross-run consolidation: a `consolidate` step (auto-run at the end of the driver, best-effort) folds all runs into `results/merged.json` (best-per-item + provenance, never-graded infra items recovered) + a hardlinked `trace/merged/`. Template: `bench/terminal-bench-2.0/consolidate.sh`.
 - [ ] Scope keys are `{bench}-{run_id}-{arm}-conv{N}`.
 - [ ] API key by name only — never in argv or written to disk.
 - [ ] `Cargo.toml`: `publish=false`, `[lib] doctest=false`, workspace deps, "NOT a CI target" header; `lib.rs` has unit tests and no heavy deps.

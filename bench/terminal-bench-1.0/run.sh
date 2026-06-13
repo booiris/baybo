@@ -12,6 +12,8 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
+# shellcheck source=../progress.sh
+. "$here/../progress.sh"
 bin="$root/target/x86_64-unknown-linux-musl/release/aura"
 
 # Build the musl binary when it's missing (or AURA_REBUILD
@@ -78,6 +80,7 @@ PY
 }
 
 prev_run="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
+mon_start="$(date +%s)"
 ( linked=0
   while :; do
     cur="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
@@ -87,6 +90,9 @@ prev_run="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
         ln -sfn "$b" runs/latest; mkdir -p trace; ln -sfn "$b" trace/latest; linked=1
       fi
       sync_outcomes "$b"
+      # tb renders its own UI; this is a coarse count of per-task dirs it has created
+      # (total isn't known to the shell, so count + elapsed, not a %bar).
+      progress_render tb 0 "$(find "runs/$b" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)" "$mon_start"
     fi
     sleep 15
   done ) &
@@ -119,5 +125,8 @@ if [ -n "$latest" ] && [ -f "${latest}results.json" ]; then
   ln -sfn "results-$base.json" results/latest.json
   [ -d "trace/$base" ] && ln -sfn "$base" trace/latest
   echo "==> report: results/results-$base.json  (runs/latest · results/latest.json · trace/latest)" >&2
+  # Fold every run (incl. this one) into one cross-run scoreboard. Best-effort:
+  # a merge hiccup must not mask tb's exit code.
+  ./consolidate.sh || echo "==> consolidate failed (non-fatal); rerun ./consolidate.sh by hand" >&2
 fi
 exit "$rc"
