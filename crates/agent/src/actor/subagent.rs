@@ -79,7 +79,7 @@ pub async fn await_subagent_terminal(
                             warn!(
                                 session_id = %child_session_id,
                                 skipped = n,
-                                "subagent waiter lagged on terminal-event bus, reconciling via store"
+                                "subagent waiter lagged on lifecycle-event bus, reconciling via store"
                             );
                             if let Some(kind) = check_child_terminal_via_store(
                                 &job_lifecycle,
@@ -94,7 +94,7 @@ pub async fn await_subagent_terminal(
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             return Err(SubagentExitStatus::Failed {
-                                reason: "job lifecycle terminal-event bus closed".into(),
+                                reason: "job lifecycle-event bus closed".into(),
                             });
                         }
                     }

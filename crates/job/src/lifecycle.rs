@@ -311,6 +311,22 @@ impl JobLifecycle {
             .collect()
     }
 
+    /// Non-terminal jobs for one session that represent user-visible
+    /// turn activity. This centralizes the `JobKind::is_turn` filter so
+    /// callers such as `/stop`, crash recovery, and TurnState projection
+    /// do not each re-define "active reply" for themselves.
+    pub async fn list_active_turns_by_session(
+        &self,
+        session_id: &aura_model::SessionId,
+    ) -> Result<Vec<Job>> {
+        Ok(self
+            .list_active_by_session(session_id)
+            .await?
+            .into_iter()
+            .filter(|j| j.kind.is_turn())
+            .collect())
+    }
+
     /// When the session has a turn in flight (a non-terminal turn-kind
     /// job — see [`JobKind::is_turn`]), the instant it started. Chat
     /// surfaces use this to tell a late-joining client "a reply is being
@@ -321,10 +337,9 @@ impl JobLifecycle {
         &self,
         session_id: &aura_model::SessionId,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-        let jobs = self.list_active_by_session(session_id).await?;
+        let jobs = self.list_active_turns_by_session(session_id).await?;
         Ok(jobs
             .into_iter()
-            .filter(|j| j.kind.is_turn())
             .map(|j| j.started_at.unwrap_or(j.created_at))
             .max())
     }
@@ -408,7 +423,7 @@ impl JobLifecycle {
 mod tests {
     use super::*;
     use crate::test_support::MemoryJobStore;
-    use aura_model::ContentBlock;
+    use aura_model::{BackgroundCompressionPayload, ContentBlock};
 
     fn user_chat_input() -> JobInput {
         JobInput::UserChat {
@@ -545,6 +560,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, JobError::KindMismatch(_)));
+    }
+
+    #[tokio::test]
+    async fn active_turns_exclude_system_jobs() {
+        let lc = make_lifecycle();
+        let session_id = SessionId::from("s1");
+        let turn = lc
+            .start_job(
+                session_id.clone(),
+                TriggerKind::User,
+                user_chat_input(),
+                None,
+            )
+            .await
+            .unwrap();
+        lc.start(&turn.id).await.unwrap();
+        let system = lc
+            .start_job(
+                session_id.clone(),
+                TriggerKind::System,
+                JobInput::System {
+                    payload: BackgroundCompressionPayload { up_to_ordinal: 7 },
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        lc.start(&system.id).await.unwrap();
+
+        let all_active = lc.list_active_by_session(&session_id).await.unwrap();
+        assert_eq!(all_active.len(), 2);
+
+        let turns = lc.list_active_turns_by_session(&session_id).await.unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].id, turn.id);
+        assert_eq!(
+            lc.active_turn_started_at(&session_id).await.unwrap(),
+            turns[0].started_at
+        );
     }
 
     #[tokio::test]

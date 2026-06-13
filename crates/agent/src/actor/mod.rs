@@ -5,6 +5,7 @@
 
 pub mod mailbox;
 pub mod router;
+pub mod runner;
 pub mod state;
 pub mod subagent;
 pub mod supervisor;

@@ -114,9 +114,10 @@ in a window where the live signal and the snapshot disagree: from the instant
 the `Pending` row exists the snapshot reads active, and the `Started` broadcast
 refines `started_at` moments later.
 
-A panicked actor is reaped by `spawn_actor_with_crash_reaper`: it cancels the
-orphaned turn jobs, which fires terminal events, which the projector turns into
-the close edge — no special-case broadcast in the watchdog.
+A panicked actor is watched by `actor::runner::spawn_actor`: it delegates to
+`recover_panicked_actor_session`, which closes the orphan trace rows and cancels
+the orphaned turn jobs. Those terminal job events are what the projector turns
+into the close edge — no special-case `TurnState` broadcast in the runner.
 
 - **Web client**: `SessionView.turn` records the latest signal;
   `applyTurnState` reconciles the transcript tail (re-opens the

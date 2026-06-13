@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `job` crate is the home for the Job concept: domain types (`Job`, `JobStatus`, `JobKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, `JobError`), the row conversions that persist them, and the `JobLifecycle` persistence orchestrator. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself; `JobLifecycle` wraps the `JobStore` with the cancel state machine, terminal-event bus, and `JobId → CancellationToken` registry the in-flight execution path subscribes to.
+The `job` crate is the home for the Job concept: domain types (`Job`, `JobStatus`, `JobKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, `JobError`), the row conversions that persist them, and the `JobLifecycle` persistence orchestrator. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself; `JobLifecycle` wraps the `JobStore` with the cancel state machine, lifecycle-event bus, and `JobId → CancellationToken` registry the in-flight execution path subscribes to.
 
 The `JobStore` trait itself lives in the `aura-store` ports crate and trades in row DTOs — `JobRow` (the queryable columns plus the serialized `Job` in `data`) and `JobTransitionRow`. This crate owns the `Job::to_row` / `Job::from_row` conversions, so the state machine stays here while the trait sits in a leaf crate every store consumer can reach. `aura-storage` provides the libsql implementation, shuttling rows without depending on `aura-job` (it converts in its tests only). `impl From<aura_store::StorageError> for JobError` bridges errors at the call sites.
 
@@ -34,7 +34,10 @@ Every transition is validated strictly. Illegal transitions return errors, never
 
 `Cancelled` carries a `reason: CancelReason` (`UserPreempt`, `SystemCrash`, `SubagentTimeout`, `ParentCancelled`, `ParentDeleted`, `OperatorCancel`, `UserStopped`) and `partial_artifacts: Vec<SpanId>` — the spans that completed (or partially completed) before the cancel. Both fields are nested **inside** the `JobStatus::Cancelled { reason, partial_artifacts }` variant; the top-level `Job` exposes `emitted_span_ids` for general progress indexing. The next job's prompt-assembly step reads `partial_artifacts` and renders a "previously completed steps:" preamble so the LLM has context. Content lives only in the trace; the field is indices.
 
-`SystemCrash` is reserved for a future restart-recovery scan — there is no production code path that mints it today.
+`SystemCrash` is used when Aura owns the cleanup after execution disappeared:
+the boot recovery sweep rolls jobs left non-terminal by a prior process death to
+`Cancelled { SystemCrash }`, and the in-process actor panic runner does the same
+for the panicked session's active turn jobs.
 
 ### Job kind mirrors session trigger
 
@@ -70,12 +73,24 @@ This keeps the state machine invariants co-located with the type and makes them 
 
 `JobLifecycle` does only: load from store → call `job.transition()` → `store.save()` + `store.record_transition()`. No state machine logic in the orchestrator. It additionally owns:
 
-- A `tokio::sync::broadcast` bus that publishes a `JobTerminalEvent` (id, session, parent, terminal kind) on every `Completed | Failed | Cancelled` transition. Subscribers (subagent runtime, admin UI) wait on this without polling the store. Lagging subscribers must reconcile via `list_by_session` — a dropped event is not re-published.
+- A `tokio::sync::broadcast` bus that publishes a `JobLifecycleEvent` (id, session, parent, phase) on `Pending → InProgress` and on every `Completed | Failed | Cancelled` transition. Subscribers either wait for terminal phases (subagent runtime) or treat every phase as a recompute trigger (TurnState projection). Lagging subscribers must reconcile via store reads such as `list_by_session` / `active_turn_started_at` — a dropped event is not re-published.
 - A `JobCancellationRegistry` mapping `JobId → CancellationToken` for in-flight jobs. `JobLifecycle::cancel` trips the registered token *before* flipping the row, so the running execution observes the cancel before terminal-state observers do. `register_running` returns a RAII `JobCancellationGuard` that unregisters on drop, so an early `?` from the agent loop can't leak entries.
 
-### Restart recovery
+### Recovery
 
-Not implemented yet. The state-machine and storage shape leave room for it (`Stuck` is non-terminal; `JobStatus::Cancelled.partial_artifacts` indexes spans that the next job should preamble-render), but there is currently no production code path that scans non-terminal jobs at startup or rewrites half-open spans. A crash leaves jobs and spans in their last-persisted state until an operator cancels them via the admin API.
+The state-machine and storage shape support recovery of non-terminal jobs
+(`Pending` / `InProgress` / `Stuck`). `aura_agent::recovery` owns the cross-table
+repair because it has both job and trace stores:
+
+- Boot recovery scans all non-terminal jobs from the prior process, closes any
+  half-open trace rows at the last observed activity time, and calls
+  `JobLifecycle::cancel_at(..., SystemCrash, ...)`.
+- Actor panic recovery scans only the panicked session's active turn jobs,
+  closes their half-open trace rows at the actor crash time, and cancels them as
+  `SystemCrash`.
+
+`JobStatus::Cancelled.partial_artifacts` remains the resume hook for spans that
+completed before cancellation; content itself lives in trace.
 
 ### Job hierarchy
 

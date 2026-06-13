@@ -4,7 +4,7 @@
 //! Domain types (`Job`, `JobStatus`, `JobKind`, `CancelReason`,
 //! `JobError`) and the `JobLifecycle` persistence orchestrator both
 //! live here; the orchestrator wraps a `JobStore` with the cancel
-//! state machine, terminal-event bus, and `JobId → CancellationToken`
+//! state machine, lifecycle-event bus, and `JobId → CancellationToken`
 //! registry that the in-flight execution path subscribes to.
 
 mod cancel;
