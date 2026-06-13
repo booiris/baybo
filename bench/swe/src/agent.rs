@@ -87,6 +87,7 @@ pub struct InstanceRun {
     pub patch: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_input_tokens: u64,
     pub cost_micro_usd: i64,
     /// Wall time of the `aura prompt` turn (the agent's actual work).
     pub latency_ms: u64,
@@ -100,6 +101,7 @@ impl InstanceRun {
             patch: String::new(),
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
             cost_micro_usd: 0,
             latency_ms: 0,
             error: Some(error),
@@ -326,7 +328,7 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
     };
 
     // 5. Read the turn's cost from aura's ledger (best-effort → zeros).
-    let (input_tokens, output_tokens, cost_micro_usd) = match read_cost(
+    let (input_tokens, output_tokens, cached_input_tokens, cost_micro_usd) = match read_cost(
         opts.docker_bin,
         name,
         &opts.session_id,
@@ -336,7 +338,7 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(instance = %instance.instance_id, error = %e, "cost read failed; zeros");
-            (0, 0, 0)
+            (0, 0, 0, 0)
         }
     };
 
@@ -358,13 +360,14 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
         patch,
         input_tokens,
         output_tokens,
+        cached_input_tokens,
         cost_micro_usd,
         latency_ms,
         error: prompt_error.take(),
     })
 }
 
-async fn read_cost(docker_bin: &str, name: &str, session: &str) -> Result<(u64, u64, i64)> {
+async fn read_cost(docker_bin: &str, name: &str, session: &str) -> Result<(u64, u64, u64, i64)> {
     let out = docker(
         docker_bin,
         &[
@@ -559,9 +562,10 @@ fn prompt_output_error(stdout: &str) -> Option<String> {
     None
 }
 
-/// Parse `(input_tokens, output_tokens, cost_micro_usd)` from `aura cost show
-/// --json`; tolerates leading log lines (parse from the first `{`).
-fn parse_cost_summary(stdout: &str) -> Result<(u64, u64, i64)> {
+/// Parse `(input_tokens, output_tokens, cached_input_tokens, cost_micro_usd)`
+/// from `aura cost show --json`; tolerates leading log lines (parse from the
+/// first `{`).
+fn parse_cost_summary(stdout: &str) -> Result<(u64, u64, u64, i64)> {
     let start = stdout
         .find('{')
         .with_context(|| format!("no JSON in aura cost output: {}", err_tail(stdout)))?;
@@ -580,7 +584,12 @@ fn parse_cost_summary(stdout: &str) -> Result<(u64, u64, i64)> {
         .get("cost_micro_usd")
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(0);
-    Ok((u("input_tokens"), u("output_tokens"), cost))
+    Ok((
+        u("input_tokens"),
+        u("output_tokens"),
+        u("cached_input_tokens"),
+        cost,
+    ))
 }
 
 fn err_tail(s: &str) -> String {
@@ -657,8 +666,8 @@ mod tests {
 
     #[test]
     fn parses_cost_summary_with_leading_logs() {
-        let out = "INFO some log\n{\"scope\":{},\"summary\":{\"cost_micro_usd\":1234,\"calls\":2,\"input_tokens\":40,\"output_tokens\":8}}";
-        assert_eq!(parse_cost_summary(out).unwrap(), (40, 8, 1234));
+        let out = "INFO some log\n{\"scope\":{},\"summary\":{\"cost_micro_usd\":1234,\"calls\":2,\"input_tokens\":40,\"output_tokens\":8,\"cached_input_tokens\":32}}";
+        assert_eq!(parse_cost_summary(out).unwrap(), (40, 8, 32, 1234));
     }
 
     #[test]

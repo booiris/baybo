@@ -52,6 +52,11 @@ for rf in sorted(glob.glob(f"{RESULTS}/results-*.json")):
             "reward": e.get("reward"),
             "failure_mode": e.get("failure_mode"),
             "parser_results": e.get("parser_results", {}),
+            "total_input_tokens": e.get("total_input_tokens") or 0,
+            "total_output_tokens": e.get("total_output_tokens") or 0,
+            "total_cached_input_tokens": e.get("total_cached_input_tokens") or 0,
+            "trial_started_at": e.get("trial_started_at"),
+            "trial_ended_at": e.get("trial_ended_at"),
             "task": task,
         })
 
@@ -88,7 +93,10 @@ for td in sorted(glob.glob(f"{RUNS}/*/*/")):
     task = trial.rsplit("__", 1)[0]
     cands.setdefault(task, []).append({
         "base": base, "trial": trial, "tier": TIER_INFRA, "reward": None,
-        "failure_mode": infra_kind(td), "parser_results": {}, "task": task,
+        "failure_mode": infra_kind(td), "parser_results": {},
+        "total_input_tokens": 0, "total_output_tokens": 0,
+        "total_cached_input_tokens": 0,
+        "trial_started_at": None, "trial_ended_at": None, "task": task,
     })
 
 # 3) pick the best candidate per task; (re)build the trace/merged tree.
@@ -132,6 +140,11 @@ for task in sorted(cands):
         "source_run": base,
         "attempts_seen": len(cands[task]),
         "parser_results": best["parser_results"],
+        "total_input_tokens": best.get("total_input_tokens") or 0,
+        "total_output_tokens": best.get("total_output_tokens") or 0,
+        "total_cached_input_tokens": best.get("total_cached_input_tokens") or 0,
+        "trial_started_at": best.get("trial_started_at"),
+        "trial_ended_at": best.get("trial_ended_at"),
         "trace_path": trace_path,
     })
     by_source[base] = by_source.get(base, 0) + 1

@@ -120,6 +120,41 @@ if [ -n "$latest" ] && [ -f "${latest}results.json" ]; then
   sync_outcomes "$base"
   mkdir -p results
   cp "${latest}results.json" "results/results-$base.json"
+  # tb reports 0 tokens for installed agents; recover real usage (incl. cached
+  # input) from each task's agent trace and inject it into the results file.
+  python3 - "$base" <<'PY'
+import json, os, sys
+b = sys.argv[1]
+rf = f"results/results-{b}.json"
+try:
+    data = json.load(open(rf))
+except Exception:
+    sys.exit(0)
+def sums(task, trial):
+    tj = f"trace/{b}/{task}/{trial}/agent-logs/trace.json"
+    tin = tout = tcache = 0
+    if task and trial and os.path.exists(tj):
+        try:
+            for job in json.load(open(tj)).get("jobs", []):
+                for step in job.get("steps", []):
+                    for span in step.get("spans", []):
+                        k = span.get("kind", {})
+                        if k.get("kind") == "llm_call":
+                            r = k.get("result") or {}
+                            tin += r.get("input_tokens") or 0
+                            tout += r.get("output_tokens") or 0
+                            tcache += r.get("cached_input_tokens") or 0
+        except Exception:
+            pass
+    return tin, tout, tcache
+for it in data.get("results", []):
+    tin, tout, tcache = sums(it.get("task_id"), it.get("trial_name"))
+    if tin or tout:
+        it["total_input_tokens"] = tin
+        it["total_output_tokens"] = tout
+        it["total_cached_input_tokens"] = tcache
+json.dump(data, open(rf, "w"), indent=2)
+PY
   # `latest` pointers to the newest run so you don't scan timestamps (gitignored).
   ln -sfn "$base" runs/latest
   ln -sfn "results-$base.json" results/latest.json

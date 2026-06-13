@@ -258,8 +258,8 @@ impl GatewayHandle {
     /// Read a question's whole-turn answer-side spend from the cost ledger via
     /// `aura cost show --session <id> --json`. Returns `(input, output, micro_usd)`;
     /// an empty session degrades to zeros (see [`COST_POLL_ATTEMPTS`]).
-    pub async fn session_cost(&self, session_id: &str) -> Result<(u64, u64, i64)> {
-        let mut last = (0u64, 0u64, 0i64);
+    pub async fn session_cost(&self, session_id: &str) -> Result<(u64, u64, u64, i64)> {
+        let mut last = (0u64, 0u64, 0u64, 0i64);
         for attempt in 0..COST_POLL_ATTEMPTS {
             let output = Command::new(&self.aura_bin)
                 .args(["cost", "show", "--session", session_id, "--json"])
@@ -280,9 +280,9 @@ impl GatewayHandle {
                     err_tail(&String::from_utf8_lossy(&output.stderr))
                 );
             }
-            let (input, output_tokens, cost, calls) =
+            let (input, output_tokens, cached, cost, calls) =
                 parse_cost_summary(&String::from_utf8_lossy(&output.stdout))?;
-            last = (input, output_tokens, cost);
+            last = (input, output_tokens, cached, cost);
             if calls > 0 {
                 return Ok(last);
             }
@@ -390,7 +390,7 @@ fn parse_response(stdout: &str) -> Result<String> {
 /// Parse `(input_tokens, output_tokens, cost_micro_usd, calls)` from
 /// `aura cost show --json` — pretty-printed JSON maybe after log lines, so parse
 /// from the first `{` to EOF; use integer `cost_micro_usd`, not the string.
-fn parse_cost_summary(stdout: &str) -> Result<(u64, u64, i64, u64)> {
+fn parse_cost_summary(stdout: &str) -> Result<(u64, u64, u64, i64, u64)> {
     let start = stdout
         .find('{')
         .with_context(|| format!("no JSON object in aura cost output: {}", err_tail(stdout)))?;
@@ -407,6 +407,7 @@ fn parse_cost_summary(stdout: &str) -> Result<(u64, u64, i64, u64)> {
     Ok((
         field_u64("input_tokens"),
         field_u64("output_tokens"),
+        field_u64("cached_input_tokens"),
         cost_micro_usd,
         field_u64("calls"),
     ))
@@ -455,18 +456,18 @@ mod tests {
     "cost_micro_usd": 1234,
     "calls": 2,
     "input_tokens": 40,
-    "cached_input_tokens": 0,
+    "cached_input_tokens": 30,
     "cache_creation_input_tokens": 0,
     "output_tokens": 8
   }
 }"#;
-        assert_eq!(parse_cost_summary(out).unwrap(), (40, 8, 1234, 2));
+        assert_eq!(parse_cost_summary(out).unwrap(), (40, 8, 30, 1234, 2));
     }
 
     #[test]
     fn cost_summary_tolerates_leading_log_lines() {
         let out = "2026-06-02T00:00:00Z INFO some tracing line\n{\"scope\":{\"session\":\"s\"},\"summary\":{\"cost_micro_usd\":500,\"calls\":1,\"input_tokens\":12,\"output_tokens\":3}}\n";
-        assert_eq!(parse_cost_summary(out).unwrap(), (12, 3, 500, 1));
+        assert_eq!(parse_cost_summary(out).unwrap(), (12, 3, 0, 500, 1));
     }
 
     #[test]

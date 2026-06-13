@@ -19,6 +19,8 @@ pub struct InstanceResult {
     pub latency_ms: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cached (prompt-cache-hit) share of `input_tokens`.
+    pub cached_input_tokens: u64,
     pub cost_micro_usd: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -47,6 +49,7 @@ pub struct RunReport {
     pub mean_latency_ms: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_input_tokens: u64,
     pub total_cost_micro_usd: i64,
     pub mean_input_tokens: f64,
     pub mean_output_tokens: f64,
@@ -85,6 +88,7 @@ pub fn aggregate(meta: ReportMeta, results: Vec<InstanceResult>) -> RunReport {
 
     let input_tokens: u64 = results.iter().map(|r| r.input_tokens).sum();
     let output_tokens: u64 = results.iter().map(|r| r.output_tokens).sum();
+    let cached_input_tokens: u64 = results.iter().map(|r| r.cached_input_tokens).sum();
     let total_cost_micro_usd: i64 = results.iter().map(|r| r.cost_micro_usd).sum();
     let per_instance = |total: f64| {
         if total_instances == 0 {
@@ -126,6 +130,7 @@ pub fn aggregate(meta: ReportMeta, results: Vec<InstanceResult>) -> RunReport {
         mean_latency_ms,
         input_tokens,
         output_tokens,
+        cached_input_tokens,
         total_cost_micro_usd,
         mean_input_tokens: per_instance(input_tokens as f64),
         mean_output_tokens: per_instance(output_tokens as f64),
@@ -187,6 +192,7 @@ mod tests {
             latency_ms: 100,
             input_tokens: 50,
             output_tokens: 10,
+            cached_input_tokens: 40,
             cost_micro_usd: cost,
             error: None,
         }

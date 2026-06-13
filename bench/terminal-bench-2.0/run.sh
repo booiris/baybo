@@ -96,8 +96,38 @@ for td in sorted(glob.glob(f"{job}/*/")):
                 shutil.copyfile(src, out)
             except Exception:
                 pass
+    # Token usage lives only in the aura trace's llm spans (Harbor's
+    # agent_result leaves n_*_tokens null), so sum it here. Agent wall-clock
+    # comes from Harbor's result.json (agent_execution, else trial-level).
+    tin = tout = tcache = 0
+    tj = os.path.join(td, "agent", "trace.json")
+    if os.path.exists(tj):
+        try:
+            for job in json.load(open(tj)).get("jobs", []):
+                for step in job.get("steps", []):
+                    for span in step.get("spans", []):
+                        k = span.get("kind", {})
+                        if k.get("kind") == "llm_call":
+                            res = k.get("result") or {}
+                            tin += res.get("input_tokens") or 0
+                            tout += res.get("output_tokens") or 0
+                            tcache += res.get("cached_input_tokens") or 0
+        except Exception:
+            pass
+    started = ended = None
+    if os.path.exists(rj):
+        try:
+            full = json.load(open(rj))
+            ex = full.get("agent_execution") or {}
+            started = ex.get("started_at") or full.get("started_at")
+            ended = ex.get("finished_at") or full.get("finished_at")
+        except Exception:
+            pass
     outcome = {"task_id": task, "trial_name": trial, "is_resolved": resolved,
-               "reward": reward, "failure_mode": failure_mode, "parser_results": parser}
+               "reward": reward, "failure_mode": failure_mode, "parser_results": parser,
+               "total_input_tokens": tin, "total_output_tokens": tout,
+               "total_cached_input_tokens": tcache,
+               "trial_started_at": started, "trial_ended_at": ended}
     json.dump(outcome, open(os.path.join(dst, "result.json"), "w"), indent=2)
     results.append({**outcome,
                     "trace_path": f"{base}/{task}/{trial}/agent-logs/trace.json"})

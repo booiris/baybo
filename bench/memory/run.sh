@@ -13,13 +13,13 @@
 # config + workspace (no aura.json needed); set AURA_CONFIG to derive from yours.
 #
 # Quick start — fill bench/memory/.env, then (floor vs ceiling, self-contained):
-#   bench/memory/run-bench.sh
+#   bench/memory/run.sh
 #
 # The real thing (OpenViking up at :1933; ingest runs automatically):
-#   ARMS="noop oracle openviking" bench/memory/run-bench.sh
+#   ARMS="noop oracle openviking" bench/memory/run.sh
 #
 # Preview the plan without spending (no keys/config needed):
-#   DRY_RUN=1 ARMS="noop oracle mem0 openviking" bench/memory/run-bench.sh
+#   DRY_RUN=1 ARMS="noop oracle mem0 openviking" bench/memory/run.sh
 #
 # Every UPPERCASE setting below is overridable from the environment.
 set -euo pipefail

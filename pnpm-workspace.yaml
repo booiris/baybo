@@ -3,3 +3,4 @@ packages:
   - "channel-src/*"
   - "tool-src/*"
   - "web"
+  - "bench/bench-web/web"

@@ -13,13 +13,13 @@
 # additionally needs a model key and a static-musl `aura` (built for you here).
 #
 # Quick start — offline floor vs ceiling on the first SWE-bench_Lite instance:
-#   bench/swe/run-bench.sh
+#   bench/swe/run.sh
 #
 # A few specific instances, all three arms (agent needs AURA_API_KEY):
-#   ARMS="noop oracle agent" INSTANCE_IDS="sympy__sympy-20590" bench/swe/run-bench.sh
+#   ARMS="noop oracle agent" INSTANCE_IDS="sympy__sympy-20590" bench/swe/run.sh
 #
 # Preview the plan (still needs swebench to resolve image keys, but no Docker/spend):
-#   DRY_RUN=1 ARMS="noop oracle agent" bench/swe/run-bench.sh
+#   DRY_RUN=1 ARMS="noop oracle agent" bench/swe/run.sh
 #
 # Every UPPERCASE setting below is overridable from the environment.
 set -euo pipefail

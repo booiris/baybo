@@ -93,7 +93,7 @@ struct Args {
 
     /// Directory to hold generated gateway configs + self-contained workspaces
     /// (one `aura-bench-ws-<run_id>-<arm>` each). Defaults to the system temp
-    /// dir; `run-bench.sh` points it under the (gitignored) bench dir.
+    /// dir; `run.sh` points it under the (gitignored) bench dir.
     #[arg(long)]
     workspace_root: Option<PathBuf>,
 
@@ -372,6 +372,7 @@ async fn main() -> Result<()> {
                             session_id: task.session_id.clone(),
                             input_tokens: 0,
                             output_tokens: 0,
+                            cached_input_tokens: 0,
                             cost_micro_usd: 0,
                         },
                     ));
@@ -379,14 +380,14 @@ async fn main() -> Result<()> {
             };
 
             // A cost-read failure degrades to zeros — it must not fail the question.
-            let (input_tokens, output_tokens, cost_micro_usd) = match gateway_ref
+            let (input_tokens, output_tokens, cached_input_tokens, cost_micro_usd) = match gateway_ref
                 .session_cost(&task.session_id)
                 .await
             {
                 Ok(metrics) => metrics,
                 Err(e) => {
                     tracing::warn!(conv = task.conv_idx, seq = task.seq, error = %e, "cost read failed; recording zeros");
-                    (0, 0, 0)
+                    (0, 0, 0, 0)
                 }
             };
 
@@ -414,6 +415,7 @@ async fn main() -> Result<()> {
                     session_id: task.session_id.clone(),
                     input_tokens,
                     output_tokens,
+                    cached_input_tokens,
                     cost_micro_usd,
                 },
             ))

@@ -246,6 +246,7 @@ async fn main() -> Result<()> {
                 latency_ms: run.map(|r| r.latency_ms).unwrap_or(0),
                 input_tokens: run.map(|r| r.input_tokens).unwrap_or(0),
                 output_tokens: run.map(|r| r.output_tokens).unwrap_or(0),
+                cached_input_tokens: run.map(|r| r.cached_input_tokens).unwrap_or(0),
                 cost_micro_usd: run.map(|r| r.cost_micro_usd).unwrap_or(0),
                 error: run.and_then(|r| r.error.clone()),
             }
