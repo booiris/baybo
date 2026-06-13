@@ -27,6 +27,8 @@ set -euo pipefail
 
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$BENCH_DIR" rev-parse --show-toplevel)"
+# shellcheck source=../progress.sh
+. "$BENCH_DIR/../progress.sh"
 # Auto-load this dir's .env (model key + overrides) — `set -a` exports each var.
 if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 
@@ -165,7 +167,11 @@ run_arm() {
     )
     [ -n "$AURA_BASE_URL" ] && agent_args+=(--base-url "$AURA_BASE_URL")
     [ -n "${NO_TRACE:-}" ] && agent_args+=(--no-trace)
+    # live %bar: completed traces / total instances (the bin writes one per instance)
+    local n_inst; n_inst=$(echo $IDS | wc -w)
+    progress_start "$arm" "$n_inst" "ls '$TRACE_DIR/$RUN_ID/$arm'/*.trace.json 2>/dev/null | wc -l"
     cargo run -q -p "$PKG" --bin run -- "${common[@]}" "${agent_args[@]}"
+    progress_stop
   else
     cargo run -q -p "$PKG" --bin run -- "${common[@]}"
   fi
@@ -219,3 +225,7 @@ else
 fi
 echo
 echo "full per-instance JSON: $RESULTS_DIR/results-*-$RUN_ID.json"
+
+# Fold every run (incl. this one) into one cross-run scoreboard per arm. Best-effort:
+# a merge hiccup must not fail the bench.
+"$BENCH_DIR/consolidate.sh" || echo ">> consolidate failed (non-fatal); rerun $BENCH_DIR/consolidate.sh by hand"

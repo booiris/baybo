@@ -14,6 +14,8 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 bin="$root/target/x86_64-unknown-linux-musl/release/aura"
+# shellcheck source=../progress.sh
+. "$here/../progress.sh"
 
 # Build the static-musl binary when missing (or AURA_REBUILD set). AURA_BIN
 # points at your own binary and skips this.
@@ -60,12 +62,16 @@ for td in sorted(glob.glob(f"{job}/*/")):
         reward = float(open(reward_f).read().strip())
     except Exception:
         reward = None
-    # task name from the per-trial result.json (strip the dataset org prefix)
-    task = trial
+    # task name from the per-trial result.json (strip the dataset org prefix).
+    # result.json lands ~tens of seconds after verifier/reward.txt, so the live
+    # monitor often syncs a trial before it exists — fall back to the trial name
+    # minus its __<id> suffix (== the clean task name) so both syncs target the
+    # same trace/<base>/<task>/ dir instead of leaving a stale __<id> duplicate.
+    task = trial.rsplit("__", 1)[0]
     rj = os.path.join(td, "result.json")
     if os.path.exists(rj):
         try:
-            task = (json.load(open(rj)).get("task_name") or trial).split("/")[-1]
+            task = (json.load(open(rj)).get("task_name") or task).split("/")[-1]
         except Exception:
             pass
     # parser_results: per-test status from the verifier's CTRF report
@@ -104,6 +110,7 @@ PY
 # trial's outcome into trace/ + results/ as harbor grades it, so a long run is
 # monitorable mid-flight (harbor names the job dir by timestamp → detect it here).
 prev_job="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
+mon_start="$(date +%s)"
 ( linked=0
   while :; do
     cur="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
@@ -116,6 +123,9 @@ prev_job="$(ls -dt runs/*/ 2>/dev/null | grep -v latest | head -1)"
         linked=1
       fi
       sync_outcomes "$b"
+      # Harbor renders its own UI; this is a coarse graded-trial count (its total
+      # isn't known to the shell, so count + elapsed, not a %bar).
+      progress_render harbor 0 "$(find "runs/$b" -name reward.txt 2>/dev/null | wc -l)" "$mon_start"
     fi
     sleep 15
   done ) &
@@ -144,5 +154,8 @@ if [ -n "$job" ]; then
   [ -f "results/results-$base.json" ] && ln -sfn "results-$base.json" results/latest.json
   [ -d "trace/$base" ] && ln -sfn "$base" trace/latest
   echo "==> report: results/results-$base.json  (runs/latest · results/latest.json · trace/latest)" >&2
+  # Fold every run (incl. this one) into one cross-run scoreboard. Best-effort:
+  # a merge hiccup must not mask harbor's exit code below.
+  ./consolidate.sh || echo "==> consolidate failed (non-fatal); rerun ./consolidate.sh by hand" >&2
 fi
 exit "$rc"

@@ -28,6 +28,8 @@ set -euo pipefail
 # Auto-load this dir's .env (keys + endpoints) so you don't have to `source` it.
 # `set -a` exports each var so the bench bins + spawned gateway inherit them.
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../progress.sh
+. "$BENCH_DIR/../progress.sh"
 if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 
 # ---- config (override via env) --------------------------------------------
@@ -197,7 +199,11 @@ run_arm() {
 }
 
 for arm in $ARMS; do
+  # live count of answered questions (the QA bin writes one trace per question; the
+  # per-conv question total isn't known to the shell, so this is a count, not a %bar)
+  progress_start "$arm" 0 "ls '$TRACE_DIR/$RUN_ID/$arm'/*.trace.json 2>/dev/null | wc -l"
   run_arm "$arm"
+  progress_stop
 done
 
 # `latest` pointers to this run so you don't scan timestamps (all gitignored).
@@ -247,3 +253,7 @@ else
 fi
 echo
 echo "full per-question JSON: $RESULTS_DIR/results-*-$RUN_ID.json"
+
+# Fold every run (incl. this one) into one cross-run scoreboard per arm. Best-effort:
+# a merge hiccup must not fail the bench.
+"$BENCH_DIR/consolidate.sh" || echo ">> consolidate failed (non-fatal); rerun $BENCH_DIR/consolidate.sh by hand"
