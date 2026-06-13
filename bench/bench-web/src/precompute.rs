@@ -15,12 +15,18 @@ use crate::model::ToolCount;
 use crate::trace::{count_tools_in_trace, tool_sidecar_rel};
 
 /// Write/refresh tool-count sidecars for every trace under each known
-/// bench's `trace/` dir below `root`. Returns how many were written.
-/// Best-effort per file: a read/parse failure is logged and skipped so
-/// one bad trace can't abort the sweep.
-pub fn write_tool_count_sidecars(root: &Path) -> anyhow::Result<usize> {
+/// bench's `trace/` dir below `root`. `only_bench` restricts the sweep to
+/// a single bench id (its dir name) — what a per-bench `consolidate.sh`
+/// passes so it touches only its own traces; `None` sweeps all (the
+/// viewer launcher). Returns how many were written. Best-effort per file:
+/// a read/parse failure is logged and skipped so one bad trace can't abort
+/// the sweep.
+pub fn write_tool_count_sidecars(root: &Path, only_bench: Option<&str>) -> anyhow::Result<usize> {
     let mut written = 0;
     for spec in BENCHES {
+        if only_bench.is_some_and(|b| b != spec.id) {
+            continue;
+        }
         let trace_dir = root.join(spec.id).join("trace");
         if !trace_dir.is_dir() {
             continue;
