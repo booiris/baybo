@@ -254,14 +254,42 @@ function ClippedPre({ text, error = false }: { text: string; error?: boolean }) 
   );
 }
 
-function StepDetail({ detail, sessionMessages }: { detail: Detail; sessionMessages: SessionMessageRow[] }) {
+/** The failure / cancellation reason — the authoritative cause for a failed
+ * row. A param-rejected tool call or an LLM transport error produces no result
+ * body, so `outcome.reason` is the ONLY record of why the row failed; without
+ * it a red, auto-opened row expands to nothing useful. */
+function FailureReason({ outcome }: { outcome: LifecycleState }) {
+  if (outcome.outcome !== 'failed' && outcome.outcome !== 'cancelled') return null;
+  return (
+    <Labeled label={outcome.outcome === 'cancelled' ? 'cancelled' : 'error'}>
+      <ClippedPre text={outcome.reason} error />
+    </Labeled>
+  );
+}
+
+function StepDetail({
+  detail,
+  outcome,
+  sessionMessages,
+}: {
+  detail: Detail;
+  outcome: LifecycleState;
+  sessionMessages: SessionMessageRow[];
+}) {
+  const failure = <FailureReason outcome={outcome} />;
   if (detail.kind === 'text') {
-    return <ClippedPre text={detail.text.trim() || '(empty)'} />;
+    return (
+      <>
+        {failure}
+        <ClippedPre text={detail.text.trim() || '(empty)'} />
+      </>
+    );
   }
   if (detail.kind === 'tool') {
     const isError = detail.result ? !detail.result.success : false;
     return (
       <div className="space-y-2">
+        {failure}
         <Labeled label="params">
           <ClippedPre text={asText(detail.begin.params)} />
         </Labeled>
@@ -274,16 +302,12 @@ function StepDetail({ detail, sessionMessages }: { detail: Detail; sessionMessag
     );
   }
   if (detail.kind === 'aux') {
-    const reason =
-      detail.step.outcome.outcome === 'failed' || detail.step.outcome.outcome === 'cancelled'
-        ? detail.step.outcome.reason
-        : null;
     return (
       <div className="space-y-1 text-[0.8rem] text-ink-soft">
+        {failure}
         <div>
           {detail.spans.length} span{detail.spans.length === 1 ? '' : 's'}
         </div>
-        {reason && <ClippedPre text={reason} error />}
       </div>
     );
   }
@@ -291,6 +315,7 @@ function StepDetail({ detail, sessionMessages }: { detail: Detail; sessionMessag
   const r = detail.result;
   return (
     <div className="space-y-2">
+      {failure}
       {r?.thinking?.trim() && (
         <details>
           <summary className="cursor-pointer text-[0.6rem] uppercase tracking-wider font-bold text-ink-soft">
@@ -479,7 +504,7 @@ export function FlowRail({ trace }: { trace: BenchTrace }) {
               </button>
               {isOpen && (
                 <div className="px-3 pb-3 pt-1 pl-10">
-                  <StepDetail detail={s.detail} sessionMessages={trace.session_messages} />
+                  <StepDetail detail={s.detail} outcome={s.outcome} sessionMessages={trace.session_messages} />
                 </div>
               )}
             </div>
