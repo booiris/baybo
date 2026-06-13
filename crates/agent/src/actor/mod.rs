@@ -398,7 +398,7 @@ impl AgentActor {
 
     /// Run the agent loop. Terminal-state notification is published by
     /// `JobLifecycle` itself on the broadcast bus
-    /// (`subscribe_terminal_events`); the actor no longer emits a
+    /// (`subscribe_lifecycle_events`); the actor no longer emits a
     /// piggy-back signal on the response channel. Used by every
     /// handler that delegates job lifecycle to `agent_loop.run`
     /// (UserInput, SubagentSpawned, cron prompt dispatch). Returns
@@ -420,19 +420,12 @@ impl AgentActor {
         // Kept so the error path below can tell a user `/stop` (token
         // tripped via the job cancel) apart from a genuine failure.
         let turn_token = self.volatile.actor_token.child_token();
-        // Emit only the leading `active: true` so a connected tab flips out
-        // of the optimistic typing state into the work block (with the true
-        // start instant) before any progress frame lands. The matching
-        // `active: false` is NOT emitted here: it's derived from the job
-        // store by `spawn_turn_state_projector` the moment this turn's job
-        // reaches a terminal state inside `agent_loop.run` — so the end edge
-        // stays in lockstep with the same truth the join-time Subscribe
-        // snapshot reads, on success / error / cancel / crash alike. (Only
-        // the *start* edge lives here: `start()` is a non-terminal transition
-        // the job bus doesn't carry.) A Subscribe landing between this emit
-        // and the job-row insert gets an idle snapshot and self-corrects on
-        // the turn's next frame.
-        self.emit_turn_state(true, Some(chrono::Utc::now())).await;
+        // The actor emits no `TurnState`: both edges are projected from the
+        // job store by `spawn_turn_state_projector` — the start edge from
+        // this turn's job `start()` (`Pending → InProgress`) inside
+        // `agent_loop.run`, the end edge from its terminal transition. So
+        // chat turn-activity has a single producer sourced from the one
+        // truth, and the per-`Subscribe` snapshot can't disagree with it.
         let result = self
             .volatile
             .agent_loop
@@ -468,26 +461,6 @@ impl AgentActor {
             self.send_response(notice, "user_turn_failed").await;
         }
         result
-    }
-
-    /// Broadcast the leading `active: true` [`AgentEvent::TurnState`] for
-    /// this session's turn. Only the start edge is emitted here; the end
-    /// edge is derived from the job store by
-    /// [`crate::actor::supervisor::spawn_turn_state_projector`]. Best-effort
-    /// like every other progress emission — a send failure only costs
-    /// display state, never the turn.
-    async fn emit_turn_state(
-        &self,
-        active: bool,
-        started_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) {
-        let output = AgentOutput {
-            session_id: self.durable.session.id.clone(),
-            user_id: self.durable.session.user.id.clone(),
-            channel: self.durable.session.channel.clone(),
-            event: AgentEvent::TurnState { active, started_at },
-        };
-        self.send_response(output, "turn_state").await;
     }
 
     /// Dispatch a fired cron job through the agent loop and send the
@@ -958,11 +931,9 @@ impl AgentActor {
         command_text: String,
         sent_at: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<()> {
-        // `compact_now` mints a turn-kind job (it matches the session's
-        // trigger), so emit the leading `active: true` like a real turn —
-        // the matching `active: false` is derived from the job store by the
-        // turn-state projector when `compact_now`'s job goes terminal.
-        self.emit_turn_state(true, Some(chrono::Utc::now())).await;
+        // `compact_now` mints a turn-kind job, so its start + terminal
+        // transitions drive the web chat's TurnState through the projector
+        // — nothing to emit here.
         let text = self
             .volatile
             .agent_loop

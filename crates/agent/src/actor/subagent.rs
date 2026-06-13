@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use aura_channels::{AgentEvent, AgentOutput};
-use aura_job::{JobLifecycle, JobStatusKind, JobTerminalEvent};
+use aura_job::{JobLifecycle, JobLifecycleEvent, JobStatusKind};
 use aura_model::{ContentBlock, SessionId, SubagentExitStatus, SubagentResult};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -19,8 +19,8 @@ use crate::actor::mailbox::MailboxSender;
 /// Wait for a freshly-spawned subagent to terminate. The caller (router)
 /// owns the synchronous prelude (build child session, spawn actor, send
 /// initial message); this routine then watches output_rx for the final
-/// message + terminal_rx for the job's terminal event, with a store
-/// fallback on broadcast lag.
+/// message + the lifecycle bus for the job's terminal event (ignoring
+/// the child's own start edge), with a store fallback on broadcast lag.
 ///
 /// `actor_token` is the child actor's own
 /// `VolatileResources::actor_token`, observed here so an external
@@ -28,7 +28,7 @@ use crate::actor::mailbox::MailboxSender;
 pub async fn await_subagent_terminal(
     child_session_id: SessionId,
     mut output_rx: mpsc::Receiver<AgentOutput>,
-    mut terminal_rx: broadcast::Receiver<JobTerminalEvent>,
+    mut terminal_rx: broadcast::Receiver<JobLifecycleEvent>,
     mailbox: MailboxSender<AgentMessage>,
     actor_token: CancellationToken,
     job_lifecycle: Arc<JobLifecycle>,
@@ -57,7 +57,13 @@ pub async fn await_subagent_terminal(
                 event = terminal_rx.recv() => {
                     match event {
                         Ok(ev) if ev.session_id == child_session_id => {
-                            if matches!(ev.kind, JobStatusKind::Completed) && captured.is_none() {
+                            // The bus now also carries the child's own start
+                            // edge — ignore it and keep waiting for a terminal
+                            // one.
+                            let Some(kind) = ev.phase.terminal_status() else {
+                                continue;
+                            };
+                            if matches!(kind, JobStatusKind::Completed) && captured.is_none() {
                                 // `JobLifecycle::complete` publishes the terminal
                                 // event inside `with_job` BEFORE
                                 // `handle_subagent_spawned` dispatches the final
@@ -66,7 +72,7 @@ pub async fn await_subagent_terminal(
                                 // event wins the select with `captured == None`.
                                 captured = drain_for_final_message(&mut output_rx).await;
                             }
-                            return terminal_event_to_status(ev.kind, captured.take());
+                            return terminal_event_to_status(kind, captured.take());
                         }
                         Ok(_) => continue,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -191,7 +197,7 @@ mod tests {
 
     struct Harness {
         job_lifecycle: Arc<JobLifecycle>,
-        terminal_rx: tokio::sync::broadcast::Receiver<JobTerminalEvent>,
+        terminal_rx: tokio::sync::broadcast::Receiver<JobLifecycleEvent>,
         output_tx: mpsc::Sender<AgentOutput>,
         output_rx: mpsc::Receiver<AgentOutput>,
         mailbox_tx: MailboxSender<AgentMessage>,
@@ -202,7 +208,7 @@ mod tests {
     impl Harness {
         fn new() -> Self {
             let job_lifecycle = Arc::new(JobLifecycle::new(Arc::new(MemoryJobStore::new())));
-            let terminal_rx = job_lifecycle.subscribe_terminal_events();
+            let terminal_rx = job_lifecycle.subscribe_lifecycle_events();
             let (output_tx, output_rx) = mpsc::channel(1);
             let (mailbox_tx, _mailbox_rx) = mailbox::channel(1);
             Self {

@@ -154,17 +154,17 @@ pub enum AgentEvent {
     /// for the session; surfaces without one drop it.
     TaskList(Vec<aura_model::Task>),
     /// Whether a turn (an agent-loop run producing this session's reply)
-    /// is in flight. An idempotent snapshot, not an edge. Three producers,
-    /// all agreeing on the same job-store truth (a non-terminal turn-kind
-    /// job): the actor emits the leading `active: true` at turn start; the
-    /// turn-state projector emits `active: false` (recomputed from the job
-    /// store) when the turn's job goes terminal — on success, error,
-    /// cancel and crash alike; and the gateway derives one snapshot on
-    /// every WS Subscribe, so a late-joining client (new tab, reconnect)
-    /// learns about a turn whose progress frames it never received.
-    /// Channels that render a per-turn work block (the web dashboard)
-    /// drive its open/closed state from this; surfaces that infer turn
-    /// activity locally (TUI) drop it.
+    /// is in flight. An idempotent snapshot, not an edge. Every emission
+    /// is derived from one truth — a non-terminal turn-kind job in the job
+    /// store: the turn-state projector recomputes and broadcasts on each
+    /// job lifecycle transition (the `Pending → InProgress` start edge and
+    /// the terminal edges — covering success, error, cancel and crash),
+    /// and the gateway derives one snapshot on every WS Subscribe, so a
+    /// late-joining client (new tab, reconnect) learns about a turn whose
+    /// progress frames it never received. The actor itself never emits
+    /// this. Channels that render a per-turn work block (the web
+    /// dashboard) drive its open/closed state from this; surfaces that
+    /// infer turn activity locally (TUI) drop it.
     TurnState {
         active: bool,
         /// `Some` iff `active` — when the in-flight turn started, so a

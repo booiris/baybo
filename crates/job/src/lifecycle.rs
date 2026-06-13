@@ -14,29 +14,59 @@ use tokio_util::sync::CancellationToken;
 
 type Result<T> = std::result::Result<T, JobError>;
 
-/// Process-wide capacity for the terminal-event broadcast bus.
+/// Process-wide capacity for the lifecycle-event broadcast bus.
 ///
 /// Sized to absorb the burst a multi-job subagent fan-out can produce
 /// without lagging the parent's wait loop. Subscribers that lag still
-/// reconcile against `list_by_session` so dropped events don't cause
-/// lost terminations — capacity is a latency knob, not correctness.
-const JOB_TERMINAL_EVENT_CAPACITY: usize = 256;
+/// reconcile against the store (`list_by_session` /
+/// `active_turn_started_at`) so dropped events don't cause lost
+/// terminations or stale turn state — capacity is a latency knob, not
+/// correctness.
+const JOB_LIFECYCLE_EVENT_CAPACITY: usize = 256;
 
-/// Terminal-state notification published by `JobLifecycle` whenever a
-/// job transitions to `Completed`, `Failed`, or `Cancelled`. Carries
-/// the minimum identifiers a subscriber needs to filter without going
-/// back to the store: the terminating `JobId`, its session, and the
-/// optional parent for hierarchy-scoped waits (subagent path).
+/// Which lifecycle transition a [`JobLifecycleEvent`] marks. The bus
+/// publishes the `Pending → InProgress` **start** edge and the three
+/// terminal edges; the intermediate `stuck` / `recover` transitions are
+/// not published (rare maintenance moves; the store stays the source of
+/// truth for them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobPhase {
+    Started,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl JobPhase {
+    /// The terminal job status this phase denotes, or `None` for
+    /// [`JobPhase::Started`] — lets a terminal-only consumer (the
+    /// subagent waiter) filter out the start edge in one match.
+    pub fn terminal_status(self) -> Option<JobStatusKind> {
+        match self {
+            JobPhase::Started => None,
+            JobPhase::Completed => Some(JobStatusKind::Completed),
+            JobPhase::Failed => Some(JobStatusKind::Failed),
+            JobPhase::Cancelled => Some(JobStatusKind::Cancelled),
+        }
+    }
+}
+
+/// A job lifecycle transition published by `JobLifecycle` on the
+/// broadcast bus: the `Pending → InProgress` start edge and the three
+/// terminal edges. Carries the minimum identifiers a subscriber needs to
+/// filter without going back to the store: the `JobId`, its session, and
+/// the optional parent for hierarchy-scoped waits (subagent path).
 ///
-/// `kind` is always one of the three terminal `JobStatusKind`
-/// discriminants — non-terminal transitions (`start`, `stuck`,
-/// `recover`) are not published.
+/// Two consumers today: the subagent runtime waits for a child's terminal
+/// edge (`phase.terminal_status()`), and the turn-state projector
+/// recomputes a session's turn activity on any edge (it ignores `phase` —
+/// every edge just means "recompute this session now").
 #[derive(Debug, Clone)]
-pub struct JobTerminalEvent {
+pub struct JobLifecycleEvent {
     pub job_id: JobId,
     pub session_id: SessionId,
     pub parent_job_id: Option<JobId>,
-    pub kind: JobStatusKind,
+    pub phase: JobPhase,
 }
 
 /// Owns the job state machine + persistence orchestration. Pure
@@ -48,29 +78,31 @@ pub struct JobLifecycle {
     /// in-flight jobs. `cancel()` trips the matching token (if any)
     /// in addition to flipping the DB row.
     cancellation: Arc<JobCancellationRegistry>,
-    /// Fire-and-forget bus for terminal transitions. The subagent
-    /// runtime subscribes to this so the parent unblocks on the
-    /// child's `Completed` / `Failed` / `Cancelled` regardless of
-    /// whether the child also produced an `AgentEvent::Message`.
-    terminal_events: broadcast::Sender<JobTerminalEvent>,
+    /// Fire-and-forget bus for lifecycle transitions (start + terminal).
+    /// The subagent runtime subscribes to unblock the parent on a child's
+    /// terminal edge; the turn-state projector subscribes to drive the
+    /// web chat's per-session turn activity off both edges.
+    lifecycle_events: broadcast::Sender<JobLifecycleEvent>,
 }
 
 impl JobLifecycle {
     pub fn new(store: Arc<dyn JobStore>) -> Self {
-        let (terminal_events, _rx) = broadcast::channel(JOB_TERMINAL_EVENT_CAPACITY);
+        let (lifecycle_events, _rx) = broadcast::channel(JOB_LIFECYCLE_EVENT_CAPACITY);
         Self {
             store,
             cancellation: Arc::new(JobCancellationRegistry::new()),
-            terminal_events,
+            lifecycle_events,
         }
     }
 
-    /// Subscribe to terminal-state events. Subscribers must reconcile
-    /// against the store (e.g. `list_by_session`) on
+    /// Subscribe to lifecycle events (start + terminal). Subscribers must
+    /// reconcile against the store on
     /// `broadcast::error::RecvError::Lagged` — a dropped event is not
-    /// re-published.
-    pub fn subscribe_terminal_events(&self) -> broadcast::Receiver<JobTerminalEvent> {
-        self.terminal_events.subscribe()
+    /// re-published (the subagent waiter re-checks via the store; the
+    /// turn-state projector recomputes on the next event, with the
+    /// Subscribe snapshot covering the gap).
+    pub fn subscribe_lifecycle_events(&self) -> broadcast::Receiver<JobLifecycleEvent> {
+        self.lifecycle_events.subscribe()
     }
 
     /// Register an in-flight job's cancellation token. The returned
@@ -121,23 +153,28 @@ impl JobLifecycle {
         Ok(job)
     }
 
-    /// Move `Pending → InProgress`.
+    /// Move `Pending → InProgress`. Publishes a [`JobPhase::Started`]
+    /// event — the start edge the turn-state projector turns into the
+    /// web chat's "turn began".
     pub async fn start(&self, job_id: &JobId) -> Result<()> {
         let (job, transition) = self.apply(job_id, |j| j.start()).await?;
-        self.persist(job, transition).await
+        self.persist_and_publish(job, transition, JobPhase::Started)
+            .await
     }
 
     /// Move `InProgress → Completed` with a final output.
     pub async fn complete(&self, job_id: &JobId, output: crate::JobOutput) -> Result<()> {
         let (job, transition) = self.apply(job_id, |j| j.complete(output)).await?;
-        self.persist_and_publish(job, transition).await
+        self.persist_and_publish(job, transition, JobPhase::Completed)
+            .await
     }
 
     /// Move to `Failed { reason }`.
     pub async fn fail(&self, job_id: &JobId, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();
         let (job, transition) = self.apply(job_id, |j| j.fail(&reason)).await?;
-        self.persist_and_publish(job, transition).await
+        self.persist_and_publish(job, transition, JobPhase::Failed)
+            .await
     }
 
     /// Move to `Cancelled { reason, partial_artifacts }`.
@@ -163,7 +200,8 @@ impl JobLifecycle {
         let (job, transition) = self
             .apply(job_id, |j| j.cancel(reason, partial_artifacts.clone()))
             .await?;
-        self.persist_and_publish(job, transition).await
+        self.persist_and_publish(job, transition, JobPhase::Cancelled)
+            .await
     }
 
     /// Boot-time recovery cancel. Same state-machine semantics as
@@ -190,7 +228,8 @@ impl JobLifecycle {
                 j.cancel_at(reason, partial_artifacts.clone(), at)
             })
             .await?;
-        self.persist_and_publish(job, transition).await
+        self.persist_and_publish(job, transition, JobPhase::Cancelled)
+            .await
     }
 
     /// Move to `Stuck { reason }` from `InProgress`.
@@ -330,22 +369,28 @@ impl JobLifecycle {
         Ok(())
     }
 
-    /// Persist a terminal transition, then fire the matching event on
-    /// the broadcast bus. Publish happens **after** the store write
-    /// succeeds so a subscriber that races back into the lifecycle
-    /// (e.g. to look the job up by id) is guaranteed to see the
-    /// terminal row. Send errors are dropped on the floor — broadcast
-    /// `send` only fails when there are no subscribers, which is the
-    /// normal state for non-subagent jobs.
-    async fn persist_and_publish(&self, job: Job, transition: JobTransition) -> Result<()> {
-        let event = JobTerminalEvent {
+    /// Persist a transition, then fire its lifecycle event on the
+    /// broadcast bus. Publish happens **after** the store write succeeds
+    /// so a subscriber that races back into the lifecycle (e.g. to look
+    /// the job up by id, or to recompute `active_turn_started_at`) is
+    /// guaranteed to see the new row. Send errors are dropped on the
+    /// floor — broadcast `send` only fails when there are no subscribers,
+    /// which is the normal state for a process with no live chat tab and
+    /// no in-flight subagent.
+    async fn persist_and_publish(
+        &self,
+        job: Job,
+        transition: JobTransition,
+        phase: JobPhase,
+    ) -> Result<()> {
+        let event = JobLifecycleEvent {
             job_id: job.id,
             session_id: job.session_id.clone(),
             parent_job_id: job.parent_job_id,
-            kind: job.status.kind(),
+            phase,
         };
         self.persist(job, transition).await?;
-        let _ = self.terminal_events.send(event);
+        let _ = self.lifecycle_events.send(event);
         Ok(())
     }
 

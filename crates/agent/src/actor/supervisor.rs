@@ -593,37 +593,38 @@ pub fn spawn_actor_with_crash_reaper(
     });
 }
 
-/// Spawn the per-process turn-state projector — the single producer of
-/// the web chat's turn-*ended* signal.
+/// Spawn the per-process turn-state projector — the **sole** producer of
+/// the web chat's `Frame::TurnState`.
 ///
-/// `Frame::TurnState { active: false }` is derived here from the one
-/// source of truth (the job store) rather than emitted by the actor in
-/// parallel: every terminal job transition publishes on
-/// [`aura_job::JobLifecycle::subscribe_terminal_events`], and on each one
-/// we recompute the session's
+/// Both edges are derived here from the one source of truth (the job
+/// store) rather than emitted by the actor: every job lifecycle
+/// transition publishes on
+/// [`aura_job::JobLifecycle::subscribe_lifecycle_events`] (the
+/// `Pending → InProgress` start edge and the three terminal edges), and on
+/// each one we recompute the session's
 /// [`aura_job::JobLifecycle::active_turn_started_at`] and broadcast the
 /// current value through the same `response_tx` → channel fan-out the
-/// actor uses. The actor still emits the leading `active: true` (job
-/// `start()` is a non-terminal transition the bus doesn't carry), and the
-/// gateway's per-`Subscribe` snapshot reads the same
-/// `active_turn_started_at` — so the start broadcast, the end broadcast,
-/// and the join-time snapshot agree by construction.
+/// actor's own output uses. The gateway's per-`Subscribe` snapshot reads
+/// the *same* `active_turn_started_at` — so the live start broadcast, the
+/// live end broadcast, and the join-time snapshot all agree by
+/// construction, and the actor never touches `TurnState` at all.
 ///
-/// Recompute-is-truth keeps this robust to *which* job's terminal fired:
-/// a child-session subagent, a background-compression `System` job, or the
-/// turn itself all just mean "recompute this session now", and the
-/// broadcast is whatever is currently true — never a stale "X ended". A
-/// `Lagged` drop is harmless: the next event recomputes, and the Subscribe
-/// snapshot covers a client that joined during the gap.
+/// Recompute-is-truth keeps this robust to *which* job's transition fired
+/// it: the turn itself, a child-session subagent, or a
+/// background-compression `System` job all just mean "recompute this
+/// session now", and the broadcast is whatever is currently true — never a
+/// stale "X started/ended". A `Lagged` drop is harmless: the next event
+/// recomputes, and the Subscribe snapshot covers a client that joined
+/// during the gap.
 pub fn spawn_turn_state_projector(
     job_lifecycle: Arc<aura_job::JobLifecycle>,
     sessions: Arc<SessionManager>,
     response_tx: mpsc::Sender<AgentOutput>,
     cancel_token: CancellationToken,
 ) -> JoinHandle<()> {
-    // Subscribe synchronously, before the spawn returns, so no terminal
+    // Subscribe synchronously, before the spawn returns, so no lifecycle
     // event published after this call can slip through unobserved.
-    let mut events = job_lifecycle.subscribe_terminal_events();
+    let mut events = job_lifecycle.subscribe_lifecycle_events();
     tokio::spawn(async move {
         loop {
             tokio::select! {

@@ -387,16 +387,16 @@ pub enum Frame {
         tasks: Vec<TaskView>,
     },
     /// Server → client: whether a turn (the session's in-flight reply)
-    /// is currently being produced. An idempotent snapshot — `active:
-    /// true` (+ start instant) is broadcast by the actor at turn start;
-    /// `active: false` by the turn-state projector when the turn's job
-    /// goes terminal (recomputed from the job store, so the end edge can't
-    /// be skipped by an error or crash); and one snapshot is sent to the
-    /// subscribing connection on every `Subscribe` so a late joiner (new
-    /// tab, reconnect) renders the in-flight turn it never saw start: open
-    /// work block, elapsed timer seeded from `started_at`, and no
-    /// "Cancelled" mislabel. Clients that infer turn activity locally
-    /// (TUI, sidecars) drop it.
+    /// is currently being produced. An idempotent snapshot, recomputed
+    /// from the job store and broadcast by the turn-state projector on
+    /// every job lifecycle transition — the `Pending → InProgress` start
+    /// edge (`active: true` + start instant) and the terminal edges
+    /// (`active: false`, so the close can't be skipped by an error or
+    /// crash). One snapshot is also sent to the subscribing connection on
+    /// every `Subscribe`, so a late joiner (new tab, reconnect) renders
+    /// the in-flight turn it never saw start: open work block, elapsed
+    /// timer seeded from `started_at`, and no "Cancelled" mislabel.
+    /// Clients that infer turn activity locally (TUI, sidecars) drop it.
     TurnState {
         #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         session_id: SessionId,

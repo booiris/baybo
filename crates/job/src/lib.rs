@@ -26,7 +26,7 @@ pub use cancel::CancelReason;
 pub use cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
 pub use error::JobError;
 pub use kind::{JobInput, JobKind, JobOutput};
-pub use lifecycle::{JobLifecycle, JobTerminalEvent};
+pub use lifecycle::{JobLifecycle, JobLifecycleEvent, JobPhase};
 
 pub type Result<T> = std::result::Result<T, JobError>;
 
