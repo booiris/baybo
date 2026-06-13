@@ -27,6 +27,14 @@ export function fmtNum(n: number | null | undefined): string {
   return n == null ? '—' : n.toLocaleString();
 }
 
+/** Human byte size (`166 MB`, `6.6 MB`, `812 KB`, `40 B`), or `—`. */
+export function fmtBytes(n: number | null | undefined): string {
+  if (n == null) return '—';
+  if (n >= 1_048_576) return `${(n / 1_048_576).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
+
 /** Cached-input share as a percent string (`88%`), or `—`. */
 export function cacheRatePct(
   cached: number | null | undefined,

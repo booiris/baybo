@@ -41,6 +41,13 @@ if [[ ! -f "$root/node_modules/.modules.yaml" ]]; then
   pnpm install
 fi
 
+# Refresh per-trace tool-count sidecars (<trace>.tools.json) so the task
+# list reads tiny precomputed counts instead of re-parsing traces that can
+# be hundreds of MB. Incremental: only new/changed traces are parsed.
+echo "==> precomputing tool-count sidecars (incremental)…" >&2
+cargo run "${PROFILE[@]}" -q -p aura-bench-web --bin precompute_tool_counts -- --root "$BENCH_ROOT" || \
+  echo "   (tool-count precompute failed — list tool chips may be empty; non-fatal)" >&2
+
 if [[ "$DEV" == "1" ]]; then
   echo "==> dev mode: starting API backend on :$PORT + Vite dev server on :5173" >&2
   cargo run "${PROFILE[@]}" -p aura-bench-web -- --root "$BENCH_ROOT" --port "$PORT" &

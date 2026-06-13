@@ -3,7 +3,7 @@ import { Link, useParams } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAsync, type AsyncState } from '../lib/useAsync';
 import type { BenchTrace } from '../api/types';
-import { cacheRatePct, fmtCost, fmtMs, fmtTokensCell } from '../lib/format';
+import { cacheRatePct, fmtBytes, fmtCost, fmtMs, fmtTokensCell } from '../lib/format';
 import { Card, StatusPill, StatChip, Spinner, ErrorBox, Empty } from '../components/ui';
 import { MessageList } from '../components/trace/MessageList';
 import { Timeline } from '../components/trace/Timeline';
@@ -13,6 +13,13 @@ import type { BenchExtra } from '../generated/BenchExtra';
 import type { ArtifactRef } from '../generated/ArtifactRef';
 import type { ChatMessage } from '../types/trace';
 
+/**
+ * Auto-fetch a trace at or below this size; above it the item view waits
+ * for an explicit click, since loading the whole `trace.json` into the
+ * browser is the slow part (a single trace has hit 166 MB).
+ */
+const LARGE_TRACE_BYTES = 15 * 1_048_576;
+
 export function ItemPage() {
   const { benchId = '', runKey = '', itemId = '' } = useParams();
   const run = useAsync(() => api.run(benchId, runKey), [benchId, runKey]);
@@ -20,9 +27,15 @@ export function ItemPage() {
 
   const tracePath = item?.trace?.trace;
   const messagesPath = item?.trace?.messages ?? undefined;
+  const traceBytes = item?.trace?.bytes ?? 0;
+  const [forceLoad, setForceLoad] = useState(false);
+  const shouldLoadTrace = !!tracePath && (forceLoad || traceBytes <= LARGE_TRACE_BYTES);
   const trace = useAsync(
-    () => (tracePath ? api.trace(benchId, tracePath, messagesPath) : Promise.resolve(null)),
-    [benchId, tracePath, messagesPath],
+    () =>
+      shouldLoadTrace && tracePath
+        ? api.trace(benchId, tracePath, messagesPath)
+        : Promise.resolve(null),
+    [benchId, tracePath, messagesPath, shouldLoadTrace],
   );
 
   if (run.loading) return <Spinner />;
@@ -65,7 +78,13 @@ export function ItemPage() {
 
       <ExtraPanel benchId={benchId} extra={item.extra} />
 
-      <TraceSection item={item} trace={trace} messages={messages} />
+      <TraceSection
+        item={item}
+        trace={trace}
+        messages={messages}
+        shouldLoad={shouldLoadTrace}
+        onLoad={() => setForceLoad(true)}
+      />
     </div>
   );
 }
@@ -79,12 +98,19 @@ function TraceSection({
   item,
   trace,
   messages,
+  shouldLoad,
+  onLoad,
 }: {
   item: Item;
   trace: AsyncState<BenchTrace | null>;
   messages: ChatMessage[];
+  shouldLoad: boolean;
+  onLoad: () => void;
 }) {
   if (!item.trace) return <Empty message="No agent trace recorded for this item." />;
+  // Large trace held back until the user opts in — loading the full
+  // trace.json into the browser is what's slow.
+  if (!shouldLoad) return <LargeTracePrompt bytes={item.trace.bytes} onLoad={onLoad} />;
   if (trace.loading) return <Spinner label="loading trace…" />;
   if (trace.error) return <ErrorBox message={trace.error} />;
   if (!trace.data) return <Empty message="Trace unavailable." />;
@@ -113,6 +139,27 @@ function TraceSection({
         </div>
       </details>
     </div>
+  );
+}
+
+/** Opt-in gate for a large trace: show its size and a button to load it,
+ * so the heavy `trace.json` fetch + in-browser render only happens on
+ * demand. */
+function LargeTracePrompt({ bytes, onLoad }: { bytes: number; onLoad: () => void }) {
+  return (
+    <Card className="p-4 space-y-3">
+      <div className="text-[0.85rem] text-ink">
+        <span className="font-bold">Large trace ({fmtBytes(bytes)}).</span> It's held back because
+        loading the full trace renders the entire timeline in your browser and can be slow.
+      </div>
+      <button
+        type="button"
+        onClick={onLoad}
+        className="px-3 py-1.5 border-2 border-black rounded bg-brand text-white font-bold text-[0.8rem] uppercase tracking-wider cursor-pointer hover:opacity-90 shadow-brutal-xs"
+      >
+        Load trace ({fmtBytes(bytes)})
+      </button>
+    </Card>
   );
 }
 

@@ -8,7 +8,7 @@
 //! 2^53 for tokens/cost-micro-USD/latency) rather than ts-rs's default
 //! `bigint`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "ts-export")]
 use ts_rs::TS;
 
@@ -139,7 +139,22 @@ pub struct Item {
     /// transcript, when present on disk. Consumed by the `/trace`
     /// endpoint (path-validated server-side).
     pub trace: Option<TracePaths>,
+    /// Per-tool call counts (by `tool_name`), highest first. Derived from
+    /// the agent trace on the single-run drill-in only — empty when no
+    /// trace exists or in the bench/search list paths that never read it.
+    pub tool_calls: Vec<ToolCount>,
     pub extra: BenchExtra,
+}
+
+/// How many times one tool was invoked in an item's agent run. Round-trips
+/// through the `<trace>.tools.json` sidecar (hence `Deserialize`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(TS))]
+#[cfg_attr(feature = "ts-export", ts(export, export_to = "../web/src/generated/"))]
+pub struct ToolCount {
+    pub name: String,
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
+    pub count: u32,
 }
 
 /// Relative paths to an item's `trace.json` + `messages.json`, under
@@ -150,6 +165,11 @@ pub struct Item {
 pub struct TracePaths {
     pub trace: String,
     pub messages: Option<String>,
+    /// Size of `trace.json` in bytes — lets the item view lazy-gate the
+    /// fetch (a single terminal-bench trace has hit 166 MB; loading the
+    /// full thing into the browser is the expensive part).
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
+    pub bytes: u64,
 }
 
 /// Bench-specific detail. Tagged on `type` so the frontend matches on a

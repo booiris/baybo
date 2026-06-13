@@ -43,6 +43,8 @@ interface FlowStep {
   durMs: number | null;
   outcome: LifecycleState;
   isError: boolean;
+  /** Tool name for `role === 'tool'` rows — drives the tool stats + filter. */
+  toolName?: string;
   inTok?: number;
   outTok?: number;
   cachedTok?: number;
@@ -142,6 +144,7 @@ function buildFlowSteps(trace: BenchTrace): FlowStep[] {
               durMs: durMs(s.started_at, s.ended_at),
               outcome: s.outcome,
               isError: s.outcome.outcome === 'failed',
+              toolName: s.kind.begin.tool_name,
               detail: { kind: 'tool', begin: s.kind.begin, result: s.kind.result },
             });
           }
@@ -358,6 +361,9 @@ function StepDetail({
 export function FlowRail({ trace }: { trace: BenchTrace }) {
   const steps = useMemo(() => buildFlowSteps(trace), [trace]);
   const [filter, setFilter] = useState<Filter>('all');
+  // A specific tool name to isolate (set by clicking a tool-stats chip);
+  // takes precedence over `filter`. null = no tool isolated.
+  const [toolFilter, setToolFilter] = useState<string | null>(null);
   const [open, setOpen] = useState<Set<number>>(() => new Set(steps.filter((s) => s.isError).map((s) => s.ord)));
 
   const maxDur = steps.reduce((m, s) => Math.max(m, s.durMs ?? 0), 0);
@@ -371,12 +377,22 @@ export function FlowRail({ trace }: { trace: BenchTrace }) {
     tool: steps.filter((s) => s.role === 'tool').length,
     aux: steps.filter((s) => s.role === 'aux').length,
   };
+  // Tool-call breakdown by name, highest first — both a glance stat and
+  // the set of clickable per-tool filters.
+  const toolStats = (() => {
+    const m = new Map<string, number>();
+    for (const s of steps) {
+      if (s.role === 'tool' && s.toolName) m.set(s.toolName, (m.get(s.toolName) ?? 0) + 1);
+    }
+    return [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  })();
 
   if (steps.length === 0) {
     return <div className="text-ink-soft text-[0.85rem] italic">No conversation or execution recorded.</div>;
   }
 
   const shown = steps.filter((s) => {
+    if (toolFilter) return s.role === 'tool' && s.toolName === toolFilter;
     if (filter === 'failures') return s.isError;
     if (filter === 'tools') return s.role === 'tool';
     if (filter === 'llm') return s.role === 'llm';
@@ -453,9 +469,12 @@ export function FlowRail({ trace }: { trace: BenchTrace }) {
             <button
               key={f}
               type="button"
-              onClick={() => setFilter(f)}
+              onClick={() => {
+                setFilter(f);
+                setToolFilter(null);
+              }}
               className={`px-2 py-0.5 border-2 border-black rounded text-[0.65rem] font-bold uppercase tracking-wider cursor-pointer ${
-                filter === f ? 'bg-brand text-white' : 'bg-white text-ink hover:bg-gray-50'
+                filter === f && !toolFilter ? 'bg-brand text-white' : 'bg-white text-ink hover:bg-gray-50'
               }`}
             >
               {lbl}
@@ -463,6 +482,38 @@ export function FlowRail({ trace }: { trace: BenchTrace }) {
           ))}
           <span className="ml-auto text-[0.7rem] text-ink-soft">{steps.length} steps</span>
         </div>
+        {/* ── per-tool breakdown + filters ── */}
+        {toolStats.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5 text-[0.7rem]">
+            <span className="font-bold uppercase tracking-wider text-ink-soft w-16 shrink-0">tools</span>
+            {toolStats.map(([name, count]) => {
+              const active = toolFilter === name;
+              return (
+                <button
+                  key={name}
+                  type="button"
+                  title={active ? `showing only ${name} — click to clear` : `show only ${name} calls`}
+                  onClick={() => setToolFilter(active ? null : name)}
+                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 border-2 border-black rounded font-mono cursor-pointer ${
+                    active ? 'bg-warn text-white' : 'bg-white text-ink hover:bg-gray-50'
+                  }`}
+                >
+                  <span className="font-bold">{name}</span>
+                  <span className={active ? 'text-white/80' : 'text-ink-soft'}>{count}</span>
+                </button>
+              );
+            })}
+            {toolFilter && (
+              <button
+                type="button"
+                onClick={() => setToolFilter(null)}
+                className="ml-1 text-[0.65rem] uppercase tracking-wider font-bold text-brand hover:underline cursor-pointer"
+              >
+                clear
+              </button>
+            )}
+          </div>
+        )}
         <Legend />
       </div>
 

@@ -7,6 +7,7 @@ import { fmtCost, fmtMs, fmtTime, fmtTokensCell } from '../lib/format';
 import { Card, PassRateBar, StatusPill, Spinner, ErrorBox, Empty } from '../components/ui';
 import type { BenchExtra } from '../generated/BenchExtra';
 import type { Item } from '../generated/Item';
+import type { ToolCount } from '../generated/ToolCount';
 
 function extraQuick(extra: BenchExtra): string {
   switch (extra.type) {
@@ -96,6 +97,26 @@ function PlainHeader({ label }: { label: string }) {
   );
 }
 
+/** Per-tool call-count chips for a task row (highest-count first, from the
+ * backend's trace-derived `tool_calls`). Empty for items with no trace. */
+function ToolChips({ tools }: { tools: ToolCount[] }) {
+  if (tools.length === 0) return <span className="text-ink-soft">—</span>;
+  return (
+    <div className="flex flex-wrap gap-1">
+      {tools.map((t) => (
+        <span
+          key={t.name}
+          className="inline-flex items-center gap-1 border border-black/30 rounded px-1 py-0.5 text-[0.7rem] font-mono bg-gray-50"
+          title={`${t.name}: ${t.count} call${t.count === 1 ? '' : 's'}`}
+        >
+          <span className="text-ink">{t.name}</span>
+          <span className="text-ink-soft">{t.count}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 export function RunPage() {
   const { benchId = '', runKey = '' } = useParams();
   const { data, error, loading } = useAsync(() => api.run(benchId, runKey), [benchId, runKey]);
@@ -174,6 +195,7 @@ export function RunPage() {
                 <SortHeader label="latency" col="latency" sortKey={sortKey} sortDir={sortDir} onSort={onSort} />
                 <SortHeader label="cost" col="cost" sortKey={sortKey} sortDir={sortDir} onSort={onSort} />
                 <SortHeader label="tokens" col="tokens" sortKey={sortKey} sortDir={sortDir} onSort={onSort} />
+                <PlainHeader label="tools" />
                 <PlainHeader label="trace" />
               </tr>
             </thead>
@@ -203,6 +225,9 @@ export function RunPage() {
                   <td className="px-3 py-2 whitespace-nowrap">{fmtCost(it.cost_micro_usd)}</td>
                   <td className="px-3 py-2 whitespace-nowrap">
                     {fmtTokensCell(it.input_tokens, it.output_tokens, it.cached_input_tokens)}
+                  </td>
+                  <td className="px-3 py-2">
+                    <ToolChips tools={it.tool_calls} />
                   </td>
                   <td className="px-3 py-2">
                     {it.trace ? <RiFileList3Line className="text-ok" title="trace available" /> : '—'}
