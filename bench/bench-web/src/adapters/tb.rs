@@ -139,6 +139,7 @@ pub(super) fn parse(
                 cost_micro_usd: None,
                 source_run: it.source_run.clone(),
                 trace,
+                tool_calls: Vec::new(),
                 extra: BenchExtra::Tb {
                     parser_results,
                     failure_mode: it.failure_mode.clone(),

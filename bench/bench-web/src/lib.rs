@@ -11,6 +11,7 @@
 pub mod adapters;
 pub mod api;
 pub mod model;
+pub mod precompute;
 
 mod error;
 mod input;

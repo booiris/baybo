@@ -4,6 +4,7 @@
 //! types line up — `{session, jobs}` + `{messages}` → `{session_id,
 //! session_messages, jobs}`.
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use axum::Json;
@@ -12,6 +13,67 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
 use crate::error::ApiError;
+use crate::model::ToolCount;
+
+/// Read an item's precomputed tool-count sidecar (`<trace>.tools.json`,
+/// written by the `precompute-tool-counts` bin). Cheap by design — the
+/// list view reads one tiny JSON per item and NEVER the trace, which can
+/// run to hundreds of MB (a single terminal-bench trace has hit 166 MB).
+/// Missing/malformed sidecar → empty (best-effort; tool stats are a
+/// nicety, never load-bearing).
+pub(crate) fn tool_counts(bench_dir: &Path, trace_rel: &str) -> Vec<ToolCount> {
+    let Ok(path) = safe_join(bench_dir, &tool_sidecar_rel(trace_rel)) else {
+        return Vec::new();
+    };
+    let Ok(val) = read_json(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_value(val).unwrap_or_default()
+}
+
+/// Sidecar path for a trace: swap the trailing `.json` for `.tools.json`
+/// (`…/trace.json` → `…/trace.tools.json`). Shared by the reader above and
+/// the precompute writer so they always agree.
+pub(crate) fn tool_sidecar_rel(trace_rel: &str) -> String {
+    match trace_rel.strip_suffix(".json") {
+        Some(stem) => format!("{stem}.tools.json"),
+        None => format!("{trace_rel}.tools.json"),
+    }
+}
+
+/// Count `tool_call` spans by `tool_name` in a parsed `trace.json`,
+/// highest first (ties broken by name). Walks the `jobs[].steps[].spans[]`
+/// shape `aura session export` emits. The precompute bin runs this once
+/// per trace and writes the result as the sidecar [`tool_counts`] reads.
+pub(crate) fn count_tools_in_trace(val: &Value) -> Vec<ToolCount> {
+    let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+    let jobs = val.get("jobs").and_then(Value::as_array);
+    for job in jobs.into_iter().flatten() {
+        let steps = job.get("steps").and_then(Value::as_array);
+        for step in steps.into_iter().flatten() {
+            let spans = step.get("spans").and_then(Value::as_array);
+            for span in spans.into_iter().flatten() {
+                let kind = span.get("kind");
+                if kind.and_then(|k| k.get("kind")).and_then(Value::as_str) != Some("tool_call") {
+                    continue;
+                }
+                if let Some(name) = kind
+                    .and_then(|k| k.get("begin"))
+                    .and_then(|b| b.get("tool_name"))
+                    .and_then(Value::as_str)
+                {
+                    *counts.entry(name.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let mut out: Vec<ToolCount> = counts
+        .into_iter()
+        .map(|(name, count)| ToolCount { name, count })
+        .collect();
+    out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+    out
+}
 
 /// Reshape an item's `trace.json` (+ optional `messages.json`) into the
 /// `{ session_id, session_messages, jobs }` shape the frontend viewer

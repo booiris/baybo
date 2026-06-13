@@ -86,9 +86,23 @@ pub fn run_detail(root: &Path, id: &str, run_key: &str) -> Option<RunDetail> {
         .into_iter()
         .find(|p| file_stem(p).as_deref() == Some(run_key))?;
     let parsed = parse_file(root, spec, &path, run_key).ok()?;
+    // Enrich with per-tool call counts from each item's trace. Scoped to
+    // this single-run view on purpose: a full run's traces can be tens of
+    // MB, so the bench/search list paths never pay this.
+    let bench_dir = root.join(spec.id);
+    let items = parsed
+        .items
+        .into_iter()
+        .map(|mut it| {
+            if let Some(tp) = &it.trace {
+                it.tool_calls = crate::trace::tool_counts(&bench_dir, &tp.trace);
+            }
+            it
+        })
+        .collect();
     Some(RunDetail {
         summary: parsed.summary,
-        items: parsed.items,
+        items,
     })
 }
 
@@ -305,9 +319,11 @@ pub(crate) fn trace_paths(
     trace_rel: String,
     messages_rel: String,
 ) -> Option<TracePaths> {
-    if !bench_dir.join(&trace_rel).is_file() {
-        return None;
-    }
+    let trace_path = bench_dir.join(&trace_rel);
+    let bytes = match std::fs::metadata(&trace_path) {
+        Ok(m) if m.is_file() => m.len(),
+        _ => return None,
+    };
     let messages = bench_dir
         .join(&messages_rel)
         .is_file()
@@ -315,6 +331,7 @@ pub(crate) fn trace_paths(
     Some(TracePaths {
         trace: trace_rel,
         messages,
+        bytes,
     })
 }
 

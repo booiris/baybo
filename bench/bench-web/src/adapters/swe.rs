@@ -60,6 +60,7 @@ pub(super) fn parse(
                 cost_micro_usd: Some(it.cost_micro_usd),
                 source_run: it.source_run.clone(),
                 trace,
+                tool_calls: Vec::new(),
                 extra: BenchExtra::Swe {
                     repo: it.repo.clone(),
                     patch_bytes: it.patch_bytes,

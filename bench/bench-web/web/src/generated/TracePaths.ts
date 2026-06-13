@@ -4,4 +4,10 @@
  * Relative paths to an item's `trace.json` + `messages.json`, under
  * the bench directory.
  */
-export type TracePaths = { trace: string, messages: string | null, };
+export type TracePaths = { trace: string, messages: string | null, 
+/**
+ * Size of `trace.json` in bytes — lets the item view lazy-gate the
+ * fetch (a single terminal-bench trace has hit 166 MB; loading the
+ * full thing into the browser is the expensive part).
+ */
+bytes: number, };
