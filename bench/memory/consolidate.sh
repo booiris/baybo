@@ -120,3 +120,10 @@ for arm in sorted(arms):
     print(f"    correct {correct}/{n} = {report['overall_accuracy']*100:.1f}%   "
           f"mean_f1={report['mean_f1']}")
 PY
+
+# Refresh this bench's per-trace tool-count sidecars (<trace>.tools.json) so the
+# bench viewer's task list reads tiny precomputed counts instead of re-parsing
+# agent traces that can run to hundreds of MB. Incremental + best-effort.
+bench_id="$(basename "$PWD")"
+cargo run -q -p aura-bench-web --bin precompute_tool_counts -- --root .. --bench "$bench_id" \
+  || echo ">> tool-count precompute skipped (non-fatal); bench/bench-web/run.sh refreshes on launch" >&2

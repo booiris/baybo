@@ -105,3 +105,10 @@ for arm in sorted(arms):
           f"-> results/merged-{arm}.json  (trace/merged/{arm}/)")
     print(f"    resolved {resolved}/{n} = {report['resolved_rate']*100:.1f}%")
 PY
+
+# Refresh this bench's per-trace tool-count sidecars (<trace>.tools.json) so the
+# bench viewer's task list reads tiny precomputed counts instead of re-parsing
+# agent traces that can run to hundreds of MB. Incremental + best-effort.
+bench_id="$(basename "$PWD")"
+cargo run -q -p aura-bench-web --bin precompute_tool_counts -- --root .. --bench "$bench_id" \
+  || echo ">> tool-count precompute skipped (non-fatal); bench/bench-web/run.sh refreshes on launch" >&2

@@ -19,6 +19,11 @@ struct Args {
     /// memory). Defaults to ./bench.
     #[arg(long, default_value = "bench")]
     root: PathBuf,
+
+    /// Restrict the sweep to one bench id (its dir name, e.g. `swe`).
+    /// Omit to refresh every known bench under `root`.
+    #[arg(long)]
+    bench: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -34,7 +39,7 @@ fn main() -> anyhow::Result<()> {
         .root
         .canonicalize()
         .with_context(|| format!("bench root {} not found", args.root.display()))?;
-    let n = aura_bench_web::precompute::write_tool_count_sidecars(&root)?;
+    let n = aura_bench_web::precompute::write_tool_count_sidecars(&root, args.bench.as_deref())?;
     println!("wrote {n} tool-count sidecar(s) under {}", root.display());
     Ok(())
 }
