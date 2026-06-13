@@ -930,6 +930,19 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         graph.actor_parent_token.clone(),
     );
 
+    // Turn-state projector: the single producer of the web chat's
+    // turn-*ended* signal. It subscribes to the job lifecycle's terminal
+    // bus and, on each terminal transition, broadcasts the session's
+    // current `TurnState` (recomputed from the job store) — so the end
+    // edge is derived from the one source of truth rather than emitted by
+    // the actor in parallel. See `spawn_turn_state_projector`.
+    aura_agent::supervisor::spawn_turn_state_projector(
+        Arc::clone(&graph.job_lifecycle),
+        Arc::clone(&graph.session_manager),
+        supervisor.response_tx().clone(),
+        graph.actor_parent_token.clone(),
+    );
+
     let workspace_paths_for_router = Arc::new(aura_workspace::WorkspacePaths::new(
         graph.workspace.root.clone(),
     ));

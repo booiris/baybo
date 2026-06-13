@@ -475,6 +475,17 @@ impl AgentTestHarnessBuilder {
         let (mailbox_tx, mailbox_rx) = aura_agent::mailbox::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
+        // Mirror production's turn-state projector so the turn-*ended*
+        // `TurnState { active: false }` is derived from the job store
+        // (the actor only emits the leading `true`). Without it the e2e
+        // outputs would never carry the close edge.
+        aura_agent::supervisor::spawn_turn_state_projector(
+            Arc::clone(&job_lifecycle),
+            Arc::clone(&session_manager),
+            output_tx.clone(),
+            actor_parent_token.child_token(),
+        );
+
         let actor = AgentActor::from_parts(
             aura_agent::state::DurableActorState::new(session.clone()),
             aura_agent::state::VolatileResources {

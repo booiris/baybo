@@ -420,15 +420,18 @@ impl AgentActor {
         // Kept so the error path below can tell a user `/stop` (token
         // tripped via the job cancel) apart from a genuine failure.
         let turn_token = self.volatile.actor_token.child_token();
-        // Bracket every turn with a TurnState snapshot — the `false` must
-        // fire on success, error and cancel alike, or a watching client's
-        // work block spins forever. Late joiners that miss these get the
-        // equivalent snapshot from the gateway's Subscribe handler (job-
-        // store-derived), so the two sources must agree on what a turn is
-        // (`JobKind::is_turn`). The `true` leads the job-row insert (it
-        // happens inside `agent_loop.run → with_job`) by one storage write:
-        // a Subscribe landing in that sliver gets an idle snapshot and
-        // self-corrects on the turn's next frame.
+        // Emit only the leading `active: true` so a connected tab flips out
+        // of the optimistic typing state into the work block (with the true
+        // start instant) before any progress frame lands. The matching
+        // `active: false` is NOT emitted here: it's derived from the job
+        // store by `spawn_turn_state_projector` the moment this turn's job
+        // reaches a terminal state inside `agent_loop.run` — so the end edge
+        // stays in lockstep with the same truth the join-time Subscribe
+        // snapshot reads, on success / error / cancel / crash alike. (Only
+        // the *start* edge lives here: `start()` is a non-terminal transition
+        // the job bus doesn't carry.) A Subscribe landing between this emit
+        // and the job-row insert gets an idle snapshot and self-corrects on
+        // the turn's next frame.
         self.emit_turn_state(true, Some(chrono::Utc::now())).await;
         let result = self
             .volatile
@@ -444,7 +447,6 @@ impl AgentActor {
                 interjections,
             )
             .await;
-        self.emit_turn_state(false, None).await;
         // A user is waiting on this turn — a genuine failure must surface as
         // a terminal notice, not silence (the log line alone leaves the chat
         // dangling on its last progress frame). Cancellation stays quiet:
@@ -468,9 +470,12 @@ impl AgentActor {
         result
     }
 
-    /// Broadcast an [`AgentEvent::TurnState`] snapshot for this session.
-    /// Best-effort like every other progress emission — a send failure
-    /// only costs display state, never the turn.
+    /// Broadcast the leading `active: true` [`AgentEvent::TurnState`] for
+    /// this session's turn. Only the start edge is emitted here; the end
+    /// edge is derived from the job store by
+    /// [`crate::actor::supervisor::spawn_turn_state_projector`]. Best-effort
+    /// like every other progress emission — a send failure only costs
+    /// display state, never the turn.
     async fn emit_turn_state(
         &self,
         active: bool,
@@ -954,12 +959,11 @@ impl AgentActor {
         sent_at: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<()> {
         // `compact_now` mints a turn-kind job (it matches the session's
-        // trigger), so the gateway's per-Subscribe snapshot would report
-        // it as an in-flight turn. Bracket it with the same TurnState
-        // emissions as a real turn so a tab subscribing mid-compaction
-        // also hears the end, not just the start.
+        // trigger), so emit the leading `active: true` like a real turn —
+        // the matching `active: false` is derived from the job store by the
+        // turn-state projector when `compact_now`'s job goes terminal.
         self.emit_turn_state(true, Some(chrono::Utc::now())).await;
-        let result = self
+        let text = self
             .volatile
             .agent_loop
             .compact_now(
@@ -969,9 +973,7 @@ impl AgentActor {
                 None,
                 self.volatile.actor_token.child_token(),
             )
-            .await;
-        self.emit_turn_state(false, None).await;
-        let text = result?;
+            .await?;
         // Record the `/compact` echo + its confirmation as out-of-band control
         // events (off the LLM transcript) so a reload shows them, anchored after
         // the (post-compaction) last row.

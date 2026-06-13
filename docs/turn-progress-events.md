@@ -84,18 +84,34 @@ connected when they fired (a second tab opened mid-turn, a reconnect) used to
 have no way to tell "the agent is still working" from "the turn died without a
 reply" — the web UI guessed from the transcript shape and a connect-settle
 timer, mislabelling live turns as **Cancelled** and restarting the elapsed
-timer at `0s`. `TurnState` replaces the guess with server truth:
+timer at `0s`. `TurnState` replaces the guess with server truth.
 
-- **Event**: `AgentEvent::TurnState { active, started_at }`, emitted by the
-  **actor** around its `run_agent_loop` chokepoint — `active: true` (+ start
-  instant) when any turn kind starts (user, cron, subagent-notification,
-  spawned), `active: false` when it returns, on success, error and cancel
-  alike. It is an idempotent snapshot, not an edge.
-- **Wire**: `Frame::TurnState`, broadcast to the session's subscribers like any
-  progress frame — and **also sent per-`Subscribe`** by the gateway, derived
-  from the job store (`JobLifecycle::active_turn_started_at`, non-terminal
-  jobs filtered by `JobKind::is_turn`; the boot-time recovery sweep keeps
-  orphaned rows out). The two sources must agree on what counts as a turn.
+The single source of truth is the **job store**: a turn is in flight exactly
+when the session has a non-terminal turn-kind job (`JobKind::is_turn` — every
+kind except `System`). `Frame::TurnState { active, started_at }` is that truth
+projected to chat clients, produced by three paths that agree by construction:
+
+- **Start edge** — the **actor** emits `active: true` (+ the start instant)
+  before `agent_loop.run` (and before `compact_now`). This edge alone is
+  actor-emitted because `start()` is a *non-terminal* job transition the
+  terminal bus below doesn't carry.
+- **End edge** — the **turn-state projector** (`spawn_turn_state_projector`)
+  subscribes to `JobLifecycle::subscribe_terminal_events` and, on every
+  terminal transition, recomputes `JobLifecycle::active_turn_started_at` for
+  that session and broadcasts the current value. So the close edge is *derived
+  from the same store* the snapshot reads — it can't be skipped by an error or
+  a crash, and it can't drift from a parallel actor emission (there is none).
+  "Recompute-is-truth" makes it robust to which job's terminal fired it (the
+  turn, a child subagent, a background-compression `System` job): each just
+  means "recompute this session now".
+- **Join snapshot** — the gateway sends one `TurnState` per `Subscribe`,
+  reading the same `active_turn_started_at`, so a late joiner (new tab,
+  reconnect) renders the in-flight turn it never saw start.
+
+A panicked actor is reaped by `spawn_actor_with_crash_reaper`: it cancels the
+orphaned turn jobs, which fires terminal events, which the projector turns into
+the close edge — no special-case broadcast in the watchdog.
+
 - **Web client**: `SessionView.turn` records the latest signal;
   `applyTurnState` reconciles the transcript tail (re-opens the
   history-reconstructed work block of an in-flight turn with the true

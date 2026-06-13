@@ -638,10 +638,12 @@ The full frame set (see `crates/channels/src/wire.rs`):
   answer text, server → client), `Notice` (out-of-band warn/error).
 - **Turn progress (server → client):** `Reasoning` (incremental thinking),
   `ToolStarted` / `ToolCompleted` (tool-call lifecycle), `TurnState
-  { active, started_at? }` (is a turn in flight — broadcast at every turn
-  start/end **and** re-derived from the job store per `Subscribe`, so a
-  late-joining tab learns about a turn whose progress frames it missed).
-  Streaming clients (TUI / web) render these live; clients without a
+  { active, started_at? }` (is a turn in flight). The start edge is emitted
+  by the actor; the end edge is projected from the job store by
+  `spawn_turn_state_projector` (subscribed to the job terminal bus), and one
+  snapshot is sent per `Subscribe` from the same `active_turn_started_at`
+  read — so a late-joining tab learns about a turn whose progress frames it
+  missed. Streaming clients (TUI / web) render these live; clients without a
   partial surface drop them.
   See [`docs/turn-progress-events.md`](../turn-progress-events.md).
 - **Approvals:** `ApprovalRequested` / `ApprovalResolved` (server →

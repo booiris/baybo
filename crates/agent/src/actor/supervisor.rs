@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use aura_channels::AgentOutput;
+use aura_channels::{AgentEvent, AgentOutput};
 use aura_model::SessionId;
 use chrono::Duration;
 use dashmap::DashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -522,13 +522,16 @@ pub struct ActorCrashContext {
 /// panics are not) and would otherwise leave its in-flight turn frozen
 /// in *durable* state until the next boot recovery sweep: the job row
 /// stays non-terminal, so every later `Subscribe` snapshot keeps telling
-/// new tabs `TurnState { active: true }` for a turn that is gone, and no
-/// `active: false` ever broadcasts. The watchdog awaits the actor task
-/// and, on panic, cancels the session's non-terminal turn-kind jobs as
-/// `SystemCrash`, broadcasts the terminal `TurnState`, and — when a turn
-/// was actually in flight — surfaces an error notice so the waiting user
-/// isn't left staring at a spinner. (The supervisor registry entry needs
-/// no help here: `ActorRegistryGuard` drops during unwind.)
+/// new tabs `TurnState { active: true }` for a turn that is gone. The
+/// watchdog awaits the actor task and, on panic, cancels the session's
+/// non-terminal turn-kind jobs as `SystemCrash` — which makes them
+/// terminal, so the [`spawn_turn_state_projector`] broadcasts the
+/// `TurnState { active: false }` that collapses the work block (the
+/// watchdog doesn't emit it directly: the projector is the single end-
+/// edge path). It also surfaces a user-facing crash notice (prose the
+/// projector doesn't carry) so the waiting user isn't left staring at a
+/// spinner. (The supervisor registry entry needs no help here:
+/// `ActorRegistryGuard` drops during unwind.)
 pub fn spawn_actor_with_crash_reaper(
     actor: crate::actor::AgentActor,
     mailbox: crate::actor::mailbox::MailboxReceiver<AgentMessage>,
@@ -562,6 +565,8 @@ pub fn spawn_actor_with_crash_reaper(
         };
         let mut reaped = 0usize;
         for job in jobs.into_iter().filter(|j| j.kind.is_turn()) {
+            // Cancelling publishes a terminal event → the turn-state
+            // projector broadcasts `TurnState { active: false }`.
             match ctx
                 .job_lifecycle
                 .cancel(&job.id, aura_job::CancelReason::SystemCrash, Vec::new())
@@ -573,32 +578,106 @@ pub fn spawn_actor_with_crash_reaper(
                 }
             }
         }
-        let send = |event| {
-            let out = AgentOutput {
+        if reaped > 0 {
+            let notice = AgentOutput {
                 session_id: ctx.session_id.clone(),
                 user_id: ctx.user_id.clone(),
                 channel: ctx.channel.clone(),
-                event,
+                event: AgentEvent::Notice {
+                    level: aura_channels::NoticeLevel::Error,
+                    text: "The assistant crashed mid-turn; the turn was cancelled.".to_string(),
+                },
             };
-            ctx.response_tx.send(out)
-        };
-        if send(aura_channels::AgentEvent::TurnState {
-            active: false,
-            started_at: None,
-        })
-        .await
-        .is_err()
-        {
-            return;
-        }
-        if reaped > 0 {
-            let _ = send(aura_channels::AgentEvent::Notice {
-                level: aura_channels::NoticeLevel::Error,
-                text: "The assistant crashed mid-turn; the turn was cancelled.".to_string(),
-            })
-            .await;
+            let _ = ctx.response_tx.send(notice).await;
         }
     });
+}
+
+/// Spawn the per-process turn-state projector — the single producer of
+/// the web chat's turn-*ended* signal.
+///
+/// `Frame::TurnState { active: false }` is derived here from the one
+/// source of truth (the job store) rather than emitted by the actor in
+/// parallel: every terminal job transition publishes on
+/// [`aura_job::JobLifecycle::subscribe_terminal_events`], and on each one
+/// we recompute the session's
+/// [`aura_job::JobLifecycle::active_turn_started_at`] and broadcast the
+/// current value through the same `response_tx` → channel fan-out the
+/// actor uses. The actor still emits the leading `active: true` (job
+/// `start()` is a non-terminal transition the bus doesn't carry), and the
+/// gateway's per-`Subscribe` snapshot reads the same
+/// `active_turn_started_at` — so the start broadcast, the end broadcast,
+/// and the join-time snapshot agree by construction.
+///
+/// Recompute-is-truth keeps this robust to *which* job's terminal fired:
+/// a child-session subagent, a background-compression `System` job, or the
+/// turn itself all just mean "recompute this session now", and the
+/// broadcast is whatever is currently true — never a stale "X ended". A
+/// `Lagged` drop is harmless: the next event recomputes, and the Subscribe
+/// snapshot covers a client that joined during the gap.
+pub fn spawn_turn_state_projector(
+    job_lifecycle: Arc<aura_job::JobLifecycle>,
+    sessions: Arc<SessionManager>,
+    response_tx: mpsc::Sender<AgentOutput>,
+    cancel_token: CancellationToken,
+) -> JoinHandle<()> {
+    // Subscribe synchronously, before the spawn returns, so no terminal
+    // event published after this call can slip through unobserved.
+    let mut events = job_lifecycle.subscribe_terminal_events();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                recv = events.recv() => match recv {
+                    Ok(ev) => {
+                        project_turn_state(&job_lifecycle, &sessions, &response_tx, &ev.session_id)
+                            .await
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        debug!(skipped = n, "turn-state projector lagged; next event recomputes");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+        debug!("turn-state projector: stopped");
+    })
+}
+
+/// Recompute one session's turn activity from the job store and broadcast
+/// the current `TurnState`. The Subscribe-time snapshot
+/// (`gateway::channel::route`) reads the same `active_turn_started_at`
+/// directly, so a freshly-joined tab and a live broadcast never disagree.
+async fn project_turn_state(
+    job_lifecycle: &aura_job::JobLifecycle,
+    sessions: &SessionManager,
+    response_tx: &mpsc::Sender<AgentOutput>,
+    session_id: &SessionId,
+) {
+    let started_at = match job_lifecycle.active_turn_started_at(session_id).await {
+        Ok(started_at) => started_at,
+        Err(e) => {
+            warn!(%session_id, error = %e, "turn-state projector: recompute failed");
+            return;
+        }
+    };
+    // TurnState is consumed only by the web dashboard; a session-row miss
+    // falls back to the reserved http channel so the frame still reaches
+    // web subscribers (every other surface drops it regardless).
+    let (channel, user_id) = match sessions.get(session_id).await {
+        Ok(Some(s)) => (s.channel, s.user.id),
+        _ => (aura_model::ChannelType::http(), String::new()),
+    };
+    let out = AgentOutput {
+        session_id: session_id.clone(),
+        user_id,
+        channel,
+        event: AgentEvent::TurnState {
+            active: started_at.is_some(),
+            started_at,
+        },
+    };
+    let _ = response_tx.send(out).await;
 }
 
 /// RAII guard that removes an actor entry from [`AgentSupervisor`] when
