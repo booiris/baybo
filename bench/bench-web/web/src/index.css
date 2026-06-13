@@ -1,0 +1,65 @@
+@import "tailwindcss";
+
+@theme {
+  --color-canvas: #fafafa;
+  --color-ink: #111111;
+  --color-ink-soft: #555555;
+  --color-brand: #3b60e4;
+  --color-brand-hover: #3151c4;
+  --color-err: #e53e3e;
+  --color-warn: #dd6b20;
+  --color-info: #3182ce;
+  --color-ok: #2f855a;
+
+  --font-sans: "Inter", sans-serif;
+  --font-mono: "Space Mono", monospace;
+
+  --shadow-brutal: 4px 4px 0 0 #000;
+  --shadow-brutal-sm: 3px 3px 0 0 #000;
+  --shadow-brutal-xs: 2px 2px 0 0 #000;
+
+  --radius-brutal: 6px;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    font-family: var(--font-mono);
+    background-color: var(--color-canvas);
+    color: var(--color-ink);
+    margin: 0;
+  }
+}
+
+/* Tinted scrollbar that blends into the canvas, with a stable gutter so
+   content doesn't jump when the thumb appears. */
+.scroll-area {
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(17, 17, 17, 0.22) transparent;
+}
+
+.scroll-area::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.scroll-area::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scroll-area::-webkit-scrollbar-thumb {
+  background-clip: padding-box;
+  background-color: rgba(17, 17, 17, 0.22);
+  border: 2px solid transparent;
+  border-radius: 6px;
+}
+
+.scroll-area::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(17, 17, 17, 0.4);
+}

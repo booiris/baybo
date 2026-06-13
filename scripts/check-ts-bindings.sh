@@ -8,6 +8,7 @@
 # Surfaces:
 #   sdks/channel-ts/src/generated/    ← `aura-channels` (channel WS frames)
 #   tool-src/browser/src/generated/   ← `aura-tools::mcp` (MCP `_meta.aura.*`)
+#   bench/bench-web/web/src/generated/ ← `aura-bench-web` (bench spine model)
 #
 # Usage: scripts/check-ts-bindings.sh
 set -euo pipefail
@@ -19,6 +20,7 @@ cd "$REPO_ROOT"
 SURFACES=(
     "sdks/channel-ts/src/generated|test -p aura-channels --features ts-export --lib wire"
     "tool-src/browser/src/generated|test -p aura-tools  --features ts-export --lib mcp::access_rule"
+    "bench/bench-web/web/src/generated|test -p aura-bench-web --features ts-export --lib model"
 )
 
 failed=0

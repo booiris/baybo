@@ -305,6 +305,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "aura-bench-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "ts-rs",
+ "zstd",
+]
+
+[[package]]
 name = "aura-channels"
 version = "0.1.0"
 dependencies = [

@@ -12,6 +12,7 @@ sdks/*/dist/
 channel-src/*/dist/
 tool-src/*/dist/
 web/dist/
+bench/bench-web/web/dist/
 origin_channel_plugin
 
 # user dotfiles / shell config bind-mounted into the workspace

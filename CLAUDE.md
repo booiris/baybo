@@ -102,6 +102,7 @@ Module index: [`docs/modules/README.md`](docs/modules/README.md)
 For non-module-crate topics, read the relevant doc before touching that area:
 
 - [`docs/webui.md`](docs/webui.md) — embedded React dashboard (`web/`), pnpm/Vite workflow, OpenAPI codegen, Tailwind v4 design tokens.
+- [`docs/bench-web.md`](docs/bench-web.md) — standalone read-only viewer (`bench/bench-web`) for bench `results/` + agent `trace/` artifacts; spine model + per-bench adapters, ts-rs gate.
 - [`docs/sidecars.md`](docs/sidecars.md) — embedded JS sidecars (`channel-src/*`, `tool-src/*`), bundling/install pipeline, domain registration, and the browser sidecar (CDDM wrapper, security trade-offs, docker mode).
 - [`docs/modules/storage.md`](docs/modules/storage.md) — libsql storage; all deletable tables use plain `DELETE` (no soft-delete tombstones).
 - [`docs/fuzzing.md`](docs/fuzzing.md) — `aura-security` cargo-fuzz harness and targets.

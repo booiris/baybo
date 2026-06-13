@@ -1,0 +1,45 @@
+[package]
+name = "aura-bench-web"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "bench-web"
+path = "src/main.rs"
+
+[features]
+# Emits ts-rs-generated TypeScript definitions for the spine model
+# (`RunSummary` / `Item` / `BenchExtra` / …) into `web/src/generated/`.
+# Behind a feature so normal builds don't compile ts-rs; the CI gate
+# (`scripts/check-ts-bindings.sh`) regenerates and diffs against HEAD.
+ts-export = ["dep:ts-rs"]
+
+[dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Runtime-side: decompress the embedded React bundle on first request
+# (build.rs side is in [build-dependencies]).
+zstd = { workspace = true }
+
+# Optional — only pulled in for the `ts-export` feature so normal
+# builds don't have to compile ts-rs.
+ts-rs = { workspace = true, optional = true }
+
+[build-dependencies]
+zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = { workspace = true }
+http-body-util = { workspace = true }

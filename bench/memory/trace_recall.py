@@ -2,7 +2,7 @@
 """Show the memory aura actually recalled while answering each bench question.
 
 Each QA question runs in its own aura session, exported (default-on; NO_TRACE=1
-disables) by run-bench.sh to
+disables) by run.sh to
   trace/<run_id>/<arm>/qa-<run_id>-<arm>-c<conv>-q<idx>.messages.json
 — the JSON that `aura session history --include-superseded --json` emits. Inside
 it the backend's recall rides as a `role=user`, `source="recalled_memory"`

@@ -81,7 +81,7 @@ defaults to the system temp dir when the bins are run directly). The **answer
 model** (the model Aura answers with) defaults to DeepSeek `deepseek-chat`, but
 provider, model, key-env, and base URL are all configurable —
 `--answer-provider` / `--answer-model` / `--answer-api-key-env` /
-`--answer-base-url` (or the `ANSWER_*` env vars in `run-bench.sh`) — so you can
+`--answer-base-url` (or the `ANSWER_*` env vars in `run.sh`) — so you can
 benchmark any provider's cost/quality (the per-question token/cost metrics make
 the comparison direct). With `--aura-config` the answer model is instead that
 config's `default-llm` and QA sessions land in its workspace (harmless — memory
@@ -115,11 +115,11 @@ template and fill it in:
 cp bench/memory/.env.example bench/memory/.env   # then fill DEEPSEEK_API_KEY etc.
 ```
 
-Easiest — `run-bench.sh` builds the read-only `aura`, auto-loads `.env`, ingests
+Easiest — `run.sh` builds the read-only `aura`, auto-loads `.env`, ingests
 as needed, and prints a floor → backend → ceiling table:
 
 ```bash
-ARMS="noop oracle openviking" CONVERSATIONS=3 QUESTIONS=10 bench/memory/run-bench.sh
+ARMS="noop oracle openviking" CONVERSATIONS=3 QUESTIONS=10 bench/memory/run.sh
 ```
 
 Or drive the bins directly (they read the process env, so build + source first):
@@ -145,7 +145,7 @@ Each `run` evaluates one arm and writes its full report to
 `results/results-<arm>-<run_id>.json` (summary scores + every question's answer,
 judge reason, answer-time, token counts, and cost). That folder is **gitignored**
 (local only, like `bench-out/`) — the JSONs are large, LLM-generated, and
-rewritten each run, so they're regenerated rather than committed. `run-bench.sh`
+rewritten each run, so they're regenerated rather than committed. `run.sh`
 compares the run's JSONs into the floor → backend → ceiling table, which now
 also carries `lat_ms` / `in_tok` / `out_tok` / `cost$` columns per arm.
 

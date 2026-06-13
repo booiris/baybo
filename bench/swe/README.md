@@ -43,7 +43,7 @@ of every prod build; `none` on its own (no feature) keeps uv + the work jail, so
 the bench needs both.
 
 The binary is copied into Ubuntu-based eval images, so it must be **static
-musl** (a glibc build from a newer host won't run there). `run-bench.sh` builds
+musl** (a glibc build from a newer host won't run there). `run.sh` builds
 it for you:
 
 ```bash
@@ -63,7 +63,7 @@ libsql's bundled SQLite requires. Point the bench at a prebuilt binary with
   images via `prepare_images`, and grade via `run_evaluation`) lives in a
   **persistent uv venv** declared by `bench/swe/pyproject.toml`. `uv sync`
   provisions a pinned CPython + deps into `bench/swe/.venv` (built once, reused);
-  `run-bench.sh` does it for you. Never `pip install` into the system Python —
+  `run.sh` does it for you. Never `pip install` into the system Python —
   in fact the system interpreter may be too new for the `swebench` stack, which
   is exactly why uv pins one. (Set `PYTHON=…` to use your own interpreter instead.)
 - For the agent arm only: the musl toolchain above + a model API key.
@@ -102,20 +102,20 @@ Credentials + overrides live in `bench/swe/.env` (gitignored — copy the templa
 cp bench/swe/.env.example bench/swe/.env   # then fill AURA_API_KEY for the agent arm
 ```
 
-Easiest — `run-bench.sh` exports the dataset, (for the agent arm) builds the
+Easiest — `run.sh` exports the dataset, (for the agent arm) builds the
 musl `aura` and pulls the prebuilt images, runs each arm, and prints a
 `noop → agent → oracle` table. It defaults to the first SWE-bench_Lite instance
 for a cheap smoke:
 
 ```bash
 # offline floor vs ceiling (no key, no aura) — validates Docker + grader:
-bench/swe/run-bench.sh
+bench/swe/run.sh
 
 # all three arms on specific instances (agent needs AURA_API_KEY):
-ARMS="noop oracle agent" INSTANCE_IDS="sympy__sympy-20590" bench/swe/run-bench.sh
+ARMS="noop oracle agent" INSTANCE_IDS="sympy__sympy-20590" bench/swe/run.sh
 
 # preview the plan (resolves image keys via swebench; no Docker/spend):
-DRY_RUN=1 ARMS="noop oracle agent" bench/swe/run-bench.sh
+DRY_RUN=1 ARMS="noop oracle agent" bench/swe/run.sh
 ```
 
 Or drive the pieces directly. The Python steps go through the uv venv — `uv sync`
@@ -168,7 +168,7 @@ exactly what the agent did and why it stopped. Default-on; `NO_TRACE=1` (or
 ## Caveats
 
 - **musl build is effectively mandatory for the agent arm.** A glibc `aura`
-  built on a newer host won't load in the older-glibc eval images. `run-bench.sh`
+  built on a newer host won't load in the older-glibc eval images. `run.sh`
   fails the agent arm with instructions if the musl toolchain is missing;
   `noop`/`oracle` never need it.
 - **Cost & time scale with the instance set.** Full splits build/pull tens of GB

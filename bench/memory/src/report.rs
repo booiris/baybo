@@ -23,6 +23,8 @@ pub struct QuestionResult {
     pub session_id: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cached (prompt-cache-hit) share of `input_tokens`.
+    pub cached_input_tokens: u64,
     pub cost_micro_usd: i64,
 }
 
@@ -54,6 +56,7 @@ pub struct RunReport {
     pub mean_latency_ms: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_input_tokens: u64,
     pub total_cost_micro_usd: i64,
     pub mean_input_tokens: f64,
     pub mean_output_tokens: f64,
@@ -97,6 +100,7 @@ pub fn aggregate(meta: ReportMeta, results: Vec<QuestionResult>) -> RunReport {
 
     let input_tokens: u64 = results.iter().map(|r| r.input_tokens).sum();
     let output_tokens: u64 = results.iter().map(|r| r.output_tokens).sum();
+    let cached_input_tokens: u64 = results.iter().map(|r| r.cached_input_tokens).sum();
     let total_cost_micro_usd: i64 = results.iter().map(|r| r.cost_micro_usd).sum();
     let per_question = |total: f64| {
         if total_questions == 0 {
@@ -146,6 +150,7 @@ pub fn aggregate(meta: ReportMeta, results: Vec<QuestionResult>) -> RunReport {
         mean_latency_ms,
         input_tokens,
         output_tokens,
+        cached_input_tokens,
         total_cost_micro_usd,
         mean_input_tokens,
         mean_output_tokens,
@@ -229,6 +234,7 @@ mod tests {
             session_id: "s".to_string(),
             input_tokens: input,
             output_tokens: output,
+            cached_input_tokens: 0,
             cost_micro_usd: cost,
         }
     }
