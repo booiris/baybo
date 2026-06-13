@@ -16,6 +16,7 @@ Run via Harbor's --agent-import-path (no fork). From bench/terminal-bench-2.0/:
         -m deepseek/deepseek-v4-flash
 """
 
+import asyncio
 import json
 import shlex
 import tempfile
@@ -35,6 +36,9 @@ _AURA_HOME = f"{_CONTAINER_DIR}/aura-home"
 _KEY_PATH = f"{_CONTAINER_DIR}/enc.key"
 # Fixed session id for the single prompt per task, so the trace can be exported.
 _SESSION_ID = "aura-tb"
+# Cap the post-run trace export so a wedged container during cleanup can't hang the
+# trial past the agent timeout (the in-shell `|| true` doesn't guard a hung exec).
+_EXPORT_TIMEOUT_SECS = 30.0
 
 # Static-musl aura binary copied into each container. Repo-root-relative (this
 # file is bench/terminal-bench-2.0/harbor_adapter/); AURA_BIN overrides.
@@ -178,6 +182,7 @@ class AuraAgent(BaseInstalledAgent):
         # Harbor enforces the task's agent timeout. A non-zero aura exit is logged
         # but not raised, so the verifier still grades whatever aura did.
         env = {self._key_env: self._key_value, "AURA_CONFIG_PATH": _CONFIG_PATH}
+        cancelled: asyncio.CancelledError | None = None
         try:
             await self.exec_as_agent(
                 environment,
@@ -187,18 +192,37 @@ class AuraAgent(BaseInstalledAgent):
                     f"{shlex.quote(instruction)}"
                 ),
             )
+        except asyncio.CancelledError as exc:
+            # Harbor enforces the agent timeout by cancelling this coroutine mid-prompt.
+            # CancelledError is a BaseException, so `except Exception` won't catch it —
+            # capture it, still export the partial trace below, then re-raise so Harbor
+            # converts it back to AgentTimeoutError instead of seeing a clean return.
+            cancelled = exc
         except Exception as exc:
             self.logger.warning(f"aura prompt exited non-zero (still grading): {exc}")
 
+        await self._export_trace(environment, env)
+
+        if cancelled is not None:
+            raise cancelled
+
+    async def _export_trace(
+        self, environment: BaseEnvironment, env: dict[str, str]
+    ) -> None:
         # Export the transcript + call-tree trace into /logs/agent (mounted to the
-        # host trial dir). Best-effort — never fail the task on a trace hiccup.
+        # host trial dir). Best-effort — never fail the task on a trace hiccup. The
+        # whole export shares one timeout so a wedged container can't stall cleanup.
         agent_dir = EnvironmentPaths.agent_dir.as_posix()
         trace_env = {**env, "RUST_LOG": "off"}
-        for sub_cmd, fname in (
-            (f"session export {_SESSION_ID} --json", "trace.json"),
-            (f"session history {_SESSION_ID} --include-superseded --json", "messages.json"),
-        ):
-            try:
+
+        async def export() -> None:
+            for sub_cmd, fname in (
+                (f"session export {_SESSION_ID} --json", "trace.json"),
+                (
+                    f"session history {_SESSION_ID} --include-superseded --json",
+                    "messages.json",
+                ),
+            ):
                 await self.exec_as_agent(
                     environment,
                     env=trace_env,
@@ -208,8 +232,11 @@ class AuraAgent(BaseInstalledAgent):
                         "2>/dev/null || true"
                     ),
                 )
-            except Exception:
-                pass
+
+        try:
+            await asyncio.wait_for(export(), timeout=_EXPORT_TIMEOUT_SECS)
+        except (Exception, asyncio.TimeoutError) as exc:
+            self.logger.warning(f"trace export failed (continuing): {exc}")
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         # Grading is filesystem-based; token/cost telemetry is best-effort and
