@@ -637,9 +637,13 @@ The full frame set (see `crates/channels/src/wire.rs`):
   echo of inbound to other subscribers out), `AnswerDelta` (incremental
   answer text, server → client), `Notice` (out-of-band warn/error).
 - **Turn progress (server → client):** `Reasoning` (incremental thinking),
-  `ToolStarted` / `ToolCompleted` (tool-call lifecycle). Streaming clients
-  (TUI / web) render these live; clients without a partial surface drop
-  them. See [`docs/turn-progress-events.md`](../turn-progress-events.md).
+  `ToolStarted` / `ToolCompleted` (tool-call lifecycle), `TurnState
+  { active, started_at? }` (is a turn in flight — broadcast at every turn
+  start/end **and** re-derived from the job store per `Subscribe`, so a
+  late-joining tab learns about a turn whose progress frames it missed).
+  Streaming clients (TUI / web) render these live; clients without a
+  partial surface drop them.
+  See [`docs/turn-progress-events.md`](../turn-progress-events.md).
 - **Approvals:** `ApprovalRequested` / `ApprovalResolved` (server →
   client), `ResolveApproval` (client → server), `PendingApprovalsSnapshot
   { session_id, call_ids }` (server → client, on Subscribe).

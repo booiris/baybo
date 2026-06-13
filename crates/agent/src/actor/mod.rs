@@ -416,7 +416,22 @@ impl AgentActor {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         interjections: Option<&mut dyn crate::runtime::agent_loop::InterjectionSource>,
     ) -> anyhow::Result<OutgoingMessage> {
-        self.volatile
+        let is_user_turn = matches!(job_input.kind(), aura_job::JobKind::UserChat);
+        // Kept so the error path below can tell a user `/stop` (token
+        // tripped via the job cancel) apart from a genuine failure.
+        let turn_token = self.volatile.actor_token.child_token();
+        // Bracket every turn with a TurnState snapshot — the `false` must
+        // fire on success, error and cancel alike, or a watching client's
+        // work block spins forever. Late joiners that miss these get the
+        // equivalent snapshot from the gateway's Subscribe handler (job-
+        // store-derived), so the two sources must agree on what a turn is
+        // (`JobKind::is_turn`). The `true` leads the job-row insert (it
+        // happens inside `agent_loop.run → with_job`) by one storage write:
+        // a Subscribe landing in that sliver gets an idle snapshot and
+        // self-corrects on the turn's next frame.
+        self.emit_turn_state(true, Some(chrono::Utc::now())).await;
+        let result = self
+            .volatile
             .agent_loop
             .run(
                 &mut self.durable.session,
@@ -425,10 +440,49 @@ impl AgentActor {
                 &self.volatile.span_recorder,
                 parent_job_id,
                 delta_tx,
-                self.volatile.actor_token.child_token(),
+                turn_token.clone(),
                 interjections,
             )
-            .await
+            .await;
+        self.emit_turn_state(false, None).await;
+        // A user is waiting on this turn — a genuine failure must surface as
+        // a terminal notice, not silence (the log line alone leaves the chat
+        // dangling on its last progress frame). Cancellation stays quiet:
+        // `/stop` already acknowledged with its own notice. Non-user turns
+        // keep their own policies (cron logs, subagent-notification retries).
+        if is_user_turn
+            && !turn_token.is_cancelled()
+            && let Err(e) = &result
+        {
+            let notice = AgentOutput {
+                session_id: self.durable.session.id.clone(),
+                user_id: self.durable.session.user.id.clone(),
+                channel: self.durable.session.channel.clone(),
+                event: AgentEvent::Notice {
+                    level: NoticeLevel::Error,
+                    text: format!("The turn failed before producing a reply: {e}"),
+                },
+            };
+            self.send_response(notice, "user_turn_failed").await;
+        }
+        result
+    }
+
+    /// Broadcast an [`AgentEvent::TurnState`] snapshot for this session.
+    /// Best-effort like every other progress emission — a send failure
+    /// only costs display state, never the turn.
+    async fn emit_turn_state(
+        &self,
+        active: bool,
+        started_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        let output = AgentOutput {
+            session_id: self.durable.session.id.clone(),
+            user_id: self.durable.session.user.id.clone(),
+            channel: self.durable.session.channel.clone(),
+            event: AgentEvent::TurnState { active, started_at },
+        };
+        self.send_response(output, "turn_state").await;
     }
 
     /// Dispatch a fired cron job through the agent loop and send the
@@ -899,7 +953,13 @@ impl AgentActor {
         command_text: String,
         sent_at: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<()> {
-        let text = self
+        // `compact_now` mints a turn-kind job (it matches the session's
+        // trigger), so the gateway's per-Subscribe snapshot would report
+        // it as an in-flight turn. Bracket it with the same TurnState
+        // emissions as a real turn so a tab subscribing mid-compaction
+        // also hears the end, not just the start.
+        self.emit_turn_state(true, Some(chrono::Utc::now())).await;
+        let result = self
             .volatile
             .agent_loop
             .compact_now(
@@ -909,7 +969,9 @@ impl AgentActor {
                 None,
                 self.volatile.actor_token.child_token(),
             )
-            .await?;
+            .await;
+        self.emit_turn_state(false, None).await;
+        let text = result?;
         // Record the `/compact` echo + its confirmation as out-of-band control
         // events (off the LLM transcript) so a reload shows them, anchored after
         // the (post-compaction) last row.

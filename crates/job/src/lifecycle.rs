@@ -272,6 +272,24 @@ impl JobLifecycle {
             .collect()
     }
 
+    /// When the session has a turn in flight (a non-terminal turn-kind
+    /// job — see [`JobKind::is_turn`]), the instant it started. Chat
+    /// surfaces use this to tell a late-joining client "a reply is being
+    /// produced since T"; `None` means the session is idle. A still-
+    /// `Pending` turn reports its `created_at` (queued counts as in
+    /// flight from the user's point of view).
+    pub async fn active_turn_started_at(
+        &self,
+        session_id: &aura_model::SessionId,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let jobs = self.list_active_by_session(session_id).await?;
+        Ok(jobs
+            .into_iter()
+            .filter(|j| j.kind.is_turn())
+            .map(|j| j.started_at.unwrap_or(j.created_at))
+            .max())
+    }
+
     /// Direct children of `parent_job_id` (one level). Used by `/stop`'s
     /// subtree walk to stamp `UserStopped` on (and back-stop the cancellation
     /// of) in-flight descendant jobs such as foreground subagents. Foreground

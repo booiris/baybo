@@ -78,6 +78,66 @@ async fn clean_conversation_streams_text_then_final_message() {
         "no minting should happen on clean text"
     );
 
+    // Every turn is bracketed by a TurnState snapshot: `active: true` with a
+    // start instant before the work, `active: false` after — the signal a
+    // late-joining tab relies on to know the agent is working.
+    let turn_states: Vec<(bool, bool)> = outs
+        .iter()
+        .filter_map(|o| match &o.event {
+            AgentEvent::TurnState { active, started_at } => Some((*active, started_at.is_some())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        turn_states,
+        vec![(true, true), (false, false)],
+        "turn must open with active+started_at then close with inactive+none, got {turn_states:?}"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_user_turn_emits_terminal_state_and_error_notice() {
+    // A user turn whose LLM call fails terminally (non-retriable) must still
+    // close the turn for watchers: a `TurnState { active: false }` AND an
+    // error `Notice`, so the web work block collapses and the user sees why
+    // instead of an indicator spinning forever.
+    let mut harness = AgentTestHarness::builder().build();
+    harness
+        .stub_llm
+        .push_stream_results(vec![Err(LlmError::Config("bad api key".into()))]);
+
+    harness.send_text("hello").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let closed_inactive = outs
+        .iter()
+        .any(|o| matches!(o.event, AgentEvent::TurnState { active: false, .. }));
+    assert!(
+        closed_inactive,
+        "a failed turn must still broadcast TurnState inactive, got {outs:?}"
+    );
+    let error_notice = outs.iter().any(|o| {
+        matches!(
+            &o.event,
+            AgentEvent::Notice {
+                level: aura_channels::NoticeLevel::Error,
+                ..
+            }
+        )
+    });
+    assert!(
+        error_notice,
+        "a failed user turn must surface an error notice, got {outs:?}"
+    );
+    assert!(
+        !outs
+            .iter()
+            .any(|o| matches!(o.event, AgentEvent::Message(_))),
+        "a failed turn produces no final Message"
+    );
+
     harness.shutdown().await;
 }
 

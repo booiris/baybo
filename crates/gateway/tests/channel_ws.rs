@@ -95,7 +95,9 @@ async fn recv_frame(
 /// Like [`recv_frame`] but transparently skips `Frame::SessionActivity`
 /// — the sidebar pulse broadcasts unconditionally to every `http`
 /// connection on dispatch, which would interpose itself before every
-/// expected content frame in tests that don't care about the pulse.
+/// expected content frame in tests that don't care about the pulse —
+/// and `Frame::TurnState`, the per-Subscribe in-flight-turn snapshot
+/// (asserted directly via [`recv_frame`] by the tests that care).
 async fn recv_frame_skip_activity(
     ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
     timeout: Duration,
@@ -107,7 +109,10 @@ async fn recv_frame_skip_activity(
             return Err("recv timeout".into());
         }
         let frame = recv_frame(ws, remaining).await?;
-        if !matches!(frame, Frame::SessionActivity { .. }) {
+        if !matches!(
+            frame,
+            Frame::SessionActivity { .. } | Frame::TurnState { .. }
+        ) {
             return Ok(frame);
         }
     }
@@ -145,6 +150,34 @@ async fn expect_empty_pending_snapshot(
             );
         }
         other => panic!("expected PendingApprovalsSnapshot, got {other:?}"),
+    }
+}
+
+/// Consume the `TurnState` snapshot the gateway sends to a connection
+/// for every `Subscribe` (after the pending-approvals snapshot and any
+/// TaskList hydration). The sessions in these tests are idle unless the
+/// test says otherwise, so the snapshot is a definitive `active: false`
+/// — noise that tests doing raw `recv_frame` assertions next need to
+/// step past ([`recv_frame_skip_activity`] skips it automatically).
+async fn expect_idle_turn_state(
+    ws: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+    expected_session: &str,
+) {
+    let frame = recv_frame(ws, Duration::from_secs(1))
+        .await
+        .expect("TurnState snapshot after Subscribe");
+    match frame {
+        Frame::TurnState {
+            session_id,
+            active,
+            started_at,
+            ..
+        } => {
+            assert_eq!(session_id.as_str(), expected_session);
+            assert!(!active, "test sessions are idle; got an active turn");
+            assert_eq!(started_at, None);
+        }
+        other => panic!("expected TurnState, got {other:?}"),
     }
 }
 
@@ -325,6 +358,121 @@ async fn subscribe_hydrates_durable_task_list_snapshot() {
     let _ = server_handle.await;
 }
 
+/// A late joiner (new tab, reconnect) learns whether a turn is in flight
+/// from the `TurnState` snapshot the gateway derives from the job store on
+/// every `Subscribe` — `active: false` on an idle session, `active: true`
+/// with the start instant while a turn-kind job is non-terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscribe_hydrates_turn_state_snapshot() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let port_file =
+        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let cfg = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+
+    let user = User {
+        id: WEB_OPERATOR_USER_ID.into(),
+        name: None,
+        channel: ChannelType::http(),
+    };
+    let session = tg
+        .deps
+        .session_manager
+        .create_session(user, ChannelType::http())
+        .await
+        .expect("create session");
+
+    let channel_tokens = tg.channel_tokens.clone();
+    let shutdown = tg.shutdown.clone();
+    let server =
+        ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone()).expect("bind server");
+    let port = server.port();
+    let server_shutdown = shutdown.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run(server_shutdown).await;
+    });
+
+    let expect_turn_state = |frame: Frame, want_active: bool| match frame {
+        Frame::TurnState {
+            session_id,
+            active,
+            started_at,
+            ..
+        } => {
+            assert_eq!(session_id, session.id);
+            assert_eq!(active, want_active);
+            assert_eq!(started_at.is_some(), want_active, "started_at iff active");
+        }
+        other => panic!("expected TurnState, got {other:?}"),
+    };
+
+    // Idle session: the snapshot is a definitive `active: false`.
+    let (token, _handle) = mint_web_token(&channel_tokens, "tab-a");
+    let mut tab_a = connect_register(port, &token, ChannelType::http())
+        .await
+        .expect("WS handshake");
+    send_frame(
+        &mut tab_a,
+        Frame::Subscribe {
+            session_id: session.id.clone(),
+            since_ordinal: None,
+        },
+    )
+    .await
+    .expect("send Subscribe");
+    expect_empty_pending_snapshot(&mut tab_a, session.id.as_str()).await;
+    // No tasks were seeded, so the next frame after the pending snapshot
+    // is the TurnState snapshot itself.
+    let frame = recv_frame(&mut tab_a, Duration::from_secs(1))
+        .await
+        .expect("TurnState snapshot after Subscribe");
+    expect_turn_state(frame, false);
+
+    // Turn in flight (a non-terminal UserChat job): a fresh tab's
+    // snapshot reports it active, with the start instant.
+    let job = tg
+        .deps
+        .job_lifecycle
+        .start_job(
+            session.id.clone(),
+            aura_model::TriggerKind::User,
+            aura_job::JobInput::UserChat { content: vec![] },
+            None,
+        )
+        .await
+        .expect("start turn job");
+    tg.deps
+        .job_lifecycle
+        .start(&job.id)
+        .await
+        .expect("job → InProgress");
+
+    let (token_b, _handle_b) = mint_web_token(&channel_tokens, "tab-b");
+    let mut tab_b = connect_register(port, &token_b, ChannelType::http())
+        .await
+        .expect("WS handshake (tab b)");
+    send_frame(
+        &mut tab_b,
+        Frame::Subscribe {
+            session_id: session.id.clone(),
+            since_ordinal: None,
+        },
+    )
+    .await
+    .expect("send Subscribe (tab b)");
+    expect_empty_pending_snapshot(&mut tab_b, session.id.as_str()).await;
+    let frame = recv_frame(&mut tab_b, Duration::from_secs(1))
+        .await
+        .expect("TurnState snapshot after Subscribe (tab b)");
+    expect_turn_state(frame, true);
+
+    drop(tab_a);
+    drop(tab_b);
+    shutdown.trigger();
+    let _ = server_handle.await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_subscribers_to_same_session_both_receive_dispatch() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -447,6 +595,7 @@ async fn unsubscribed_session_does_not_receive_dispatch() {
     .await
     .expect("subscribe");
     expect_empty_pending_snapshot(&mut client, "interesting").await;
+    expect_idle_turn_state(&mut client, "interesting").await;
 
     let http_channel = channel_registry.get(&ChannelType::http()).expect("http");
     // Dispatch a content frame (Notice) to an unrelated session. The
@@ -545,6 +694,7 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
     .await
     .expect("send Subscribe");
     expect_empty_pending_snapshot(&mut subscriber, "sess-x").await;
+    expect_idle_turn_state(&mut subscriber, "sess-x").await;
 
     let http_channel = channel_registry.get(&ChannelType::http()).expect("http");
     let created_at = chrono::Utc::now();

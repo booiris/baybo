@@ -884,6 +884,13 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     trace_event_stream.clone(),
                 ));
 
+                let crash_ctx = aura_agent::supervisor::ActorCrashContext {
+                    session_id: session.id.clone(),
+                    user_id: session.user.id.clone(),
+                    channel: session.channel.clone(),
+                    response_tx: response_tx.clone(),
+                    job_lifecycle: Arc::clone(&job_lifecycle),
+                };
                 let actor = AgentActor::from_parts(
                     aura_agent::state::DurableActorState::new(session),
                     aura_agent::state::VolatileResources {
@@ -898,9 +905,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 );
                 let (sender, mailbox) =
                     aura_agent::mailbox::channel(aura_agent::mailbox::DEFAULT_CAPACITY);
-                tokio::spawn(async move {
-                    actor.run(mailbox).await;
-                });
+                aura_agent::supervisor::spawn_actor_with_crash_reaper(actor, mailbox, crash_ctx);
                 sender
             },
         )

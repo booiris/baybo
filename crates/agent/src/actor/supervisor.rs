@@ -506,6 +506,101 @@ pub fn spawn_idle_reaper(
     })
 }
 
+/// Everything the post-panic reap needs that lives inside the actor —
+/// captured by [`spawn_actor_with_crash_reaper`] before the actor is
+/// moved into its task.
+pub struct ActorCrashContext {
+    pub session_id: SessionId,
+    pub user_id: String,
+    pub channel: aura_model::ChannelType,
+    pub response_tx: mpsc::Sender<AgentOutput>,
+    pub job_lifecycle: Arc<aura_job::JobLifecycle>,
+}
+
+/// Spawn an actor's run loop with a crash watchdog. A panic anywhere in
+/// the actor escapes `run` (handler errors are caught in `dispatch_one`,
+/// panics are not) and would otherwise leave its in-flight turn frozen
+/// in *durable* state until the next boot recovery sweep: the job row
+/// stays non-terminal, so every later `Subscribe` snapshot keeps telling
+/// new tabs `TurnState { active: true }` for a turn that is gone, and no
+/// `active: false` ever broadcasts. The watchdog awaits the actor task
+/// and, on panic, cancels the session's non-terminal turn-kind jobs as
+/// `SystemCrash`, broadcasts the terminal `TurnState`, and — when a turn
+/// was actually in flight — surfaces an error notice so the waiting user
+/// isn't left staring at a spinner. (The supervisor registry entry needs
+/// no help here: `ActorRegistryGuard` drops during unwind.)
+pub fn spawn_actor_with_crash_reaper(
+    actor: crate::actor::AgentActor,
+    mailbox: crate::actor::mailbox::MailboxReceiver<AgentMessage>,
+    ctx: ActorCrashContext,
+) {
+    let task = tokio::spawn(async move {
+        actor.run(mailbox).await;
+    });
+    tokio::spawn(async move {
+        let Err(join_err) = task.await else { return };
+        // An aborted task is the shutdown path — the boot sweep owns
+        // that cleanup; only a panic needs mid-process reaping.
+        if !join_err.is_panic() {
+            return;
+        }
+        warn!(
+            session_id = %ctx.session_id,
+            error = %join_err,
+            "agent actor panicked; reaping in-flight turn jobs"
+        );
+        let jobs = match ctx
+            .job_lifecycle
+            .list_active_by_session(&ctx.session_id)
+            .await
+        {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                warn!(session_id = %ctx.session_id, error = %e, "crash reap: job listing failed");
+                Vec::new()
+            }
+        };
+        let mut reaped = 0usize;
+        for job in jobs.into_iter().filter(|j| j.kind.is_turn()) {
+            match ctx
+                .job_lifecycle
+                .cancel(&job.id, aura_job::CancelReason::SystemCrash, Vec::new())
+                .await
+            {
+                Ok(()) => reaped += 1,
+                Err(e) => {
+                    warn!(session_id = %ctx.session_id, job_id = %job.id, error = %e, "crash reap: cancel failed")
+                }
+            }
+        }
+        let send = |event| {
+            let out = AgentOutput {
+                session_id: ctx.session_id.clone(),
+                user_id: ctx.user_id.clone(),
+                channel: ctx.channel.clone(),
+                event,
+            };
+            ctx.response_tx.send(out)
+        };
+        if send(aura_channels::AgentEvent::TurnState {
+            active: false,
+            started_at: None,
+        })
+        .await
+        .is_err()
+        {
+            return;
+        }
+        if reaped > 0 {
+            let _ = send(aura_channels::AgentEvent::Notice {
+                level: aura_channels::NoticeLevel::Error,
+                text: "The assistant crashed mid-turn; the turn was cancelled.".to_string(),
+            })
+            .await;
+        }
+    });
+}
+
 /// RAII guard that removes an actor entry from [`AgentSupervisor`] when
 /// the actor's task exits. Held by the actor's `run` loop so cleanup
 /// runs unconditionally — including on panic — and the supervisor's

@@ -28,6 +28,22 @@ pub enum JobKind {
 }
 
 impl JobKind {
+    /// Whether a job of this kind is a *turn* — an agent-loop run whose
+    /// progress a chat surface renders as the session's in-flight reply.
+    /// Deliberately a positive, exhaustive match: a future kind must
+    /// decide explicitly whether it is a turn (`System` — background
+    /// maintenance such as context compression — runs on the session
+    /// without being a reply).
+    pub fn is_turn(&self) -> bool {
+        match self {
+            JobKind::UserChat
+            | JobKind::Cron
+            | JobKind::Spawned
+            | JobKind::SubagentNotification => true,
+            JobKind::System => false,
+        }
+    }
+
     /// Whether this kind of job is permitted on a session whose root
     /// trigger has the given kind. `Spawned` is permitted everywhere.
     pub fn allowed_for(&self, trigger: TriggerKind) -> bool {

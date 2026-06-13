@@ -386,6 +386,25 @@ pub enum Frame {
         user_id: String,
         tasks: Vec<TaskView>,
     },
+    /// Server → client: whether a turn (the session's in-flight reply)
+    /// is currently being produced. An idempotent snapshot — broadcast at
+    /// every turn start (`active: true` + the start instant) and end
+    /// (`active: false`), and sent to the subscribing connection on every
+    /// `Subscribe` so a late joiner (new tab, reconnect) renders the
+    /// in-flight turn it never saw start: open work block, elapsed timer
+    /// seeded from `started_at`, and no "Cancelled" mislabel. Clients that
+    /// infer turn activity locally (TUI, sidecars) drop it.
+    TurnState {
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        user_id: String,
+        active: bool,
+        /// `Some` iff `active`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts-export", ts(optional, type = "string"))]
+        started_at: Option<DateTime<Utc>>,
+    },
     /// Server → client: a tool call is blocked waiting for the
     /// channel's user to approve or deny. Clients with an approval UX
     /// should echo a [`Frame::ResolveApproval`] back; clients without
