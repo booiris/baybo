@@ -223,7 +223,7 @@ Router-level user rate limiting (`actor/router`) uses a sliding window (default 
 | `workspace` | Identity files for system prompt |
 | `cron` | Owns `CronJob`, `CronExecution`, and `CronScheduler`; agent re-exports `CronScheduler` / `CronTriggerEvent` for assembly-layer wiring |
 | `context` | Conversation window and compression |
-| `job` | Owns `Job`, `JobStatus`, `JobKind`, and `JobLifecycle` (persistence orchestrator + cancellation registry + terminal-event bus); the `JobStore` trait lives in `aura-store` and this crate owns the `Job` ↔ `JobRow` conversions. Agent constructs and shares one `JobLifecycle` across the loop, router, supervisor, and subagent wait routine |
+| `job` | Owns `Job`, `JobStatus`, `JobInputKind` / `JobShape` (+ `Job.origin`), and `JobLifecycle` (persistence orchestrator + cancellation registry + terminal-event bus); the `JobStore` trait lives in `aura-store` and this crate owns the `Job` ↔ `JobRow` conversions. Agent constructs and shares one `JobLifecycle` across the loop, router, supervisor, and subagent wait routine |
 | `trace` | Owns `Step`, `Span`, `SpanEvent`, `SpanRecorder` (lifecycle facade), and `TraceEventStream` (broadcast bus); the `TraceStore` trait lives in `aura-store` and this crate owns the row conversions. Agent constructs and shares one `SpanRecorder` per session |
 | `query` | Owns `QueryApi` — the read-only analytics facade over session/job/trace/cost. Agent does not consume `QueryApi` directly; gateway and CLI do |
 | `session` | Provides `SessionManager` and its error type (domain types live in `aura-model`) |

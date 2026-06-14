@@ -181,7 +181,7 @@ mod tests {
     use crate::actor::mailbox::{self, MailboxReceiver};
     use aura_channels::OutgoingMessage;
     use aura_job::test_support::MemoryJobStore;
-    use aura_job::{JobInput, JobOutput};
+    use aura_job::{JobInput, JobOutput, JobShape};
     use aura_model::{ChannelType, MessageMetadata, TriggerKind};
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -250,6 +250,7 @@ mod tests {
             .start_job(
                 SessionId::from(CHILD_SESSION),
                 TriggerKind::User,
+                JobShape::Turn,
                 JobInput::Spawned {
                     initial_prompt: vec![ContentBlock::Text("task".into())],
                 },

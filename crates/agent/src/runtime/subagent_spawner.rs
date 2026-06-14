@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aura_channels::{AgentOutput, IncomingMessage, Message};
 use aura_cost::CostManager;
-use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
+use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput, JobShape};
 use aura_llm::TokenUsage;
 use aura_model::{
     BACKGROUND_DISPATCH_ACK_PREFIX, ChannelType, ChatMessage, ContentBlock, ExternalAgentKind,
@@ -1072,6 +1072,7 @@ async fn run_external_agent_job(
         .start_job(
             child_session_id.clone(),
             job_ctx.trigger_kind,
+            JobShape::Turn,
             JobInput::Spawned { initial_prompt },
             Some(job_ctx.parent_job_id),
         )

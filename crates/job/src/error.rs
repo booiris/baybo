@@ -8,9 +8,6 @@ pub enum JobError {
     #[error("invalid state transition: {0}")]
     InvalidTransition(String),
 
-    #[error("kind / input mismatch: {0}")]
-    KindMismatch(String),
-
     #[error("job storage error: {0}")]
     Storage(String),
 

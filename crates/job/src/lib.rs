@@ -1,8 +1,8 @@
 //! Job lifecycle types and orchestration — see `docs/modules/job.md`
 //! for the design.
 //!
-//! Domain types (`Job`, `JobStatus`, `JobKind`, `CancelReason`,
-//! `JobError`) and the `JobLifecycle` persistence orchestrator both
+//! Domain types (`Job`, `JobStatus`, `JobInputKind`, `JobShape`,
+//! `CancelReason`, `JobError`) and the `JobLifecycle` orchestrator both
 //! live here; the orchestrator wraps a `JobStore` with the cancel
 //! state machine, terminal-event bus, and `JobId → CancellationToken`
 //! registry that the in-flight execution path subscribes to.
@@ -17,7 +17,7 @@ mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-use aura_model::{JobId, SessionId, SpanId};
+use aura_model::{JobId, SessionId, SpanId, TriggerKind};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,7 @@ pub use aura_store::{JobRow, JobStore, JobTransitionRow};
 pub use cancel::CancelReason;
 pub use cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
 pub use error::JobError;
-pub use kind::{JobInput, JobKind, JobOutput};
+pub use kind::{JobInput, JobInputKind, JobOutput, JobShape};
 pub use lifecycle::{JobLifecycle, JobTerminalEvent};
 
 pub type Result<T> = std::result::Result<T, JobError>;
@@ -151,6 +151,16 @@ impl std::fmt::Display for JobStatusKind {
 
 // ── Job ─────────────────────────────────────────────────────────────
 
+/// Fallback `origin` for a job row persisted before the field existed.
+fn default_origin() -> TriggerKind {
+    TriggerKind::User
+}
+
+/// Fallback `shape` for a job row persisted before the field existed.
+fn default_shape() -> JobShape {
+    JobShape::Turn
+}
+
 /// One externally-triggered unit of work. Lives within a `Session` and
 /// owns a chain of `Step`s (in `aura-trace`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,7 +169,22 @@ pub struct Job {
     pub session_id: SessionId,
     pub parent_job_id: Option<JobId>,
 
-    pub kind: JobKind,
+    /// The owning session's root trigger, recorded as-is at creation.
+    /// Not asserted against `input` — a maintenance job runs inside a
+    /// `User`-trigger session and records `origin = User` honestly.
+    ///
+    /// `serde(default)`: rows persisted before `origin`/`shape` existed
+    /// carry neither field (they had a single `kind`). The defaults let
+    /// those legacy rows still deserialize — `from_row` reads from the
+    /// `data` blob, so a missing field would otherwise fail the load
+    /// (and poison `list_*`, recovery, and `/stop`).
+    #[serde(default = "default_origin")]
+    pub origin: TriggerKind,
+    /// Turn vs maintenance, declared by the code path that runs the job
+    /// (not inferred from `input`). `serde(default)` for the legacy-row
+    /// reason on `origin` above.
+    #[serde(default = "default_shape")]
+    pub shape: JobShape,
     pub input: JobInput,
     pub status: JobStatus,
 
@@ -178,14 +203,23 @@ pub struct Job {
 }
 
 impl Job {
-    /// Construct a fresh job in `Pending` status.
-    pub fn new(session_id: SessionId, input: JobInput, parent_job_id: Option<JobId>) -> Self {
-        let kind = input.kind();
+    /// Construct a fresh job in `Pending` status. `origin` is the owning
+    /// session's root trigger; `shape` is declared by the caller (the
+    /// code path that runs the job — `Turn` drives the agent loop,
+    /// `Maintenance` does not).
+    pub fn new(
+        session_id: SessionId,
+        origin: TriggerKind,
+        shape: JobShape,
+        input: JobInput,
+        parent_job_id: Option<JobId>,
+    ) -> Self {
         Self {
             id: JobId::new(),
             session_id,
             parent_job_id,
-            kind,
+            origin,
+            shape,
             input,
             status: JobStatus::Pending,
             final_result: None,
@@ -198,6 +232,17 @@ impl Job {
 
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
+    }
+
+    /// Whether this job runs a full agent-loop turn (vs a one-shot
+    /// maintenance pass). See [`JobShape`].
+    pub fn is_turn(&self) -> bool {
+        matches!(self.shape, JobShape::Turn)
+    }
+
+    /// What payload fed this job — projected from `input`. Display only.
+    pub fn input_kind(&self) -> JobInputKind {
+        self.input.input_kind()
     }
 
     /// Apply a state transition. Validates against the state machine,
@@ -387,7 +432,13 @@ mod tests {
     }
 
     fn fresh_job() -> Job {
-        Job::new(SessionId::from("cli-test"), user_chat_input(), None)
+        Job::new(
+            SessionId::from("cli-test"),
+            TriggerKind::User,
+            JobShape::Turn,
+            user_chat_input(),
+            None,
+        )
     }
 
     fn dummy_output() -> JobOutput {
@@ -445,7 +496,9 @@ mod tests {
     fn new_job_is_pending() {
         let j = fresh_job();
         assert!(matches!(j.status, JobStatus::Pending));
-        assert_eq!(j.kind, JobKind::UserChat);
+        assert_eq!(j.input_kind(), JobInputKind::UserChat);
+        assert_eq!(j.origin, TriggerKind::User);
+        assert!(j.is_turn());
         assert!(j.started_at.is_none());
         assert!(j.ended_at.is_none());
         assert!(j.final_result.is_none());
@@ -460,15 +513,40 @@ mod tests {
     }
 
     #[test]
-    fn job_kind_derived_from_input() {
+    fn origin_input_and_shape_are_independent() {
+        // A spawned-input job inside a cron-trigger session keeps all
+        // three facts separately: input kind = Spawned, origin = Cron,
+        // shape = Turn (caller-declared). No assertion ties them.
         let j = Job::new(
             SessionId::from("s"),
+            TriggerKind::Cron,
+            JobShape::Turn,
             JobInput::Spawned {
                 initial_prompt: vec![],
             },
             None,
         );
-        assert_eq!(j.kind, JobKind::Spawned);
+        assert_eq!(j.input_kind(), JobInputKind::Spawned);
+        assert_eq!(j.origin, TriggerKind::Cron);
+        assert!(j.is_turn());
+    }
+
+    #[test]
+    fn maintenance_shape_is_not_a_turn() {
+        // `shape` is caller-declared, not inferred from the input — a
+        // `/compact` carries a UserChat input yet is `Maintenance`.
+        let j = Job::new(
+            SessionId::from("s"),
+            TriggerKind::User,
+            JobShape::Maintenance,
+            JobInput::UserChat {
+                content: vec![ContentBlock::Text("/compact".into())],
+            },
+            None,
+        );
+        assert!(!j.is_turn());
+        assert_eq!(j.input_kind(), JobInputKind::UserChat);
+        assert_eq!(j.origin, TriggerKind::User);
     }
 
     // -- Happy path --
@@ -588,8 +666,30 @@ mod tests {
         let s = serde_json::to_string(&j).unwrap();
         let back: Job = serde_json::from_str(&s).unwrap();
         assert_eq!(back.id, j.id);
-        assert_eq!(back.kind, j.kind);
+        assert_eq!(back.origin, j.origin);
+        assert_eq!(back.shape, j.shape);
+        assert_eq!(back.input_kind(), j.input_kind());
         assert_eq!(back.session_id, j.session_id);
+    }
+
+    #[test]
+    fn legacy_row_without_origin_or_shape_deserializes_with_defaults() {
+        // A row persisted before `origin`/`shape` existed carries neither
+        // (it had a single `kind`). It must still load — `from_row` reads
+        // the whole `Job` from the `data` blob, so a missing required
+        // field would fail the load and poison `list_*` / recovery / `/stop`.
+        let j = fresh_job();
+        let mut v = serde_json::to_value(&j).unwrap();
+        let obj = v.as_object_mut().expect("job serializes to an object");
+        obj.remove("origin");
+        obj.remove("shape");
+        // The dropped legacy field is now an unknown key — serde ignores it.
+        obj.insert("kind".into(), serde_json::json!("system"));
+
+        let back: Job = serde_json::from_value(v).expect("legacy row must deserialize");
+        assert_eq!(back.id, j.id);
+        assert_eq!(back.origin, TriggerKind::User, "default_origin");
+        assert!(back.is_turn(), "default_shape is Turn");
     }
 
     #[test]

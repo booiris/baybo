@@ -255,9 +255,10 @@ async fn pick_span_close_time(
 mod tests {
     use super::*;
     use aura_job::test_support::MemoryJobStore;
-    use aura_job::{Job, JobInput, JobStatus, JobStore};
+    use aura_job::{Job, JobInput, JobShape, JobStatus, JobStore};
     use aura_model::{
         ApprovalDecision, ContentBlock, ParallelGroup, ResourceAccess, SessionId, SpanId, StepId,
+        TriggerKind,
     };
     use aura_trace::test_support::MemoryTraceStore;
     use aura_trace::{
@@ -326,6 +327,8 @@ mod tests {
         let store = Arc::new(MemoryJobStore::new());
         let mut job = Job::new(
             SessionId::from("s1"),
+            TriggerKind::User,
+            JobShape::Turn,
             JobInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
@@ -519,6 +522,8 @@ mod tests {
         let store = Arc::new(MemoryJobStore::new());
         let mut job = Job::new(
             SessionId::from("s1"),
+            TriggerKind::User,
+            JobShape::Turn,
             JobInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
@@ -543,6 +548,8 @@ mod tests {
         let store = Arc::new(MemoryJobStore::new());
         let mut job = Job::new(
             SessionId::from("s1"),
+            TriggerKind::User,
+            JobShape::Turn,
             JobInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },

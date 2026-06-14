@@ -82,7 +82,7 @@ Both checkpoints call `AgentLoop::maybe_run_background_compression(session, …,
 | Checkpoint | Site | Disjunctive clause |
 |---|---|---|
 | End-of-iteration | After tool-result append, before next `compress_if_needed` (`agent_loop.rs`, `job_done = false`) | `tool_calls_since_anchor > 3` |
-| End-of-job | At terminal `Final` of a `JobKind::UserChat` or `JobKind::Cron` turn (`agent_loop.rs`, `job_done = true`) | `job_done = true` |
+| End-of-job | At terminal `Final` of a `UserChat` or `Cron` turn (`agent_loop.rs`, `job_done = true`) | `job_done = true` |
 
 The threshold evaluation itself lives in `ContextManager::maybe_request_background_summary(job_done)` — it returns `Some(BackgroundCompressionPayload { up_to_ordinal })` when the gate passes, `None` otherwise. `maybe_run_background_compression` owns only the at-most-one check and the detached spawn.
 
@@ -137,10 +137,11 @@ let cancel_token = CancellationToken::new();
 
 let handle = tokio::spawn(async move {
     let spec = JobSpec {
-        session_id,                                // this session
-        session_trigger_kind: TriggerKind::System, // clears JobInput::System's allowed_for gate
+        session_id,                          // this session
+        origin: session.trigger.kind(),      // the triggering (User / Cron) session's trigger, recorded as-is
+        shape: JobShape::Maintenance,        // a compression pass, not an agent-loop turn
         input: JobInput::System { payload },
-        parent_job_id: Some(current_job_id),      // parent the System job under the triggering turn
+        parent_job_id: Some(current_job_id), // parent the maintenance job under the triggering turn
     };
     let result = scope::with_job(&job_lifecycle, cancel_token.clone(), spec, move |job_id| async move {
         let runner = BackgroundCompressionRunner { /* session_id, user_id, job_id, cancel_token, … */ };
@@ -157,8 +158,8 @@ self.bg_compression = Some(handle);
 Key properties:
 
 - **Attribution is the session's.** `JobSpec.session_id`, and the `BackgroundCompressionRunner`'s `session_id` / `user_id`, are all the session's. The pass's cost row, `StepKind::Compression` step, and `LlmCall` span therefore attribute to the session/user.
-- **`session_trigger_kind: TriggerKind::System`** is passed purely to satisfy `JobInput::System`'s `allowed_for` gate (a `System` job is only admitted under a `System`-trigger session). The job row's real attribution keys off `session_id` above, which is the session's.
-- **`parent_job_id = Some(current_job_id)`** parents the minted `System` job under the triggering turn's job, so the trace nests correctly.
+- **`origin` is the triggering session's trigger, recorded as-is** (`User` / `Cron`) — there is no payload/trigger constraint to satisfy. **`shape: JobShape::Maintenance`** is declared explicitly by this spawn path (not inferred from the `System` input) — that is what marks it as a non-turn job; the foreground `/compact` declares the same `Maintenance` shape despite a `UserChat` input. The job row's real attribution keys off `session_id` above, which is the session's.
+- **`parent_job_id = Some(current_job_id)`** parents the minted maintenance job under the triggering turn's job, so the trace nests correctly.
 - **Cancel token** is a fresh `CancellationToken::new()` that is never cancelled. It is **not** derived from the actor's token — see *Cancellation* below.
 
 ### `BackgroundCompressionRunner::run` → `aura_context::run_background_summary`

@@ -6,7 +6,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::JobStatus;
 use crate::cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
-use crate::{CancelReason, Job, JobError, JobInput, JobStatusKind, JobTransition};
+use crate::{CancelReason, Job, JobError, JobInput, JobShape, JobStatusKind, JobTransition};
 use aura_model::{JobId, SessionId, SpanId, TriggerKind};
 use aura_store::JobStore;
 use tokio::sync::broadcast;
@@ -90,11 +90,10 @@ impl JobLifecycle {
 
     /// Create a new job in `Pending`.
     ///
-    /// `session_trigger_kind` is the root trigger kind of the owning
-    /// session — used to enforce the `JobKind ↔ TriggerKind` invariant
-    /// documented in `aura_job::kind`. Mismatches return
-    /// `JobError::KindMismatch` with a descriptive message (rather than
-    /// passing through silently as before).
+    /// `origin` is the root trigger kind of the owning session — stored
+    /// on the job as-is (see `aura_job::kind`), independent of `input`.
+    /// `shape` is declared by the caller (the running code path), not
+    /// inferred from `input`.
     ///
     /// **Production code does not call this directly** — it goes
     /// through `agent::scope::with_job` (which builds a `JobSpec`
@@ -105,18 +104,12 @@ impl JobLifecycle {
     pub async fn start_job(
         &self,
         session_id: SessionId,
-        session_trigger_kind: TriggerKind,
+        origin: TriggerKind,
+        shape: JobShape,
         input: JobInput,
         parent_job_id: Option<JobId>,
     ) -> Result<Job> {
-        let job_kind = input.kind();
-        if !job_kind.allowed_for(session_trigger_kind) {
-            return Err(JobError::KindMismatch(format!(
-                "job kind {job_kind:?} not allowed in {session_trigger_kind:?}-trigger session \
-                 (see aura_job::kind allowed-for table)"
-            )));
-        }
-        let job = Job::new(session_id, input, parent_job_id);
+        let job = Job::new(session_id, origin, shape, input, parent_job_id);
         self.store.create(&job.to_row()?).await?;
         Ok(job)
     }
@@ -370,6 +363,7 @@ mod tests {
             .start_job(
                 SessionId::from("s1"),
                 TriggerKind::User,
+                JobShape::Turn,
                 user_chat_input(),
                 None,
             )
@@ -392,6 +386,7 @@ mod tests {
             .start_job(
                 SessionId::from("s1"),
                 TriggerKind::User,
+                JobShape::Turn,
                 user_chat_input(),
                 None,
             )
@@ -420,6 +415,7 @@ mod tests {
             .start_job(
                 SessionId::from("s2"),
                 TriggerKind::User,
+                JobShape::Turn,
                 user_chat_input(),
                 None,
             )
@@ -436,52 +432,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawned_job_kind_allowed_under_every_root_trigger() {
-        // Pins the contract that the subagent dispatch path relies on:
-        // JobInput::Spawned must work for a child session whose root
-        // trigger is inherited from the parent (User / Cron / System).
+    async fn origin_recorded_as_is_for_any_input_under_any_trigger() {
+        // origin is the session's root trigger, recorded honestly and
+        // independent of the input payload. The subagent dispatch path
+        // relies on a Spawned input working under any inherited root
+        // trigger; more broadly, no input/trigger pairing is rejected.
         let lc = make_lifecycle();
         for trigger in [TriggerKind::User, TriggerKind::Cron, TriggerKind::System] {
             let job = lc
                 .start_job(
                     SessionId::from(format!("child-of-{trigger:?}")),
                     trigger,
+                    JobShape::Turn,
                     JobInput::Spawned {
                         initial_prompt: vec![ContentBlock::Text("task".into())],
                     },
                     None,
                 )
-                .await;
-            assert!(
-                job.is_ok(),
-                "subagent dispatch under {trigger:?} root must be allowed: {:?}",
-                job.err()
-            );
+                .await
+                .expect("any input is allowed under any root trigger");
+            assert_eq!(job.origin, trigger);
+            assert_eq!(job.input_kind(), crate::JobInputKind::Spawned);
         }
     }
 
     #[tokio::test]
-    async fn user_chat_under_cron_session_is_rejected() {
-        // The bug this guards against: subagent.rs used to send
-        // AgentMessage::UserInput, which mapped to JobInput::UserChat —
-        // and a Cron-rooted child session rejected that with KindMismatch.
-        // The fix routes subagents through JobInput::Spawned (covered by
-        // the test above); this test pins the underlying state-machine
-        // rejection so a regression elsewhere can't silently restore the
-        // old shape.
+    async fn user_chat_input_under_cron_session_records_cron_origin() {
+        // Input kind and origin are recorded side by side and independently:
+        // a UserChat payload in a Cron-trigger session yields input kind =
+        // UserChat, origin = Cron, with no payload/trigger constraint.
         let lc = make_lifecycle();
-        let err = lc
+        let job = lc
             .start_job(
                 SessionId::from("cron-session"),
                 TriggerKind::Cron,
+                JobShape::Turn,
                 JobInput::UserChat {
                     content: vec![ContentBlock::Text("hi".into())],
                 },
                 None,
             )
             .await
-            .unwrap_err();
-        assert!(matches!(err, JobError::KindMismatch(_)));
+            .expect("input no longer constrained by trigger");
+        assert_eq!(job.origin, TriggerKind::Cron);
+        assert_eq!(job.input_kind(), crate::JobInputKind::UserChat);
     }
 
     #[tokio::test]
@@ -491,6 +485,7 @@ mod tests {
             .start_job(
                 SessionId::from("s1"),
                 TriggerKind::User,
+                JobShape::Turn,
                 user_chat_input(),
                 None,
             )
@@ -514,6 +509,7 @@ mod tests {
             .start_job(
                 SessionId::from("s1"),
                 TriggerKind::User,
+                JobShape::Turn,
                 user_chat_input(),
                 None,
             )

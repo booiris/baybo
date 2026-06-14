@@ -61,11 +61,10 @@ pub enum AgentMessage {
     CronTrigger { job_id: String, prompt: String },
     /// A subagent was spawned. Carries the initial prompt assembled by
     /// `Router::handle_subagent_spawn` and the parent's `JobId` for
-    /// lineage. The child actor runs `agent_loop.run` with `JobInput::Spawned`,
-    /// which `JobKind::Spawned.allowed_for(*) == true` lets through
-    /// regardless of the child session's root trigger — which it must,
-    /// because subagents inherit the parent's trigger (cron / system)
-    /// via `create_spawned_session`.
+    /// lineage. The child actor runs `agent_loop.run` with `JobInput::Spawned`;
+    /// the job records the child session's root trigger as its `origin`
+    /// (subagents inherit the parent's trigger — cron / system — via
+    /// `create_spawned_session`), with no payload/trigger pairing constraint.
     SubagentSpawned {
         initial_message: Box<IncomingMessage>,
         parent_job_id: aura_model::JobId,
@@ -434,12 +433,11 @@ impl AgentActor {
     /// Dispatch a fired cron job through the agent loop and send the
     /// response to the output channel.
     ///
-    /// The `JobInput::Cron` provenance must match the session's root
-    /// trigger or `JobLifecycle::start_job` will reject it; the cron fire
-    /// mints a Cron-rooted session, so it does. The content the LLM sees
-    /// The fire is framed + appended by `AgentLoop::append_cron_fire` (which
-    /// uses `aura_context::prompts::cron`) so the model treats it as a task to
-    /// perform now rather than a live user message.
+    /// The cron fire mints a Cron-rooted session, so the job records
+    /// `origin = Cron`. The content the LLM sees is framed + appended by
+    /// `AgentLoop::append_cron_fire` (which uses `aura_context::prompts::cron`)
+    /// so the model treats it as a task to perform now rather than a live
+    /// user message.
     async fn dispatch_cron_prompt(&mut self, prompt: &str, job_id: &str) -> anyhow::Result<()> {
         let job_input = JobInput::Cron {
             action_payload: serde_json::json!({
