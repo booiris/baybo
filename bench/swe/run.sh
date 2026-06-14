@@ -48,6 +48,8 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 : "${DOCKER:=docker}"
 : "${MUSL_TARGET:=x86_64-unknown-linux-musl}"
 : "${AURA_BIN:=}"                              # agent arm; empty => build static musl here
+: "${AURA_RG_BIN:=}"                           # agent arm; empty => fetch static-musl rg to bench-out/rg
+: "${RG_VERSION:=14.1.1}"                       # ripgrep release bundled into eval images
 : "${OUTDIR:=$BENCH_DIR/bench-out}"            # scratch: instances.json (gitignored)
 : "${RESULTS_DIR:=$BENCH_DIR/results}"         # the final results JSON report only
 : "${RUNS_DIR:=$BENCH_DIR/runs}"               # run working artifacts: predictions, swebench report + logs/
@@ -139,6 +141,26 @@ if [ "$want_agent" = 1 ]; then
     AURA_BIN="$REPO_ROOT/target/$MUSL_TARGET/release/aura"
   fi
   [ -x "$AURA_BIN" ] || { echo "aura binary not executable: $AURA_BIN" >&2; exit 1; }
+  # Bundle a static-musl ripgrep — the eval images don't ship `rg`, which aura's
+  # Grep tool needs (a glibc host rg won't load in the older-glibc images, same
+  # as aura). Cached in bench-out/ across runs.
+  if [ -z "$AURA_RG_BIN" ]; then
+    AURA_RG_BIN="$OUTDIR/rg"
+    if [ ! -x "$AURA_RG_BIN" ]; then
+      echo ">> fetching static-musl ripgrep $RG_VERSION -> $AURA_RG_BIN"
+      rg_url="https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+      rg_tmp="$(mktemp -d)"
+      if curl -fsSL --max-time 180 "$rg_url" -o "$rg_tmp/rg.tgz"; then
+        tar -xzf "$rg_tmp/rg.tgz" -C "$rg_tmp"
+        cp "$rg_tmp"/ripgrep-*/rg "$AURA_RG_BIN" && chmod +x "$AURA_RG_BIN"
+      else
+        echo "failed to download ripgrep $RG_VERSION; set AURA_RG_BIN to a static-musl rg" >&2
+        rm -rf "$rg_tmp"; exit 1
+      fi
+      rm -rf "$rg_tmp"
+    fi
+  fi
+  [ -x "$AURA_RG_BIN" ] || { echo "rg binary not executable: $AURA_RG_BIN" >&2; exit 1; }
   if [ "$NAMESPACE" = none ]; then
     echo ">> pre-building eval images locally (prepare_images; --namespace none)"
     $PYTHON -m swebench.harness.prepare_images \
@@ -162,8 +184,8 @@ run_arm() {
   )
   if [ "$arm" = agent ]; then
     local agent_args=(
-      --aura-bin "$AURA_BIN" --model "$AURA_MODEL" --prompt-timeout "$PROMPT_TIMEOUT"
-      --trace-dir "$TRACE_DIR"
+      --aura-bin "$AURA_BIN" --rg-bin "$AURA_RG_BIN" --model "$AURA_MODEL"
+      --prompt-timeout "$PROMPT_TIMEOUT" --trace-dir "$TRACE_DIR"
     )
     [ -n "$AURA_BASE_URL" ] && agent_args+=(--base-url "$AURA_BASE_URL")
     [ -n "${NO_TRACE:-}" ] && agent_args+=(--no-trace)

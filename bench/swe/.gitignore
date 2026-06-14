@@ -4,6 +4,7 @@
 #   runs/      — run working artifacts: predictions.jsonl, the swebench harness
 #                report (<model>.<run_id>.json) + its logs/
 /bench-out/
+/bench-out-rerun100/
 /results/
 /runs/
 # Per-run transcripts + call-tree traces (regenerated; embed full conversations).

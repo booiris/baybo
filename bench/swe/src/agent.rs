@@ -28,6 +28,11 @@ const CONTAINER_CONFIG: &str = "/installed-agent/aura.json";
 /// `-e` arg pointing aura at the in-container config (mirrors [`CONTAINER_CONFIG`]).
 const CONTAINER_CONFIG_ENV: &str = "AURA_CONFIG_PATH=/installed-agent/aura.json";
 const CONTAINER_KEY_FILE: &str = "/installed-agent/encryption.key";
+/// Bundled static-musl `rg` (ripgrep). SWE-bench eval images don't ship it, but
+/// aura's `Grep` tool spawns bare `rg` (PATH lookup) — without it the tool errors
+/// and the agent limps along on Bash `grep`. `/usr/local/bin` is on the images'
+/// PATH, so dropping it here makes the tool work.
+const CONTAINER_RG_BIN: &str = "/usr/local/bin/rg";
 const CONTAINER_WORKSPACE: &str = "/aura-home";
 /// SWE-bench eval images check the repo out here.
 const TESTBED: &str = "/testbed";
@@ -114,6 +119,10 @@ pub struct RunOpts<'a> {
     pub docker_bin: &'a str,
     /// Host path of the static-musl `aura` binary.
     pub aura_bin_host: &'a Path,
+    /// Host path of the static-musl `rg` (ripgrep) binary, copied onto the
+    /// container's PATH so aura's `Grep` tool works (the eval images don't ship
+    /// ripgrep).
+    pub rg_bin_host: &'a Path,
     /// Rendered `aura.json` text (see [`render_agent_config`]).
     pub config_json: &'a str,
     pub instance: &'a SweInstance,
@@ -229,6 +238,21 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
     docker(
         opts.docker_bin,
         &["exec", name, "chmod", "+x", CONTAINER_AURA_BIN],
+    )
+    .await?;
+    let host_rg = opts
+        .rg_bin_host
+        .to_str()
+        .context("rg binary path is not utf-8")?;
+    docker(
+        opts.docker_bin,
+        &["cp", host_rg, &format!("{name}:{CONTAINER_RG_BIN}")],
+    )
+    .await
+    .context("docker cp rg binary into container")?;
+    docker(
+        opts.docker_bin,
+        &["exec", name, "chmod", "+x", CONTAINER_RG_BIN],
     )
     .await?;
     docker_with_stdin(
