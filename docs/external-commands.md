@@ -41,7 +41,7 @@ How each runtime dependency is handled there:
 |---------|----------------|
 | `git` | **Not needed.** A `bench-bash` build skips the workspace identity-repo `git init` (`aura-workspace`), and the install script no longer apt-installs git. (Previously the base image's missing git forced a per-task `apt-get install git` that on a slow network took ~11 min, blowing the agent budget — the motivation for the fix.) |
 | `sh` | Present in every task container; nothing to do. |
-| `rg` | **Not provided** — the install script installs only `git`. The `Grep` tool therefore fails in bench runs and the agent limps along with Bash `grep`/`python`. **Gap.** |
+| `rg` | **Bundled (`bench/swe`).** The agent driver `docker cp`s a static-musl `rg` to `/usr/local/bin/rg` (on the image PATH) alongside the `aura` binary, so the `Grep` tool works. `run.sh` fetches the pinned ripgrep musl release into `bench-out/rg` (cached, gitignored) or honours `AURA_RG_BIN`. A glibc host `rg` won't load in the older-glibc images — hence static-musl, same as `aura`. The `terminal-bench` installed-agent path doesn't bundle it yet. |
 | sandbox backend | **Not needed** — `sandbox.mode = none` disables OS sandboxing. |
 | `uv` | **Not needed** — the `bench-bash` prompt tells the agent that `python`/`pip` are the host interpreters (no uv shim). |
 | `bun`, external agents | N/A in bench. |
@@ -54,10 +54,10 @@ How each runtime dependency is handled there:
    task image genuinely lacks them — the t-bench base ships them, so the common
    case does **no `apt` at all**). This removes the per-task ~11-min
    `apt-get update` that was blowing agent budgets.
-2. **`rg` still missing.** The `Grep` tool has no ripgrep in bench containers, so
-   the agent falls back to Bash `grep`/`python`. ⚠️ Don't fix this with
-   `apt-get install ripgrep` — that re-introduces the per-task `apt-get update`
-   tax. Bundle a static `rg` (or bake it into the bench image) instead.
-
-The remaining gap (`rg`) systematically dents bench scores independent of the
-model under test, so weigh that when reading a low pass-rate.
+2. **`rg` — bundled in `bench/swe`.** The agent driver copies a static-musl
+   ripgrep onto the container PATH (chosen over `apt-get install ripgrep`, which
+   would re-add the per-task `apt-get update` tax). `run.sh` downloads the pinned
+   release once into `bench-out/` and reuses it. If a `bench/swe` run still shows
+   the *"ripgrep not found"* tool error, the container didn't get the binary —
+   check `--rg-bin` / `AURA_RG_BIN`. The `terminal-bench` installed-agent path
+   doesn't bundle `rg` yet, so the Grep tool still falls back to Bash `grep` there.

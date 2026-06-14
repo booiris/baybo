@@ -78,6 +78,12 @@ struct Args {
     #[arg(long)]
     aura_bin: Option<PathBuf>,
 
+    /// Host path of a static-musl `rg` (ripgrep), bundled into each eval container
+    /// so aura's `Grep` tool works (the SWE-bench images don't ship ripgrep).
+    /// Required for the agent arm.
+    #[arg(long)]
+    rg_bin: Option<PathBuf>,
+
     /// Agent LLM as `<provider>/<model>` (e.g. `deepseek/deepseek-v4-flash`,
     /// `openai/gpt-4o`, `anthropic/claude-3-5-sonnet`). No `provider/` prefix
     /// assumes the `deepseek` provider. (agent arm)
@@ -287,6 +293,12 @@ async fn run_agent(
     if !aura_bin.exists() {
         bail!("aura binary not found at {}", aura_bin.display());
     }
+    let rg_bin = args.rg_bin.as_ref().context(
+        "the agent arm requires --rg-bin (a static-musl ripgrep bundled into each eval image)",
+    )?;
+    if !rg_bin.exists() {
+        bail!("rg binary not found at {}", rg_bin.display());
+    }
     // Split `<provider>/<model>`; read the key from the canonical `AURA_API_KEY`
     // (the bench fixes the env-var name — it's not a user knob).
     let (provider, model) = parse_model(&args.model);
@@ -352,6 +364,7 @@ async fn run_agent(
             let opts = RunOpts {
                 docker_bin,
                 aura_bin_host: aura_bin,
+                rg_bin_host: rg_bin,
                 config_json: cfg,
                 instance: inst,
                 api_key_env: key_env,
