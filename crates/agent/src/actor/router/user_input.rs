@@ -187,10 +187,15 @@ impl Router {
         // descendant walk is a best-effort `UserStopped` audit stamp + backstop,
         // not the load-bearing stop (a foreground child cancelled via cascade
         // ends up `ParentCancelled`, which is the accurate reason for it).
-        // `list_active_by_session` is store-filtered, so a long-lived session's
-        // full job history isn't loaded just to find the live few.
+        // `list_active_turns_by_session` is store-filtered before applying the
+        // turn-kind filter, so a long-lived session's full job history isn't
+        // loaded just to find the live reply job(s).
         let mut cancelled_turn = false;
-        match self.job_lifecycle.list_active_by_session(session_id).await {
+        match self
+            .job_lifecycle
+            .list_active_turns_by_session(session_id)
+            .await
+        {
             Ok(jobs) => {
                 for job in jobs {
                     cancelled_turn = true;
@@ -210,11 +215,11 @@ impl Router {
         // stored token to also cover the pre-job-dispatch window: when no row
         // exists yet the token is the only handle, and the child aborts at
         // iteration 0 once it spawns its job (`with_job` then flips that row
-        // terminal). `list_active_by_session` keeps the lookup bounded.
+        // terminal). `list_active_turns_by_session` keeps the lookup bounded.
         for (child_session, info) in &background {
             if let Ok(jobs) = self
                 .job_lifecycle
-                .list_active_by_session(child_session)
+                .list_active_turns_by_session(child_session)
                 .await
             {
                 for job in jobs {

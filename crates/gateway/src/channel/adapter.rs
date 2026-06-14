@@ -411,6 +411,12 @@ async fn agent_output_to_frame(
             user_id,
             tasks: tasks.into_iter().map(TaskView::from).collect(),
         },
+        AgentEvent::TurnState { active, started_at } => Frame::TurnState {
+            session_id,
+            user_id,
+            active,
+            started_at,
+        },
         // Reuse `split_content`'s media→`WireAttachment` mapping; the
         // text half is empty for the media-only blocks this carries.
         AgentEvent::Attachment(blocks) => {

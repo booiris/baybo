@@ -5,6 +5,7 @@
 
 pub mod mailbox;
 pub mod router;
+pub mod runner;
 pub mod state;
 pub mod subagent;
 pub mod supervisor;
@@ -397,7 +398,7 @@ impl AgentActor {
 
     /// Run the agent loop. Terminal-state notification is published by
     /// `JobLifecycle` itself on the broadcast bus
-    /// (`subscribe_terminal_events`); the actor no longer emits a
+    /// (`subscribe_lifecycle_events`); the actor no longer emits a
     /// piggy-back signal on the response channel. Used by every
     /// handler that delegates job lifecycle to `agent_loop.run`
     /// (UserInput, SubagentSpawned, cron prompt dispatch). Returns
@@ -415,7 +416,18 @@ impl AgentActor {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         interjections: Option<&mut dyn crate::runtime::agent_loop::InterjectionSource>,
     ) -> anyhow::Result<OutgoingMessage> {
-        self.volatile
+        let is_user_turn = matches!(job_input.input_kind(), aura_job::JobInputKind::UserChat);
+        // Kept so the error path below can tell a user `/stop` (token
+        // tripped via the job cancel) apart from a genuine failure.
+        let turn_token = self.volatile.actor_token.child_token();
+        // The actor emits no `TurnState`: both edges are projected from the
+        // job store by `spawn_turn_state_projector` — the start edge from
+        // this turn's job `start()` (`Pending → InProgress`) inside
+        // `agent_loop.run`, the end edge from its terminal transition. So
+        // chat turn-activity has a single producer sourced from the one
+        // truth, and the per-`Subscribe` snapshot can't disagree with it.
+        let result = self
+            .volatile
             .agent_loop
             .run(
                 &mut self.durable.session,
@@ -424,10 +436,31 @@ impl AgentActor {
                 &self.volatile.span_recorder,
                 parent_job_id,
                 delta_tx,
-                self.volatile.actor_token.child_token(),
+                turn_token.clone(),
                 interjections,
             )
-            .await
+            .await;
+        // A user is waiting on this turn — a genuine failure must surface as
+        // a terminal notice, not silence (the log line alone leaves the chat
+        // dangling on its last progress frame). Cancellation stays quiet:
+        // `/stop` already acknowledged with its own notice. Non-user turns
+        // keep their own policies (cron logs, subagent-notification retries).
+        if is_user_turn
+            && !turn_token.is_cancelled()
+            && let Err(e) = &result
+        {
+            let notice = AgentOutput {
+                session_id: self.durable.session.id.clone(),
+                user_id: self.durable.session.user.id.clone(),
+                channel: self.durable.session.channel.clone(),
+                event: AgentEvent::Notice {
+                    level: NoticeLevel::Error,
+                    text: format!("The turn failed before producing a reply: {e}"),
+                },
+            };
+            self.send_response(notice, "user_turn_failed").await;
+        }
+        result
     }
 
     /// Dispatch a fired cron job through the agent loop and send the
@@ -897,6 +930,9 @@ impl AgentActor {
         command_text: String,
         sent_at: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<()> {
+        // `compact_now` mints a turn-kind job, so its start + terminal
+        // transitions drive the web chat's TurnState through the projector
+        // — nothing to emit here.
         let text = self
             .volatile
             .agent_loop

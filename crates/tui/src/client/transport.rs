@@ -354,6 +354,12 @@ fn map_frame(
             // surfaced on the web dashboard. Drop it here like Reasoning.
             None
         }
+        Frame::TurnState { .. } => {
+            // The TUI tracks turn activity locally (it initiated the turn),
+            // so the server-side snapshot is redundant here. Drop it like
+            // Reasoning; the web dashboard is its consumer.
+            None
+        }
         Frame::ToolStarted {
             session_id,
             call_id,

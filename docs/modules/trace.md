@@ -134,9 +134,14 @@ marker path by a negative test.
 
 Writes are asynchronous, with **synchronous fences** before any LLM or tool call: previous span's `end` and current span's `begin` must be durable before the request goes out. Other writes happen on a background writer task — the agent actor never blocks on persistence except at fences.
 
-### Restart recovery
+### Recovery
 
-Not implemented yet. The schema indexes the half-open lookup (`spans.ended_at IS NULL AND deleted_at IS NULL`), and `CancelReason::SystemCrash` is reserved for it, but the scan + rewrite is not wired. After a crash, half-open spans stay half-open until an operator cancels the parent job via the admin API.
+`aura_agent::recovery` closes half-open trace rows left by dropped execution.
+At boot, `recover_orphaned_traces_and_jobs` walks non-terminal jobs from the
+prior process, closes pending spans/steps at the last observed child activity,
+and cancels the job as `SystemCrash`. While the process is still alive,
+`recover_panicked_actor_session` performs the same repair for the panicked
+session's active turn jobs, using the actor task's crash time as the close time.
 
 ## Constraints
 

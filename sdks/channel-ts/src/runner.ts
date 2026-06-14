@@ -678,6 +678,11 @@ function dispatchFrame(
     case "reasoning":
       // Thinking trace — no bot-side surface today; drop it.
       return;
+    // Work-block surfaces (the web dashboard) consume these; sidecars
+    // narrate turn progress through the notice/status path instead.
+    case "task_list":
+    case "turn_state":
+      return;
     case "approval_requested": {
       void handleApproval(frame, channel, ws, logger);
       return;

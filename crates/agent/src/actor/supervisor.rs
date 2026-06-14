@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use aura_channels::AgentOutput;
+use aura_channels::{AgentEvent, AgentOutput};
 use aura_model::SessionId;
 use chrono::Duration;
 use dashmap::DashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -504,6 +504,94 @@ pub fn spawn_idle_reaper(
             }
         }
     })
+}
+
+/// Spawn the per-process turn-state projector — the **sole** producer of
+/// the web chat's `Frame::TurnState`.
+///
+/// Both edges are derived here from the one source of truth (the job
+/// store) rather than emitted by the actor: every job lifecycle
+/// transition publishes on
+/// [`aura_job::JobLifecycle::subscribe_lifecycle_events`] (the
+/// `Pending → InProgress` start edge and the three terminal edges), and on
+/// each one we recompute the session's
+/// [`aura_job::JobLifecycle::active_turn_started_at`] and broadcast the
+/// current value through the same `response_tx` → channel fan-out the
+/// actor's own output uses. The gateway's per-`Subscribe` snapshot reads
+/// the *same* `active_turn_started_at` — so the live start broadcast, the
+/// live end broadcast, and the join-time snapshot all agree by
+/// construction, and the actor never touches `TurnState` at all.
+///
+/// Recompute-is-truth keeps this robust to *which* job's transition fired
+/// it: the turn itself, a child-session subagent, or a
+/// background-compression `System` job all just mean "recompute this
+/// session now", and the broadcast is whatever is currently true — never a
+/// stale "X started/ended". A `Lagged` drop is harmless: the next event
+/// recomputes, and the Subscribe snapshot covers a client that joined
+/// during the gap.
+pub fn spawn_turn_state_projector(
+    job_lifecycle: Arc<aura_job::JobLifecycle>,
+    sessions: Arc<SessionManager>,
+    response_tx: mpsc::Sender<AgentOutput>,
+    cancel_token: CancellationToken,
+) -> JoinHandle<()> {
+    // Subscribe synchronously, before the spawn returns, so no lifecycle
+    // event published after this call can slip through unobserved.
+    let mut events = job_lifecycle.subscribe_lifecycle_events();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                recv = events.recv() => match recv {
+                    Ok(ev) => {
+                        project_turn_state(&job_lifecycle, &sessions, &response_tx, &ev.session_id)
+                            .await
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        debug!(skipped = n, "turn-state projector lagged; next event recomputes");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+        debug!("turn-state projector: stopped");
+    })
+}
+
+/// Recompute one session's turn activity from the job store and broadcast
+/// the current `TurnState`. The Subscribe-time snapshot
+/// (`gateway::channel::route`) reads the same `active_turn_started_at`
+/// directly, so a freshly-joined tab and a live broadcast never disagree.
+async fn project_turn_state(
+    job_lifecycle: &aura_job::JobLifecycle,
+    sessions: &SessionManager,
+    response_tx: &mpsc::Sender<AgentOutput>,
+    session_id: &SessionId,
+) {
+    let started_at = match job_lifecycle.active_turn_started_at(session_id).await {
+        Ok(started_at) => started_at,
+        Err(e) => {
+            warn!(%session_id, error = %e, "turn-state projector: recompute failed");
+            return;
+        }
+    };
+    // TurnState is consumed only by the web dashboard; a session-row miss
+    // falls back to the reserved http channel so the frame still reaches
+    // web subscribers (every other surface drops it regardless).
+    let (channel, user_id) = match sessions.get(session_id).await {
+        Ok(Some(s)) => (s.channel, s.user.id),
+        _ => (aura_model::ChannelType::http(), String::new()),
+    };
+    let out = AgentOutput {
+        session_id: session_id.clone(),
+        user_id,
+        channel,
+        event: AgentEvent::TurnState {
+            active: started_at.is_some(),
+            started_at,
+        },
+    };
+    let _ = response_tx.send(out).await;
 }
 
 /// RAII guard that removes an actor entry from [`AgentSupervisor`] when

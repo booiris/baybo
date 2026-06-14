@@ -38,6 +38,7 @@ agent/src/
 │   └── llm_pool.rs           # per-provider LlmClient pool
 └── actor/                    # per-session actor + orchestration
     ├── mod.rs                # AgentActor + AgentMessage
+    ├── runner.rs             # tokio task boundary + actor panic recovery
     ├── supervisor.rs         # AgentSupervisor + idle reaper
     ├── subagent.rs           # subagent wait routine
     ├── router/               # ingress dispatch (cron / user / output / system_spawn)
@@ -123,7 +124,13 @@ The per-session mailbox is a **priority queue** (`mailbox::channel`): `UserInput
 
 ### Startup recovery
 
-Not implemented yet — see `docs/modules/job.md` "Restart recovery" and `docs/modules/trace.md` "Restart recovery". After a crash, in-flight jobs and half-open spans stay in their last-persisted state until an operator cancels them via the admin API.
+On boot, `aura_agent::recovery::recover_orphaned_traces_and_jobs` closes
+half-open trace rows and cancels non-terminal jobs left by a prior process death
+as `SystemCrash`. During the current process, `actor::runner::spawn_actor`
+watches actor task panics and calls `recover_panicked_actor_session` for that
+session's active turn jobs, then emits a user-facing crash notice. The TurnState
+inactive edge still comes from the job lifecycle event via the projector, not
+from the runner directly.
 
 ### Router's upstream responsibilities
 
@@ -223,7 +230,7 @@ Router-level user rate limiting (`actor/router`) uses a sliding window (default 
 | `workspace` | Identity files for system prompt |
 | `cron` | Owns `CronJob`, `CronExecution`, and `CronScheduler`; agent re-exports `CronScheduler` / `CronTriggerEvent` for assembly-layer wiring |
 | `context` | Conversation window and compression |
-| `job` | Owns `Job`, `JobStatus`, `JobInputKind` / `JobShape` (+ `Job.origin`), and `JobLifecycle` (persistence orchestrator + cancellation registry + terminal-event bus); the `JobStore` trait lives in `aura-store` and this crate owns the `Job` ↔ `JobRow` conversions. Agent constructs and shares one `JobLifecycle` across the loop, router, supervisor, and subagent wait routine |
+| `job` | Owns `Job`, `JobStatus`, `JobInputKind` / `JobShape` (+ `Job.origin`), and `JobLifecycle` (persistence orchestrator + cancellation registry + lifecycle-event bus); the `JobStore` trait lives in `aura-store` and this crate owns the `Job` ↔ `JobRow` conversions. Agent constructs and shares one `JobLifecycle` across the loop, router, supervisor, and subagent wait routine |
 | `trace` | Owns `Step`, `Span`, `SpanEvent`, `SpanRecorder` (lifecycle facade), and `TraceEventStream` (broadcast bus); the `TraceStore` trait lives in `aura-store` and this crate owns the row conversions. Agent constructs and shares one `SpanRecorder` per session |
 | `query` | Owns `QueryApi` — the read-only analytics facade over session/job/trace/cost. Agent does not consume `QueryApi` directly; gateway and CLI do |
 | `session` | Provides `SessionManager` and its error type (domain types live in `aura-model`) |

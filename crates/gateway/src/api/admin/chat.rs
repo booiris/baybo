@@ -1170,8 +1170,19 @@ fn reconstruct_transcript(
     for (_, _, _, entry) in entries {
         let (ordinal, created_at, msg) = match entry {
             Entry::Control(ev) => {
-                work.flush(&mut items, None);
+                // A control event interrupting an open work block bounds it:
+                // for the common case — the `/stop` echo + notice right after
+                // a cancelled turn's partial rows — the event instant is when
+                // the work actually ended, where the fallback (last persisted
+                // row) would undercount a turn stopped mid-LLM-call to `0s`.
+                let ended_at = ev.created_at;
+                work.flush(&mut items, Some(ended_at));
                 items.push(control_event_item(ev));
+                // The event also ends the turn (`/stop`) or sits on a turn
+                // boundary (`/compact`): a later turn with no user row of its
+                // own (a subagent-notification fire) must not inherit the
+                // interrupted turn's start.
+                turn_started = None;
                 continue;
             }
             Entry::Row(ordinal, created_at, msg) => (ordinal, created_at, msg),
@@ -1188,7 +1199,14 @@ fn reconstruct_transcript(
             // calls into the open work block.
             Role::Assistant if msg.has_tool_use() => {
                 if work.started.is_none() {
-                    work.started = Some(created_at);
+                    // Prefer the turn's start (the user row) over this row's
+                    // own timestamp: the first intermediate row only lands
+                    // after the first LLM call returns, so timing from it
+                    // would drop that whole first thinking stretch from the
+                    // `Worked Xs` label the live view counted. Falls back to
+                    // the row when the user turn is off-page (or absent —
+                    // cron fires).
+                    work.started = Some(turn_started.unwrap_or(created_at));
                     work.ordinal = Some(ordinal);
                 }
                 work.last = Some(created_at);
@@ -1230,7 +1248,11 @@ fn reconstruct_transcript(
                                 continue;
                             }
                             if work.started.is_none() {
-                                work.started = turn_started;
+                                // Same page-boundary fallback as the tool
+                                // path: a missing user row degrades to this
+                                // row's own timestamp instead of a `None`
+                                // that flush would paper over with `now()`.
+                                work.started = Some(turn_started.unwrap_or(created_at));
                                 work.ordinal = Some(ordinal);
                             }
                             work.steps.push(ChatWorkStep::reasoning(text));
@@ -1241,6 +1263,9 @@ fn reconstruct_transcript(
                 if let Some(item) = message_item(ordinal, created_at, "assistant", &msg) {
                     items.push(item);
                 }
+                // Turn boundary: a later turn that has no user row on this
+                // page (a cron fire) must not inherit this turn's start.
+                turn_started = None;
             }
             Role::Tool => {
                 work.last = Some(created_at);
@@ -1521,7 +1546,11 @@ mod tests {
             work.ordinal, 3,
             "work block inherits first intermediate ordinal"
         );
-        assert_eq!(work.work_started_at, Some(ts(3)));
+        assert_eq!(
+            work.work_started_at,
+            Some(ts(2)),
+            "starts at the user turn, not the first persisted iteration"
+        );
         assert_eq!(work.work_ended_at, Some(ts(9)), "ends at the final reply");
         assert_eq!(work.steps.len(), 3);
         assert!(matches!(work.steps[0].kind, WorkStepKind::Reasoning));
@@ -1584,8 +1613,16 @@ mod tests {
         assert_eq!(items[1].text, "go");
 
         // The tool turn folds into one work block, flushed before the control
-        // events anchored after it.
+        // events anchored after it — and *bounded* by them: the stop instant
+        // is when the work ended, not the last persisted row (which would
+        // report a turn stopped mid-LLM-call as `Worked 0s`).
         assert!(matches!(items[2].kind, TranscriptItemKind::Work));
+        assert_eq!(items[2].work_started_at, Some(ts(2)));
+        assert_eq!(
+            items[2].work_ended_at,
+            Some(ts(5)),
+            "a /stop'd turn's work block ends at the stop instant"
+        );
 
         // Same anchor (4): seq orders the echo (Command → user bubble) before
         // the notice.
@@ -1636,6 +1673,91 @@ mod tests {
         assert!(matches!(items[3].kind, TranscriptItemKind::Message));
         assert_eq!(items[3].role, "assistant");
         assert_eq!(items[3].text, "done");
+    }
+
+    #[test]
+    fn reconstruct_turn_without_user_row_does_not_inherit_prior_start() {
+        // A turn with no user row on the page (a cron fire, or a turn whose
+        // user row fell off the page boundary) times its work block from its
+        // own first intermediate row — never from a *previous* turn's user
+        // message, which would inflate `Worked Xs` by the idle gap.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("hi")])),
+            (3, ts(4), ChatMessage::assistant(vec![text("hello")])),
+            (
+                4,
+                ts(1000),
+                ChatMessage::assistant(vec![tool_use(
+                    "c1",
+                    "Bash",
+                    serde_json::json!({"command": "echo cron"}),
+                )]),
+            ),
+            (5, ts(1003), ChatMessage::assistant(vec![text("cron done")])),
+        ];
+        let items = reconstruct_transcript(tail, Vec::new());
+        // user, answer, work, answer
+        assert_eq!(items.len(), 4);
+        let work = &items[2];
+        assert!(matches!(work.kind, TranscriptItemKind::Work));
+        assert_eq!(
+            work.work_started_at,
+            Some(ts(1000)),
+            "no user row in this turn → falls back to its own first row"
+        );
+        assert_eq!(work.work_ended_at, Some(ts(1003)));
+    }
+
+    #[test]
+    fn reconstruct_no_user_row_turn_after_stop_does_not_inherit_start() {
+        use aura_model::ControlEventKind::{Command, NoticeInfo};
+        // A /stop'd turn ends at its control events; the next turn on the
+        // page has no user row (a subagent-notification fire). Its work
+        // block must time from its own first row, not the stopped turn's
+        // user message.
+        let tail = vec![
+            (2, ts(10), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(12),
+                ChatMessage::assistant(vec![tool_use(
+                    "c1",
+                    "Bash",
+                    serde_json::json!({"command": "sleep 99"}),
+                )]),
+            ),
+            (
+                4,
+                ts(5000),
+                ChatMessage::assistant(vec![tool_use(
+                    "c2",
+                    "Read",
+                    serde_json::json!({"path": "/tmp/x"}),
+                )]),
+            ),
+            (5, ts(5003), ChatMessage::assistant(vec![text("done")])),
+        ];
+        let events = vec![
+            ctl(0, 3, Command, "/stop", 15),
+            ctl(1, 3, NoticeInfo, "Stopped.", 15),
+        ];
+        let items = reconstruct_transcript(tail, events);
+
+        // user, work (stopped), /stop echo, notice, work (notification), answer
+        assert_eq!(items.len(), 6);
+        let stopped = &items[1];
+        assert!(matches!(stopped.kind, TranscriptItemKind::Work));
+        assert_eq!(stopped.work_started_at, Some(ts(10)));
+        assert_eq!(stopped.work_ended_at, Some(ts(15)));
+
+        let notification = &items[4];
+        assert!(matches!(notification.kind, TranscriptItemKind::Work));
+        assert_eq!(
+            notification.work_started_at,
+            Some(ts(5000)),
+            "must not inherit the stopped turn's user-row start"
+        );
+        assert_eq!(notification.work_ended_at, Some(ts(5003)));
     }
 
     #[test]

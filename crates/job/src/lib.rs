@@ -4,7 +4,7 @@
 //! Domain types (`Job`, `JobStatus`, `JobInputKind`, `JobShape`,
 //! `CancelReason`, `JobError`) and the `JobLifecycle` orchestrator both
 //! live here; the orchestrator wraps a `JobStore` with the cancel
-//! state machine, terminal-event bus, and `JobId → CancellationToken`
+//! state machine, lifecycle-event bus, and `JobId → CancellationToken`
 //! registry that the in-flight execution path subscribes to.
 
 mod cancel;
@@ -26,7 +26,7 @@ pub use cancel::CancelReason;
 pub use cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
 pub use error::JobError;
 pub use kind::{JobInput, JobInputKind, JobOutput, JobShape};
-pub use lifecycle::{JobLifecycle, JobTerminalEvent};
+pub use lifecycle::{JobLifecycle, JobLifecycleEvent, JobPhase};
 
 pub type Result<T> = std::result::Result<T, JobError>;
 
