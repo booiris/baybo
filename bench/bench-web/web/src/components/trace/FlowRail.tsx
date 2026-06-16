@@ -16,6 +16,7 @@ import type { BenchTrace } from '../../api/types';
 import { cacheRatePct, fmtMs, fmtTokens } from '../../lib/format';
 import { renderWithSanitizeChips } from './SanitizeChip';
 import { MessageList } from './MessageList';
+import { optimizeToolValue, useOptimizedToolIo } from '../../lib/toolIo';
 
 // ── model ────────────────────────────────────────────────────────────
 
@@ -279,6 +280,8 @@ function StepDetail({
   outcome: LifecycleState;
   sessionMessages: SessionMessageRow[];
 }) {
+  const optimized = useOptimizedToolIo();
+  const fmtToolValue = (v: unknown) => (optimized ? optimizeToolValue(v) : asText(v));
   const failure = <FailureReason outcome={outcome} />;
   if (detail.kind === 'text') {
     return (
@@ -294,11 +297,11 @@ function StepDetail({
       <div className="space-y-2">
         {failure}
         <Labeled label="params">
-          <ClippedPre text={asText(detail.begin.params)} />
+          <ClippedPre text={fmtToolValue(detail.begin.params)} />
         </Labeled>
         {detail.result && (
           <Labeled label={`result (${detail.result.success ? 'ok' : 'error'})`}>
-            <ClippedPre text={asText(detail.result.output)} error={isError} />
+            <ClippedPre text={fmtToolValue(detail.result.output) || '(no output)'} error={isError} />
           </Labeled>
         )}
       </div>
@@ -320,7 +323,7 @@ function StepDetail({
     <div className="space-y-2">
       {failure}
       {r?.thinking?.trim() && (
-        <details>
+        <details open>
           <summary className="cursor-pointer text-[0.6rem] uppercase tracking-wider font-bold text-ink-soft">
             thinking
           </summary>

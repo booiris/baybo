@@ -202,31 +202,36 @@ pub fn parse_report(raw: &str) -> Result<GradeReport> {
 }
 
 /// Summarize WHY a graded instance didn't resolve, by reading the harness's
-/// **per-instance** report (`<runs_dir>/logs/run_evaluation/<run_id>/<model>/<id>/report.json`).
-/// The run-level report parsed by [`parse_report`] only buckets ids; this
-/// per-instance file carries the `tests_status` detail. Returns `None` when the
-/// instance resolved, the report is absent/unparseable, or nothing stands out.
+/// **per-instance** artifacts under
+/// `<runs_dir>/logs/run_evaluation/<run_id>/<model>/<id>/`: `report.json`
+/// (which `FAIL_TO_PASS`/`PASS_TO_PASS` tests are still red) plus the sibling
+/// `test_output.txt` (the actual exception/assertion lines from the test run).
+/// The run-level report parsed by [`parse_report`] only buckets ids. Returns
+/// `None` when the instance resolved, the report is absent/unparseable, or
+/// nothing stands out.
 pub fn failure_reason(
     runs_dir: &Path,
     run_id: &str,
     model_name: &str,
     instance_id: &str,
 ) -> Option<String> {
-    let path = runs_dir
+    let dir = runs_dir
         .join("logs/run_evaluation")
         .join(run_id)
         .join(model_name)
-        .join(instance_id)
-        .join("report.json");
-    reason_from_report(&std::fs::read_to_string(path).ok()?, instance_id)
+        .join(instance_id);
+    let report = std::fs::read_to_string(dir.join("report.json")).ok()?;
+    let test_output = std::fs::read_to_string(dir.join("test_output.txt")).ok();
+    reason_from_report(&report, test_output.as_deref(), instance_id)
 }
 
 const MAX_LISTED_TESTS: usize = 3;
 
-/// Categorize an unresolved instance from its per-instance report JSON. Pure
-/// (no I/O) so it's unit-testable. `None` if the record says resolved or carries
-/// no actionable failure.
-fn reason_from_report(raw: &str, instance_id: &str) -> Option<String> {
+/// Categorize an unresolved instance from its per-instance report JSON, then
+/// enrich it with the concrete exception lines from the harness
+/// `test_output.txt` (when supplied). Pure (no I/O) so it's unit-testable.
+/// `None` if the record says resolved or carries no actionable failure.
+fn reason_from_report(raw: &str, test_output: Option<&str>, instance_id: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     let rec = value.get(instance_id)?;
     if rec.get("resolved").and_then(serde_json::Value::as_bool) == Some(true) {
@@ -255,17 +260,24 @@ fn reason_from_report(raw: &str, instance_id: &str) -> Option<String> {
             .unwrap_or_default()
     };
     let f2p = failures("FAIL_TO_PASS");
-    if !f2p.is_empty() {
-        return Some(format!(
-            "FAIL_TO_PASS still failing: {}",
-            summarize_tests(&f2p)
-        ));
-    }
     let p2p = failures("PASS_TO_PASS");
-    if !p2p.is_empty() {
-        return Some(format!("PASS_TO_PASS regressed: {}", summarize_tests(&p2p)));
+    let head = if !f2p.is_empty() {
+        format!("FAIL_TO_PASS still failing: {}", summarize_tests(&f2p))
+    } else if !p2p.is_empty() {
+        format!("PASS_TO_PASS regressed: {}", summarize_tests(&p2p))
+    } else {
+        return None;
+    };
+    let errors = test_output.map(extract_error_lines).unwrap_or_default();
+    if errors.is_empty() {
+        return Some(head);
     }
-    None
+    let mut s = head;
+    for e in errors {
+        s.push_str("\n↳ ");
+        s.push_str(&e);
+    }
+    Some(s)
 }
 
 /// Join up to [`MAX_LISTED_TESTS`] test ids, appending `(+N more)` if truncated.
@@ -276,6 +288,114 @@ fn summarize_tests(tests: &[String]) -> String {
         s.push_str(&format!(" (+{} more)", tests.len() - shown));
     }
     s
+}
+
+const MAX_ERROR_LINES: usize = 5;
+const MAX_ERROR_LINE_LEN: usize = 200;
+const EXCEPTION_SUFFIXES: [&str; 3] = ["Error", "Exception", "Failed"];
+
+/// Pull the concrete exception/assertion lines out of a harness
+/// `test_output.txt`, tolerant of the runner formats SWE-bench uses: pytest
+/// (`E   <Exc>: msg`, astropy/matplotlib), and unittest/django + sympy
+/// (`<Exc>: msg` at column 0). ANSI color codes (astropy) are stripped first.
+/// Prefers typed-exception lines; falls back to raw pytest `E` lines (e.g. a
+/// bare `assert` expansion) when no exception type is present.
+fn extract_error_lines(test_output: &str) -> Vec<String> {
+    let clean = strip_ansi(test_output);
+    let mut primary: Vec<String> = Vec::new();
+    let mut fallback: Vec<String> = Vec::new();
+    for raw in clean.lines() {
+        let line = raw.trim_end();
+        if let Some(content) = pytest_e_marker(line) {
+            if looks_like_exception(content) {
+                if push_capped(&mut primary, content) {
+                    break;
+                }
+            } else if fallback.len() < MAX_ERROR_LINES {
+                push_capped(&mut fallback, content);
+            }
+        } else if !line.starts_with(char::is_whitespace)
+            && looks_like_exception(line)
+            && push_capped(&mut primary, line)
+        {
+            break;
+        }
+    }
+    if primary.is_empty() {
+        fallback
+    } else {
+        primary
+    }
+}
+
+/// Pytest tags each line of a failure's captured exception with a leading `E`
+/// + whitespace; return the content after that marker.
+fn pytest_e_marker(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix('E')?;
+    if rest.starts_with(char::is_whitespace) {
+        let t = rest.trim_start();
+        return (!t.is_empty()).then_some(t);
+    }
+    None
+}
+
+/// Whether `text` opens with a Python-exception-shaped token (`AssertionError`,
+/// `ValueError: …`, `module.Custom Error`, …). Used to keep prose / source
+/// lines out of the extracted reason.
+fn looks_like_exception(text: &str) -> bool {
+    let token = text
+        .split(|c: char| c == ':' || c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        && EXCEPTION_SUFFIXES.iter().any(|s| token.ends_with(s))
+}
+
+/// Append `text` (trimmed, length-capped, deduped) to `out`. Returns whether
+/// `out` has reached [`MAX_ERROR_LINES`].
+fn push_capped(out: &mut Vec<String>, text: &str) -> bool {
+    let t = truncate_chars(text.trim(), MAX_ERROR_LINE_LEN);
+    if !t.is_empty() && !out.iter().any(|e| e == &t) {
+        out.push(t);
+    }
+    out.len() >= MAX_ERROR_LINES
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// Strip ANSI CSI escape sequences (`ESC [ … <final-byte>`) — astropy's pytest
+/// run colorizes its output, which would otherwise pollute the extracted lines.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // ESC: consume a CSI sequence (`[` … terminator in 0x40..=0x7E). A lone
+        // ESC with no `[` is simply dropped.
+        let mut rest = chars.clone();
+        if rest.next() == Some('[') {
+            for n in rest.by_ref() {
+                if ('@'..='~').contains(&n) {
+                    break;
+                }
+            }
+            chars = rest;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -330,7 +450,7 @@ mod tests {
 
     #[test]
     fn reason_reports_fail_to_pass_with_truncation() {
-        let r = reason_from_report(REPORT, "sphinx-doc__sphinx-1").unwrap();
+        let r = reason_from_report(REPORT, None, "sphinx-doc__sphinx-1").unwrap();
         assert!(r.starts_with("FAIL_TO_PASS still failing:"));
         assert!(r.contains("t/x.py::a"));
         assert!(r.contains("(+1 more)")); // 4 failures, 3 shown
@@ -341,7 +461,7 @@ mod tests {
         let raw = r#"{"i":{"patch_successfully_applied":true,"resolved":false,
             "tests_status":{"FAIL_TO_PASS":{"success":["t::a"],"failure":[]},
             "PASS_TO_PASS":{"success":[],"failure":["t::z"]}}}}"#;
-        let r = reason_from_report(raw, "i").unwrap();
+        let r = reason_from_report(raw, None, "i").unwrap();
         assert_eq!(r, "PASS_TO_PASS regressed: t::z");
     }
 
@@ -350,7 +470,7 @@ mod tests {
         let raw =
             r#"{"i":{"patch_successfully_applied":false,"resolved":false,"tests_status":{}}}"#;
         assert_eq!(
-            reason_from_report(raw, "i").unwrap(),
+            reason_from_report(raw, None, "i").unwrap(),
             "patch failed to apply"
         );
     }
@@ -358,9 +478,71 @@ mod tests {
     #[test]
     fn reason_none_when_resolved_or_missing() {
         let raw = r#"{"i":{"patch_successfully_applied":true,"resolved":true,"tests_status":{}}}"#;
-        assert!(reason_from_report(raw, "i").is_none());
+        assert!(reason_from_report(raw, None, "i").is_none());
         // Record for a different id => None (not this instance's report).
-        assert!(reason_from_report(REPORT, "other").is_none());
-        assert!(reason_from_report("not json", "i").is_none());
+        assert!(reason_from_report(REPORT, None, "other").is_none());
+        assert!(reason_from_report("not json", None, "i").is_none());
+    }
+
+    #[test]
+    fn reason_appends_extracted_exception_lines() {
+        // django-style unittest output: `<Exc>: msg` at column 0.
+        let out = "FAIL: test_choices (m.C)\n\
+                   ----\nTraceback (most recent call last):\n\
+                   \x20 File \"x.py\", line 1, in test_choices\n\
+                   AssertionError: Lists differ: ['a'] != ['b']\n";
+        let r = reason_from_report(REPORT, Some(out), "sphinx-doc__sphinx-1").unwrap();
+        assert!(r.starts_with("FAIL_TO_PASS still failing:"));
+        assert!(r.contains("↳ AssertionError: Lists differ: ['a'] != ['b']"));
+    }
+
+    #[test]
+    fn extract_handles_pytest_e_marker_and_ansi() {
+        // pytest with astropy-style ANSI color codes around the E line.
+        let out = "    def test_x():\n>       foo()\n\
+                   \x1b[1m\x1b[31mE       AttributeError: module 'm' has no attribute 'foo'\x1b[0m\n\
+                   lib/m/__init__.py:153: AttributeError\n";
+        let lines = extract_error_lines(out);
+        assert_eq!(
+            lines,
+            vec!["AttributeError: module 'm' has no attribute 'foo'".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_falls_back_to_assert_expansion_when_untyped() {
+        // A bare `assert` failure: pytest prints `E   assert …` with no typed
+        // exception on an E line; the footer `file:line: AssertionError` is not
+        // column 0, so the fallback `assert` line is what we surface.
+        let out = "    def test_x():\n>       assert add(1, 2) == 4\n\
+                   E       assert 3 == 4\n\
+                   test_x.py:2: AssertionError\n";
+        let lines = extract_error_lines(out);
+        assert_eq!(lines, vec!["assert 3 == 4".to_string()]);
+    }
+
+    #[test]
+    fn extract_ignores_uppercase_pip_error_noise() {
+        // pip's `ERROR:` (all caps) must not be mistaken for an exception line.
+        let out = "ERROR: pip's dependency resolver does not currently take...\n\
+                   AssertionError: real failure\n";
+        assert_eq!(
+            extract_error_lines(out),
+            vec!["AssertionError: real failure".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_dedupes_and_caps() {
+        let mut out = String::new();
+        for _ in 0..3 {
+            out.push_str("AssertionError: same message\n");
+        }
+        for i in 0..10 {
+            out.push_str(&format!("ValueError: distinct {i}\n"));
+        }
+        let lines = extract_error_lines(&out);
+        assert_eq!(lines.len(), MAX_ERROR_LINES);
+        assert_eq!(lines[0], "AssertionError: same message");
     }
 }
