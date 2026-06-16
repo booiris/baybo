@@ -11,6 +11,7 @@
 //! boundary. The grader runs separately, in its own hermetic containers — see
 //! [`crate::grader`].
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -212,6 +213,30 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
     .await
     .with_context(|| format!("docker run {}", instance.image_key))?;
 
+    // 1b. Snapshot files already dirty in `/testbed` BEFORE the agent runs. Some
+    //     eval images (notably sphinx) ship an uncommitted env-pin diff in
+    //     setup.py / tox.ini; `git diff HEAD` (step 4) would fold that into the
+    //     prediction, and the grader's `git apply` then sees the hunks as already
+    //     present and reverse-applies the WHOLE patch — silently reverting the
+    //     agent's real fix. Excluding these paths captures only the agent's net
+    //     contribution. Best-effort: a failure leaves the set empty (= old behavior).
+    let preexisting_dirty = match docker(
+        opts.docker_bin,
+        &["exec", name, "git", "-C", TESTBED, "status", "--porcelain"],
+    )
+    .await
+    {
+        Ok(s) => parse_dirty_paths(&s),
+        Err(e) => {
+            tracing::warn!(
+                instance = %instance.instance_id,
+                error = %e,
+                "git status snapshot failed; not excluding pre-existing image dirt"
+            );
+            BTreeSet::new()
+        }
+    };
+
     // 2. Lay down the aura dir, binary, config, and a fresh encryption key.
     docker(
         opts.docker_bin,
@@ -343,7 +368,7 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
     let diff_cmd =
         format!("git -C {TESTBED} add -A -N >/dev/null 2>&1; git -C {TESTBED} diff HEAD");
     let patch = match docker(opts.docker_bin, &["exec", name, "sh", "-c", &diff_cmd]).await {
-        Ok(p) => p,
+        Ok(p) => strip_diff_sections(&p, &preexisting_dirty),
         Err(e) => {
             prompt_error
                 .get_or_insert_with(|| format!("git diff failed: {}", err_tail(&e.to_string())));
@@ -616,6 +641,55 @@ fn parse_cost_summary(stdout: &str) -> Result<(u64, u64, u64, i64)> {
     ))
 }
 
+/// Paths already dirty in `/testbed` at container start, parsed from
+/// `git status --porcelain`. These are SWE-bench's own env setup that some images
+/// leave uncommitted (sphinx pins setup.py/tox.ini); they're excluded from the
+/// captured prediction — see [`strip_diff_sections`] and the call site.
+fn parse_dirty_paths(porcelain: &str) -> BTreeSet<String> {
+    porcelain
+        .lines()
+        .filter_map(|line| {
+            // Porcelain v1: `XY <path>` — 2 status chars then a space, then path.
+            if line.len() < 4 {
+                return None;
+            }
+            let rest = &line[3..];
+            // A rename/copy renders as `old -> new`; the working-tree path is `new`.
+            let path = rest.rsplit(" -> ").next().unwrap_or(rest).trim();
+            // git quotes paths with special chars; drop the surrounding quotes.
+            let path = path.trim_matches('"');
+            (!path.is_empty()).then(|| path.to_string())
+        })
+        .collect()
+}
+
+/// Drop from a unified diff every file section whose target path is in `exclude`.
+/// A diff is a sequence of `diff --git a/<x> b/<y>` blocks; a block is kept iff its
+/// `b/<y>` path isn't excluded. Removes pre-existing image dirt (env-pin edits to
+/// setup.py/tox.ini) so the grader's `git apply` doesn't see already-present hunks
+/// and reverse-apply the whole patch.
+fn strip_diff_sections(diff: &str, exclude: &BTreeSet<String>) -> String {
+    if exclude.is_empty() {
+        return diff.to_string();
+    }
+    let mut out = String::with_capacity(diff.len());
+    let mut keep = true;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            // `a/<x> b/<y>` — the section's file is the b/ side (last token).
+            keep = match rest.rsplit(' ').next().and_then(|t| t.strip_prefix("b/")) {
+                Some(p) => !exclude.contains(p),
+                None => true,
+            };
+        }
+        if keep {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn err_tail(s: &str) -> String {
     let trimmed = s.trim();
     let tail: String = trimmed
@@ -697,5 +771,38 @@ mod tests {
     #[test]
     fn cost_summary_errors_without_json() {
         assert!(parse_cost_summary("no json here").is_err());
+    }
+
+    #[test]
+    fn parse_dirty_paths_reads_porcelain() {
+        // ` M` modified, `??` untracked, `R ` rename (working-tree path = new).
+        let out = " M setup.py\n M tox.ini\n?? newfile.py\nR  old.py -> new.py\n";
+        let d = parse_dirty_paths(out);
+        assert!(d.contains("setup.py"));
+        assert!(d.contains("tox.ini"));
+        assert!(d.contains("newfile.py"));
+        assert!(d.contains("new.py"));
+        assert!(!d.contains("old.py"));
+        assert_eq!(parse_dirty_paths("").len(), 0);
+    }
+
+    #[test]
+    fn strip_diff_sections_drops_excluded_files() {
+        let diff = "diff --git a/setup.py b/setup.py\n--- a/setup.py\n+++ b/setup.py\n@@ -1 +1 @@\n-x\n+y\n\
+                    diff --git a/sphinx/util/typing.py b/sphinx/util/typing.py\n--- a/sphinx/util/typing.py\n+++ b/sphinx/util/typing.py\n@@ -1 +1 @@\n-a\n+b\n";
+        let mut excl = BTreeSet::new();
+        excl.insert("setup.py".to_string());
+        excl.insert("tox.ini".to_string());
+        let stripped = strip_diff_sections(diff, &excl);
+        assert!(!stripped.contains("a/setup.py"));
+        assert!(stripped.contains("a/sphinx/util/typing.py"));
+        // The real source hunk survives intact.
+        assert!(stripped.contains("+b"));
+    }
+
+    #[test]
+    fn strip_diff_sections_noop_when_nothing_excluded() {
+        let diff = "diff --git a/foo.py b/foo.py\n@@ -1 +1 @@\n-x\n+y\n";
+        assert_eq!(strip_diff_sections(diff, &BTreeSet::new()), diff);
     }
 }
