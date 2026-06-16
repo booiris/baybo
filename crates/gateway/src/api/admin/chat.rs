@@ -30,10 +30,13 @@
 use std::collections::HashMap;
 
 use aura_agent::actor::AgentMessage;
+use aura_channels::{
+    AgentEvent, STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, SessionEvent, ToolStatus,
+};
 use aura_channels::wire::{SessionPatch, SlashCommandSpec};
 use aura_model::{
-    ChannelType, ChatMessage, ContentBlock, ControlEvent, LlmEntryName, MessageSource, Role,
-    Session, SessionId, ThinkingContent, TriggerSource, User,
+    ChannelType, ChatMessage, ContentBlock, ControlEvent, ControlEventKind, LlmEntryName,
+    MessageSource, Role, Session, SessionId, ThinkingContent, TriggerSource, User,
 };
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -218,6 +221,12 @@ pub struct ChatTranscriptItem {
     pub work_started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_ended_at: Option<DateTime<Utc>>,
+    /// `true` when this `work` item belongs to a turn that was cancelled
+    /// (e.g. `/stop`) rather than run to a normal reply — the client labels it
+    /// "Cancelled" instead of a plain `Worked Xs`. Always false for
+    /// `message` / `notice` items.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
     /// Severity of a `notice` item (`"info"` / `"warn"` / `"error"`), so a reload
     /// colors it the way the live frame did. `None` for `message` / `work` items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -603,7 +612,36 @@ async fn get_session(
         }
         _ => Vec::new(),
     };
-    let transcript = reconstruct_transcript(tail, control_events);
+    // Only the newest page (no `before_ordinal`) can contain the in-flight
+    // turn, so only there does aligning the trailing work block's start with
+    // the live `TurnState` matter. Best-effort: a lookup miss just leaves the
+    // message-timestamp start (the worst case is the pre-existing split).
+    let active_turn_started = if query.before_ordinal.is_none() {
+        state
+            .job_lifecycle
+            .active_turn_started_at(&sid)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    // The in-flight turn's reasoning / tool steps are still streaming and not
+    // yet persisted, so a tab loading mid-turn would miss everything thought
+    // before it joined. Fold the live channel's per-session buffer of that
+    // progress into the trailing work block. Newest page only (where the
+    // in-flight turn lives) and only while a turn is active.
+    let in_flight_steps = if active_turn_started.is_some() {
+        state
+            .channel_registry
+            .get(&ChannelType::http())
+            .map(|ch| in_flight_work_steps(ch.in_flight_events(&sid)))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let transcript =
+        reconstruct_transcript(tail, control_events, active_turn_started, in_flight_steps);
     Ok(Json(ChatSessionDetail {
         session_id,
         created_at: session.created_at,
@@ -1098,6 +1136,9 @@ struct WorkAccumulator {
     ordinal: Option<i64>,
     started: Option<DateTime<Utc>>,
     last: Option<DateTime<Utc>>,
+    /// Set when the turn this block belongs to was cancelled (`/stop`) — the
+    /// flushed item carries it so the client labels the block "Cancelled".
+    cancelled: bool,
     /// `tool_use_id` → index into `steps`, so a later tool-result message
     /// fills in the matching call's summary.
     pending_tools: HashMap<String, usize>,
@@ -1117,14 +1158,33 @@ impl WorkAccumulator {
                 steps: std::mem::take(&mut self.steps),
                 work_started_at: started,
                 work_ended_at: ended_at.or(self.last).or(started),
+                cancelled: self.cancelled,
                 notice_level: None,
             });
         }
         self.ordinal = None;
         self.started = None;
         self.last = None;
+        self.cancelled = false;
         self.pending_tools.clear();
     }
+}
+
+/// A control event that marks the turn it interrupts as *cancelled* — the
+/// `/stop` echo (and only that). `/compact` and other commands sit on turn
+/// boundaries but don't cancel the work, so they must not flip the label.
+fn is_stop_control_event(ev: &ControlEvent) -> bool {
+    ev.kind == ControlEventKind::Command
+        && ev
+            .text
+            .trim()
+            .strip_prefix('/')
+            .map(|rest| {
+                // `/stop`, `/stop@bot`, `/stop arg` → first token is the command.
+                let cmd = rest.split([' ', '@']).next().unwrap_or("");
+                cmd.eq_ignore_ascii_case(STOP_COMMAND_NAME)
+            })
+            .unwrap_or(false)
 }
 
 /// Rebuild the chat transcript from persisted messages. User turns and the
@@ -1136,9 +1196,64 @@ impl WorkAccumulator {
 /// reload the same work-block-then-answer shape the live view shows —
 /// turn-progress is otherwise live-only, but every block it needs is
 /// durably persisted, so this is where it's reconstructed.
+/// Convert a session's buffered in-flight progress (from the live channel,
+/// streamed but not yet persisted) into work steps — mirroring how
+/// `reconstruct_transcript` derives steps from persisted messages — so a tab
+/// loading mid-turn shows the reasoning / tool steps that streamed before it
+/// joined. Consecutive reasoning / answer deltas were already coalesced by the
+/// channel buffer, so each arrives as a single entry.
+fn in_flight_work_steps(events: Vec<SessionEvent>) -> Vec<ChatWorkStep> {
+    let mut steps: Vec<ChatWorkStep> = Vec::new();
+    let mut pending_tools: HashMap<String, usize> = HashMap::new();
+    for ev in events {
+        let SessionEvent::Agent(out) = ev else {
+            continue;
+        };
+        match out.event {
+            AgentEvent::Reasoning(text) if !text.trim().is_empty() => {
+                steps.push(ChatWorkStep::reasoning(text));
+            }
+            AgentEvent::AnswerDelta(text) if !text.trim().is_empty() => {
+                steps.push(ChatWorkStep::prose(text));
+            }
+            AgentEvent::ToolStarted {
+                call_id,
+                tool,
+                label,
+            } => {
+                pending_tools.insert(call_id, steps.len());
+                steps.push(ChatWorkStep::tool(tool, label));
+            }
+            AgentEvent::ToolCompleted {
+                call_id,
+                status,
+                summary,
+            } => {
+                if let Some(&idx) = pending_tools.get(&call_id)
+                    && let Some(step) = steps.get_mut(idx)
+                {
+                    step.tool_status = Some(
+                        match status {
+                            ToolStatus::Ok => "ok",
+                            ToolStatus::Error => "error",
+                            ToolStatus::Denied => "denied",
+                        }
+                        .to_owned(),
+                    );
+                    step.tool_summary = Some(summary);
+                }
+            }
+            _ => {}
+        }
+    }
+    steps
+}
+
 fn reconstruct_transcript(
     tail: Vec<(i64, DateTime<Utc>, ChatMessage)>,
     control_events: Vec<ControlEvent>,
+    active_turn_started: Option<DateTime<Utc>>,
+    in_flight_steps: Vec<ChatWorkStep>,
 ) -> Vec<ChatTranscriptItem> {
     // Merge message rows and out-of-band control events into one ordinal-ordered
     // stream: a control event with `after_ordinal = N` sorts right after the row
@@ -1149,6 +1264,10 @@ fn reconstruct_transcript(
         Row(i64, DateTime<Utc>, ChatMessage),
         Control(ControlEvent),
     }
+    // Newest persisted ordinal — the in-flight work block (which has no
+    // persisted intermediate row of its own to borrow one from) inherits this
+    // so its React key is unique and it sorts after the turn's user message.
+    let last_ordinal = tail.iter().map(|(o, _, _)| *o).max().unwrap_or(0);
     let mut entries: Vec<(i64, u8, i64, Entry)> =
         Vec::with_capacity(tail.len() + control_events.len());
     for (ordinal, created_at, msg) in tail {
@@ -1167,7 +1286,33 @@ fn reconstruct_transcript(
     // reconstructed work block spans from here to the answer's timestamp.
     let mut turn_started: Option<DateTime<Utc>> = None;
 
-    for (_, _, _, entry) in entries {
+    // Whether the entry at index `i` is a `/stop` echo that ACTUALLY cancelled
+    // an in-progress reply — i.e. its acknowledgement notice (the next entry,
+    // same anchor + next seq) carries `STOP_CANCELLED_REPLY_LINE`. A no-op
+    // `/stop` typed after a turn already finished says "Nothing in progress to
+    // stop." instead, so it must NOT fold the completed answer into a
+    // "Cancelled" block (that bug hid finished replies on reload).
+    let is_cancelling_stop_echo: Vec<bool> = (0..entries.len())
+        .map(|i| {
+            let is_echo =
+                matches!(entries.get(i), Some((_, _, _, Entry::Control(ev))) if is_stop_control_event(ev));
+            is_echo
+                && matches!(
+                    entries.get(i + 1),
+                    Some((_, _, _, Entry::Control(ev)))
+                        if ev.kind == ControlEventKind::NoticeInfo
+                            && ev.text.contains(STOP_CANCELLED_REPLY_LINE)
+                )
+        })
+        .collect();
+    // Whether the entry AFTER index `i` is such a cancelling `/stop` — lets the
+    // final-answer arm recognise a cancelled partial (its trailing row) and
+    // fold it into the work block instead of emitting an answer bubble.
+    let next_is_cancelling_stop: Vec<bool> = (0..entries.len())
+        .map(|i| is_cancelling_stop_echo.get(i + 1).copied().unwrap_or(false))
+        .collect();
+
+    for (idx, (_, _, _, entry)) in entries.into_iter().enumerate() {
         let (ordinal, created_at, msg) = match entry {
             Entry::Control(ev) => {
                 // A control event interrupting an open work block bounds it:
@@ -1175,6 +1320,13 @@ fn reconstruct_transcript(
                 // a cancelled turn's partial rows — the event instant is when
                 // the work actually ended, where the fallback (last persisted
                 // row) would undercount a turn stopped mid-LLM-call to `0s`.
+                // A `/stop` that actually cancelled the reply marks the block
+                // cancelled so the client labels it "Cancelled" rather than
+                // plain "Worked Xs". A no-op `/stop` (nothing in progress)
+                // leaves the block untouched.
+                if is_cancelling_stop_echo[idx] {
+                    work.cancelled = true;
+                }
                 let ended_at = ev.created_at;
                 work.flush(&mut items, Some(ended_at));
                 items.push(control_event_item(ev));
@@ -1227,6 +1379,41 @@ fn reconstruct_transcript(
                             work.pending_tools.insert(id.clone(), work.steps.len());
                             work.steps
                                 .push(ChatWorkStep::tool(name.clone(), tool_label(input)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Final answer (no tool calls): close the work block, then the
+            // reply bubble lands below it. A direct-answer turn (no tool
+            // iterations, so nothing accumulated yet) still carries its
+            // reasoning in this same row; rebuild a single-step work block
+            // from it so a reload shows the same `Worked Xs` + reasoning the
+            // tool path produces, rather than dropping the thinking on the
+            // floor in `message_item`.
+            // A cancelled turn's trailing partial row (the next entry is a
+            // `/stop` that actually cancelled the reply): fold its reasoning +
+            // partial text into the open work block and leave it for the
+            // `/stop` flush to emit cancelled, rather than spinning the text
+            // off as a bubble that reads like a finished answer. A no-op
+            // `/stop` after a finished turn does NOT match here, so a completed
+            // answer is never folded away.
+            Role::Assistant if next_is_cancelling_stop[idx] => {
+                if work.started.is_none() {
+                    work.started = Some(turn_started.unwrap_or(created_at));
+                    work.ordinal = Some(ordinal);
+                }
+                work.last = Some(created_at);
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Thinking { content, .. } => {
+                            let text = thinking_text(content);
+                            if !text.is_empty() {
+                                work.steps.push(ChatWorkStep::reasoning(text));
+                            }
+                        }
+                        ContentBlock::Text(t) if !t.trim().is_empty() => {
+                            work.steps.push(ChatWorkStep::prose(t.clone()));
                         }
                         _ => {}
                     }
@@ -1292,6 +1479,28 @@ fn reconstruct_transcript(
     // the true tail — harmless, since the re-replayed rows are dropped by
     // the message-only catch-up filter. A turn straddling the page
     // boundary likewise reconstructs partially until an older page loads.
+    //
+    // Fold the in-flight turn's still-streaming progress (reasoning / tool
+    // steps the live channel buffered but hasn't persisted) onto the end of the
+    // trailing block — so a tab loading mid-turn shows what was thought before
+    // it joined. For a turn still in its first iteration there's no persisted
+    // intermediate row, so seed the block's ordinal from the newest message.
+    let has_in_flight = !in_flight_steps.is_empty();
+    work.steps.extend(in_flight_steps);
+    if has_in_flight && work.ordinal.is_none() {
+        work.ordinal = Some(last_ordinal);
+    }
+    // When a turn is still in flight, align this trailing block's start with
+    // the live `TurnState`'s `started_at` (the job start instant) rather than
+    // the first message's timestamp. Both are computed from
+    // `active_turn_started_at`, so they match exactly — which is what lets a
+    // reloading tab *reopen* this block on the next `turn_state{active}`
+    // (`workStartedAt === startedAt`) instead of opening a second one.
+    if let Some(start) = active_turn_started
+        && !work.steps.is_empty()
+    {
+        work.started = Some(start);
+    }
     work.flush(&mut items, None);
     items
 }
@@ -1335,6 +1544,7 @@ fn message_item(
         steps: Vec::new(),
         work_started_at: None,
         work_ended_at: None,
+        cancelled: false,
         notice_level: None,
     })
 }
@@ -1363,6 +1573,7 @@ fn control_event_item(ev: ControlEvent) -> ChatTranscriptItem {
         steps: Vec::new(),
         work_started_at: None,
         work_ended_at: None,
+        cancelled: false,
         notice_level: level.map(str::to_owned),
     }
 }
@@ -1533,7 +1744,7 @@ mod tests {
                 ChatMessage::assistant(vec![text("done, sort of")]),
             ),
         ];
-        let items = reconstruct_transcript(tail, Vec::new());
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
         assert_eq!(items.len(), 3);
 
         assert!(matches!(items[0].kind, TranscriptItemKind::Message));
@@ -1592,13 +1803,16 @@ mod tests {
                 ChatMessage::tool_result("c1".to_owned(), "ok".to_owned()),
             ),
         ];
+        // The acknowledgement carries the real cancellation line so reconstruct
+        // recognises this `/stop` as one that actually cancelled the turn.
+        let stop_notice = format!("Stopped.\n{}", aura_channels::STOP_CANCELLED_REPLY_LINE);
         // Deliberately out of sorted order to prove reconstruct sorts them.
         let events = vec![
-            ctl(2, 4, NoticeInfo, "Stopped the current turn", 5),
+            ctl(2, 4, NoticeInfo, &stop_notice, 5),
             ctl(0, -1, NoticeWarn, "early", 1),
             ctl(1, 4, Command, "/stop", 5),
         ];
-        let items = reconstruct_transcript(tail, events);
+        let items = reconstruct_transcript(tail, events, None, Vec::new());
 
         // early notice, user, work block, /stop echo, /stop notice
         assert_eq!(items.len(), 5);
@@ -1617,6 +1831,7 @@ mod tests {
         // is when the work ended, not the last persisted row (which would
         // report a turn stopped mid-LLM-call as `Worked 0s`).
         assert!(matches!(items[2].kind, TranscriptItemKind::Work));
+        assert!(items[2].cancelled, "a /stop'd turn's work block is marked cancelled");
         assert_eq!(items[2].work_started_at, Some(ts(2)));
         assert_eq!(
             items[2].work_ended_at,
@@ -1632,7 +1847,7 @@ mod tests {
         assert_eq!(items[3].notice_level, None);
 
         assert!(matches!(items[4].kind, TranscriptItemKind::Notice));
-        assert_eq!(items[4].text, "Stopped the current turn");
+        assert_eq!(items[4].text, stop_notice);
         assert_eq!(items[4].notice_level.as_deref(), Some("info"));
 
         // Control items carry synthetic negative ordinals so they never collide
@@ -1640,6 +1855,167 @@ mod tests {
         for ctl_item in [&items[0], &items[3], &items[4]] {
             assert!(ctl_item.ordinal < 0, "control items use negative ordinals");
         }
+    }
+
+    #[test]
+    fn reconstruct_stopped_partial_turn_is_a_cancelled_work_block_not_an_answer() {
+        use aura_model::ControlEventKind::{Command, NoticeInfo};
+        // A turn cancelled mid-LLM-call: the loop persisted a partial assistant
+        // row (reasoning + partial answer text, no tool calls) before aborting,
+        // then the `/stop` echo + notice anchored right after it (the ordering
+        // the `/stop` settle-wait guarantees).
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("explain b-trees")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![thinking("weighing the options"), text("a b-tree is")]),
+            ),
+        ];
+        let stop_notice = format!("Stopped.\n{}", aura_channels::STOP_CANCELLED_REPLY_LINE);
+        let events = vec![
+            ctl(1, 3, Command, "/stop", 5),
+            ctl(2, 3, NoticeInfo, &stop_notice, 5),
+        ];
+        let items = reconstruct_transcript(tail, events, None, Vec::new());
+
+        // user, cancelled work block, /stop echo, /stop notice — and crucially
+        // NO assistant answer bubble for the cut-short turn.
+        assert_eq!(items.len(), 4, "got {items:?}");
+        assert!(matches!(items[0].kind, TranscriptItemKind::Message));
+        assert_eq!(items[0].role, "user");
+
+        let work = &items[1];
+        assert!(matches!(work.kind, TranscriptItemKind::Work));
+        assert!(work.cancelled, "a /stop'd partial turn's work block is cancelled");
+        assert_eq!(work.work_ended_at, Some(ts(5)), "bounded at the stop instant");
+        // Both the reasoning and the partial answer text fold into the block,
+        // instead of the text spinning off as a finished-looking answer bubble.
+        assert_eq!(work.steps.len(), 2, "reasoning + folded partial text");
+        assert!(matches!(work.steps[0].kind, WorkStepKind::Reasoning));
+        assert_eq!(work.steps[0].text, "weighing the options");
+        assert!(matches!(work.steps[1].kind, WorkStepKind::Prose));
+        assert_eq!(work.steps[1].text, "a b-tree is");
+
+        assert_eq!(items[2].text, "/stop");
+        assert!(matches!(items[3].kind, TranscriptItemKind::Notice));
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i.kind, TranscriptItemKind::Message) && i.role == "assistant"),
+            "a cancelled partial must not render as a finished answer bubble: {items:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_completed_answer_then_noop_stop_keeps_the_answer() {
+        use aura_model::ControlEventKind::{Command, NoticeInfo};
+        // A turn that FINISHED (full answer), then the user typed `/stop` — a
+        // no-op (its notice says "Nothing in progress to stop."). The completed
+        // answer must render as its bubble, NOT get folded into a "Cancelled"
+        // work block (the regression that hid finished replies on reload).
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("explain b-trees")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![text("A b-tree is a balanced, sorted tree …")]),
+            ),
+        ];
+        let events = vec![
+            ctl(1, 3, Command, "/stop", 5),
+            // No-op stop: nothing was in progress, so no cancellation line.
+            ctl(2, 3, NoticeInfo, "Nothing in progress to stop.", 5),
+        ];
+        let items = reconstruct_transcript(tail, events, None, Vec::new());
+
+        // The finished answer survives as an assistant bubble; nothing is
+        // marked cancelled.
+        let answer = items
+            .iter()
+            .find(|i| matches!(i.kind, TranscriptItemKind::Message) && i.role == "assistant")
+            .expect("the completed answer must still render as a bubble");
+        assert!(answer.text.contains("A b-tree is"), "got {:?}", answer.text);
+        assert!(
+            !items.iter().any(|i| i.cancelled),
+            "a no-op /stop after a finished turn must not mark anything cancelled: {items:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_in_flight_turn_aligns_work_start_with_live_turn_state() {
+        // An in-flight turn (tool call persisted, no final answer yet). With an
+        // active turn, the trailing work block must start at the live
+        // TurnState instant (ts(9), the job start) — NOT the user message's
+        // timestamp (ts(2)) — so a reloading tab reopens THIS block on the
+        // next `turn_state{active}` (start-match) instead of opening a second.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("go")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![tool_use(
+                    "c1",
+                    "Bash",
+                    serde_json::json!({"command": "sleep 99"}),
+                )]),
+            ),
+        ];
+        let aligned = reconstruct_transcript(tail.clone(), Vec::new(), Some(ts(9)), Vec::new());
+        let work = aligned
+            .iter()
+            .find(|i| matches!(i.kind, TranscriptItemKind::Work))
+            .expect("in-flight work block");
+        assert_eq!(
+            work.work_started_at,
+            Some(ts(9)),
+            "in-flight block starts at the live TurnState instant, not the message time"
+        );
+
+        // Without an active turn (older page / no in-flight turn), the start
+        // stays the message-derived value — no override.
+        let bare = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
+        let work = bare
+            .iter()
+            .find(|i| matches!(i.kind, TranscriptItemKind::Work))
+            .expect("work block");
+        assert_eq!(work.work_started_at, Some(ts(2)), "no active turn → message-time start");
+    }
+
+    #[test]
+    fn reconstruct_folds_in_flight_steps_into_the_trailing_block() {
+        // A turn still in its first iteration: only the user message persisted,
+        // the reasoning is still streaming (buffered by the live channel). The
+        // in-flight steps must surface as the trailing work block, started at
+        // the live TurnState instant so a reload reopens it.
+        let tail = vec![(2, ts(2), ChatMessage::user(vec![text("explain b-trees")]))];
+        let in_flight = vec![
+            ChatWorkStep::reasoning("weighing the options".into()),
+            ChatWorkStep::tool("Bash".into(), Some("ls".into())),
+        ];
+        let items = reconstruct_transcript(tail, Vec::new(), Some(ts(9)), in_flight);
+
+        let work = items
+            .iter()
+            .find(|i| matches!(i.kind, TranscriptItemKind::Work))
+            .expect("in-flight work block");
+        assert_eq!(
+            work.work_started_at,
+            Some(ts(9)),
+            "in-flight block starts at the live TurnState instant"
+        );
+        assert!(!work.cancelled, "a still-streaming turn is not cancelled");
+        assert_eq!(work.steps.len(), 2, "reasoning + tool folded in: {:?}", work.steps);
+        assert!(matches!(work.steps[0].kind, WorkStepKind::Reasoning));
+        assert_eq!(work.steps[0].text, "weighing the options");
+        assert!(matches!(work.steps[1].kind, WorkStepKind::Tool));
+        // No assistant answer bubble — the turn hasn't replied yet.
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i.kind, TranscriptItemKind::Message) && i.role == "assistant"),
+            "an in-flight turn has no answer bubble yet: {items:?}"
+        );
     }
 
     #[test]
@@ -1662,7 +2038,7 @@ mod tests {
             (4, ts(6), ChatMessage::assistant(vec![text("done")])),
         ];
         let events = vec![ctl(0, 3, NoticeInfo, "midway", 4)];
-        let items = reconstruct_transcript(tail, events);
+        let items = reconstruct_transcript(tail, events, None, Vec::new());
 
         // user, work (the c1 tool step), notice, answer
         assert_eq!(items.len(), 4);
@@ -1695,7 +2071,7 @@ mod tests {
             ),
             (5, ts(1003), ChatMessage::assistant(vec![text("cron done")])),
         ];
-        let items = reconstruct_transcript(tail, Vec::new());
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
         // user, answer, work, answer
         assert_eq!(items.len(), 4);
         let work = &items[2];
@@ -1741,7 +2117,7 @@ mod tests {
             ctl(0, 3, Command, "/stop", 15),
             ctl(1, 3, NoticeInfo, "Stopped.", 15),
         ];
-        let items = reconstruct_transcript(tail, events);
+        let items = reconstruct_transcript(tail, events, None, Vec::new());
 
         // user, work (stopped), /stop echo, notice, work (notification), answer
         assert_eq!(items.len(), 6);
@@ -1773,7 +2149,7 @@ mod tests {
                 ChatMessage::assistant(vec![thinking("let me add"), text("2")]),
             ),
         ];
-        let items = reconstruct_transcript(tail, Vec::new());
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
         assert_eq!(items.len(), 3);
 
         assert!(matches!(items[0].kind, TranscriptItemKind::Message));
@@ -1804,7 +2180,7 @@ mod tests {
             (2, ts(2), ChatMessage::user(vec![text("hi")])),
             (3, ts(3), ChatMessage::assistant(vec![text("hello")])),
         ];
-        let items = reconstruct_transcript(tail, Vec::new());
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
         assert_eq!(items.len(), 2);
         assert!(
             items
@@ -1833,7 +2209,7 @@ mod tests {
                 ChatMessage::tool_result("c1".to_owned(), "ok output".to_owned()),
             ),
         ];
-        let items = reconstruct_transcript(tail, Vec::new());
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
         assert_eq!(items.len(), 2);
         let work = &items[1];
         assert!(matches!(work.kind, TranscriptItemKind::Work));
@@ -1851,7 +2227,7 @@ mod tests {
             (3, ts(3), ChatMessage::user(vec![text("hi")])),
             (4, ts(4), ChatMessage::assistant(vec![text("hello")])),
         ];
-        let items = reconstruct_transcript(tail, Vec::new());
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
         assert_eq!(items.len(), 2);
         assert!(
             items
@@ -1873,7 +2249,7 @@ mod tests {
                 serde_json::json!({"command": "ls"}),
             )]),
         )];
-        let items = reconstruct_transcript(tail, Vec::new());
+        let items = reconstruct_transcript(tail, Vec::new(), None, Vec::new());
         assert_eq!(items.len(), 1);
         assert!(items[0].steps[0].tool_summary.is_none());
         assert!(items[0].steps[0].tool_status.is_none());
