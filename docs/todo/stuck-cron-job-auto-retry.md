@@ -8,7 +8,7 @@ This issue is gated on recovery being wired again — see `docs/modules/job.md` 
 
 ## Proposed Direction
 
-Once recovery exists, after the restart sweep scan for Stuck Jobs where `Job.kind == JobKind::Cron`. For each, either:
+Once recovery exists, after the restart sweep scan for Stuck Jobs where `Job.origin == TriggerKind::Cron`. For each, either:
 - Automatically re-dispatch via the actor (re-send `AgentMessage::CronTrigger`)
 - Or move to `Failed` with a reason and let the user decide
 

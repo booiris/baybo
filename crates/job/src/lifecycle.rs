@@ -6,7 +6,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::JobStatus;
 use crate::cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
-use crate::{CancelReason, Job, JobError, JobInput, JobStatusKind, JobTransition};
+use crate::{CancelReason, Job, JobError, JobInput, JobShape, JobStatusKind, JobTransition};
 use aura_model::{JobId, SessionId, SpanId, TriggerKind};
 use aura_store::JobStore;
 use tokio::sync::broadcast;
@@ -14,29 +14,59 @@ use tokio_util::sync::CancellationToken;
 
 type Result<T> = std::result::Result<T, JobError>;
 
-/// Process-wide capacity for the terminal-event broadcast bus.
+/// Process-wide capacity for the lifecycle-event broadcast bus.
 ///
 /// Sized to absorb the burst a multi-job subagent fan-out can produce
 /// without lagging the parent's wait loop. Subscribers that lag still
-/// reconcile against `list_by_session` so dropped events don't cause
-/// lost terminations — capacity is a latency knob, not correctness.
-const JOB_TERMINAL_EVENT_CAPACITY: usize = 256;
+/// reconcile against the store (`list_by_session` /
+/// `active_turn_started_at`) so dropped events don't cause lost
+/// terminations or stale turn state — capacity is a latency knob, not
+/// correctness.
+const JOB_LIFECYCLE_EVENT_CAPACITY: usize = 256;
 
-/// Terminal-state notification published by `JobLifecycle` whenever a
-/// job transitions to `Completed`, `Failed`, or `Cancelled`. Carries
-/// the minimum identifiers a subscriber needs to filter without going
-/// back to the store: the terminating `JobId`, its session, and the
-/// optional parent for hierarchy-scoped waits (subagent path).
+/// Which lifecycle transition a [`JobLifecycleEvent`] marks. The bus
+/// publishes the `Pending → InProgress` **start** edge and the three
+/// terminal edges; the intermediate `stuck` / `recover` transitions are
+/// not published (rare maintenance moves; the store stays the source of
+/// truth for them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobPhase {
+    Started,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl JobPhase {
+    /// The terminal job status this phase denotes, or `None` for
+    /// [`JobPhase::Started`] — lets a terminal-only consumer (the
+    /// subagent waiter) filter out the start edge in one match.
+    pub fn terminal_status(self) -> Option<JobStatusKind> {
+        match self {
+            JobPhase::Started => None,
+            JobPhase::Completed => Some(JobStatusKind::Completed),
+            JobPhase::Failed => Some(JobStatusKind::Failed),
+            JobPhase::Cancelled => Some(JobStatusKind::Cancelled),
+        }
+    }
+}
+
+/// A job lifecycle transition published by `JobLifecycle` on the
+/// broadcast bus: the `Pending → InProgress` start edge and the three
+/// terminal edges. Carries the minimum identifiers a subscriber needs to
+/// filter without going back to the store: the `JobId`, its session, and
+/// the optional parent for hierarchy-scoped waits (subagent path).
 ///
-/// `kind` is always one of the three terminal `JobStatusKind`
-/// discriminants — non-terminal transitions (`start`, `stuck`,
-/// `recover`) are not published.
+/// Two consumers today: the subagent runtime waits for a child's terminal
+/// edge (`phase.terminal_status()`), and the turn-state projector
+/// recomputes a session's turn activity on any edge (it ignores `phase` —
+/// every edge just means "recompute this session now").
 #[derive(Debug, Clone)]
-pub struct JobTerminalEvent {
+pub struct JobLifecycleEvent {
     pub job_id: JobId,
     pub session_id: SessionId,
     pub parent_job_id: Option<JobId>,
-    pub kind: JobStatusKind,
+    pub phase: JobPhase,
 }
 
 /// Owns the job state machine + persistence orchestration. Pure
@@ -48,29 +78,31 @@ pub struct JobLifecycle {
     /// in-flight jobs. `cancel()` trips the matching token (if any)
     /// in addition to flipping the DB row.
     cancellation: Arc<JobCancellationRegistry>,
-    /// Fire-and-forget bus for terminal transitions. The subagent
-    /// runtime subscribes to this so the parent unblocks on the
-    /// child's `Completed` / `Failed` / `Cancelled` regardless of
-    /// whether the child also produced an `AgentEvent::Message`.
-    terminal_events: broadcast::Sender<JobTerminalEvent>,
+    /// Fire-and-forget bus for lifecycle transitions (start + terminal).
+    /// The subagent runtime subscribes to unblock the parent on a child's
+    /// terminal edge; the turn-state projector subscribes to drive the
+    /// web chat's per-session turn activity off both edges.
+    lifecycle_events: broadcast::Sender<JobLifecycleEvent>,
 }
 
 impl JobLifecycle {
     pub fn new(store: Arc<dyn JobStore>) -> Self {
-        let (terminal_events, _rx) = broadcast::channel(JOB_TERMINAL_EVENT_CAPACITY);
+        let (lifecycle_events, _rx) = broadcast::channel(JOB_LIFECYCLE_EVENT_CAPACITY);
         Self {
             store,
             cancellation: Arc::new(JobCancellationRegistry::new()),
-            terminal_events,
+            lifecycle_events,
         }
     }
 
-    /// Subscribe to terminal-state events. Subscribers must reconcile
-    /// against the store (e.g. `list_by_session`) on
+    /// Subscribe to lifecycle events (start + terminal). Subscribers must
+    /// reconcile against the store on
     /// `broadcast::error::RecvError::Lagged` — a dropped event is not
-    /// re-published.
-    pub fn subscribe_terminal_events(&self) -> broadcast::Receiver<JobTerminalEvent> {
-        self.terminal_events.subscribe()
+    /// re-published (the subagent waiter re-checks via the store; the
+    /// turn-state projector recomputes on the next event, with the
+    /// Subscribe snapshot covering the gap).
+    pub fn subscribe_lifecycle_events(&self) -> broadcast::Receiver<JobLifecycleEvent> {
+        self.lifecycle_events.subscribe()
     }
 
     /// Register an in-flight job's cancellation token. The returned
@@ -90,11 +122,10 @@ impl JobLifecycle {
 
     /// Create a new job in `Pending`.
     ///
-    /// `session_trigger_kind` is the root trigger kind of the owning
-    /// session — used to enforce the `JobKind ↔ TriggerKind` invariant
-    /// documented in `aura_job::kind`. Mismatches return
-    /// `JobError::KindMismatch` with a descriptive message (rather than
-    /// passing through silently as before).
+    /// `origin` is the root trigger kind of the owning session — stored
+    /// on the job as-is (see `aura_job::kind`), independent of `input`.
+    /// `shape` is declared by the caller (the running code path), not
+    /// inferred from `input`.
     ///
     /// **Production code does not call this directly** — it goes
     /// through `agent::scope::with_job` (which builds a `JobSpec`
@@ -105,39 +136,38 @@ impl JobLifecycle {
     pub async fn start_job(
         &self,
         session_id: SessionId,
-        session_trigger_kind: TriggerKind,
+        origin: TriggerKind,
+        shape: JobShape,
         input: JobInput,
         parent_job_id: Option<JobId>,
     ) -> Result<Job> {
-        let job_kind = input.kind();
-        if !job_kind.allowed_for(session_trigger_kind) {
-            return Err(JobError::KindMismatch(format!(
-                "job kind {job_kind:?} not allowed in {session_trigger_kind:?}-trigger session \
-                 (see aura_job::kind allowed-for table)"
-            )));
-        }
-        let job = Job::new(session_id, input, parent_job_id);
+        let job = Job::new(session_id, origin, shape, input, parent_job_id);
         self.store.create(&job.to_row()?).await?;
         Ok(job)
     }
 
-    /// Move `Pending → InProgress`.
+    /// Move `Pending → InProgress`. Publishes a [`JobPhase::Started`]
+    /// event — the start edge the turn-state projector turns into the
+    /// web chat's "turn began".
     pub async fn start(&self, job_id: &JobId) -> Result<()> {
         let (job, transition) = self.apply(job_id, |j| j.start()).await?;
-        self.persist(job, transition).await
+        self.persist_and_publish(job, transition, JobPhase::Started)
+            .await
     }
 
     /// Move `InProgress → Completed` with a final output.
     pub async fn complete(&self, job_id: &JobId, output: crate::JobOutput) -> Result<()> {
         let (job, transition) = self.apply(job_id, |j| j.complete(output)).await?;
-        self.persist_and_publish(job, transition).await
+        self.persist_and_publish(job, transition, JobPhase::Completed)
+            .await
     }
 
     /// Move to `Failed { reason }`.
     pub async fn fail(&self, job_id: &JobId, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();
         let (job, transition) = self.apply(job_id, |j| j.fail(&reason)).await?;
-        self.persist_and_publish(job, transition).await
+        self.persist_and_publish(job, transition, JobPhase::Failed)
+            .await
     }
 
     /// Move to `Cancelled { reason, partial_artifacts }`.
@@ -163,7 +193,8 @@ impl JobLifecycle {
         let (job, transition) = self
             .apply(job_id, |j| j.cancel(reason, partial_artifacts.clone()))
             .await?;
-        self.persist_and_publish(job, transition).await
+        self.persist_and_publish(job, transition, JobPhase::Cancelled)
+            .await
     }
 
     /// Boot-time recovery cancel. Same state-machine semantics as
@@ -190,7 +221,8 @@ impl JobLifecycle {
                 j.cancel_at(reason, partial_artifacts.clone(), at)
             })
             .await?;
-        self.persist_and_publish(job, transition).await
+        self.persist_and_publish(job, transition, JobPhase::Cancelled)
+            .await
     }
 
     /// Move to `Stuck { reason }` from `InProgress`.
@@ -272,6 +304,41 @@ impl JobLifecycle {
             .collect()
     }
 
+    /// Non-terminal jobs for one session that represent user-visible
+    /// turn activity. This centralizes the `Job::is_turn` filter so
+    /// callers such as `/stop`, crash recovery, and TurnState projection
+    /// do not each re-define "active reply" for themselves. A `/compact`
+    /// runs `Maintenance`-shaped, so it is correctly excluded here even
+    /// though its input is a `UserChat` payload.
+    pub async fn list_active_turns_by_session(
+        &self,
+        session_id: &aura_model::SessionId,
+    ) -> Result<Vec<Job>> {
+        Ok(self
+            .list_active_by_session(session_id)
+            .await?
+            .into_iter()
+            .filter(|j| j.is_turn())
+            .collect())
+    }
+
+    /// When the session has a turn in flight (a non-terminal turn-shaped
+    /// job — see [`Job::is_turn`]), the instant it started. Chat
+    /// surfaces use this to tell a late-joining client "a reply is being
+    /// produced since T"; `None` means the session is idle. A still-
+    /// `Pending` turn reports its `created_at` (queued counts as in
+    /// flight from the user's point of view).
+    pub async fn active_turn_started_at(
+        &self,
+        session_id: &aura_model::SessionId,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let jobs = self.list_active_turns_by_session(session_id).await?;
+        Ok(jobs
+            .into_iter()
+            .map(|j| j.started_at.unwrap_or(j.created_at))
+            .max())
+    }
+
     /// Direct children of `parent_job_id` (one level). Used by `/stop`'s
     /// subtree walk to stamp `UserStopped` on (and back-stop the cancellation
     /// of) in-flight descendant jobs such as foreground subagents. Foreground
@@ -312,22 +379,28 @@ impl JobLifecycle {
         Ok(())
     }
 
-    /// Persist a terminal transition, then fire the matching event on
-    /// the broadcast bus. Publish happens **after** the store write
-    /// succeeds so a subscriber that races back into the lifecycle
-    /// (e.g. to look the job up by id) is guaranteed to see the
-    /// terminal row. Send errors are dropped on the floor — broadcast
-    /// `send` only fails when there are no subscribers, which is the
-    /// normal state for non-subagent jobs.
-    async fn persist_and_publish(&self, job: Job, transition: JobTransition) -> Result<()> {
-        let event = JobTerminalEvent {
+    /// Persist a transition, then fire its lifecycle event on the
+    /// broadcast bus. Publish happens **after** the store write succeeds
+    /// so a subscriber that races back into the lifecycle (e.g. to look
+    /// the job up by id, or to recompute `active_turn_started_at`) is
+    /// guaranteed to see the new row. Send errors are dropped on the
+    /// floor — broadcast `send` only fails when there are no subscribers,
+    /// which is the normal state for a process with no live chat tab and
+    /// no in-flight subagent.
+    async fn persist_and_publish(
+        &self,
+        job: Job,
+        transition: JobTransition,
+        phase: JobPhase,
+    ) -> Result<()> {
+        let event = JobLifecycleEvent {
             job_id: job.id,
             session_id: job.session_id.clone(),
             parent_job_id: job.parent_job_id,
-            kind: job.status.kind(),
+            phase,
         };
         self.persist(job, transition).await?;
-        let _ = self.terminal_events.send(event);
+        let _ = self.lifecycle_events.send(event);
         Ok(())
     }
 
@@ -345,7 +418,7 @@ impl JobLifecycle {
 mod tests {
     use super::*;
     use crate::test_support::MemoryJobStore;
-    use aura_model::ContentBlock;
+    use aura_model::{BackgroundCompressionPayload, ContentBlock};
 
     fn user_chat_input() -> JobInput {
         JobInput::UserChat {
@@ -370,6 +443,7 @@ mod tests {
             .start_job(
                 SessionId::from("s1"),
                 TriggerKind::User,
+                JobShape::Turn,
                 user_chat_input(),
                 None,
             )
@@ -392,6 +466,7 @@ mod tests {
             .start_job(
                 SessionId::from("s1"),
                 TriggerKind::User,
+                JobShape::Turn,
                 user_chat_input(),
                 None,
             )
@@ -420,6 +495,7 @@ mod tests {
             .start_job(
                 SessionId::from("s2"),
                 TriggerKind::User,
+                JobShape::Turn,
                 user_chat_input(),
                 None,
             )
@@ -436,52 +512,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawned_job_kind_allowed_under_every_root_trigger() {
-        // Pins the contract that the subagent dispatch path relies on:
-        // JobInput::Spawned must work for a child session whose root
-        // trigger is inherited from the parent (User / Cron / System).
+    async fn origin_recorded_as_is_for_any_input_under_any_trigger() {
+        // origin is the session's root trigger, recorded honestly and
+        // independent of the input payload. The subagent dispatch path
+        // relies on a Spawned input working under any inherited root
+        // trigger; more broadly, no input/trigger pairing is rejected.
         let lc = make_lifecycle();
         for trigger in [TriggerKind::User, TriggerKind::Cron, TriggerKind::System] {
             let job = lc
                 .start_job(
                     SessionId::from(format!("child-of-{trigger:?}")),
                     trigger,
+                    JobShape::Turn,
                     JobInput::Spawned {
                         initial_prompt: vec![ContentBlock::Text("task".into())],
                     },
                     None,
                 )
-                .await;
-            assert!(
-                job.is_ok(),
-                "subagent dispatch under {trigger:?} root must be allowed: {:?}",
-                job.err()
-            );
+                .await
+                .expect("any input is allowed under any root trigger");
+            assert_eq!(job.origin, trigger);
+            assert_eq!(job.input_kind(), crate::JobInputKind::Spawned);
         }
     }
 
     #[tokio::test]
-    async fn user_chat_under_cron_session_is_rejected() {
-        // The bug this guards against: subagent.rs used to send
-        // AgentMessage::UserInput, which mapped to JobInput::UserChat —
-        // and a Cron-rooted child session rejected that with KindMismatch.
-        // The fix routes subagents through JobInput::Spawned (covered by
-        // the test above); this test pins the underlying state-machine
-        // rejection so a regression elsewhere can't silently restore the
-        // old shape.
+    async fn user_chat_input_under_cron_session_records_cron_origin() {
+        // Input kind and origin are recorded side by side and independently:
+        // a UserChat payload in a Cron-trigger session yields input kind =
+        // UserChat, origin = Cron, with no payload/trigger constraint.
         let lc = make_lifecycle();
-        let err = lc
+        let job = lc
             .start_job(
                 SessionId::from("cron-session"),
                 TriggerKind::Cron,
+                JobShape::Turn,
                 JobInput::UserChat {
                     content: vec![ContentBlock::Text("hi".into())],
                 },
                 None,
             )
             .await
-            .unwrap_err();
-        assert!(matches!(err, JobError::KindMismatch(_)));
+            .expect("input no longer constrained by trigger");
+        assert_eq!(job.origin, TriggerKind::Cron);
+        assert_eq!(job.input_kind(), crate::JobInputKind::UserChat);
+    }
+
+    #[tokio::test]
+    async fn active_turns_exclude_system_jobs() {
+        let lc = make_lifecycle();
+        let session_id = SessionId::from("s1");
+        let turn = lc
+            .start_job(
+                session_id.clone(),
+                TriggerKind::User,
+                JobShape::Turn,
+                user_chat_input(),
+                None,
+            )
+            .await
+            .unwrap();
+        lc.start(&turn.id).await.unwrap();
+        let system = lc
+            .start_job(
+                session_id.clone(),
+                TriggerKind::System,
+                JobShape::Maintenance,
+                JobInput::System {
+                    payload: BackgroundCompressionPayload { up_to_ordinal: 7 },
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        lc.start(&system.id).await.unwrap();
+
+        let all_active = lc.list_active_by_session(&session_id).await.unwrap();
+        assert_eq!(all_active.len(), 2);
+
+        let turns = lc.list_active_turns_by_session(&session_id).await.unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].id, turn.id);
+        assert_eq!(
+            lc.active_turn_started_at(&session_id).await.unwrap(),
+            turns[0].started_at
+        );
     }
 
     #[tokio::test]
@@ -491,6 +606,7 @@ mod tests {
             .start_job(
                 SessionId::from("s1"),
                 TriggerKind::User,
+                JobShape::Turn,
                 user_chat_input(),
                 None,
             )
@@ -514,6 +630,7 @@ mod tests {
             .start_job(
                 SessionId::from("s1"),
                 TriggerKind::User,
+                JobShape::Turn,
                 user_chat_input(),
                 None,
             )

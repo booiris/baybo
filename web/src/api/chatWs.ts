@@ -113,6 +113,20 @@ export type Frame =
   | { kind: 'status'; session_id: string; user_id?: string; phase: string }
   | { kind: 'task_list'; session_id: string; user_id?: string; tasks: TaskView[] }
   | {
+      kind: 'turn_state';
+      session_id: string;
+      user_id?: string;
+      /** Whether a turn (the session's in-flight reply) is currently
+       *  being produced. Broadcast at every turn start/end AND sent as
+       *  a snapshot on every Subscribe, so a late joiner (new tab,
+       *  reconnect) learns about a turn whose progress frames it never
+       *  received. */
+      active: boolean;
+      /** ISO instant the in-flight turn started; present iff `active`.
+       *  Seeds the work block's elapsed timer with true turn age. */
+      started_at?: string | null;
+    }
+  | {
       kind: 'notice';
       session_id: string;
       user_id?: string;

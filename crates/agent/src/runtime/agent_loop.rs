@@ -4,7 +4,7 @@ use aura_channels::{
     AgentEvent, AgentOutput, COMPACT_COMMAND, OutgoingMessage, ToolStatus, TurnStatus,
 };
 use aura_context::ContextManager;
-use aura_job::{JobInput, JobLifecycle, JobOutput};
+use aura_job::{JobInput, JobLifecycle, JobOutput, JobShape};
 use aura_llm::{
     Attribution, BillableLlm, BoundBilledLlm, ChatRequest, LlmResponse, StreamEvent, TokenUsage,
     ToolDefinitionForLlm,
@@ -602,7 +602,8 @@ impl AgentLoop {
         let memory_query = memory_recall_query(&job_input);
         let spec = JobSpec {
             session_id: session.id.clone(),
-            session_trigger_kind: session.trigger.kind(),
+            origin: session.trigger.kind(),
+            shape: JobShape::Turn,
             input: job_input,
             parent_job_id,
         };
@@ -2247,23 +2248,19 @@ impl AgentLoop {
         parent_job_id: Option<JobId>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<String> {
-        // Match the session trigger so the JobKind invariant holds for
-        // both user-triggered and spawned sessions. `/compact` is a
-        // user-typed command, so UserChat is the natural default; for
-        // sessions whose root trigger is anything else (Cron / System
-        // / Spawned) we fall back to JobKind::Spawned which is allowed
-        // under every trigger.
-        let job_input = match session.trigger.kind() {
-            aura_model::TriggerKind::User => JobInput::UserChat {
-                content: vec![ContentBlock::Text(COMPACT_COMMAND.to_string())],
-            },
-            _ => JobInput::Spawned {
-                initial_prompt: vec![ContentBlock::Text(COMPACT_COMMAND.to_string())],
-            },
+        // `/compact` is a user-typed command, so the input is a UserChat
+        // payload regardless of the session's root trigger; the trigger
+        // is recorded separately as the job's origin. It runs
+        // `force_compress`, not the agent loop, so its shape is
+        // `Maintenance` (like background compression) despite the
+        // turn-shaped input.
+        let job_input = JobInput::UserChat {
+            content: vec![ContentBlock::Text(COMPACT_COMMAND.to_string())],
         };
         let spec = JobSpec {
             session_id: session.id.clone(),
-            session_trigger_kind: session.trigger.kind(),
+            origin: session.trigger.kind(),
+            shape: JobShape::Maintenance,
             input: job_input,
             parent_job_id,
         };
@@ -2370,6 +2367,7 @@ impl AgentLoop {
         // future cannot borrow `&self` / `&session`. The pass bills +
         // traces against this session.
         let session_id = session.id.clone();
+        let origin = session.trigger.kind();
         let user_id = session.user.id.clone();
         let llm_client = self.llm_client.clone();
         let security_gateway = self.security_gateway.clone();
@@ -2390,16 +2388,15 @@ impl AgentLoop {
             let runner_session_id = session_id.clone();
             let spec = JobSpec {
                 session_id,
-                // The pass is a `System` job, which `allowed_for` only
-                // admits under a `System`-trigger session. It runs inside
-                // a User / Cron-trigger session's actor, so pass `System`
-                // here purely to clear the gate — the job row's
-                // attribution keys off `session_id` above, not this kind.
-                session_trigger_kind: aura_model::TriggerKind::System,
+                // Runs inside the triggering (User / Cron) session, so it
+                // records that session's trigger as its origin.
+                origin,
+                // A compression pass, not an agent-loop turn.
+                shape: JobShape::Maintenance,
                 input: aura_job::JobInput::System {
                     payload: payload.clone(),
                 },
-                // Parent the System job under the triggering turn's job.
+                // Parent the maintenance job under the triggering turn's job.
                 parent_job_id: Some(current_job_id),
             };
             let result = crate::runtime::scope::with_job(

@@ -77,17 +77,71 @@ worth knowing:
   blocks for turns missed during a brief disconnect don't reappear until a full
   reload re-runs reconstruction.
 
+## `TurnState`: the in-flight turn survives a late join
+
+Progress events are fire-and-forget broadcasts, so a client that wasn't
+connected when they fired (a second tab opened mid-turn, a reconnect) used to
+have no way to tell "the agent is still working" from "the turn died without a
+reply" — the web UI guessed from the transcript shape and a connect-settle
+timer, mislabelling live turns as **Cancelled** and restarting the elapsed
+timer at `0s`. `TurnState` replaces the guess with server truth.
+
+The single source of truth is the **job store**: a turn is in flight exactly
+when the session has a non-terminal turn-shaped job (`Job::is_turn` — `shape ==
+Turn`). Background compression and `/compact` run `Maintenance`-shaped and are
+excluded, so a compaction never lights up the chat as a live reply — even
+`/compact`, whose input is a `UserChat` payload. `Frame::TurnState { active, started_at }` is that truth
+projected to chat clients. The actor emits **nothing**; there is one producer
+of the live signal and one of the join snapshot, both reading the same store:
+
+- **Live edges** — the **turn-state projector** (`spawn_turn_state_projector`)
+  subscribes to `JobLifecycle::subscribe_lifecycle_events`, which now carries
+  both the `Pending → InProgress` **start** edge and the **terminal** edges
+  (`JobPhase`). On *every* transition it recomputes
+  `JobLifecycle::active_turn_started_at` for that session and broadcasts the
+  current value. So both edges are derived from the same store the snapshot
+  reads — they can't drift from a parallel actor emission (there is none), the
+  close can't be skipped by an error or a crash, and the start carries the
+  job's real `started_at`. "Recompute-is-truth" makes it robust to *which*
+  job's transition fired it (the turn, a child subagent, a
+  background-compression `System` job): each just means "recompute this session
+  now", and the broadcast is whatever is currently true.
+- **Join snapshot** — the gateway sends one `TurnState` per `Subscribe`,
+  reading the same `active_turn_started_at`, so a late joiner (new tab,
+  reconnect) renders the in-flight turn it never saw start.
+
+Because the start edge is the job's own `start()` transition (not a separate
+actor emission that raced the job-row insert), a `Subscribe` can no longer land
+in a window where the live signal and the snapshot disagree: from the instant
+the `Pending` row exists the snapshot reads active, and the `Started` broadcast
+refines `started_at` moments later.
+
+A panicked actor is watched by `actor::runner::spawn_actor`: it delegates to
+`recover_panicked_actor_session`, which closes the orphan trace rows and cancels
+the orphaned turn jobs. Those terminal job events are what the projector turns
+into the close edge — no special-case `TurnState` broadcast in the runner.
+
+- **Web client**: `SessionView.turn` records the latest signal;
+  `applyTurnState` reconciles the transcript tail (re-opens the
+  history-reconstructed work block of an in-flight turn with the true
+  `started_at`, closes the block on `active: false` even when no terminal
+  `Message`/`Notice` arrives — error, cancel, blank cron reply). The
+  **Cancelled** indicator renders only on a definitive `active: false`; with
+  no signal yet it stays quiet.
+- **TUI / sidecars**: drop the frame (the TUI infers turn activity locally; it
+  initiated the turn).
+
 ## Out of scope / future
 
 - **`Status` spinner — remaining phases.** `AgentEvent::Status(TurnStatus)` shipped
   for context compaction (`Compacting` / `Compacted`, see the table above). The other
-  phases the enum could carry — Thinking / Working / Responding — are still deferred on
-  the **wire**; they're inferable consumer-side from turn activity, which is exactly what
-  the TUI now does: it renders a **client-side animated "working" indicator** (gated on a
-  local turn-active flag) instead of the model's reasoning trace, and **drops `Reasoning`
-  frames entirely** rather than rendering them. So a server-side Working/Thinking status
-  remains low priority for the TUI. Other channels (e.g. the web UI) still consume
-  `Reasoning`. See [`docs/modules/tui.md`](modules/tui.md#working-indicator--mid-turn-steering).
+  phases the enum could carry — Thinking / Responding — are still deferred on the
+  **wire**. Coarse turn-level activity is no longer inferred consumer-side: that's
+  `TurnState` (above). The TUI still renders a **client-side animated "working"
+  indicator** (gated on a local turn-active flag — it initiated the turn) instead of
+  the model's reasoning trace, and **drops `Reasoning` frames entirely** rather than
+  rendering them. Other channels (e.g. the web UI) still consume `Reasoning`.
+  See [`docs/modules/tui.md`](modules/tui.md#working-indicator--mid-turn-steering).
 - **Subagent → parent progress** — subagents run with `delta_tx = None`. Surfacing
   their progress to the parent ties into the planned `SubagentNotification` redesign.
 - **Fine-grained in-tool events** — forward a curated subset of `ToolEventSink`

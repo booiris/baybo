@@ -89,6 +89,11 @@ pub struct WsChannelState {
     /// client's `Frame::TaskList` snapshot, so a reload / reconnect / view-cache
     /// eviction recovers the durable list without waiting for the next turn.
     pub task_store: Arc<dyn TaskStore>,
+    /// Job registry. Read on `Subscribe` to derive the client's
+    /// `Frame::TurnState` snapshot (is a turn in flight, since when) —
+    /// the live `TurnState` broadcasts cover connected clients; this
+    /// covers the late joiner who missed them.
+    pub job_lifecycle: Arc<aura_job::JobLifecycle>,
     /// Recent-window dedup for sidecar-supplied
     /// `(channel_type, bot_id, platform_msg_id)` triples. Sidecars that
     /// replay their long-poll buffer after a restart hit this and the
@@ -125,6 +130,7 @@ impl WsChannelState {
             pairing,
             blob_store: deps.stores.blob.clone(),
             task_store: deps.stores.task.clone(),
+            job_lifecycle: Arc::clone(&deps.job_lifecycle),
             inbound_dedup: Arc::new(InboundDedup::new()),
         }
     }

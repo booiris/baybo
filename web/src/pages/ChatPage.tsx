@@ -82,10 +82,13 @@ interface TranscriptRow {
    *  replays — those rows are also reachable via the REST history
    *  surface with the real value once the page refetches. */
   createdAt?: string;
-  /** Set on the single live-only "work" row that aggregates a turn's
-   *  intermediate progress — reasoning, tool calls, status, and mid-turn
-   *  prose — into one collapsible block. Live-only: never persisted, so a
-   *  REST history reload drops it. See `docs/turn-progress-events.md`. */
+  /** Set on the single "work" row that aggregates a turn's intermediate
+   *  progress — reasoning, tool calls, status, and mid-turn prose — into
+   *  one collapsible block. Built live from progress frames, and
+   *  reconstructed from persisted rows on a REST history load (the
+   *  server folds each tool-using turn into a `work` transcript item);
+   *  `applyTurnState` re-opens the reconstructed block when the server
+   *  says its turn is still in flight. See `docs/turn-progress-events.md`. */
   kind?: 'work';
   /** Ordered progress steps inside a `kind === 'work'` row. */
   steps?: WorkStep[];
@@ -193,6 +196,14 @@ interface SessionView {
    *  `Frame::TaskList` snapshot (it's idempotent, not a delta). Empty
    *  when the agent has no active plan — the checklist panel hides. */
   tasks: TaskView[];
+  /** Server-authoritative "is a turn in flight, since when (epoch ms)".
+   *  Fed by `Frame::TurnState` — broadcast at every turn start/end and
+   *  snapshotted to this connection on every Subscribe — so a tab that
+   *  missed the turn's progress frames (opened mid-turn, reconnected)
+   *  still knows the agent is working. `null` = no signal yet on this
+   *  connection: nothing that depends on knowing (the Cancelled
+   *  indicator) may render. */
+  turn: { active: boolean; startedAt: number | null } | null;
 }
 
 const EMPTY_VIEW: SessionView = {
@@ -206,6 +217,7 @@ const EMPTY_VIEW: SessionView = {
   awaitingReply: false,
   model: null,
   tasks: [],
+  turn: null,
 };
 
 /** Soft cap on `views` map size. Past this, the oldest non-active
@@ -215,14 +227,6 @@ const EMPTY_VIEW: SessionView = {
  *  casual session-switching stays free; bites only when the user has
  *  genuinely roamed across many conversations in one tab session. */
 const VIEW_CACHE_LIMIT = 20;
-
-/* Grace period after the WS reaches `connected` before the "Cancelled"
- *  badge is allowed to render. On a fresh load the transcript is fetched
- *  over REST before the socket is up, so its trailing work block looks
- *  "cancelled" until the live connection delivers the turn's actual
- *  continuation / catch-up. Holding the badge until the connection has
- *  settled avoids flashing it during that load→connect window. */
-const CANCELLED_BADGE_SETTLE_MS = 800;
 
 export function ChatPage() {
   const { sessionId } = useParams<{ sessionId?: string }>();
@@ -287,10 +291,6 @@ export function ChatPage() {
   const [cronInboxRefresh, setCronInboxRefresh] = useState(0);
 
   const [status, setStatus] = useState<ConnectionStatus>({ state: 'connecting' });
-  // Gates the "Cancelled" badge (see CANCELLED_BADGE_SETTLE_MS). False
-  // until the socket has held `connected` for the grace window, so a
-  // freshly-loaded transcript can't flash the badge before live state lands.
-  const [connectionSettled, setConnectionSettled] = useState(false);
   const [composer, setComposer] = useState('');
   const [showSlashHints, setShowSlashHints] = useState(false);
 
@@ -668,6 +668,7 @@ export function ChatPage() {
           case 'notice':
           case 'approval_requested':
           case 'task_list':
+          case 'turn_state':
             recencyRef.current.set(frame.session_id, Date.now());
             break;
           default:
@@ -801,16 +802,27 @@ export function ChatPage() {
           if (data.newest_ordinal != null) {
             wsRef.current?.recordOrdinal(sessionId, data.newest_ordinal);
           }
-          setViews((prev) =>
-            mergeView(prev, sessionId, {
-              transcript: rows,
+          setViews((prev) => {
+            // The reload replaces the transcript wholesale — including any
+            // live work block frames built up while the fetch was in
+            // flight (their un-persisted steps can't be merged reliably,
+            // so they're sacrificed). Re-apply the connection's current
+            // TurnState so an in-flight turn's trailing reconstructed
+            // block comes back *active* with the true start time instead
+            // of collapsing to `Worked 0s` until the next frame.
+            const turn = (prev[sessionId] ?? EMPTY_VIEW).turn;
+            const transcript = turn
+              ? applyTurnState(rows, turn.active, turn.startedAt)
+              : rows;
+            return mergeView(prev, sessionId, {
+              transcript,
               historyLoaded: true,
               historyLoading: false,
               oldestOrdinal,
               hasMore: data.has_more,
               model: data.last_llm ?? null,
-            }),
-          );
+            });
+          });
         } else {
           setViews((prev) =>
             mergeView(prev, sessionId, { historyLoaded: true, historyLoading: false }),
@@ -908,21 +920,6 @@ export function ChatPage() {
     if (status.state === 'connected') {
       lastConnectedAtRef.current = Date.now();
     }
-  }, [status.state]);
-
-  // Drive `connectionSettled`: true only after the socket has held
-  // `connected` for the grace window; reset the moment it drops. Gates the
-  // "Cancelled" badge so the load→connect race can't flash it.
-  useEffect(() => {
-    if (status.state !== 'connected') {
-      setConnectionSettled(false);
-      return;
-    }
-    const t = window.setTimeout(
-      () => setConnectionSettled(true),
-      CANCELLED_BADGE_SETTLE_MS,
-    );
-    return () => window.clearTimeout(t);
   }, [status.state]);
 
   // Scroll-up pagination: when the user is within `topThresholdPx`
@@ -1342,15 +1339,7 @@ export function ChatPage() {
                 const nodes: React.ReactNode[] = [
                   <MessageBubble key={row.key} row={row} />,
                 ];
-                if (
-                  connectionSettled &&
-                  isCancelledWorkAt(
-                    arr,
-                    i,
-                    currentView.awaitingReply,
-                    currentView.pendingApproval,
-                  )
-                ) {
+                if (isCancelledWorkAt(arr, i, currentView.turn)) {
                   nodes.push(
                     <CancelledTurnIndicator key={`${row.key}-cancelled`} />,
                   );
@@ -1579,6 +1568,30 @@ function routeInboundFrame(
       // and the checklist panel hides.
       const sid = frame.session_id;
       setViews((prev) => mergeView(prev, sid, { tasks: frame.tasks }));
+      return;
+    }
+    case 'turn_state': {
+      // Server-authoritative turn lifecycle: broadcast at every turn
+      // start/end, snapshotted on every Subscribe. Recorded on the view
+      // (drives the Cancelled indicator) and reconciled into the
+      // transcript's trailing work block (open/elapsed-timer/close).
+      // On `active` it also takes over from the optimistic
+      // awaiting-reply indicator — the (possibly still empty) work
+      // block is the working affordance from here.
+      const sid = frame.session_id;
+      const startedAt = parseEpochMs(frame.started_at);
+      setViews((prev) => {
+        const view = prev[sid] ?? EMPTY_VIEW;
+        return {
+          ...prev,
+          [sid]: {
+            ...view,
+            turn: { active: frame.active, startedAt },
+            transcript: applyTurnState(view.transcript, frame.active, startedAt),
+            awaitingReply: frame.active ? false : view.awaitingReply,
+          },
+        };
+      });
       return;
     }
     case 'message': {
@@ -2027,6 +2040,33 @@ function appendStreamingDelta(prev: TranscriptRow[], text: string): TranscriptRo
   ];
 }
 
+/** The single source of truth for the empty/active work-block row shape.
+ *  Both `ensureWork` (live progress) and `applyTurnState` (turn-state
+ *  reconciliation) open blocks through here so a schema change lands in
+ *  one place. `position` only disambiguates the React key from sibling
+ *  blocks already in the transcript. */
+function newWorkRow(startedAt: number, position: number): TranscriptRow {
+  return {
+    key: `work-${startedAt}-${position}`,
+    role: 'system',
+    text: '',
+    kind: 'work',
+    steps: [],
+    workActive: true,
+    workStartedAt: startedAt,
+  };
+}
+
+/** Parse a server ISO timestamp to epoch ms, mapping both absent and
+ *  unparseable inputs to `null` — so `Date.parse`'s `NaN` failure
+ *  sentinel never leaks into elapsed-timer math, React keys, or the
+ *  `===` identity checks that drive idempotency. */
+function parseEpochMs(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  return Number.isNaN(ms) ? null : ms;
+}
+
 /** Locate the turn's open work block — creating one at the tail if
  *  absent — and fold any trailing streaming answer bubble into it as a
  *  `prose` step first. Returns the next rows plus the block's index.
@@ -2055,19 +2095,7 @@ function ensureWork(prev: TranscriptRow[]): { rows: TranscriptRow[]; idx: number
   if (tail?.kind === 'work' && tail.workActive) {
     idx = rows.length - 1;
   } else {
-    const now = Date.now();
-    rows = [
-      ...rows,
-      {
-        key: `work-${now}-${rows.length}`,
-        role: 'system',
-        text: '',
-        kind: 'work',
-        steps: [],
-        workActive: true,
-        workStartedAt: now,
-      },
-    ];
+    rows = [...rows, newWorkRow(Date.now(), rows.length)];
     idx = rows.length - 1;
   }
   if (proseStep) {
@@ -2196,6 +2224,66 @@ function closeActiveWork(prev: TranscriptRow[]): TranscriptRow[] {
   return prev;
 }
 
+/** Reconcile the transcript's tail with the server's `TurnState`.
+ *
+ *  Active: make sure a trailing *active* work block exists and pin its
+ *  `workStartedAt` to the server's turn start — this re-opens the
+ *  inactive block a REST history reload reconstructs for an in-flight
+ *  turn (so it renders as "Working" with the true elapsed time instead
+ *  of a collapsed `Worked 0s` that the Cancelled indicator would then
+ *  mislabel), corrects the receive-time stamp `ensureWork` had to guess
+ *  for a mid-turn joiner, and — when the tail has no work block at all
+ *  (turn started, nothing streamed to this tab yet) — opens an empty one
+ *  as the working affordance.
+ *
+ *  Inactive: close any open block. This is the turn-end signal that
+ *  doesn't depend on a terminal `Message`/`Notice` arriving, so a turn
+ *  that ends without either (error, cancel, blank cron reply) can't
+ *  leave the block spinning forever.
+ *
+ *  Idempotent — safe to apply both on every `turn_state` frame and after
+ *  a history reload replaces the transcript. */
+function applyTurnState(
+  prev: TranscriptRow[],
+  active: boolean,
+  startedAt: number | null,
+): TranscriptRow[] {
+  if (!active) {
+    // The actor emits `active: false` when its loop returns, BEFORE the
+    // terminal Message/Notice ships on the same ordered stream. A block
+    // whose tail is `prose` is holding the streamed answer that the
+    // imminent Message will peel into the real bubble
+    // (`closeWorkForFinalReply`) — closing it here would fossilise that
+    // prose inside the collapsed block and the answer would render
+    // twice. Leave it for the terminal frame; close everything else
+    // (tool/reasoning tails, turns that end with no terminal frame at
+    // all — cancel, blank cron reply). A *failed* user turn now always
+    // gets a terminal error notice (see `run_agent_loop`), whose handler
+    // closes the block via `closeActiveWork` — so the prose-tail block
+    // doesn't dangle on the error path either.
+    const last = prev[prev.length - 1];
+    if (last?.kind === 'work' && last.workActive) {
+      const steps = last.steps ?? [];
+      if (steps[steps.length - 1]?.kind === 'prose') return prev;
+    }
+    return closeActiveWork(prev);
+  }
+  const last = prev[prev.length - 1];
+  if (last?.kind === 'work') {
+    const pinned = startedAt ?? last.workStartedAt ?? Date.now();
+    if (last.workActive && last.workStartedAt === pinned) return prev;
+    const next = prev.slice();
+    next[next.length - 1] = {
+      ...last,
+      workActive: true,
+      workStartedAt: pinned,
+      workEndedAt: undefined,
+    };
+    return next;
+  }
+  return [...prev, newWorkRow(startedAt ?? Date.now(), prev.length)];
+}
+
 /** Close the open work block at the turn's terminal reply, peeling off a
  *  trailing `prose` step — that's the final answer the model streamed
  *  into the block — so the caller renders it as the standalone answer
@@ -2312,8 +2400,8 @@ function historyRowToTranscript(sessionId: string, row: HistoryRowDto): Transcri
       text: '',
       kind: 'work',
       workActive: false,
-      workStartedAt: row.work_started_at ? Date.parse(row.work_started_at) : undefined,
-      workEndedAt: row.work_ended_at ? Date.parse(row.work_ended_at) : undefined,
+      workStartedAt: parseEpochMs(row.work_started_at) ?? undefined,
+      workEndedAt: parseEpochMs(row.work_ended_at) ?? undefined,
       steps: (row.steps ?? []).map((s, i) => ({
         key: `hist-${sessionId}-${row.ordinal}-${i}`,
         kind: s.kind,
@@ -2990,27 +3078,26 @@ function LiveElapsed({ startedAt }: { startedAt: number }) {
 
 // True when the trailing closed `work` block at position `i` represents
 // a turn that ended without producing the final assistant reply —
-// typically a cancellation (user stop, agent loop abort, gateway
-// shutdown mid-turn). Only the very last transcript row is considered:
-// a mid-transcript work block followed by a user message is ambiguous
-// — it could be a real cancel, OR a race where the user typed during a
-// long-running turn (e.g. a transient LLM SSE failure that retries for
-// >1min) whose reply is still in flight. We can't distinguish those
-// from the transcript alone, so we stay quiet rather than mis-label a
-// recovering turn as cancelled. Live turns still in flight
-// (`awaitingReply` / `pendingApproval`) are also excluded so the
-// indicator doesn't flash mid-stream.
+// a cancellation the session never got a notice for (agent-loop abort,
+// gateway shutdown mid-turn; a user `/stop` leaves its own notice as the
+// trailing row, so it never reaches this). Keyed on the server's
+// `TurnState`: the indicator renders only once this connection has been
+// told, definitively, that no turn is in flight — a turn the server says
+// is still running renders as the live work block instead, and with no
+// signal at all (`turn === null`, e.g. the Subscribe snapshot hasn't
+// landed yet) we stay quiet rather than mis-label a working turn.
+// Only the very last transcript row is considered: a mid-transcript work
+// block followed by a user message is an answered-elsewhere ambiguity we
+// don't flag.
 function isCancelledWorkAt(
   transcript: TranscriptRow[],
   i: number,
-  awaitingReply: boolean,
-  pendingApproval: PendingApproval | null,
+  turn: SessionView['turn'],
 ): boolean {
   if (i !== transcript.length - 1) return false;
-  if (awaitingReply || pendingApproval) return false;
+  if (turn === null || turn.active) return false;
   const row = transcript[i];
-  if (row.kind !== 'work' || row.workActive) return false;
-  return true;
+  return row.kind === 'work' && !row.workActive;
 }
 
 function CancelledTurnIndicator() {

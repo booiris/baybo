@@ -434,6 +434,37 @@ async fn run_inbound_loop(
                                 tracing::warn!(error = %e, %session_id, "failed to load tasks for snapshot");
                             }
                         }
+                        // Tell this connection whether a turn is in flight
+                        // right now (and since when), derived from the job
+                        // store. A new tab / reconnect missed the live
+                        // `TurnState` broadcasts, and without a definitive
+                        // answer it can neither run the in-flight work
+                        // block's elapsed timer nor distinguish "agent
+                        // still working" from "turn died without a reply".
+                        // Always sent — `active: false` is load-bearing
+                        // (it's what authorises the Cancelled indicator).
+                        match state
+                            .job_lifecycle
+                            .active_turn_started_at(&session_id)
+                            .await
+                        {
+                            Ok(started_at) => {
+                                if let Err(e) = sidecar
+                                    .send_frame(Frame::TurnState {
+                                        session_id: session_id.clone(),
+                                        user_id: String::new(),
+                                        active: started_at.is_some(),
+                                        started_at,
+                                    })
+                                    .await
+                                {
+                                    tracing::warn!(error = %e, %session_id, "failed to send TurnState snapshot");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, %session_id, "failed to derive TurnState snapshot");
+                            }
+                        }
                     }
                     Frame::Unsubscribe { session_id } => {
                         let Some(sub) = sidecar.channel.as_subscribed() else {

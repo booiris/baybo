@@ -884,6 +884,14 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                     trace_event_stream.clone(),
                 ));
 
+                let runner_ctx = aura_agent::runner::ActorRunnerContext {
+                    session_id: session.id.clone(),
+                    user_id: session.user.id.clone(),
+                    channel: session.channel.clone(),
+                    response_tx: response_tx.clone(),
+                    job_lifecycle: Arc::clone(&job_lifecycle),
+                    trace_store: trace_store.clone(),
+                };
                 let actor = AgentActor::from_parts(
                     aura_agent::state::DurableActorState::new(session),
                     aura_agent::state::VolatileResources {
@@ -898,9 +906,7 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                 );
                 let (sender, mailbox) =
                     aura_agent::mailbox::channel(aura_agent::mailbox::DEFAULT_CAPACITY);
-                tokio::spawn(async move {
-                    actor.run(mailbox).await;
-                });
+                aura_agent::runner::spawn_actor(actor, mailbox, runner_ctx);
                 sender
             },
         )
@@ -922,6 +928,18 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
     aura_agent::supervisor::spawn_idle_reaper(
         supervisor.clone(),
         Arc::clone(&graph.session_manager),
+        graph.actor_parent_token.clone(),
+    );
+
+    // Turn-state projector: the single producer of the web chat's live
+    // turn-activity signal. It subscribes to job lifecycle start + terminal
+    // events and, on each transition, broadcasts the session's current
+    // `TurnState` recomputed from the job store. See
+    // `spawn_turn_state_projector`.
+    aura_agent::supervisor::spawn_turn_state_projector(
+        Arc::clone(&graph.job_lifecycle),
+        Arc::clone(&graph.session_manager),
+        supervisor.response_tx().clone(),
         graph.actor_parent_token.clone(),
     );
 

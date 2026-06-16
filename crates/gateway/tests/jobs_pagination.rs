@@ -9,7 +9,7 @@ use serde_json::Value;
 use tower::ServiceExt;
 
 use aura_gateway::test_support::{TEST_ADMIN_TOKEN, build_test_deps};
-use aura_job::JobInput;
+use aura_job::{JobInput, JobShape};
 use aura_model::{ContentBlock, SessionId, TriggerKind};
 
 fn auth(req: Request<Body>) -> Request<Body> {
@@ -39,9 +39,13 @@ async fn build_router_with_seeded_jobs(sessions: &[(&str, TriggerKind, usize)]) 
                     initial_prompt: vec![ContentBlock::Text("task".into())],
                 },
             };
+            let shape = match trigger {
+                TriggerKind::System => JobShape::Maintenance,
+                _ => JobShape::Turn,
+            };
             tg.deps
                 .job_lifecycle
-                .start_job(SessionId::from(*sid), *trigger, input, None)
+                .start_job(SessionId::from(*sid), *trigger, shape, input, None)
                 .await
                 .expect("seed job");
         }

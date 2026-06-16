@@ -96,8 +96,7 @@ pub enum TriggerSource {
 }
 
 impl TriggerSource {
-    /// Kind discriminator (matches `JobKind` 1:1 — see invariant in
-    /// `aura-job`).
+    /// Kind discriminator for this trigger.
     pub fn kind(&self) -> TriggerKind {
         match self {
             TriggerSource::User => TriggerKind::User,
@@ -106,14 +105,11 @@ impl TriggerSource {
     }
 }
 
-/// Discriminator for `TriggerSource`. Used to enforce the invariant
-/// `session.trigger.kind() == job.kind()` at job creation time without
-/// having to clone the trigger payload.
-///
-/// `Spawned` has no `TriggerSource` counterpart (a spawned session
-/// inherits its trigger), but spawned **jobs** do — they carry
-/// `JobKind::Spawned` while still belonging to a session whose
-/// `TriggerSource` reflects the root.
+/// Discriminator for `TriggerSource`, also recorded on each `Job` as its
+/// `origin` (the owning session's root trigger). `Spawned` has no
+/// `TriggerSource` counterpart — a spawned session inherits its parent's
+/// trigger — but it is a valid job origin, since a subagent session's
+/// root is itself `Spawned`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerKind {

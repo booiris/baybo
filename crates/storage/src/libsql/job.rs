@@ -219,12 +219,14 @@ impl LibsqlJobStore {
 #[allow(unused_must_use)] // tests build state machines via direct calls; the JobTransition audit record isn't the assertion target
 mod tests {
     use super::*;
-    use aura_job::{Job, JobInput, JobStatus};
-    use aura_model::ContentBlock;
+    use aura_job::{Job, JobInput, JobShape, JobStatus};
+    use aura_model::{ContentBlock, TriggerKind};
 
     fn test_job() -> Job {
         Job::new(
             SessionId::from("sess-1"),
+            TriggerKind::User,
+            JobShape::Turn,
             JobInput::UserChat {
                 content: vec![ContentBlock::Text("hi".into())],
             },
@@ -328,6 +330,8 @@ mod tests {
         let mk = |s: &SessionId| {
             Job::new(
                 s.clone(),
+                TriggerKind::User,
+                JobShape::Turn,
                 JobInput::UserChat {
                     content: vec![ContentBlock::Text("hi".into())],
                 },

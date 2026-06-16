@@ -78,7 +78,162 @@ async fn clean_conversation_streams_text_then_final_message() {
         "no minting should happen on clean text"
     );
 
+    // The turn's close edge is always projected from the job store: the
+    // final TurnState a watcher sees is `active: false`. (The open edge is
+    // also projected, but this stub turn finishes sub-millisecond — faster
+    // than the projector can recompute its `Started` event — so the live
+    // `true` is legitimately coalesced away here; the deterministic
+    // `turn_state_projector_brackets_a_slow_turn` test below covers both
+    // edges with a turn held open. Either way the join-time Subscribe
+    // snapshot, not this live edge, is what a late tab relies on.)
+    let last_turn_state = outs.iter().rev().find_map(|o| match &o.event {
+        AgentEvent::TurnState { active, started_at } => Some((*active, started_at.is_some())),
+        _ => None,
+    });
+    assert_eq!(
+        last_turn_state,
+        Some((false, false)),
+        "the turn must close with a projected inactive TurnState, got {last_turn_state:?}"
+    );
+
     harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_user_turn_emits_terminal_state_and_error_notice() {
+    // A user turn whose LLM call fails terminally (non-retriable) must still
+    // close the turn for watchers: a `TurnState { active: false }` AND an
+    // error `Notice`, so the web work block collapses and the user sees why
+    // instead of an indicator spinning forever.
+    let mut harness = AgentTestHarness::builder().build();
+    harness
+        .stub_llm
+        .push_stream_results(vec![Err(LlmError::Config("bad api key".into()))]);
+
+    harness.send_text("hello").await.unwrap();
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+
+    let closed_inactive = outs
+        .iter()
+        .any(|o| matches!(o.event, AgentEvent::TurnState { active: false, .. }));
+    assert!(
+        closed_inactive,
+        "a failed turn must still broadcast TurnState inactive, got {outs:?}"
+    );
+    let error_notice = outs.iter().any(|o| {
+        matches!(
+            &o.event,
+            AgentEvent::Notice {
+                level: aura_channels::NoticeLevel::Error,
+                ..
+            }
+        )
+    });
+    assert!(
+        error_notice,
+        "a failed user turn must surface an error notice, got {outs:?}"
+    );
+    assert!(
+        !outs
+            .iter()
+            .any(|o| matches!(o.event, AgentEvent::Message(_))),
+        "a failed turn produces no final Message"
+    );
+
+    harness.shutdown().await;
+}
+
+/// Pull the next `TurnState` `(active, started_at.is_some())` the projector
+/// broadcasts, ignoring any other output, within a generous timeout.
+async fn next_turn_state(rx: &mut tokio::sync::mpsc::Receiver<AgentOutput>) -> (bool, bool) {
+    loop {
+        let out = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("projector broadcast within timeout")
+            .expect("projector channel open");
+        if let AgentEvent::TurnState { active, started_at } = out.event {
+            return (active, started_at.is_some());
+        }
+    }
+}
+
+/// The turn-state projector brackets a turn held open across the `Started`
+/// recompute: driving `JobLifecycle` directly (no actor) keeps the job
+/// `InProgress` until we complete it, so both edges are observed
+/// deterministically — unlike the instant stub turn in
+/// `clean_conversation_streams_text_then_final_message`, which finishes
+/// before the projector can recompute its start edge.
+#[tokio::test]
+async fn turn_state_projector_brackets_a_slow_turn() {
+    use aura_job::JobInput;
+    use aura_job::test_support::MemoryJobStore;
+    use aura_job::{JobLifecycle, JobOutput};
+    use aura_model::{ContentBlock, TriggerKind};
+
+    let session = SessionBuilder::new().build();
+    let job_lifecycle = Arc::new(JobLifecycle::new(
+        Arc::new(MemoryJobStore::new()) as Arc<dyn aura_store::JobStore>
+    ));
+    let session_store = {
+        let store = Arc::new(aura_session::test_support::MemorySessionStore::new());
+        store.seed_session(&session);
+        store as Arc<dyn aura_session::SessionStore>
+    };
+    let summary_store = Arc::new(aura_session::test_support::MemorySessionSummaryStore::new())
+        as Arc<dyn aura_session::SessionSummaryStore>;
+    let sessions = Arc::new(aura_agent::SessionManager::new(
+        session_store,
+        summary_store,
+    ));
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentOutput>(16);
+    let token = tokio_util::sync::CancellationToken::new();
+    aura_agent::supervisor::spawn_turn_state_projector(
+        Arc::clone(&job_lifecycle),
+        sessions,
+        tx,
+        token.clone(),
+    );
+
+    // Open a turn-kind job and move it InProgress — but NOT terminal — so
+    // the projector's `Started` recompute sees a live turn.
+    let job = job_lifecycle
+        .start_job(
+            session.id.clone(),
+            TriggerKind::User,
+            aura_job::JobShape::Turn,
+            JobInput::UserChat { content: vec![] },
+            None,
+        )
+        .await
+        .expect("start_job");
+    job_lifecycle
+        .start(&job.id)
+        .await
+        .expect("start → InProgress");
+    assert_eq!(
+        next_turn_state(&mut rx).await,
+        (true, true),
+        "start edge: active with the job's start instant"
+    );
+
+    // Complete it → terminal → projected close edge.
+    job_lifecycle
+        .complete(
+            &job.id,
+            JobOutput::Message {
+                content: vec![ContentBlock::Text("done".into())],
+            },
+        )
+        .await
+        .expect("complete");
+    assert_eq!(
+        next_turn_state(&mut rx).await,
+        (false, false),
+        "close edge: inactive, no start instant"
+    );
+
+    token.cancel();
 }
 
 #[tokio::test]
