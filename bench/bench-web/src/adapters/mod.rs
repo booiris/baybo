@@ -175,6 +175,12 @@ fn info_from(spec: &BenchSpec, runs: &[RunSummary], standing: &[StandingArm]) ->
     }
 }
 
+/// SWE diagnostic arms hidden from the viewer: `oracle` (gold-patch ceiling)
+/// and `noop` (empty-patch floor) validate the grader pipeline but aren't real
+/// measurements. Dropping them leaves only `agent`, matching the single-result
+/// view of the other benches.
+const SWE_HIDDEN_ARMS: &[&str] = &["oracle", "noop"];
+
 /// Parse every (non-symlink) results file for a bench. Files that fail
 /// to parse are skipped with a warning rather than failing the whole
 /// query.
@@ -185,7 +191,17 @@ fn parse_all(root: &Path, spec: &'static BenchSpec) -> Vec<ParsedRun> {
             continue;
         };
         match parse_file(root, spec, &path, &run_key) {
-            Ok(p) => out.push(p),
+            Ok(p) => {
+                if spec.id == "swe"
+                    && p.summary
+                        .arm
+                        .as_deref()
+                        .is_some_and(|a| SWE_HIDDEN_ARMS.contains(&a))
+                {
+                    continue;
+                }
+                out.push(p);
+            }
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "skipping unparseable results file")
             }
