@@ -11,6 +11,7 @@ import {
 } from 'react-icons/ri';
 import type { ChatMessage, ContentBlock, Role, SecretKind } from '../../types/trace';
 import { renderWithSanitizeChips } from './SanitizeChip';
+import { optimizeToolValue, stripToolOutputWrapper, useOptimizedToolIo } from '../../lib/toolIo';
 
 const ROLE_META: Record<
   Role,
@@ -102,9 +103,11 @@ function ContentBlockView({
     'Audio' in block ||
     'File' in block;
   // …except a failed tool result, which opens by default + is flagged red
-  // so errors are visible in the transcript without a click.
+  // so errors are visible in the transcript without a click, and thinking,
+  // which reads as part of the assistant's turn and so shows expanded.
   const isToolError = 'ToolResult' in block && isToolResultError(block.ToolResult.content);
-  const [open, setOpen] = useState(!isStructured || isToolError);
+  const [open, setOpen] = useState(!isStructured || isToolError || 'Thinking' in block);
+  const optimized = useOptimizedToolIo();
 
   if ('Text' in block) {
     return <ClippedText text={block.Text} kindHint={kindHint} />;
@@ -115,20 +118,29 @@ function ContentBlockView({
   if ('ToolUse' in block) {
     label = `tool_use → ${block.ToolUse.name}`;
     body = (
-      <pre className="whitespace-pre-wrap break-all font-mono text-[0.8rem] text-ink-soft bg-gray-50 border-2 border-black rounded-md p-2">
-        {JSON.stringify(block.ToolUse.input, null, 2)}
+      <pre
+        className={`whitespace-pre-wrap font-mono text-[0.8rem] text-ink-soft bg-gray-50 border-2 border-black rounded-md p-2 ${
+          optimized ? 'break-words' : 'break-all'
+        }`}
+      >
+        {optimized
+          ? optimizeToolValue(block.ToolUse.input)
+          : JSON.stringify(block.ToolUse.input, null, 2)}
       </pre>
     );
   } else if ('ToolResult' in block) {
     const name = toolNames.get(block.ToolResult.tool_use_id) ?? block.ToolResult.tool_use_id;
     label = isToolError ? `tool_result ✕ ${name} (error)` : `tool_result ← ${name}`;
+    const content = optimized
+      ? stripToolOutputWrapper(block.ToolResult.content)
+      : block.ToolResult.content;
     body = (
       <pre
         className={`whitespace-pre-wrap break-words font-mono text-[0.8rem] bg-gray-50 border-2 border-black rounded-md p-2 ${
           isToolError ? 'text-err' : 'text-ink'
         }`}
       >
-        {renderWithSanitizeChips(block.ToolResult.content, kindHint)}
+        {renderWithSanitizeChips(content, kindHint)}
       </pre>
     );
   } else if ('Thinking' in block) {
