@@ -110,9 +110,7 @@ impl Channel {
         };
         match &out.event {
             // A new turn opens a fresh buffer.
-            AgentEvent::TurnState {
-                active: true, ..
-            } => {
+            AgentEvent::TurnState { active: true, .. } => {
                 self.in_flight.insert(session_id.clone(), Vec::new());
             }
             // The turn ended — its content is now durable (a reload restores
@@ -742,8 +740,15 @@ mod tests {
     fn multiplexed_channel_does_not_buffer() {
         // Only Subscribed (web) channels buffer; a telegram-shape channel must
         // never accumulate one.
-        let channel = Channel::new(ChannelType::from("telegram"), ChannelKind::Multiplexed, None);
+        let channel = Channel::new(
+            ChannelType::from("telegram"),
+            ChannelKind::Multiplexed,
+            None,
+        );
         channel.dispatch_event(agent_evt("s", AgentEvent::Reasoning("x".into())));
-        assert!(channel.in_flight.is_empty(), "multiplexed channels skip the buffer");
+        assert!(
+            channel.in_flight.is_empty(),
+            "multiplexed channels skip the buffer"
+        );
     }
 }

@@ -141,7 +141,8 @@ mod tests {
     async fn wait_until_idle_returns_immediately_when_unregistered() {
         let r = JobCancellationRegistry::new();
         // Never registered → returns at once even with a generous budget.
-        r.wait_until_idle(&JobId::new(), Duration::from_secs(5)).await;
+        r.wait_until_idle(&JobId::new(), Duration::from_secs(5))
+            .await;
     }
 
     #[tokio::test]
@@ -161,7 +162,10 @@ mod tests {
 
         drop(guard); // turn settled → deregistered
         tokio::time::sleep(Duration::from_millis(30)).await; // > IDLE_POLL_INTERVAL
-        assert!(waiter.is_finished(), "wait must resolve once the guard drops");
+        assert!(
+            waiter.is_finished(),
+            "wait must resolve once the guard drops"
+        );
         waiter.await.expect("waiter task");
     }
 
@@ -172,6 +176,9 @@ mod tests {
         r.register(job_id, CancellationToken::new()); // never deregistered
         // Bounded: returns despite the entry never clearing (best-effort).
         r.wait_until_idle(&job_id, Duration::from_millis(40)).await;
-        assert!(r.is_registered(&job_id), "entry still present; we just stopped waiting");
+        assert!(
+            r.is_registered(&job_id),
+            "entry still present; we just stopped waiting"
+        );
     }
 }

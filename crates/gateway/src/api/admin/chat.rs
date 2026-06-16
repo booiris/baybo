@@ -30,10 +30,10 @@
 use std::collections::HashMap;
 
 use aura_agent::actor::AgentMessage;
+use aura_channels::wire::{SessionPatch, SlashCommandSpec};
 use aura_channels::{
     AgentEvent, STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, SessionEvent, ToolStatus,
 };
-use aura_channels::wire::{SessionPatch, SlashCommandSpec};
 use aura_model::{
     ChannelType, ChatMessage, ContentBlock, ControlEvent, ControlEventKind, LlmEntryName,
     MessageSource, Role, Session, SessionId, ThinkingContent, TriggerSource, User,
@@ -1831,7 +1831,10 @@ mod tests {
         // is when the work ended, not the last persisted row (which would
         // report a turn stopped mid-LLM-call as `Worked 0s`).
         assert!(matches!(items[2].kind, TranscriptItemKind::Work));
-        assert!(items[2].cancelled, "a /stop'd turn's work block is marked cancelled");
+        assert!(
+            items[2].cancelled,
+            "a /stop'd turn's work block is marked cancelled"
+        );
         assert_eq!(items[2].work_started_at, Some(ts(2)));
         assert_eq!(
             items[2].work_ended_at,
@@ -1887,8 +1890,15 @@ mod tests {
 
         let work = &items[1];
         assert!(matches!(work.kind, TranscriptItemKind::Work));
-        assert!(work.cancelled, "a /stop'd partial turn's work block is cancelled");
-        assert_eq!(work.work_ended_at, Some(ts(5)), "bounded at the stop instant");
+        assert!(
+            work.cancelled,
+            "a /stop'd partial turn's work block is cancelled"
+        );
+        assert_eq!(
+            work.work_ended_at,
+            Some(ts(5)),
+            "bounded at the stop instant"
+        );
         // Both the reasoning and the partial answer text fold into the block,
         // instead of the text spinning off as a finished-looking answer bubble.
         assert_eq!(work.steps.len(), 2, "reasoning + folded partial text");
@@ -1979,7 +1989,11 @@ mod tests {
             .iter()
             .find(|i| matches!(i.kind, TranscriptItemKind::Work))
             .expect("work block");
-        assert_eq!(work.work_started_at, Some(ts(2)), "no active turn → message-time start");
+        assert_eq!(
+            work.work_started_at,
+            Some(ts(2)),
+            "no active turn → message-time start"
+        );
     }
 
     #[test]
@@ -2005,7 +2019,12 @@ mod tests {
             "in-flight block starts at the live TurnState instant"
         );
         assert!(!work.cancelled, "a still-streaming turn is not cancelled");
-        assert_eq!(work.steps.len(), 2, "reasoning + tool folded in: {:?}", work.steps);
+        assert_eq!(
+            work.steps.len(),
+            2,
+            "reasoning + tool folded in: {:?}",
+            work.steps
+        );
         assert!(matches!(work.steps[0].kind, WorkStepKind::Reasoning));
         assert_eq!(work.steps[0].text, "weighing the options");
         assert!(matches!(work.steps[1].kind, WorkStepKind::Tool));
