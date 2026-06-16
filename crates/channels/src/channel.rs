@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use crate::connection::{Connection, ConnectionId, SendOutcome};
 use crate::error::ConnectionNotFoundError;
 use crate::kind::ChannelKind;
-use crate::types::{AgentOutput, IncomingMessage, SessionEvent};
+use crate::types::{AgentEvent, AgentOutput, IncomingMessage, SessionEvent};
 use crate::wire::{ActivityKind, Frame, SessionPatch};
 
 /// Side-effect callback invoked at the top of [`Channel::dispatch_event`],
@@ -61,7 +61,23 @@ pub struct Channel {
     /// enough to clone the `Arc` — the observer body runs without the
     /// lock so it can re-enter `Channel::broadcast_frame` safely.
     dispatch_observer: Mutex<Option<DispatchObserver>>,
+    /// Per-session replay buffer of the *in-flight* turn's progress events
+    /// (reasoning / answer / tool steps), for `Subscribed` channels only. The
+    /// live stream is otherwise ephemeral until the turn's assistant message
+    /// persists, so a tab that subscribes mid-turn would miss everything
+    /// streamed before it joined. [`SubscribedView::subscribe`] replays this
+    /// to a fresh subscriber; the buffer is reset when a new turn starts and
+    /// dropped when the turn ends (history then serves a reload). Consecutive
+    /// answer/reasoning deltas coalesce in place so memory tracks the turn's
+    /// text size, not its frame count.
+    in_flight: DashMap<SessionId, Vec<SessionEvent>>,
 }
+
+/// Cap on distinct buffered entries per session (tool steps etc.; coalesced
+/// answer/reasoning count as one each). A turn with more discrete steps than
+/// this stops buffering the overflow — a late joiner then catches up on the
+/// rest from the live stream once subscribed.
+const MAX_INFLIGHT_ENTRIES: usize = 2048;
 
 impl Channel {
     pub fn new(
@@ -76,11 +92,73 @@ impl Channel {
             connections: DashMap::new(),
             subscriptions: DashMap::new(),
             dispatch_observer: Mutex::new(None),
+            in_flight: DashMap::new(),
+        }
+    }
+
+    /// Update the in-flight replay buffer for a `Subscribed` channel as an
+    /// event fans out. Runs regardless of whether the session has subscribers
+    /// yet, so a tab that opens mid-turn as the *first* subscriber still
+    /// catches up. A turn boundary resets/clears the buffer; consecutive
+    /// answer/reasoning deltas coalesce into the trailing entry.
+    fn note_in_flight(&self, event: &SessionEvent, session_id: &SessionId) {
+        if self.kind != ChannelKind::Subscribed {
+            return;
+        }
+        let SessionEvent::Agent(out) = event else {
+            return;
+        };
+        match &out.event {
+            // A new turn opens a fresh buffer.
+            AgentEvent::TurnState { active: true, .. } => {
+                self.in_flight.insert(session_id.clone(), Vec::new());
+            }
+            // The turn ended — its content is now durable (a reload restores
+            // it from history), so drop the live buffer.
+            AgentEvent::TurnState { active: false, .. } | AgentEvent::Message(_) => {
+                self.in_flight.remove(session_id);
+            }
+            AgentEvent::AnswerDelta(_)
+            | AgentEvent::Reasoning(_)
+            | AgentEvent::ToolStarted { .. }
+            | AgentEvent::ToolCompleted { .. }
+            | AgentEvent::Status(_)
+            | AgentEvent::Attachment(_) => {
+                let mut buf = self.in_flight.entry(session_id.clone()).or_default();
+                // Coalesce a run of same-kind text deltas into the trailing
+                // entry so the buffer is bounded by text size, not delta count.
+                if let Some(SessionEvent::Agent(last)) = buf.last_mut() {
+                    match (&mut last.event, &out.event) {
+                        (AgentEvent::AnswerDelta(acc), AgentEvent::AnswerDelta(more))
+                        | (AgentEvent::Reasoning(acc), AgentEvent::Reasoning(more)) => {
+                            acc.push_str(more);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                if buf.len() < MAX_INFLIGHT_ENTRIES {
+                    buf.push(event.clone());
+                }
+            }
+            _ => {}
         }
     }
 
     pub fn channel_type(&self) -> &ChannelType {
         &self.channel_type
+    }
+
+    /// Snapshot the in-flight turn's buffered progress events for `session_id`
+    /// (empty if no turn is streaming, or on a non-`Subscribed` channel). The
+    /// chat-history endpoint folds these into the reconstructed transcript so a
+    /// tab that loads mid-turn shows the reasoning / tool steps streamed before
+    /// it joined — content the live stream hasn't persisted yet.
+    pub fn in_flight_events(&self, session_id: &SessionId) -> Vec<SessionEvent> {
+        self.in_flight
+            .get(session_id)
+            .map(|b| b.clone())
+            .unwrap_or_default()
     }
 
     pub fn kind(&self) -> ChannelKind {
@@ -272,6 +350,10 @@ impl Channel {
             obs(&event, view);
         }
         let session_id = event.session_id().clone();
+        // Keep the in-flight replay buffer current — before the fan-out, and
+        // before the no-subscribers early-return below, so a tab that opens
+        // mid-turn as the first subscriber still catches up.
+        self.note_in_flight(&event, &session_id);
         let mut to_drop = Vec::new();
         let mut to_reset = Vec::new();
 
@@ -576,6 +658,97 @@ mod tests {
             sink.count(),
             1,
             "Subscribed channels must echo inbound to every subscriber of the session",
+        );
+    }
+
+    fn agent_evt(session: &str, event: AgentEvent) -> SessionEvent {
+        SessionEvent::Agent(AgentOutput {
+            session_id: SessionId::from(session),
+            user_id: "u".into(),
+            channel: ChannelType::http(),
+            event,
+        })
+    }
+
+    #[test]
+    fn in_flight_buffer_snapshots_the_streaming_turn() {
+        let channel = Channel::new(ChannelType::http(), ChannelKind::Subscribed, None);
+        let sid = "sess-mid";
+        // A turn streams reasoning (two deltas) + a tool — with NO subscriber yet.
+        channel.dispatch_event(agent_evt(
+            sid,
+            AgentEvent::TurnState {
+                active: true,
+                started_at: Some(Utc::now()),
+            },
+        ));
+        channel.dispatch_event(agent_evt(sid, AgentEvent::Reasoning("weigh".into())));
+        channel.dispatch_event(agent_evt(sid, AgentEvent::Reasoning("ing it".into())));
+        channel.dispatch_event(agent_evt(
+            sid,
+            AgentEvent::ToolStarted {
+                call_id: "c1".into(),
+                tool: "edit".into(),
+                label: None,
+            },
+        ));
+
+        // The history endpoint reads this to fold the in-flight thinking into
+        // a reloading tab's transcript.
+        let got = channel.in_flight_events(&SessionId::from(sid));
+        // Coalesced reasoning ("weighing it") + the tool step = 2 entries.
+        assert_eq!(got.len(), 2, "got {got:?}");
+        let (SessionEvent::Agent(a), SessionEvent::Agent(b)) = (&got[0], &got[1]) else {
+            panic!("unexpected snapshot shape: {got:?}");
+        };
+        assert!(
+            matches!(&a.event, AgentEvent::Reasoning(r) if r == "weighing it"),
+            "consecutive reasoning deltas coalesce: {:?}",
+            a.event
+        );
+        assert!(matches!(&b.event, AgentEvent::ToolStarted { call_id, .. } if call_id == "c1"));
+    }
+
+    #[test]
+    fn in_flight_buffer_cleared_at_turn_end() {
+        let channel = Channel::new(ChannelType::http(), ChannelKind::Subscribed, None);
+        let sid = "sess-done";
+        channel.dispatch_event(agent_evt(
+            sid,
+            AgentEvent::TurnState {
+                active: true,
+                started_at: Some(Utc::now()),
+            },
+        ));
+        channel.dispatch_event(agent_evt(sid, AgentEvent::Reasoning("thinking".into())));
+        channel.dispatch_event(agent_evt(
+            sid,
+            AgentEvent::TurnState {
+                active: false,
+                started_at: None,
+            },
+        ));
+
+        // A tab loading AFTER the turn ended reads nothing — history serves it.
+        assert!(
+            channel.in_flight_events(&SessionId::from(sid)).is_empty(),
+            "buffer must clear at turn end",
+        );
+    }
+
+    #[test]
+    fn multiplexed_channel_does_not_buffer() {
+        // Only Subscribed (web) channels buffer; a telegram-shape channel must
+        // never accumulate one.
+        let channel = Channel::new(
+            ChannelType::from("telegram"),
+            ChannelKind::Multiplexed,
+            None,
+        );
+        channel.dispatch_event(agent_evt("s", AgentEvent::Reasoning("x".into())));
+        assert!(
+            channel.in_flight.is_empty(),
+            "multiplexed channels skip the buffer"
         );
     }
 }

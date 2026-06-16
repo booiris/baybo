@@ -197,6 +197,15 @@ impl JobLifecycle {
             .await
     }
 
+    /// Wait (bounded by `timeout`) until `job_id`'s in-flight run has fully
+    /// unwound — its `with_job` scope exited, so any partial row the cancelled
+    /// turn persists is already durable. `/stop` calls this after `cancel` so
+    /// its control events anchor after the cancelled turn's last row instead
+    /// of racing it. No-op once the run has deregistered.
+    pub async fn wait_until_idle(&self, job_id: &JobId, timeout: std::time::Duration) {
+        self.cancellation.wait_until_idle(job_id, timeout).await;
+    }
+
     /// Boot-time recovery cancel. Same state-machine semantics as
     /// [`Self::cancel`], but `ended_at` is set to the supplied `at`
     /// (typically `max(child_step.ended_at)`) instead of `Utc::now()` —

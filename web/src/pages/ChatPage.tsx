@@ -43,7 +43,7 @@ import { TaskChecklist } from '../components/chat/TaskChecklist';
  *  start created. `prose` is mid-turn answer text the model emitted
  *  before its final reply — folded in here rather than left as its own
  *  bubble. */
-interface WorkStep {
+export interface WorkStep {
   key: string;
   kind: 'reasoning' | 'tool' | 'status' | 'prose';
   text?: string;
@@ -54,7 +54,7 @@ interface WorkStep {
   toolSummary?: string;
 }
 
-interface TranscriptRow {
+export interface TranscriptRow {
   /** Stable key for React. Synthetic; not part of any server schema. */
   key: string;
   role: 'user' | 'assistant' | 'system';
@@ -101,6 +101,9 @@ interface TranscriptRow {
    *  timer and the collapsed `Worked Xs` label. */
   workStartedAt?: number;
   workEndedAt?: number;
+  /** True when this block's turn was cancelled (`/stop`) rather than run to a
+   *  normal reply — the collapsed summary reads "Cancelled · Worked Xs". */
+  workCancelled?: boolean;
 }
 
 interface PendingApproval {
@@ -160,7 +163,7 @@ interface ModelOption {
  * background session reaches the right bucket without racing the
  * active view.
  */
-interface SessionView {
+export interface SessionView {
   transcript: TranscriptRow[];
   pendingApproval: PendingApproval | null;
   historyLoaded: boolean;
@@ -206,7 +209,7 @@ interface SessionView {
   turn: { active: boolean; startedAt: number | null } | null;
 }
 
-const EMPTY_VIEW: SessionView = {
+export const EMPTY_VIEW: SessionView = {
   transcript: [],
   pendingApproval: null,
   historyLoaded: false,
@@ -329,6 +332,13 @@ export function ChatPage() {
   // below. Lives in a ref so the WS onFrame closure can read/write it
   // without forcing the effect that constructs the WS to re-run.
   const recencyRef = useRef<Map<string, number>>(new Map());
+
+  // Sessions the user just `/stop`'d locally. While a session is in here, a
+  // late `answer_delta` (one the server had already put on the wire before it
+  // saw the stop) is dropped instead of spilling a fresh bubble below the
+  // now-collapsed work block. Cleared when a new turn starts (`turn_state`
+  // active) or the user sends a non-stop message.
+  const stoppedSessionsRef = useRef<Set<string>>(new Set());
 
   // Streaming pacer: decouples the visual reveal cadence from the wire
   // cadence. Servers tend to flush Delta frames in uneven bursts (a few
@@ -674,25 +684,45 @@ export function ChatPage() {
           default:
             break;
         }
+        // A fresh `turn_state{active}` means a new turn — the prior `/stop`
+        // (if any) is over, so stop dropping this session's deltas.
+        if (frame.kind === 'turn_state' && frame.active) {
+          stoppedSessionsRef.current.delete(frame.session_id);
+        }
         // Route delta frames through the pacer instead of straight to
         // setViews — the pacer's rAF loop owns the bubble's text while
         // streaming is in flight. routeInboundFrame's delta case stays
         // as a defensive fallback but should not fire from this path.
         if (frame.kind === 'answer_delta') {
+          // Drop a delta that raced in after a local `/stop` — the partial
+          // answer is already settled inside the collapsed work block; a new
+          // bubble here is the stray "message after /stop".
+          if (stoppedSessionsRef.current.has(frame.session_id)) return;
           enqueueDelta(frame.session_id, frame.text);
           return;
         }
-        // Progress frames (reasoning / tool lifecycle / status) interrupt
-        // the answer stream. Settle the paced answer bubble first — its
-        // buffered text was mid-turn prose, so `routeInboundFrame` folds
-        // it into the turn's work block ahead of this progress step.
+        // Progress frames (reasoning / tool lifecycle / status) and a
+        // terminal `notice` (e.g. the `/stop` confirmation) interrupt the
+        // answer stream. Settle the paced answer bubble FIRST — its buffered
+        // text is mid-turn prose, so it folds into the work block ahead of
+        // this frame. Crucial for the notice: otherwise the pacer's rAF keeps
+        // ticking and spills the buffered answer as a bubble *after* the
+        // notice (the observed "reply after the stop notice" on a reloaded tab).
         if (
           frame.kind === 'reasoning' ||
           frame.kind === 'tool_started' ||
           frame.kind === 'tool_completed' ||
-          frame.kind === 'status'
+          frame.kind === 'status' ||
+          frame.kind === 'notice'
         ) {
           flushPacerKeepStreaming(frame.session_id);
+        }
+        // A broadcast `/stop` cancellation notice stops THIS tab's stream too
+        // (the observer never ran the local `/stop`): settle the buffer above,
+        // then drop any delta that races in afterwards so it can't spill a
+        // bubble below the now-closed work block.
+        if (frame.kind === 'notice' && !frame.transient && isStopCancellationNotice(frame.text)) {
+          stoppedSessionsRef.current.add(frame.session_id);
         }
         // An assistant message frame is the authoritative final text
         // for the stream — drop any pacer state so its in-flight rAF
@@ -802,27 +832,25 @@ export function ChatPage() {
           if (data.newest_ordinal != null) {
             wsRef.current?.recordOrdinal(sessionId, data.newest_ordinal);
           }
-          setViews((prev) => {
-            // The reload replaces the transcript wholesale — including any
-            // live work block frames built up while the fetch was in
-            // flight (their un-persisted steps can't be merged reliably,
-            // so they're sacrificed). Re-apply the connection's current
-            // TurnState so an in-flight turn's trailing reconstructed
-            // block comes back *active* with the true start time instead
-            // of collapsing to `Worked 0s` until the next frame.
-            const turn = (prev[sessionId] ?? EMPTY_VIEW).turn;
-            const transcript = turn
-              ? applyTurnState(rows, turn.active, turn.startedAt)
-              : rows;
-            return mergeView(prev, sessionId, {
-              transcript,
+          setViews((prev) =>
+            // The reload replaces the transcript wholesale. Do NOT fold the
+            // cached `turn` back in here: the freshly-fetched REST history
+            // is the server's authoritative state (a finished/cancelled
+            // turn comes back collapsed), and the WS (re)subscribe that
+            // accompanies a reload always delivers a fresh `TurnState`
+            // snapshot which re-opens a genuinely in-flight turn's block
+            // (matched by start). Folding a possibly-stale cached `turn`
+            // over the reload could resurrect a finished turn as a phantom
+            // "Working" box, so the authoritative snapshot drives it.
+            mergeView(prev, sessionId, {
+              transcript: rows,
               historyLoaded: true,
               historyLoading: false,
               oldestOrdinal,
               hasMore: data.has_more,
               model: data.last_llm ?? null,
-            });
-          });
+            }),
+          );
         } else {
           setViews((prev) =>
             mergeView(prev, sessionId, { historyLoaded: true, historyLoading: false }),
@@ -1027,6 +1055,24 @@ export function ChatPage() {
       // that same id replaces this row in place rather than appending
       // a duplicate). Generated once here so both sides agree.
       const clientMsgId = crypto.randomUUID();
+      // `/stop` is the one command we can reflect without the backend: the
+      // user's own action means "cancel", so collapse the live work block to
+      // "Cancelled" and end the turn locally right away. Don't show the
+      // awaiting-reply spinner (we're stopping, not starting a turn); the
+      // server's TurnState/notice frames then reconcile idempotently.
+      const stopping = isStopCommand(trimmed);
+      // Settle any buffered answer text INTO the still-open work block before
+      // we collapse it. Otherwise the pacer's leftover buffer flushes a beat
+      // later against the now-closed block and pops out as a stray bubble
+      // ("a message after /stop") — the partial answer belongs inside the
+      // "Cancelled" block, not below it. Mark the session stopped so a delta
+      // that raced in just after is dropped rather than spilling a bubble.
+      if (stopping) {
+        flushPacerKeepStreaming(sessionId);
+        stoppedSessionsRef.current.add(sessionId);
+      } else {
+        stoppedSessionsRef.current.delete(sessionId);
+      }
       setViews((prev) => {
         const view = prev[sessionId] ?? EMPTY_VIEW;
         return {
@@ -1034,7 +1080,7 @@ export function ChatPage() {
           [sessionId]: {
             ...view,
             transcript: [
-              ...closeActiveWork(view.transcript),
+              ...closeActiveWork(view.transcript, stopping),
               {
                 key: `pending-${clientMsgId}`,
                 role: 'user',
@@ -1044,7 +1090,8 @@ export function ChatPage() {
                 createdAt: new Date().toISOString(),
               },
             ],
-            awaitingReply: true,
+            awaitingReply: !stopping,
+            turn: stopping ? { active: false, startedAt: null } : view.turn,
           },
         };
       });
@@ -1069,7 +1116,7 @@ export function ChatPage() {
       setComposer('');
       setShowSlashHints(false);
     },
-    [composer, sessionId, status.state],
+    [composer, sessionId, status.state, flushPacerKeepStreaming],
   );
 
   const handleComposerKey = useCallback(
@@ -1465,7 +1512,7 @@ export function ChatPage() {
  *  accounting lives elsewhere — `Frame::SessionActivity` is the single
  *  source of truth for sidebar badges, fired by the gateway's
  *  dispatch observer regardless of subscription state. */
-function routeInboundFrame(
+export function routeInboundFrame(
   frame: Frame,
   setViews: React.Dispatch<React.SetStateAction<Record<string, SessionView>>>,
   setSessions: React.Dispatch<React.SetStateAction<SessionSummary[]>>,
@@ -1495,7 +1542,7 @@ function routeInboundFrame(
           ...prev,
           [sid]: {
             ...view,
-            transcript: appendReasoningStep(view.transcript, frame.text),
+            transcript: appendReasoningStep(view.transcript, frame.text, view.turn?.active ?? null),
             awaitingReply: false,
           },
         };
@@ -1515,6 +1562,7 @@ function routeInboundFrame(
               frame.call_id,
               frame.tool,
               frame.label ?? null,
+              view.turn?.active ?? null,
             ),
             awaitingReply: false,
           },
@@ -1535,6 +1583,7 @@ function routeInboundFrame(
               frame.call_id,
               frame.status,
               frame.summary,
+              view.turn?.active ?? null,
             ),
           },
         };
@@ -1555,7 +1604,7 @@ function routeInboundFrame(
           ...prev,
           [sid]: {
             ...view,
-            transcript: pushStatusStep(view.transcript, text),
+            transcript: pushStatusStep(view.transcript, text, view.turn?.active ?? null),
             awaitingReply: false,
           },
         };
@@ -1846,7 +1895,7 @@ function routeInboundFrame(
             ...prev,
             [sid]: {
               ...view,
-              transcript: pushStatusStep(view.transcript, frame.text),
+              transcript: pushStatusStep(view.transcript, frame.text, view.turn?.active ?? null),
               awaitingReply: false,
             },
           };
@@ -1858,7 +1907,16 @@ function routeInboundFrame(
         // A notice is terminal for the turn (slash-command reply,
         // refusal, compaction confirmation, …) — close any open work
         // block so it collapses above the notice instead of dangling.
-        const base = closeActiveWork(view.transcript);
+        // When the notice is a `/stop` that actually cancelled the reply,
+        // label that block "Cancelled" — this is the path EVERY tab takes
+        // (the notice is broadcast), so an observer agrees with the
+        // originator (which marked it optimistically) and with a reload.
+        // `markLast` also covers the case where `turn_state{inactive}`
+        // already closed the block to "Worked" a moment earlier.
+        const closed = closeActiveWork(view.transcript);
+        const base = isStopCancellationNotice(frame.text)
+          ? markLastWorkCancelled(closed)
+          : closed;
         return {
           ...prev,
           [sid]: {
@@ -1879,6 +1937,13 @@ function routeInboundFrame(
             // indicator would hang forever for those sends. The notice
             // itself is now the reply, so awaitingReply ends here.
             awaitingReply: false,
+            // The terminal notice ends the turn locally — so a frame that
+            // lands after it (a tool finishing post-`/stop`, a paced flush)
+            // folds into the now-closed block via `ensureWork(active:false)`
+            // instead of opening a fresh ticking block below the notice. The
+            // authoritative `turn_state{active:false}` confirms this moments
+            // later; setting it here just closes the race window.
+            turn: { active: false, startedAt: null },
           },
         };
       });
@@ -2080,7 +2145,10 @@ function parseEpochMs(iso: string | null | undefined): number | null {
  *  own the returned `rows` (they slice before writing), so `prev` is
  *  never mutated. The work block is `role: 'system'` so it never collides
  *  with the assistant-streaming / replay reconciliation paths. */
-function ensureWork(prev: TranscriptRow[]): { rows: TranscriptRow[]; idx: number } {
+function ensureWork(
+  prev: TranscriptRow[],
+  turnActive: boolean | null,
+): { rows: TranscriptRow[]; idx: number } {
   let rows = prev;
   let proseStep: WorkStep | null = null;
   const last = rows[rows.length - 1];
@@ -2092,10 +2160,22 @@ function ensureWork(prev: TranscriptRow[]): { rows: TranscriptRow[]; idx: number
   }
   const tail = rows[rows.length - 1];
   let idx: number;
-  if (tail?.kind === 'work' && tail.workActive) {
+  if (tail?.kind === 'work' && (tail.workActive || turnActive === false)) {
+    // Reuse the trailing work block: an active one (a live turn), OR —
+    // when the server says the turn already ended — its just-closed block,
+    // so a late trailing frame (e.g. a tool call that completed after a
+    // `/stop` cancel) folds into that turn's collapsed block instead of
+    // spawning a perpetual "Working" box that no turn-end frame will close.
     idx = rows.length - 1;
   } else {
-    rows = [...rows, newWorkRow(Date.now(), rows.length)];
+    // No reusable block. Open one — pre-closed when the server says the
+    // turn already ended, so a late frame renders as a collapsed summary
+    // rather than a ticking box anchored to its receive time.
+    const fresh = newWorkRow(Date.now(), rows.length);
+    rows = [
+      ...rows,
+      turnActive === false ? { ...fresh, workActive: false, workEndedAt: Date.now() } : fresh,
+    ];
     idx = rows.length - 1;
   }
   if (proseStep) {
@@ -2107,8 +2187,12 @@ function ensureWork(prev: TranscriptRow[]): { rows: TranscriptRow[]; idx: number
 }
 
 /** Append one step to the turn's open work block. */
-function pushWorkStep(prev: TranscriptRow[], step: WorkStep): TranscriptRow[] {
-  const { rows, idx } = ensureWork(prev);
+function pushWorkStep(
+  prev: TranscriptRow[],
+  step: WorkStep,
+  turnActive: boolean | null,
+): TranscriptRow[] {
+  const { rows, idx } = ensureWork(prev, turnActive);
   const block = rows[idx];
   const next = rows.slice();
   next[idx] = { ...block, steps: [...(block.steps ?? []), step] };
@@ -2117,8 +2201,12 @@ function pushWorkStep(prev: TranscriptRow[], step: WorkStep): TranscriptRow[] {
 
 /** Append a reasoning chunk, merging into a trailing reasoning step so
  *  the streamed thinking reads as one paragraph. */
-function appendReasoningStep(prev: TranscriptRow[], text: string): TranscriptRow[] {
-  const { rows, idx } = ensureWork(prev);
+function appendReasoningStep(
+  prev: TranscriptRow[],
+  text: string,
+  turnActive: boolean | null,
+): TranscriptRow[] {
+  const { rows, idx } = ensureWork(prev, turnActive);
   const block = rows[idx];
   const steps = block.steps ?? [];
   const lastStep = steps[steps.length - 1];
@@ -2144,8 +2232,9 @@ function pushToolStartedStep(
   callId: string,
   tool: string,
   label: string | null,
+  turnActive: boolean | null,
 ): TranscriptRow[] {
-  const { rows, idx } = ensureWork(prev);
+  const { rows, idx } = ensureWork(prev, turnActive);
   const block = rows[idx];
   const steps = block.steps ?? [];
   if (steps.some((s) => s.kind === 'tool' && s.toolCallId === callId)) return rows;
@@ -2168,6 +2257,7 @@ function applyToolCompletedStep(
   callId: string,
   status: string,
   summary: string,
+  turnActive: boolean | null,
 ): TranscriptRow[] {
   const toolStatus: WorkStep['toolStatus'] =
     status === 'error' ? 'error' : status === 'denied' ? 'denied' : 'ok';
@@ -2183,19 +2273,27 @@ function applyToolCompletedStep(
     next[i] = { ...row, steps: nextSteps };
     return next;
   }
-  return pushWorkStep(prev, {
-    key: `tool-${callId}`,
-    kind: 'tool',
-    toolCallId: callId,
-    tool: 'tool',
-    toolStatus,
-    toolSummary: summary,
-  });
+  return pushWorkStep(
+    prev,
+    {
+      key: `tool-${callId}`,
+      kind: 'tool',
+      toolCallId: callId,
+      tool: 'tool',
+      toolStatus,
+      toolSummary: summary,
+    },
+    turnActive,
+  );
 }
 
 /** Push a status step (compaction, …) into the turn's open work block. */
-function pushStatusStep(prev: TranscriptRow[], text: string): TranscriptRow[] {
-  const { rows, idx } = ensureWork(prev);
+function pushStatusStep(
+  prev: TranscriptRow[],
+  text: string,
+  turnActive: boolean | null,
+): TranscriptRow[] {
+  const { rows, idx } = ensureWork(prev, turnActive);
   const block = rows[idx];
   const steps = block.steps ?? [];
   const next = rows.slice();
@@ -2209,8 +2307,11 @@ function pushStatusStep(prev: TranscriptRow[], text: string): TranscriptRow[] {
 /** Close the turn's open work block: stamp `workEndedAt` and clear
  *  `workActive` so it collapses to a `Worked Xs ›` summary. An empty
  *  block (the turn produced no intermediate steps — a direct answer) is
- *  dropped entirely so no summary line / arrow appears. */
-function closeActiveWork(prev: TranscriptRow[]): TranscriptRow[] {
+ *  dropped entirely so no summary line / arrow appears. Pass
+ *  `cancelled = true` to label it "Cancelled" — used by the optimistic
+ *  `/stop` path, where the user's own action is proof the turn was cancelled
+ *  (so the block flips instantly, without waiting on a backend signal). */
+export function closeActiveWork(prev: TranscriptRow[], cancelled = false): TranscriptRow[] {
   for (let i = prev.length - 1; i >= 0; i--) {
     const row = prev[i];
     if (row.kind !== 'work' || !row.workActive) continue;
@@ -2218,32 +2319,73 @@ function closeActiveWork(prev: TranscriptRow[]): TranscriptRow[] {
       return [...prev.slice(0, i), ...prev.slice(i + 1)];
     }
     const next = prev.slice();
-    next[i] = { ...row, workActive: false, workEndedAt: Date.now() };
+    next[i] = {
+      ...row,
+      workActive: false,
+      workEndedAt: Date.now(),
+      workCancelled: row.workCancelled || cancelled,
+    };
     return next;
   }
   return prev;
 }
 
+/** Recognise a `/stop` the user typed, mirroring the gateway's parser
+ *  (leading `/`, first token, tolerant of a `@bot` suffix / args) so the
+ *  client can optimistically reflect the cancel before the round-trip. */
+export function isStopCommand(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('/')) return false;
+  const cmd = trimmed.slice(1).split(/[\s@]/, 1)[0]?.toLowerCase();
+  return cmd === 'stop';
+}
+
+/** Stable substring of `aura-channels`' `STOP_CANCELLED_REPLY_LINE` — present
+ *  in a `/stop` notice ONLY when it actually cancelled an in-progress reply
+ *  (a no-op stop says "Nothing in progress to stop."). Keep in sync with that
+ *  const; a server-side test pins the producer text. */
+const STOP_CANCELLED_NOTICE_MARKER = 'Cancelled the in-progress reply';
+
+/** Whether a terminal notice is a `/stop` that actually cancelled a reply —
+ *  so its turn's work block reads "Cancelled" on every tab, not just the one
+ *  that typed `/stop` (which marks it optimistically) or after a reload. */
+export function isStopCancellationNotice(text: string): boolean {
+  return text.includes(STOP_CANCELLED_NOTICE_MARKER);
+}
+
+/** Mark the transcript's trailing work block cancelled. Only the *last* row is
+ *  touched, so a cancelled turn whose own block was dropped (no steps) can't
+ *  mis-label an earlier turn's block. Idempotent. */
+export function markLastWorkCancelled(rows: TranscriptRow[]): TranscriptRow[] {
+  const last = rows[rows.length - 1];
+  if (last?.kind !== 'work' || last.workCancelled) return rows;
+  const next = rows.slice();
+  next[next.length - 1] = { ...last, workCancelled: true };
+  return next;
+}
+
 /** Reconcile the transcript's tail with the server's `TurnState`.
  *
- *  Active: make sure a trailing *active* work block exists and pin its
- *  `workStartedAt` to the server's turn start — this re-opens the
- *  inactive block a REST history reload reconstructs for an in-flight
- *  turn (so it renders as "Working" with the true elapsed time instead
- *  of a collapsed `Worked 0s` that the Cancelled indicator would then
- *  mislabel), corrects the receive-time stamp `ensureWork` had to guess
- *  for a mid-turn joiner, and — when the tail has no work block at all
- *  (turn started, nothing streamed to this tab yet) — opens an empty one
- *  as the working affordance.
+ *  Active (`started_at` is always present — the server asserts it iff
+ *  `active`): pin an already-open block's `workStartedAt` to the server's
+ *  start, re-open a *closed* block whose start matches this turn (the
+ *  in-flight turn a REST reload reconstructed as collapsed `Worked Xs`),
+ *  or — when the tail is no work block at all (turn started, nothing
+ *  streamed to this tab yet) — open an empty one as the working
+ *  affordance. A closed block with a *different* start belongs to a
+ *  finished turn and is left alone (a fresh block opens instead). A null
+ *  `started_at` under `active` is a stale/lossy artifact and is ignored,
+ *  so a finished turn can never be resurrected as a phantom "Working" box.
  *
  *  Inactive: close any open block. This is the turn-end signal that
  *  doesn't depend on a terminal `Message`/`Notice` arriving, so a turn
  *  that ends without either (error, cancel, blank cron reply) can't
  *  leave the block spinning forever.
  *
- *  Idempotent — safe to apply both on every `turn_state` frame and after
- *  a history reload replaces the transcript. */
-function applyTurnState(
+ *  Idempotent — driven only by `turn_state` frames (the authoritative
+ *  server signal); the REST history reload no longer folds a cached turn
+ *  through here. */
+export function applyTurnState(
   prev: TranscriptRow[],
   active: boolean,
   startedAt: number | null,
@@ -2268,20 +2410,31 @@ function applyTurnState(
     }
     return closeActiveWork(prev);
   }
+  // A server `active:true` ALWAYS carries a real `started_at` (the
+  // gateway asserts `started_at` iff `active`). An `active:true` with a
+  // null start is a stale/lossy artifact (e.g. a cached turn folded in
+  // after a dropped close frame) — never fabricate or re-anchor a block
+  // off it, or a finished turn resurfaces as a phantom "Working" box whose
+  // elapsed counts from the wrong (old) start.
+  if (startedAt === null) return prev;
   const last = prev[prev.length - 1];
-  if (last?.kind === 'work') {
-    const pinned = startedAt ?? last.workStartedAt ?? Date.now();
-    if (last.workActive && last.workStartedAt === pinned) return prev;
+  if (last?.kind === 'work' && (last.workActive || last.workStartedAt === startedAt)) {
+    // Re-pin an already-open block, or re-open a *closed* block only when
+    // its start matches this turn — the same in-flight turn a REST reload
+    // reconstructed as collapsed. A closed block with a *different* start
+    // belongs to a finished turn; falling through opens a fresh block
+    // rather than resurrecting that turn's steps.
+    if (last.workActive && last.workStartedAt === startedAt) return prev;
     const next = prev.slice();
     next[next.length - 1] = {
       ...last,
       workActive: true,
-      workStartedAt: pinned,
+      workStartedAt: startedAt,
       workEndedAt: undefined,
     };
     return next;
   }
-  return [...prev, newWorkRow(startedAt ?? Date.now(), prev.length)];
+  return [...prev, newWorkRow(startedAt, prev.length)];
 }
 
 /** Close the open work block at the turn's terminal reply, peeling off a
@@ -2377,6 +2530,9 @@ interface HistoryRowDto {
   steps?: HistoryWorkStepDto[];
   work_started_at?: string | null;
   work_ended_at?: string | null;
+  /** True when a `work` row's turn was cancelled (`/stop`); the block then
+   *  collapses to a "Cancelled · Worked Xs" summary. */
+  cancelled?: boolean;
   /** Severity of a `notice` row, so reload colors it like the live frame.
    *  Normalized through `noticeLevel()` at the call site. */
   notice_level?: string | null;
@@ -2400,6 +2556,7 @@ function historyRowToTranscript(sessionId: string, row: HistoryRowDto): Transcri
       text: '',
       kind: 'work',
       workActive: false,
+      workCancelled: row.cancelled ?? false,
       workStartedAt: parseEpochMs(row.work_started_at) ?? undefined,
       workEndedAt: parseEpochMs(row.work_ended_at) ?? undefined,
       steps: (row.steps ?? []).map((s, i) => ({
@@ -2941,24 +3098,58 @@ function WorkStepView({ step }: { step: WorkStep }) {
   );
 }
 
-// The turn's aggregated progress. While `workActive`, it's an expanded
-// assistant-side bubble with an animated "Working" header + live elapsed
-// timer and the steps revealed underneath. On completion it collapses to
-// a dim `Worked Xs ›` line (click to re-expand the work) that sits above
-// the final answer bubble. A turn that produced no steps is dropped on
-// close (see `closeActiveWork`), so a collapsed block always has work to
-// show and the arrow is always meaningful.
+/** The WorkBlock's two display flags, derived from turn/step/expand state.
+ *  Pure + exported so the "spinner first, expand on the first step" contract
+ *  is unit-testable without rendering:
+ *   • `boxed`     — draw the bordered card (live turn, or a re-expanded
+ *     finished block).
+ *   • `panelOpen` — reveal the steps panel (only once a live turn has a step,
+ *     or the user expanded a finished block). */
+export function workBlockDisplay(
+  active: boolean,
+  hasSteps: boolean,
+  expanded: boolean,
+): { boxed: boolean; panelOpen: boolean } {
+  return {
+    boxed: active || expanded,
+    panelOpen: (active && hasSteps) || expanded,
+  };
+}
+
+/** Collapsed-summary label for a finished work block. A sub-second turn drops
+ *  the duration (never "Worked 0s"); a cancelled turn (`/stop`) is labelled
+ *  "Cancelled" so it reads distinctly from a turn that ran to completion. */
+export function formatWorkedLabel(secs: number, cancelled = false): string {
+  const worked = secs >= 1 ? `Worked ${secs}s` : 'Worked';
+  return cancelled ? (secs >= 1 ? `Cancelled · ${worked}` : 'Cancelled') : worked;
+}
+
+// The turn's aggregated progress. A live turn that hasn't produced a step
+// yet is just the compact "Working" spinner (matching the initial
+// WorkingIndicator); the bordered bubble grows its steps panel in only once
+// work actually lands. On completion it collapses to a dim `Worked Xs ›`
+// line (click to re-expand) that sits above the final answer bubble. A turn
+// that produced no steps is dropped on close (see `closeActiveWork`), so a
+// collapsed block always has work to show and the arrow is always meaningful.
 function WorkBlock({ row }: { row: TranscriptRow }) {
   const active = !!row.workActive;
   const steps = row.steps ?? [];
   // `expanded` is the user's explicit toggle for the *finished* block and
-  // defaults closed; while the turn is still active the block is forced
-  // open. Deriving `open` this way — rather than an effect that flips
-  // `expanded` on completion — keeps the active→done collapse a single
-  // render, so the body animates 1fr→0fr cleanly with no intermediate
-  // flash.
+  // defaults closed. Two derived flags drive the look — deriving them rather
+  // than flipping state in an effect keeps every transition a single render
+  // (the body animates 0fr↔1fr cleanly, no flash):
+  //  • `boxed`     — show the bordered card. True while the turn is live (so
+  //    it reads as one element with the initial WorkingIndicator) or when the
+  //    user re-expanded a finished block.
+  //  • `panelOpen` — reveal the steps panel. Held shut until the turn has
+  //    actually produced a step, so a live-but-stepless turn is just the
+  //    compact spinner and the panel grows in when the first step lands.
   const [expanded, setExpanded] = useState(false);
-  const open = active || expanded;
+  const hasSteps = steps.length > 0;
+  const { boxed, panelOpen } = workBlockDisplay(active, hasSteps, expanded);
+  // The spinner-first state hugs its content instead of stretching the full
+  // card width; the panel/steps states take the full width so work has room.
+  const compact = boxed && !panelOpen;
 
   // Pin the steps panel to its tail while the turn is producing so a long
   // tool loop reveals the newest reasoning/tool line at the bottom instead
@@ -2979,6 +3170,10 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
     row.workEndedAt && row.workStartedAt
       ? Math.max(0, Math.round((row.workEndedAt - row.workStartedAt) / 1000))
       : 0;
+  // Never surface a "0s" duration; a cancelled (`/stop`) turn reads
+  // "Cancelled · Worked Xs" instead of a plain completion summary.
+  const cancelled = !!row.workCancelled;
+  const workedLabel = formatWorkedLabel(secs, cancelled);
   // A *collapsed* finished block sits directly above its turn's answer
   // bubble — pull the row gap in (the transcript's `gap-3`) so the
   // `Worked Xs ›` summary reads as attached to that answer. Only when
@@ -2986,7 +3181,7 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
   // the steps panel becomes its own box that needs the normal gap to the
   // answer. Transitioned so expand/collapse eases the gap rather than
   // snapping it.
-  const tighten = open ? '' : '-mb-3';
+  const tighten = boxed ? '' : '-mb-3';
 
   // One persistent element tree across active / collapsed / expanded so
   // the transitions actually animate (a branch swap would just hard-cut).
@@ -2999,8 +3194,10 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
       className={`group flex flex-col items-start w-full transition-[margin-bottom] duration-300 ease-out ${tighten}`}
     >
       <div
-        className={`w-full max-w-4xl rounded-md overflow-hidden border-2 transition-all duration-300 ease-out ${
-          open
+        className={`${
+          compact ? 'w-fit max-w-4xl' : 'w-full max-w-4xl'
+        } rounded-md overflow-hidden border-2 transition-all duration-300 ease-out ${
+          boxed
             ? 'border-black bg-white shadow-brutal-sm'
             : // Collapsed: pull left by the 2px transparent border so the
               // `Worked Xs ›` line sits flush with the answer bubble's edge.
@@ -3015,7 +3212,12 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
           className={`w-full flex items-center gap-2 py-2 font-mono text-xs text-left border-b-2 transition-all duration-300 ease-out ${
             // Drop the horizontal padding when collapsed so the summary
             // aligns to the bubble's left edge, not its (indented) text.
-            open ? 'px-3 border-black bg-canvas' : 'px-0 border-transparent bg-transparent'
+            boxed ? 'px-3' : 'px-0'
+          } ${
+            // The header divider + tint only read once the steps panel is
+            // open; the compact spinner card and the collapsed summary keep
+            // a seamless, divider-less header.
+            panelOpen ? 'border-black bg-canvas' : 'border-transparent bg-transparent'
           } ${active ? 'cursor-default' : 'cursor-pointer hover:bg-canvas'}`}
         >
           {active ? (
@@ -3030,7 +3232,7 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
             </>
           ) : (
             <>
-              <span className="text-ink-soft">Worked {secs}s</span>
+              <span className={cancelled ? 'text-error' : 'text-ink-soft'}>{workedLabel}</span>
               <RiArrowRightSLine
                 className={`text-sm text-ink-soft shrink-0 transition-transform duration-300 ease-out ${
                   expanded ? 'rotate-90' : ''
@@ -3041,13 +3243,13 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
         </button>
         <div
           className={`grid transition-[grid-template-rows] duration-300 ease-out ${
-            open ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'
+            panelOpen ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'
           }`}
         >
           <div
             ref={stepsContainerRef}
             className={`min-h-0 ${
-              open
+              panelOpen
                 ? 'chat-scroll max-h-[calc((100vh-12rem)*3/5)] overflow-y-auto'
                 : 'overflow-hidden'
             }`}
@@ -3073,7 +3275,9 @@ function LiveElapsed({ startedAt }: { startedAt: number }) {
     return () => window.clearInterval(id);
   }, []);
   const secs = Math.max(0, Math.floor((now - startedAt) / 1000));
-  return <>{secs}s</>;
+  // Hold the counter back for the first second so a just-started turn reads
+  // "Working", never "Working 0s".
+  return secs < 1 ? null : <>{secs}s</>;
 }
 
 // True when the trailing closed `work` block at position `i` represents

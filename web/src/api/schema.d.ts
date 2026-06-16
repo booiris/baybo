@@ -759,6 +759,13 @@ export interface components {
          */
         ChatTranscriptItem: {
             /**
+             * @description `true` when this `work` item belongs to a turn that was cancelled
+             *     (e.g. `/stop`) rather than run to a normal reply — the client labels it
+             *     "Cancelled" instead of a plain `Worked Xs`. Always false for
+             *     `message` / `notice` items.
+             */
+            cancelled?: boolean;
+            /**
              * Format: date-time
              * @description Wall-clock time the row was persisted, sourced from
              *     `session_messages.created_at`. Lets the client render a

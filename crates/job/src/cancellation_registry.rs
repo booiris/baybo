@@ -15,10 +15,16 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aura_model::JobId;
 use parking_lot::RwLock;
 use tokio_util::sync::CancellationToken;
+
+/// How often [`JobCancellationRegistry::wait_until_idle`] re-checks
+/// registration while waiting. Short enough that the post-cancel anchor read
+/// follows the turn's drain by at most this, with a tiny bounded busy-wait.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Default)]
 pub struct JobCancellationRegistry {
@@ -52,6 +58,26 @@ impl JobCancellationRegistry {
         } else {
             false
         }
+    }
+
+    /// Whether `job_id` currently has a live (registered) token.
+    pub fn is_registered(&self, job_id: &JobId) -> bool {
+        self.tokens.read().contains_key(job_id)
+    }
+
+    /// Wait until `job_id` is no longer registered — i.e. its run's
+    /// `with_job` scope exited and dropped the guard, which happens *after*
+    /// the agent loop's body (so after any partial assistant row it persists
+    /// on a cancel). Bounded by `timeout`; returns immediately if already
+    /// gone. `/stop` uses this so its control events anchor after the
+    /// cancelled turn's last row instead of racing it.
+    pub async fn wait_until_idle(&self, job_id: &JobId, timeout: Duration) {
+        let _ = tokio::time::timeout(timeout, async {
+            while self.is_registered(job_id) {
+                tokio::time::sleep(IDLE_POLL_INTERVAL).await;
+            }
+        })
+        .await;
     }
 }
 
@@ -109,5 +135,50 @@ mod tests {
         }
         // After drop, the entry is gone — re-cancel reports no live token.
         assert!(!r.cancel(&job_id));
+    }
+
+    #[tokio::test]
+    async fn wait_until_idle_returns_immediately_when_unregistered() {
+        let r = JobCancellationRegistry::new();
+        // Never registered → returns at once even with a generous budget.
+        r.wait_until_idle(&JobId::new(), Duration::from_secs(5))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn wait_until_idle_resolves_when_the_guard_drops() {
+        let r = Arc::new(JobCancellationRegistry::new());
+        let job_id = JobId::new();
+        r.register(job_id, CancellationToken::new());
+        let guard = JobCancellationGuard::new(Arc::clone(&r), job_id);
+
+        let waiter = {
+            let r = Arc::clone(&r);
+            tokio::spawn(async move { r.wait_until_idle(&job_id, Duration::from_secs(30)).await })
+        };
+        // Still registered: the waiter must not have resolved.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!waiter.is_finished());
+
+        drop(guard); // turn settled → deregistered
+        tokio::time::sleep(Duration::from_millis(30)).await; // > IDLE_POLL_INTERVAL
+        assert!(
+            waiter.is_finished(),
+            "wait must resolve once the guard drops"
+        );
+        waiter.await.expect("waiter task");
+    }
+
+    #[tokio::test]
+    async fn wait_until_idle_gives_up_after_timeout() {
+        let r = Arc::new(JobCancellationRegistry::new());
+        let job_id = JobId::new();
+        r.register(job_id, CancellationToken::new()); // never deregistered
+        // Bounded: returns despite the entry never clearing (best-effort).
+        r.wait_until_idle(&job_id, Duration::from_millis(40)).await;
+        assert!(
+            r.is_registered(&job_id),
+            "entry still present; we just stopped waiting"
+        );
     }
 }

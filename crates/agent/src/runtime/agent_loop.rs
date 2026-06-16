@@ -172,6 +172,54 @@ fn skip_leading_whitespace(chunk: &mut String, stripped: &mut bool) -> bool {
     true
 }
 
+/// An empty assistant response — the sentinel a cancelled provider call
+/// resolves to (the in-flight request was dropped before it produced
+/// anything), so the cancel handling has a uniform `LlmResponse` to inspect.
+fn empty_llm_response() -> LlmResponse {
+    LlmResponse {
+        content: String::new(),
+        content_blocks: Vec::new(),
+        tool_calls: Vec::new(),
+        usage: TokenUsage::default(),
+        thinking: None,
+    }
+}
+
+/// Blocks safe to persist from an assistant turn cancelled mid-stream:
+/// rendered text and completed thinking. A streamed-but-undispatched
+/// `ToolUse` is dropped — persisting a `tool_use` with no matching
+/// `tool_result` would wedge the next request's provider validation.
+fn salvage_partial_blocks(resp: &LlmResponse) -> Vec<ContentBlock> {
+    resp.content_blocks
+        .iter()
+        .filter(|b| match b {
+            ContentBlock::Text(t) => !t.trim().is_empty(),
+            ContentBlock::Thinking { .. } => true,
+            _ => false,
+        })
+        .cloned()
+        .collect()
+}
+
+/// Error returned by `call_llm` when the turn is cancelled while the LLM
+/// call is in flight. Carries the partial assistant content salvaged from a
+/// mid-stream cancel so `run_iteration` can persist it — keeping the
+/// cancelled turn's work block alive across a page reload — before
+/// propagating the abort. `partial` is empty when nothing was produced
+/// (a non-streaming call dropped before its single response).
+#[derive(Debug)]
+struct CancelledTurn {
+    partial: Vec<ContentBlock>,
+}
+
+impl std::fmt::Display for CancelledTurn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LLM call cancelled mid-flight")
+    }
+}
+
+impl std::error::Error for CancelledTurn {}
+
 /// `try_send` drops on a full channel: notices are non-load-bearing
 /// (the verdict still lands in the trace) and `SessionNotifier::emit`
 /// is sync, so blocking the tool path on backpressure would be worse
@@ -938,9 +986,28 @@ impl AgentLoop {
         notifier: Option<Arc<dyn aura_tools::SessionNotifier>>,
         cancel_token: &CancellationToken,
     ) -> anyhow::Result<IterationOutcome> {
-        let (response, llm_span_id) = self
-            .call_llm_with_retry(session, span_recorder, &step, delta_tx)
-            .await?;
+        let (response, llm_span_id) = match self
+            .call_llm_with_retry(session, span_recorder, &step, delta_tx, cancel_token)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                // Cancelled mid-call: persist any partial assistant content
+                // the stream produced before the abort, so the cancelled
+                // turn's work block survives a page reload (reconstruction
+                // reads it back from `session_messages`). Only text + thinking
+                // are salvaged — never a dangling tool_use — so the row is a
+                // valid standalone assistant turn for the next request.
+                if let Some(cancelled) = e.downcast_ref::<CancelledTurn>()
+                    && !cancelled.partial.is_empty()
+                {
+                    self.context_manager
+                        .append(&ChatMessage::assistant(cancelled.partial.clone()))
+                        .await;
+                }
+                return Err(e);
+            }
+        };
 
         // If no tool calls, we have the final response.
         if response.tool_calls.is_empty() {
@@ -1218,13 +1285,21 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         step: &StepHandle,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        cancel_token: &CancellationToken,
     ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
         let mut attempt = 0u32;
         loop {
-            match self.call_llm(session, span_recorder, step, delta_tx).await {
+            match self
+                .call_llm(session, span_recorder, step, delta_tx, cancel_token)
+                .await
+            {
                 Ok(pair) => return Ok(pair),
                 Err(e) => {
-                    if !self.error_handler.should_retry(attempt, &e) {
+                    // A `/stop` mid-call aborts the provider request inside
+                    // `call_llm`; never retry it — the turn is unwinding, and
+                    // a cancellation can otherwise read as a transient error.
+                    if cancel_token.is_cancelled() || !self.error_handler.should_retry(attempt, &e)
+                    {
                         return Err(e);
                     }
                     let backoff = self.error_handler.backoff_duration(attempt);
@@ -1234,7 +1309,13 @@ impl AgentLoop {
                         error = %e,
                         "retrying LLM call after transient error"
                     );
-                    tokio::time::sleep(backoff).await;
+                    // Honour a cancel that arrives during backoff too, so
+                    // `/stop` isn't stalled waiting out the sleep.
+                    tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => return Err(e),
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
                     attempt += 1;
                 }
             }
@@ -1252,6 +1333,7 @@ impl AgentLoop {
         span_recorder: &Arc<SpanRecorder>,
         step: &StepHandle,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
+        cancel_token: &CancellationToken,
     ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
         let model_info = self.llm_client.model_info();
 
@@ -1284,6 +1366,7 @@ impl AgentLoop {
 
         let input_messages = self.context_manager.build_call_input_marker().await;
 
+        let cancel = cancel_token.clone();
         crate::runtime::scope::with_llm_span(
             span_recorder.as_ref(),
             step,
@@ -1295,7 +1378,7 @@ impl AgentLoop {
                 input_messages,
                 temperature: None,
             },
-            None,
+            Some((cancel_token, aura_job::CancelReason::ParentCancelled)),
             |span| async move {
                 // Bind this call to its `LlmCall` span so the spend lands
                 // on the right span. `BoundBilledLlm` does gate → call →
@@ -1307,13 +1390,46 @@ impl AgentLoop {
                     span_id: span.span_id,
                     reason: aura_llm::CallReason::Chat,
                 });
-                let (partial_usage, llm_result) = match delta_tx {
-                    Some(tx) => self.chat_streaming(&bound, &request, session, tx).await,
-                    None => match bound.chat(&request).await {
-                        Ok(billed) => (billed.response.usage, Ok(billed.response)),
-                        Err(e) => (TokenUsage::default(), Err(e)),
-                    },
-                };
+                // Run the provider call. The streaming path is cancel-aware
+                // internally — it stops consuming and returns whatever it
+                // streamed so far. The atomic non-streaming call is raced
+                // against the token so a `/stop` (or the idle reaper) aborts
+                // the in-flight request by dropping it (a streaming
+                // `RecordingStream` still bills its partial usage on drop).
+                let (partial_usage, llm_result): (TokenUsage, aura_llm::Result<LlmResponse>) =
+                    match delta_tx {
+                        Some(tx) => self.chat_streaming(&bound, &request, session, tx, &cancel).await,
+                        None => tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => (TokenUsage::default(), Ok(empty_llm_response())),
+                            res = bound.chat(&request) => match res {
+                                Ok(billed) => (billed.response.usage, Ok(billed.response)),
+                                Err(e) => (TokenUsage::default(), Err(e)),
+                            },
+                        },
+                    };
+
+                // Cancelled while the call was in flight: salvage any partial
+                // assistant content the stream produced and hand it up via
+                // `CancelledTurn` so `run_iteration` persists it (the work
+                // block then survives a reload). The span closes `Cancelled`
+                // via the cancel context, and the retry loop won't re-issue.
+                if cancel.is_cancelled() {
+                    let partial = match &llm_result {
+                        Ok(resp) => salvage_partial_blocks(resp),
+                        Err(_) => Vec::new(),
+                    };
+                    let finalize = LlmCallResult {
+                        output_content: String::new(),
+                        thinking: None,
+                        tool_calls: Vec::new(),
+                        input_tokens: partial_usage.input_tokens,
+                        output_tokens: partial_usage.output_tokens,
+                        cached_input_tokens: partial_usage.cached_input_tokens,
+                        cache_creation_input_tokens: partial_usage.cache_creation_input_tokens,
+                    };
+                    return (finalize, Err(anyhow::Error::new(CancelledTurn { partial })));
+                }
                 let (finalize, value_result) = match llm_result {
                     Ok(mut response) => {
                         // Defensive scrub of LLM output.
@@ -1740,14 +1856,24 @@ impl AgentLoop {
     /// yield `TokenUsage::default()` on a mid-stream drop — the row
     /// still lands in `cost_records` with zero counts so operators
     /// see the failed call instead of silent under-billing.
+    ///
+    /// Cancel-aware: a `/stop` (or idle reaper) tripping `cancel` stops
+    /// consuming and returns whatever was streamed so far as `Ok(partial)`
+    /// (the caller salvages it). Dropping the stream aborts the in-flight
+    /// HTTP request and bills the partial usage via `RecordingStream::drop`.
     async fn chat_streaming(
         &self,
         bound: &BoundBilledLlm,
         request: &ChatRequest,
         session: &Session,
         delta_tx: &mpsc::Sender<AgentOutput>,
+        cancel: &CancellationToken,
     ) -> (TokenUsage, aura_llm::Result<LlmResponse>) {
-        let mut stream = match bound.chat_stream(request).await {
+        let mut stream = match tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return (TokenUsage::default(), Ok(empty_llm_response())),
+            opened = bound.chat_stream(request) => opened,
+        } {
             Ok(s) => s,
             Err(e) => return (TokenUsage::default(), Err(e)),
         };
@@ -1775,7 +1901,16 @@ impl AgentLoop {
         // streamed as ephemeral `Reasoning` rather than answer `AnswerDelta`.
         let mut pending_reasoning = String::new();
 
-        while let Some(event) = stream.next().await {
+        loop {
+            // Stop consuming the moment the turn is cancelled, falling through
+            // to flush + return the partial. The stream drops on function exit,
+            // aborting the in-flight request and billing the partial usage.
+            let next = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                ev = stream.next() => ev,
+            };
+            let Some(event) = next else { break };
             let event = match event {
                 Ok(e) => e,
                 Err(e) => return (usage, Err(e)),

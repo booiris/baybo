@@ -2658,6 +2658,10 @@
           "created_at"
         ],
         "properties": {
+          "cancelled": {
+            "type": "boolean",
+            "description": "`true` when this `work` item belongs to a turn that was cancelled\n(e.g. `/stop`) rather than run to a normal reply — the client labels it\n\"Cancelled\" instead of a plain `Worked Xs`. Always false for\n`message` / `notice` items."
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
