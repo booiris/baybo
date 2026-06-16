@@ -56,6 +56,11 @@ pub struct AgentTestHarness {
     pub vault: Arc<SecretVault>,
     pub secret_store: Arc<MemorySecretStore>,
     pub job_store: Arc<MemoryJobStore>,
+    /// The same `JobLifecycle` instance the actor drives. Exposed so a test
+    /// can cancel the session's in-flight turn the way the Router's `/stop`
+    /// does (`list_active_turns_by_session` → `cancel`), which trips the very
+    /// token the agent loop threads into the live LLM call.
+    pub job_lifecycle: Arc<JobLifecycle>,
     pub cost_store: Arc<MemoryCostStore>,
     pub trace_store: Arc<MemoryTraceStore>,
     pub tool_registry: Arc<ToolRegistry>,
@@ -187,6 +192,11 @@ pub struct AgentTestHarnessBuilder {
     /// Pluggable memory wired into the loop. Defaults to `None` (inert); tests
     /// assert the recall / write hooks by wiring a `RecordingMemory`.
     memory: Option<Arc<dyn aura_memory::Memory>>,
+    /// Override the LLM client wired into the pool. Defaults to `None` → the
+    /// scriptable `StubLlm`. Set it to drive a custom `LlmCompletion` (e.g. a
+    /// fixture whose call blocks until cancelled) when `StubLlm`'s
+    /// return-immediately contract doesn't fit.
+    llm: Option<Arc<dyn LlmCompletion>>,
 }
 
 impl Default for AgentTestHarnessBuilder {
@@ -204,6 +214,7 @@ impl Default for AgentTestHarnessBuilder {
             model_context_window: None,
             compression_threshold: None,
             memory: None,
+            llm: None,
         }
     }
 }
@@ -291,6 +302,14 @@ impl AgentTestHarnessBuilder {
         self
     }
 
+    /// Wire a custom [`LlmCompletion`] into the pool instead of the default
+    /// [`StubLlm`]. Use for behaviours `StubLlm` can't express — e.g. a call
+    /// that blocks until its future is dropped, to test in-flight cancellation.
+    pub fn with_llm(mut self, llm: Arc<dyn LlmCompletion>) -> Self {
+        self.llm = Some(llm);
+        self
+    }
+
     /// Wire everything and spawn the `AgentActor`. The returned harness
     /// owns the mailbox sender and the response receiver.
     pub fn build(self) -> AgentTestHarness {
@@ -346,6 +365,13 @@ impl AgentTestHarnessBuilder {
             }
             Arc::new(stub)
         };
+        // The client actually wired into the pool: the custom override when
+        // set, else the scriptable stub. Its `model_info` drives the pool
+        // entry name + tokenizer so they stay consistent either way.
+        let wired_llm: Arc<dyn aura_llm::LlmCompletion> = match self.llm {
+            Some(custom) => custom,
+            None => stub_llm.clone(),
+        };
         let mut tool_registry = ToolRegistry::new();
         for (tool, manifest) in self.tools {
             tool_registry.register(tool, manifest);
@@ -394,7 +420,7 @@ impl AgentTestHarnessBuilder {
 
         // Tokenizer model id must match the LLM client's so
         // `TokenCalibration` keys observe and adjust identically.
-        let stub_model_id = stub_llm.model_info().id.clone();
+        let stub_model_id = wired_llm.model_info().id.clone();
         let tokenizer = Arc::new(TiktokenTokenizer::for_model(&stub_model_id));
         // Non-existent root → fast-path read hits NotFound → falls
         // through. No tempdir to clean up.
@@ -436,15 +462,13 @@ impl AgentTestHarnessBuilder {
             subagent_profile: Some((subagent_registry, "harness".to_string())),
         });
 
-        let guarded_llm = aura_llm::BillableLlm::new(
-            stub_llm.clone() as Arc<dyn aura_llm::LlmCompletion>,
-            cost_hooks(&cost_manager),
-        );
+        let guarded_llm =
+            aura_llm::BillableLlm::new(Arc::clone(&wired_llm), cost_hooks(&cost_manager));
 
-        // Single-entry pool keyed by the stub model's id; tests that
+        // Single-entry pool keyed by the wired model's id; tests that
         // exercise mid-session swap can extend this by registering
         // extra stubs under different names via a builder method.
-        let stub_entry_name = LlmEntryName::from(stub_llm.model_info().id.clone());
+        let stub_entry_name = LlmEntryName::from(wired_llm.model_info().id.clone());
         let mut pool_clients = std::collections::HashMap::new();
         pool_clients.insert(stub_entry_name.clone(), guarded_llm);
         let llm_pool: aura_agent::LlmPoolHandle = Arc::new(parking_lot::RwLock::new(Arc::new(
@@ -486,6 +510,7 @@ impl AgentTestHarnessBuilder {
             actor_parent_token.child_token(),
         );
 
+        let job_lifecycle_for_harness = Arc::clone(&job_lifecycle);
         let actor = AgentActor::from_parts(
             aura_agent::state::DurableActorState::new(session.clone()),
             aura_agent::state::VolatileResources {
@@ -507,6 +532,7 @@ impl AgentTestHarnessBuilder {
             vault,
             secret_store,
             job_store,
+            job_lifecycle: job_lifecycle_for_harness,
             cost_store,
             trace_store,
             tool_registry,

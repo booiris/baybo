@@ -296,6 +296,18 @@ impl LlmStream {
         }
     }
 
+    /// Test-only escape hatch for driving an arbitrary event stream — e.g. one
+    /// that yields a few events then parks, which `from_events` (a fixed,
+    /// self-terminating sequence) can't express. Lets integration tests
+    /// exercise mid-stream behaviour like cancellation.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_event_stream<S>(stream: S) -> Self
+    where
+        S: Stream<Item = crate::Result<StreamEvent>> + Send + 'static,
+    {
+        Self::from_stream(stream)
+    }
+
     /// Wraps a rig `StreamingCompletionResponse` into our type-erased `LlmStream`,
     /// converting provider-specific events into `StreamEvent`.
     fn from_rig_stream<R>(rig_stream: streaming::StreamingCompletionResponse<R>) -> Self

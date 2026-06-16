@@ -2362,3 +2362,288 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
 
     harness.shutdown().await;
 }
+
+/// An `LlmCompletion` whose calls park forever once entered. Drives the
+/// in-flight-cancellation test: the agent loop must abort the pending
+/// provider await when the turn's cancel token trips, rather than waiting
+/// out a response that never comes.
+mod blocking_llm {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use aura_llm::{ChatRequest, LlmCompletion, LlmResponse, LlmStream, ModelInfo, ModelPricing};
+    use tokio::sync::Notify;
+
+    pub struct BlockingLlm {
+        model_info: ModelInfo,
+        entered: Arc<Notify>,
+    }
+
+    impl BlockingLlm {
+        /// `entered` fires the instant a provider call begins, so the test
+        /// trips the cancel only once the call is genuinely in flight.
+        pub fn new(entered: Arc<Notify>) -> Self {
+            Self {
+                model_info: ModelInfo {
+                    id: "blocking-model".into(),
+                    provider: "stub".into(),
+                    context_window: 8_192,
+                    supports_tools: true,
+                    supports_vision: false,
+                    pricing: ModelPricing::default(),
+                },
+                entered,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmCompletion for BlockingLlm {
+        async fn chat(&self, _request: &ChatRequest) -> aura_llm::Result<LlmResponse> {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+            unreachable!("blocking LLM never returns; the call is ended only by drop-on-cancel")
+        }
+
+        async fn chat_stream(&self, _request: &ChatRequest) -> aura_llm::Result<LlmStream> {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+            unreachable!("blocking LLM never returns; the call is ended only by drop-on-cancel")
+        }
+
+        fn model_info(&self) -> &ModelInfo {
+            &self.model_info
+        }
+    }
+}
+
+/// `/stop` must abort an LLM call that is already in flight — not just be
+/// observed at the next iteration boundary. The provider call here parks
+/// forever, so the agent loop can only ever leave it if cancelling the turn
+/// job (what the Router's `/stop` does) trips the token threaded into the
+/// live `chat_stream` and drops the pending await.
+///
+/// The discriminating assertion is the *timed shutdown*: `JobLifecycle::cancel`
+/// flips the job row terminal by itself, so the turn-state projector emits the
+/// `active:false` close edge whether or not the loop actually unblocked.
+/// What only the fix delivers is the actor returning to its mailbox — without
+/// it the actor stays parked in the dead call and never processes `ActorStop`,
+/// so `shutdown` would hang forever.
+#[tokio::test]
+async fn stop_aborts_an_in_flight_llm_call() {
+    use aura_job::CancelReason;
+    use blocking_llm::BlockingLlm;
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let llm = Arc::new(BlockingLlm::new(Arc::clone(&entered)));
+    let mut harness = AgentTestHarness::builder()
+        .with_llm(llm as Arc<dyn aura_llm::LlmCompletion>)
+        .build();
+
+    harness.send_text("please hang").await.unwrap();
+
+    // Don't cancel until the provider call is genuinely in flight, so the
+    // test exercises mid-call cancellation rather than a pre-call short
+    // circuit at the iteration boundary.
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the in-flight LLM call should have started");
+
+    // Exactly what `handle_stop` does: cancel the session's in-flight turn
+    // job with `UserStopped`, tripping the registered loop token.
+    let turns = harness
+        .job_lifecycle
+        .list_active_turns_by_session(&harness.session.id)
+        .await
+        .expect("list active turns");
+    assert!(!turns.is_empty(), "a turn must be in flight to cancel");
+    for job in &turns {
+        harness
+            .job_lifecycle
+            .cancel(&job.id, CancelReason::UserStopped, vec![])
+            .await
+            .expect("cancel the in-flight turn");
+    }
+
+    // The turn job is now terminal, so the projector publishes the close edge.
+    let outs = harness.drain_outputs(DRAIN_TIMEOUT).await;
+    let last_turn_state = outs.iter().rev().find_map(|o| match &o.event {
+        AgentEvent::TurnState { active, .. } => Some(*active),
+        _ => None,
+    });
+    assert_eq!(
+        last_turn_state,
+        Some(false),
+        "the cancelled turn must project a close edge, got {outs:?}"
+    );
+
+    // Load-bearing: the actor must be free again. Bounded so the broken
+    // behaviour (loop still parked on the dead call) fails fast here instead
+    // of hanging the suite.
+    tokio::time::timeout(Duration::from_secs(5), harness.shutdown())
+        .await
+        .expect("actor must terminate after its in-flight LLM call is cancelled");
+}
+
+/// A streaming `LlmCompletion` that emits a fixed prefix of events, then
+/// parks forever — signalling `drained` once every event has been pulled, so
+/// a test can cancel exactly when the call is blocked mid-stream with partial
+/// content already produced.
+mod partial_stream_llm {
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    use async_trait::async_trait;
+    use aura_llm::{
+        ChatRequest, LlmCompletion, LlmResponse, LlmStream, ModelInfo, ModelPricing, StreamEvent,
+    };
+    use futures::Stream;
+    use parking_lot::Mutex;
+    use tokio::sync::Notify;
+
+    struct PartialThenBlock {
+        events: Mutex<VecDeque<StreamEvent>>,
+        drained: Arc<Notify>,
+    }
+
+    impl Stream for PartialThenBlock {
+        type Item = aura_llm::Result<StreamEvent>;
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if let Some(ev) = self.events.lock().pop_front() {
+                // Self-wake so the queued events drain back-to-back.
+                cx.waker().wake_by_ref();
+                Poll::Ready(Some(Ok(ev)))
+            } else {
+                // Every event delivered; park (no waker registered) and tell
+                // the test the call is now blocked mid-stream.
+                self.drained.notify_one();
+                Poll::Pending
+            }
+        }
+    }
+
+    pub struct PartialStreamLlm {
+        model_info: ModelInfo,
+        events: Vec<StreamEvent>,
+        drained: Arc<Notify>,
+    }
+
+    impl PartialStreamLlm {
+        pub fn new(events: Vec<StreamEvent>, drained: Arc<Notify>) -> Self {
+            Self {
+                model_info: ModelInfo {
+                    id: "partial-stream-model".into(),
+                    provider: "stub".into(),
+                    context_window: 8_192,
+                    supports_tools: true,
+                    supports_vision: false,
+                    pricing: ModelPricing::default(),
+                },
+                events,
+                drained,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmCompletion for PartialStreamLlm {
+        async fn chat(&self, _request: &ChatRequest) -> aura_llm::Result<LlmResponse> {
+            unreachable!("the streaming turn never calls chat()")
+        }
+
+        async fn chat_stream(&self, _request: &ChatRequest) -> aura_llm::Result<LlmStream> {
+            Ok(LlmStream::from_event_stream(PartialThenBlock {
+                events: Mutex::new(self.events.iter().cloned().collect()),
+                drained: Arc::clone(&self.drained),
+            }))
+        }
+
+        fn model_info(&self) -> &ModelInfo {
+            &self.model_info
+        }
+    }
+}
+
+/// A turn cancelled *mid-stream* must persist the partial assistant content it
+/// already produced (reasoning + answer text), so reconstructing the
+/// transcript on reload still shows the cancelled turn's work — not a blank.
+/// Regression for the in-flight-cancel path dropping the stream wholesale.
+#[tokio::test]
+async fn stop_persists_partial_work_so_it_survives_reload() {
+    use aura_job::CancelReason;
+    use aura_model::Role;
+    use partial_stream_llm::PartialStreamLlm;
+
+    let drained = Arc::new(tokio::sync::Notify::new());
+    let llm = Arc::new(PartialStreamLlm::new(
+        vec![
+            StreamEvent::Reasoning("weighing the options".into()),
+            StreamEvent::Text("here is the partial answer".into()),
+        ],
+        Arc::clone(&drained),
+    ));
+    let mut harness = AgentTestHarness::builder()
+        .with_llm(llm as Arc<dyn aura_llm::LlmCompletion>)
+        .build();
+
+    harness.send_text("think out loud then hang").await.unwrap();
+
+    // Wait until both events are consumed and the stream is parked — the call
+    // is now genuinely blocked mid-stream with partial content in hand.
+    tokio::time::timeout(Duration::from_secs(2), drained.notified())
+        .await
+        .expect("the stream should have delivered its prefix then parked");
+
+    // `/stop`: cancel the in-flight turn.
+    let turns = harness
+        .job_lifecycle
+        .list_active_turns_by_session(&harness.session.id)
+        .await
+        .expect("list active turns");
+    assert!(!turns.is_empty(), "a turn must be in flight to cancel");
+    for job in &turns {
+        harness
+            .job_lifecycle
+            .cancel(&job.id, CancelReason::UserStopped, vec![])
+            .await
+            .expect("cancel the in-flight turn");
+    }
+
+    // Grab the store handles before `shutdown` consumes the harness; joining
+    // the actor then guarantees the turn fully unwound (and its partial was
+    // appended) before we read it back.
+    let session_manager = Arc::clone(&harness.session_manager);
+    let sid = harness.session.id.clone();
+
+    // The actor must unwind promptly (in-flight call aborted)...
+    tokio::time::timeout(Duration::from_secs(5), harness.shutdown())
+        .await
+        .expect("actor must terminate after its in-flight LLM call is cancelled");
+
+    // ...and the partial assistant turn must be durable: a reload rebuilds the
+    // transcript from `session_messages`, so the salvaged text + reasoning have
+    // to be there or the cancelled turn's work would vanish on refresh.
+    let persisted = session_manager
+        .full_transcript(&sid)
+        .await
+        .expect("load transcript");
+    let assistant = persisted
+        .iter()
+        .find(|m| m.role == Role::Assistant)
+        .expect("a partial assistant turn must be persisted");
+    let text = aura_llm::multimodal::extract_text(&assistant.content);
+    assert!(
+        text.contains("here is the partial answer"),
+        "persisted partial must carry the streamed answer text, got {text:?}"
+    );
+    assert!(
+        assistant
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Thinking { .. })),
+        "persisted partial must carry the streamed reasoning, got {:?}",
+        assistant.content
+    );
+}
