@@ -1064,12 +1064,15 @@ async fn subscribe_with_since_ordinal_replays_missed_messages() {
     let _ = server_handle.await;
 }
 
-/// The web mint endpoint stashes a `TokenHandle` in
-/// `web_chat_tokens`; the channel-WS upgrade is supposed to remove it
-/// from that stash and bind the handle to the connection's `Sidecar`,
-/// so closing the WS revokes the token.
+/// The web mint endpoint stashes a `TokenHandle` in `web_chat_tokens`;
+/// the channel-WS upgrade claims it (removes it from the stash) for the
+/// connection's lifetime, and on close RE-STASHES it (fresh `minted_at`)
+/// instead of dropping/revoking it — so the client's own backoff
+/// reconnect can re-present the same `?token=` and re-claim a still-live
+/// token rather than eating a 401. An abandoned token is bounded only by
+/// the janitor's TTL sweep of the re-stashed entry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn web_ws_upgrade_takes_handle_and_revokes_on_close() {
+async fn web_ws_close_restashes_token_so_reconnect_reuses_it() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let port_file =
         aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
@@ -1108,30 +1111,50 @@ async fn web_ws_upgrade_takes_handle_and_revokes_on_close() {
         .await
         .expect("handshake");
 
-    // After upgrade, the stash entry is gone — the handle has been
-    // moved into the Sidecar — but the token itself stays live for
-    // the duration of the WS.
+    // After upgrade, the stash entry is gone — the route claimed the
+    // handle for the connection's lifetime — but the token stays live.
     assert!(
         !web_chat_tokens.contains_key(&token),
-        "WS upgrade should have removed the stashed handle",
+        "WS upgrade should have claimed the stashed handle",
     );
     assert!(
         channel_tokens.lookup(&token).is_some(),
-        "token stays live while the WS is open (Sidecar owns the handle)",
+        "token stays live while the WS is open",
     );
 
     drop(client);
 
-    // Server-side close detection is async — poll until the Sidecar
-    // drops its handle (or fail the test after a generous deadline).
+    // Server-side close detection is async — poll until the route's
+    // teardown has re-stashed the handle. The token must NEVER go dead in
+    // the process (it's handed straight from the connection back into the
+    // stash, not dropped).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while channel_tokens.lookup(&token).is_some() {
+    loop {
+        assert!(
+            channel_tokens.lookup(&token).is_some(),
+            "token must stay live across close (re-stashed, never revoked)",
+        );
+        if web_chat_tokens.contains_key(&token) {
+            break;
+        }
         if tokio::time::Instant::now() >= deadline {
-            panic!("token should have been revoked after WS close");
+            panic!("handle should have been re-stashed after WS close");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    // The whole point: a reconnect presenting the SAME token re-claims it
+    // and handshakes cleanly instead of getting a dead-token 401.
+    let client2 = connect_register(port, &token, ChannelType::http())
+        .await
+        .expect("reconnect with the same token must succeed");
+    assert!(
+        !web_chat_tokens.contains_key(&token),
+        "reconnect re-claimed the re-stashed handle",
+    );
+    assert!(channel_tokens.lookup(&token).is_some(), "token still live");
+
+    drop(client2);
     shutdown.trigger();
     let _ = server_handle.await;
 }
