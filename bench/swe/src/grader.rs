@@ -201,6 +201,83 @@ pub fn parse_report(raw: &str) -> Result<GradeReport> {
     })
 }
 
+/// Summarize WHY a graded instance didn't resolve, by reading the harness's
+/// **per-instance** report (`<runs_dir>/logs/run_evaluation/<run_id>/<model>/<id>/report.json`).
+/// The run-level report parsed by [`parse_report`] only buckets ids; this
+/// per-instance file carries the `tests_status` detail. Returns `None` when the
+/// instance resolved, the report is absent/unparseable, or nothing stands out.
+pub fn failure_reason(
+    runs_dir: &Path,
+    run_id: &str,
+    model_name: &str,
+    instance_id: &str,
+) -> Option<String> {
+    let path = runs_dir
+        .join("logs/run_evaluation")
+        .join(run_id)
+        .join(model_name)
+        .join(instance_id)
+        .join("report.json");
+    reason_from_report(&std::fs::read_to_string(path).ok()?, instance_id)
+}
+
+const MAX_LISTED_TESTS: usize = 3;
+
+/// Categorize an unresolved instance from its per-instance report JSON. Pure
+/// (no I/O) so it's unit-testable. `None` if the record says resolved or carries
+/// no actionable failure.
+fn reason_from_report(raw: &str, instance_id: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let rec = value.get(instance_id)?;
+    if rec.get("resolved").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    // A genuine apply failure shows as patch_successfully_applied=false. (A
+    // reverse-applied patch is mislabeled true by swebench — that case surfaces
+    // below as the FAIL_TO_PASS tests then failing.)
+    if rec
+        .get("patch_successfully_applied")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        return Some("patch failed to apply".to_string());
+    }
+    let ts = rec.get("tests_status")?;
+    let failures = |group: &str| -> Vec<String> {
+        ts.get(group)
+            .and_then(|g| g.get("failure"))
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let f2p = failures("FAIL_TO_PASS");
+    if !f2p.is_empty() {
+        return Some(format!(
+            "FAIL_TO_PASS still failing: {}",
+            summarize_tests(&f2p)
+        ));
+    }
+    let p2p = failures("PASS_TO_PASS");
+    if !p2p.is_empty() {
+        return Some(format!("PASS_TO_PASS regressed: {}", summarize_tests(&p2p)));
+    }
+    None
+}
+
+/// Join up to [`MAX_LISTED_TESTS`] test ids, appending `(+N more)` if truncated.
+fn summarize_tests(tests: &[String]) -> String {
+    let shown = tests.len().min(MAX_LISTED_TESTS);
+    let mut s = tests[..shown].join(", ");
+    if tests.len() > shown {
+        s.push_str(&format!(" (+{} more)", tests.len() - shown));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +322,45 @@ mod tests {
     #[test]
     fn rejects_non_json() {
         assert!(parse_report("not json").is_err());
+    }
+
+    const REPORT: &str = r#"{"sphinx-doc__sphinx-1":{"patch_successfully_applied":true,"resolved":false,
+        "tests_status":{"FAIL_TO_PASS":{"success":[],"failure":["t/x.py::a","t/x.py::b","t/x.py::c","t/x.py::d"]},
+        "PASS_TO_PASS":{"success":["t/y.py::ok"],"failure":[]}}}}"#;
+
+    #[test]
+    fn reason_reports_fail_to_pass_with_truncation() {
+        let r = reason_from_report(REPORT, "sphinx-doc__sphinx-1").unwrap();
+        assert!(r.starts_with("FAIL_TO_PASS still failing:"));
+        assert!(r.contains("t/x.py::a"));
+        assert!(r.contains("(+1 more)")); // 4 failures, 3 shown
+    }
+
+    #[test]
+    fn reason_reports_pass_to_pass_regression() {
+        let raw = r#"{"i":{"patch_successfully_applied":true,"resolved":false,
+            "tests_status":{"FAIL_TO_PASS":{"success":["t::a"],"failure":[]},
+            "PASS_TO_PASS":{"success":[],"failure":["t::z"]}}}}"#;
+        let r = reason_from_report(raw, "i").unwrap();
+        assert_eq!(r, "PASS_TO_PASS regressed: t::z");
+    }
+
+    #[test]
+    fn reason_reports_apply_failure() {
+        let raw =
+            r#"{"i":{"patch_successfully_applied":false,"resolved":false,"tests_status":{}}}"#;
+        assert_eq!(
+            reason_from_report(raw, "i").unwrap(),
+            "patch failed to apply"
+        );
+    }
+
+    #[test]
+    fn reason_none_when_resolved_or_missing() {
+        let raw = r#"{"i":{"patch_successfully_applied":true,"resolved":true,"tests_status":{}}}"#;
+        assert!(reason_from_report(raw, "i").is_none());
+        // Record for a different id => None (not this instance's report).
+        assert!(reason_from_report(REPORT, "other").is_none());
+        assert!(reason_from_report("not json", "i").is_none());
     }
 }

@@ -186,6 +186,10 @@ pub enum BenchExtra {
         empty_patch: bool,
         errored: bool,
         error: Option<String>,
+        /// Why an unresolved instance failed grading (FAIL_TO_PASS tests left
+        /// failing, a PASS_TO_PASS regression, or an apply failure) — the SWE
+        /// analogue of the `tb` arm's `failure_mode`.
+        failure_reason: Option<String>,
         artifacts: Vec<ArtifactRef>,
     },
     Tb {

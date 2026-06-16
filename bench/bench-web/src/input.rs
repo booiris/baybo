@@ -66,6 +66,10 @@ pub struct SweItem {
     pub cost_micro_usd: i64,
     #[serde(default)]
     pub error: Option<String>,
+    /// Grading-side reason an unresolved instance failed (which FAIL_TO_PASS
+    /// tests, a PASS_TO_PASS regression, or an apply failure). Absent on older runs.
+    #[serde(default)]
+    pub failure_reason: Option<String>,
     #[serde(default)]
     pub source_run: Option<String>,
 }
