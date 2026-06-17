@@ -25,7 +25,7 @@ export function SettingsView({ conn }: { conn: Connection }) {
     <div className="relative flex flex-1 flex-col overflow-hidden">
       <header
         data-tauri-drag-region="deep"
-        className="flex items-center gap-3 border-b-[3px] border-border bg-canvas px-6 pb-3 pt-7"
+        className="flex items-center gap-3 border-b-[3px] border-border bg-canvas px-6 py-3"
       >
         {adding && (
           <button

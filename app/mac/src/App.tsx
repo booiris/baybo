@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { getConnection, type Connection } from './api/connection';
 import { setupStatus, startRuntime } from './api/setup';
 import { SetupWizard } from './setup/SetupWizard';
@@ -32,6 +33,33 @@ export function App() {
       if (signal.aborted) return;
       setPhase({ k: 'error', message: e instanceof Error ? e.message : String(e) });
     }
+  }, []);
+
+  // Mirror the native window's fullscreen state onto <html> so the title-bar
+  // reservation (`--titlebar`) collapses when macOS hides the traffic lights.
+  useEffect(() => {
+    const win = getCurrentWindow();
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    const sync = () =>
+      win
+        .isFullscreen()
+        .then((fs) => {
+          if (!cancelled) document.documentElement.classList.toggle('is-fullscreen', fs);
+        })
+        .catch(() => undefined);
+    sync();
+    win
+      .onResized(sync)
+      .then((un) => {
+        if (cancelled) un();
+        else unlisten = un;
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   }, []);
 
   useEffect(() => {

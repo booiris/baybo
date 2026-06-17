@@ -100,7 +100,7 @@ export function Sidebar({
       data-tauri-drag-region="deep"
       className="flex w-64 shrink-0 flex-col border-r-[3px] border-border bg-canvas"
     >
-      <div data-tauri-drag-region="deep" className="h-7 shrink-0" />
+      <div data-tauri-drag-region="deep" className="h-[var(--titlebar)] shrink-0" />
 
       <nav data-tauri-drag-region="deep" className="flex flex-col gap-0.5 px-2 pb-2">
         <NavItem icon={<NewChatIcon className="h-4 w-4" />} label="新对话" onClick={onNewChat} />

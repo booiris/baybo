@@ -139,29 +139,36 @@ export function Workspace({ conn }: { conn: Connection }) {
   return (
     <div className="flex h-screen bg-canvas">
       {/* Far-left app rail (gold): brand/home + settings — app-level nav, kept
-          distinct from the conversation sidebar to its right. */}
-      <nav
-        data-tauri-drag-region="deep"
-        className="flex w-12 shrink-0 flex-col items-center gap-3 border-r-[3px] border-border bg-rail pb-3 pt-7"
-      >
-        <button
-          onClick={() => setView('chat')}
-          title="对话"
-          className={`flex h-8 w-8 items-center justify-center rounded-brutal border-2 border-border font-mono text-sm font-bold transition-all hover:-translate-y-0.5 hover:shadow-brutal-sm active:translate-y-0 active:shadow-none ${
-            view === 'settings' ? 'bg-surface' : 'bg-selected shadow-brutal-sm'
-          }`}
+          distinct from the conversation sidebar to its right. The top 32px is a
+          seamless cream title-bar strip shared with the sidebar (no rail→sidebar
+          divider runs through it) so the macOS overlay traffic lights sit on a
+          clean field instead of straddling the gold/cream seam. The gold fill
+          and its `border-r` divider start below the strip. */}
+      <nav data-tauri-drag-region="deep" className="flex w-12 shrink-0 flex-col bg-canvas">
+        <div data-tauri-drag-region="deep" className="h-[var(--titlebar)] shrink-0" />
+        <div
+          data-tauri-drag-region="deep"
+          className="flex flex-1 flex-col items-center gap-3 border-r-[3px] border-border bg-rail pb-3 pt-3"
         >
-          A
-        </button>
-        <button
-          onClick={() => setView('settings')}
-          title="设置"
-          className={`group mt-auto flex h-8 w-8 items-center justify-center rounded-brutal border-2 border-border transition-all hover:-translate-y-0.5 hover:shadow-brutal-sm active:translate-y-0 active:shadow-none ${
-            view === 'settings' ? 'bg-selected shadow-brutal-sm' : 'bg-surface'
-          }`}
-        >
-          <SettingsIcon className="h-4 w-4 transition-transform duration-300 group-hover:rotate-90" />
-        </button>
+          <button
+            onClick={() => setView('chat')}
+            title="对话"
+            className={`flex h-8 w-8 items-center justify-center rounded-brutal border-2 border-border font-mono text-sm font-bold transition-all hover:-translate-y-0.5 hover:shadow-brutal-sm active:translate-y-0 active:shadow-none ${
+              view === 'settings' ? 'bg-surface' : 'bg-selected shadow-brutal-sm'
+            }`}
+          >
+            A
+          </button>
+          <button
+            onClick={() => setView('settings')}
+            title="设置"
+            className={`group mt-auto flex h-8 w-8 items-center justify-center rounded-brutal border-2 border-border transition-all hover:-translate-y-0.5 hover:shadow-brutal-sm active:translate-y-0 active:shadow-none ${
+              view === 'settings' ? 'bg-selected shadow-brutal-sm' : 'bg-surface'
+            }`}
+          >
+            <SettingsIcon className="h-4 w-4 transition-transform duration-300 group-hover:rotate-90" />
+          </button>
+        </div>
       </nav>
 
       <Sidebar
@@ -493,7 +500,7 @@ function Thread({
     <>
       <header
         data-tauri-drag-region="deep"
-        className="flex items-center justify-between gap-3 border-b-[3px] border-border bg-canvas px-6 pb-2.5 pt-7"
+        className="flex items-center justify-between gap-3 border-b-[3px] border-border bg-canvas px-6 py-3"
       >
         <h1 className="min-w-0 flex-1 truncate text-sm font-bold">{title || '新对话'}</h1>
         <ConnState link={link} phase={phase} />

@@ -28,7 +28,7 @@ function Pane({
     <div className="flex flex-1 flex-col overflow-hidden">
       <header
         data-tauri-drag-region="deep"
-        className="flex items-center gap-2.5 border-b-[3px] border-border bg-canvas px-6 pb-3 pt-7"
+        className="flex items-center gap-2.5 border-b-[3px] border-border bg-canvas px-6 py-3"
       >
         <span className="text-ink">{icon}</span>
         <h2 className="text-base font-bold uppercase tracking-tight">{title}</h2>
