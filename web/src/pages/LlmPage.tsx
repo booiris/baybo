@@ -304,7 +304,7 @@ function LlmCard({
           <div className="flex items-center gap-3 mb-1 flex-wrap">
             <h3 className="font-bold text-[1.15rem] tracking-tight">{entry.name}</h3>
             {entry.is_default ? (
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black bg-brand text-white">
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black bg-brand text-ink">
                 <RiStarFill /> Default
               </span>
             ) : (

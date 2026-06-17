@@ -164,7 +164,7 @@ export function CronInbox({ refreshSignal }: CronInboxProps) {
             onClick={markAllSeen}
             title="Mark all as read"
             aria-label={`${unreadCount} new cron fires — mark all as read`}
-            className="inline-flex items-center justify-center min-w-[20px] h-[20px] px-1.5 bg-brand text-white border-2 border-black rounded-md text-[0.65rem] font-bold shadow-brutal-xs hover:bg-brand-hover active:translate-x-[1px] active:translate-y-[1px] active:shadow-none cursor-pointer"
+            className="inline-flex items-center justify-center min-w-[20px] h-[20px] px-1.5 bg-brand text-ink border-2 border-black rounded-md text-[0.65rem] font-bold shadow-brutal-xs hover:bg-brand-hover active:translate-x-[1px] active:translate-y-[1px] active:shadow-none cursor-pointer"
           >
             {unreadCount}
           </button>
@@ -251,7 +251,7 @@ function CronMessageRow({ message, isNew, expanded, onToggle }: CronMessageRowPr
             {message.cron_job_id.slice(0, 8)}
           </code>
           {isNew ? (
-            <span className="px-1 py-0.5 bg-brand text-white border border-black rounded text-[0.55rem] leading-none">
+            <span className="px-1 py-0.5 bg-brand text-ink border border-black rounded text-[0.55rem] leading-none">
               new
             </span>
           ) : null}
