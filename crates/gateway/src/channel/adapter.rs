@@ -17,6 +17,7 @@
 //! `Frame`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aura_channels::wire::{
     self, AttachmentKind, Frame, Message as WireMessage, TaskView, WireAttachment,
@@ -34,8 +35,6 @@ use futures::stream::SplitSink;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::auth::TokenHandle;
-
 pub(crate) type WsSink = SplitSink<WebSocket, AxumWsMessage>;
 
 /// Outbound mpsc buffer. Large enough to absorb a short burst of
@@ -51,18 +50,6 @@ pub(crate) struct Sidecar {
     pub connection: Arc<Connection>,
     frame_tx: mpsc::Sender<Frame>,
     pump: JoinHandle<()>,
-    /// `Some` for `AuthedClient::Web` connections: the `TokenHandle`
-    /// owned by this WS. Held purely for its `Drop` side effect —
-    /// when the `Sidecar` drops (WS close), the handle drops, which
-    /// revokes the token from [`crate::auth::ChannelTokenTable`].
-    /// `None` for other auth variants whose handles are owned
-    /// elsewhere (gateway-issued TUI token, `spawn::ChildHandle` for
-    /// sidecars). Race-tolerant: if a second WS upgrades with the
-    /// same token (e.g. dev StrictMode double-mount) and the handle
-    /// is already owned by the first `Sidecar`, the second gets
-    /// `None` here — the token stays alive as long as either
-    /// `Sidecar` does.
-    _token_handle: Option<TokenHandle>,
 }
 
 /// Resolve the channel for `channel_type` from the registry, falling
@@ -100,7 +87,6 @@ impl Sidecar {
         channel: Arc<Channel>,
         sink: WsSink,
         blob_store: Arc<dyn BlobStore>,
-        token_handle: Option<TokenHandle>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(OUTBOUND_BUFFER);
         let (frame_tx, frame_rx) = mpsc::channel::<Frame>(OUTBOUND_BUFFER);
@@ -135,7 +121,6 @@ impl Sidecar {
             connection,
             frame_tx,
             pump,
-            _token_handle: token_handle,
         }
     }
 
@@ -232,8 +217,31 @@ async fn translator_loop(
     }
 }
 
+/// Server-initiated keepalive cadence. The web client force-closes a WS
+/// it hasn't heard from in ~45s (its half-open watchdog), and a
+/// backgrounded tab's own ping timer gets throttled by the browser — so
+/// the *server* must emit periodic traffic to keep that watchdog fed.
+/// Each `Ping` also draws a client `Pong`; either frame resets the
+/// client's `lastFrameAt`. Comfortably under the client's liveness budget
+/// so a single dropped frame doesn't trip it.
+const KEEPALIVE_PING_INTERVAL: Duration = Duration::from_secs(20);
+
 async fn pump_loop(mut sink: WsSink, mut frame_rx: mpsc::Receiver<Frame>) {
-    while let Some(frame) = frame_rx.recv().await {
+    // First tick fires one interval out, not immediately, so a chatty
+    // connection never carries a redundant startup Ping.
+    let mut keepalive = tokio::time::interval_at(
+        tokio::time::Instant::now() + KEEPALIVE_PING_INTERVAL,
+        KEEPALIVE_PING_INTERVAL,
+    );
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let frame = tokio::select! {
+            recv = frame_rx.recv() => match recv {
+                Some(frame) => frame,
+                None => break,
+            },
+            _ = keepalive.tick() => Frame::Ping,
+        };
         let bytes = match wire::encode(&frame) {
             Ok(b) => b,
             Err(e) => {
@@ -410,6 +418,12 @@ async fn agent_output_to_frame(
             session_id,
             user_id,
             tasks: tasks.into_iter().map(TaskView::from).collect(),
+        },
+        AgentEvent::TurnState { active, started_at } => Frame::TurnState {
+            session_id,
+            user_id,
+            active,
+            started_at,
         },
         // Reuse `split_content`'s media→`WireAttachment` mapping; the
         // text half is empty for the media-only blocks this carries.

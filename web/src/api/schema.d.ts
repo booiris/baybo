@@ -759,6 +759,13 @@ export interface components {
          */
         ChatTranscriptItem: {
             /**
+             * @description `true` when this `work` item belongs to a turn that was cancelled
+             *     (e.g. `/stop`) rather than run to a normal reply — the client labels it
+             *     "Cancelled" instead of a plain `Worked Xs`. Always false for
+             *     `message` / `notice` items.
+             */
+            cancelled?: boolean;
+            /**
              * Format: date-time
              * @description Wall-clock time the row was persisted, sourced from
              *     `session_messages.created_at`. Lets the client render a
@@ -930,18 +937,34 @@ export interface components {
             ended_at?: string | null;
             final_result?: Record<string, never> | null;
             id: string;
-            kind: components["schemas"]["JobKind"];
+            /** @description What payload fed the job (display-only projection of the input). */
+            input_kind: components["schemas"]["JobInputKind"];
+            /** @description The owning session's root trigger. */
+            origin: components["schemas"]["JobOrigin"];
             parent_job_id?: string | null;
             session_id: string;
+            /** @description Turn vs maintenance. */
+            shape: components["schemas"]["JobShape"];
             /** Format: date-time */
             started_at?: string | null;
             status: components["schemas"]["JobStatus"];
         };
         /**
-         * @description Wire mirror of [`aura_job::JobKind`].
+         * @description Wire mirror of [`aura_job::JobInputKind`] — what payload fed the job.
          * @enum {string}
          */
-        JobKind: "user_chat" | "cron" | "system" | "spawned" | "subagent_notification";
+        JobInputKind: "user_chat" | "cron" | "system" | "spawned" | "subagent_notification";
+        /**
+         * @description Wire mirror of a job's origin (the owning session's root trigger,
+         *     [`aura_model::TriggerKind`]).
+         * @enum {string}
+         */
+        JobOrigin: "user" | "cron" | "system" | "spawned";
+        /**
+         * @description Wire mirror of [`aura_job::JobShape`] — turn vs maintenance.
+         * @enum {string}
+         */
+        JobShape: "turn" | "maintenance";
         /**
          * @description Wire mirror of [`aura_job::JobStatus`]. Carries the same payload
          *     the domain enum carries (cancel reason, partial-artifact span IDs);
@@ -2169,9 +2192,14 @@ export interface operations {
                             ended_at?: string | null;
                             final_result?: Record<string, never> | null;
                             id: string;
-                            kind: components["schemas"]["JobKind"];
+                            /** @description What payload fed the job (display-only projection of the input). */
+                            input_kind: components["schemas"]["JobInputKind"];
+                            /** @description The owning session's root trigger. */
+                            origin: components["schemas"]["JobOrigin"];
                             parent_job_id?: string | null;
                             session_id: string;
+                            /** @description Turn vs maintenance. */
+                            shape: components["schemas"]["JobShape"];
                             /** Format: date-time */
                             started_at?: string | null;
                             status: components["schemas"]["JobStatus"];

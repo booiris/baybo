@@ -6,4 +6,10 @@ import type { ParserResult } from "./ParserResult";
  * Bench-specific detail. Tagged on `type` so the frontend matches on a
  * single discriminator.
  */
-export type BenchExtra = { "type": "swe", repo: string, patch_bytes: number, empty_patch: boolean, errored: boolean, error: string | null, artifacts: Array<ArtifactRef>, } | { "type": "tb", parser_results: Array<ParserResult>, failure_mode: string, instruction: string | null, artifacts: Array<ArtifactRef>, } | { "type": "memory", category: string, question: string, gold: string, answer: string, judge_reason: string, f1: number, };
+export type BenchExtra = { "type": "swe", repo: string, patch_bytes: number, empty_patch: boolean, errored: boolean, error: string | null, 
+/**
+ * Why an unresolved instance failed grading (FAIL_TO_PASS tests left
+ * failing, a PASS_TO_PASS regression, or an apply failure) — the SWE
+ * analogue of the `tb` arm's `failure_mode`.
+ */
+failure_reason: string | null, artifacts: Array<ArtifactRef>, } | { "type": "tb", parser_results: Array<ParserResult>, failure_mode: string, instruction: string | null, artifacts: Array<ArtifactRef>, } | { "type": "memory", category: string, question: string, gold: string, answer: string, judge_reason: string, f1: number, };

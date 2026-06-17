@@ -67,6 +67,7 @@ pub(super) fn parse(
                     empty_patch: it.empty_patch,
                     errored: it.errored,
                     error: it.error.clone(),
+                    failure_reason: it.failure_reason.clone(),
                     artifacts,
                 },
             }

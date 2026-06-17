@@ -512,10 +512,10 @@ impl From<aura_job::JobStatus> for JobStatus {
     }
 }
 
-/// Wire mirror of [`aura_job::JobKind`].
+/// Wire mirror of [`aura_job::JobInputKind`] — what payload fed the job.
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum JobKind {
+pub enum JobInputKind {
     UserChat,
     Cron,
     System,
@@ -523,14 +523,53 @@ pub enum JobKind {
     SubagentNotification,
 }
 
-impl From<aura_job::JobKind> for JobKind {
-    fn from(v: aura_job::JobKind) -> Self {
+impl From<aura_job::JobInputKind> for JobInputKind {
+    fn from(v: aura_job::JobInputKind) -> Self {
         match v {
-            aura_job::JobKind::UserChat => Self::UserChat,
-            aura_job::JobKind::Cron => Self::Cron,
-            aura_job::JobKind::System => Self::System,
-            aura_job::JobKind::Spawned => Self::Spawned,
-            aura_job::JobKind::SubagentNotification => Self::SubagentNotification,
+            aura_job::JobInputKind::UserChat => Self::UserChat,
+            aura_job::JobInputKind::Cron => Self::Cron,
+            aura_job::JobInputKind::System => Self::System,
+            aura_job::JobInputKind::Spawned => Self::Spawned,
+            aura_job::JobInputKind::SubagentNotification => Self::SubagentNotification,
+        }
+    }
+}
+
+/// Wire mirror of a job's origin (the owning session's root trigger,
+/// [`aura_model::TriggerKind`]).
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JobOrigin {
+    User,
+    Cron,
+    System,
+    Spawned,
+}
+
+impl From<aura_model::TriggerKind> for JobOrigin {
+    fn from(v: aura_model::TriggerKind) -> Self {
+        match v {
+            aura_model::TriggerKind::User => Self::User,
+            aura_model::TriggerKind::Cron => Self::Cron,
+            aura_model::TriggerKind::System => Self::System,
+            aura_model::TriggerKind::Spawned => Self::Spawned,
+        }
+    }
+}
+
+/// Wire mirror of [`aura_job::JobShape`] — turn vs maintenance.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JobShape {
+    Turn,
+    Maintenance,
+}
+
+impl From<aura_job::JobShape> for JobShape {
+    fn from(v: aura_job::JobShape) -> Self {
+        match v {
+            aura_job::JobShape::Turn => Self::Turn,
+            aura_job::JobShape::Maintenance => Self::Maintenance,
         }
     }
 }
@@ -543,7 +582,12 @@ pub struct Job {
     pub id: String,
     pub session_id: String,
     pub parent_job_id: Option<String>,
-    pub kind: JobKind,
+    /// What payload fed the job (display-only projection of the input).
+    pub input_kind: JobInputKind,
+    /// The owning session's root trigger.
+    pub origin: JobOrigin,
+    /// Turn vs maintenance.
+    pub shape: JobShape,
     pub status: JobStatus,
     #[schema(value_type = Option<Object>)]
     pub final_result: Option<serde_json::Value>,
@@ -559,7 +603,9 @@ impl From<aura_job::Job> for Job {
             id: v.id.to_string(),
             session_id: v.session_id.to_string(),
             parent_job_id: v.parent_job_id.map(|p| p.to_string()),
-            kind: v.kind.into(),
+            input_kind: v.input_kind().into(),
+            origin: v.origin.into(),
+            shape: v.shape.into(),
             status: v.status.into(),
             final_result: v
                 .final_result

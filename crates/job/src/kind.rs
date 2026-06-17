@@ -1,25 +1,29 @@
-//! `JobKind`, `JobInput`, `JobOutput`.
+//! `JobInputKind`, `JobInput`, `JobShape`, `JobOutput`.
 //!
-//! Trigger ↔ Job kind mapping (the `session.trigger.kind() == job.kind()`
-//! invariant in `session.md`):
-//!
-//! | session trigger | allowed job kind            |
-//! | --------------- | --------------------------- |
-//! | `User`          | `JobKind::UserChat`         |
-//! | `Cron`          | `JobKind::Cron`             |
-//! | `System`        | `JobKind::System`           |
-//! | (any)           | `JobKind::Spawned` is also valid in any session — spawned jobs inherit their parent context regardless of root trigger |
-//! | (any)           | `JobKind::SubagentNotification` is also valid in any session — the parent's autonomous turn reacting to a finished background subagent |
+//! A job carries three orthogonal descriptors, each with a single
+//! source of truth:
+//! - **input kind** ([`JobInputKind`]) — what payload fed it; a
+//!   projection of [`JobInput`]. Display / denormalisation only.
+//! - **origin** ([`aura_model::TriggerKind`], stored on `Job`) — the
+//!   owning session's root trigger, recorded as-is at creation. Not
+//!   asserted against the payload: a maintenance job runs inside a
+//!   `User`-trigger session and records `origin = User` honestly.
+//! - **shape** ([`JobShape`]) — whether the job runs a full agent-loop
+//!   turn or a one-shot maintenance pass. Declared by the code path that
+//!   runs the job, *not* derived from the payload: `/compact` and
+//!   background compression are both `Maintenance` even though only the
+//!   latter carries a `System` input.
 
-use aura_model::{BackgroundCompressionPayload, ContentBlock, TriggerKind};
+use aura_model::{BackgroundCompressionPayload, ContentBlock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Discriminator for the four job shapes. Mirrors `TriggerKind` 1:1
-/// plus `Spawned` (subagent jobs).
+/// What payload fed this job — a projection of [`JobInput`]. Used for
+/// display and the denormalised `jobs.kind` column only; behaviour
+/// branches on [`JobInput`] itself, never on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum JobKind {
+pub enum JobInputKind {
     UserChat,
     Cron,
     System,
@@ -27,19 +31,20 @@ pub enum JobKind {
     SubagentNotification,
 }
 
-impl JobKind {
-    /// Whether this kind of job is permitted on a session whose root
-    /// trigger has the given kind. `Spawned` is permitted everywhere.
-    pub fn allowed_for(&self, trigger: TriggerKind) -> bool {
-        matches!(
-            (self, trigger),
-            (JobKind::UserChat, TriggerKind::User)
-                | (JobKind::Cron, TriggerKind::Cron)
-                | (JobKind::System, TriggerKind::System)
-                | (JobKind::Spawned, _)
-                | (JobKind::SubagentNotification, _)
-        )
-    }
+/// Whether a job runs a full agent-loop turn or a one-shot maintenance
+/// pass. A turn drives the LLM↔tool loop on behalf of its session; a
+/// maintenance job (background compression, `/compact`) does focused
+/// bookkeeping and never enters the loop. Read via `Job::is_turn()`.
+///
+/// Set by the code path that runs the job — `run()` is a `Turn`,
+/// compression paths are `Maintenance` — rather than inferred from the
+/// payload, which would mislabel a `/compact` (a `UserChat`-input
+/// maintenance pass) as a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobShape {
+    Turn,
+    Maintenance,
 }
 
 /// What initially fed this job.
@@ -75,13 +80,13 @@ pub enum JobInput {
 }
 
 impl JobInput {
-    pub fn kind(&self) -> JobKind {
+    pub fn input_kind(&self) -> JobInputKind {
         match self {
-            JobInput::UserChat { .. } => JobKind::UserChat,
-            JobInput::Cron { .. } => JobKind::Cron,
-            JobInput::System { .. } => JobKind::System,
-            JobInput::Spawned { .. } => JobKind::Spawned,
-            JobInput::SubagentNotification { .. } => JobKind::SubagentNotification,
+            JobInput::UserChat { .. } => JobInputKind::UserChat,
+            JobInput::Cron { .. } => JobInputKind::Cron,
+            JobInput::System { .. } => JobInputKind::System,
+            JobInput::Spawned { .. } => JobInputKind::Spawned,
+            JobInput::SubagentNotification { .. } => JobInputKind::SubagentNotification,
         }
     }
 }
@@ -106,44 +111,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn job_kind_allowed_for_matches_trigger() {
-        assert!(JobKind::UserChat.allowed_for(TriggerKind::User));
-        assert!(JobKind::Cron.allowed_for(TriggerKind::Cron));
-        assert!(JobKind::System.allowed_for(TriggerKind::System));
-        // Spawned is allowed under any root trigger
-        assert!(JobKind::Spawned.allowed_for(TriggerKind::User));
-        assert!(JobKind::Spawned.allowed_for(TriggerKind::Cron));
-        assert!(JobKind::Spawned.allowed_for(TriggerKind::System));
-        assert!(JobKind::SubagentNotification.allowed_for(TriggerKind::User));
-        assert!(JobKind::SubagentNotification.allowed_for(TriggerKind::Cron));
-        // Mismatches are rejected
-        assert!(!JobKind::UserChat.allowed_for(TriggerKind::Cron));
-        assert!(!JobKind::Cron.allowed_for(TriggerKind::User));
-        assert!(!JobKind::System.allowed_for(TriggerKind::User));
-    }
-
-    #[test]
     fn input_kind_matches_variant() {
         let i = JobInput::UserChat { content: vec![] };
-        assert_eq!(i.kind(), JobKind::UserChat);
+        assert_eq!(i.input_kind(), JobInputKind::UserChat);
 
         let i = JobInput::Cron {
             action_payload: serde_json::json!({}),
         };
-        assert_eq!(i.kind(), JobKind::Cron);
+        assert_eq!(i.input_kind(), JobInputKind::Cron);
 
         let i = JobInput::System {
             payload: BackgroundCompressionPayload { up_to_ordinal: 0 },
         };
-        assert_eq!(i.kind(), JobKind::System);
+        assert_eq!(i.input_kind(), JobInputKind::System);
 
         let i = JobInput::Spawned {
             initial_prompt: vec![],
         };
-        assert_eq!(i.kind(), JobKind::Spawned);
+        assert_eq!(i.input_kind(), JobInputKind::Spawned);
 
         let i = JobInput::SubagentNotification { content: vec![] };
-        assert_eq!(i.kind(), JobKind::SubagentNotification);
+        assert_eq!(i.input_kind(), JobInputKind::SubagentNotification);
     }
 
     #[test]
@@ -153,7 +141,7 @@ mod tests {
         };
         let s = serde_json::to_string(&i).unwrap();
         let back: JobInput = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.kind(), i.kind());
+        assert_eq!(back.input_kind(), i.input_kind());
     }
 
     #[test]

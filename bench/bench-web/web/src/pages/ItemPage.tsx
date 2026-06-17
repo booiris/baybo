@@ -174,6 +174,16 @@ function ExtraPanel({ benchId, extra }: { benchId: string; extra: BenchExtra }) 
           {extra.empty_patch && <StatChip label="patch" value="empty" />}
           {extra.errored && <StatChip label="errored" value="yes" />}
         </div>
+        {extra.failure_reason && (
+          <div>
+            <div className="text-[0.6rem] uppercase tracking-wider text-ink-soft font-bold mb-1">
+              why unresolved
+            </div>
+            <pre className="whitespace-pre-wrap break-words font-mono text-[0.8rem] text-err bg-err/10 border-2 border-black rounded-md p-2">
+              {extra.failure_reason}
+            </pre>
+          </div>
+        )}
         {extra.error && (
           <pre className="whitespace-pre-wrap break-words font-mono text-[0.8rem] text-err bg-err/10 border-2 border-black rounded-md p-2">
             {extra.error}

@@ -33,6 +33,17 @@ const SWE_MERGED_AGENT: &str = r#"{
     "source_run": "2026-01-01__00-00-00"}]
 }"#;
 
+// Diagnostic arms (oracle = ceiling, noop = floor). The viewer hides these
+// for SWE so only `agent` shows — see `swe_hides_diagnostic_arms`.
+const SWE_ORACLE_RUN: &str = r#"{
+  "run_id": "2026-01-01__00-00-00", "arm": "oracle", "model": "gold", "mean_latency_ms": 0,
+  "results": [{"instance_id": "repo__pkg-1", "repo": "repo/pkg", "resolved": true}]
+}"#;
+const SWE_NOOP_RUN: &str = r#"{
+  "run_id": "2026-01-01__00-00-00", "arm": "noop", "model": "aura-noop", "mean_latency_ms": 0,
+  "results": [{"instance_id": "repo__pkg-1", "repo": "repo/pkg", "resolved": false, "empty_patch": true}]
+}"#;
+
 const TB1_RUN: &str = r#"{
   "id": "uuid-1", "results": [{"task_id": "mytask",
     "trial_name": "mytask.1-of-1.2026-02-02__00-00-00", "is_resolved": true,
@@ -74,6 +85,16 @@ fn fixture() -> tempfile::TempDir {
         SWE_AGENT_RUN,
     );
     write(r.join("swe/results/merged-agent.json"), SWE_MERGED_AGENT);
+    // Diagnostic arms present on disk but expected to be filtered out.
+    write(
+        r.join("swe/results/results-oracle-2026-01-01__00-00-00.json"),
+        SWE_ORACLE_RUN,
+    );
+    write(r.join("swe/results/merged-oracle.json"), SWE_ORACLE_RUN);
+    write(
+        r.join("swe/results/results-noop-2026-01-01__00-00-00.json"),
+        SWE_NOOP_RUN,
+    );
     symlink(
         "results-agent-2026-01-01__00-00-00.json",
         r.join("swe/results/latest-agent.json"),
@@ -167,9 +188,31 @@ fn swe_merged_float_latency_parses() {
 fn swe_run_count_excludes_merged_and_symlink() {
     let d = fixture();
     let detail = adapters::bench_detail(root(&d), "swe").expect("swe detail");
-    // One individual + one merged; the `latest-*` symlink is skipped.
+    // One individual + one merged; the `latest-*` symlink and the oracle/noop
+    // diagnostic arms are skipped.
     assert_eq!(detail.runs.len(), 2);
     assert_eq!(detail.info.run_count, 1);
+}
+
+#[test]
+fn swe_hides_diagnostic_arms() {
+    let d = fixture();
+    let detail = adapters::bench_detail(root(&d), "swe").expect("swe detail");
+    let arms: Vec<&str> = detail.standing.iter().map(|s| s.arm.as_str()).collect();
+    assert_eq!(arms, ["agent"], "only the agent arm is shown for SWE");
+    assert!(
+        detail
+            .runs
+            .iter()
+            .all(|r| r.arm.as_deref() == Some("agent"))
+    );
+    // Search must not surface oracle/noop items either.
+    let hits = adapters::search(root(&d), "repo__pkg-1");
+    assert!(
+        hits.iter()
+            .filter(|h| h.bench == "swe")
+            .all(|h| h.arm.as_deref() == Some("agent"))
+    );
 }
 
 #[test]

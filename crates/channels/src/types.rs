@@ -153,6 +153,25 @@ pub enum AgentEvent {
     /// render a live checklist (the web dashboard) replace their stored list
     /// for the session; surfaces without one drop it.
     TaskList(Vec<aura_model::Task>),
+    /// Whether a turn (an agent-loop run producing this session's reply)
+    /// is in flight. An idempotent snapshot, not an edge. Every emission
+    /// is derived from one truth — a non-terminal turn-kind job in the job
+    /// store: the turn-state projector recomputes and broadcasts on each
+    /// job lifecycle transition (the `Pending → InProgress` start edge and
+    /// the terminal edges — covering success, error, cancel and crash),
+    /// and the gateway derives one snapshot on every WS Subscribe, so a
+    /// late-joining client (new tab, reconnect) learns about a turn whose
+    /// progress frames it never received. The actor itself never emits
+    /// this. Channels that render a per-turn work block (the web
+    /// dashboard) drive its open/closed state from this; surfaces that
+    /// infer turn activity locally (TUI) drop it.
+    TurnState {
+        active: bool,
+        /// `Some` iff `active` — when the in-flight turn started, so a
+        /// late joiner's elapsed timer shows true turn age rather than
+        /// restarting at zero.
+        started_at: Option<DateTime<Utc>>,
+    },
     /// Media a tool produced mid-turn (a sent file, a screenshot), to be
     /// delivered to the user as its **own** message the moment the tool
     /// returns — distinct from `Message` (the turn's terminal reply) so it

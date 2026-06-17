@@ -17,9 +17,9 @@ pub use kind::ChannelKind;
 pub use registration::{Prompter, RegistrationResult};
 pub use registry::ChannelRegistry;
 pub use slash::{
-    COMPACT_COMMAND, COMPACT_COMMAND_NAME, DashboardProvider, DashboardSnapshot, STOP_COMMAND,
-    STOP_COMMAND_DESCRIPTION, STOP_COMMAND_NAME, SlashCommand, SlashHandler, SlashOutcome,
-    ViewKind,
+    COMPACT_COMMAND, COMPACT_COMMAND_NAME, DashboardProvider, DashboardSnapshot,
+    STOP_CANCELLED_REPLY_LINE, STOP_COMMAND, STOP_COMMAND_DESCRIPTION, STOP_COMMAND_NAME,
+    SlashCommand, SlashHandler, SlashOutcome, ViewKind,
 };
 pub use types::{
     AgentEvent, AgentOutput, IncomingMessage, Message, MessageRole, NoticeLevel, OutgoingMessage,

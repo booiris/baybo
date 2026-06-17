@@ -30,7 +30,7 @@
 
 use std::future::Future;
 
-use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
+use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput, JobShape};
 use aura_model::{JobId, ParallelGroup, SessionId, TriggerKind};
 use aura_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanFinalize, SpanHandle, SpanKind,
@@ -46,7 +46,12 @@ use tracing::warn;
 /// so the cancel state machine can't be skipped.
 pub(crate) struct JobSpec {
     pub session_id: SessionId,
-    pub session_trigger_kind: TriggerKind,
+    /// The owning session's root trigger — recorded on the job as its
+    /// `origin`, independent of `input`.
+    pub origin: TriggerKind,
+    /// Whether this job runs a full agent-loop turn or a maintenance
+    /// pass — declared by the spawning path, not inferred from `input`.
+    pub shape: JobShape,
     pub input: JobInput,
     pub parent_job_id: Option<JobId>,
 }
@@ -152,7 +157,8 @@ where
     let job = lifecycle
         .start_job(
             spec.session_id,
-            spec.session_trigger_kind,
+            spec.origin,
+            spec.shape,
             spec.input,
             spec.parent_job_id,
         )

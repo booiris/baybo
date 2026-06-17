@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::Duration;
 
 use aura_channels::{
     AgentEvent, AgentOutput, IncomingMessage, NoticeLevel, OutgoingMessage, STOP_COMMAND_NAME,
@@ -11,6 +12,12 @@ use crate::actor::AgentMessage;
 use crate::actor::supervisor::InFlightJob;
 
 use super::Router;
+
+/// How long `/stop` waits for a cancelled turn to fully unwind (persisting its
+/// partial assistant row) before anchoring the stop control events. Generous —
+/// the abort is near-instant — and a backstop so a wedged turn can't stall the
+/// durable stop log indefinitely.
+const STOP_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl Router {
     pub(super) async fn handle_incoming(
@@ -187,13 +194,20 @@ impl Router {
         // descendant walk is a best-effort `UserStopped` audit stamp + backstop,
         // not the load-bearing stop (a foreground child cancelled via cascade
         // ends up `ParentCancelled`, which is the accurate reason for it).
-        // `list_active_by_session` is store-filtered, so a long-lived session's
-        // full job history isn't loaded just to find the live few.
+        // `list_active_turns_by_session` is store-filtered before applying the
+        // turn-kind filter, so a long-lived session's full job history isn't
+        // loaded just to find the live reply job(s).
         let mut cancelled_turn = false;
-        match self.job_lifecycle.list_active_by_session(session_id).await {
+        let mut cancelled_turn_jobs: Vec<JobId> = Vec::new();
+        match self
+            .job_lifecycle
+            .list_active_turns_by_session(session_id)
+            .await
+        {
             Ok(jobs) => {
                 for job in jobs {
                     cancelled_turn = true;
+                    cancelled_turn_jobs.push(job.id);
                     let _ = self
                         .job_lifecycle
                         .cancel(&job.id, CancelReason::UserStopped, vec![])
@@ -210,11 +224,11 @@ impl Router {
         // stored token to also cover the pre-job-dispatch window: when no row
         // exists yet the token is the only handle, and the child aborts at
         // iteration 0 once it spawns its job (`with_job` then flips that row
-        // terminal). `list_active_by_session` keeps the lookup bounded.
+        // terminal). `list_active_turns_by_session` keeps the lookup bounded.
         for (child_session, info) in &background {
             if let Ok(jobs) = self
                 .job_lifecycle
-                .list_active_by_session(child_session)
+                .list_active_turns_by_session(child_session)
                 .await
             {
                 for job in jobs {
@@ -233,15 +247,36 @@ impl Router {
         // completed work — so once the cancelled turn returns, the actor reports
         // them via the normal notification path.
         let text = build_stop_notice(cancelled_turn, &background);
+
+        // Fire the live notice first so the user sees the stop immediately,
+        // independent of the durable-persist work below.
+        self.handle_agent_output(AgentOutput {
+            session_id: session_id.clone(),
+            user_id: user_id.to_string(),
+            channel: channel.clone(),
+            event: AgentEvent::Notice {
+                level: NoticeLevel::Info,
+                text: text.clone(),
+            },
+        })
+        .await;
+
+        // Let each cancelled turn fully unwind before anchoring the control
+        // events: the aborting loop persists its partial assistant row as it
+        // tears down, so anchoring after the turn settles keeps the `/stop`
+        // echo + notice after that row on reload (instead of racing it, which
+        // would sort the cancelled turn's work block *after* the stop notice).
+        for job_id in &cancelled_turn_jobs {
+            self.job_lifecycle
+                .wait_until_idle(job_id, STOP_SETTLE_TIMEOUT)
+                .await;
+        }
+
         // Record the user's `/stop` echo + the outcome notice as out-of-band
         // control events (separate from the LLM transcript) so a reload shows
-        // both. Anchor them after the session's current last row so they land
-        // right after this turn's partial rows; `stopped_at` is the send time.
-        // A lookup error skips the persist (best-effort) rather than mis-anchor
-        // it; the live notice below still fires regardless. NOTE: a partial row
-        // landing between this read and the cancel taking effect sorts after the
-        // echo on reload (and can split the turn's work block) — acceptable for a
-        // best-effort display log.
+        // both, anchored after the session's last row (the just-settled turn's
+        // partial). A lookup error skips the persist (best-effort) rather than
+        // mis-anchor it; the live notice above already fired.
         match self
             .session_manager
             .latest_session_ordinal(session_id)
@@ -272,16 +307,6 @@ impl Router {
                 "/stop: latest-ordinal lookup failed; skipping control-event persist"
             ),
         }
-        self.handle_agent_output(AgentOutput {
-            session_id: session_id.clone(),
-            user_id: user_id.to_string(),
-            channel: channel.clone(),
-            event: AgentEvent::Notice {
-                level: NoticeLevel::Info,
-                text,
-            },
-        })
-        .await;
     }
 
     /// Append an out-of-band control event (slash-command echo / notice) to the
@@ -375,7 +400,7 @@ fn build_stop_notice(cancelled_turn: bool, background: &[(SessionId, InFlightJob
     }
     let mut lines = vec!["Stopped.".to_string()];
     if cancelled_turn {
-        lines.push("- Cancelled the in-progress reply.".to_string());
+        lines.push(aura_channels::STOP_CANCELLED_REPLY_LINE.to_string());
     }
     if !background.is_empty() {
         lines.push(format!(

@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { RiArrowDownSLine, RiArrowUpSLine, RiFileList3Line } from 'react-icons/ri';
+import { RiArrowDownSLine, RiArrowUpSLine } from 'react-icons/ri';
 import { api } from '../api/client';
 import { useAsync } from '../lib/useAsync';
 import { fmtCost, fmtMs, fmtTime, fmtTokensCell } from '../lib/format';
@@ -196,7 +196,6 @@ export function RunPage() {
                 <SortHeader label="cost" col="cost" sortKey={sortKey} sortDir={sortDir} onSort={onSort} />
                 <SortHeader label="tokens" col="tokens" sortKey={sortKey} sortDir={sortDir} onSort={onSort} />
                 <PlainHeader label="tools" />
-                <PlainHeader label="trace" />
               </tr>
             </thead>
             <tbody>
@@ -228,9 +227,6 @@ export function RunPage() {
                   </td>
                   <td className="px-3 py-2">
                     <ToolChips tools={it.tool_calls} />
-                  </td>
-                  <td className="px-3 py-2">
-                    {it.trace ? <RiFileList3Line className="text-ok" title="trace available" /> : '—'}
                   </td>
                 </tr>
               ))}

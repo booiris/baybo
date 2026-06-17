@@ -5,6 +5,7 @@
 
 pub mod mailbox;
 pub mod router;
+pub mod runner;
 pub mod state;
 pub mod subagent;
 pub mod supervisor;
@@ -61,11 +62,10 @@ pub enum AgentMessage {
     CronTrigger { job_id: String, prompt: String },
     /// A subagent was spawned. Carries the initial prompt assembled by
     /// `Router::handle_subagent_spawn` and the parent's `JobId` for
-    /// lineage. The child actor runs `agent_loop.run` with `JobInput::Spawned`,
-    /// which `JobKind::Spawned.allowed_for(*) == true` lets through
-    /// regardless of the child session's root trigger — which it must,
-    /// because subagents inherit the parent's trigger (cron / system)
-    /// via `create_spawned_session`.
+    /// lineage. The child actor runs `agent_loop.run` with `JobInput::Spawned`;
+    /// the job records the child session's root trigger as its `origin`
+    /// (subagents inherit the parent's trigger — cron / system — via
+    /// `create_spawned_session`), with no payload/trigger pairing constraint.
     SubagentSpawned {
         initial_message: Box<IncomingMessage>,
         parent_job_id: aura_model::JobId,
@@ -398,7 +398,7 @@ impl AgentActor {
 
     /// Run the agent loop. Terminal-state notification is published by
     /// `JobLifecycle` itself on the broadcast bus
-    /// (`subscribe_terminal_events`); the actor no longer emits a
+    /// (`subscribe_lifecycle_events`); the actor no longer emits a
     /// piggy-back signal on the response channel. Used by every
     /// handler that delegates job lifecycle to `agent_loop.run`
     /// (UserInput, SubagentSpawned, cron prompt dispatch). Returns
@@ -416,7 +416,18 @@ impl AgentActor {
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         interjections: Option<&mut dyn crate::runtime::agent_loop::InterjectionSource>,
     ) -> anyhow::Result<OutgoingMessage> {
-        self.volatile
+        let is_user_turn = matches!(job_input.input_kind(), aura_job::JobInputKind::UserChat);
+        // Kept so the error path below can tell a user `/stop` (token
+        // tripped via the job cancel) apart from a genuine failure.
+        let turn_token = self.volatile.actor_token.child_token();
+        // The actor emits no `TurnState`: both edges are projected from the
+        // job store by `spawn_turn_state_projector` — the start edge from
+        // this turn's job `start()` (`Pending → InProgress`) inside
+        // `agent_loop.run`, the end edge from its terminal transition. So
+        // chat turn-activity has a single producer sourced from the one
+        // truth, and the per-`Subscribe` snapshot can't disagree with it.
+        let result = self
+            .volatile
             .agent_loop
             .run(
                 &mut self.durable.session,
@@ -425,21 +436,41 @@ impl AgentActor {
                 &self.volatile.span_recorder,
                 parent_job_id,
                 delta_tx,
-                self.volatile.actor_token.child_token(),
+                turn_token.clone(),
                 interjections,
             )
-            .await
+            .await;
+        // A user is waiting on this turn — a genuine failure must surface as
+        // a terminal notice, not silence (the log line alone leaves the chat
+        // dangling on its last progress frame). Cancellation stays quiet:
+        // `/stop` already acknowledged with its own notice. Non-user turns
+        // keep their own policies (cron logs, subagent-notification retries).
+        if is_user_turn
+            && !turn_token.is_cancelled()
+            && let Err(e) = &result
+        {
+            let notice = AgentOutput {
+                session_id: self.durable.session.id.clone(),
+                user_id: self.durable.session.user.id.clone(),
+                channel: self.durable.session.channel.clone(),
+                event: AgentEvent::Notice {
+                    level: NoticeLevel::Error,
+                    text: format!("The turn failed before producing a reply: {e}"),
+                },
+            };
+            self.send_response(notice, "user_turn_failed").await;
+        }
+        result
     }
 
     /// Dispatch a fired cron job through the agent loop and send the
     /// response to the output channel.
     ///
-    /// The `JobInput::Cron` provenance must match the session's root
-    /// trigger or `JobLifecycle::start_job` will reject it; the cron fire
-    /// mints a Cron-rooted session, so it does. The content the LLM sees
-    /// The fire is framed + appended by `AgentLoop::append_cron_fire` (which
-    /// uses `aura_context::prompts::cron`) so the model treats it as a task to
-    /// perform now rather than a live user message.
+    /// The cron fire mints a Cron-rooted session, so the job records
+    /// `origin = Cron`. The content the LLM sees is framed + appended by
+    /// `AgentLoop::append_cron_fire` (which uses `aura_context::prompts::cron`)
+    /// so the model treats it as a task to perform now rather than a live
+    /// user message.
     async fn dispatch_cron_prompt(&mut self, prompt: &str, job_id: &str) -> anyhow::Result<()> {
         let job_input = JobInput::Cron {
             action_payload: serde_json::json!({
@@ -899,6 +930,9 @@ impl AgentActor {
         command_text: String,
         sent_at: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<()> {
+        // `compact_now` mints a turn-kind job, so its start + terminal
+        // transitions drive the web chat's TurnState through the projector
+        // — nothing to emit here.
         let text = self
             .volatile
             .agent_loop

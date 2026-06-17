@@ -17,13 +17,9 @@ pub enum CancelReason {
     /// running job's partial output is preserved on
     /// `JobStatus::Cancelled.partial_artifacts`.
     UserPreempt,
-    /// Reserved for a future restart-recovery scan: a job that was
-    /// `InProgress` at crash time and is rolled to `Cancelled` on the
-    /// next process boot. No production code path mints this variant
-    /// today — the auto-cancel rewrite at boot was removed (the
-    /// `find_recoverable_jobs` listing still exists). The variant is
-    /// kept so the wire/serde shape doesn't churn when the rewrite
-    /// is restored.
+    /// The process or actor that owned this job crashed before it could
+    /// close the normal lifecycle path. Boot recovery and in-process actor
+    /// panic recovery roll such jobs to `Cancelled { SystemCrash }`.
     SystemCrash,
     /// An external `spawn_subagent` subprocess hit its idle safety
     /// timeout (no output within the window). Triggers cancellation of

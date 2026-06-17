@@ -5,16 +5,19 @@
 //! so the job state machine stays in this crate while the store contract
 //! sits alongside every other one. Callers convert at the boundary.
 
-use crate::{Job, JobError, JobKind, JobTransition, Result};
+use crate::{Job, JobError, JobInputKind, JobTransition, Result};
 use aura_store::{JobRow, JobTransitionRow};
 
-fn job_kind_str(kind: JobKind) -> &'static str {
+/// Snake-case string for the denormalised `jobs.kind` column. The column
+/// is display-only (never filtered in SQL; `from_row` rebuilds the whole
+/// `Job` from `data`), so it carries the input-kind projection.
+fn job_input_kind_str(kind: JobInputKind) -> &'static str {
     match kind {
-        JobKind::UserChat => "user_chat",
-        JobKind::Cron => "cron",
-        JobKind::System => "system",
-        JobKind::Spawned => "spawned",
-        JobKind::SubagentNotification => "subagent_notification",
+        JobInputKind::UserChat => "user_chat",
+        JobInputKind::Cron => "cron",
+        JobInputKind::System => "system",
+        JobInputKind::Spawned => "spawned",
+        JobInputKind::SubagentNotification => "subagent_notification",
     }
 }
 
@@ -28,7 +31,7 @@ impl Job {
             id: self.id,
             session_id: self.session_id.clone(),
             parent_job_id: self.parent_job_id,
-            kind: job_kind_str(self.kind).to_string(),
+            kind: job_input_kind_str(self.input.input_kind()).to_string(),
             status_kind: self.status.kind().as_snake_case().to_string(),
             created_at: self.created_at,
             started_at: self.started_at,

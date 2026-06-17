@@ -20,7 +20,9 @@ pub struct JobRow {
     pub id: JobId,
     pub session_id: SessionId,
     pub parent_job_id: Option<JobId>,
-    /// `JobKind` rendered as its wire string — for queries only.
+    /// The job's input kind rendered as its wire string. Denormalised
+    /// for display only — never filtered in SQL (`from_row` rebuilds the
+    /// whole `Job` from `data`).
     pub kind: String,
     /// `JobStatusKind` rendered as its snake_case string — drives the
     /// `list_by_status_kind` / `list_recoverable` filters.

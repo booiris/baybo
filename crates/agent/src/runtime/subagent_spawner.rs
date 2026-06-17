@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aura_channels::{AgentOutput, IncomingMessage, Message};
 use aura_cost::CostManager;
-use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput};
+use aura_job::{CancelReason, JobInput, JobLifecycle, JobOutput, JobShape};
 use aura_llm::TokenUsage;
 use aura_model::{
     BACKGROUND_DISPATCH_ACK_PREFIX, ChannelType, ChatMessage, ContentBlock, ExternalAgentKind,
@@ -247,7 +247,7 @@ impl ActorSubagentSpawner {
         // terminal past us. Background spawns subscribe inside their detached
         // task instead — see the `if background` arm — so this receiver is
         // consumed only on the foreground paths below.
-        let terminal_rx = self.job_lifecycle.subscribe_terminal_events();
+        let terminal_rx = self.job_lifecycle.subscribe_lifecycle_events();
 
         let now = Utc::now();
         let incoming = IncomingMessage {
@@ -339,7 +339,7 @@ impl ActorSubagentSpawner {
             tokio::spawn(async move {
                 // Subscribe before feeding the prompt so a child that exits
                 // quickly can't slip its terminal past us.
-                let terminal_rx = job_lifecycle.subscribe_terminal_events();
+                let terminal_rx = job_lifecycle.subscribe_lifecycle_events();
                 let result = if let Err(e) = mailbox
                     .send(AgentMessage::SubagentSpawned {
                         initial_message: Box::new(incoming),
@@ -1072,6 +1072,7 @@ async fn run_external_agent_job(
         .start_job(
             child_session_id.clone(),
             job_ctx.trigger_kind,
+            JobShape::Turn,
             JobInput::Spawned { initial_prompt },
             Some(job_ctx.parent_job_id),
         )

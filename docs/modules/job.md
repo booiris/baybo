@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `job` crate is the home for the Job concept: domain types (`Job`, `JobStatus`, `JobKind`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, `JobError`), the row conversions that persist them, and the `JobLifecycle` persistence orchestrator. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself; `JobLifecycle` wraps the `JobStore` with the cancel state machine, terminal-event bus, and `JobId → CancellationToken` registry the in-flight execution path subscribes to.
+The `job` crate is the home for the Job concept: domain types (`Job`, `JobStatus`, `JobInputKind`, `JobShape`, `JobInput`, `JobOutput`, `CancelReason`, `JobTransition`, `JobError`), the row conversions that persist them, and the `JobLifecycle` persistence orchestrator. `Job` owns the state machine: construction, transition validation, timestamp management, and convenience methods all live on the type itself; `JobLifecycle` wraps the `JobStore` with the cancel state machine, lifecycle-event bus, and `JobId → CancellationToken` registry the in-flight execution path subscribes to.
 
 The `JobStore` trait itself lives in the `aura-store` ports crate and trades in row DTOs — `JobRow` (the queryable columns plus the serialized `Job` in `data`) and `JobTransitionRow`. This crate owns the `Job::to_row` / `Job::from_row` conversions, so the state machine stays here while the trait sits in a leaf crate every store consumer can reach. `aura-storage` provides the libsql implementation, shuttling rows without depending on `aura-job` (it converts in its tests only). `impl From<aura_store::StorageError> for JobError` bridges errors at the call sites.
 
@@ -34,27 +34,36 @@ Every transition is validated strictly. Illegal transitions return errors, never
 
 `Cancelled` carries a `reason: CancelReason` (`UserPreempt`, `SystemCrash`, `SubagentTimeout`, `ParentCancelled`, `ParentDeleted`, `OperatorCancel`, `UserStopped`) and `partial_artifacts: Vec<SpanId>` — the spans that completed (or partially completed) before the cancel. Both fields are nested **inside** the `JobStatus::Cancelled { reason, partial_artifacts }` variant; the top-level `Job` exposes `emitted_span_ids` for general progress indexing. The next job's prompt-assembly step reads `partial_artifacts` and renders a "previously completed steps:" preamble so the LLM has context. Content lives only in the trace; the field is indices.
 
-`SystemCrash` is reserved for a future restart-recovery scan — there is no production code path that mints it today.
+`SystemCrash` is used when Aura owns the cleanup after execution disappeared:
+the boot recovery sweep rolls jobs left non-terminal by a prior process death to
+`Cancelled { SystemCrash }`, and the in-process actor panic runner does the same
+for the panicked session's active turn jobs.
 
-### Job kind mirrors session trigger
+### Three orthogonal descriptors: input kind, origin, shape
+
+A job is described along three independent axes, each with one source of truth — replacing a single overloaded `kind` that conflated "what payload" with "which trigger":
 
 ```rust
-pub enum JobKind {
-    UserChat,
-    Cron,
-    System,
-    Spawned,
-    SubagentNotification,
-}
+// input kind — what payload fed the job; a projection of JobInput.
+// Display / the denormalised `jobs.kind` column only.
+pub enum JobInputKind { UserChat, Cron, System, Spawned, SubagentNotification }
+
+// shape — does it run a full agent-loop turn, or a one-shot
+// maintenance pass? Declared by the spawning code path.
+pub enum JobShape { Turn, Maintenance }
 ```
 
-Invariant: `session.trigger.kind() == job.kind()` at job creation time. `JobInput` is a strongly typed enum whose variants line up 1:1 with `JobKind`. `JobOutput` does not — it has only `Message` and `Structured`, the two shapes any kind can produce.
+- **input kind** (`JobInputKind`) — `Job::input_kind()`, projected from `JobInput`. `JobInput` is a strongly typed payload enum whose variants line up 1:1 with `JobInputKind`.
+- **origin** (`aura_model::TriggerKind`, stored on `Job.origin`) — the owning session's root trigger, recorded **as-is** at creation. It is *not* asserted against the payload: background compression runs inside a `User`-trigger session and records `origin = User` while carrying a `System` input. Subagent jobs record `origin = Spawned` (their session's inherited root).
+- **shape** (`JobShape`, stored on `Job.shape`) — **declared by the code path that runs the job**, not inferred from the payload: `run()` mints `Turn`; both background compression and the foreground `/compact` mint `Maintenance` (the latter despite its `UserChat` input — inferring shape from the input would mislabel it a turn). `Job::is_turn()` reads it. A session serialises its turns (≤1 active turn-job) but may run a concurrent `Maintenance` job, which is why `list_active_by_session` returns a `Vec`.
+
+`JobOutput` does not split this way — it has only `Message` and `Structured`, the two shapes any job can produce.
 
 ### Job owns its behavior
 
 `Job` is not a passive data struct — it encapsulates the state machine:
 
-- `Job::new(session_id, input, parent_job_id)` — constructor with ULID, `Pending` status, timestamps. `kind` is derived from `input.kind()`.
+- `Job::new(session_id, origin, shape, input, parent_job_id)` — constructor with ULID, `Pending` status, timestamps. `origin` and `shape` are supplied by the caller; `input_kind` is projected from `input`.
 - `Job::transition(target, ...)` — validates transition, mutates status/timestamps, returns `JobTransition` record. `transition_at(target, ..., at)` / `cancel_at(reason, artifacts, at)` are explicit-timestamp variants reserved for the boot-recovery sweep, which must backdate `ended_at` to the last observed activity rather than the boot wall-clock; live callers use `transition` / `cancel`.
 - Convenience methods: `start()`, `complete(output)`, `fail(reason)`, `cancel(reason, partial_artifacts)`, `stuck(reason)`, `recover()`
 - `Job::is_terminal()` — true for `Completed | Cancelled | Failed`
@@ -70,12 +79,24 @@ This keeps the state machine invariants co-located with the type and makes them 
 
 `JobLifecycle` does only: load from store → call `job.transition()` → `store.save()` + `store.record_transition()`. No state machine logic in the orchestrator. It additionally owns:
 
-- A `tokio::sync::broadcast` bus that publishes a `JobTerminalEvent` (id, session, parent, terminal kind) on every `Completed | Failed | Cancelled` transition. Subscribers (subagent runtime, admin UI) wait on this without polling the store. Lagging subscribers must reconcile via `list_by_session` — a dropped event is not re-published.
+- A `tokio::sync::broadcast` bus that publishes a `JobLifecycleEvent` (id, session, parent, phase) on `Pending → InProgress` and on every `Completed | Failed | Cancelled` transition. Subscribers either wait for terminal phases (subagent runtime) or treat every phase as a recompute trigger (TurnState projection). Lagging subscribers must reconcile via store reads such as `list_by_session` / `active_turn_started_at` — a dropped event is not re-published.
 - A `JobCancellationRegistry` mapping `JobId → CancellationToken` for in-flight jobs. `JobLifecycle::cancel` trips the registered token *before* flipping the row, so the running execution observes the cancel before terminal-state observers do. `register_running` returns a RAII `JobCancellationGuard` that unregisters on drop, so an early `?` from the agent loop can't leak entries.
 
-### Restart recovery
+### Recovery
 
-Not implemented yet. The state-machine and storage shape leave room for it (`Stuck` is non-terminal; `JobStatus::Cancelled.partial_artifacts` indexes spans that the next job should preamble-render), but there is currently no production code path that scans non-terminal jobs at startup or rewrites half-open spans. A crash leaves jobs and spans in their last-persisted state until an operator cancels them via the admin API.
+The state-machine and storage shape support recovery of non-terminal jobs
+(`Pending` / `InProgress` / `Stuck`). `aura_agent::recovery` owns the cross-table
+repair because it has both job and trace stores:
+
+- Boot recovery scans all non-terminal jobs from the prior process, closes any
+  half-open trace rows at the last observed activity time, and calls
+  `JobLifecycle::cancel_at(..., SystemCrash, ...)`.
+- Actor panic recovery scans only the panicked session's active turn jobs,
+  closes their half-open trace rows at the actor crash time, and cancels them as
+  `SystemCrash`.
+
+`JobStatus::Cancelled.partial_artifacts` remains the resume hook for spans that
+completed before cancellation; content itself lives in trace.
 
 ### Job hierarchy
 
@@ -108,7 +129,7 @@ Distinct from a new trigger arriving, the out-of-band `/stop` control command ca
 
 - `input` / `final_result` / `JobStatus::Cancelled.partial_artifacts` store sanitized JSON / span-id lists only — sensitive values must already be placeholders
 - `save()` and `record_transition()` should run in the same transaction (enforced by `JobLifecycle`)
-- `session.trigger.kind() == job.kind()` invariant is enforced at `JobLifecycle::start_job` (returns `JobError::KindMismatch` on violation); `Job::new` is the type-safe constructor and trusts the caller to have matched kinds upstream
+- `Job.origin` and `Job.shape` are both supplied by the caller at `JobLifecycle::start_job` (via `JobSpec.origin` / `JobSpec.shape`) and passed straight into `Job::new`; neither is validated against the payload — input kind, origin, and shape are independent. Only `input_kind` is projected from `input`
 - Does not depend on `trace`, `llm`, `tools`, or `agent`. Depends only on `aura-model` for IDs.
 - `test_support::MemoryJobStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `aura-job = { workspace = true, features = ["test-support"] }`.
 
@@ -120,4 +141,4 @@ Distinct from a new trigger arriving, the out-of-band `/stop` control command ca
 | `trace`   | Provides `SpanId`; `JobStatus::Cancelled.partial_artifacts` references trace spans; recovery coordinates with the trace scan    |
 | `store`   | Owns the `JobStore` trait + its `JobRow` / `JobTransitionRow` DTOs and `StorageError`; this crate converts `Job` ↔ rows |
 | `storage` | Provides the libsql implementation of `JobStore` (from `aura-store`), shuttling rows; depends on `aura-job` only as a dev-dependency |
-| `session` | `Session.trigger.kind() == Job.kind()` invariant; `Lineage` consumes `parent_job_id`                       |
+| `session` | `Session.trigger.kind()` is recorded as `Job.origin`; `Lineage` consumes `parent_job_id`                       |

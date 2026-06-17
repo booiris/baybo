@@ -239,10 +239,11 @@ async fn main() -> Result<()> {
         .map(|inst| {
             let id = inst.instance_id.as_str();
             let run = runs_by_id.get(id);
+            let is_resolved = resolved.contains(id);
             InstanceResult {
                 instance_id: inst.instance_id.clone(),
                 repo: inst.repo.clone(),
-                resolved: resolved.contains(id),
+                resolved: is_resolved,
                 empty_patch: empty.contains(id)
                     || run
                         .map(|r| r.patch.trim().is_empty())
@@ -255,6 +256,11 @@ async fn main() -> Result<()> {
                 cached_input_tokens: run.map(|r| r.cached_input_tokens).unwrap_or(0),
                 cost_micro_usd: run.map(|r| r.cost_micro_usd).unwrap_or(0),
                 error: run.and_then(|r| r.error.clone()),
+                // Grading-side "why unresolved" from the per-instance report
+                // (resolved instances get None).
+                failure_reason: (!is_resolved)
+                    .then(|| grader::failure_reason(&runs_dir, &run_id, model_name, id))
+                    .flatten(),
             }
         })
         .collect();

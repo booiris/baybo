@@ -26,6 +26,16 @@ pub const STOP_COMMAND: &str = "/stop";
 /// One-line description shared by every surface that lists `/stop`.
 pub const STOP_COMMAND_DESCRIPTION: &str = "Stop the in-progress reply and any background tasks";
 
+/// The acknowledgement line a `/stop` emits **only when it actually cancelled
+/// an in-progress reply** (a no-op `/stop` after a turn already finished says
+/// "Nothing in progress to stop." instead). The agent emits it in the stop
+/// notice; the chat-history reconstruction keys off it to tell a
+/// genuinely-cancelled turn (fold the partial into a "Cancelled" work block)
+/// apart from a completed answer that merely had a `/stop` typed after it
+/// (leave the answer intact). Shared so the producer and the matcher can't
+/// drift.
+pub const STOP_CANCELLED_REPLY_LINE: &str = "- Cancelled the in-progress reply.";
+
 /// Outcome of inspecting a `/`-prefixed line.
 ///
 /// Channel adapters call [`SlashHandler::handle`] on any input that starts

@@ -351,6 +351,7 @@ async fn consume_inprocess_turn(
             | AgentEvent::Status(_)
             | AgentEvent::Progress(_)
             | AgentEvent::TaskList(_)
+            | AgentEvent::TurnState { .. }
             | AgentEvent::Attachment(_) => {}
         }
     }

@@ -22,8 +22,15 @@ pub struct InstanceResult {
     /// Cached (prompt-cache-hit) share of `input_tokens`.
     pub cached_input_tokens: u64,
     pub cost_micro_usd: i64,
+    /// Agent-side failure (timeout, turn rejection, git-diff capture). Paired
+    /// with `errored = true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Grading verdict for an unresolved instance — which `FAIL_TO_PASS` tests
+    /// still fail, a `PASS_TO_PASS` regression, or an apply failure. Extracted
+    /// from the harness's per-instance report; `None` when resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -195,6 +202,7 @@ mod tests {
             cached_input_tokens: 40,
             cost_micro_usd: cost,
             error: None,
+            failure_reason: None,
         }
     }
 
