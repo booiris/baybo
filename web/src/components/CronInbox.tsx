@@ -150,7 +150,7 @@ export function CronInbox({ refreshSignal }: CronInboxProps) {
   );
 
   return (
-    <aside className="hidden xl:flex flex-col w-[260px] border-l-2 border-black bg-white absolute right-0 top-12 bottom-0 z-10">
+    <aside className="hidden xl:flex flex-col w-[260px] border-l-2 border-black bg-canvas absolute right-0 top-12 bottom-0 z-10">
       <header className="px-3 py-3 border-b-2 border-black flex items-center gap-2">
         <RiNotification3Line
           className={`text-lg shrink-0 ${unreadCount > 0 ? 'text-brand' : ''}`}

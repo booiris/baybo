@@ -7,9 +7,6 @@
      the warm tone without a per-component class sweep. */
   --color-canvas: #faf6ec;
   --color-surface: #fffdf7;
-  /* Chat reading surface — a touch whiter than the warm `surface` so the
-     thread reads as a bright page. The composer fade backdrop fades to it. */
-  --color-thread: #fffefc;
   --color-ink: #2a2520;
   --color-ink-soft: #6b6258;
   --color-brand: #ffd23f;

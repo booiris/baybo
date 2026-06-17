@@ -20,6 +20,7 @@ import {
   RiCheckLine,
   RiClipboardLine,
   RiCloseLine,
+  RiDeleteBin6Line,
   RiFileLine,
   RiImageLine,
   RiLoader4Line,
@@ -1272,42 +1273,57 @@ export function ChatPage() {
     [sessionId, views],
   );
 
-  const handleHideSession = useCallback(
-    async (id: string) => {
-      if (
-        !window.confirm(
-          'Hide this conversation from your list? It stays on the server — only your view is filtered.',
-        )
-      ) {
-        return;
+  // Hiding a conversation is confirmed through an in-app dialog (not the
+  // browser's native `confirm`). `hidePrompt` holds the row awaiting
+  // confirmation; the delete only fires from `confirmHideSession`.
+  const [hidePrompt, setHidePrompt] = useState<string | null>(null);
+  const [hideSubmitting, setHideSubmitting] = useState(false);
+  const [hideError, setHideError] = useState<string | null>(null);
+
+  const handleHideSession = useCallback((id: string) => {
+    setHideError(null);
+    setHidePrompt(id);
+  }, []);
+
+  const cancelHideSession = useCallback(() => {
+    if (hideSubmitting) return;
+    setHidePrompt(null);
+    setHideError(null);
+  }, [hideSubmitting]);
+
+  const confirmHideSession = useCallback(async () => {
+    const id = hidePrompt;
+    if (!id) return;
+    setHideSubmitting(true);
+    setHideError(null);
+    const { error, response } = await client.DELETE('/v1/chat/sessions/{session_id}', {
+      params: { path: { session_id: id } },
+    });
+    if (error || !response.ok) {
+      // Surface server-side failure (404, etc.) in the dialog without
+      // nuking the sidebar. The hide is server-authoritative; if the
+      // call fails the row stays visible and the dialog stays open.
+      setHideSubmitting(false);
+      setHideError(error?.error ?? `HTTP ${response.status}`);
+      return;
+    }
+    setSessions((prev) => prev.filter((s) => s.session_id !== id));
+    releaseSessionView(id);
+    if (sessionId === id) {
+      const fallback =
+        sessions.find((s) => s.session_id !== id)?.session_id ??
+        (anchorSessionIdRef.current && anchorSessionIdRef.current !== id
+          ? anchorSessionIdRef.current
+          : null);
+      if (fallback) {
+        navigateRef.current(`/chat/${fallback}`, { replace: true });
+      } else {
+        navigateRef.current('/chat', { replace: true });
       }
-      const { error } = await client.DELETE('/v1/chat/sessions/{session_id}', {
-        params: { path: { session_id: id } },
-      });
-      if (error) {
-        // Surface server-side failure (404, etc.) without nuking the
-        // sidebar. The hide is server-authoritative; if the call
-        // fails the row stays visible.
-        console.warn('hide session failed:', error);
-        return;
-      }
-      setSessions((prev) => prev.filter((s) => s.session_id !== id));
-      releaseSessionView(id);
-      if (sessionId === id) {
-        const fallback =
-          sessions.find((s) => s.session_id !== id)?.session_id ??
-          (anchorSessionIdRef.current && anchorSessionIdRef.current !== id
-            ? anchorSessionIdRef.current
-            : null);
-        if (fallback) {
-          navigateRef.current(`/chat/${fallback}`, { replace: true });
-        } else {
-          navigateRef.current('/chat', { replace: true });
-        }
-      }
-    },
-    [client, releaseSessionView, sessionId, sessions],
-  );
+    }
+    setHideSubmitting(false);
+    setHidePrompt(null);
+  }, [client, hidePrompt, releaseSessionView, sessionId, sessions]);
 
   // Re-pin the active session's model. The PUT is authoritative — its
   // `last_llm` echo drives the local update, and a live actor (if any)
@@ -1414,7 +1430,7 @@ export function ChatPage() {
   );
 
   return (
-    <div className="flex flex-1 overflow-hidden bg-thread min-h-0">
+    <div className="flex flex-1 overflow-hidden bg-surface min-h-0">
       {/* Session list sidebar (zone 2; the global icon rail is zone 1) */}
       <SessionSidebar
         sessions={sessions}
@@ -1531,7 +1547,7 @@ export function ChatPage() {
                 under the pill and `-top-20` lifts the fade-in into the thread. */}
             <div
               aria-hidden
-              className="pointer-events-none absolute inset-x-0 -bottom-6 -top-20 bg-linear-to-t from-thread from-40% to-transparent"
+              className="pointer-events-none absolute inset-x-0 -bottom-6 -top-20 bg-linear-to-t from-surface from-40% to-transparent"
             />
             {filteredSlash.length > 0 ? (
               <div className="absolute bottom-full left-0 right-0 mb-2 border-2 border-black bg-white rounded-2xl shadow-brutal px-2 py-2 flex flex-col gap-0.5">
@@ -1639,11 +1655,11 @@ export function ChatPage() {
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
                     disabled={!channelToken || status.state !== 'connected'}
-                    className="shrink-0 h-7 w-7 flex items-center justify-center text-ink-soft hover:text-ink border-2 border-transparent hover:border-black hover:bg-canvas rounded-md disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
+                    className="group shrink-0 h-7 w-7 flex items-center justify-center bg-surface text-ink-soft hover:text-ink border-2 border-black rounded-md shadow-brutal-xs hover:bg-canvas hover:-translate-y-px active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer transition-[transform,box-shadow,background-color,color] duration-150"
                     title="Attach image or file"
                     aria-label="Attach image or file"
                   >
-                    <RiAttachmentLine className="text-lg" />
+                    <RiAttachmentLine className="text-base transition-transform duration-200 group-hover:-rotate-[18deg] group-hover:scale-110" />
                   </button>
                 </div>
                 {sessionId && models.length > 1 ? (
@@ -1687,6 +1703,91 @@ export function ChatPage() {
         </div>
         </div>
       </main>
+
+      {hidePrompt ? (
+        <HideSessionModal
+          submitting={hideSubmitting}
+          error={hideError}
+          onCancel={cancelHideSession}
+          onConfirm={confirmHideSession}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/** In-app confirmation for hiding a conversation, replacing the browser's
+ *  native `confirm`. Hiding only filters the row from the user's list —
+ *  the session row, transcript, and binding stay live on the server — so
+ *  the copy frames it as a recoverable "remove from list", not a delete.
+ *  Backdrop click and the Escape key both cancel (while idle). */
+function HideSessionModal({
+  submitting,
+  error,
+  onCancel,
+  onConfirm,
+}: {
+  submitting: boolean;
+  error: string | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') onCancel();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onCancel]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
+      role="dialog"
+      aria-modal="true"
+      onClick={onCancel}
+    >
+      <div
+        className="max-w-md w-full bg-surface border-[3px] border-black rounded-md shadow-brutal overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <header className="px-6 py-4 border-b-2 border-black">
+          <h3 className="font-bold uppercase tracking-wider">Remove conversation</h3>
+        </header>
+        <div className="px-6 py-4 space-y-3">
+          <p className="text-[0.95rem] leading-relaxed">
+            Remove this conversation from your list?
+          </p>
+          {error ? (
+            <div className="bg-surface border-2 border-err text-err rounded-md px-3 py-2 font-mono text-[0.85rem]">
+              {error}
+            </div>
+          ) : null}
+        </div>
+        <footer className="flex justify-end gap-2 px-6 py-3 border-t-2 border-black bg-canvas">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={submitting}
+            className="h-9 px-3 border-2 border-black rounded-md bg-surface font-bold uppercase tracking-wider text-[0.85rem] shadow-brutal-xs hover:bg-canvas active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={submitting}
+            className="h-9 px-3 inline-flex items-center gap-1.5 border-2 border-err rounded-md bg-err text-white font-bold uppercase tracking-wider text-[0.85rem] shadow-brutal-xs hover:bg-err/90 active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+          >
+            {submitting ? (
+              <RiLoader4Line className="animate-spin text-base shrink-0" />
+            ) : (
+              <RiDeleteBin6Line className="text-base shrink-0" />
+            )}
+            Remove
+          </button>
+        </footer>
+      </div>
     </div>
   );
 }
