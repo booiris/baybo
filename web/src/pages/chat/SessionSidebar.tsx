@@ -44,7 +44,7 @@ function SessionRow({
       to={`/chat/${session.session_id}`}
       className={`group relative flex items-center gap-2 px-3 py-1.5 rounded-md border-2 ${
         active
-          ? 'bg-selected text-ink border-black'
+          ? 'bg-selected text-ink border-black shadow-brutal-sm'
           : 'border-transparent hover:bg-gray-100 text-ink'
       }`}
       title={session.session_id}

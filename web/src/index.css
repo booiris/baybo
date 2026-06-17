@@ -1,17 +1,19 @@
 @import "tailwindcss";
 
 @theme {
-  /* Warm light-touch palette: cream canvas, warm-black ink/borders, amber
-     brand (was cool blue). The default `black`/`white` are revalued so the
-     existing `border-black` / `bg-white` utilities across every page pick up
-     the warm tone without a per-component class sweep. */
+  /* Warm light-touch palette: cream canvas, warm-black ink/borders, warm-gold
+     brand. The default `black`/`white` are revalued so the existing
+     `border-black` / `bg-white` utilities across every page pick up the warm
+     tone without a per-component class sweep. */
   --color-canvas: #faf6ec;
   --color-surface: #fffdf7;
   --color-ink: #2a2520;
   --color-ink-soft: #6b6258;
-  --color-brand: #ffd23f;
+  /* Warm gold — primary actions, active states, the icon rail, and the
+     user message bubble. Dark `text-ink` rides on top. */
+  --color-brand: #f2c14e;
   --color-brand-hover: #f5b400;
-  /* Selected chat row: a bright coral-red. Light enough that dark `text-ink`
+  /* Selected chat row: a warm coral. Light enough that dark `text-ink`
      reads better on it than white (same dark-on-warm pairing as the brand). */
   --color-selected: #ff8c90;
   --color-err: #e53e3e;
@@ -59,15 +61,21 @@
   }
 }
 
-/* Tinted scrollbar that blends into the canvas background. The gutter is
-   reserved on BOTH edges so (a) content doesn't jump horizontally when the
-   thumb first appears, and (b) the centered message band stays on the same
-   center axis as the floating composer — a right-only gutter shifts the band
-   left by half the scrollbar width, so bubbles would poke past the composer. */
+/* Tinted scrollbar that blends into the canvas background. */
 .chat-scroll {
-  scrollbar-gutter: stable both-edges;
   scrollbar-width: thin;
   scrollbar-color: rgba(42, 37, 32, 0.22) transparent;
+}
+
+/* Transcript-only: reserve the gutter on BOTH edges so (a) content doesn't
+   jump horizontally when the thumb first appears, and (b) the centered
+   message band stays on the same center axis as the floating composer — a
+   right-only gutter shifts the band left by half the scrollbar width, so
+   bubbles would poke past the composer. Side panels (cron inbox, work-block
+   step list) must NOT use this — it would inset their full-width dividers
+   away from both edges. */
+.chat-scroll-centered {
+  scrollbar-gutter: stable both-edges;
 }
 
 .chat-scroll::-webkit-scrollbar {

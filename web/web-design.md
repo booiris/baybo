@@ -22,7 +22,7 @@ The Aura Dashboard follows a **warm** "Neo-Brutalist" design language characteri
 | **Surface**     | `#fffdf7` | Raised panels / cards (revalues `white`)       |
 | **Ink**         | `#2a2520` | Primary text + borders (revalues `black`)      |
 | **Ink Soft**    | `#6b6258` | Secondary text and metadata                    |
-| **Brand**       | `#ffd23f` | Sunny warm-yellow — primary actions & active states. Pair with `text-ink` (dark on yellow), never `text-white` |
+| **Brand**       | `#f2c14e` | Warm gold — primary actions, active states, the icon rail, and the user message bubble (at 60%). Pair with `text-ink` (dark on gold), never `text-white` |
 | **Brand Hover** | `#f5b400` | Action hover states                            |
 | **Selected**    | `#ff8c90` | Soft coral-pink for the *selected* chat row. Light enough that **dark `text-ink`** reads best on it (same dark-on-warm pairing as the brand) |
 | **Error**       | `#e53e3e` | Destructive actions, Error logs                |
@@ -30,7 +30,7 @@ The Aura Dashboard follows a **warm** "Neo-Brutalist" design language characteri
 | **Info**        | `#3182ce` | Informational logs                             |
 | **OK**          | `#2f855a` | Success states                                 |
 
-> The amber brand is light, so **dark `text-ink` on `bg-brand`** is the readable pairing (white-on-amber fails contrast). `black`/`white` are revalued in the `@theme` block of `index.css`, so the pervasive `border-black` / `bg-white` utilities warm automatically.
+> The gold brand is light, so **dark `text-ink` on `bg-brand`** is the readable pairing (white-on-gold fails contrast). `black`/`white` are revalued in the `@theme` block of `index.css`, so the pervasive `border-black` / `bg-white` utilities warm automatically.
 
 ### Typography
 

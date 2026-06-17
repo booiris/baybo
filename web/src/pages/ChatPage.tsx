@@ -1469,7 +1469,7 @@ export function ChatPage() {
         <div
           ref={transcriptScrollRef}
           onScroll={handleTranscriptScroll}
-          className="chat-scroll relative w-full overflow-y-auto overflow-x-hidden px-6 pt-4 pb-40"
+          className="chat-scroll chat-scroll-centered relative w-full overflow-y-auto overflow-x-hidden px-6 pt-4 pb-40"
         >
           <TaskChecklist tasks={currentView.tasks} />
           {currentView.historyLoading ? (
@@ -3326,7 +3326,7 @@ function MessageBubble({
           <div
             className={`rounded-md py-2 text-sm text-ink transition-opacity break-words [overflow-wrap:anywhere] ${
               showMarkdown ? 'chat-prose' : 'font-mono whitespace-pre-wrap'
-            } ${isUser ? 'border-2 border-black px-3' : ''} ${
+            } ${isUser ? 'border-2 border-black px-3 bg-brand/60 shadow-brutal-sm' : ''} ${
               row.pending ? 'opacity-60' : ''
             }`}
           >
