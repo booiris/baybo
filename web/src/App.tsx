@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
+import { Navigate, Route, Routes } from 'react-router-dom';
 import { RiLoader4Line } from 'react-icons/ri';
-import { Sidebar } from './components/Sidebar';
+import { IconRail } from './components/IconRail';
 import { LoginScreen } from './components/LoginScreen';
 import { LogsPage } from './pages/LogsPage';
 import { TracesPage } from './pages/TracesPage';
@@ -18,7 +18,6 @@ export default function App() {
   const [isValidating, setIsValidating] = useState(true);
   const [isValid, setIsValid] = useState(false);
   const [version, setVersion] = useState<string | undefined>();
-  const location = useLocation();
 
   useEffect(() => {
     if (!token || !client) {
@@ -62,25 +61,17 @@ export default function App() {
     );
   }
 
-  // ChatShell lives outside the admin sidebar — /chat/* renders a
-  // distinct shell with its own session-list rail. The admin sidebar
-  // remains the entry point and exposes a Chat NavLink that drops
-  // into this branch.
-  if (location.pathname.startsWith('/chat')) {
-    return (
-      <Routes>
-        <Route path="/chat" element={<ChatPage />} />
-        <Route path="/chat/:sessionId" element={<ChatPage />} />
-      </Routes>
-    );
-  }
-
+  // One shell for every route: the global icon rail plus a content area.
+  // Chat renders inside it as a [session sidebar | thread] row; the admin
+  // pages render as their own flex-col columns.
   return (
     <div className="flex h-screen">
-      <Sidebar version={version} />
-      <main className="flex-1 flex flex-col overflow-hidden bg-canvas">
+      <IconRail version={version} />
+      <main className="flex-1 flex flex-col overflow-hidden bg-canvas min-w-0">
         <Routes>
-          <Route path="/" element={<Navigate to="/logs" replace />} />
+          <Route path="/" element={<Navigate to="/chat" replace />} />
+          <Route path="/chat" element={<ChatPage />} />
+          <Route path="/chat/:sessionId" element={<ChatPage />} />
           <Route path="/logs" element={<LogsPage />} />
           <Route path="/traces" element={<TracesPage />} />
           <Route path="/traces/:id" element={<TraceSessionPage />} />
@@ -88,7 +79,7 @@ export default function App() {
           <Route path="/jobs" element={<JobsPage />} />
           <Route path="/analytics" element={<AnalyticsPage />} />
           <Route path="/llm" element={<LlmPage />} />
-          <Route path="*" element={<Navigate to="/logs" replace />} />
+          <Route path="*" element={<Navigate to="/chat" replace />} />
         </Routes>
       </main>
     </div>

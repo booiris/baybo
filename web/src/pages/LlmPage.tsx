@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   RiCpuLine,
   RiRefreshLine,
@@ -21,31 +21,9 @@ import type { components } from '../api/schema';
 
 type LlmModelEntry = components['schemas']['LlmModelEntry'];
 type LlmModelsResponse = components['schemas']['LlmModelsResponse'];
-type LlmUsageResponse = components['schemas']['LlmUsageResponse'];
-type LlmModelUsage = components['schemas']['LlmModelUsage'];
 type LlmModelTestResult = components['schemas']['LlmModelTestResult'];
 type UpdateLlmModelRequest = components['schemas']['UpdateLlmModelRequest'];
 type LlmPricingOverrideDto = components['schemas']['LlmPricingOverrideDto'];
-
-const RANGE_OPTIONS = [
-  { value: 1, label: 'Last 24 hours' },
-  { value: 7, label: 'Last 7 days' },
-  { value: 30, label: 'Last 30 days' },
-  { value: 90, label: 'Last 90 days' },
-] as const;
-
-function formatMicroUsd(microUsd: number): string {
-  const usd = microUsd / 1_000_000;
-  if (usd >= 1_000) return `$${usd.toFixed(0).toLocaleString()}`;
-  if (usd >= 10) return `$${usd.toFixed(2)}`;
-  return `$${usd.toFixed(4)}`;
-}
-
-function formatTokens(val: number): string {
-  if (val >= 1_000_000) return `${(val / 1_000_000).toFixed(1)}M`;
-  if (val >= 1_000) return `${(val / 1_000).toFixed(1)}k`;
-  return Math.floor(val).toString();
-}
 
 function microToUsdInput(micros: number | null | undefined): string {
   if (micros == null) return '';
@@ -75,8 +53,6 @@ export function LlmPage() {
   const { logout } = useAuth();
 
   const [data, setData] = useState<LlmModelsResponse | null>(null);
-  const [usage, setUsage] = useState<LlmUsageResponse | null>(null);
-  const [days, setDays] = useState<number>(30);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -91,19 +67,10 @@ export function LlmPage() {
     async function load() {
       setLoading(true);
       setError(null);
-      const until = new Date();
-      const since = new Date(until.getTime() - days * 24 * 60 * 60 * 1000);
       try {
-        const [modelsRes, usageRes] = await Promise.all([
-          client.GET('/v1/llm/models'),
-          client.GET('/v1/llm/usage', {
-            params: {
-              query: { since: since.toISOString(), until: until.toISOString() },
-            },
-          }),
-        ]);
+        const modelsRes = await client.GET('/v1/llm/models');
         if (canceled) return;
-        if (modelsRes.response.status === 401 || usageRes.response.status === 401) {
+        if (modelsRes.response.status === 401) {
           logout();
           return;
         }
@@ -112,7 +79,6 @@ export function LlmPage() {
           return;
         }
         setData(modelsRes.data ?? null);
-        if (usageRes.data) setUsage(usageRes.data);
       } catch (e) {
         if (canceled) return;
         setError(e instanceof Error ? `Network error: ${e.message}` : 'Network error contacting gateway');
@@ -122,7 +88,7 @@ export function LlmPage() {
     }
     void load();
     return () => { canceled = true; };
-  }, [client, logout, refreshKey, days]);
+  }, [client, logout, refreshKey]);
 
   // -------- actions ---------
   const handleSetDefault = useCallback(
@@ -186,13 +152,6 @@ export function LlmPage() {
     [client, logout],
   );
 
-  // -------- usage lookup ---------
-  const usageByName = useMemo<Record<string, LlmModelUsage>>(() => {
-    const map: Record<string, LlmModelUsage> = {};
-    for (const u of usage?.items ?? []) map[u.name] = u;
-    return map;
-  }, [usage]);
-
   // -------- render ---------
   if (loading && !data) {
     return (
@@ -216,24 +175,13 @@ export function LlmPage() {
             </p>
           )}
         </div>
-        <div className="flex items-center gap-3">
-          <SelectBox
-            value={days}
-            onChange={(e) => setDays(Number(e.target.value))}
-            className="h-10 px-3"
-          >
-            {RANGE_OPTIONS.map((opt) => (
-              <option key={opt.value} value={opt.value}>{opt.label}</option>
-            ))}
-          </SelectBox>
-          <Button
-            onClick={() => setRefreshKey((k) => k + 1)}
-            disabled={loading}
-            className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
-          >
-            <RiRefreshLine className="text-lg shrink-0" /> Refresh
-          </Button>
-        </div>
+        <Button
+          onClick={() => setRefreshKey((k) => k + 1)}
+          disabled={loading}
+          className="!py-2 !px-4 !text-[0.9rem] h-10 w-[120px] justify-center gap-1.5"
+        >
+          <RiRefreshLine className="text-lg shrink-0" /> Refresh
+        </Button>
       </div>
 
       {error && (
@@ -256,7 +204,6 @@ export function LlmPage() {
             <LlmCard
               key={entry.name}
               entry={entry}
-              usage={usageByName[entry.name]}
               testing={Boolean(testing[entry.name])}
               testResult={testResults[entry.name]}
               onTest={() => handleTest(entry.name)}
@@ -282,7 +229,6 @@ export function LlmPage() {
 
 function LlmCard({
   entry,
-  usage,
   testing,
   testResult,
   onTest,
@@ -290,7 +236,6 @@ function LlmCard({
   onEdit,
 }: {
   entry: LlmModelEntry;
-  usage?: LlmModelUsage;
   testing: boolean;
   testResult?: LlmModelTestResult;
   onTest: () => void;
@@ -304,7 +249,7 @@ function LlmCard({
           <div className="flex items-center gap-3 mb-1 flex-wrap">
             <h3 className="font-bold text-[1.15rem] tracking-tight">{entry.name}</h3>
             {entry.is_default ? (
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black bg-brand text-white">
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[0.7rem] font-bold uppercase border-2 border-black bg-brand text-ink">
                 <RiStarFill /> Default
               </span>
             ) : (
@@ -422,26 +367,6 @@ function LlmCard({
           </div>
         </Field>
       </div>
-
-      {usage && (
-        <div className="border-t-2 border-black -mx-5 px-5 pt-3">
-          <div className="font-bold uppercase tracking-wider text-[0.7rem] text-ink-soft mb-2">
-            Usage (selected range)
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 font-mono text-[0.85rem]">
-            <UsageStat label="Calls" value={usage.call_count.toLocaleString()} />
-            <UsageStat
-              label="Input"
-              value={formatTokens(
-                usage.input_tokens + usage.cached_input_tokens + usage.cache_creation_input_tokens,
-              )}
-              sub={usage.cached_input_tokens > 0 ? `${formatTokens(usage.cached_input_tokens)} cached` : undefined}
-            />
-            <UsageStat label="Output" value={formatTokens(usage.output_tokens)} />
-            <UsageStat label="Spend" value={formatMicroUsd(usage.cost_micro_usd)} highlight />
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -469,26 +394,6 @@ function Field({
         )}
       </div>
       <div className="font-mono text-[0.9rem] break-all">{children}</div>
-    </div>
-  );
-}
-
-function UsageStat({
-  label,
-  value,
-  sub,
-  highlight,
-}: {
-  label: string;
-  value: string;
-  sub?: string;
-  highlight?: boolean;
-}) {
-  return (
-    <div>
-      <div className="font-bold uppercase tracking-wider text-[0.65rem] text-ink-soft mb-0.5">{label}</div>
-      <div className={`text-[0.95rem] ${highlight ? 'font-bold' : ''}`}>{value}</div>
-      {sub && <div className="text-ink-soft text-[0.7rem]">{sub}</div>}
     </div>
   );
 }
