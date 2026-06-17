@@ -1,24 +1,46 @@
 @import "tailwindcss";
 
 @theme {
-  --color-canvas: #fafafa;
-  --color-ink: #111111;
-  --color-ink-soft: #555555;
-  --color-brand: #3b60e4;
-  --color-brand-hover: #3151c4;
+  /* Warm light-touch palette: cream canvas, warm-black ink/borders, warm-gold
+     brand. The default `black`/`white` are revalued so the existing
+     `border-black` / `bg-white` utilities across every page pick up the warm
+     tone without a per-component class sweep. */
+  --color-canvas: #faf6ec;
+  --color-surface: #fffdf7;
+  --color-ink: #2a2520;
+  --color-ink-soft: #6b6258;
+  /* Warm gold — primary actions, active states, the icon rail, and the
+     user message bubble. Dark `text-ink` rides on top. */
+  --color-brand: #f2c14e;
+  --color-brand-hover: #f5b400;
+  /* Selected chat row: a warm coral. Light enough that dark `text-ink`
+     reads better on it than white (same dark-on-warm pairing as the brand). */
+  --color-selected: #ff8c90;
   --color-err: #e53e3e;
   --color-warn: #dd6b20;
   --color-info: #3182ce;
   --color-ok: #2f855a;
 
+  --color-black: #2a2520;
+  --color-white: #fffdf7;
+
   --font-sans: "Inter", sans-serif;
   --font-mono: "Space Mono", monospace;
 
-  --shadow-brutal: 4px 4px 0 0 #000;
-  --shadow-brutal-sm: 3px 3px 0 0 #000;
-  --shadow-brutal-xs: 2px 2px 0 0 #000;
+  --shadow-brutal: 4px 4px 0 0 #2a2520;
+  --shadow-brutal-sm: 3px 3px 0 0 #2a2520;
+  --shadow-brutal-xs: 2px 2px 0 0 #2a2520;
 
   --radius-brutal: 6px;
+}
+
+/* Assistant prose in the chat thread reads as Inter sans at a comfortable
+   reading size (mono is kept for metadata/code via `font-mono`); the rest of
+   the dashboard stays monospace. */
+.chat-prose {
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.7;
 }
 
 @layer base {
@@ -39,13 +61,21 @@
   }
 }
 
-/* Tinted scrollbar that blends into the canvas background, with a stable
-   gutter so content doesn't jump horizontally the moment the thumb appears
-   (e.g. when a long transcript first overflows the viewport). */
+/* Tinted scrollbar that blends into the canvas background. */
 .chat-scroll {
-  scrollbar-gutter: stable;
   scrollbar-width: thin;
-  scrollbar-color: rgba(17, 17, 17, 0.22) transparent;
+  scrollbar-color: rgba(42, 37, 32, 0.22) transparent;
+}
+
+/* Transcript-only: reserve the gutter on BOTH edges so (a) content doesn't
+   jump horizontally when the thumb first appears, and (b) the centered
+   message band stays on the same center axis as the floating composer — a
+   right-only gutter shifts the band left by half the scrollbar width, so
+   bubbles would poke past the composer. Side panels (cron inbox, work-block
+   step list) must NOT use this — it would inset their full-width dividers
+   away from both edges. */
+.chat-scroll-centered {
+  scrollbar-gutter: stable both-edges;
 }
 
 .chat-scroll::-webkit-scrollbar {
@@ -59,13 +89,13 @@
 
 .chat-scroll::-webkit-scrollbar-thumb {
   background-clip: padding-box;
-  background-color: rgba(17, 17, 17, 0.22);
+  background-color: rgba(42, 37, 32, 0.22);
   border: 2px solid transparent;
   border-radius: 6px;
 }
 
 .chat-scroll::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(17, 17, 17, 0.4);
+  background-color: rgba(42, 37, 32, 0.4);
 }
 
 .chat-scroll::-webkit-scrollbar-corner {

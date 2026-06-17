@@ -5,24 +5,27 @@ import {
   useMemo,
   useRef,
   useState,
+  type ChangeEvent,
   type FormEvent,
   type KeyboardEvent,
 } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
-  RiAddLine,
   RiArrowDownLine,
   RiArrowDownSLine,
-  RiArrowLeftLine,
   RiArrowRightSLine,
+  RiAttachmentLine,
   RiCheckLine,
   RiClipboardLine,
   RiCloseLine,
   RiDeleteBin6Line,
+  RiFileLine,
+  RiImageLine,
   RiLoader4Line,
   RiSendPlane2Line,
+  RiStopFill,
 } from 'react-icons/ri';
 
 import { useAdminClient, useAuth } from '../api/auth';
@@ -33,9 +36,12 @@ import {
   type ResourceAccess,
   type SessionPatch,
   type TaskView,
+  type WireAttachment,
 } from '../api/chatWs';
 import { CronInbox } from '../components/CronInbox';
 import { TaskChecklist } from '../components/chat/TaskChecklist';
+import { SessionSidebar } from './chat/SessionSidebar';
+import type { SessionSummary } from './chat/types';
 
 /** One progress entry inside a turn's work block. `reasoning`, `status`
  *  and `prose` carry `text`; `tool` carries the tool-call fields and is
@@ -64,6 +70,10 @@ export interface TranscriptRow {
   streaming?: boolean;
   notice?: { level: 'info' | 'warn' | 'error'; text: string };
   hasAttachments?: boolean;
+  /** Full attachment details for *live* rows (optimistic sends + WS
+   *  frames). History rows carry only `hasAttachments` — the REST
+   *  transcript DTO omits details — so those fall back to a placeholder. */
+  attachments?: WireAttachment[];
   /** True while a user-authored row is on screen optimistically,
    *  waiting for the server's UserEcho. Cleared when the echo arrives
    *  carrying the same `clientMsgId` in its `platform_msg_id`. */
@@ -124,25 +134,6 @@ interface PendingApproval {
 }
 
 type ApprovalDecision = 'approve' | 'approve_always' | 'deny';
-
-interface SessionSummary {
-  session_id: string;
-  created_at: string;
-  last_active: string;
-  /** Local-only unread counter. Server doesn't surface this — the
-   *  sidebar derives it from incoming `Frame::SessionActivity`. Cleared
-   *  on navigation to the session. Always 0 on the row the user is
-   *  currently viewing because activity for foreground sessions
-   *  doesn't bump. */
-  unread: number;
-  /** Preview text the sidebar row renders — the session's most-recent
-   *  user-authored message, truncated server-side. `undefined` for
-   *  brand-new sessions with no user turn yet, and for sessions whose
-   *  preview fetch failed on the list call. Updated locally on send
-   *  and on inbound `Frame::UserEcho` so the row reflects the latest
-   *  prompt without a list refetch. */
-  last_user_text?: string;
-}
 
 /** One selectable model in the header picker, projected from a
  *  `GET /v1/llm/models` entry. `name` is the `aura.json` entry name
@@ -231,6 +222,27 @@ export const EMPTY_VIEW: SessionView = {
  *  genuinely roamed across many conversations in one tab session. */
 const VIEW_CACHE_LIMIT = 20;
 
+/** A file the user picked in the composer. Uploaded to the blob store as
+ *  soon as it's selected; `blobId` is filled once the upload lands, at which
+ *  point it can be attached to the next outgoing message. */
+interface PendingAttachment {
+  localId: string;
+  filename: string;
+  mime: string;
+  size: number;
+  status: 'uploading' | 'ready' | 'error';
+  blobId?: string;
+  /** Local object URL for an instant composer thumbnail (images only).
+   *  Revoked on remove / after send. */
+  previewUrl?: string;
+}
+
+function attachmentKind(mime: string): WireAttachment['kind'] {
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('audio/')) return 'audio';
+  return 'file';
+}
+
 export function ChatPage() {
   const { sessionId } = useParams<{ sessionId?: string }>();
   const navigate = useNavigate();
@@ -255,12 +267,20 @@ export function ChatPage() {
   // ChatWs fires onTokenRejected and we mint a fresh one for the
   // same anchor — see handleTokenRejected below.
   const [channelToken, setChannelToken] = useState<string | null>(null);
+  // Files picked in the composer, uploaded to the blob store on select and
+  // attached to the next outgoing message once their upload lands.
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const anchorSessionIdRef = useRef<string | null>(null);
 
   // Per-session view buckets keyed by session_id. `currentView` is
   // the derived projection of the URL's sessionId.
   const [views, setViews] = useState<Record<string, SessionView>>({});
   const currentView = (sessionId && views[sessionId]) || EMPTY_VIEW;
+  // A turn is "in flight" either optimistically (between send and the first
+  // response) or per the server's authoritative TurnState. While busy the
+  // composer's send button becomes a stop button and new sends are blocked.
+  const busy = currentView.awaitingReply || (currentView.turn?.active ?? false);
   // Mirrors `useParams().sessionId` in a ref so the WS onFrame closure
   // (captured once at WS construction) can answer "is this frame for
   // the session the user is currently viewing?" without rebuilding the
@@ -1042,11 +1062,11 @@ export function ChatPage() {
     ta.style.height = `${Math.min(ta.scrollHeight, max)}px`;
   }, [composer]);
 
-  const handleSend = useCallback(
-    (e: FormEvent) => {
-      e.preventDefault();
-      const trimmed = composer.trim();
-      if (!trimmed || !sessionId || !wsRef.current) return;
+  const sendText = useCallback(
+    (raw: string, wireAttachments: WireAttachment[] = []) => {
+      const trimmed = raw.trim();
+      if ((!trimmed && wireAttachments.length === 0) || !sessionId || !wsRef.current)
+        return;
       if (status.state !== 'connected') return;
       // Same UUID flows two ways: as the WS frame's `platform_msg_id`
       // (server-side dedup key — a retry between send and echo doesn't
@@ -1085,6 +1105,8 @@ export function ChatPage() {
                 key: `pending-${clientMsgId}`,
                 role: 'user',
                 text: trimmed,
+                hasAttachments: wireAttachments.length > 0,
+                attachments: wireAttachments.length > 0 ? wireAttachments : undefined,
                 pending: true,
                 clientMsgId,
                 createdAt: new Date().toISOString(),
@@ -1100,7 +1122,7 @@ export function ChatPage() {
       // into setSessions via applySessionUserText), but reflecting it
       // here keeps the sidebar in lockstep with the bubble the user
       // just dropped.
-      setSessions((prev) => applySessionUserText(prev, sessionId, trimmed));
+      setSessions((prev) => applySessionUserText(prev, sessionId, trimmed || '[attachment]'));
       // The user just hit send — anchor them to the tail regardless of
       // where they had scrolled to, so the optimistic row + incoming
       // reply land in view. The transcript-change effect above reads
@@ -1112,24 +1134,121 @@ export function ChatPage() {
         userId: 'web-operator',
         content: trimmed,
         clientMsgId,
+        attachments: wireAttachments,
       });
+    },
+    [sessionId, status.state, flushPacerKeepStreaming],
+  );
+
+  const handleSend = useCallback(
+    (e: FormEvent) => {
+      e.preventDefault();
+      // While a turn is in flight the composer's action is "stop" (see the
+      // footer button) and new messages are blocked — the user must let the
+      // turn finish or hit stop first.
+      if (busy) return;
+      // Don't send until every picked file has finished uploading, so an
+      // in-flight attachment isn't silently dropped from the message.
+      if (attachments.some((a) => a.status === 'uploading')) return;
+      const wire: WireAttachment[] = attachments
+        .filter((a) => a.status === 'ready' && a.blobId)
+        .map((a) => ({
+          kind: attachmentKind(a.mime),
+          blob_id: a.blobId as string,
+          mime_type: a.mime,
+          size: a.size,
+          filename: a.filename,
+        }));
+      if (composer.trim().length === 0 && wire.length === 0) return;
+      sendText(composer, wire);
       setComposer('');
+      attachments.forEach((a) => {
+        if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+      });
+      setAttachments([]);
       setShowSlashHints(false);
     },
-    [composer, sessionId, status.state, flushPacerKeepStreaming],
+    [composer, busy, attachments, sendText],
   );
+
+  const handleStop = useCallback(() => {
+    // The stop button issues `/stop` through the same path as typing it,
+    // ignoring any draft already in the composer.
+    sendText('/stop');
+  }, [sendText]);
+
+  const uploadAttachment = useCallback(
+    async (file: File) => {
+      const localId = crypto.randomUUID();
+      const mime = file.type || 'application/octet-stream';
+      // Instant composer thumbnail for images, straight from the local file
+      // (no upload round-trip needed to preview it).
+      const previewUrl = mime.startsWith('image/') ? URL.createObjectURL(file) : undefined;
+      setAttachments((prev) => [
+        ...prev,
+        { localId, filename: file.name, mime, size: file.size, status: 'uploading', previewUrl },
+      ]);
+      try {
+        // The web operator's channel token authorises `/v1/blobs` (it
+        // resolves to `AuthedClient::Web`, which bypasses pairing); the
+        // returned content-addressed blob id is what the message references.
+        const base = (baseUrl || '').replace(/\/+$/, '');
+        const res = await fetch(`${base}/v1/blobs`, {
+          method: 'POST',
+          headers: {
+            'x-aura-channel-token': channelToken ?? '',
+            'content-type': mime,
+          },
+          body: file,
+        });
+        if (!res.ok) throw new Error(`upload failed: ${res.status}`);
+        const data = (await res.json()) as { blob_id: string };
+        setAttachments((prev) =>
+          prev.map((a) =>
+            a.localId === localId ? { ...a, status: 'ready', blobId: data.blob_id } : a,
+          ),
+        );
+      } catch {
+        setAttachments((prev) =>
+          prev.map((a) => (a.localId === localId ? { ...a, status: 'error' } : a)),
+        );
+      }
+    },
+    [baseUrl, channelToken],
+  );
+
+  const handleFilePick = useCallback(
+    (e: ChangeEvent<HTMLInputElement>) => {
+      const files = e.target.files;
+      if (files) {
+        for (const file of Array.from(files)) void uploadAttachment(file);
+      }
+      // Reset so picking the same file again still fires `change`.
+      e.target.value = '';
+    },
+    [uploadAttachment],
+  );
+
+  const removeAttachment = useCallback((localId: string) => {
+    setAttachments((prev) => {
+      const target = prev.find((a) => a.localId === localId);
+      if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl);
+      return prev.filter((a) => a.localId !== localId);
+    });
+  }, []);
 
   const handleComposerKey = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        if (composer.trim().length > 0) {
+        const hasReady = attachments.some((a) => a.status === 'ready');
+        if (!busy && (composer.trim().length > 0 || hasReady)) {
           const form = e.currentTarget.form;
           form?.requestSubmit();
         }
       }
     },
-    [composer],
+    [composer, busy, attachments],
   );
 
   const handleComposerChange = useCallback(
@@ -1154,42 +1273,57 @@ export function ChatPage() {
     [sessionId, views],
   );
 
-  const handleHideSession = useCallback(
-    async (id: string) => {
-      if (
-        !window.confirm(
-          'Hide this conversation from your list? It stays on the server — only your view is filtered.',
-        )
-      ) {
-        return;
+  // Hiding a conversation is confirmed through an in-app dialog (not the
+  // browser's native `confirm`). `hidePrompt` holds the row awaiting
+  // confirmation; the delete only fires from `confirmHideSession`.
+  const [hidePrompt, setHidePrompt] = useState<string | null>(null);
+  const [hideSubmitting, setHideSubmitting] = useState(false);
+  const [hideError, setHideError] = useState<string | null>(null);
+
+  const handleHideSession = useCallback((id: string) => {
+    setHideError(null);
+    setHidePrompt(id);
+  }, []);
+
+  const cancelHideSession = useCallback(() => {
+    if (hideSubmitting) return;
+    setHidePrompt(null);
+    setHideError(null);
+  }, [hideSubmitting]);
+
+  const confirmHideSession = useCallback(async () => {
+    const id = hidePrompt;
+    if (!id) return;
+    setHideSubmitting(true);
+    setHideError(null);
+    const { error, response } = await client.DELETE('/v1/chat/sessions/{session_id}', {
+      params: { path: { session_id: id } },
+    });
+    if (error || !response.ok) {
+      // Surface server-side failure (404, etc.) in the dialog without
+      // nuking the sidebar. The hide is server-authoritative; if the
+      // call fails the row stays visible and the dialog stays open.
+      setHideSubmitting(false);
+      setHideError(error?.error ?? `HTTP ${response.status}`);
+      return;
+    }
+    setSessions((prev) => prev.filter((s) => s.session_id !== id));
+    releaseSessionView(id);
+    if (sessionId === id) {
+      const fallback =
+        sessions.find((s) => s.session_id !== id)?.session_id ??
+        (anchorSessionIdRef.current && anchorSessionIdRef.current !== id
+          ? anchorSessionIdRef.current
+          : null);
+      if (fallback) {
+        navigateRef.current(`/chat/${fallback}`, { replace: true });
+      } else {
+        navigateRef.current('/chat', { replace: true });
       }
-      const { error } = await client.DELETE('/v1/chat/sessions/{session_id}', {
-        params: { path: { session_id: id } },
-      });
-      if (error) {
-        // Surface server-side failure (404, etc.) without nuking the
-        // sidebar. The hide is server-authoritative; if the call
-        // fails the row stays visible.
-        console.warn('hide session failed:', error);
-        return;
-      }
-      setSessions((prev) => prev.filter((s) => s.session_id !== id));
-      releaseSessionView(id);
-      if (sessionId === id) {
-        const fallback =
-          sessions.find((s) => s.session_id !== id)?.session_id ??
-          (anchorSessionIdRef.current && anchorSessionIdRef.current !== id
-            ? anchorSessionIdRef.current
-            : null);
-        if (fallback) {
-          navigateRef.current(`/chat/${fallback}`, { replace: true });
-        } else {
-          navigateRef.current('/chat', { replace: true });
-        }
-      }
-    },
-    [client, releaseSessionView, sessionId, sessions],
-  );
+    }
+    setHideSubmitting(false);
+    setHidePrompt(null);
+  }, [client, hidePrompt, releaseSessionView, sessionId, sessions]);
 
   // Re-pin the active session's model. The PUT is authoritative — its
   // `last_llm` echo drives the local update, and a live actor (if any)
@@ -1285,60 +1419,33 @@ export function ChatPage() {
     );
   }, [showSlashHints, composer, slashCommands]);
 
+  const pendingApprovalIds = useMemo(
+    () =>
+      new Set(
+        Object.entries(views)
+          .filter(([, v]) => v.pendingApproval)
+          .map(([id]) => id),
+      ),
+    [views],
+  );
+
   return (
-    <div className="flex h-screen bg-canvas">
-      {/* Session list rail */}
-      <aside className="w-[260px] border-r-2 border-black flex flex-col bg-white shrink-0">
-        <div className="px-4 py-4 border-b-2 border-black flex items-center justify-between">
-          <Link
-            to="/logs"
-            className="flex items-center gap-1.5 text-ink-soft hover:text-ink text-[0.85rem] font-bold uppercase tracking-wider"
-            title="Back to admin"
-          >
-            <RiArrowLeftLine className="text-base" />
-            Admin
-          </Link>
-          <span className="text-xl font-bold uppercase -tracking-[0.05em]">CHAT</span>
-        </div>
-        <div className="px-3 py-3 border-b-2 border-black">
-          <button
-            type="button"
-            onClick={handleNewChat}
-            disabled={creating}
-            className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-brand text-white border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.85rem] hover:bg-brand-hover active:translate-x-[2px] active:translate-y-[2px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-          >
-            <RiAddLine className="text-lg" />
-            New chat
-          </button>
-        </div>
-        <nav className="flex-1 overflow-auto px-2 py-2 flex flex-col gap-1">
-          {sessionsLoading ? (
-            <div className="flex justify-center py-6 text-ink-soft">
-              <RiLoader4Line className="text-2xl animate-spin" />
-            </div>
-          ) : sessions.length === 0 ? (
-            <div className="text-center text-ink-soft text-sm py-6 font-mono">
-              No conversations yet.
-            </div>
-          ) : (
-            sessions.map((s) => (
-              <SessionRow
-                key={s.session_id}
-                session={s}
-                active={s.session_id === sessionId}
-                hasPending={Boolean(views[s.session_id]?.pendingApproval)}
-                unreadCount={s.unread}
-                onHide={handleHideSession}
-              />
-            ))
-          )}
-        </nav>
-      </aside>
+    <div className="flex flex-1 overflow-hidden bg-surface min-h-0">
+      {/* Session list sidebar (zone 2; the global icon rail is zone 1) */}
+      <SessionSidebar
+        sessions={sessions}
+        activeSessionId={sessionId}
+        pendingIds={pendingApprovalIds}
+        creating={creating}
+        loading={sessionsLoading}
+        onNewChat={handleNewChat}
+        onHide={handleHideSession}
+      />
 
       {/* Main column */}
       <main className="flex-1 flex flex-col overflow-hidden relative">
         <CronInbox refreshSignal={cronInboxRefresh} />
-        <header className="h-12 px-4 border-b-2 border-black flex items-center justify-between gap-3 bg-white">
+        <header className="h-12 px-4 border-b-2 border-black flex items-center justify-between gap-3 bg-canvas">
           <div className="flex items-baseline gap-2 min-w-0 flex-1">
             {sessionId ? (
               <span
@@ -1362,7 +1469,7 @@ export function ChatPage() {
         <div
           ref={transcriptScrollRef}
           onScroll={handleTranscriptScroll}
-          className="chat-scroll relative w-full max-w-6xl overflow-y-auto overflow-x-hidden px-6 py-4"
+          className="chat-scroll chat-scroll-centered relative w-full overflow-y-auto overflow-x-hidden px-6 pt-4 pb-40"
         >
           <TaskChecklist tasks={currentView.tasks} />
           {currentView.historyLoading ? (
@@ -1372,7 +1479,7 @@ export function ChatPage() {
           ) : currentView.transcript.length === 0 && !currentView.pendingApproval ? (
             <WelcomeEmpty slashCommands={slashCommands} onPick={handleComposerChange} />
           ) : (
-            <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-3 w-full max-w-4xl mx-auto">
               {currentView.olderLoading ? (
                 <div className="flex justify-center py-2 text-ink-soft">
                   <RiLoader4Line className="text-xl animate-spin" />
@@ -1384,7 +1491,12 @@ export function ChatPage() {
               ) : null}
               {currentView.transcript.flatMap((row, i, arr) => {
                 const nodes: React.ReactNode[] = [
-                  <MessageBubble key={row.key} row={row} />,
+                  <MessageBubble
+                    key={row.key}
+                    row={row}
+                    channelToken={channelToken}
+                    baseUrl={baseUrl}
+                  />,
                 ];
                 if (isCancelledWorkAt(arr, i, currentView.turn)) {
                   nodes.push(
@@ -1411,7 +1523,7 @@ export function ChatPage() {
           <button
             type="button"
             onClick={jumpToLatest}
-            className="absolute bottom-[calc(18vh+12px)] left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-3 py-1.5 bg-white border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:bg-gray-100 cursor-pointer"
+            className="absolute bottom-32 left-1/2 -translate-x-1/2 z-30 flex items-center gap-1.5 px-3 py-1.5 bg-white border-2 border-black rounded-md shadow-brutal-sm font-bold uppercase tracking-wider text-[0.75rem] hover:bg-gray-100 cursor-pointer"
             title="Jump to latest"
           >
             <RiArrowDownLine className="text-base" />
@@ -1419,14 +1531,26 @@ export function ChatPage() {
           </button>
         ) : null}
 
-        <div className="bg-canvas border-t-2 border-black max-w-6xl mx-auto w-full">
-        <form
-          onSubmit={handleSend}
-          className="bg-canvas px-4 pt-3 pb-6 mb-[calc(14vh-131px)] max-w-3xl mx-auto w-full"
-        >
-          <div className="relative border-2 border-black rounded-md bg-white shadow-brutal-sm focus-within:shadow-brutal transition-shadow">
+        {/* Floating composer pill (app/mac-style): hovers over the thread
+            bottom, centered on the reading column. */}
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex justify-center px-4 pb-6 xl:pl-0 xl:pr-[260px]">
+          <form
+            onSubmit={handleSend}
+            className="pointer-events-auto relative w-full max-w-4xl"
+          >
+            {/* The thread scrolls *behind* the floating composer. A page-colour
+                gradient (transparent at the top → opaque canvas) makes bubbles
+                fade out as they slide into the composer — fully gone by roughly
+                the pill's middle — while keeping the area below the input clear.
+                Scoped to the form (the band width) so it never paints over the
+                right-hand panel/divider; `-bottom-6` reaches the viewport edge
+                under the pill and `-top-20` lifts the fade-in into the thread. */}
+            <div
+              aria-hidden
+              className="pointer-events-none absolute inset-x-0 -bottom-6 -top-20 bg-linear-to-t from-surface from-40% to-transparent"
+            />
             {filteredSlash.length > 0 ? (
-              <div className="border-b-2 border-black bg-canvas px-2 py-2 flex flex-col gap-0.5 rounded-t-[4px]">
+              <div className="absolute bottom-full left-0 right-0 mb-2 border-2 border-black bg-white rounded-2xl shadow-brutal px-2 py-2 flex flex-col gap-0.5">
                 <div className="px-2 pb-1 text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
                   Slash commands
                 </div>
@@ -1437,7 +1561,7 @@ export function ChatPage() {
                     onClick={() => {
                       handleComposerChange(`/${s.command} `);
                     }}
-                    className="text-left px-2 py-1.5 border-2 border-transparent hover:border-black hover:bg-white rounded font-mono text-sm flex items-center gap-2 cursor-pointer"
+                    className="text-left px-2 py-1.5 border-2 border-transparent hover:border-black hover:bg-canvas rounded font-mono text-sm flex items-center gap-2 cursor-pointer"
                   >
                     <span className="font-bold shrink-0">/{s.command}</span>
                     <span className="text-ink-soft truncate">{s.description}</span>
@@ -1446,22 +1570,98 @@ export function ChatPage() {
               </div>
             ) : null}
 
-            <textarea
-              ref={composerRef}
-              value={composer}
-              onChange={(e) => handleComposerChange(e.target.value)}
-              onKeyDown={handleComposerKey}
-              placeholder={
-                status.state === 'connected'
-                  ? 'Message Aura…'
-                  : 'Waiting for connection…'
-              }
-              rows={1}
-              className="w-full px-3.5 py-3 font-mono text-sm bg-transparent resize-none focus:outline-none leading-relaxed placeholder:text-ink-soft/70"
-            />
+            <div className="relative border-2 border-black rounded-2xl bg-white shadow-brutal focus-within:shadow-brutal transition-shadow">
+              {attachments.length > 0 ? (
+                <div className="flex flex-wrap gap-1.5 px-3 pt-2.5">
+                  {attachments.map((a) =>
+                    a.previewUrl ? (
+                      <span key={a.localId} className="relative inline-flex shrink-0">
+                        <img
+                          src={a.previewUrl}
+                          alt={a.filename}
+                          title={a.filename}
+                          className={`h-14 w-14 object-cover rounded-md border-2 border-black ${
+                            a.status === 'error' ? 'opacity-40' : ''
+                          }`}
+                        />
+                        {a.status === 'uploading' ? (
+                          <span className="absolute inset-0 flex items-center justify-center bg-white/60 rounded-md">
+                            <RiLoader4Line className="text-base animate-spin" />
+                          </span>
+                        ) : null}
+                        <button
+                          type="button"
+                          onClick={() => removeAttachment(a.localId)}
+                          className="absolute -top-1.5 -right-1.5 h-4 w-4 flex items-center justify-center bg-white border-2 border-black rounded-full text-ink hover:bg-err hover:text-white cursor-pointer"
+                          aria-label="Remove attachment"
+                        >
+                          <RiCloseLine className="text-[0.6rem]" />
+                        </button>
+                      </span>
+                    ) : (
+                      <span
+                        key={a.localId}
+                        className={`flex items-center gap-1 max-w-[200px] px-2 py-0.5 border-2 border-black rounded-md font-mono text-[0.7rem] ${
+                          a.status === 'error' ? 'bg-err/10 text-err' : 'bg-canvas text-ink'
+                        }`}
+                      >
+                        {a.status === 'uploading' ? (
+                          <RiLoader4Line className="text-xs animate-spin shrink-0" />
+                        ) : a.status === 'error' ? (
+                          <RiCloseLine className="text-xs shrink-0" />
+                        ) : (
+                          <RiAttachmentLine className="text-xs shrink-0" />
+                        )}
+                        <span className="truncate" title={a.filename}>
+                          {a.filename}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => removeAttachment(a.localId)}
+                          className="shrink-0 text-ink-soft hover:text-err cursor-pointer"
+                          aria-label="Remove attachment"
+                        >
+                          <RiCloseLine className="text-xs" />
+                        </button>
+                      </span>
+                    ),
+                  )}
+                </div>
+              ) : null}
+              <textarea
+                ref={composerRef}
+                value={composer}
+                onChange={(e) => handleComposerChange(e.target.value)}
+                onKeyDown={handleComposerKey}
+                placeholder={
+                  status.state === 'connected'
+                    ? 'Message Aura…  (Shift+Enter for newline)'
+                    : 'Waiting for connection…'
+                }
+                rows={1}
+                className="w-full px-4 pt-3 pb-1.5 font-sans text-sm bg-transparent resize-none focus:outline-none leading-relaxed placeholder:text-ink-soft/70"
+              />
 
-            <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 border-t-2 border-black bg-canvas rounded-b-[4px]">
-              <div className="flex items-center gap-2 min-w-0 flex-1">
+              <div className="flex items-center justify-between gap-2 px-2.5 pb-2 pt-0.5">
+                <div className="flex items-center gap-2 min-w-0 flex-1">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    className="hidden"
+                    onChange={handleFilePick}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={!channelToken || status.state !== 'connected'}
+                    className="group shrink-0 h-7 w-7 flex items-center justify-center bg-surface text-ink-soft hover:text-ink border-2 border-black rounded-md shadow-brutal-xs hover:bg-canvas hover:-translate-y-px active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer transition-[transform,box-shadow,background-color,color] duration-150"
+                    title="Attach image or file"
+                    aria-label="Attach image or file"
+                  >
+                    <RiAttachmentLine className="text-base transition-transform duration-200 group-hover:-rotate-[18deg] group-hover:scale-110" />
+                  </button>
+                </div>
                 {sessionId && models.length > 1 ? (
                   <ModelPicker
                     models={models}
@@ -1470,36 +1670,124 @@ export function ChatPage() {
                     onSelect={handleSelectModel}
                   />
                 ) : null}
-                <span className="hidden lg:flex items-center gap-1 text-[0.6rem] font-mono text-ink-soft/80 min-w-0">
-                  <kbd className="px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
-                    Enter
-                  </kbd>
-                  send
-                  <kbd className="ml-1 px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
-                    ⇧Enter
-                  </kbd>
-                  newline
-                  <kbd className="ml-1 px-1.5 py-0.5 border border-black/40 rounded bg-white font-bold">
-                    /
-                  </kbd>
-                  commands
-                </span>
+                {busy ? (
+                  <button
+                    type="button"
+                    onClick={handleStop}
+                    disabled={status.state !== 'connected'}
+                    className="shrink-0 h-8 w-8 flex items-center justify-center bg-err text-white border-2 border-black rounded-full shadow-brutal-xs hover:opacity-90 active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                    title="Stop the current turn (/stop)"
+                    aria-label="Stop the current turn"
+                  >
+                    <RiStopFill className="text-base" />
+                  </button>
+                ) : (
+                  <button
+                    type="submit"
+                    disabled={
+                      !sessionId ||
+                      status.state !== 'connected' ||
+                      attachments.some((a) => a.status === 'uploading') ||
+                      (composer.trim().length === 0 &&
+                        !attachments.some((a) => a.status === 'ready'))
+                    }
+                    className="shrink-0 h-8 w-8 flex items-center justify-center bg-brand text-ink border-2 border-black rounded-full shadow-brutal-xs hover:bg-brand-hover active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                    title="Send (Enter)"
+                  >
+                    <RiSendPlane2Line className="text-base" />
+                  </button>
+                )}
               </div>
-              <button
-                type="submit"
-                disabled={!sessionId || composer.trim().length === 0 || status.state !== 'connected'}
-                className="shrink-0 px-3 py-1.5 bg-brand text-white border-2 border-black rounded-md shadow-brutal-xs font-bold uppercase tracking-wider text-[0.7rem] hover:bg-brand-hover active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer flex items-center gap-1.5"
-                title="Send (Enter)"
-              >
-                <RiSendPlane2Line className="text-sm" />
-                Send
-              </button>
             </div>
-          </div>
-        </form>
+          </form>
         </div>
         </div>
       </main>
+
+      {hidePrompt ? (
+        <HideSessionModal
+          submitting={hideSubmitting}
+          error={hideError}
+          onCancel={cancelHideSession}
+          onConfirm={confirmHideSession}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/** In-app confirmation for hiding a conversation, replacing the browser's
+ *  native `confirm`. Hiding only filters the row from the user's list —
+ *  the session row, transcript, and binding stay live on the server — so
+ *  the copy frames it as a recoverable "remove from list", not a delete.
+ *  Backdrop click and the Escape key both cancel (while idle). */
+function HideSessionModal({
+  submitting,
+  error,
+  onCancel,
+  onConfirm,
+}: {
+  submitting: boolean;
+  error: string | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') onCancel();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onCancel]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
+      role="dialog"
+      aria-modal="true"
+      onClick={onCancel}
+    >
+      <div
+        className="max-w-md w-full bg-surface border-[3px] border-black rounded-md shadow-brutal overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <header className="px-6 py-4 border-b-2 border-black">
+          <h3 className="font-bold uppercase tracking-wider">Remove conversation</h3>
+        </header>
+        <div className="px-6 py-4 space-y-3">
+          <p className="text-[0.95rem] leading-relaxed">
+            Remove this conversation from your list?
+          </p>
+          {error ? (
+            <div className="bg-surface border-2 border-err text-err rounded-md px-3 py-2 font-mono text-[0.85rem]">
+              {error}
+            </div>
+          ) : null}
+        </div>
+        <footer className="flex justify-end gap-2 px-6 py-3 border-t-2 border-black bg-canvas">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={submitting}
+            className="h-9 px-3 border-2 border-black rounded-md bg-surface font-bold uppercase tracking-wider text-[0.85rem] shadow-brutal-xs hover:bg-canvas active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={submitting}
+            className="h-9 px-3 inline-flex items-center gap-1.5 border-2 border-err rounded-md bg-err text-white font-bold uppercase tracking-wider text-[0.85rem] shadow-brutal-xs hover:bg-err/90 active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+          >
+            {submitting ? (
+              <RiLoader4Line className="animate-spin text-base shrink-0" />
+            ) : (
+              <RiDeleteBin6Line className="text-base shrink-0" />
+            )}
+            Remove
+          </button>
+        </footer>
+      </div>
     </div>
   );
 }
@@ -1834,7 +2122,7 @@ export function routeInboundFrame(
             ...prev,
             [sid]: {
               ...view,
-              transcript: finalizeMessage(view.transcript, role, frame.content, hasAttachments),
+              transcript: finalizeMessage(view.transcript, role, frame.content, hasAttachments, frame.attachments),
             },
           };
         });
@@ -1872,6 +2160,7 @@ export function routeInboundFrame(
                 role: 'assistant',
                 text: '',
                 hasAttachments: true,
+                attachments: frame.attachments,
                 createdAt: new Date().toISOString(),
               },
             ],
@@ -2467,7 +2756,9 @@ function finalizeMessage(
   role: 'user' | 'assistant',
   content: string,
   hasAttachments: boolean,
+  attachments: WireAttachment[] = [],
 ): TranscriptRow[] {
+  const details = attachments.length > 0 ? attachments : undefined;
   const last = prev[prev.length - 1];
   if (role === 'assistant' && last?.streaming && last.role === 'assistant') {
     return [
@@ -2477,9 +2768,10 @@ function finalizeMessage(
         text: content,
         streaming: false,
         // Live attachments stay observable on the streaming row — the
-        // bubble's `row.text || [attachment]` fallback then renders
-        // correctly even when the assistant produced only media.
+        // bubble renders the thumbnails/filenames (or the `[attachment]`
+        // fallback) even when the assistant produced only media.
         hasAttachments: hasAttachments || last.hasAttachments,
+        attachments: details ?? last.attachments,
       },
     ];
   }
@@ -2490,6 +2782,7 @@ function finalizeMessage(
       role,
       text: content,
       hasAttachments: hasAttachments || undefined,
+      attachments: details,
       createdAt: new Date().toISOString(),
     },
   ];
@@ -2758,98 +3051,7 @@ function pad2(n: number): string {
   return n < 10 ? `0${n}` : `${n}`;
 }
 
-/** Compact human-readable age. Same shape the logs page uses, kept
- *  local since the dep would be marginal. */
-function relativeAge(iso: string, now: number = Date.now()): string {
-  const t = new Date(iso).getTime();
-  if (Number.isNaN(t)) return '';
-  const diffSec = Math.max(0, Math.floor((now - t) / 1000));
-  if (diffSec < 5) return 'just now';
-  if (diffSec < 60) return `${diffSec}s ago`;
-  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
-  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
-  if (diffSec < 86400 * 7) return `${Math.floor(diffSec / 86400)}d ago`;
-  return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-}
-
 // ── visual components ───────────────────────────────────────────────
-
-function SessionRow({
-  session,
-  active,
-  hasPending,
-  unreadCount,
-  onHide,
-}: {
-  session: SessionSummary;
-  active: boolean;
-  hasPending: boolean;
-  unreadCount: number;
-  onHide: (id: string) => void;
-}) {
-  // Unread badge only shows on background rows — the active row is
-  // already cleared on entry, but guard anyway in case a frame races
-  // the clearing effect.
-  const showUnread = unreadCount > 0 && !active;
-  return (
-    <Link
-      to={`/chat/${session.session_id}`}
-      className={`group relative px-3 py-2 rounded-md border-2 ${
-        active
-          ? 'bg-brand text-white border-black'
-          : 'border-transparent hover:bg-gray-100 text-ink'
-      }`}
-      title={session.session_id}
-    >
-      <div className="flex items-center gap-2">
-        <span
-          className={`text-sm font-bold flex-1 truncate ${
-            active ? 'text-white' : 'text-ink'
-          } ${session.last_user_text ? '' : 'italic opacity-70'}`}
-          title={session.last_user_text ?? undefined}
-        >
-          {session.last_user_text ?? 'New conversation'}
-        </span>
-        {showUnread ? (
-          <span
-            className="shrink-0 min-w-[20px] h-5 px-1.5 rounded-full bg-brand text-white border-2 border-black font-mono text-[0.65rem] font-bold flex items-center justify-center leading-none"
-            title={`${unreadCount} unread message${unreadCount === 1 ? '' : 's'}`}
-          >
-            {unreadCount > 99 ? '99+' : unreadCount}
-          </span>
-        ) : null}
-        {hasPending ? (
-          <span
-            className={`w-2 h-2 rounded-full shrink-0 ${active ? 'bg-white' : 'bg-warn'}`}
-            title="Approval pending"
-          />
-        ) : null}
-        <button
-          type="button"
-          onClick={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            onHide(session.session_id);
-          }}
-          className={`opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity p-0.5 rounded border-2 border-transparent hover:border-black shrink-0 ${
-            active ? 'text-white hover:bg-brand-hover' : 'text-ink-soft hover:bg-white'
-          }`}
-          title="Hide from list (server-side row is kept)"
-          aria-label="Hide conversation"
-        >
-          <RiDeleteBin6Line className="text-sm" />
-        </button>
-      </div>
-      <div
-        className={`mt-0.5 font-mono text-[0.65rem] ${
-          active ? 'text-white/70' : 'text-ink-soft'
-        }`}
-      >
-        {relativeAge(session.last_active)}
-      </div>
-    </Link>
-  );
-}
 
 // Brutalist override map for ReactMarkdown. Keeps the bubble feeling
 // like a chat bubble (tight spacing, no doc-style top margins) while
@@ -2900,7 +3102,7 @@ const MARKDOWN_COMPONENTS: Components = {
       href={href}
       target="_blank"
       rel="noopener noreferrer"
-      className="text-brand underline underline-offset-2 hover:text-brand-hover break-words"
+      className="text-info underline underline-offset-2 hover:opacity-80 break-words"
     >
       {children}
     </a>
@@ -2921,7 +3123,7 @@ const MARKDOWN_COMPONENTS: Components = {
     if (isInline) {
       return (
         <code
-          className="bg-canvas border border-black/30 rounded px-1 py-[1px] text-[0.85em]"
+          className="font-mono bg-canvas border border-black/30 rounded px-1 py-[1px] text-[0.85em]"
           {...rest}
         >
           {children}
@@ -2935,7 +3137,7 @@ const MARKDOWN_COMPONENTS: Components = {
     );
   },
   pre: ({ children }) => (
-    <pre className="my-2 first:mt-0 last:mb-0 bg-canvas border-2 border-black rounded-md p-2 overflow-x-auto text-xs leading-snug">
+    <pre className="font-mono my-2 first:mt-0 last:mb-0 bg-canvas border-2 border-black rounded-md p-2 overflow-x-auto text-xs leading-snug">
       {children}
     </pre>
   ),
@@ -2963,7 +3165,113 @@ function MarkdownBody({ text }: { text: string }) {
   );
 }
 
-function MessageBubble({ row }: { row: TranscriptRow }) {
+function AttachmentImage({
+  blobId,
+  alt,
+  baseUrl,
+  channelToken,
+}: {
+  blobId: string;
+  alt: string;
+  baseUrl: string;
+  channelToken: string | null;
+}) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  // `<img>` can't carry the `x-aura-channel-token` header, so fetch the
+  // blob ourselves and hand the bitmap to the tag as an object URL.
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    void (async () => {
+      try {
+        const base = (baseUrl || '').replace(/\/+$/, '');
+        const res = await fetch(`${base}/v1/blobs/${encodeURIComponent(blobId)}`, {
+          headers: { 'x-aura-channel-token': channelToken ?? '' },
+        });
+        if (!res.ok) throw new Error(`blob ${res.status}`);
+        const blob = await res.blob();
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setUrl(objectUrl);
+      } catch {
+        if (!cancelled) setFailed(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [blobId, baseUrl, channelToken]);
+
+  if (failed) {
+    return (
+      <span className="flex items-center gap-1.5 px-2 py-1 bg-canvas border-2 border-black rounded-md font-mono text-[0.7rem] max-w-full">
+        <RiImageLine className="text-sm shrink-0" />
+        <span className="truncate">{alt}</span>
+      </span>
+    );
+  }
+  if (!url) {
+    return (
+      <div className="flex items-center justify-center h-24 w-24 bg-canvas border-2 border-black rounded-md">
+        <RiLoader4Line className="text-lg animate-spin text-ink-soft" />
+      </div>
+    );
+  }
+  return (
+    <img
+      src={url}
+      alt={alt}
+      className="max-h-48 max-w-full rounded-md border-2 border-black object-contain"
+    />
+  );
+}
+
+function AttachmentList({
+  attachments,
+  baseUrl,
+  channelToken,
+}: {
+  attachments: WireAttachment[];
+  baseUrl: string;
+  channelToken: string | null;
+}) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {attachments.map((a, i) =>
+        a.kind === 'image' ? (
+          <AttachmentImage
+            key={`${a.blob_id}-${i}`}
+            blobId={a.blob_id}
+            alt={a.filename ?? 'image'}
+            baseUrl={baseUrl}
+            channelToken={channelToken}
+          />
+        ) : (
+          <span
+            key={`${a.blob_id}-${i}`}
+            className="flex items-center gap-1.5 px-2 py-1 bg-canvas border-2 border-black rounded-md font-mono text-[0.7rem] max-w-full"
+            title={a.filename ?? a.mime_type}
+          >
+            <RiFileLine className="text-sm shrink-0" />
+            <span className="truncate">{a.filename ?? a.mime_type}</span>
+          </span>
+        ),
+      )}
+    </div>
+  );
+}
+
+function MessageBubble({
+  row,
+  channelToken,
+  baseUrl,
+}: {
+  row: TranscriptRow;
+  channelToken: string | null;
+  baseUrl: string;
+}) {
   if (row.kind === 'work') {
     return <WorkBlock row={row} />;
   }
@@ -2976,24 +3284,32 @@ function MessageBubble({ row }: { row: TranscriptRow }) {
           : 'bg-info/10 border-info text-info';
     return (
       <div className="flex flex-col items-start min-w-0">
-        <div
-          className={`border-2 rounded-md px-3 py-2 font-mono text-sm whitespace-pre-wrap ${palette}`}
-        >
-          {row.notice.text}
-        </div>
-        {row.createdAt ? (
-          <span
-            className="mt-1 px-1 font-mono text-[0.65rem] text-ink-soft tabular-nums"
-            title={formatTimestampTooltip(row.createdAt)}
+        <div className="flex flex-col w-fit min-w-0">
+          <div
+            className={`border-2 rounded-md px-3 py-2 font-mono text-sm whitespace-pre-wrap ${palette}`}
           >
-            {formatTimestampShort(row.createdAt)}
-          </span>
-        ) : null}
+            {row.notice.text}
+          </div>
+          {row.createdAt ? (
+            <span
+              className="mt-1 px-1 self-start font-mono text-[0.65rem] text-ink-soft tabular-nums"
+              title={formatTimestampTooltip(row.createdAt)}
+            >
+              {formatTimestampShort(row.createdAt)}
+            </span>
+          ) : null}
+        </div>
       </div>
     );
   }
   const isUser = row.role === 'user';
-  const body = row.text || (row.hasAttachments ? '[attachment]' : '');
+  // Live rows carry full attachment details (render thumbnails/filenames);
+  // history rows carry only `hasAttachments`, so those still fall back to
+  // the `[attachment]` placeholder.
+  const attachmentDetails = row.attachments ?? [];
+  const body =
+    row.text ||
+    (row.hasAttachments && attachmentDetails.length === 0 ? '[attachment]' : '');
   // Markdown rendering is reserved for assistant output — user input
   // is left as plain pre-wrap so markdown-looking syntax (e.g. paths
   // with underscores, leading hashes in shell logs, raw HTML tags)
@@ -3005,41 +3321,56 @@ function MessageBubble({ row }: { row: TranscriptRow }) {
   const showMarkdown = !isUser && !row.notice && body.length > 0;
   return (
     <div className={`group flex flex-col min-w-0 ${isUser ? 'items-end' : 'items-start'}`}>
-      <div className={`relative min-w-0 ${isUser ? 'max-w-2xl' : 'max-w-4xl'}`}>
-        <div
-          className={`border-2 border-black rounded-md px-3 py-2 text-sm transition-opacity break-words [overflow-wrap:anywhere] ${
-            showMarkdown ? 'font-mono' : 'font-mono whitespace-pre-wrap'
-          } ${isUser ? 'bg-brand text-white' : 'bg-white text-ink'} ${
-            row.pending ? 'opacity-60' : ''
-          }`}
-        >
-          {showMarkdown ? (
-            <MarkdownBody text={body} />
-          ) : (
-            <>
-              {body}
-              {row.streaming ? (
-                <span className="inline-block w-1.5 h-3 ml-0.5 align-baseline bg-current animate-pulse" />
-              ) : null}
-            </>
-          )}
+      <div className={`flex flex-col w-fit min-w-0 ${isUser ? 'max-w-2xl' : 'max-w-4xl'}`}>
+        <div className="relative min-w-0">
+          <div
+            className={`rounded-md py-2 text-sm text-ink transition-opacity break-words [overflow-wrap:anywhere] ${
+              showMarkdown ? 'chat-prose' : 'font-mono whitespace-pre-wrap'
+            } ${isUser ? 'border-2 border-black px-3 bg-brand/60 shadow-brutal-sm' : ''} ${
+              row.pending ? 'opacity-60' : ''
+            }`}
+          >
+            {attachmentDetails.length > 0 ? (
+              <div className={body ? 'mb-1.5' : ''}>
+                <AttachmentList
+                  attachments={attachmentDetails}
+                  baseUrl={baseUrl}
+                  channelToken={channelToken}
+                />
+              </div>
+            ) : null}
+            {showMarkdown ? (
+              <MarkdownBody text={body} />
+            ) : (
+              <>
+                {body}
+                {row.streaming ? (
+                  <span className="inline-block w-1.5 h-3 ml-0.5 align-baseline bg-current animate-pulse" />
+                ) : null}
+              </>
+            )}
+          </div>
+          {row.pending ? (
+            <RiLoader4Line
+              className="absolute -bottom-1.5 -right-1.5 text-sm bg-white text-ink rounded-full border-2 border-black animate-spin"
+              title="Sending…"
+            />
+          ) : null}
         </div>
-        {row.pending ? (
-          <RiLoader4Line
-            className="absolute -bottom-1.5 -right-1.5 text-sm bg-white text-ink rounded-full border-2 border-black animate-spin"
-            title="Sending…"
-          />
+        {row.createdAt || (!isUser && !row.streaming && body) ? (
+          <div className="mt-1 flex items-center gap-1.5 self-start">
+            {row.createdAt ? (
+              <span
+                className="font-mono text-[0.65rem] text-ink-soft tabular-nums"
+                title={formatTimestampTooltip(row.createdAt)}
+              >
+                {formatTimestampShort(row.createdAt)}
+              </span>
+            ) : null}
+            {!isUser && !row.streaming && body ? <CopyButton text={body} /> : null}
+          </div>
         ) : null}
-        {!isUser && !row.streaming && body ? <CopyButton text={body} /> : null}
       </div>
-      {row.createdAt ? (
-        <span
-          className="mt-1 px-1 font-mono text-[0.65rem] text-ink-soft tabular-nums"
-          title={formatTimestampTooltip(row.createdAt)}
-        >
-          {formatTimestampShort(row.createdAt)}
-        </span>
-      ) : null}
     </div>
   );
 }
@@ -3174,14 +3505,6 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
   // "Cancelled · Worked Xs" instead of a plain completion summary.
   const cancelled = !!row.workCancelled;
   const workedLabel = formatWorkedLabel(secs, cancelled);
-  // A *collapsed* finished block sits directly above its turn's answer
-  // bubble — pull the row gap in (the transcript's `gap-3`) so the
-  // `Worked Xs ›` summary reads as attached to that answer. Only when
-  // collapsed: while active there's nothing below it, and once expanded
-  // the steps panel becomes its own box that needs the normal gap to the
-  // answer. Transitioned so expand/collapse eases the gap rather than
-  // snapping it.
-  const tighten = boxed ? '' : '-mb-3';
 
   // One persistent element tree across active / collapsed / expanded so
   // the transitions actually animate (a branch swap would just hard-cut).
@@ -3190,9 +3513,7 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
   // dependable way to animate to/from content height. Border *width*
   // stays 2px in every state (only its color fades) so nothing reflows.
   return (
-    <div
-      className={`group flex flex-col items-start w-full transition-[margin-bottom] duration-300 ease-out ${tighten}`}
-    >
+    <div className="group flex flex-col items-start w-full">
       <div
         className={`${
           compact ? 'w-fit max-w-4xl' : 'w-full max-w-4xl'
@@ -3218,7 +3539,7 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
             // open; the compact spinner card and the collapsed summary keep
             // a seamless, divider-less header.
             panelOpen ? 'border-black bg-canvas' : 'border-transparent bg-transparent'
-          } ${active ? 'cursor-default' : 'cursor-pointer hover:bg-canvas'}`}
+          } ${active ? 'cursor-default' : 'cursor-pointer'}`}
         >
           {active ? (
             <>
@@ -3262,6 +3583,9 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
           </div>
         </div>
       </div>
+      {!active && !expanded ? (
+        <div aria-hidden className="w-full border-t border-black/20" />
+      ) : null}
     </div>
   );
 }
@@ -3350,11 +3674,11 @@ function CopyButton({ text }: { text: string }) {
     <button
       type="button"
       onClick={handle}
-      className="absolute -bottom-2 right-2 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity flex items-center gap-1 px-1.5 py-0.5 bg-white border-2 border-black rounded-md font-mono text-[0.65rem] uppercase tracking-wider hover:bg-gray-100 cursor-pointer"
-      title="Copy message"
+      className="opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity text-ink-soft hover:text-ink cursor-pointer"
+      title={copied ? 'Copied' : 'Copy message'}
+      aria-label="Copy message"
     >
       {copied ? <RiCheckLine className="text-xs" /> : <RiClipboardLine className="text-xs" />}
-      {copied ? 'Copied' : 'Copy'}
     </button>
   );
 }

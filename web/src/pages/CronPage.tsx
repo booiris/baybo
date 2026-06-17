@@ -30,7 +30,7 @@ const thCell =
 const STATUS_BADGE_STYLE: Record<CronStatus, string> = {
   enabled: 'bg-ok text-white',
   disabled: 'bg-gray-200 text-ink-soft',
-  executed: 'bg-brand text-white',
+  executed: 'bg-brand text-ink',
 };
 
 function formatTimestamp(iso: string | null | undefined): string {

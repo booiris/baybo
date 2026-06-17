@@ -305,7 +305,7 @@ function SpanRow({
       onClick={() => onSelect(span.id)}
       className={`w-full text-left flex items-center gap-3 px-3 py-2 border-2 border-black rounded-md transition-all ${
         selected
-          ? 'bg-brand/10 border-brand shadow-brutal-xs'
+          ? 'bg-selected shadow-brutal-xs'
           : 'bg-white hover:bg-gray-50 hover:shadow-brutal-xs'
       }`}
     >
@@ -366,7 +366,7 @@ function StepBlock({
 
   // Group consecutive parallel-group siblings to render the "‖" rail.
   return (
-    <div className="bg-white border-[3px] border-black rounded-md shadow-brutal flex flex-col">
+    <div className="bg-surface border-[3px] border-black rounded-md shadow-brutal flex flex-col">
       <div className="flex items-center gap-3 px-4 py-3 border-b-2 border-black">
         <div
           className={`w-9 h-9 rounded-full border-2 border-black flex items-center justify-center shrink-0 ${visual.bg}`}
@@ -385,7 +385,7 @@ function StepBlock({
           <div className="text-[0.75rem] text-ink font-mono">{formatDuration(ms)}</div>
         </div>
       </div>
-      <div className="px-4 py-3 bg-canvas flex flex-col gap-2">
+      <div className="px-4 py-3 bg-surface flex flex-col gap-2">
         {sortedSpans.length === 0 && (
           <div className="text-ink-soft text-[0.85rem] italic">No spans yet…</div>
         )}
@@ -833,7 +833,7 @@ function SpanDetailPanel({
   const ms = durationMs(span);
 
   return (
-    <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-white flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
+    <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-surface flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
       <div className="flex flex-col border-b-[3px] border-black bg-canvas">
         <div className="flex items-center p-4 pb-2">
           <div className="flex items-center gap-3 min-w-0">
@@ -1050,7 +1050,7 @@ function JobSidebar({
   onChange: (id: string) => void;
 }) {
   return (
-    <div className="w-[120px] shrink-0 border-r-[3px] border-black bg-white flex flex-col z-10 overflow-y-auto">
+    <div className="w-[120px] shrink-0 border-r-[3px] border-black bg-canvas flex flex-col z-10 overflow-y-auto">
       <div className="px-2 py-1.5 border-b-2 border-black font-bold uppercase tracking-wider text-[0.65rem] text-ink-soft bg-canvas">
         Jobs · {jobs.length}
       </div>
@@ -1114,7 +1114,7 @@ function JobSummaryPanel({
 }) {
   if (!summary) {
     return (
-      <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-white flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
+      <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-surface flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
         <div className="p-5 text-ink-soft italic text-[0.85rem]">No job available.</div>
       </div>
     );
@@ -1142,7 +1142,7 @@ function JobSummaryPanel({
   const queuedMs = jobQueuedMs(summary);
 
   return (
-    <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-white flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
+    <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-surface flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
       <div className="border-b-[3px] border-black bg-canvas p-4">
         <div className="flex items-center gap-3 min-w-0">
           <div className="w-10 h-10 rounded-full border-2 border-black flex items-center justify-center shrink-0 bg-brand/10">
@@ -1568,7 +1568,7 @@ export function TraceSessionPage() {
 
   return (
     <div className="flex flex-col h-full overflow-hidden bg-canvas">
-      <div className="p-5 shrink-0 flex items-center gap-4 bg-white border-b-[3px] border-black z-10">
+      <div className="p-5 shrink-0 flex items-center gap-4 bg-canvas border-b-[3px] border-black z-10">
         <IconButton onClick={() => navigate(-1)} aria-label="Go back">
           <RiArrowLeftLine />
         </IconButton>
