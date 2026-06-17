@@ -1645,15 +1645,15 @@ export function ChatPage() {
                   >
                     <RiAttachmentLine className="text-lg" />
                   </button>
-                  {sessionId && models.length > 1 ? (
-                    <ModelPicker
-                      models={models}
-                      defaultName={defaultModelName}
-                      current={currentView.model}
-                      onSelect={handleSelectModel}
-                    />
-                  ) : null}
                 </div>
+                {sessionId && models.length > 1 ? (
+                  <ModelPicker
+                    models={models}
+                    defaultName={defaultModelName}
+                    current={currentView.model}
+                    onSelect={handleSelectModel}
+                  />
+                ) : null}
                 {busy ? (
                   <button
                     type="button"
