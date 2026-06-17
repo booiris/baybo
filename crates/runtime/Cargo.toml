@@ -1,0 +1,49 @@
+[package]
+name = "aura-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+# Mirror the root binary's bench features so they chain through the moved
+# runtime wiring (runtime.rs gates `bench-readonly-memory`; the bash-mode
+# prompt framing rides aura-tools/aura-workspace).
+bench-readonly-memory = ["aura-memory/bench-readonly-memory"]
+bench-bash = ["aura-tools/bench-bash", "aura-workspace/bench-bash"]
+
+[dependencies]
+aura-model = { workspace = true }
+aura-channels = { workspace = true }
+aura-llm = { workspace = true }
+aura-tools = { workspace = true }
+aura-workspace = { workspace = true, features = ["io"] }
+aura-context = { workspace = true }
+aura-job = { workspace = true }
+aura-memory = { workspace = true }
+aura-cost = { workspace = true }
+aura-trace = { workspace = true }
+aura-security = { workspace = true }
+aura-sandbox = { workspace = true }
+aura-agent = { workspace = true }
+aura-cron = { workspace = true }
+aura-janitor = { workspace = true }
+aura-storage = { workspace = true }
+aura-store = { workspace = true }
+aura-skills = { workspace = true }
+aura-skills-assessor = { workspace = true }
+aura-subagent = { workspace = true }
+aura-task = { workspace = true }
+aura-config = { workspace = true }
+aura-gateway = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+regex = { workspace = true }
+futures = { workspace = true }

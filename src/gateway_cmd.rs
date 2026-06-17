@@ -19,18 +19,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_cli::cli::{GatewayCmd, GatewayTokenCmd};
 use aura_config::AuraConfig;
+use aura_gateway::AdminToken;
 use aura_gateway::installer::{self, InstallContext, ServiceInstaller};
-use aura_gateway::{
-    AdminToken, ChannelServer, ChannelSpawner, ChannelTokenTable, ClientIdentity, GatewayDeps,
-    GatewayServer, RuntimeGatewayConfig, SidecarSupervisor, TUI_CLIENT_LABEL, TUI_TOKEN_VAULT_KEY,
-};
 
-use crate::boot;
-use crate::runtime;
-use crate::singleton;
+use aura_runtime::{boot, runtime};
+
 use crate::tracing_init::{TracingMode, init_tracing};
 
 /// Entry point — routes the parsed subcommand to the right handler.
@@ -220,371 +215,32 @@ async fn token_rotate(config: &AuraConfig) -> anyhow::Result<()> {
 // ---- start (long-running) ----
 
 async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
-    // Per-workspace singleton. The gateway owns the same libsql store as
-    // the TUI, runs job recovery, and drives cron ticks — two instances
-    // against the same workspace would race.
-    let workspace_paths =
-        aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
-    aura_workspace::WorkspaceManager::new(workspace_paths.root().to_path_buf())
-        .ensure_layout()
-        .await?;
-    let _workspace_lock = singleton::acquire(workspace_paths.root())?;
-
-    // Register SIGHUP **before** the long boot work below (manager build,
-    // sidecar install, router wiring). Until a signal stream exists SIGHUP
-    // sits at its default disposition — terminate — so a concurrent `aura
-    // llm` edit that signals our freshly-recorded pid (singleton wrote it
-    // just above) would kill the gateway mid-boot. Creating the stream now
-    // flips the disposition and buffers any boot-time signal; the reload
-    // loop drains it once the reloader exists.
-    let sighup = {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::hangup()) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::error!(error = %e, "failed to register SIGHUP; config reload-on-signal disabled");
-                None
-            }
-        }
-    };
-
-    // Read the admin token AND mint+publish a fresh TUI token BEFORE
-    // building the manager graph: both are registered as
-    // `LeakAction::Replace` rules on the LeakDetector, which happens
-    // inside `build_managers` before the detector is sealed into an
-    // Arc. The admin token is auto-minted on first run so a fresh
-    // workspace can `aura gateway start` without a prior `enable`. The
-    // TUI token is rotated unconditionally on every start — semantics
-    // of a "temporary" token: any TUI still holding the previous
-    // generation's value must reconnect via the freshly published
-    // vault entry.
-    let (token, tui_token) = {
-        let vault = runtime::build_secret_vault(&config).await?;
-        let admin_token = AdminToken::new(Arc::clone(&vault)).mint_if_absent().await?;
-        let tui_token = aura_gateway::generate_token();
-        vault
-            .store_secret(TUI_TOKEN_VAULT_KEY, tui_token.as_bytes())
-            .await
-            .map_err(|e| anyhow::anyhow!("publish TUI token to vault: {e}"))?;
-        (admin_token, tui_token)
-    };
-
-    // Build the leak detector (with every gateway-minted token
-    // registered as a `LeakAction::Replace` rule) BEFORE initialising
-    // tracing so log lines that accidentally echo any credential are
-    // masked on disk. Pass the same `Arc<LeakDetector>` into
-    // `build_managers` so the runtime graph's SecurityGateway uses
-    // the same rule set.
-    let leak_detector = runtime::build_leak_detector(
-        &config.security,
-        &[
-            ("gateway.admin_token", token.as_str()),
-            (TUI_TOKEN_VAULT_KEY, tui_token.as_str()),
-        ],
-    );
-    let log_dir = workspace_paths.logs_dir();
-    let tracing_guards = init_tracing(TracingMode::File {
-        log_dir: &log_dir,
-        leak_detector: Arc::clone(&leak_detector),
-    });
-    let log_buffer = tracing_guards.log_buffer();
-    tracing::info!(token_len = token.len(), "gateway token loaded from vault");
-    tracing::info!(
-        token_len = tui_token.len(),
-        "fresh TUI token published to vault"
-    );
-
-    // Resolve the runtime gateway config up front so a bad `bind_address`
-    // fails fast before we open libsql a second time.
-    let runtime_cfg = RuntimeGatewayConfig::from_config(&config.gateway)
-        .map_err(|e| anyhow::anyhow!("invalid gateway config: {e}"))?;
-
-    // Channel-token table for the TUI handshake. The browser MCP
-    // sidecar (chrome-devtools-mcp wrapper) does not use the blob
-    // upload backchannel — its screenshots flow through the standard
-    // MCP `attachImage` content type and are decoded by Aura's
-    // gateway-side `content_adapter`. So no tool/* token registration
-    // is needed here.
-    let channel_tokens = ChannelTokenTable::new();
-    let _tui_token_handle = channel_tokens.register(
-        tui_token.clone(),
-        ClientIdentity {
-            pid: std::process::id(),
-            label: TUI_CLIENT_LABEL.to_string(),
-            // None: TUI's channel-type binding is enforced via
-            // `TUI_CLIENT_LABEL` in the handshake, not via this
-            // field. Subprocess sidecars get `Some(channel_type)`
-            // from `ChannelSpawner::spawn`.
-            bound_channel_type: None,
-        },
-    );
-
-    // Workspace channel-port file — the channel listener writes its
-    // bound port here at start.
-    let port_file = workspace_paths.channel_port();
-
-    // Install the embedded sidecar runtime once and reuse it for both
-    // the MCP-profile collection (browser MCP server) below and the
-    // channel-sidecar supervisor further down. Idempotent install but
-    // keeping a single Arc avoids the second filesystem walk.
-    let sidecar_runtime: Option<Arc<aura_gateway::SidecarRuntime>> =
-        match aura_gateway::SidecarRuntime::install() {
-            Ok(rt) => Some(Arc::new(rt)),
-            Err(e) => {
-                tracing::info!(
-                    error = %e,
-                    "embedded sidecar runtime unavailable; no embedded sidecars will be spawned",
-                );
-                None
-            }
-        };
-    let embedded_mcp_servers: Vec<aura_tools::mcp::EmbeddedMcpServer> = sidecar_runtime
-        .as_deref()
-        .map(|rt| {
-            aura_tools::mcp::embedded_servers(&aura_gateway::collect_profiles(
-                rt,
-                &config,
-                &workspace_paths,
-            ))
-        })
-        .unwrap_or_default();
-
-    let shutdown = ShutdownSignal::new();
-    // The resolved config path, or the default path when none existed at
-    // boot — so a first-run `aura llm add` that creates the file and
-    // SIGHUPs us still hot-reloads instead of silently returning
-    // `NoConfigPath`. This single value feeds both the reloader and the
-    // admin read/mutate surface (`GatewayDeps.config_path`) so the two
-    // never diverge — otherwise `GET /v1/config` would keep reporting the
-    // boot snapshot after a first-run reload had already applied the file.
-    let reload_config_path =
-        boot::resolve_config_path().or_else(|| Some(aura_workspace::paths::default_config_file()));
-    let mut graph = runtime::build_managers(
-        Arc::clone(&config),
-        reload_config_path.clone(),
-        shutdown.clone(),
-        Arc::clone(&leak_detector),
-        embedded_mcp_servers,
-    )
-    .await?;
-    let run_handle = runtime::wire_router(&mut graph).await;
-
-    // WS-backed sidecars register themselves from the route task when a
-    // client connects; nothing to pre-register here.
-
-    let mut task_tracker = TaskTracker::new();
-    runtime::install_signal_handler(&mut task_tracker, shutdown.clone());
-
-    // SIGHUP → config hot-reload, draining the stream registered before
-    // boot. Covers hand-edits to aura.json and the `aura llm` CLI (which
-    // signals after writing config and/or rotating a vault credential).
-    // `reload` always rebuilds the LLM pool, so a vault key rotation —
-    // invisible in the config diff — still takes effect. A signal that
-    // arrived during boot was buffered by the stream and is processed here.
-    if let Some(mut hup) = sighup {
-        let reloader = Arc::clone(&graph.config_reloader);
-        let hup_shutdown = shutdown.clone();
-        task_tracker.track(tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = hup.recv() => match reloader.reload().await {
-                        Ok(o) => {
-                            tracing::info!(active_model = %o.active_model, "SIGHUP: config reloaded")
-                        }
-                        Err(e) => tracing::warn!(error = %e, "SIGHUP: config reload failed"),
-                    },
-                    _ = hup_shutdown.wait() => break,
-                }
-            }
-        }));
-    }
-
-    // Cron tick loop.
-    let cron_handle = Arc::clone(&graph.cron_scheduler);
-    task_tracker.track(tokio::spawn(async move {
-        cron_handle.run().await;
-    }));
-
-    {
-        let mut janitor = aura_janitor::Janitor::new(workspace_paths.clone())
-            .with_pairing_store(graph.stores.channel_pairing.clone());
-        if let Some(runtime) = sidecar_runtime.as_ref()
-            && let Some(cache_root) = runtime.sidecars_cache_root()
-        {
-            janitor = janitor.with_sidecar_cache(aura_janitor::SidecarCache {
-                cache_root,
-                live_dirs: runtime.live_dir_names(),
+    let running = aura_runtime::start_gateway(aura_runtime::StartGatewayOpts {
+        config,
+        config_path: None,
+        install_signals: true,
+        start_channel_listener: true,
+        // The CLI owns tracing: a file layer under the workspace `logs/` dir,
+        // with the leak detector wired in so any log line echoing a token is
+        // masked. The returned guards ride on `RunningGateway` to stay alive.
+        setup_tracing: Box::new(|paths, leak_detector| {
+            let log_dir = paths.logs_dir();
+            let guards = init_tracing(TracingMode::File {
+                log_dir: &log_dir,
+                leak_detector,
             });
-        }
-        let janitor_shutdown = shutdown.clone();
-        task_tracker.track(tokio::spawn(async move {
-            janitor
-                .run(async move { janitor_shutdown.wait().await })
-                .await;
-        }));
-    }
+            let log_buffer = guards.log_buffer();
+            (log_buffer, Box::new(guards) as aura_runtime::TracingGuard)
+        }),
+    })
+    .await?;
 
-    let channel_control = Arc::new(aura_gateway::ChannelControlRegistry::new());
-
-    // CLI-driven bot add/remove writes straight to libsql + vault. The
-    // reconciler polls those stores on a short tick and pushes
-    // `StartBot` / `StopBot` frames to whichever sidecars are
-    // connected. Spawning here so it rides the shared shutdown signal
-    // alongside the cron loop and axum servers.
-    let bot_reconciler = Arc::new(aura_gateway::channel::ChannelBotReconciler::new(
-        Arc::clone(&channel_control),
-        graph.stores.channel_bot.clone(),
-        Arc::clone(&graph.secret_vault),
-    ));
-    {
-        let reconciler = Arc::clone(&bot_reconciler);
-        let shutdown_for_reconciler = shutdown.clone();
-        task_tracker.track(tokio::spawn(async move {
-            reconciler.run(shutdown_for_reconciler).await;
-        }));
-    }
-
-    // Stash for web-chat token handles. Built here so the TTL
-    // janitor task and the GatewayDeps both clone the same Arc;
-    // mint-side (admin chat) and take-side (channel WS) share this
-    // map.
-    let web_chat_tokens = Arc::new(Default::default());
-
-    // TTL reaper for web_chat_tokens. Drops `StashedTokenHandle`
-    // entries that a WS upgrade never claimed within
-    // `WebTokenJanitor::DEFAULT_TTL`. Without this, mints that never
-    // reach a `/v1/channel-ws` upgrade leak until process exit.
-    {
-        let janitor = aura_gateway::channel::WebTokenJanitor::new(Arc::clone(&web_chat_tokens));
-        let shutdown_for_janitor = shutdown.clone();
-        task_tracker.track(tokio::spawn(async move {
-            janitor.run(shutdown_for_janitor).await;
-        }));
-    }
-
-    // Build the axum server from the assembled graph.
-    let deps = GatewayDeps {
-        config: Arc::clone(&graph.config),
-        config_path: reload_config_path,
-        runtime_config: runtime_cfg.clone(),
-        session_manager: Arc::clone(&graph.session_manager),
-        job_lifecycle: Arc::clone(&graph.job_lifecycle),
-        cron_scheduler: Arc::clone(&graph.cron_scheduler),
-        skill_registry: Arc::clone(&graph.skill_registry),
-        tool_registry: Arc::clone(&graph.tool_registry),
-        channel_registry: Arc::clone(&graph.channels_registry),
-        llm_pool: Arc::clone(&graph.llm_pool),
-        supervisor: run_handle.supervisor.clone(),
-        config_reloader: Arc::clone(&graph.config_reloader),
-        admin_token: token.clone(),
-        log_buffer: Arc::clone(&log_buffer),
-        incoming_tx: run_handle.incoming_tx.clone(),
-        channel_tokens: channel_tokens.clone(),
-        web_chat_tokens,
-        secret_vault: Arc::clone(&graph.secret_vault),
-        stores: graph.stores.clone(),
-        channel_control,
-        bot_reconciler: Arc::clone(&bot_reconciler),
-    };
-
-    // Channel loopback-TCP listener — publishes its ephemeral port to
-    // `<workspace>/state/channel.port` (next to the singleton
-    // lockfile) so TUI and sidecars can discover it without a config
-    // roundtrip.
-    let channel_server = ChannelServer::bind(&deps, port_file, channel_tokens.clone())
-        .map_err(|e| anyhow::anyhow!("bind channel TCP listener: {e}"))?;
-    let channel_port = channel_server.port();
-    let channel_url = format!("ws://127.0.0.1:{channel_port}/v1/channel-ws");
-
-    // Channel-sidecar supervisor (telegram / weixin / …). The channel
-    // TCP listener is already bound above so the kernel's listen queue
-    // absorbs child connection attempts even before
-    // `channel_server.run()` starts accepting inside the select! below.
-    // The browser MCP server lives on a separate path: it is spawned
-    // by the MCP reconciler set up inside `runtime::build_managers`,
-    // not by this supervisor.
-    if let Some(runtime) = sidecar_runtime.as_ref() {
-        let domains: Vec<&str> = runtime.domains().collect();
-        if domains.is_empty() {
-            tracing::info!("no embedded sidecars in this build");
-        } else {
-            for domain in &domains {
-                let names: Vec<&str> = runtime.names_in_domain(domain).collect();
-                tracing::info!(
-                    domain = %domain,
-                    sidecars = ?names,
-                    channel_port,
-                    "sidecar runtime materialised",
-                );
-            }
-        }
-
-        let channel_only: Vec<String> = runtime
-            .names_in_domain(aura_gateway::sidecar::domains::CHANNEL)
-            .map(String::from)
-            .collect();
-        if !channel_only.is_empty() {
-            let spawner = ChannelSpawner::new(
-                channel_url.clone(),
-                channel_tokens.clone(),
-                boot::proxy_settings(&config),
-            );
-            let supervisor = SidecarSupervisor::new(
-                Arc::clone(runtime),
-                spawner,
-                Arc::clone(&log_buffer),
-                workspace_paths.channel_logs_dir(),
-                Arc::clone(&leak_detector),
-                graph.stores.channel_bot.clone(),
-            );
-            let sv_shutdown = shutdown.clone();
-            task_tracker.track(tokio::spawn(async move {
-                supervisor.run(sv_shutdown).await;
-            }));
-        }
-    }
-
-    let server = GatewayServer::new(deps);
-    let banner_bind = server.bind();
     // Dashboard URL first, then the admin token on its own line for the
-    // operator to paste into the login field. Deliberately NOT a
-    // `?token=…` URL — that would leak the token into the gateway's
-    // access log on the very first request.
-    println!("Web dashboard: http://{banner_bind}");
-    println!("Admin token:   {token}");
+    // operator to paste into the login field. Deliberately NOT a `?token=…`
+    // URL — that would leak the token into the gateway's access log on the
+    // very first request.
+    println!("Web dashboard: http://{}", running.admin_addr);
+    println!("Admin token:   {}", running.admin_token);
 
-    tracing::info!(bind = %banner_bind, "gateway start: all components initialized");
-
-    let admin_shutdown = shutdown.clone();
-    let channel_shutdown = shutdown.clone();
-    let router_shutdown = shutdown.clone();
-    tokio::select! {
-        res = server.run(admin_shutdown) => {
-            if let Err(e) = res {
-                tracing::error!(error = %e, "admin gateway server exited with error");
-                shutdown.trigger();
-                return Err(anyhow::anyhow!("gateway server error: {e}"));
-            }
-        }
-        res = channel_server.run(channel_shutdown) => {
-            if let Err(e) = res {
-                tracing::error!(error = %e, "channel gateway server exited with error");
-                shutdown.trigger();
-                return Err(anyhow::anyhow!("channel server error: {e}"));
-            }
-        }
-        _ = run_handle.router.run(run_handle.incoming_rx, run_handle.response_rx) => {
-            tracing::info!("router exited before server; triggering shutdown");
-            shutdown.trigger();
-        }
-        _ = router_shutdown.wait() => {
-            tracing::info!("shutdown signal received, stopping gateway");
-        }
-    }
-
-    runtime::force_exit_watchdog(runtime_cfg.shutdown_grace);
-
-    task_tracker.shutdown().await;
-    tracing::info!("gateway shutdown complete");
-    Ok(())
+    running.serve().await
 }

@@ -42,7 +42,7 @@ pub fn admin_addr_from_config(config: &AuraConfig) -> anyhow::Result<SocketAddr>
 /// would only mask the more specific connect-failure message that the
 /// dial attempt produces a moment later.
 pub async fn read_tui_token(config: &AuraConfig) -> Option<String> {
-    let vault = match crate::runtime::build_secret_vault(config).await {
+    let vault = match aura_runtime::runtime::build_secret_vault(config).await {
         Ok(v) => v,
         Err(e) => {
             tracing::debug!(error = %e, "tui token: open vault failed");

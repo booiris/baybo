@@ -4,3 +4,4 @@ packages:
   - "tool-src/*"
   - "web"
   - "bench/bench-web/web"
+  - "app/mac"

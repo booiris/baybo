@@ -85,3 +85,31 @@ jobs:
       - run: pnpm -r --if-present run check
       # node --test suites (channel SDK, channel + browser sidecars)
       - run: pnpm -r --if-present run test
+
+  mac-app:
+    name: mac app (tauri build)
+    # Needs a macOS runner: Tauri bundles a real .app and links against the
+    # system WebKit (WKWebView). Inherits the top-level env that disables the
+    # repo's sccache/lld wrapper, which stock runners don't have.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      # Channel + components come from rust-toolchain.toml; this also caches the
+      # cargo registry/target (the embedded runtime is a large build).
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: pnpm install --frozen-lockfile
+      # src/api/schema.d.ts is gitignored (generated from docs/openapi.json).
+      # The tauri build's beforeBuildCommand runs `tsc`, which imports it, so
+      # generate it first.
+      - run: pnpm --filter aura-mac gen:api
+      # Debug build (skips release LTO) of just the .app — skipping the dmg,
+      # which is the slow/flaky part on CI. Compiles the in-process aura runtime
+      # and the React frontend and bundles them: enough to prove the app builds.
+      - run: pnpm --filter aura-mac tauri build --debug --bundles app

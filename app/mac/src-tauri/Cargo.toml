@@ -1,0 +1,30 @@
+[package]
+name = "aura-mac"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "aura_mac"
+doctest = false
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin-single-instance = { workspace = true }
+aura-runtime = { workspace = true }
+aura-gateway = { workspace = true }
+aura-config = { workspace = true }
+aura-workspace = { workspace = true, features = ["io"] }
+aura-setup = { workspace = true }
+aura-llm = { workspace = true }
+aura-security = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+parking_lot = { workspace = true }

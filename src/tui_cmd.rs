@@ -33,8 +33,8 @@ use tracing::info;
 use crate::gateway_client::{
     admin_addr_from_config, read_tui_token, try_connect_with_token, unreachable_gateway_error,
 };
-use crate::runtime::force_exit_watchdog;
-use crate::runtime::install_signal_handler;
+use aura_runtime::runtime::{force_exit_watchdog, install_signal_handler};
+
 use crate::tracing_init::{TracingMode, init_tracing};
 
 /// Resolved options passed from `main.rs` after parsing the clap
@@ -91,7 +91,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
                     // a `--config` flag on the TUI would point the child
                     // at a different vault, and they'd disagree on bind
                     // address.
-                    let config_path = crate::boot::resolve_config_path();
+                    let config_path = aura_runtime::boot::resolve_config_path();
                     _auto_gateway =
                         Some(dev_auto::spawn_and_wait_ready(admin_addr, config_path).await?);
                     // Reconnect with the freshly-rotated token the spawned
@@ -152,7 +152,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
 }
 
 async fn read_admin_token(config: &AuraConfig) -> Option<String> {
-    let vault = match crate::runtime::build_secret_vault(config).await {
+    let vault = match aura_runtime::runtime::build_secret_vault(config).await {
         Ok(v) => v,
         Err(e) => {
             tracing::debug!(error = %e, "admin token: open vault failed");

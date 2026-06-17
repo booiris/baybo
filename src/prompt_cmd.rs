@@ -45,7 +45,8 @@ use uuid::Uuid;
 use crate::gateway_client::{
     admin_addr_from_config, read_tui_token, try_connect_with_token, unreachable_gateway_error,
 };
-use crate::runtime::{build_leak_detector, build_managers, force_exit_watchdog, wire_router};
+use aura_runtime::runtime::{build_leak_detector, build_managers, force_exit_watchdog, wire_router};
+
 use crate::tracing_init::{TracingMode, init_tracing};
 
 /// Capacity of the in-process sink → consumer hop. Same order as the
@@ -128,7 +129,7 @@ pub async fn run(config: Arc<AuraConfig>, opts: Options) -> anyhow::Result<()> {
     // uses (`gateway_cmd::start`) so the flock actually collides.
     let workspace_paths =
         aura_workspace::WorkspacePaths::new(std::path::PathBuf::from(&config.workspace.path));
-    let result = match crate::singleton::acquire(workspace_paths.root()) {
+    let result = match aura_runtime::singleton::acquire(workspace_paths.root()) {
         Ok(lock) => {
             info!("no running gateway; serving the prompt in-process");
             run_in_process(config, opts, lock, session_id.clone()).await
@@ -232,7 +233,7 @@ async fn run_in_process(
     opts: Options,
     // Held for the whole turn so no gateway / another `aura prompt` can
     // race the workspace. Dropped on return, releasing the flock.
-    _lock: crate::singleton::WorkspaceLock,
+    _lock: aura_runtime::singleton::WorkspaceLock,
     session_id: SessionId,
 ) -> anyhow::Result<()> {
     let shutdown = ShutdownSignal::new();

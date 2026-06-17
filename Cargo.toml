@@ -26,6 +26,7 @@ members = [
     "crates/config",
     "crates/cli",
     "crates/gateway",
+    "crates/runtime",
     "crates/tui",
     "crates/pairing",
     "crates/integration-tests",
@@ -35,6 +36,7 @@ members = [
     "bench/memory",
     "bench/swe",
     "bench/bench-web",
+    "app/mac/src-tauri",
 ]
 exclude = ["crates/security/fuzz"]
 
@@ -70,6 +72,7 @@ aura-cron = { path = "crates/cron" }
 aura-config = { path = "crates/config" }
 aura-cli = { path = "crates/cli" }
 aura-gateway = { path = "crates/gateway" }
+aura-runtime = { path = "crates/runtime" }
 aura-tui = { path = "crates/tui" }
 aura-pairing = { path = "crates/pairing" }
 aura-integration-tests = { path = "crates/integration-tests" }
@@ -78,6 +81,11 @@ aura-setup = { path = "crates/setup" }
 aura-term-harness = { path = "crates/term-harness" }
 aura-bench-web = { path = "bench/bench-web" }
 # External dependencies
+# Tauri (macOS app shell — see app/mac and docs/mac-app.md). Pinned to the
+# versions already in the local cargo cache so the embed builds offline.
+tauri = { version = "2", features = [] }
+tauri-build = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -183,8 +191,8 @@ edition.workspace = true
 # Build a benchmark-only `aura` that recalls memory but never writes it, so the
 # LOCOMO bench (`bench/memory`) can drive the real agent end-to-end without QA
 # turns polluting the recall scope. Wraps the backend in
-# `aura_memory::ReadOnlyMemory` (see `src/runtime.rs`). NOT for production.
-bench-readonly-memory = ["aura-memory/bench-readonly-memory"]
+# `aura_memory::ReadOnlyMemory` (see `crates/runtime/src/runtime.rs`). NOT for production.
+bench-readonly-memory = ["aura-runtime/bench-readonly-memory", "aura-memory/bench-readonly-memory"]
 
 # Compile the Bash tool's bench profile: run shell commands raw inside an
 # already-disposable container — no uv shims, no work-dir jail, cwd inherited
@@ -193,7 +201,7 @@ bench-readonly-memory = ["aura-memory/bench-readonly-memory"]
 # on PATH. Distinct from the `sandbox.mode = none` config (which only drops the
 # OS sandbox but keeps uv + the work/ jail). Off by default; absent in every
 # prod build. For bench/swe + bench/terminal-bench-1.0.
-bench-bash = ["aura-tools/bench-bash", "aura-workspace/bench-bash"]
+bench-bash = ["aura-runtime/bench-bash", "aura-tools/bench-bash", "aura-workspace/bench-bash"]
 
 [dependencies]
 aura-model = { workspace = true }
@@ -211,6 +219,7 @@ aura-sandbox = { workspace = true }
 aura-agent = { workspace = true }
 aura-cron = { workspace = true }
 aura-janitor = { workspace = true }
+aura-runtime = { workspace = true }
 aura-storage = { workspace = true }
 aura-store = { workspace = true }
 aura-skills = { workspace = true }

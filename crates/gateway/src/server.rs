@@ -45,6 +45,7 @@ use aura_store::ChannelBotStore;
 use aura_tools::ToolRegistry;
 use aura_trace::TraceStore;
 use axum::Router;
+use axum::http::{HeaderName, Method, header};
 use axum::middleware;
 use tokio::sync::mpsc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -267,21 +268,68 @@ impl GatewayServer {
         self.shutdown_grace
     }
 
+    /// Bind the admin TCP listener eagerly and return a [`BoundGateway`]
+    /// that exposes the OS-assigned [`SocketAddr`]. With `port = 0` the
+    /// kernel picks an ephemeral port; an embedding host (the macOS app)
+    /// reads it back via [`BoundGateway::local_addr`] *before* serving so
+    /// it can hand the real `http://127.0.0.1:<port>` base URL to its
+    /// webview. The CLI's [`Self::run`] is a thin bind-then-serve wrapper.
+    pub async fn bind_listener(self) -> Result<BoundGateway> {
+        let listener =
+            tokio::net::TcpListener::bind(self.bind)
+                .await
+                .map_err(|e| GatewayError::Bind {
+                    addr: self.bind.to_string(),
+                    reason: e.to_string(),
+                })?;
+        let local_addr = listener.local_addr().map_err(|e| GatewayError::Bind {
+            addr: self.bind.to_string(),
+            reason: e.to_string(),
+        })?;
+        Ok(BoundGateway {
+            local_addr,
+            listener,
+            router: self.router,
+            shutdown_grace: self.shutdown_grace,
+        })
+    }
+
     /// Run the admin server to completion. Returns once
     /// [`ShutdownSignal`] fires and axum has drained in-flight
-    /// requests.
+    /// requests. Equivalent to `self.bind_listener().await?.serve(...)`.
     pub async fn run(self, shutdown: ShutdownSignal) -> Result<()> {
-        let listener = tokio::net::TcpListener::bind(self.bind)
-            .await
-            .map_err(|e| GatewayError::Bind {
-                addr: self.bind.to_string(),
-                reason: e.to_string(),
-            })?;
-        tracing::info!(bind = %self.bind, listener = "admin", "gateway listening");
+        self.bind_listener().await?.serve(shutdown).await
+    }
+}
+
+/// An admin server whose TCP listener is already bound. Splitting bind from
+/// serve lets an embedding host read the OS-assigned ephemeral port
+/// ([`Self::local_addr`]) before the server begins accepting — the seam the
+/// macOS app needs to advertise its loopback URL. See `docs/mac-app.md` §2.
+pub struct BoundGateway {
+    local_addr: SocketAddr,
+    listener: tokio::net::TcpListener,
+    router: Router,
+    shutdown_grace: std::time::Duration,
+}
+
+impl BoundGateway {
+    /// The OS-assigned bind address — the real port even when bound with `:0`.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn shutdown_grace(&self) -> std::time::Duration {
+        self.shutdown_grace
+    }
+
+    /// Serve until [`ShutdownSignal`] fires and axum drains in-flight requests.
+    pub async fn serve(self, shutdown: ShutdownSignal) -> Result<()> {
+        tracing::info!(bind = %self.local_addr, listener = "admin", "gateway listening");
         let shutdown_fut = async move {
             shutdown.wait().await;
         };
-        axum::serve(listener, self.router.into_make_service())
+        axum::serve(self.listener, self.router.into_make_service())
             .with_graceful_shutdown(shutdown_fut)
             .await
             .map_err(|e| GatewayError::Internal(format!("serve error: {e}")))
@@ -368,11 +416,31 @@ fn build_cors(origins: &[String]) -> CorsLayer {
         .iter()
         .map(|o| o.parse::<axum::http::HeaderValue>())
         .collect();
-    match parsed {
-        Ok(list) => CorsLayer::new().allow_origin(AllowOrigin::list(list)),
+    let list = match parsed {
+        Ok(list) => list,
         Err(e) => {
             tracing::warn!(error = %e, "invalid CORS origin in config; defaulting to none");
-            CorsLayer::new()
+            return CorsLayer::new();
         }
-    }
+    };
+    // A cross-origin caller (the embedded macOS app's webview fetches the
+    // loopback gateway directly) sends `Authorization` / `x-aura-channel-token`,
+    // which makes the request preflighted. Allow the verbs + those headers, or
+    // the browser blocks the call before it reaches a handler. NOTE: the `*`
+    // wildcard in `Access-Control-Allow-Headers` does NOT cover `Authorization`
+    // — it must be named explicitly.
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(list))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static(crate::auth::CHANNEL_TOKEN_HEADER),
+        ])
 }

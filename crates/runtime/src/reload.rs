@@ -311,7 +311,7 @@ pub struct RuntimeConfigReloader {
 }
 
 impl RuntimeConfigReloader {
-    pub fn new(
+    pub(crate) fn new(
         config_path: Option<PathBuf>,
         handle: ConfigHandle,
         llm: LlmReloader,

@@ -1,0 +1,95 @@
+@import "tailwindcss";
+
+/* Fresh warm neo-brutalist design tokens (see docs/mac-app.md section 7),
+   modelled on raft.build and NOT reused from web/. Tailwind v4 generates
+   utilities directly from these namespaced theme variables. */
+@theme {
+  --color-canvas: #faf6ec;
+  --color-surface: #fffdf7;
+  --color-ink: #1a1714;
+  --color-ink-soft: #6b6258;
+
+  --color-rail: #f2c14e;
+  --color-selected: #f08a5d;
+  --color-accent: #e07a3f;
+
+  --color-ok: #3f8f5b;
+  --color-warn: #c98a1e;
+  --color-err: #c2452d;
+  --color-info: #3a6ea5;
+
+  --color-border: #1a1714;
+
+  --shadow-brutal: 4px 4px 0 0 #1a1714;
+  --shadow-brutal-sm: 2px 2px 0 0 #1a1714;
+
+  --radius-brutal: 8px;
+
+  --font-sans: "Inter", system-ui, sans-serif;
+  --font-mono: "Space Mono", ui-monospace, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Minimal readable styles for react-markdown output (Tailwind preflight
+   resets list/heading styling). */
+.markdown p {
+  margin: 0.25rem 0;
+}
+.markdown ul,
+.markdown ol {
+  margin: 0.25rem 0;
+  padding-left: 1.25rem;
+  list-style: revert;
+}
+.markdown code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--color-canvas);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  padding: 0 0.25rem;
+}
+.markdown pre {
+  overflow-x: auto;
+  background: var(--color-canvas);
+  border: 2px solid var(--color-border);
+  border-radius: 8px;
+  padding: 0.5rem;
+}
+.markdown pre code {
+  border: 0;
+  background: transparent;
+}
+.markdown a {
+  color: var(--color-info);
+  text-decoration: underline;
+}
+
+/* Comfortable reading size for assistant prose in the centered (Codex-style)
+   column. Applied as `markdown reading-col`; mono code/pre inside keep their
+   own sizing from the `.markdown` rules above. */
+.reading-col {
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+/* Hide the scrollbar but keep scrolling (WKWebView / WebKit + standard). */
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}

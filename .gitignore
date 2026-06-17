@@ -33,6 +33,9 @@ origin_channel_plugin
 .claude/settings.json
 .mcp.json
 
+# macOS Finder metadata
+.DS_Store
+
 # stray submodule manifest from local sandbox
 .gitmodules
 .antigravitycli

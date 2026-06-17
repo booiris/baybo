@@ -1,17 +1,14 @@
-mod boot;
 mod gateway_client;
 mod gateway_cmd;
 mod prompt_cmd;
-mod reload;
-mod runtime;
 mod setup_cmd;
-mod singleton;
 mod tracing_init;
 mod tui_cmd;
 mod tui_log;
 
 use aura_cli::cli::ShellKind;
 use aura_cli::{Cli, Commands, ContextBuilder, Invocation, OutputFormat, dispatch};
+use aura_runtime::{boot, runtime};
 use clap::CommandFactory;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
