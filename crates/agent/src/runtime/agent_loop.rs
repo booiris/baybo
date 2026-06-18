@@ -311,16 +311,17 @@ pub trait InterjectionSource: Send {
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.
 /// The recall query for a job, or `None` for job kinds that don't recall.
 /// Memory recall/write run only for `UserChat` and `Cron` jobs — `System`,
-/// `Spawned` (subagent), and `SubagentNotification` have no direct user input
-/// and would pollute or double-write. The exhaustive match forces a
-/// classification when a new `JobInput` variant is added.
+/// `Spawned` (subagent), `SubagentNotification`, and `GoalContinuation` have no
+/// direct user input and would pollute or double-write. The exhaustive match
+/// forces a classification when a new `JobInput` variant is added.
 fn memory_recall_query(input: &JobInput) -> Option<Vec<ContentBlock>> {
     match input {
         JobInput::UserChat { content } => Some(content.clone()),
         JobInput::Cron { action_payload } => Some(cron_prompt_blocks(action_payload)),
         JobInput::System { .. }
         | JobInput::Spawned { .. }
-        | JobInput::SubagentNotification { .. } => None,
+        | JobInput::SubagentNotification { .. }
+        | JobInput::GoalContinuation { .. } => None,
     }
 }
 
@@ -1836,6 +1837,37 @@ impl AgentLoop {
             return;
         }
         let msg = ChatMessage::agent_context(content);
+        self.context_manager.append_in_memory(&msg);
+    }
+
+    /// Append the framed goal continuation steering **in-memory only** (the
+    /// analog of [`Self::append_subagent_notification`]). The steering is
+    /// re-derived from the live goal every turn, so persisting per-turn would
+    /// stack identical long `GoalSteering` rows in the transcript and grow the
+    /// `session_messages` table without bound; keeping it in-memory also lets a
+    /// transiently-failed continuation roll the row back. Only the model's
+    /// proactive reply (if any) is persisted by the turn. The caller seeds the
+    /// system prompt and snapshots the transcript *before* this so a failed turn
+    /// can roll the row back; `content` is built via `aura_goal::prompts`.
+    pub fn append_goal_continuation(&mut self, content: Vec<ContentBlock>) {
+        let seeded = self
+            .context_manager
+            .messages()
+            .first()
+            .is_some_and(|m| m.role == Role::System);
+        debug_assert!(
+            seeded,
+            "append_goal_continuation requires the system prompt already seeded \
+             (call ensure_system_prompt_seeded before snapshotting)"
+        );
+        if !seeded {
+            error!(
+                "append_goal_continuation called before the system prompt was seeded; \
+                 dropping the in-memory steering to keep the transcript prefix intact"
+            );
+            return;
+        }
+        let msg = ChatMessage::goal_steering(content);
         self.context_manager.append_in_memory(&msg);
     }
 

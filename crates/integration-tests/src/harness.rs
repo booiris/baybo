@@ -75,6 +75,10 @@ pub struct AgentTestHarness {
     /// loop's per-turn reminder. Exposed so a task e2e can assert what the
     /// model's tool calls persisted.
     pub task_store: Arc<dyn aura_store::TaskStore>,
+    /// Autonomous-goal facade over the same `session_goals` store the registered
+    /// goal tools write through. Exposed so a goal e2e can assert the goal's
+    /// final state after the continuation loop runs.
+    pub goal_service: Arc<aura_goal::GoalService>,
     pub mailbox: MailboxSender<AgentMessage>,
     outputs: mpsc::Receiver<AgentOutput>,
     actor_handle: Option<JoinHandle<()>>,
@@ -384,6 +388,12 @@ impl AgentTestHarnessBuilder {
         for (tool, manifest) in aura_task::tools::agent_tools(task_store.clone()) {
             tool_registry.register(tool, manifest);
         }
+        let goal_store: Arc<dyn aura_store::GoalStore> =
+            Arc::new(aura_goal::test_support::MemoryGoalStore::new());
+        for (tool, manifest) in aura_goal::tools::agent_tools(goal_store.clone()) {
+            tool_registry.register(tool, manifest);
+        }
+        let goal_service = Arc::new(aura_goal::GoalService::new(goal_store.clone()));
         let tool_registry = Arc::new(tool_registry);
         let skill_registry = Arc::new(SkillRegistry::new());
         let approval_gates = Arc::new(ApprovalGateMap::new());
@@ -521,6 +531,8 @@ impl AgentTestHarnessBuilder {
                 actor_token,
                 supervisor: None,
                 session_manager: Arc::clone(&session_manager),
+                goal_service: Arc::clone(&goal_service),
+                cost_manager: Arc::clone(&cost_manager),
             },
         );
         let actor_handle = tokio::spawn(actor.run(mailbox_rx));
@@ -541,6 +553,7 @@ impl AgentTestHarnessBuilder {
             token_calibration,
             session_manager,
             task_store,
+            goal_service,
             mailbox: mailbox_tx,
             outputs: output_rx,
             actor_handle: Some(actor_handle),

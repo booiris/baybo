@@ -26,6 +26,7 @@ aura-sandbox = { workspace = true }
 aura-store = { workspace = true }
 aura-storage = { workspace = true }
 aura-channels = { workspace = true }
+aura-goal = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
@@ -48,6 +49,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 aura-cost = { workspace = true, features = ["test-support"] }
+aura-goal = { workspace = true, features = ["test-support"] }
 aura-job = { workspace = true, features = ["test-support"] }
 aura-llm = { workspace = true, features = ["test-support"] }
 aura-memory = { workspace = true, features = ["test-support"] }

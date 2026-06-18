@@ -9,6 +9,8 @@ mod background_compression_e2e;
 mod channel_registration;
 #[path = "context_compression_e2e.rs"]
 mod context_compression_e2e;
+#[path = "goal_continuation_e2e.rs"]
+mod goal_continuation_e2e;
 #[path = "security_pipeline.rs"]
 mod security_pipeline;
 #[path = "smoke.rs"]

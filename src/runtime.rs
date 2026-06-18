@@ -485,6 +485,14 @@ pub async fn build_managers(
         tool_registry.register(tool, manifest);
     }
 
+    // Autonomous-goal tools (`create_goal` / `get_goal` / `update_goal`). Like
+    // the `Task*` tools they hold the per-session `GoalStore` and register from
+    // the runtime; the actor's continuation loop drives the lifecycle (see
+    // `docs/modules/goal.md`).
+    for (tool, manifest) in aura_goal::tools::agent_tools(stores.goal.clone()) {
+        tool_registry.register(tool, manifest);
+    }
+
     // `spawn_subagent` is just another tool from the LLM's perspective.
     // It calls the actor-backed `SubagentSpawner` directly (via the
     // late-set slot above) to materialise the child; the spawner does the
@@ -818,6 +826,12 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         let tokenizer = Arc::clone(&tokenizer);
         let trace_event_stream = trace_event_stream.clone();
         let token_calibration = Arc::clone(&token_calibration);
+        // Goal continuation engine deps: one shared `GoalService` over the
+        // per-session `session_goals` table (same store the goal tools write
+        // through), plus the cost manager for the per-session token meter the
+        // continuation loop samples around each goal turn.
+        let goal_service = Arc::new(aura_goal::GoalService::new(graph.stores.goal.clone()));
+        let cost_manager_for_actor = Arc::clone(&cost_manager);
 
         let sessions = Arc::clone(&graph.session_manager);
         let subagent_registry = Arc::clone(&graph.subagent_registry);
@@ -902,6 +916,8 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
                         actor_token,
                         supervisor: Some(supervisor_for_spawn.clone()),
                         session_manager: Arc::clone(&sessions),
+                        goal_service: Arc::clone(&goal_service),
+                        cost_manager: Arc::clone(&cost_manager_for_actor),
                     },
                 );
                 let (sender, mailbox) =

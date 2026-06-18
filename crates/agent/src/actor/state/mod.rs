@@ -103,6 +103,14 @@ pub struct VolatileResources {
     /// the idle reaper eventually reclaims still hands the pending
     /// notifications to the fresh actor on hydration.
     pub session_manager: Arc<SessionManager>,
+    /// CRUD + transitions over this session's autonomous goal. Drives the
+    /// turn-boundary continuation loop and the `/goal` command. Shares the
+    /// `session_goals` table with the goal tools (see `aura-goal`).
+    pub goal_service: Arc<aura_goal::GoalService>,
+    /// Read side of the per-session token meter: the goal continuation loop
+    /// samples `cost_manager.session_tokens(session_id)` before/after each goal
+    /// turn and accrues the delta into the goal's `tokens_used`.
+    pub cost_manager: Arc<aura_cost::CostManager>,
 }
 
 /// Compile-time assertion: every field type of [`VolatileResources`]
@@ -121,6 +129,8 @@ const _ASSERT_VOLATILE_FIELDS: fn() = || {
     assert_volatile::<CancellationToken>();
     assert_volatile::<Option<AgentSupervisor>>();
     assert_volatile::<Arc<SessionManager>>();
+    assert_volatile::<Arc<aura_goal::GoalService>>();
+    assert_volatile::<Arc<aura_cost::CostManager>>();
 };
 
 /// Compile-time assertion: [`DurableActorState`] is fully
