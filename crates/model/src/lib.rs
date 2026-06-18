@@ -3,6 +3,7 @@ mod control_event;
 mod cost;
 mod cron;
 mod external_agent;
+mod goal;
 mod governance;
 mod ids;
 mod llm_entry_name;
@@ -22,8 +23,12 @@ pub use cron::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus
 pub use external_agent::{
     AURA_BACKEND_TAG, ExternalAgentKind, SubagentBackend, SubagentBackendKind, SubagentBackendTag,
 };
+pub use goal::{
+    CREATE_GOAL_TOOL_NAME, GET_GOAL_TOOL_NAME, GOAL_MUTATING_TOOL_NAMES, Goal, GoalStatus,
+    UPDATE_GOAL_TOOL_NAME,
+};
 pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLevel};
-pub use ids::{CostRecordId, JobId, ParallelGroup, SessionId, SpanId, StepId, TaskId};
+pub use ids::{CostRecordId, GoalId, JobId, ParallelGroup, SessionId, SpanId, StepId, TaskId};
 pub use llm_entry_name::LlmEntryName;
 pub use message::{
     BlobRef, ChatMessage, ContentBlock, MessageMetadata, MessageSource, Role,

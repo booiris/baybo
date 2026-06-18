@@ -185,6 +185,11 @@ ulid_newtype! {
     TaskId
 }
 
+ulid_newtype! {
+    /// Identifier for a session's current autonomous `Goal`.
+    GoalId
+}
+
 /// Identifier for a parallel-tool batch within a `Step`.
 ///
 /// Spans sharing the same `ParallelGroup` were dispatched concurrently;

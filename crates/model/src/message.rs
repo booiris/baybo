@@ -111,6 +111,14 @@ pub enum MessageSource {
     /// every later turn (the failure mode that retired the prior memory
     /// pipeline).
     RecalledMemory,
+    /// A goal continuation turn's framed steering prompt: synthesized by the
+    /// agent at the turn boundary (so hidden from the chat transcript like
+    /// [`MessageSource::Agent`]), but tracked distinctly so operator surfaces can
+    /// tell autonomous continuation turns from genuine input. Always rides as a
+    /// framed `Role::User` row — never `Role::System`, which would re-assert
+    /// itself on every later turn. The analog of Codex's `ContextualUserFragment`
+    /// (`aura_goal::prompts`). See `docs/modules/goal.md`.
+    GoalSteering,
     /// Any other agent-originated row: skill reminders, a spawned/subagent task
     /// prompt, the subagent-finished notification, summary instructions, the
     /// system prompt, assistant output, tool results. Hidden from chat surfaces.
@@ -126,6 +134,7 @@ impl MessageSource {
             MessageSource::UserInterjection => "user_interjection",
             MessageSource::Cron => "cron",
             MessageSource::RecalledMemory => "recalled_memory",
+            MessageSource::GoalSteering => "goal_steering",
             MessageSource::Agent => "agent",
         }
     }
@@ -140,6 +149,7 @@ impl std::str::FromStr for MessageSource {
             "user_interjection" => Ok(MessageSource::UserInterjection),
             "cron" => Ok(MessageSource::Cron),
             "recalled_memory" => Ok(MessageSource::RecalledMemory),
+            "goal_steering" => Ok(MessageSource::GoalSteering),
             "agent" => Ok(MessageSource::Agent),
             other => Err(format!("unknown message source: {other}")),
         }
@@ -215,6 +225,20 @@ impl ChatMessage {
             role: Role::User,
             content,
             source: MessageSource::RecalledMemory,
+        }
+    }
+
+    /// A goal continuation turn's framed steering prompt — a `Role::User` turn
+    /// the agent synthesized at the turn boundary (see `aura_goal::prompts`) to
+    /// keep the model rigorously driving toward the objective. Carries
+    /// [`MessageSource::GoalSteering`] so it never surfaces as a user bubble and
+    /// operator surfaces can tell it apart from a genuine prompt. The **only**
+    /// constructor that marks a row [`MessageSource::GoalSteering`].
+    pub fn goal_steering(content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: Role::User,
+            content,
+            source: MessageSource::GoalSteering,
         }
     }
 
@@ -354,6 +378,7 @@ mod tests {
                 | MessageSource::UserInterjection
                 | MessageSource::Cron
                 | MessageSource::RecalledMemory
+                | MessageSource::GoalSteering
                 | MessageSource::Agent => {}
             }
         }
@@ -362,6 +387,7 @@ mod tests {
             MessageSource::UserInterjection,
             MessageSource::Cron,
             MessageSource::RecalledMemory,
+            MessageSource::GoalSteering,
             MessageSource::Agent,
         ]
     }
