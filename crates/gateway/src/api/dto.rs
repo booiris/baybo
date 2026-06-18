@@ -133,6 +133,54 @@ pub struct BackgroundJobsResponse {
     pub jobs: Vec<BackgroundJob>,
 }
 
+/// One session's autonomous goal — the wire shape for the dashboard goals
+/// column and the chat goal banner.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GoalItem {
+    pub session_id: String,
+    pub objective: String,
+    /// `GoalStatus::as_str()` — `active` / `complete` / `blocked` / `paused` /
+    /// `budget_limited` / `spend_capped`.
+    pub status: String,
+    /// `null` when the goal has no per-goal token budget.
+    pub token_budget: Option<u64>,
+    pub tokens_used: u64,
+    /// Remaining budget; `null` when unbudgeted.
+    pub tokens_remaining: Option<u64>,
+    pub time_used_seconds: u64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl GoalItem {
+    pub fn from_goal(session_id: &aura_model::SessionId, goal: &aura_model::Goal) -> Self {
+        Self {
+            session_id: session_id.as_str().to_string(),
+            objective: goal.objective.clone(),
+            status: goal.status.as_str().to_string(),
+            token_budget: goal.token_budget,
+            tokens_used: goal.tokens_used,
+            tokens_remaining: goal.remaining_budget(),
+            time_used_seconds: goal.time_used_seconds,
+            created_at: goal.created_at.to_rfc3339(),
+            updated_at: goal.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+/// Response body for `GET /v1/goals` — every session's current goal.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GoalsResponse {
+    pub goals: Vec<GoalItem>,
+}
+
+/// Response body for `GET /v1/chat/sessions/{id}/goal` and the pause control —
+/// the session's current goal, or `null` when none is set.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SessionGoalResponse {
+    pub goal: Option<GoalItem>,
+}
+
 /// Response body for `PUT` / `DELETE /v1/config`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MutateResponse {
@@ -521,6 +569,7 @@ pub enum JobInputKind {
     System,
     Spawned,
     SubagentNotification,
+    GoalContinuation,
 }
 
 impl From<aura_job::JobInputKind> for JobInputKind {
@@ -531,6 +580,7 @@ impl From<aura_job::JobInputKind> for JobInputKind {
             aura_job::JobInputKind::System => Self::System,
             aura_job::JobInputKind::Spawned => Self::Spawned,
             aura_job::JobInputKind::SubagentNotification => Self::SubagentNotification,
+            aura_job::JobInputKind::GoalContinuation => Self::GoalContinuation,
         }
     }
 }

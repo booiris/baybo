@@ -98,6 +98,7 @@ async fn router_with_seed() -> (axum::Router, Arc<aura_gateway::log_buffer::LogB
         cron_scheduler: Arc::clone(&tg.deps.cron_scheduler),
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
+        goal_store: tg.deps.stores.goal.clone(),
         query_api: Arc::new(aura_query::QueryApi::new(
             tg.deps.session_manager.store(),
             Arc::clone(&tg.deps.job_lifecycle),

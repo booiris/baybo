@@ -104,6 +104,51 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/{session_id}/goal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One session's current goal — the chat goal banner. `goal` is `null` when
+         *     none is set.
+         */
+        get: operations["get_session_goal"];
+        put?: never;
+        post?: never;
+        /**
+         * Operator clear: the one explicit per-row goal delete. The continuation loop
+         *     stops at the next boundary (no goal row to read).
+         */
+        delete: operations["clear_session_goal"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/sessions/{session_id}/goal/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Operator pause: flip an `Active` goal to `Paused` so the continuation loop
+         *     stops at the next turn boundary. A no-op (returns the goal unchanged) when
+         *     no goal is set or it isn't currently active.
+         */
+        post: operations["pause_session_goal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}/model": {
         parameters: {
             query?: never;
@@ -227,6 +272,26 @@ export interface paths {
         put?: never;
         post?: never;
         delete: operations["delete_cron"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/goals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Cross-session view of every session's current goal — the dashboard goals
+         *     column.
+         */
+        get: operations["list_goals"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -925,6 +990,39 @@ export interface components {
             error: string;
         };
         /**
+         * @description One session's autonomous goal — the wire shape for the dashboard goals
+         *     column and the chat goal banner.
+         */
+        GoalItem: {
+            created_at: string;
+            objective: string;
+            session_id: string;
+            /**
+             * @description `GoalStatus::as_str()` — `active` / `complete` / `blocked` / `paused` /
+             *     `budget_limited` / `spend_capped`.
+             */
+            status: string;
+            /** Format: int64 */
+            time_used_seconds: number;
+            /**
+             * Format: int64
+             * @description `null` when the goal has no per-goal token budget.
+             */
+            token_budget?: number | null;
+            /**
+             * Format: int64
+             * @description Remaining budget; `null` when unbudgeted.
+             */
+            tokens_remaining?: number | null;
+            /** Format: int64 */
+            tokens_used: number;
+            updated_at: string;
+        };
+        /** @description Response body for `GET /v1/goals` — every session's current goal. */
+        GoalsResponse: {
+            goals: components["schemas"]["GoalItem"][];
+        };
+        /**
          * @description Wire mirror of [`aura_job::Job`]. Inner shape reflects the new
          *     state machine (Q6) — `final_result` replaces `output`/`error`,
          *     `emitted_span_ids` replaces `trace_span_id`.
@@ -953,7 +1051,7 @@ export interface components {
          * @description Wire mirror of [`aura_job::JobInputKind`] — what payload fed the job.
          * @enum {string}
          */
-        JobInputKind: "user_chat" | "cron" | "system" | "spawned" | "subagent_notification";
+        JobInputKind: "user_chat" | "cron" | "system" | "spawned" | "subagent_notification" | "goal_continuation";
         /**
          * @description Wire mirror of a job's origin (the owning session's root trigger,
          *     [`aura_model::TriggerKind`]).
@@ -1193,6 +1291,13 @@ export interface components {
             dropped: string[];
             /** @description All entry names present in the rebuilt pool. */
             entries: string[];
+        };
+        /**
+         * @description Response body for `GET /v1/chat/sessions/{id}/goal` and the pause control —
+         *     the session's current goal, or `null` when none is set.
+         */
+        SessionGoalResponse: {
+            goal?: null | components["schemas"]["GoalItem"];
         };
         /**
          * @description Wire mirror of [`aura_query::SessionKind`]. Coarse trigger/lineage
@@ -1622,6 +1727,127 @@ export interface operations {
             };
             /** @description Session not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_session_goal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The session's current goal (or null) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionGoalResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Goal store error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    clear_session_goal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Goal cleared (or none was set) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Goal store error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    pause_session_goal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The goal after pausing (or null) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionGoalResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Goal store error */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2142,6 +2368,44 @@ export interface operations {
                 };
             };
             /** @description Scheduler error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_goals: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every session's current goal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GoalsResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Goal store error */
             500: {
                 headers: {
                     [name: string]: unknown;

@@ -8,6 +8,7 @@ import { TracesPage } from './pages/TracesPage';
 import { TraceSessionPage } from './pages/TraceSessionPage';
 import { CronPage } from './pages/CronPage';
 import { JobsPage } from './pages/JobsPage';
+import { GoalsPage } from './pages/GoalsPage';
 import { AnalyticsPage } from './pages/AnalyticsPage';
 import { LlmPage } from './pages/LlmPage';
 import { ChatPage } from './pages/ChatPage';
@@ -77,6 +78,7 @@ export default function App() {
           <Route path="/traces/:id" element={<TraceSessionPage />} />
           <Route path="/cron" element={<CronPage />} />
           <Route path="/jobs" element={<JobsPage />} />
+          <Route path="/goals" element={<GoalsPage />} />
           <Route path="/analytics" element={<AnalyticsPage />} />
           <Route path="/llm" element={<LlmPage />} />
           <Route path="*" element={<Navigate to="/chat" replace />} />

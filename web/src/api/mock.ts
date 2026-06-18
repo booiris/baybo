@@ -196,6 +196,33 @@ export const MOCK_BACKGROUND_JOBS: components['schemas']['BackgroundJobsResponse
   ],
 };
 
+export const MOCK_GOALS: components['schemas']['GoalsResponse'] = {
+  goals: [
+    {
+      session_id: 'sess-mock-1',
+      objective: 'Get the integration suite green and keep it that way',
+      status: 'active',
+      token_budget: 500000,
+      tokens_used: 182340,
+      tokens_remaining: 317660,
+      time_used_seconds: 1840,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    },
+    {
+      session_id: 'sess-mock-2',
+      objective: 'Port the legacy parser to the new AST',
+      status: 'paused',
+      token_budget: null,
+      tokens_used: 64200,
+      tokens_remaining: null,
+      time_used_seconds: 520,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    },
+  ],
+};
+
 // Analytics mock lives inline in `pages/AnalyticsPage.tsx` so it can
 // produce the exact `AnalyticsResponse` shape from the OpenAPI schema
 // without having a parallel TS interface to keep in sync.

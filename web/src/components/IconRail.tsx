@@ -5,6 +5,7 @@ import {
   RiChat3Line,
   RiCpuLine,
   RiFileList3Line,
+  RiFocus3Line,
   RiGitMergeLine,
   RiLogoutBoxRLine,
   RiStackLine,
@@ -29,6 +30,7 @@ const DESTINATIONS: { to: string; label: string; Icon: IconType }[] = [
   { to: '/traces', label: 'Trace', Icon: RiGitMergeLine },
   { to: '/cron', label: 'Cron', Icon: RiAlarmLine },
   { to: '/jobs', label: 'Jobs', Icon: RiStackLine },
+  { to: '/goals', label: 'Goals', Icon: RiFocus3Line },
   { to: '/analytics', label: 'Analytics', Icon: RiBarChartBoxLine },
   { to: '/llm', label: 'LLM', Icon: RiCpuLine },
 ];

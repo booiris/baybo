@@ -23,7 +23,10 @@
 use std::sync::LazyLock;
 
 use aura_channels::wire::{Message as WireMessage, SlashCommandSpec};
-use aura_channels::{COMPACT_COMMAND_NAME, STOP_COMMAND_DESCRIPTION, STOP_COMMAND_NAME};
+use aura_channels::{
+    COMPACT_COMMAND_NAME, GOAL_COMMAND_DESCRIPTION, GOAL_COMMAND_NAME, STOP_COMMAND_DESCRIPTION,
+    STOP_COMMAND_NAME,
+};
 use aura_model::{ChannelType, SessionId};
 
 use super::session_resolver::ChannelSessionResolver;
@@ -48,6 +51,10 @@ static MANIFEST: LazyLock<Vec<SlashCommandSpec>> = LazyLock::new(|| {
         SlashCommandSpec {
             command: STOP_COMMAND_NAME.to_string(),
             description: STOP_COMMAND_DESCRIPTION.to_string(),
+        },
+        SlashCommandSpec {
+            command: GOAL_COMMAND_NAME.to_string(),
+            description: GOAL_COMMAND_DESCRIPTION.to_string(),
         },
     ]
 });

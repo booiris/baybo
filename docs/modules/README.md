@@ -9,7 +9,7 @@ Bottom-up along the dependency graph:
 1. [model.md](model.md) → [config.md](config.md) → [session.md](session.md) → [channels.md](channels.md)
 2. [job.md](job.md) → [cron.md](cron.md) → [skills.md](skills.md)
 3. [llm.md](llm.md) → [security.md](security.md)
-4. [tools.md](tools.md) → [workspace.md](workspace.md) → [subagent.md](subagent.md) → [task.md](task.md) → [context.md](context.md)
+4. [tools.md](tools.md) → [workspace.md](workspace.md) → [subagent.md](subagent.md) → [task.md](task.md) → [goal.md](goal.md) → [context.md](context.md)
 5. [trace.md](trace.md)
 6. [storage.md](storage.md) → [janitor.md](janitor.md) → [pairing.md](pairing.md) → [agent.md](agent.md) → [setup.md](setup.md) → [bootstrap.md](bootstrap.md) → [cli.md](cli.md) → [gateway.md](gateway.md) → [tui.md](tui.md)
 
@@ -35,6 +35,7 @@ Bottom-up along the dependency graph:
 - **[skills-assessor](skills-assessor.md)** — LLM-backed risk classifier for skills. Hashes the skill directory, caches verdicts (`Safe`/`Suspicious`/`Dangerous`) in `SkillRiskStore`, tiers large skills (primary-scope synchronous + full-scope background worker with restart-safe job recovery), and gates skill injection in `AgentLoop` so only `Dangerous` blocks. Kept separate from `skills` so selection stays deterministic and offline-capable.
 - **[subagent](subagent.md)** — Typed subagents: the `SubagentProfile` + process-wide `SubagentRegistry`, the per-root fan-out `SubagentDispatchLimiter`, and the `spawn_subagent` tool. Profiles load from `<workspace>/agents/<name>.md` and the profile's system prompt fully replaces the parent's Soul in the spawned child actor. Like `skills`/`cron`, it owns its own `Tool` and depends on `aura-tools` for the trait. External `claude`/`codex`/`gemini` backends are documented in [`../external-agents.md`](../external-agents.md).
 - **[task](task.md)** — The session planning-checklist tools (`TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`), modeled on Claude Code's `Task*` and Codex's `update_plan`. Like `cron`/`skills`/`subagent`, it owns its own `Tool` impls over the `TaskStore` trait. The `Task`/`TaskStatus`/`TaskId` value types live in `model`, the `TaskStore` trait in `store`, the libsql impl over the dedicated `session_tasks` table in `storage`. The agent loop re-injects the list into the model every turn and emits it to the web checklist (`AgentEvent::TaskList` → `Frame::TaskList`). `TaskStop`/`TaskOutput` (the background half) stay stubbed.
+- **[goal](goal.md)** — Autonomous persistent objectives (`/goal`), a faithful port of Codex's `ext/goal`. An `Active` goal on a UserChat session makes the agent self-drive its own turns (immediate at each turn boundary, continuation steering injected) until verifiably `Complete`, `Blocked`, `BudgetLimited`, or `SpendCapped`. Like `cron`/`skills`/`subagent`/`task`, it owns its `Tool` impls (`create_goal`/`get_goal`/`update_goal`) over the `GoalStore` trait; the `Goal`/`GoalStatus`/`GoalId` value types live in `model`, the trait in `store`, the libsql impl over the dedicated `session_goals` table (one current goal per session) in `storage`. The continuation engine (turn-boundary re-fire, token/time accounting, reaper exemption, `/goal` command, `/stop` vs `/goal pause`) lives in `agent`. Optional per-goal `token_budget`; the global cost gate is the backstop.
 - **workspace** — Identity files and long-running configuration.
 - **cron** — Cron scheduling: the `CronScheduler` business logic and `CronError`, standard cron syntax. The cron data types (`CronJob`, `CronExecution`, `CronStatus`, `CronSchedule`, `ExecutionStatus`) now live in `model` (re-exported here for back-compat); the `CronStore` trait lives in `store`.
 - **context** — Per-actor token budget + compression strategy + transcript ownership (`ContextManager`). Pure in-memory; persistence is the agent loop's job, brokered through `SessionStore` from `session`.
@@ -91,8 +92,9 @@ pairing   ──► model, store (owns PairingService + code generator; consumes
 sandbox   ──► (no internal deps; OS sandbox runner consumed by agent)
 subagent  ──► model, session, tools (typed subagents + spawn_subagent tool; owns its Tool like skills/cron; profiles from <workspace>/agents/)
 task      ──► model, store, tools (planning-checklist Task* tools over the TaskStore trait; owns its Tool like cron/skills/subagent)
-agent     ──► model, llm, tools, subagent, skills, skills-assessor, workspace, context, session, trace, job, memory, cost, cron, security, sandbox, storage, channels
-gateway   ──► agent, channels, config, context, cron, cost, job, llm, model, pairing, query, security, session, skills, storage, store, tools, trace, workspace
+goal      ──► model, store, tools (autonomous /goal objective; create_goal/get_goal/update_goal over the GoalStore trait + steering prompts; continuation engine lives in agent, consuming aura-goal's GoalService)
+agent     ──► model, llm, tools, subagent, skills, skills-assessor, workspace, context, session, trace, job, memory, cost, cron, goal, security, sandbox, storage, channels
+gateway   ──► agent, channels, config, context, cron, cost, goal, job, llm, model, pairing, query, security, session, skills, storage, store, tools, trace, workspace
 tui       ──► channels, model, tools (trait defs + shared types; talks to gateway over HTTP+SSE)
 setup     ──► channels, config, gateway, llm, model, security, storage, workspace (interactive first-run wizard; aura-cli's llm-add/channel-add wrap its flow primitives)
 bootstrap ──► config + all domain crates it assembles (entry point only)

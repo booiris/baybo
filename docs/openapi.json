@@ -403,6 +403,153 @@
         }
       }
     },
+    "/v1/chat/sessions/{session_id}/goal": {
+      "get": {
+        "tags": [
+          "goals"
+        ],
+        "summary": "One session's current goal — the chat goal banner. `goal` is `null` when\nnone is set.",
+        "operationId": "get_session_goal",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The session's current goal (or null)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionGoalResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Goal store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "goals"
+        ],
+        "summary": "Operator clear: the one explicit per-row goal delete. The continuation loop\nstops at the next boundary (no goal row to read).",
+        "operationId": "clear_session_goal",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Goal cleared (or none was set)"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Goal store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/sessions/{session_id}/goal/pause": {
+      "post": {
+        "tags": [
+          "goals"
+        ],
+        "summary": "Operator pause: flip an `Active` goal to `Paused` so the continuation loop\nstops at the next turn boundary. A no-op (returns the goal unchanged) when\nno goal is set or it isn't currently active.",
+        "operationId": "pause_session_goal",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The goal after pausing (or null)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionGoalResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Goal store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}/model": {
       "put": {
         "tags": [
@@ -1044,6 +1191,47 @@
           },
           "500": {
             "description": "Scheduler error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/goals": {
+      "get": {
+        "tags": [
+          "goals"
+        ],
+        "summary": "Cross-session view of every session's current goal — the dashboard goals\ncolumn.",
+        "operationId": "list_goals",
+        "responses": {
+          "200": {
+            "description": "Every session's current goal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoalsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Goal store error",
             "content": {
               "application/json": {
                 "schema": {
@@ -2933,6 +3121,80 @@
           }
         }
       },
+      "GoalItem": {
+        "type": "object",
+        "description": "One session's autonomous goal — the wire shape for the dashboard goals\ncolumn and the chat goal banner.",
+        "required": [
+          "session_id",
+          "objective",
+          "status",
+          "tokens_used",
+          "time_used_seconds",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "objective": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "description": "`GoalStatus::as_str()` — `active` / `complete` / `blocked` / `paused` /\n`budget_limited` / `spend_capped`."
+          },
+          "time_used_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "token_budget": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`null` when the goal has no per-goal token budget.",
+            "minimum": 0
+          },
+          "tokens_remaining": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Remaining budget; `null` when unbudgeted.",
+            "minimum": 0
+          },
+          "tokens_used": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        }
+      },
+      "GoalsResponse": {
+        "type": "object",
+        "description": "Response body for `GET /v1/goals` — every session's current goal.",
+        "required": [
+          "goals"
+        ],
+        "properties": {
+          "goals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GoalItem"
+            }
+          }
+        }
+      },
       "Job": {
         "type": "object",
         "description": "Wire mirror of [`aura_job::Job`]. Inner shape reflects the new\nstate machine (Q6) — `final_result` replaces `output`/`error`,\n`emitted_span_ids` replaces `trace_span_id`.",
@@ -3014,7 +3276,8 @@
           "cron",
           "system",
           "spawned",
-          "subagent_notification"
+          "subagent_notification",
+          "goal_continuation"
         ]
       },
       "JobOrigin": {
@@ -3567,6 +3830,22 @@
           }
         }
       },
+      "SessionGoalResponse": {
+        "type": "object",
+        "description": "Response body for `GET /v1/chat/sessions/{id}/goal` and the pause control —\nthe session's current goal, or `null` when none is set.",
+        "properties": {
+          "goal": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GoalItem"
+              }
+            ]
+          }
+        }
+      },
       "SessionKind": {
         "type": "string",
         "description": "Wire mirror of [`aura_query::SessionKind`]. Coarse trigger/lineage\nlabel for the trace browser list view.",
@@ -3912,6 +4191,10 @@
     {
       "name": "chat",
       "description": "Web chat sessions + channel-token mint"
+    },
+    {
+      "name": "goals",
+      "description": "Autonomous session goals (/goal)"
     },
     {
       "name": "llm",

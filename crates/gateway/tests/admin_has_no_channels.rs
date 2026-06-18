@@ -44,6 +44,7 @@ async fn admin_router() -> axum::Router {
         cron_scheduler: std::sync::Arc::clone(&tg.deps.cron_scheduler),
         trace_store: tg.deps.stores.trace.clone(),
         cost_store: tg.deps.stores.cost.clone(),
+        goal_store: tg.deps.stores.goal.clone(),
         query_api: std::sync::Arc::new(aura_query::QueryApi::new(
             tg.deps.session_manager.store(),
             std::sync::Arc::clone(&tg.deps.job_lifecycle),

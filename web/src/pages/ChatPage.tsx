@@ -41,6 +41,7 @@ import {
 import { CronInbox } from '../components/CronInbox';
 import { TaskChecklist } from '../components/chat/TaskChecklist';
 import { SessionSidebar } from './chat/SessionSidebar';
+import { GoalBanner } from './chat/GoalBanner';
 import type { SessionSummary } from './chat/types';
 
 /** One progress entry inside a turn's work block. `reasoning`, `status`
@@ -1463,6 +1464,8 @@ export function ChatPage() {
             <ConnectionBadge status={status} />
           </div>
         </header>
+
+        <GoalBanner sessionId={sessionId} onCommand={(c) => sendText(c, [])} />
 
         <div className="flex-1 flex flex-col overflow-hidden relative xl:pr-[260px]">
         <div className="flex-1 flex justify-center min-h-0 relative">

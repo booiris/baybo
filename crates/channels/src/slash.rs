@@ -26,6 +26,30 @@ pub const STOP_COMMAND: &str = "/stop";
 /// One-line description shared by every surface that lists `/stop`.
 pub const STOP_COMMAND_DESCRIPTION: &str = "Stop the in-progress reply and any background tasks";
 
+/// Bare name (no leading `/`) of the goal slash command. Published in the
+/// gateway slash manifest + TUI command list for discoverability; paired
+/// with [`GOAL_COMMAND`] for the form users type.
+pub const GOAL_COMMAND_NAME: &str = "goal";
+
+/// Full leading-slash form of the goal command. Recognised by the agent actor
+/// to set / view / pause / resume / clear the session's autonomous objective
+/// (see `docs/modules/goal.md`). `/goal <objective> [--budget N]` starts the
+/// loop; bare `/goal` views it; `/goal pause|resume|clear` control it.
+pub const GOAL_COMMAND: &str = "/goal";
+
+/// One-line description shared by every surface that lists `/goal`.
+pub const GOAL_COMMAND_DESCRIPTION: &str =
+    "Set, view, or control an autonomous goal the agent self-drives to completion";
+
+/// The `--budget` flag on `/goal <objective> --budget N` — caps the per-goal
+/// token spend. Shared so the actor parser and any help text agree.
+pub const GOAL_BUDGET_FLAG: &str = "--budget";
+
+/// `/goal` sub-commands that control an existing goal (no objective argument).
+pub const GOAL_PAUSE_SUBCOMMAND: &str = "pause";
+pub const GOAL_RESUME_SUBCOMMAND: &str = "resume";
+pub const GOAL_CLEAR_SUBCOMMAND: &str = "clear";
+
 /// The acknowledgement line a `/stop` emits **only when it actually cancelled
 /// an in-progress reply** (a no-op `/stop` after a turn already finished says
 /// "Nothing in progress to stop." instead). The agent emits it in the stop
