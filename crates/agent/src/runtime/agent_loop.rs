@@ -185,12 +185,22 @@ fn empty_llm_response() -> LlmResponse {
     }
 }
 
+/// Appended to a cancelled turn's salvaged content so the next request makes
+/// plain to the model that this assistant turn was interrupted, not a
+/// deliberate stopping point — the reply text and any reasoning above are
+/// partial. Without it the model reads the truncated turn back as a finished
+/// reply and may pick up mid-sentence as if it had completed.
+const CANCELLED_TURN_SUFFIX: &str = "\n\n[This turn was cancelled before it finished — the reply and any reasoning above are incomplete.]";
+
 /// Blocks safe to persist from an assistant turn cancelled mid-stream:
-/// rendered text and completed thinking. A streamed-but-undispatched
-/// `ToolUse` is dropped — persisting a `tool_use` with no matching
-/// `tool_result` would wedge the next request's provider validation.
+/// rendered text and completed thinking, with [`CANCELLED_TURN_SUFFIX`]
+/// appended so the model knows the turn was cut short. A
+/// streamed-but-undispatched `ToolUse` is dropped — persisting a `tool_use`
+/// with no matching `tool_result` would wedge the next request's provider
+/// validation.
 fn salvage_partial_blocks(resp: &LlmResponse) -> Vec<ContentBlock> {
-    resp.content_blocks
+    let mut blocks: Vec<ContentBlock> = resp
+        .content_blocks
         .iter()
         .filter(|b| match b {
             ContentBlock::Text(t) => !t.trim().is_empty(),
@@ -198,7 +208,19 @@ fn salvage_partial_blocks(resp: &LlmResponse) -> Vec<ContentBlock> {
             _ => false,
         })
         .cloned()
-        .collect()
+        .collect();
+    if blocks.is_empty() {
+        return blocks;
+    }
+    // Fold the marker into the trailing text rather than emitting a second
+    // adjacent text block; a thinking-only salvage gets its own marker block.
+    match blocks.last_mut() {
+        Some(ContentBlock::Text(t)) => t.push_str(CANCELLED_TURN_SUFFIX),
+        _ => blocks.push(ContentBlock::Text(
+            CANCELLED_TURN_SUFFIX.trim_start().to_string(),
+        )),
+    }
+    blocks
 }
 
 /// Error returned by `call_llm` when the turn is cancelled while the LLM
@@ -1415,14 +1437,38 @@ impl AgentLoop {
                 // block then survives a reload). The span closes `Cancelled`
                 // via the cancel context, and the retry loop won't re-issue.
                 if cancel.is_cancelled() {
-                    let partial = match &llm_result {
-                        Ok(resp) => salvage_partial_blocks(resp),
-                        Err(_) => Vec::new(),
+                    // Record the partial output the model produced before the
+                    // abort onto the span too — otherwise the trace detail
+                    // shows a blank LLM call even though text/thinking were
+                    // generated. The streamed text was sanitized per-fragment
+                    // but `thinking` accumulates raw, so run the same defensive
+                    // scrub the success path applies before either the salvaged
+                    // transcript copy or the trace copy escapes.
+                    let (output_content, thinking, trace_tool_calls, partial) = match llm_result {
+                        Ok(mut resp) => {
+                            if let Err(e) =
+                                self.security_gateway.sanitize_llm_response(&mut resp).await
+                            {
+                                warn!(error = %e, "failed to sanitize cancelled LLM response");
+                            }
+                            let trace_tool_calls = resp
+                                .tool_calls
+                                .iter()
+                                .map(|tc| aura_trace::LlmToolCallRecord {
+                                    id: tc.id.clone(),
+                                    name: tc.name.clone(),
+                                    arguments: tc.arguments.clone(),
+                                })
+                                .collect();
+                            let partial = salvage_partial_blocks(&resp);
+                            (resp.content, resp.thinking, trace_tool_calls, partial)
+                        }
+                        Err(_) => (String::new(), None, Vec::new(), Vec::new()),
                     };
                     let finalize = LlmCallResult {
-                        output_content: String::new(),
-                        thinking: None,
-                        tool_calls: Vec::new(),
+                        output_content,
+                        thinking,
+                        tool_calls: trace_tool_calls,
                         input_tokens: partial_usage.input_tokens,
                         output_tokens: partial_usage.output_tokens,
                         cached_input_tokens: partial_usage.cached_input_tokens,

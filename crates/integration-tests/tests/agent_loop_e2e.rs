@@ -2615,7 +2615,9 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
     // the actor then guarantees the turn fully unwound (and its partial was
     // appended) before we read it back.
     let session_manager = Arc::clone(&harness.session_manager);
+    let trace_store = Arc::clone(&harness.trace_store);
     let sid = harness.session.id.clone();
+    let job_id = turns[0].id;
 
     // The actor must unwind promptly (in-flight call aborted)...
     tokio::time::timeout(Duration::from_secs(5), harness.shutdown())
@@ -2639,11 +2641,56 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
         "persisted partial must carry the streamed answer text, got {text:?}"
     );
     assert!(
+        text.contains("cancelled before it finished"),
+        "persisted partial must be marked as cancelled so the model knows the \
+         turn was cut short, got {text:?}"
+    );
+    assert!(
         assistant
             .content
             .iter()
             .any(|b| matches!(b, ContentBlock::Thinking { .. })),
         "persisted partial must carry the streamed reasoning, got {:?}",
         assistant.content
+    );
+
+    // ...and that partial output must also land on the LLM span. The trace
+    // detail renders the span's recorded `result`, so a blank result would
+    // hide what the model produced before the abort even though the
+    // transcript kept it.
+    use aura_trace::{Span, SpanKind, Step, TraceStore};
+    let steps: Vec<Step> = trace_store
+        .list_steps_by_job(&job_id)
+        .await
+        .expect("list steps")
+        .into_iter()
+        .map(|r| Step::from_row(r).expect("decode step"))
+        .collect();
+    let mut llm_results = Vec::new();
+    for step in &steps {
+        for row in trace_store
+            .list_spans_by_step(&step.id)
+            .await
+            .expect("list spans")
+        {
+            if let SpanKind::LlmCall {
+                result: Some(r), ..
+            } = Span::from_row(row).expect("decode span").kind
+            {
+                llm_results.push(r);
+            }
+        }
+    }
+    let cancelled = llm_results
+        .iter()
+        .find(|r| r.output_content.contains("here is the partial answer"))
+        .expect("the cancelled LLM span must record the partial answer text");
+    assert!(
+        cancelled
+            .thinking
+            .as_deref()
+            .is_some_and(|t| t.contains("weighing the options")),
+        "the cancelled LLM span must record the partial reasoning, got {:?}",
+        cancelled.thinking
     );
 }

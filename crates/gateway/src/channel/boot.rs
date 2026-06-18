@@ -78,10 +78,10 @@ pub fn install_channels(
 }
 
 /// Install one channel with its approval gate. For the `http` channel
-/// the [`SessionPulse`] observer is attached too: every `UserEcho` /
-/// `Agent` dispatch then emits a throttled `Frame::SessionActivity` so
-/// sidebar tabs not subscribed to the affected session still get the
-/// unread signal.
+/// the [`SessionPulse`] observer is attached too: a `UserEcho` or a
+/// *completed* agent emission (terminal `Message`/`Notice`) then emits a
+/// throttled `Frame::SessionActivity` so sidebar tabs not subscribed to
+/// the affected session still get the unread signal.
 pub(crate) fn install_channel(
     registry: &Arc<ChannelRegistry>,
     channel_type: ChannelType,
