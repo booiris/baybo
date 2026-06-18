@@ -29,6 +29,7 @@ pub enum JobInputKind {
     System,
     Spawned,
     SubagentNotification,
+    GoalContinuation,
 }
 
 /// Whether a job runs a full agent-loop turn or a one-shot maintenance
@@ -77,6 +78,14 @@ pub enum JobInput {
     SubagentNotification {
         content: Vec<ContentBlock>,
     },
+    /// A self-initiated turn fired at the turn boundary while a `/goal` is
+    /// `Active`: the agent keeps working toward the objective without a new
+    /// user message. `content` is the framed continuation steering
+    /// (`aura_goal::prompts`). UserChat sessions only. See
+    /// `docs/modules/goal.md`.
+    GoalContinuation {
+        content: Vec<ContentBlock>,
+    },
 }
 
 impl JobInput {
@@ -87,6 +96,7 @@ impl JobInput {
             JobInput::System { .. } => JobInputKind::System,
             JobInput::Spawned { .. } => JobInputKind::Spawned,
             JobInput::SubagentNotification { .. } => JobInputKind::SubagentNotification,
+            JobInput::GoalContinuation { .. } => JobInputKind::GoalContinuation,
         }
     }
 }

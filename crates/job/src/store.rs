@@ -18,6 +18,7 @@ fn job_input_kind_str(kind: JobInputKind) -> &'static str {
         JobInputKind::System => "system",
         JobInputKind::Spawned => "spawned",
         JobInputKind::SubagentNotification => "subagent_notification",
+        JobInputKind::GoalContinuation => "goal_continuation",
     }
 }
 
