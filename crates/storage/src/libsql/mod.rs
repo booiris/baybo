@@ -4,6 +4,7 @@ mod channel_pairing;
 mod channel_session;
 mod cost;
 mod cron;
+mod goal;
 mod job;
 mod secret;
 mod session;
@@ -19,6 +20,7 @@ pub use channel_pairing::LibsqlChannelPairingStore;
 pub use channel_session::LibsqlChannelSessionStore;
 pub use cost::LibsqlCostStore;
 pub use cron::LibsqlCronStore;
+pub use goal::LibsqlGoalStore;
 pub use job::LibsqlJobStore;
 pub use secret::LibsqlSecretStore;
 pub use session::LibsqlSessionStore;
@@ -274,6 +276,31 @@ impl LibsqlPool {
                 );
                 CREATE INDEX IF NOT EXISTS idx_session_tasks_session
                     ON session_tasks(session_id);
+
+                -- A session's current autonomous objective (`/goal`). One
+                -- current goal per session (the PRIMARY KEY is session_id).
+                -- Mutated out-of-band of the turn (the model's update_goal, the
+                -- /goal command, per-turn token/time accounting), so it gets a
+                -- dedicated row-keyed table — it never clobbers, and is never
+                -- clobbered by, the full-blob writers on the `sessions` row.
+                -- CASCADE reaps the goal on user-triggered session delete; the
+                -- only explicit DELETE is `/goal clear`.
+                CREATE TABLE IF NOT EXISTS session_goals (
+                    session_id        TEXT    PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                    goal_id           TEXT    NOT NULL,
+                    -- The user's objective; untrusted user data to the steering.
+                    objective         TEXT    NOT NULL,
+                    -- GoalStatus::as_str(); an unrecognized value (future
+                    -- variant) is skipped on read, never 500s the list.
+                    status            TEXT    NOT NULL,
+                    -- NULL = no per-goal budget (the common case).
+                    token_budget      INTEGER,
+                    tokens_used       INTEGER NOT NULL DEFAULT 0,
+                    time_used_seconds INTEGER NOT NULL DEFAULT 0,
+                    -- Unix µs (matches the rest of the µs schema).
+                    created_at        INTEGER NOT NULL,
+                    updated_at        INTEGER NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS secrets (
                     name            TEXT PRIMARY KEY,
