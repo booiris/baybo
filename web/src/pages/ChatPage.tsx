@@ -383,14 +383,12 @@ export function ChatPage() {
 
   // Reveal the pacer's fully-buffered answer text at once and stop the
   // rAF loop. A progress frame (reasoning / tool / status) is interrupting
-  // the answer stream, so flush the buffer to its destination via
-  // `writeStreamingAnswer`: into the open work block's trailing `prose`
-  // step when a block is active (it stays put as an earlier mid-turn line
-  // once the progress step lands after it), or into the standalone
-  // streaming bubble otherwise — left `streaming: true` so
-  // `routeInboundFrame`'s `ensureWork` can fold it into a fresh block. The
-  // final `Message` path (which finalizes the answer) goes through
-  // `cancelPacer` instead. No-op when no answer is mid-stream.
+  // the answer stream, so flush the buffer into the standalone streaming
+  // bubble via `writeStreamingAnswer`, left `streaming: true` so
+  // `routeInboundFrame`'s `ensureWork` can fold it into the work block as an
+  // intermediate `prose` step. The final `Message` path (which finalizes the
+  // answer) goes through `cancelPacer` instead. No-op when no answer is
+  // mid-stream.
   const flushPacerKeepStreaming = useCallback((sid: string) => {
     const pacer = streamPacersRef.current[sid];
     if (!pacer) return;
@@ -1081,12 +1079,11 @@ export function ChatPage() {
       // awaiting-reply spinner (we're stopping, not starting a turn); the
       // server's TurnState/notice frames then reconcile idempotently.
       const stopping = isStopCommand(trimmed);
-      // Settle any buffered answer text INTO the still-open work block before
-      // we collapse it. Otherwise the pacer's leftover buffer flushes a beat
-      // later against the now-closed block and pops out as a stray bubble
-      // ("a message after /stop") — the partial answer belongs inside the
-      // "Cancelled" block, not below it. Mark the session stopped so a delta
-      // that raced in just after is dropped rather than spilling a bubble.
+      // Settle any buffered answer text, then fold the partial reply INTO the
+      // still-open work block before we collapse it (`foldTrailingAnswerIntoWork`
+      // in the updater below): the partial answer belongs inside the "Cancelled"
+      // block, not as a dangling bubble below it. Mark the session stopped so a
+      // delta that raced in just after is dropped rather than spilling a bubble.
       if (stopping) {
         flushPacerKeepStreaming(sessionId);
         stoppedSessionsRef.current.add(sessionId);
@@ -1100,7 +1097,10 @@ export function ChatPage() {
           [sessionId]: {
             ...view,
             transcript: [
-              ...closeActiveWork(view.transcript, stopping),
+              ...closeActiveWork(
+                stopping ? foldTrailingAnswerIntoWork(view.transcript) : view.transcript,
+                stopping,
+              ),
               {
                 key: `pending-${clientMsgId}`,
                 role: 'user',
@@ -1533,7 +1533,7 @@ export function ChatPage() {
 
         {/* Floating composer pill (app/mac-style): hovers over the thread
             bottom, centered on the reading column. */}
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex justify-center px-4 pb-6 xl:pl-0 xl:pr-[260px]">
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex justify-center px-6 pb-6 xl:pr-[284px]">
           <form
             onSubmit={handleSend}
             className="pointer-events-auto relative w-full max-w-4xl"
@@ -1948,7 +1948,7 @@ export function routeInboundFrame(
         setViews((prev) => {
           const view = prev[sid];
           if (!view) return prev;
-          const transcript = closeWorkForFinalReply(view.transcript);
+          const transcript = closeActiveWork(view.transcript);
           if (transcript === view.transcript && !view.awaitingReply) return prev;
           return { ...prev, [sid]: { ...view, transcript, awaitingReply: false } };
         });
@@ -2202,10 +2202,11 @@ export function routeInboundFrame(
         // originator (which marked it optimistically) and with a reload.
         // `markLast` also covers the case where `turn_state{inactive}`
         // already closed the block to "Worked" a moment earlier.
-        const closed = closeActiveWork(view.transcript);
-        const base = isStopCancellationNotice(frame.text)
-          ? markLastWorkCancelled(closed)
-          : closed;
+        const isStopCancel = isStopCancellationNotice(frame.text);
+        const closed = closeActiveWork(
+          isStopCancel ? foldTrailingAnswerIntoWork(view.transcript) : view.transcript,
+        );
+        const base = isStopCancel ? markLastWorkCancelled(closed) : closed;
         return {
           ...prev,
           [sid]: {
@@ -2328,42 +2329,29 @@ function mergeView(
 // The second arg is the *full* visible text (not an increment), so each
 // rAF tick replaces rather than appends.
 //
-// While a turn's work block is open, the answer streams **inside** it as
-// its trailing `prose` step — that's what keeps mid-turn output (and the
-// final answer as it types out) from popping out below the working bubble.
-// When the terminal `Frame::Message` lands, `closeWorkForFinalReply` peels
-// that prose step back off into the standalone answer bubble. With no open
-// block (a direct answer, no reasoning/tools) it streams straight into a
-// standalone bubble, finalized by the message path as today.
+// The answer always streams into a standalone assistant bubble — even when a
+// work block is open above it — so the reply types out *below* the working
+// card, not inside it. If a progress frame (reasoning / tool / status)
+// interrupts the stream, `ensureWork` folds the bubble-so-far into the block
+// as an intermediate `prose` step; the terminal `Frame::Message` finalizes the
+// bubble in place. A still-open block with no steps yet (a turn that opened the
+// "Working" affordance but produced no reasoning/tools) is dropped as the
+// answer starts — the streaming bubble is itself the activity signal, so an
+// empty card must not hover above it.
 function writeStreamingAnswer(prev: TranscriptRow[], text: string): TranscriptRow[] {
   const last = prev[prev.length - 1];
-  if (last?.kind === 'work' && last.workActive) {
-    const steps = last.steps ?? [];
-    const lastStep = steps[steps.length - 1];
-    if (lastStep?.kind === 'prose') {
-      if (lastStep.text === text) return prev;
-      const next = prev.slice();
-      next[next.length - 1] = {
-        ...last,
-        steps: [...steps.slice(0, -1), { ...lastStep, text }],
-      };
-      return next;
-    }
-    const next = prev.slice();
-    next[next.length - 1] = {
-      ...last,
-      steps: [...steps, { key: `prose-${steps.length}-${Date.now()}`, kind: 'prose', text }],
-    };
-    return next;
-  }
   if (last?.streaming && last.role === 'assistant') {
     if (last.text === text) return prev;
     return [...prev.slice(0, -1), { ...last, text }];
   }
+  const base =
+    last?.kind === 'work' && last.workActive && (last.steps?.length ?? 0) === 0
+      ? prev.slice(0, -1)
+      : prev;
   return [
-    ...prev,
+    ...base,
     {
-      key: `stream-${prev.length}-${Date.now()}`,
+      key: `stream-${base.length}-${Date.now()}`,
       role: 'assistant',
       text,
       streaming: true,
@@ -2619,6 +2607,28 @@ export function closeActiveWork(prev: TranscriptRow[], cancelled = false): Trans
   return prev;
 }
 
+/** Fold a trailing streaming answer bubble into the active work block as a
+ *  final `prose` step. Used only on `/stop`: the answer normally streams in
+ *  its own bubble below the block, but a cancelled partial reply belongs
+ *  *inside* the collapsed "Cancelled" block, not dangling as a never-finalized
+ *  bubble below it. No-op unless the tail is a streaming assistant bubble sat
+ *  directly on an open block; an empty partial just drops the bubble. */
+function foldTrailingAnswerIntoWork(prev: TranscriptRow[]): TranscriptRow[] {
+  const n = prev.length;
+  const last = prev[n - 1];
+  if (!last?.streaming || last.role !== 'assistant') return prev;
+  const block = prev[n - 2];
+  if (block?.kind !== 'work' || !block.workActive) return prev;
+  const next = prev.slice(0, -1);
+  if (last.text.trim().length > 0) {
+    next[n - 2] = {
+      ...block,
+      steps: [...(block.steps ?? []), { key: `prose-${last.key}`, kind: 'prose', text: last.text }],
+    };
+  }
+  return next;
+}
+
 /** Recognise a `/stop` the user typed, mirroring the gateway's parser
  *  (leading `/`, first token, tolerant of a `@bot` suffix / args) so the
  *  client can optimistically reflect the cancel before the round-trip. */
@@ -2680,23 +2690,13 @@ export function applyTurnState(
   startedAt: number | null,
 ): TranscriptRow[] {
   if (!active) {
-    // The actor emits `active: false` when its loop returns, BEFORE the
-    // terminal Message/Notice ships on the same ordered stream. A block
-    // whose tail is `prose` is holding the streamed answer that the
-    // imminent Message will peel into the real bubble
-    // (`closeWorkForFinalReply`) — closing it here would fossilise that
-    // prose inside the collapsed block and the answer would render
-    // twice. Leave it for the terminal frame; close everything else
-    // (tool/reasoning tails, turns that end with no terminal frame at
-    // all — cancel, blank cron reply). A *failed* user turn now always
-    // gets a terminal error notice (see `run_agent_loop`), whose handler
-    // closes the block via `closeActiveWork` — so the prose-tail block
-    // doesn't dangle on the error path either.
-    const last = prev[prev.length - 1];
-    if (last?.kind === 'work' && last.workActive) {
-      const steps = last.steps ?? [];
-      if (steps[steps.length - 1]?.kind === 'prose') return prev;
-    }
+    // Turn end. Collapse the open work block to its `Worked Xs` summary. The
+    // actor emits `active: false` when its loop returns, BEFORE the terminal
+    // Message/Notice ships on the same ordered stream — but any answer the
+    // model is still streaming lives in its own bubble *below* the block, so
+    // collapsing here never swallows the reply (the imminent Message finalizes
+    // that bubble in place). Also covers turns that end with no terminal frame
+    // at all — error, cancel, blank cron reply.
     return closeActiveWork(prev);
   }
   // A server `active:true` ALWAYS carries a real `started_at` (the
@@ -2724,31 +2724,6 @@ export function applyTurnState(
     return next;
   }
   return [...prev, newWorkRow(startedAt, prev.length)];
-}
-
-/** Close the open work block at the turn's terminal reply, peeling off a
- *  trailing `prose` step — that's the final answer the model streamed
- *  into the block — so the caller renders it as the standalone answer
- *  bubble below (from the authoritative `Frame::Message` content, so the
- *  peeled step's own text is just discarded). If peeling empties the
- *  block (a direct answer that only opened a block to stream into, e.g.
- *  reasoning-less), the block is dropped so no `Worked Xs` line shows. */
-function closeWorkForFinalReply(prev: TranscriptRow[]): TranscriptRow[] {
-  for (let i = prev.length - 1; i >= 0; i--) {
-    const row = prev[i];
-    if (row.kind !== 'work' || !row.workActive) continue;
-    let steps = row.steps ?? [];
-    if (steps.length > 0 && steps[steps.length - 1].kind === 'prose') {
-      steps = steps.slice(0, -1);
-    }
-    if (steps.length === 0) {
-      return [...prev.slice(0, i), ...prev.slice(i + 1)];
-    }
-    const next = prev.slice();
-    next[i] = { ...row, steps, workActive: false, workEndedAt: Date.now() };
-    return next;
-  }
-  return prev;
 }
 
 function finalizeMessage(
@@ -2912,9 +2887,10 @@ function formatHttpError(err: unknown): string {
  *  * Otherwise present fields are merged in place — absent fields
  *    keep their previous values.
  *
- *  Sort order: keep "most-recent `last_active` first" so a session
- *  bumping its activity floats to the top without an explicit list
- *  refetch. Stable for rows whose `last_active` didn't change. */
+ *  Row order is never touched: fields merge in place, so a live update
+ *  (a session bumping its activity) cannot reposition the row. This is
+ *  deliberate — concurrent replies must not reshuffle the list under the
+ *  user. A genuinely new session is prepended (newest first). */
 function applySessionPatch(
   prev: SessionSummary[],
   sessionId: string,
@@ -2926,15 +2902,15 @@ function applySessionPatch(
   const idx = prev.findIndex((s) => s.session_id === sessionId);
   if (idx === -1) {
     if (patch.created_at == null || patch.last_active == null) return prev;
-    return sortByLastActiveDesc([
-      ...prev,
+    return [
       {
         session_id: sessionId,
         created_at: patch.created_at,
         last_active: patch.last_active,
         unread: 0,
       },
-    ]);
+      ...prev,
+    ];
   }
   const current = prev[idx];
   const merged: SessionSummary = {
@@ -2952,17 +2928,18 @@ function applySessionPatch(
   }
   const next = prev.slice();
   next[idx] = merged;
-  return sortByLastActiveDesc(next);
+  return next;
 }
 
 /** Merge a `SessionActivity` ping onto the sidebar list. Projects
- *  `at` onto the row's local `last_active` (so the age string and
- *  sort order both stay current without a list refetch) and bumps
- *  `unread` iff the activity isn't on the currently-foregrounded
- *  session. Activity for sessions we don't know about (raced ahead
- *  of Created, or hidden in this tab) is dropped on the floor —
- *  Created arrives separately, and rehydration after a hide isn't
- *  worth optimising. */
+ *  `at` onto the row's local `last_active` (so the age string stays
+ *  current without a list refetch) and bumps `unread` iff the activity
+ *  isn't on the currently-foregrounded session. The row is updated in
+ *  place — never repositioned — so concurrent replies don't reshuffle
+ *  the list. Activity for sessions we don't know about (raced ahead of
+ *  Created, or hidden in this tab) is dropped on the floor — Created
+ *  arrives separately, and rehydration after a hide isn't worth
+ *  optimising. */
 function applySessionActivity(
   prev: SessionSummary[],
   sessionId: string,
@@ -2980,13 +2957,7 @@ function applySessionActivity(
   }
   const next = prev.slice();
   next[idx] = { ...current, last_active: nextLastActive, unread: nextUnread };
-  return sortByLastActiveDesc(next);
-}
-
-function sortByLastActiveDesc(list: SessionSummary[]): SessionSummary[] {
-  return list
-    .slice()
-    .sort((a, b) => Date.parse(b.last_active) - Date.parse(a.last_active));
+  return next;
 }
 
 /** Soft cap on the sidebar preview length. Mirrors `PREVIEW_MAX_CHARS`
@@ -3397,8 +3368,12 @@ function WorkStepView({ step }: { step: WorkStep }) {
     );
   }
   if (step.kind === 'prose') {
+    // Intermediate reply text the model emitted between tool calls (the final
+    // answer streams in its own bubble, not here). Render it with the answer
+    // bubble's prose styling — not the dim mono of the reasoning/tool steps —
+    // so it reads as reply text when the block is expanded.
     return (
-      <div className="font-mono text-xs text-ink-soft leading-relaxed">
+      <div className="chat-prose text-ink">
         <MarkdownBody text={step.text ?? ''} />
       </div>
     );
@@ -3484,12 +3459,21 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
 
   // Pin the steps panel to its tail while the turn is producing so a long
   // tool loop reveals the newest reasoning/tool line at the bottom instead
-  // of stranding the user at the top. Fires on each step list mutation —
-  // new step, status update, prose append — and is layout-effect-scoped so
-  // the catch-up happens pre-paint, no visible flash.
+  // of stranding the user at the top — but ONLY while the user is parked at
+  // (or near) the bottom. Once they scroll up to read an earlier line we stop
+  // yanking them back down, and re-engage when they scroll back to the end.
+  // Layout-effect-scoped so the catch-up happens pre-paint, no visible flash.
   const stepsContainerRef = useRef<HTMLDivElement | null>(null);
+  const stepsPinnedRef = useRef(true);
+  const handleStepsScroll = useCallback(() => {
+    const el = stepsContainerRef.current;
+    if (!el) return;
+    const slackPx = 48;
+    stepsPinnedRef.current =
+      el.scrollHeight - el.scrollTop - el.clientHeight <= slackPx;
+  }, []);
   useLayoutEffect(() => {
-    if (!active) return;
+    if (!active || !stepsPinnedRef.current) return;
     const el = stepsContainerRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
@@ -3569,6 +3553,7 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
         >
           <div
             ref={stepsContainerRef}
+            onScroll={handleStepsScroll}
             className={`min-h-0 ${
               panelOpen
                 ? 'chat-scroll max-h-[calc((100vh-12rem)*3/5)] overflow-y-auto'
