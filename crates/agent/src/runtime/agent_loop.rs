@@ -325,6 +325,15 @@ fn memory_recall_query(input: &JobInput) -> Option<Vec<ContentBlock>> {
     }
 }
 
+/// Whether `name` is one of the autonomous-goal tools (`create_goal` /
+/// `get_goal` / `update_goal`) — hidden from sessions that aren't goal-eligible
+/// (see [`AgentLoop::call_llm`]).
+fn is_goal_tool_name(name: &str) -> bool {
+    name == aura_model::CREATE_GOAL_TOOL_NAME
+        || name == aura_model::GET_GOAL_TOOL_NAME
+        || name == aura_model::UPDATE_GOAL_TOOL_NAME
+}
+
 /// Best-effort extraction of a cron fire's prompt text for the recall query.
 /// The cron router writes `action_payload` as `{cron_job_id, prompt}` (an
 /// opaque trace blob — see `aura_job::JobInput::Cron`); a missing or non-string
@@ -1338,10 +1347,19 @@ impl AgentLoop {
     ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
         let model_info = self.llm_client.model_info();
 
+        // The goal tools are registered globally but are only meaningful on a
+        // goal-eligible (top-level UserChat) session — a cron/subagent turn that
+        // called `create_goal` would write an `Active` goal whose continuation
+        // loop is never eligible to fire. Hide them from every other session so
+        // the model is never offered a control it can't honour. (See
+        // `crate::actor::goal_eligible` — the same gate the continuation loop
+        // uses.)
+        let hide_goal_tools = !crate::actor::goal_eligible(session);
         let tool_defs: Vec<ToolDefinitionForLlm> = self
             .tool_registry
             .tool_definitions()
             .into_iter()
+            .filter(|td| !(hide_goal_tools && is_goal_tool_name(&td.name)))
             .map(|td| ToolDefinitionForLlm {
                 name: td.name,
                 description: td.description,

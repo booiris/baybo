@@ -25,6 +25,11 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 pub struct GoalPatch {
     pub status: Option<GoalStatus>,
     pub objective: Option<String>,
+    /// Outer `None` = leave the budget untouched; `Some(None)` = clear it (run
+    /// unbudgeted); `Some(Some(n))` = set the per-goal token budget to `n`. The
+    /// nesting is what lets `/goal <obj> --budget N` raise the cap on an
+    /// existing goal without an unconditional overwrite.
+    pub token_budget: Option<Option<u64>>,
     pub tokens_used: Option<u64>,
     pub time_used_seconds: Option<u64>,
 }
@@ -39,6 +44,7 @@ impl GoalPatch {
     pub fn is_empty(&self) -> bool {
         self.status.is_none()
             && self.objective.is_none()
+            && self.token_budget.is_none()
             && self.tokens_used.is_none()
             && self.time_used_seconds.is_none()
     }

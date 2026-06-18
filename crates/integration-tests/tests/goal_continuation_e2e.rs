@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use aura_channels::{AgentEvent, AgentOutput};
 use aura_llm::{LlmResponse, TokenUsage, ToolCallInfo};
-use aura_model::{ContentBlock, GoalStatus};
+use aura_model::{ContentBlock, GoalStatus, TriggerSource};
 use serde_json::json;
 
-use aura_integration_tests::AgentTestHarness;
+use aura_integration_tests::{AgentTestHarness, SessionBuilder};
 
 const DRAIN: Duration = Duration::from_millis(800);
 
@@ -177,6 +177,44 @@ async fn goal_view_reports_status() {
             .any(|t| t.contains("climb the mountain")),
         "view should echo the objective: {:?}",
         notices(&outs)
+    );
+
+    harness.shutdown().await;
+}
+
+/// A non-goal-eligible session (here a cron-trigger one) must NOT be advertised
+/// the goal tools — otherwise it could `create_goal` an Active row whose
+/// continuation loop is never eligible to fire. Task tools (also globally
+/// registered) stay visible, proving the filter is selective.
+#[tokio::test]
+async fn goal_tools_hidden_on_non_eligible_session() {
+    let mut session = SessionBuilder::new().id("cron-sess").build();
+    session.trigger = TriggerSource::Cron {
+        cron_job_id: "job-1".into(),
+    };
+    let mut harness = AgentTestHarness::builder().session(session).build();
+    harness.stub_llm.push_response(text_reply("ok"));
+
+    harness.send_text("do something").await.unwrap();
+    let _ = harness.drain_outputs(DRAIN).await;
+
+    let captured = harness.stub_llm.captured_requests();
+    let tool_names: Vec<&str> = captured
+        .first()
+        .expect("one LLM request")
+        .tools
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
+    for goal_tool in ["create_goal", "get_goal", "update_goal"] {
+        assert!(
+            !tool_names.contains(&goal_tool),
+            "{goal_tool} must be hidden on a non-eligible session; saw {tool_names:?}"
+        );
+    }
+    assert!(
+        tool_names.contains(&"TaskCreate"),
+        "task tools must stay visible (filter is goal-specific); saw {tool_names:?}"
     );
 
     harness.shutdown().await;

@@ -122,32 +122,33 @@ fn is_blank_reply(content: &[ContentBlock]) -> bool {
     })
 }
 
-/// Mirrors the gateway slash dispatcher's tolerance for casing and
-/// trailing arguments so a user typing `/Compact extra` from any
-/// channel hits the same control path.
-fn is_compact_command(content: &[ContentBlock]) -> bool {
+/// The bare leading command token of a slash message — `/cmd@Bot arg` → `cmd`.
+/// Strips the optional `@BotName` suffix platforms append in group chats (so
+/// `/goal@MyBot pause` routes like `/goal pause`, matching the router's `/stop`
+/// handling). `None` when `content` doesn't lead with a `/<token>`.
+fn slash_command_name(content: &[ContentBlock]) -> Option<&str> {
     let Some(ContentBlock::Text(text)) = content.first() else {
-        return false;
+        return None;
     };
-    let Some(rest) = text.trim().strip_prefix('/') else {
-        return false;
-    };
+    let rest = text.trim().strip_prefix('/')?;
     let token = rest.split_whitespace().next().unwrap_or("");
-    token.eq_ignore_ascii_case(COMPACT_COMMAND.trim_start_matches('/'))
+    Some(token.split('@').next().unwrap_or(""))
+}
+
+/// Mirrors the gateway slash dispatcher's tolerance for casing, a trailing
+/// `@BotName`, and trailing arguments so a user typing `/Compact@Bot extra`
+/// from any channel hits the same control path.
+fn is_compact_command(content: &[ContentBlock]) -> bool {
+    slash_command_name(content)
+        .is_some_and(|t| t.eq_ignore_ascii_case(COMPACT_COMMAND.trim_start_matches('/')))
 }
 
 /// Mirrors [`is_compact_command`] for `/goal` (set / view / pause / resume /
 /// clear the session's autonomous objective). Routed to the actor like
 /// `/compact` so it can drive the continuation loop and the goal store.
 fn is_goal_command(content: &[ContentBlock]) -> bool {
-    let Some(ContentBlock::Text(text)) = content.first() else {
-        return false;
-    };
-    let Some(rest) = text.trim().strip_prefix('/') else {
-        return false;
-    };
-    let token = rest.split_whitespace().next().unwrap_or("");
-    token.eq_ignore_ascii_case(GOAL_COMMAND.trim_start_matches('/'))
+    slash_command_name(content)
+        .is_some_and(|t| t.eq_ignore_ascii_case(GOAL_COMMAND.trim_start_matches('/')))
 }
 
 /// Transient (non-persisted) per-actor goal continuation state. The goal itself
@@ -187,8 +188,11 @@ enum GoalTurnOutcome {
 /// Goals exist only in top-level user-facing sessions (Telegram / web / TUI):
 /// a `User` trigger and no subagent lineage. Cron fires and spawned subagents
 /// are one-shot/ephemeral and get no continuation. Mirrors the UserChat-only
-/// gates for `SubagentNotification` / mid-turn interjection.
-fn goal_eligible(session: &Session) -> bool {
+/// gates for `SubagentNotification` / mid-turn interjection. Also the single
+/// source of truth for which sessions are advertised the goal tools (see
+/// `AgentLoop::call_llm`), so a cron/subagent turn can't create an `Active`
+/// goal whose continuation loop would never be eligible to fire.
+pub(crate) fn goal_eligible(session: &Session) -> bool {
     matches!(session.trigger, TriggerSource::User) && session.lineage.is_none()
 }
 
@@ -1492,7 +1496,7 @@ impl AgentActor {
                 if let Err(e) = self
                     .volatile
                     .goal_service
-                    .set_objective(&self.durable.session.id, &objective)
+                    .edit(&self.durable.session.id, &objective, budget)
                     .await
                 {
                     return format!("Failed to update goal: {e}");
@@ -1500,20 +1504,27 @@ impl AgentActor {
                 // The next continuation turn re-derives requirements from the
                 // new objective (OBJECTIVE_UPDATED steering).
                 self.goal.pending_objective_update = Some(objective.clone());
-                format!("🎯 Goal objective updated to: \"{objective}\"")
+                format!(
+                    "🎯 Goal objective updated to: \"{objective}\"{}",
+                    budget_note(budget)
+                )
             }
             Ok(Some(g)) if !g.status.is_terminal() => {
+                // Apply `--budget` here too: after a `BudgetLimited` stop the
+                // user is told to raise the budget and `/goal resume`, so the
+                // new cap must actually land or resume would hit the same stop.
                 if let Err(e) = self
                     .volatile
                     .goal_service
-                    .set_objective(&self.durable.session.id, &objective)
+                    .edit(&self.durable.session.id, &objective, budget)
                     .await
                 {
                     return format!("Failed to update goal: {e}");
                 }
                 self.goal.pending_objective_update = Some(objective.clone());
                 format!(
-                    "🎯 Goal objective updated to: \"{objective}\"\nThe goal is {}; run `/goal resume` to continue working on it.",
+                    "🎯 Goal objective updated to: \"{objective}\"{}\nThe goal is {}; run `/goal resume` to continue working on it.",
+                    budget_note(budget),
                     g.status.as_str()
                 )
             }
@@ -1603,6 +1614,7 @@ impl AgentActor {
 }
 
 /// Parsed form of a `/goal` command (everything after the leading `/goal`).
+#[derive(Debug, PartialEq, Eq)]
 enum GoalCommand {
     View,
     Pause,
@@ -1628,7 +1640,11 @@ fn parse_goal_command(command_text: &str) -> GoalCommand {
     if rest.is_empty() {
         return GoalCommand::View;
     }
-    match rest {
+    // Subcommands match case-insensitively (the command token itself already
+    // does), so `/Goal Pause` stops the goal rather than overwriting it with a
+    // new objective "Pause". Only the bare subcommand word is normalized; the
+    // objective (the `Set` fallback below) keeps its original casing.
+    match rest.to_ascii_lowercase().as_str() {
         GOAL_PAUSE_SUBCOMMAND => return GoalCommand::Pause,
         GOAL_RESUME_SUBCOMMAND => return GoalCommand::Resume,
         GOAL_CLEAR_SUBCOMMAND => return GoalCommand::Clear,
@@ -1680,6 +1696,14 @@ fn fmt_goal_duration(seconds: u64) -> String {
     } else {
         format!("{s}s")
     }
+}
+
+/// `" (token budget: N)"` when a budget was just set, else empty — appended to
+/// the goal-edit confirmation so the user sees the cap actually changed.
+fn budget_note(budget: Option<u64>) -> String {
+    budget
+        .map(|b| format!(" (token budget: {b})"))
+        .unwrap_or_default()
 }
 
 fn goal_set_text(goal: &Goal) -> String {
@@ -1795,6 +1819,60 @@ mod tests {
             tool_use_id: "x".into(),
             content: "/compact".into(),
         }]));
+    }
+
+    #[test]
+    fn goal_command_detects_casing_args_and_bot_suffix() {
+        assert!(is_goal_command(&text("/goal")));
+        assert!(is_goal_command(&text("/Goal do the thing")));
+        // Group-chat form: `/goal@BotName ...` must still route to handle_goal.
+        assert!(is_goal_command(&text("/goal@MyBot pause")));
+        assert!(is_goal_command(&text("/GOAL@MyBot")));
+        // The same `@bot` tolerance now covers `/compact` too.
+        assert!(is_compact_command(&text("/compact@MyBot")));
+        assert!(!is_goal_command(&text("/goalkeeper")));
+        assert!(!is_goal_command(&text("goal")));
+    }
+
+    #[test]
+    fn parse_goal_subcommands_are_case_insensitive() {
+        assert!(matches!(parse_goal_command("/goal"), GoalCommand::View));
+        assert!(matches!(
+            parse_goal_command("/goal pause"),
+            GoalCommand::Pause
+        ));
+        // `/Goal Pause` must pause, NOT create a goal named "Pause".
+        assert!(matches!(
+            parse_goal_command("/Goal Pause"),
+            GoalCommand::Pause
+        ));
+        assert!(matches!(
+            parse_goal_command("/goal@Bot RESUME"),
+            GoalCommand::Resume
+        ));
+        assert!(matches!(
+            parse_goal_command("/goal Clear"),
+            GoalCommand::Clear
+        ));
+    }
+
+    #[test]
+    fn parse_goal_set_preserves_objective_casing_and_budget() {
+        match parse_goal_command("/goal Ship The Feature --budget 5000") {
+            GoalCommand::Set { objective, budget } => {
+                assert_eq!(objective, "Ship The Feature");
+                assert_eq!(budget, Some(5000));
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+        // `--budget=N` form, objective casing intact, no accidental subcommand.
+        match parse_goal_command("/goal Pause The World --budget=10_000") {
+            GoalCommand::Set { objective, budget } => {
+                assert_eq!(objective, "Pause The World");
+                assert_eq!(budget, Some(10_000));
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
     }
 
     fn incoming(body: &str) -> IncomingMessage {

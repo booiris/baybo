@@ -46,6 +46,9 @@ impl GoalStore for MemoryGoalStore {
         if let Some(objective) = &patch.objective {
             goal.objective = objective.clone();
         }
+        if let Some(token_budget) = patch.token_budget {
+            goal.token_budget = token_budget;
+        }
         if let Some(tokens_used) = patch.tokens_used {
             goal.tokens_used = tokens_used;
         }

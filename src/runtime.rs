@@ -947,6 +947,18 @@ pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle {
         graph.actor_parent_token.clone(),
     );
 
+    // Goal re-arm: a one-shot boot scan that resumes every `Active` goal that
+    // survived a restart, so autonomous "keep working on X" continuation picks
+    // up again without waiting for the next user message. Uses the same actor
+    // spawner the router/subagent paths use.
+    aura_agent::supervisor::spawn_goal_rearm(
+        supervisor.clone(),
+        Arc::clone(&graph.session_manager),
+        graph.stores.goal.clone(),
+        Arc::clone(&spawn_actor_for),
+        graph.actor_parent_token.clone(),
+    );
+
     // Turn-state projector: the single producer of the web chat's live
     // turn-activity signal. It subscribes to job lifecycle start + terminal
     // events and, on each transition, broadcasts the session's current

@@ -136,6 +136,13 @@ impl GoalStore for LibsqlGoalStore {
             params.push(libsql::Value::Text(objective.clone()));
             sets.push(format!("objective = ?{}", params.len()));
         }
+        if let Some(token_budget) = patch.token_budget {
+            params.push(match token_budget {
+                Some(n) => libsql::Value::Integer(n as i64),
+                None => libsql::Value::Null,
+            });
+            sets.push(format!("token_budget = ?{}", params.len()));
+        }
         if let Some(tokens_used) = patch.tokens_used {
             params.push(libsql::Value::Integer(tokens_used as i64));
             sets.push(format!("tokens_used = ?{}", params.len()));

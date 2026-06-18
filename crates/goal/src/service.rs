@@ -107,14 +107,24 @@ impl GoalService {
             .map_err(|e| GoalError::Store(e.to_string()))
     }
 
-    /// Edit the objective in place (the `/goal <new objective>` path). `Ok(false)`
-    /// when no goal is set.
-    pub async fn set_objective(&self, session_id: &SessionId, objective: &str) -> Result<bool> {
+    /// Edit an existing goal in place (the `/goal <new objective> [--budget N]`
+    /// path): always updates the objective, and raises/sets the per-goal token
+    /// budget when `budget` is `Some` (a `None` budget leaves the existing cap
+    /// untouched, so editing the objective alone never silently drops it).
+    /// `Ok(false)` when no goal is set.
+    pub async fn edit(
+        &self,
+        session_id: &SessionId,
+        objective: &str,
+        budget: Option<u64>,
+    ) -> Result<bool> {
         self.store
             .update(
                 session_id,
                 &GoalPatch {
                     objective: Some(objective.to_string()),
+                    // `Some(n)` → set the cap to `n`; `None` → leave untouched.
+                    token_budget: budget.map(Some),
                     ..GoalPatch::new()
                 },
             )
@@ -229,14 +239,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_objective_and_clear() {
+    async fn edit_and_clear() {
         let svc = service();
         let sid = SessionId::from("s1");
         svc.create(&sid, "old", None).await.unwrap();
-        assert!(svc.set_objective(&sid, "new").await.unwrap());
+        assert!(svc.edit(&sid, "new", None).await.unwrap());
         assert_eq!(svc.current(&sid).await.unwrap().unwrap().objective, "new");
         assert!(svc.clear(&sid).await.unwrap());
         assert!(svc.current(&sid).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn edit_raises_budget_but_leaves_it_untouched_when_omitted() {
+        let svc = service();
+        let sid = SessionId::from("s1");
+        svc.create(&sid, "obj", Some(1_000)).await.unwrap();
+        // Edit objective only (no budget) → cap preserved.
+        svc.edit(&sid, "obj2", None).await.unwrap();
+        let g = svc.current(&sid).await.unwrap().unwrap();
+        assert_eq!(g.objective, "obj2");
+        assert_eq!(g.token_budget, Some(1_000));
+        // Edit with a new budget → cap raised (the post-BudgetLimited path).
+        svc.edit(&sid, "obj2", Some(5_000)).await.unwrap();
+        assert_eq!(
+            svc.current(&sid).await.unwrap().unwrap().token_budget,
+            Some(5_000)
+        );
     }
 
     #[tokio::test]

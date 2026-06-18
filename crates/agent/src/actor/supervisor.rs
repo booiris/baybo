@@ -325,6 +325,28 @@ impl AgentSupervisor {
         }
     }
 
+    /// Atomically build + register a fresh actor only when none exists for
+    /// `session_id`, returning `true` if it spawned. Unlike
+    /// [`Self::route_or_spawn`] it sends **no** message — the actor's `run` loop
+    /// self-fires (used by the goal-rearm boot scan, where the run loop resumes
+    /// an `Active` goal on its own without any triggering message). `spawn` runs
+    /// only when the slot is vacant, so a lost race never leaves an orphaned
+    /// actor task.
+    pub fn spawn_if_absent<F>(&self, session_id: &SessionId, spawn: F) -> bool
+    where
+        F: FnOnce() -> MailboxSender<AgentMessage>,
+    {
+        use dashmap::Entry;
+        match self.actors.entry(session_id.clone()) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                debug!(%session_id, "registering actor (goal re-arm)");
+                slot.insert(ActorHandle { sender: spawn() });
+                true
+            }
+        }
+    }
+
     /// Remove an actor handle. Called by [`ActorRegistryGuard`] when an
     /// actor's `run` loop exits for any reason — Shutdown, mailbox
     /// close, or panic — so the supervisor's map never holds entries
@@ -506,6 +528,66 @@ pub fn spawn_idle_reaper(
     })
 }
 
+/// One-shot boot scan that re-arms every `Active` goal which survived a process
+/// restart. For each goal-eligible session whose durable goal is `Active`, it
+/// builds + registers the actor (when not already resident); the actor's `run`
+/// loop then fires the next continuation turn on its own — so "keep working on
+/// X" resumes after a restart instead of stalling until the user sends another
+/// message (Codex's `restore_after_resume`). Detached so boot isn't blocked on
+/// loading sessions; idempotent against the normal message path via
+/// [`AgentSupervisor::spawn_if_absent`].
+///
+/// The returned [`JoinHandle`] is ignorable; the task runs once and exits.
+pub fn spawn_goal_rearm(
+    supervisor: AgentSupervisor,
+    sessions: Arc<SessionManager>,
+    goal_store: Arc<dyn aura_store::GoalStore>,
+    actor_spawner: crate::actor::router::ActorSpawner,
+    actor_parent_token: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let goals = match goal_store.list_all().await {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(error = %e, "goal re-arm: list_all failed; active goals resume on next message");
+                return;
+            }
+        };
+        let response_tx = supervisor.response_tx().clone();
+        let mut rearmed = 0usize;
+        for (session_id, goal) in goals {
+            if !goal.status.is_active() {
+                continue;
+            }
+            let session = match sessions.get(&session_id).await {
+                Ok(Some(s)) => s,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(%session_id, error = %e, "goal re-arm: session load failed");
+                    continue;
+                }
+            };
+            // Only top-level UserChat sessions self-fire (cron/subagent never do);
+            // same gate the continuation loop uses.
+            if !crate::actor::goal_eligible(&session) {
+                continue;
+            }
+            let actor_token = actor_parent_token.child_token();
+            let pinned = session.state.last_llm.clone();
+            let spawner = actor_spawner.clone();
+            let tx = response_tx.clone();
+            if supervisor.spawn_if_absent(&session_id, move || {
+                spawner(session, pinned, tx, actor_token)
+            }) {
+                rearmed += 1;
+            }
+        }
+        if rearmed > 0 {
+            info!(rearmed, "re-armed active goals after startup");
+        }
+    })
+}
+
 /// Spawn the per-process turn-state projector — the **sole** producer of
 /// the web chat's `Frame::TurnState`.
 ///
@@ -642,6 +724,38 @@ mod tests {
         assert_eq!(supervisor.len(), 1);
         supervisor.remove(&session_id);
         assert_eq!(supervisor.len(), 0);
+    }
+
+    #[test]
+    fn spawn_if_absent_spawns_once_and_never_orphans() {
+        let supervisor = make_supervisor();
+        let session_id = SessionId::from("s-rearm");
+
+        // First call spawns + registers.
+        let mut spawn_count = 0;
+        let spawned = supervisor.spawn_if_absent(&session_id, || {
+            spawn_count += 1;
+            let (tx, _rx) = mailbox::channel(8);
+            tx
+        });
+        assert!(spawned);
+        assert_eq!(spawn_count, 1);
+        assert_eq!(supervisor.len(), 1);
+
+        // Second call is a no-op AND must not even run the spawn closure (so a
+        // re-arm racing the normal message path can't leak an orphan actor).
+        let mut second_spawn_count = 0;
+        let spawned_again = supervisor.spawn_if_absent(&session_id, || {
+            second_spawn_count += 1;
+            let (tx, _rx) = mailbox::channel(8);
+            tx
+        });
+        assert!(!spawned_again);
+        assert_eq!(
+            second_spawn_count, 0,
+            "spawn closure must not run when occupied"
+        );
+        assert_eq!(supervisor.len(), 1);
     }
 
     #[test]
