@@ -708,6 +708,7 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
                 created_at: Some(created_at),
                 last_active: Some(created_at),
                 hidden: Some(false),
+                pinned: Some(false),
             },
         );
 

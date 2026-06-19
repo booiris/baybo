@@ -1,12 +1,19 @@
+import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import { RiAddLine, RiDeleteBin6Line, RiLoader4Line } from 'react-icons/ri';
+import {
+  RiAddLine,
+  RiDeleteBin6Line,
+  RiLoader4Line,
+  RiPushpin2Fill,
+  RiPushpin2Line,
+} from 'react-icons/ri';
 import type { SessionSummary } from './types';
 
 // Chat zone 2: the session list sidebar (the global icon rail is zone 1, the
-// thread + floating composer is zone 3). A flat, newest-first conversation
-// list of compact single-line rows: a coral-red-highlighted active row, the
-// title with a right-aligned mono timestamp, an unread badge, and a
-// hover-reveal hide affordance.
+// thread + floating composer is zone 3). A newest-first conversation list of
+// compact single-line rows: a coral-red-highlighted active row, the title with
+// a right-aligned mono timestamp, an unread badge, and hover-reveal pin + hide
+// affordances. Pinned sessions are lifted into a labelled block above the rest.
 
 /** Compact human-readable age. Same shape the logs page uses, kept
  *  local since the dep would be marginal. */
@@ -28,17 +35,22 @@ function SessionRow({
   hasPending,
   unreadCount,
   onHide,
+  onTogglePin,
 }: {
   session: SessionSummary;
   active: boolean;
   hasPending: boolean;
   unreadCount: number;
   onHide: (id: string) => void;
+  onTogglePin: (id: string, pinned: boolean) => void;
 }) {
   // Unread badge only shows on background rows — the active row is
   // already cleared on entry, but guard anyway in case a frame races
   // the clearing effect.
   const showUnread = unreadCount > 0 && !active;
+  const iconBtn = `flex items-center justify-center h-5 w-5 rounded shrink-0 ${
+    active ? 'text-ink hover:bg-white/40' : 'text-ink-soft hover:bg-white'
+  }`;
   return (
     <Link
       to={`/chat/${session.session_id}`}
@@ -49,6 +61,17 @@ function SessionRow({
       }`}
       title={session.session_id}
     >
+      {/* Persistent pin glyph on pinned rows so the state reads at a
+          glance even before hovering; hidden on hover where the
+          interactive toggle takes its place. */}
+      {session.pinned ? (
+        <RiPushpin2Fill
+          className={`text-[0.7rem] shrink-0 group-hover:hidden ${
+            active ? 'text-ink/70' : 'text-ink-soft'
+          }`}
+          title="Pinned"
+        />
+      ) : null}
       <span
         className={`text-sm flex-1 truncate text-ink ${active ? 'font-bold' : ''} ${
           session.last_user_text ? '' : 'italic opacity-70'
@@ -78,22 +101,48 @@ function SessionRow({
       >
         {relativeAge(session.last_active)}
       </span>
-      <button
-        type="button"
-        onClick={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          onHide(session.session_id);
-        }}
-        className={`hidden group-hover:flex items-center justify-center h-5 w-5 rounded shrink-0 ${
-          active ? 'text-ink hover:bg-white/40' : 'text-ink-soft hover:bg-white'
-        }`}
-        title="Hide from list (server-side row is kept)"
-        aria-label="Hide conversation"
-      >
-        <RiDeleteBin6Line className="text-sm" />
-      </button>
+      <div className="hidden group-hover:flex items-center gap-0.5">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            onTogglePin(session.session_id, !session.pinned);
+          }}
+          className={iconBtn}
+          title={session.pinned ? 'Unpin from top' : 'Pin to top'}
+          aria-label={session.pinned ? 'Unpin conversation' : 'Pin conversation to top'}
+        >
+          {session.pinned ? (
+            <RiPushpin2Fill className="text-sm" />
+          ) : (
+            <RiPushpin2Line className="text-sm" />
+          )}
+        </button>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            onHide(session.session_id);
+          }}
+          className={iconBtn}
+          title="Hide from list (server-side row is kept)"
+          aria-label="Hide conversation"
+        >
+          <RiDeleteBin6Line className="text-sm" />
+        </button>
+      </div>
     </Link>
+  );
+}
+
+/** Small uppercase divider label for the pinned / recent blocks. */
+function SectionLabel({ children }: { children: ReactNode }) {
+  return (
+    <div className="px-2 pt-2 pb-0.5 font-mono text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft select-none">
+      {children}
+    </div>
   );
 }
 
@@ -105,6 +154,7 @@ export function SessionSidebar({
   loading,
   onNewChat,
   onHide,
+  onTogglePin,
 }: {
   sessions: SessionSummary[];
   activeSessionId: string | null | undefined;
@@ -113,7 +163,23 @@ export function SessionSidebar({
   loading: boolean;
   onNewChat: () => void;
   onHide: (id: string) => void;
+  onTogglePin: (id: string, pinned: boolean) => void;
 }) {
+  // Partition preserves the incoming newest-first order within each block,
+  // so pinning never reshuffles the relative order of conversations.
+  const pinned = sessions.filter((s) => s.pinned);
+  const rest = sessions.filter((s) => !s.pinned);
+  const renderRow = (s: SessionSummary) => (
+    <SessionRow
+      key={s.session_id}
+      session={s}
+      active={s.session_id === activeSessionId}
+      hasPending={pendingIds.has(s.session_id)}
+      unreadCount={s.unread}
+      onHide={onHide}
+      onTogglePin={onTogglePin}
+    />
+  );
   return (
     <aside className="w-[260px] border-r-2 border-black flex flex-col bg-canvas shrink-0">
       <div className="px-3 py-3 border-b-2 border-black">
@@ -137,16 +203,16 @@ export function SessionSidebar({
             No conversations yet.
           </div>
         ) : (
-          sessions.map((s) => (
-            <SessionRow
-              key={s.session_id}
-              session={s}
-              active={s.session_id === activeSessionId}
-              hasPending={pendingIds.has(s.session_id)}
-              unreadCount={s.unread}
-              onHide={onHide}
-            />
-          ))
+          <>
+            {pinned.length > 0 ? (
+              <>
+                <SectionLabel>Pinned</SectionLabel>
+                {pinned.map(renderRow)}
+                {rest.length > 0 ? <SectionLabel>Recent</SectionLabel> : null}
+              </>
+            ) : null}
+            {rest.map(renderRow)}
+          </>
         )}
       </nav>
     </aside>

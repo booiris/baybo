@@ -49,6 +49,7 @@ fn durable_actor_state_json_roundtrip_preserves_all_fields() {
         trigger: aura_model::TriggerSource::User,
         lineage: None,
         hidden: false,
+        pinned: false,
     };
 
     let original = DurableActorState::new(session);

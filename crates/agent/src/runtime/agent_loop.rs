@@ -185,19 +185,13 @@ fn empty_llm_response() -> LlmResponse {
     }
 }
 
-/// Appended to a cancelled turn's salvaged content so the next request makes
-/// plain to the model that this assistant turn was interrupted, not a
-/// deliberate stopping point — the reply text and any reasoning above are
-/// partial. Without it the model reads the truncated turn back as a finished
-/// reply and may pick up mid-sentence as if it had completed.
-const CANCELLED_TURN_SUFFIX: &str = "\n\n[This turn was cancelled before it finished — the reply and any reasoning above are incomplete.]";
-
 /// Blocks safe to persist from an assistant turn cancelled mid-stream:
-/// rendered text and completed thinking, with [`CANCELLED_TURN_SUFFIX`]
-/// appended so the model knows the turn was cut short. A
-/// streamed-but-undispatched `ToolUse` is dropped — persisting a `tool_use`
-/// with no matching `tool_result` would wedge the next request's provider
-/// validation.
+/// rendered text and completed thinking, with the cancelled-turn marker
+/// ([`aura_context::prompts::cancelled_turn`]) appended so the model knows the
+/// turn was cut short. The marker is model-facing framing; display surfaces
+/// strip it before rendering the partial reply. A streamed-but-undispatched
+/// `ToolUse` is dropped — persisting a `tool_use` with no matching
+/// `tool_result` would wedge the next request's provider validation.
 fn salvage_partial_blocks(resp: &LlmResponse) -> Vec<ContentBlock> {
     let mut blocks: Vec<ContentBlock> = resp
         .content_blocks
@@ -215,9 +209,9 @@ fn salvage_partial_blocks(resp: &LlmResponse) -> Vec<ContentBlock> {
     // Fold the marker into the trailing text rather than emitting a second
     // adjacent text block; a thinking-only salvage gets its own marker block.
     match blocks.last_mut() {
-        Some(ContentBlock::Text(t)) => t.push_str(CANCELLED_TURN_SUFFIX),
+        Some(ContentBlock::Text(t)) => t.push_str(aura_context::prompts::cancelled_turn::SUFFIX),
         _ => blocks.push(ContentBlock::Text(
-            CANCELLED_TURN_SUFFIX.trim_start().to_string(),
+            aura_context::prompts::cancelled_turn::marker_block_text(),
         )),
     }
     blocks
@@ -3002,6 +2996,7 @@ mod session_end_gate_tests {
             trigger,
             lineage,
             hidden: false,
+            pinned: false,
         }
     }
 

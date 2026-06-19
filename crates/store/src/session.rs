@@ -67,6 +67,18 @@ pub trait SessionStore: Send + Sync {
         llm: Option<&LlmEntryName>,
     ) -> Result<bool>;
 
+    /// Set (or clear, with `false`) the session's chat-list pin flag —
+    /// the sidebar "pin to top" affordance (`PUT /v1/chat/sessions/:id/pin`).
+    /// Returns `Ok(true)` when the row existed and was updated, `Ok(false)`
+    /// if no row matched.
+    ///
+    /// Same flat-column discipline as [`Self::set_hidden`]: implementations
+    /// write only the `pinned` column and leave the JSON `data` blob alone,
+    /// so a concurrent `save`/`touch` (full-blob rewrite from a stale
+    /// in-memory `Session`) can't clobber the flag. `get` patches
+    /// `Session.pinned` from the column at read time.
+    async fn set_pinned(&self, session_id: &SessionId, pinned: bool) -> Result<bool>;
+
     /// Hard-delete the session.
     ///
     /// Returns `Ok(true)` if the row existed and was removed, `Ok(false)`

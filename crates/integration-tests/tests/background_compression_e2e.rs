@@ -60,6 +60,7 @@ fn root_session(id: &str) -> Session {
         trigger: TriggerSource::User,
         lineage: None,
         hidden: false,
+        pinned: false,
     }
 }
 

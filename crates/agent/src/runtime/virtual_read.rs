@@ -356,6 +356,7 @@ mod tests {
             trigger: aura_model::TriggerSource::User,
             lineage: None,
             hidden: false,
+            pinned: false,
         };
         let store = Arc::new(MemorySessionStore::new());
         store.seed_session(&session);

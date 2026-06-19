@@ -8,6 +8,7 @@ import {
   type ChangeEvent,
   type FormEvent,
   type KeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
 } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import ReactMarkdown, { type Components } from 'react-markdown';
@@ -510,6 +511,7 @@ export function ChatPage() {
         created_at: s.created_at,
         last_active: s.last_active,
         unread: 0,
+        pinned: s.pinned,
         last_user_text: s.last_user_text ?? undefined,
       }));
       setSessions(existing);
@@ -580,6 +582,7 @@ export function ChatPage() {
                   created_at: new Date().toISOString(),
                   last_active: new Date().toISOString(),
                   unread: 0,
+                  pinned: false,
                 },
                 ...prev,
               ],
@@ -1079,11 +1082,12 @@ export function ChatPage() {
       // awaiting-reply spinner (we're stopping, not starting a turn); the
       // server's TurnState/notice frames then reconcile idempotently.
       const stopping = isStopCommand(trimmed);
-      // Settle any buffered answer text, then fold the partial reply INTO the
-      // still-open work block before we collapse it (`foldTrailingAnswerIntoWork`
-      // in the updater below): the partial answer belongs inside the "Cancelled"
-      // block, not as a dangling bubble below it. Mark the session stopped so a
-      // delta that raced in just after is dropped rather than spilling a bubble.
+      // Settle any buffered answer text, then keep the partial reply as its own
+      // bubble (`finalizeTrailingAnswer` in the updater below): the cut-short
+      // answer is the agent's final output, so it stays a reply bubble below
+      // the collapsed "Cancelled" work block rather than being folded inside
+      // it. Mark the session stopped so a delta that raced in just after is
+      // dropped rather than spilling a second bubble.
       if (stopping) {
         flushPacerKeepStreaming(sessionId);
         stoppedSessionsRef.current.add(sessionId);
@@ -1098,7 +1102,7 @@ export function ChatPage() {
             ...view,
             transcript: [
               ...closeActiveWork(
-                stopping ? foldTrailingAnswerIntoWork(view.transcript) : view.transcript,
+                stopping ? finalizeTrailingAnswer(view.transcript) : view.transcript,
                 stopping,
               ),
               {
@@ -1171,11 +1175,23 @@ export function ChatPage() {
     [composer, busy, attachments, sendText],
   );
 
-  const handleStop = useCallback(() => {
-    // The stop button issues `/stop` through the same path as typing it,
-    // ignoring any draft already in the composer.
-    sendText('/stop');
-  }, [sendText]);
+  const handleStop = useCallback(
+    (e: ReactMouseEvent<HTMLButtonElement>) => {
+      // Clicking stop flips `busy` false (the turn is cancelled optimistically),
+      // which React flushes synchronously — mid-click — re-typing THIS button
+      // from `type="button"` to the Send button's `type="submit"`. The browser
+      // then runs the click's default action on the now-submit button and
+      // submits the form, firing `handleSend` (whose `if (busy) return` guard
+      // no longer holds) and sending the composer draft. Prevent that default
+      // submit; the distinct button `key`s below stop the node reuse at the
+      // source too.
+      e.preventDefault();
+      // The stop button issues `/stop` through the same path as typing it,
+      // ignoring any draft already in the composer.
+      sendText('/stop');
+    },
+    [sendText],
+  );
 
   const uploadAttachment = useCallback(
     async (file: File) => {
@@ -1284,6 +1300,37 @@ export function ChatPage() {
     setHideError(null);
     setHidePrompt(id);
   }, []);
+
+  // Pin / unpin a conversation. Optimistic: flip the local row right
+  // away so the sidebar reshuffles instantly, then PUT. The server's
+  // SessionPatch broadcast converges every tab; on failure we revert
+  // the optimistic flip (the row falls back to its prior block).
+  const handleTogglePin = useCallback(
+    async (id: string, pinned: boolean) => {
+      setSessions((prev) => {
+        const idx = prev.findIndex((s) => s.session_id === id);
+        if (idx === -1 || prev[idx].pinned === pinned) return prev;
+        const next = prev.slice();
+        next[idx] = { ...prev[idx], pinned };
+        return next;
+      });
+      const { error, response } = await client.PUT('/v1/chat/sessions/{session_id}/pin', {
+        params: { path: { session_id: id } },
+        body: { pinned },
+      });
+      if (error || !response.ok) {
+        console.warn('toggle session pin failed', id, error);
+        setSessions((prev) => {
+          const idx = prev.findIndex((s) => s.session_id === id);
+          if (idx === -1 || prev[idx].pinned !== pinned) return prev;
+          const next = prev.slice();
+          next[idx] = { ...prev[idx], pinned: !pinned };
+          return next;
+        });
+      }
+    },
+    [client],
+  );
 
   const cancelHideSession = useCallback(() => {
     if (hideSubmitting) return;
@@ -1400,6 +1447,7 @@ export function ChatPage() {
                   created_at: new Date().toISOString(),
                   last_active: new Date().toISOString(),
                   unread: 0,
+                  pinned: false,
                 },
                 ...prev,
               ],
@@ -1440,6 +1488,7 @@ export function ChatPage() {
         loading={sessionsLoading}
         onNewChat={handleNewChat}
         onHide={handleHideSession}
+        onTogglePin={handleTogglePin}
       />
 
       {/* Main column */}
@@ -1672,6 +1721,7 @@ export function ChatPage() {
                 ) : null}
                 {busy ? (
                   <button
+                    key="composer-stop"
                     type="button"
                     onClick={handleStop}
                     disabled={status.state !== 'connected'}
@@ -1683,6 +1733,7 @@ export function ChatPage() {
                   </button>
                 ) : (
                   <button
+                    key="composer-send"
                     type="submit"
                     disabled={
                       !sessionId ||
@@ -2203,8 +2254,12 @@ export function routeInboundFrame(
         // `markLast` also covers the case where `turn_state{inactive}`
         // already closed the block to "Worked" a moment earlier.
         const isStopCancel = isStopCancellationNotice(frame.text);
+        // On a cancelling /stop, keep the in-progress reply as its own bubble
+        // (finalizeTrailingAnswer) below the collapsed, "Cancelled"-labelled
+        // work block — mirroring the REST reload path — rather than folding it
+        // into the block.
         const closed = closeActiveWork(
-          isStopCancel ? foldTrailingAnswerIntoWork(view.transcript) : view.transcript,
+          isStopCancel ? finalizeTrailingAnswer(view.transcript) : view.transcript,
         );
         const base = isStopCancel ? markLastWorkCancelled(closed) : closed;
         return {
@@ -2607,26 +2662,17 @@ export function closeActiveWork(prev: TranscriptRow[], cancelled = false): Trans
   return prev;
 }
 
-/** Fold a trailing streaming answer bubble into the active work block as a
- *  final `prose` step. Used only on `/stop`: the answer normally streams in
- *  its own bubble below the block, but a cancelled partial reply belongs
- *  *inside* the collapsed "Cancelled" block, not dangling as a never-finalized
- *  bubble below it. No-op unless the tail is a streaming assistant bubble sat
- *  directly on an open block; an empty partial just drops the bubble. */
-function foldTrailingAnswerIntoWork(prev: TranscriptRow[]): TranscriptRow[] {
-  const n = prev.length;
-  const last = prev[n - 1];
+/** Finalize a trailing streaming answer bubble on `/stop`: the cut-short
+ *  reply is the agent's final output, so it stays as its own (now non-
+ *  streaming) bubble below the collapsed "Cancelled" work block rather than
+ *  being folded inside it. No-op unless the tail is a streaming assistant
+ *  bubble; an empty partial (nothing streamed yet) is dropped so no blank
+ *  bubble lingers. */
+export function finalizeTrailingAnswer(prev: TranscriptRow[]): TranscriptRow[] {
+  const last = prev[prev.length - 1];
   if (!last?.streaming || last.role !== 'assistant') return prev;
-  const block = prev[n - 2];
-  if (block?.kind !== 'work' || !block.workActive) return prev;
-  const next = prev.slice(0, -1);
-  if (last.text.trim().length > 0) {
-    next[n - 2] = {
-      ...block,
-      steps: [...(block.steps ?? []), { key: `prose-${last.key}`, kind: 'prose', text: last.text }],
-    };
-  }
-  return next;
+  if (last.text.trim().length === 0) return prev.slice(0, -1);
+  return [...prev.slice(0, -1), { ...last, streaming: false }];
 }
 
 /** Recognise a `/stop` the user typed, mirroring the gateway's parser
@@ -2652,14 +2698,19 @@ export function isStopCancellationNotice(text: string): boolean {
   return text.includes(STOP_CANCELLED_NOTICE_MARKER);
 }
 
-/** Mark the transcript's trailing work block cancelled. Only the *last* row is
- *  touched, so a cancelled turn whose own block was dropped (no steps) can't
- *  mis-label an earlier turn's block. Idempotent. */
+/** Mark the turn-just-stopped's work block cancelled. The block is the last
+ *  row, or sits just above a salvaged trailing reply bubble (a /stop'd partial
+ *  answer kept as its own bubble). Only that one block is touched and only an
+ *  *assistant* tail is skipped — a newer user message (a fresh turn) is the
+ *  barrier, so an earlier turn's block can't be mis-labelled. Idempotent. */
 export function markLastWorkCancelled(rows: TranscriptRow[]): TranscriptRow[] {
-  const last = rows[rows.length - 1];
-  if (last?.kind !== 'work' || last.workCancelled) return rows;
+  let i = rows.length - 1;
+  const last = rows[i];
+  if (last && last.kind !== 'work' && last.role === 'assistant') i -= 1;
+  const block = rows[i];
+  if (block?.kind !== 'work' || block.workCancelled) return rows;
   const next = rows.slice();
-  next[next.length - 1] = { ...last, workCancelled: true };
+  next[i] = { ...block, workCancelled: true };
   return next;
 }
 
@@ -2908,6 +2959,7 @@ function applySessionPatch(
         created_at: patch.created_at,
         last_active: patch.last_active,
         unread: 0,
+        pinned: patch.pinned ?? false,
       },
       ...prev,
     ];
@@ -2918,11 +2970,13 @@ function applySessionPatch(
     created_at: patch.created_at ?? current.created_at,
     last_active: patch.last_active ?? current.last_active,
     unread: current.unread,
+    pinned: patch.pinned ?? current.pinned,
     last_user_text: current.last_user_text,
   };
   if (
     merged.created_at === current.created_at &&
-    merged.last_active === current.last_active
+    merged.last_active === current.last_active &&
+    merged.pinned === current.pinned
   ) {
     return prev;
   }

@@ -155,6 +155,7 @@ impl SessionManager {
             trigger: parent.trigger.clone(),
             lineage: Some(lineage),
             hidden: false,
+            pinned: false,
         };
         self.store.save(&session).await?;
         debug!(
@@ -184,6 +185,7 @@ impl SessionManager {
             trigger,
             lineage: None,
             hidden: false,
+            pinned: false,
         };
         self.store.save(&session).await?;
         debug!(session_id = %session.id, "created new session");
@@ -504,6 +506,19 @@ impl SessionManager {
             return Err(SessionError::NotFound(format!("session {session_id}")));
         }
         debug!(session_id = %session_id, llm = ?llm, "set session llm pin");
+        Ok(())
+    }
+
+    /// Flip the session's chat-list `pinned` flag — the sidebar "pin to
+    /// top" affordance. Targeted flat-column write that survives a
+    /// concurrent `touch`; see [`aura_store::SessionStore::set_pinned`].
+    /// Returns `Err(NotFound)` when the session id is unknown.
+    pub async fn set_pinned(&self, session_id: &SessionId, pinned: bool) -> Result<()> {
+        let updated = self.store.set_pinned(session_id, pinned).await?;
+        if !updated {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        debug!(session_id = %session_id, pinned, "toggled session pinned");
         Ok(())
     }
 

@@ -14,6 +14,9 @@
 //!   admin / trace surfaces still see it. Reversible via
 //!   `POST /v1/chat/sessions/:id/unhide`.
 //! * `POST /v1/chat/sessions/:id/unhide` — undo the hide.
+//! * `PUT /v1/chat/sessions/:id/pin` — pin (or unpin) the session to
+//!   the top of the chat list. Presentation only; the row is otherwise
+//!   unchanged.
 //! * `POST /v1/chat/sessions/:id/token` — refresh the channel-token
 //!   (drop old, mint new). Used by the web client when its existing
 //!   token's lifetime is close to expiring.
@@ -60,6 +63,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(list_sessions))
         .routes(routes!(get_session))
         .routes(routes!(set_session_model))
+        .routes(routes!(set_session_pin))
         .routes(routes!(delete_session))
         .routes(routes!(unhide_session))
         .routes(routes!(refresh_session_token))
@@ -345,6 +349,10 @@ pub struct ChatSessionSummary {
     /// `include_hidden=true` was requested.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden: bool,
+    /// True when the user has pinned this session to the top of their
+    /// chat list. Always emitted so the sidebar can place every row in
+    /// the right block; set via `PUT /v1/chat/sessions/{id}/pin`.
+    pub pinned: bool,
     /// Preview text drawn from the session's most-recent user-authored
     /// message, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar
     /// renders this as the row label so users can scan past
@@ -462,6 +470,7 @@ async fn create_session(State(state): State<AdminState>) -> Result<Json<ChatSess
             created_at: Some(session.created_at),
             last_active: Some(session.last_active),
             hidden: Some(false),
+            pinned: Some(false),
         },
     );
     Ok(Json(cred))
@@ -524,6 +533,7 @@ async fn list_sessions(
             created_at: s.created_at,
             last_active: s.last_active,
             hidden: s.hidden,
+            pinned: s.pinned,
             last_user_text,
         })
         .collect();
@@ -755,6 +765,55 @@ async fn set_session_model(
     }))
 }
 
+/// Request body for `PUT /v1/chat/sessions/{session_id}/pin`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetSessionPinRequest {
+    /// `true` to pin this session to the top of the chat list, `false`
+    /// to unpin it back into the regular list.
+    pub pinned: bool,
+}
+
+#[utoipa::path(
+    put,
+    path = "/chat/sessions/{session_id}/pin",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Session id to pin or unpin"),
+    ),
+    request_body = SetSessionPinRequest,
+    responses(
+        (status = 204, description = "Pin state updated"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn set_session_pin(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<SetSessionPinRequest>,
+) -> Result<axum::http::StatusCode> {
+    // Same web-chat scoping as get/hide/model — a non-`http` id 404s.
+    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
+    // Targeted flat-column write — like `set_hidden`, it survives a
+    // concurrent `touch` (full-blob save) so the pin can't be clobbered.
+    state
+        .session_manager
+        .set_pinned(&sid, req.pinned)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("set session pin: {e}")))?;
+    // Broadcast so every open chat tab moves the row to the right block
+    // without a list refetch.
+    broadcast_session_patch(
+        &state,
+        &sid,
+        SessionPatch {
+            pinned: Some(req.pinned),
+            ..SessionPatch::default()
+        },
+    );
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 #[utoipa::path(
     delete,
     path = "/chat/sessions/{session_id}",
@@ -826,6 +885,9 @@ async fn unhide_session(
             created_at: Some(session.created_at),
             last_active: Some(session.last_active),
             hidden: Some(false),
+            // Carry the live pin state so a sibling tab re-adding the
+            // row drops it straight into the correct block.
+            pinned: Some(session.pinned),
         },
     );
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -1384,48 +1446,23 @@ fn reconstruct_transcript(
                     }
                 }
             }
-            // Final answer (no tool calls): close the work block, then the
+            // Final answer (tool-free row): close the work block, then the
             // reply bubble lands below it. A direct-answer turn (no tool
             // iterations, so nothing accumulated yet) still carries its
             // reasoning in this same row; rebuild a single-step work block
             // from it so a reload shows the same `Worked Xs` + reasoning the
             // tool path produces, rather than dropping the thinking on the
             // floor in `message_item`.
-            // A cancelled turn's trailing partial row (the next entry is a
-            // `/stop` that actually cancelled the reply): fold its reasoning +
-            // partial text into the open work block and leave it for the
-            // `/stop` flush to emit cancelled, rather than spinning the text
-            // off as a bubble that reads like a finished answer. A no-op
-            // `/stop` after a finished turn does NOT match here, so a completed
-            // answer is never folded away.
-            Role::Assistant if next_is_cancelling_stop[idx] => {
-                if work.started.is_none() {
-                    work.started = Some(turn_started.unwrap_or(created_at));
-                    work.ordinal = Some(ordinal);
-                }
-                work.last = Some(created_at);
-                for block in &msg.content {
-                    match block {
-                        ContentBlock::Thinking { content, .. } => {
-                            let text = thinking_text(content);
-                            if !text.is_empty() {
-                                work.steps.push(ChatWorkStep::reasoning(text));
-                            }
-                        }
-                        ContentBlock::Text(t) if !t.trim().is_empty() => {
-                            work.steps.push(ChatWorkStep::prose(t.clone()));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            // Final answer (no tool calls): close the work block, then the
-            // reply bubble lands below it. A direct-answer turn (no tool
-            // iterations, so nothing accumulated yet) still carries its
-            // reasoning in this same row; rebuild a single-step work block
-            // from it so a reload shows the same `Worked Xs` + reasoning the
-            // tool path produces, rather than dropping the thinking on the
-            // floor in `message_item`.
+            //
+            // A turn cut short by a cancelling `/stop` (the next entry is the
+            // cancelling echo) takes the SAME shape: its reasoning folds into
+            // the work block and its partial text lands as a reply bubble —
+            // the agent's cut-short final output stays a bubble rather than
+            // being folded inside the work card. The only difference is the
+            // block is flagged `cancelled` so it collapses to "Cancelled", and
+            // the model-facing cancelled-turn marker is stripped from the
+            // bubble. A no-op `/stop` after a finished turn does NOT match
+            // `next_is_cancelling_stop`, so a completed answer is never marked.
             Role::Assistant => {
                 if work.started.is_none() {
                     for block in &msg.content {
@@ -1446,9 +1483,23 @@ fn reconstruct_transcript(
                         }
                     }
                 }
+                let cancelled = next_is_cancelling_stop[idx];
+                if cancelled {
+                    work.cancelled = true;
+                }
                 work.flush(&mut items, Some(created_at));
-                if let Some(item) = message_item(ordinal, created_at, "assistant", &msg) {
-                    items.push(item);
+                if let Some(mut item) = message_item(ordinal, created_at, "assistant", &msg) {
+                    if cancelled {
+                        // Drop the model-facing cancelled-turn marker so the
+                        // salvaged reply renders as clean partial output.
+                        item.text = aura_context::prompts::cancelled_turn::strip_marker(&item.text)
+                            .to_string();
+                    }
+                    // A marker-only salvage (thinking-only cancelled turn)
+                    // leaves nothing to show once stripped — no empty bubble.
+                    if !item.text.is_empty() || item.has_attachments {
+                        items.push(item);
+                    }
                 }
                 // Turn boundary: a later turn that has no user row on this
                 // page (a cron fire) must not inherit this turn's start.
@@ -1861,18 +1912,23 @@ mod tests {
     }
 
     #[test]
-    fn reconstruct_stopped_partial_turn_is_a_cancelled_work_block_not_an_answer() {
+    fn reconstruct_stopped_partial_turn_salvages_reply_as_bubble_below_cancelled_block() {
         use aura_model::ControlEventKind::{Command, NoticeInfo};
         // A turn cancelled mid-LLM-call: the loop persisted a partial assistant
         // row (reasoning + partial answer text, no tool calls) before aborting,
         // then the `/stop` echo + notice anchored right after it (the ordering
-        // the `/stop` settle-wait guarantees).
+        // the `/stop` settle-wait guarantees). The persisted partial carries
+        // the model-facing cancelled-turn marker, which display must strip.
+        let partial = format!(
+            "a b-tree is{}",
+            aura_context::prompts::cancelled_turn::SUFFIX
+        );
         let tail = vec![
             (2, ts(2), ChatMessage::user(vec![text("explain b-trees")])),
             (
                 3,
                 ts(3),
-                ChatMessage::assistant(vec![thinking("weighing the options"), text("a b-tree is")]),
+                ChatMessage::assistant(vec![thinking("weighing the options"), text(&partial)]),
             ),
         ];
         let stop_notice = format!("Stopped.\n{}", aura_channels::STOP_CANCELLED_REPLY_LINE);
@@ -1882,9 +1938,10 @@ mod tests {
         ];
         let items = reconstruct_transcript(tail, events, None, Vec::new());
 
-        // user, cancelled work block, /stop echo, /stop notice — and crucially
-        // NO assistant answer bubble for the cut-short turn.
-        assert_eq!(items.len(), 4, "got {items:?}");
+        // user, cancelled work block, the salvaged reply bubble, /stop echo,
+        // /stop notice — the cut-short reply is its OWN bubble below the
+        // collapsed "Cancelled" block, not folded inside it.
+        assert_eq!(items.len(), 5, "got {items:?}");
         assert!(matches!(items[0].kind, TranscriptItemKind::Message));
         assert_eq!(items[0].role, "user");
 
@@ -1894,27 +1951,59 @@ mod tests {
             work.cancelled,
             "a /stop'd partial turn's work block is cancelled"
         );
-        assert_eq!(
-            work.work_ended_at,
-            Some(ts(5)),
-            "bounded at the stop instant"
-        );
-        // Both the reasoning and the partial answer text fold into the block,
-        // instead of the text spinning off as a finished-looking answer bubble.
-        assert_eq!(work.steps.len(), 2, "reasoning + folded partial text");
+        // Reasoning stays in the block; the partial answer text does NOT.
+        assert_eq!(work.steps.len(), 1, "only reasoning folds into the block");
         assert!(matches!(work.steps[0].kind, WorkStepKind::Reasoning));
         assert_eq!(work.steps[0].text, "weighing the options");
-        assert!(matches!(work.steps[1].kind, WorkStepKind::Prose));
-        assert_eq!(work.steps[1].text, "a b-tree is");
 
-        assert_eq!(items[2].text, "/stop");
-        assert!(matches!(items[3].kind, TranscriptItemKind::Notice));
+        let reply = &items[2];
+        assert!(matches!(reply.kind, TranscriptItemKind::Message));
+        assert_eq!(reply.role, "assistant");
+        assert_eq!(
+            reply.text, "a b-tree is",
+            "the salvaged reply renders as a bubble with the model-facing marker stripped"
+        );
+
+        assert_eq!(items[3].text, "/stop");
+        assert!(matches!(items[4].kind, TranscriptItemKind::Notice));
+    }
+
+    #[test]
+    fn reconstruct_stopped_thinking_only_turn_has_no_reply_bubble() {
+        use aura_model::ControlEventKind::{Command, NoticeInfo};
+        // Cancelled before any answer text streamed — only reasoning was
+        // salvaged (so the persisted partial is a marker-only block). The
+        // cancelled work block carries the reasoning; there is no reply bubble.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("explain b-trees")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![
+                    thinking("weighing the options"),
+                    text(&aura_context::prompts::cancelled_turn::marker_block_text()),
+                ]),
+            ),
+        ];
+        let stop_notice = format!("Stopped.\n{}", aura_channels::STOP_CANCELLED_REPLY_LINE);
+        let events = vec![
+            ctl(1, 3, Command, "/stop", 5),
+            ctl(2, 3, NoticeInfo, &stop_notice, 5),
+        ];
+        let items = reconstruct_transcript(tail, events, None, Vec::new());
+
         assert!(
             !items
                 .iter()
                 .any(|i| matches!(i.kind, TranscriptItemKind::Message) && i.role == "assistant"),
-            "a cancelled partial must not render as a finished answer bubble: {items:?}"
+            "a marker-only (thinking-only) salvage must not render an empty reply bubble: {items:?}"
         );
+        let work = items
+            .iter()
+            .find(|i| matches!(i.kind, TranscriptItemKind::Work))
+            .expect("cancelled work block");
+        assert!(work.cancelled);
+        assert_eq!(work.steps.len(), 1, "the reasoning is preserved");
     }
 
     #[test]
