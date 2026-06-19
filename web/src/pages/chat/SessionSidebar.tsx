@@ -4,9 +4,8 @@ import {
   RiAddLine,
   RiDeleteBin6Line,
   RiLoader4Line,
-  RiPushpinFill,
-  RiPushpinLine,
-  RiUnpinLine,
+  RiPushpin2Fill,
+  RiPushpin2Line,
 } from 'react-icons/ri';
 import type { SessionSummary } from './types';
 
@@ -66,7 +65,7 @@ function SessionRow({
           glance even before hovering; hidden on hover where the
           interactive toggle takes its place. */}
       {session.pinned ? (
-        <RiPushpinFill
+        <RiPushpin2Fill
           className={`text-[0.7rem] shrink-0 group-hover:hidden ${
             active ? 'text-ink/70' : 'text-ink-soft'
           }`}
@@ -115,9 +114,9 @@ function SessionRow({
           aria-label={session.pinned ? 'Unpin conversation' : 'Pin conversation to top'}
         >
           {session.pinned ? (
-            <RiUnpinLine className="text-sm" />
+            <RiPushpin2Fill className="text-sm" />
           ) : (
-            <RiPushpinLine className="text-sm" />
+            <RiPushpin2Line className="text-sm" />
           )}
         </button>
         <button
