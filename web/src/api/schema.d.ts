@@ -120,6 +120,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/{session_id}/pin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_session_pin"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}/token": {
         parameters: {
             query?: never;
@@ -744,6 +760,12 @@ export interface components {
              *     transcript holds only system/tool rows).
              */
             last_user_text?: string | null;
+            /**
+             * @description True when the user has pinned this session to the top of their
+             *     chat list. Always emitted so the sidebar can place every row in
+             *     the right block; set via `PUT /v1/chat/sessions/{id}/pin`.
+             */
+            pinned: boolean;
             session_id: string;
         };
         ChatSessionsList: {
@@ -1230,6 +1252,14 @@ export interface components {
             /** @description The pin now in effect: the entry name, or `null` for `default-llm`. */
             last_llm?: string | null;
         };
+        /** @description Request body for `PUT /v1/chat/sessions/{session_id}/pin`. */
+        SetSessionPinRequest: {
+            /**
+             * @description `true` to pin this session to the top of the chat list, `false`
+             *     to unpin it back into the regular list.
+             */
+            pinned: boolean;
+        };
         /**
          * @description Wire DTO for slash command entries. Mirror of
          *     [`aura_channels::wire::SlashCommandSpec`] so the OpenAPI surface
@@ -1664,6 +1694,49 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_session_pin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id to pin or unpin */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSessionPinRequest"];
+            };
+        };
+        responses: {
+            /** @description Pin state updated */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Unauthorized */
             401: {

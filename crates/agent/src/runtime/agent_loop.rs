@@ -3002,6 +3002,7 @@ mod session_end_gate_tests {
             trigger,
             lineage,
             hidden: false,
+            pinned: false,
         }
     }
 

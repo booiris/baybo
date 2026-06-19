@@ -1404,6 +1404,7 @@ mod resume_validation_tests {
             trigger: TriggerSource::User,
             lineage: None,
             hidden: false,
+            pinned: false,
         }
     }
 

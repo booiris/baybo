@@ -735,6 +735,7 @@ mod tests {
                 kind: LineageKind::Subagent,
             }),
             hidden: false,
+            pinned: false,
         };
         sessions.store().save(&child).await.unwrap();
         SessionId::from(child_id)

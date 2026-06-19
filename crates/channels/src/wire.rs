@@ -624,6 +624,13 @@ pub struct SessionPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub hidden: Option<bool>,
+    /// Flipped by `PUT /v1/chat/sessions/:id/pin`. `true` moves the row
+    /// into the sidebar's pinned block, `false` moves it back into the
+    /// regular list. Carried on Create / Unhide too so a sibling tab
+    /// re-adding the row renders it in the right block immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub pinned: Option<bool>,
 }
 
 /// Serialize a frame with named fields (MessagePack map representation).
@@ -908,6 +915,7 @@ mod tests {
                 created_at: Some(now),
                 last_active: Some(now),
                 hidden: Some(false),
+                pinned: Some(false),
             },
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
@@ -925,6 +933,7 @@ mod tests {
                 created_at: None,
                 last_active: Some(now),
                 hidden: None,
+                pinned: None,
             },
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());

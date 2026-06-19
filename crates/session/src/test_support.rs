@@ -63,11 +63,13 @@ impl SessionStore for MemorySessionStore {
     async fn save(&self, session: &Session) -> Result<()> {
         let mut data = self.data.lock();
         let mut to_store = session.clone();
-        // `hidden` is owned by `set_hidden`; preserve the existing row's
-        // value so a stale in-memory save can't un-hide it. Mirrors the
-        // libsql impl, whose upsert omits the flat `hidden` column.
+        // `hidden` / `pinned` are owned by `set_hidden` / `set_pinned`;
+        // preserve the existing row's values so a stale in-memory save
+        // can't un-hide or un-pin it. Mirrors the libsql impl, whose
+        // upsert omits both flat columns.
         if let Some(existing) = data.get(&session.id) {
             to_store.hidden = existing.hidden;
+            to_store.pinned = existing.pinned;
         }
         data.insert(session.id.clone(), to_store);
         Ok(())
@@ -78,6 +80,17 @@ impl SessionStore for MemorySessionStore {
         match data.get_mut(session_id) {
             Some(s) => {
                 s.hidden = hidden;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn set_pinned(&self, session_id: &SessionId, pinned: bool) -> Result<bool> {
+        let mut data = self.data.lock();
+        match data.get_mut(session_id) {
+            Some(s) => {
+                s.pinned = pinned;
                 Ok(true)
             }
             None => Ok(false),

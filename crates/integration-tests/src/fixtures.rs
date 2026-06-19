@@ -98,6 +98,7 @@ impl SessionBuilder {
             trigger: TriggerSource::User,
             lineage: None,
             hidden: false,
+            pinned: false,
         }
     }
 }

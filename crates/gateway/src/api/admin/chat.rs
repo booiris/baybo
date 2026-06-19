@@ -14,6 +14,9 @@
 //!   admin / trace surfaces still see it. Reversible via
 //!   `POST /v1/chat/sessions/:id/unhide`.
 //! * `POST /v1/chat/sessions/:id/unhide` — undo the hide.
+//! * `PUT /v1/chat/sessions/:id/pin` — pin (or unpin) the session to
+//!   the top of the chat list. Presentation only; the row is otherwise
+//!   unchanged.
 //! * `POST /v1/chat/sessions/:id/token` — refresh the channel-token
 //!   (drop old, mint new). Used by the web client when its existing
 //!   token's lifetime is close to expiring.
@@ -60,6 +63,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(list_sessions))
         .routes(routes!(get_session))
         .routes(routes!(set_session_model))
+        .routes(routes!(set_session_pin))
         .routes(routes!(delete_session))
         .routes(routes!(unhide_session))
         .routes(routes!(refresh_session_token))
@@ -345,6 +349,10 @@ pub struct ChatSessionSummary {
     /// `include_hidden=true` was requested.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden: bool,
+    /// True when the user has pinned this session to the top of their
+    /// chat list. Always emitted so the sidebar can place every row in
+    /// the right block; set via `PUT /v1/chat/sessions/{id}/pin`.
+    pub pinned: bool,
     /// Preview text drawn from the session's most-recent user-authored
     /// message, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar
     /// renders this as the row label so users can scan past
@@ -462,6 +470,7 @@ async fn create_session(State(state): State<AdminState>) -> Result<Json<ChatSess
             created_at: Some(session.created_at),
             last_active: Some(session.last_active),
             hidden: Some(false),
+            pinned: Some(false),
         },
     );
     Ok(Json(cred))
@@ -524,6 +533,7 @@ async fn list_sessions(
             created_at: s.created_at,
             last_active: s.last_active,
             hidden: s.hidden,
+            pinned: s.pinned,
             last_user_text,
         })
         .collect();
@@ -755,6 +765,55 @@ async fn set_session_model(
     }))
 }
 
+/// Request body for `PUT /v1/chat/sessions/{session_id}/pin`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetSessionPinRequest {
+    /// `true` to pin this session to the top of the chat list, `false`
+    /// to unpin it back into the regular list.
+    pub pinned: bool,
+}
+
+#[utoipa::path(
+    put,
+    path = "/chat/sessions/{session_id}/pin",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Session id to pin or unpin"),
+    ),
+    request_body = SetSessionPinRequest,
+    responses(
+        (status = 204, description = "Pin state updated"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn set_session_pin(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<SetSessionPinRequest>,
+) -> Result<axum::http::StatusCode> {
+    // Same web-chat scoping as get/hide/model — a non-`http` id 404s.
+    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
+    // Targeted flat-column write — like `set_hidden`, it survives a
+    // concurrent `touch` (full-blob save) so the pin can't be clobbered.
+    state
+        .session_manager
+        .set_pinned(&sid, req.pinned)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("set session pin: {e}")))?;
+    // Broadcast so every open chat tab moves the row to the right block
+    // without a list refetch.
+    broadcast_session_patch(
+        &state,
+        &sid,
+        SessionPatch {
+            pinned: Some(req.pinned),
+            ..SessionPatch::default()
+        },
+    );
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 #[utoipa::path(
     delete,
     path = "/chat/sessions/{session_id}",
@@ -826,6 +885,9 @@ async fn unhide_session(
             created_at: Some(session.created_at),
             last_active: Some(session.last_active),
             hidden: Some(false),
+            // Carry the live pin state so a sibling tab re-adding the
+            // row drops it straight into the correct block.
+            pinned: Some(session.pinned),
         },
     );
     Ok(axum::http::StatusCode::NO_CONTENT)

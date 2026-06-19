@@ -58,6 +58,9 @@ export interface SessionPatch {
   created_at?: string;
   last_active?: string;
   hidden?: boolean;
+  /** Flipped by `PUT /v1/chat/sessions/:id/pin`. `true` moves the row
+   *  into the sidebar's pinned block; `false` moves it back. */
+  pinned?: boolean;
 }
 
 /** Source of a `Frame::SessionActivity` event — mirror of Rust

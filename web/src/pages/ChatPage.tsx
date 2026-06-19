@@ -510,6 +510,7 @@ export function ChatPage() {
         created_at: s.created_at,
         last_active: s.last_active,
         unread: 0,
+        pinned: s.pinned,
         last_user_text: s.last_user_text ?? undefined,
       }));
       setSessions(existing);
@@ -580,6 +581,7 @@ export function ChatPage() {
                   created_at: new Date().toISOString(),
                   last_active: new Date().toISOString(),
                   unread: 0,
+                  pinned: false,
                 },
                 ...prev,
               ],
@@ -1285,6 +1287,37 @@ export function ChatPage() {
     setHidePrompt(id);
   }, []);
 
+  // Pin / unpin a conversation. Optimistic: flip the local row right
+  // away so the sidebar reshuffles instantly, then PUT. The server's
+  // SessionPatch broadcast converges every tab; on failure we revert
+  // the optimistic flip (the row falls back to its prior block).
+  const handleTogglePin = useCallback(
+    async (id: string, pinned: boolean) => {
+      setSessions((prev) => {
+        const idx = prev.findIndex((s) => s.session_id === id);
+        if (idx === -1 || prev[idx].pinned === pinned) return prev;
+        const next = prev.slice();
+        next[idx] = { ...prev[idx], pinned };
+        return next;
+      });
+      const { error, response } = await client.PUT('/v1/chat/sessions/{session_id}/pin', {
+        params: { path: { session_id: id } },
+        body: { pinned },
+      });
+      if (error || !response.ok) {
+        console.warn('toggle session pin failed', id, error);
+        setSessions((prev) => {
+          const idx = prev.findIndex((s) => s.session_id === id);
+          if (idx === -1 || prev[idx].pinned !== pinned) return prev;
+          const next = prev.slice();
+          next[idx] = { ...prev[idx], pinned: !pinned };
+          return next;
+        });
+      }
+    },
+    [client],
+  );
+
   const cancelHideSession = useCallback(() => {
     if (hideSubmitting) return;
     setHidePrompt(null);
@@ -1400,6 +1433,7 @@ export function ChatPage() {
                   created_at: new Date().toISOString(),
                   last_active: new Date().toISOString(),
                   unread: 0,
+                  pinned: false,
                 },
                 ...prev,
               ],
@@ -1440,6 +1474,7 @@ export function ChatPage() {
         loading={sessionsLoading}
         onNewChat={handleNewChat}
         onHide={handleHideSession}
+        onTogglePin={handleTogglePin}
       />
 
       {/* Main column */}
@@ -2908,6 +2943,7 @@ function applySessionPatch(
         created_at: patch.created_at,
         last_active: patch.last_active,
         unread: 0,
+        pinned: patch.pinned ?? false,
       },
       ...prev,
     ];
@@ -2918,11 +2954,13 @@ function applySessionPatch(
     created_at: patch.created_at ?? current.created_at,
     last_active: patch.last_active ?? current.last_active,
     unread: current.unread,
+    pinned: patch.pinned ?? current.pinned,
     last_user_text: current.last_user_text,
   };
   if (
     merged.created_at === current.created_at &&
-    merged.last_active === current.last_active
+    merged.last_active === current.last_active &&
+    merged.pinned === current.pinned
   ) {
     return prev;
   }
