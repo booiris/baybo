@@ -152,6 +152,14 @@ impl LibsqlPool {
                     -- save) can't clobber a just-set pin; `get` patches
                     -- `Session.state.last_llm` from this column on read.
                     last_llm              TEXT,
+                    -- User-facing chat-list pin flag, set by
+                    -- PUT /v1/chat/sessions/:id/pin. Like `hidden` /
+                    -- `last_llm` it is a flat column owned by a targeted
+                    -- UPDATE (`set_pinned`) and omitted from the DO UPDATE
+                    -- in `save`, so a concurrent `touch` (load + full save)
+                    -- can't clobber a just-set pin; `get` patches
+                    -- `Session.pinned` from this column on read.
+                    pinned                INTEGER NOT NULL DEFAULT 0,
                     data                  TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_root
@@ -509,6 +517,7 @@ impl LibsqlPool {
         let migrations: &[&str] = &[
             "ALTER TABLE sessions ADD COLUMN parent_span_id TEXT",
             "ALTER TABLE sessions ADD COLUMN last_llm TEXT",
+            "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE cost_records ADD COLUMN reason TEXT",
         ];
         for stmt in migrations {

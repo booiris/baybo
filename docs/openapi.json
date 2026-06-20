@@ -621,6 +621,60 @@
         }
       }
     },
+    "/v1/chat/sessions/{session_id}/pin": {
+      "put": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "set_session_pin",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to pin or unpin",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSessionPinRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Pin state updated"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}/token": {
       "post": {
         "tags": [
@@ -2793,7 +2847,8 @@
         "required": [
           "session_id",
           "created_at",
-          "last_active"
+          "last_active",
+          "pinned"
         ],
         "properties": {
           "created_at": {
@@ -2814,6 +2869,10 @@
               "null"
             ],
             "description": "Preview text drawn from the session's most-recent user-authored\nmessage, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar\nrenders this as the row label so users can scan past\nconversations by what they last asked. `None` for sessions\nwithout a user turn yet (a freshly-created row, or one whose\ntranscript holds only system/tool rows)."
+          },
+          "pinned": {
+            "type": "boolean",
+            "description": "True when the user has pinned this session to the top of their\nchat list. Always emitted so the sidebar can place every row in\nthe right block; set via `PUT /v1/chat/sessions/{id}/pin`."
           },
           "session_id": {
             "type": "string"
@@ -3913,6 +3972,19 @@
               "null"
             ],
             "description": "The pin now in effect: the entry name, or `null` for `default-llm`."
+          }
+        }
+      },
+      "SetSessionPinRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/chat/sessions/{session_id}/pin`.",
+        "required": [
+          "pinned"
+        ],
+        "properties": {
+          "pinned": {
+            "type": "boolean",
+            "description": "`true` to pin this session to the top of the chat list, `false`\nto unpin it back into the regular list."
           }
         }
       },

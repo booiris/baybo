@@ -708,6 +708,7 @@ async fn chat_list_broadcast_reaches_every_web_tab() {
                 created_at: Some(created_at),
                 last_active: Some(created_at),
                 hidden: Some(false),
+                pinned: Some(false),
             },
         );
 
@@ -741,8 +742,9 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
     // subscribed to session F still gets a cheap unread signal when
     // F sees activity, without paying for F's full content stream.
     // This exercises both directions through the same dispatch
-    // observer: a UserEcho should produce `ActivityKind::User`; an
-    // agent AnswerDelta should produce `ActivityKind::Assistant`.
+    // observer: a UserEcho produces `ActivityKind::User`; a completed
+    // agent `Message` produces `ActivityKind::Assistant` (mid-turn
+    // streaming events like AnswerDelta deliberately don't pulse).
     let tempdir = tempfile::tempdir().expect("tempdir");
     let port_file =
         aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
@@ -769,15 +771,22 @@ async fn session_activity_pulse_reaches_unsubscribed_tab() {
 
     let http_channel = channel_registry.get(&ChannelType::http()).expect("http");
 
-    // Assistant-side: dispatch a AnswerDelta for a session the client never
-    // subscribed to. Content frame drops on the floor for this
-    // connection; the activity pulse broadcasts to every http tab.
-    http_channel.dispatch_agent(AgentOutput {
-        session_id: "sess-bg".into(),
-        user_id: String::new(),
-        channel: ChannelType::http(),
-        event: AgentEvent::AnswerDelta("agent reply".into()),
-    });
+    // Assistant-side: dispatch the turn's terminal Message for a session the
+    // client never subscribed to. The content frame drops on the floor for
+    // this connection; the activity pulse broadcasts to every http tab. (A
+    // mid-turn AnswerDelta would NOT pulse — only a completed emission does.)
+    http_channel.dispatch_agent(
+        OutgoingMessage {
+            session_id: "sess-bg".into(),
+            user_id: String::new(),
+            channel: ChannelType::http(),
+            content: vec![ContentBlock::Text("agent reply".into())],
+            reply_to: None,
+            metadata: MessageMetadata::default(),
+            ordinal: None,
+        }
+        .into(),
+    );
     let activity = recv_frame(&mut client, Duration::from_secs(1))
         .await
         .expect("assistant activity pulse");

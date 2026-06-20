@@ -1301,6 +1301,20 @@ mod tests {
                 None => Ok(false),
             }
         }
+        async fn set_pinned(
+            &self,
+            id: &SessionId,
+            pinned: bool,
+        ) -> std::result::Result<bool, aura_store::StorageError> {
+            let mut data = self.sessions.lock();
+            match data.get_mut(id) {
+                Some(s) => {
+                    s.pinned = pinned;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
         async fn delete(
             &self,
             _id: &SessionId,
@@ -1543,6 +1557,7 @@ mod tests {
             trigger: TriggerSource::User,
             lineage: None,
             hidden: false,
+            pinned: false,
         }
     }
 

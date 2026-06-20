@@ -3,6 +3,7 @@
 //! scattered across the agent loop. See
 //! `docs/todo/prompt-framing-to-context.md` for the migration plan.
 
+pub mod cancelled_turn;
 pub mod compression;
 pub mod cron;
 pub mod interjection;

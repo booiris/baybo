@@ -198,6 +198,17 @@ pub struct Session {
     /// sessions. Default `false` so legacy JSON blobs deserialize.
     #[serde(default)]
     pub hidden: bool,
+
+    /// User-facing "pin to top" flag for the chat list. Set via the
+    /// chat admin `PUT /v1/chat/sessions/:id/pin` endpoint. The chat
+    /// list surfaces pinned sessions in their own block above the rest;
+    /// it changes presentation only — the row is otherwise an ordinary
+    /// session. Like [`Self::hidden`] it is a flat column owned by a
+    /// targeted UPDATE (`set_pinned`), not the JSON blob, so a
+    /// concurrent `touch` can't clobber it. Default `false` so legacy
+    /// JSON blobs deserialize.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl Session {

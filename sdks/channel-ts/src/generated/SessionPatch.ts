@@ -34,4 +34,11 @@ last_active?: string,
  * `created_at` + `last_active` lets a client re-add a previously-
  * hidden session it might never have seen.
  */
-hidden?: boolean, };
+hidden?: boolean, 
+/**
+ * Flipped by `PUT /v1/chat/sessions/:id/pin`. `true` moves the row
+ * into the sidebar's pinned block, `false` moves it back into the
+ * regular list. Carried on Create / Unhide too so a sibling tab
+ * re-adding the row renders it in the right block immediately.
+ */
+pinned?: boolean, };
