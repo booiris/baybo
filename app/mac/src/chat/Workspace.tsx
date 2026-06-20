@@ -9,7 +9,24 @@ import {
 } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { ChatWs, type Frame, type TaskView, type WireAttachment } from '@aura/chat-core';
+import {
+  ChatWs,
+  EMPTY_VIEW,
+  closeActiveWork,
+  formatWorkedLabel,
+  historyRowToTranscript,
+  isStopCancellationNotice,
+  isStopCommand,
+  routeInboundFrame,
+  workBlockDisplay,
+  type HistoryRowDto,
+  type PendingApproval,
+  type SessionView,
+  type TaskView,
+  type TranscriptRow,
+  type WireAttachment,
+  type WorkStep,
+} from '@aura/chat-core';
 import {
   admin,
   createSession,
@@ -35,58 +52,13 @@ import { AutomationView, PluginsView } from './SystemViews';
 // warm neo-brutalist tokens: one merged sidebar (nav + project→conversation
 // tree + 设置), a centered reading-column thread (user-right, agent-centered),
 // and a floating composer that hovers over the messages.
+//
+// The live-turn state model (SessionView, work blocks, server-authoritative
+// turn_state, optimistic send + echo reconciliation) lives in @aura/chat-core
+// and is shared with the web dashboard — this file owns only the mac-styled
+// rendering of that shared view-model.
 
 const OPERATOR = 'web-operator';
-
-interface ToolStep {
-  callId: string;
-  tool: string;
-  label?: string;
-  status?: string;
-  summary?: string;
-}
-
-interface MsgItem {
-  kind: 'message';
-  id: string;
-  role: string;
-  text: string;
-  ordinal?: number;
-  // True while this assistant bubble is still being built from
-  // `answer_delta` frames. Cleared when the terminal `message` frame folds
-  // the streamed text into its finalized form. Without it the final reply
-  // would render as a second, duplicate bubble next to the streamed one.
-  streaming?: boolean;
-}
-interface WorkItem {
-  kind: 'work';
-  id: string;
-  reasoning: string;
-  tools: ToolStep[];
-  streaming: boolean;
-}
-interface NoticeItem {
-  kind: 'notice';
-  id: string;
-  level: string;
-  text: string;
-}
-type Item = MsgItem | WorkItem | NoticeItem;
-
-interface Approval {
-  callId: string;
-  tool: string;
-  preview: string;
-  description?: string | null;
-}
-
-interface TranscriptItem {
-  ordinal: number;
-  kind: string;
-  role: string;
-  text: string;
-  notice_level?: string | null;
-}
 
 export function Workspace({ conn }: { conn: Connection }) {
   const client = useMemo<AdminClient>(() => admin(conn), [conn]);
@@ -244,137 +216,40 @@ function Thread({
   slash: SlashCommand[];
   onActivity: () => void;
 }) {
-  const [items, setItems] = useState<Item[]>([]);
-  const [approvals, setApprovals] = useState<Approval[]>([]);
-  const [tasks, setTasks] = useState<TaskView[]>([]);
-  // Connection health (from the WS) is kept separate from the agent's
-  // transient turn phase (e.g. "compacting") — conflating them is what made
-  // a steady "connected" sit in the header. `link` only surfaces on a
-  // problem; `phase` only while a turn emits one.
+  // One per-session bucket map (mirrors web). The Thread is keyed by
+  // `sessionId` so it only ever holds the active session, but routing
+  // through the shared `routeInboundFrame` keeps the reducer identical to
+  // web's — the mac UI just renders the resulting `SessionView`.
+  const [views, setViews] = useState<Record<string, SessionView>>({});
+  const v = views[sessionId] ?? EMPTY_VIEW;
+  // A turn is in flight either optimistically (between send and the first
+  // response) or per the server's authoritative TurnState. While busy the
+  // composer's send button becomes a stop button and new sends are blocked.
+  const busy = v.awaitingReply || (v.turn?.active ?? false);
   const [link, setLink] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
-  const [phase, setPhase] = useState('');
   const [model, setModel] = useState<string>('');
   const [input, setInput] = useState('');
   const [pending, setPending] = useState<WireAttachment[]>([]);
   const wsRef = useRef<ChatWs | null>(null);
-  const liveRef = useRef<string | null>(null);
-  const newestOrdinalRef = useRef<number>(-1);
   const tokenRef = useRef<string>('');
+  const newestOrdinalRef = useRef<number>(-1);
+  const lastConnectedAtRef = useRef<number>(0);
+  // Sessions just `/stop`'d locally: a late `answer_delta` the server had
+  // already put on the wire is dropped instead of spilling a stray bubble
+  // below the now-collapsed work block. Cleared when a new turn starts.
+  const stoppedRef = useRef<Set<string>>(new Set());
   const fileRef = useRef<HTMLInputElement | null>(null);
   const threadRef = useRef<HTMLDivElement | null>(null);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     threadRef.current?.scrollTo({ top: threadRef.current.scrollHeight });
-  }, [items, approvals]);
+  }, [v.transcript, v.pendingApproval, v.awaitingReply]);
 
   // Load history, pin the model picker, then open the live stream.
   useEffect(() => {
     let ws: ChatWs | null = null;
     let cancelled = false;
-
-    const updateLive = (fn: (w: WorkItem) => WorkItem) => {
-      let id = liveRef.current;
-      if (!id) {
-        id = crypto.randomUUID();
-        liveRef.current = id;
-        const fresh: WorkItem = { kind: 'work', id, reasoning: '', tools: [], streaming: true };
-        setItems((xs) => [...xs, fn(fresh)]);
-        return;
-      }
-      const liveId = id;
-      setItems((xs) => xs.map((it) => (it.kind === 'work' && it.id === liveId ? fn(it) : it)));
-    };
-
-    const handleFrame = (f: Frame) => {
-      switch (f.kind) {
-        case 'message': {
-          if (f.ordinal !== undefined && f.ordinal <= newestOrdinalRef.current) return; // dup vs history
-          if (f.ordinal !== undefined) newestOrdinalRef.current = f.ordinal;
-          liveRef.current = null;
-          if (f.role === 'assistant') setPhase(''); // turn ended — drop any phase hint
-          setItems((xs) => {
-            // The gateway stamps the persisted ordinal onto the SAME reply
-            // we just streamed via `answer_delta`, so fold it into the live
-            // bubble. Appending would render the finalized copy as a second,
-            // duplicate reply bubble.
-            if (f.role === 'assistant') {
-              const last = xs[xs.length - 1];
-              if (last && last.kind === 'message' && last.role === 'assistant' && last.streaming) {
-                return xs.map((it, i) =>
-                  i === xs.length - 1
-                    ? { ...last, text: f.content, ordinal: f.ordinal, streaming: false }
-                    : it,
-                );
-              }
-            }
-            return [
-              ...xs,
-              { kind: 'message', id: crypto.randomUUID(), role: f.role, text: f.content, ordinal: f.ordinal },
-            ];
-          });
-          break;
-        }
-        case 'answer_delta':
-          // deltas accumulate into a streaming message bubble
-          setItems((xs) => {
-            const last = xs[xs.length - 1];
-            if (last && last.kind === 'message' && last.role === 'assistant' && last.streaming) {
-              return xs.map((it, i) => (i === xs.length - 1 ? { ...last, text: last.text + f.text } : it));
-            }
-            return [
-              ...xs,
-              { kind: 'message', id: crypto.randomUUID(), role: 'assistant', text: f.text, streaming: true },
-            ];
-          });
-          break;
-        case 'reasoning':
-          updateLive((w) => ({ ...w, reasoning: w.reasoning + f.text }));
-          break;
-        case 'tool_started':
-          updateLive((w) => ({ ...w, tools: [...w.tools, { callId: f.call_id, tool: f.tool, label: f.label }] }));
-          break;
-        case 'tool_completed':
-          updateLive((w) => ({
-            ...w,
-            tools: w.tools.map((t) => (t.callId === f.call_id ? { ...t, status: f.status, summary: f.summary } : t)),
-          }));
-          break;
-        case 'status':
-          setPhase(
-            f.phase === 'compacting'
-              ? 'Compacting context…'
-              : f.phase === 'compacted'
-                ? 'Context compacted'
-                : f.phase,
-          );
-          break;
-        case 'notice':
-          if (!f.transient)
-            setItems((xs) => [...xs, { kind: 'notice', id: crypto.randomUUID(), level: f.level, text: f.text }]);
-          break;
-        case 'task_list':
-          setTasks(f.tasks);
-          break;
-        case 'approval_requested':
-          setApprovals((xs) => [
-            ...xs,
-            { callId: f.call_id, tool: f.tool, preview: f.params_preview, description: f.description },
-          ]);
-          break;
-        case 'approval_resolved':
-          setApprovals((xs) => xs.filter((a) => a.callId !== f.call_id));
-          break;
-        case 'pending_approvals_snapshot':
-          setApprovals((xs) => xs.filter((a) => f.call_ids.includes(a.callId)));
-          break;
-        case 'session_activity':
-          onActivity();
-          break;
-        default:
-          break;
-      }
-    };
 
     (async () => {
       // History via REST, then seed the live cursor so the WS only streams new.
@@ -384,15 +259,20 @@ function Thread({
       if (cancelled) return;
       if (data) {
         setModel(data.last_llm ?? '');
-        const transcript = (data.transcript ?? []) as TranscriptItem[];
-        const loaded: Item[] = transcript
-          .filter((t) => t.kind === 'message' || t.kind === 'notice')
-          .map((t) =>
-            t.kind === 'notice'
-              ? { kind: 'notice', id: `h${t.ordinal}`, level: t.notice_level ?? 'info', text: t.text }
-              : { kind: 'message', id: `h${t.ordinal}`, role: t.role, text: t.text, ordinal: t.ordinal },
-          );
-        setItems(loaded);
+        const rows = ((data.transcript ?? []) as unknown as HistoryRowDto[]).map((r) =>
+          historyRowToTranscript(sessionId, r),
+        );
+        setViews((prev) => ({
+          ...prev,
+          [sessionId]: {
+            ...EMPTY_VIEW,
+            transcript: rows,
+            historyLoaded: true,
+            oldestOrdinal: data.oldest_ordinal ?? null,
+            hasMore: data.has_more ?? false,
+            model: data.last_llm ?? null,
+          },
+        }));
         newestOrdinalRef.current = data.newest_ordinal ?? -1;
       }
       const token = await refreshToken(client, sessionId);
@@ -402,8 +282,31 @@ function Thread({
         baseUrl: conn.baseUrl,
         channelToken: token,
         initialSessionIds: [sessionId],
-        onStatus: (s) => setLink(s.state),
-        onFrame: handleFrame,
+        onStatus: (s) => {
+          setLink(s.state);
+          // The snapshot-approval reconciliation uses this cutoff to tell a
+          // card from before the reconnect (droppable) from one that raced in
+          // after it (kept).
+          if (s.state === 'connected') lastConnectedAtRef.current = Date.now();
+        },
+        onFrame: (frame) => {
+          if (frame.kind === 'session_activity') onActivity();
+          // A fresh turn supersedes any prior local `/stop`.
+          if (frame.kind === 'turn_state' && frame.active) {
+            stoppedRef.current.delete(frame.session_id);
+          }
+          // Drop a delta that raced in after a local `/stop` — the partial
+          // answer is already settled inside the collapsed work block.
+          if (frame.kind === 'answer_delta' && stoppedRef.current.has(frame.session_id)) {
+            return;
+          }
+          // A broadcast `/stop` cancellation notice stops this tab's stream
+          // too (an observer never ran the local `/stop`).
+          if (frame.kind === 'notice' && !frame.transient && isStopCancellationNotice(frame.text)) {
+            stoppedRef.current.add(frame.session_id);
+          }
+          routeInboundFrame(frame, setViews, () => undefined, lastConnectedAtRef.current);
+        },
         onTokenRejected: () => {
           // The channel token expired or was revoked (the common cause is the
           // gateway restarting on a config reload). Without this the socket
@@ -431,18 +334,66 @@ function Thread({
     };
   }, [client, conn, sessionId, onActivity]);
 
-  const send = () => {
-    const text = input.trim();
-    if ((!text && pending.length === 0) || !wsRef.current) return;
-    wsRef.current.sendMessage({
-      sessionId,
-      userId: OPERATOR,
-      content: text,
-      attachments: pending.length ? pending : undefined,
+  // Optimistically close the live work block as Cancelled and tell the server.
+  // A typed `/stop` and the composer's stop button both land here.
+  const doStop = (text: string) => {
+    const ws = wsRef.current;
+    if (!ws) return;
+    ws.sendMessage({ sessionId, userId: OPERATOR, content: text || '/stop' });
+    stoppedRef.current.add(sessionId);
+    setViews((prev) => {
+      const view = prev[sessionId] ?? EMPTY_VIEW;
+      return {
+        ...prev,
+        [sessionId]: {
+          ...view,
+          transcript: closeActiveWork(view.transcript, true),
+          awaitingReply: false,
+          turn: { active: false, startedAt: null },
+        },
+      };
     });
     setInput('');
+    const ta = taRef.current;
+    if (ta) ta.style.height = 'auto';
+  };
+
+  const send = () => {
+    const text = input.trim();
+    const ws = wsRef.current;
+    if ((!text && pending.length === 0) || !ws) return;
+    // A `/stop` is a control command, not a chat turn — no optimistic bubble.
+    if (isStopCommand(text)) {
+      doStop(text);
+      return;
+    }
+    // The agent is already working — block new turns; only `/stop` gets through.
+    if (busy) return;
+    const clientMsgId = crypto.randomUUID();
+    const attachments = pending.length ? pending : undefined;
+    // Optimistic user bubble keyed by `clientMsgId`; the server's echo
+    // reconciles against it in `routeInboundFrame` (clears `pending`, keeps
+    // the row identity) instead of appending a duplicate.
+    setViews((prev) => {
+      const view = prev[sessionId] ?? EMPTY_VIEW;
+      const row: TranscriptRow = {
+        key: `local-${clientMsgId}`,
+        role: 'user',
+        text,
+        pending: true,
+        clientMsgId,
+        hasAttachments: attachments ? true : undefined,
+        attachments,
+        createdAt: new Date().toISOString(),
+      };
+      return {
+        ...prev,
+        [sessionId]: { ...view, transcript: [...view.transcript, row], awaitingReply: true },
+      };
+    });
+    ws.sendMessage({ sessionId, userId: OPERATOR, content: text, attachments, clientMsgId });
+    setInput('');
     setPending([]);
-    liveRef.current = null;
     const ta = taRef.current;
     if (ta) ta.style.height = 'auto';
   };
@@ -479,7 +430,11 @@ function Thread({
 
   const resolve = (callId: string, decision: 'approve' | 'approve_always' | 'deny') => {
     wsRef.current?.resolveApproval(callId, decision);
-    setApprovals((xs) => xs.filter((a) => a.callId !== callId));
+    setViews((prev) => {
+      const view = prev[sessionId];
+      if (!view?.pendingApproval) return prev;
+      return { ...prev, [sessionId]: { ...view, pendingApproval: null } };
+    });
   };
 
   const onModelChange = async (m: string) => {
@@ -503,31 +458,28 @@ function Thread({
         className="flex items-center justify-between gap-3 border-b-[3px] border-border bg-canvas px-6 py-3"
       >
         <h1 className="min-w-0 flex-1 truncate text-sm font-bold">{title || '新对话'}</h1>
-        <ConnState link={link} phase={phase} />
+        <ConnState link={link} />
       </header>
 
-      {tasks.length > 0 && <TasksPanel tasks={tasks} />}
+      {v.tasks.length > 0 && <TasksPanel tasks={v.tasks} />}
 
       <div ref={threadRef} className="no-scrollbar relative flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-3xl space-y-6 px-6 pb-44 pt-6">
-          {items.map((it) =>
-            it.kind === 'message' ? (
-              <MessageBubble key={it.id} role={it.role} text={it.text} />
-            ) : it.kind === 'notice' ? (
-              <div
-                key={it.id}
-                className="rounded-brutal border-2 border-info bg-surface px-3 py-2 text-sm font-bold text-info"
-              >
-                {it.text}
+          {v.transcript.map((row) =>
+            row.kind === 'work' ? (
+              <WorkBlock key={row.key} row={row} />
+            ) : row.notice ? (
+              <div key={row.key} className={noticeClass(row.notice.level)}>
+                {row.notice.text}
               </div>
             ) : (
-              <WorkBlock key={it.id} item={it} />
+              <MessageBubble key={row.key} role={row.role} text={row.text} pending={row.pending} />
             ),
           )}
 
-          {approvals.map((a) => (
-            <ApprovalCard key={a.callId} approval={a} onResolve={resolve} />
-          ))}
+          {v.awaitingReply && <WorkingIndicator />}
+
+          {v.pendingApproval && <ApprovalCard approval={v.pendingApproval} onResolve={resolve} />}
         </div>
       </div>
 
@@ -537,17 +489,29 @@ function Thread({
         slashMatches={slashMatches}
         model={model}
         models={models}
+        busy={busy}
         taRef={taRef}
         fileRef={fileRef}
         onInputChange={onInputChange}
         onSend={send}
+        onStop={() => doStop('/stop')}
         onPickSlash={(cmd) => setInput(`/${cmd} `)}
         onAttach={onAttach}
         onRemovePending={(i) => setPending((p) => p.filter((_, j) => j !== i))}
-        onModelChange={(v) => void onModelChange(v)}
+        onModelChange={(value) => void onModelChange(value)}
       />
     </>
   );
+}
+
+function noticeClass(level: 'info' | 'warn' | 'error'): string {
+  const tone =
+    level === 'error'
+      ? 'border-err text-err'
+      : level === 'warn'
+        ? 'border-warn text-warn'
+        : 'border-info text-info';
+  return `rounded-brutal border-2 bg-surface px-3 py-2 text-sm font-bold ${tone}`;
 }
 
 function Composer({
@@ -556,10 +520,12 @@ function Composer({
   slashMatches,
   model,
   models,
+  busy,
   taRef,
   fileRef,
   onInputChange,
   onSend,
+  onStop,
   onPickSlash,
   onAttach,
   onRemovePending,
@@ -570,10 +536,12 @@ function Composer({
   slashMatches: SlashCommand[];
   model: string;
   models: string[];
+  busy: boolean;
   taRef: RefObject<HTMLTextAreaElement | null>;
   fileRef: RefObject<HTMLInputElement | null>;
   onInputChange: (e: ChangeEvent<HTMLTextAreaElement>) => void;
   onSend: () => void;
+  onStop: () => void;
   onPickSlash: (command: string) => void;
   onAttach: (file: File) => void;
   onRemovePending: (index: number) => void;
@@ -672,14 +640,24 @@ function Composer({
             >
               <MicIcon className="h-4 w-4" />
             </button>
-            <button
-              onClick={onSend}
-              disabled={!canSend}
-              title="发送"
-              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border-[3px] border-border bg-accent text-surface shadow-brutal-sm transition-all hover:-translate-y-0.5 active:translate-y-0 active:shadow-none disabled:opacity-50 disabled:hover:translate-y-0 disabled:hover:shadow-brutal-sm"
-            >
-              <SendArrowIcon className="h-4 w-4" />
-            </button>
+            {busy ? (
+              <button
+                onClick={onStop}
+                title="停止"
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border-[3px] border-border bg-err text-surface shadow-brutal-sm transition-all hover:-translate-y-0.5 active:translate-y-0 active:shadow-none"
+              >
+                <span className="h-3 w-3 rounded-[2px] bg-surface" />
+              </button>
+            ) : (
+              <button
+                onClick={onSend}
+                disabled={!canSend}
+                title="发送"
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border-[3px] border-border bg-accent text-surface shadow-brutal-sm transition-all hover:-translate-y-0.5 active:translate-y-0 active:shadow-none disabled:opacity-50 disabled:hover:translate-y-0 disabled:hover:shadow-brutal-sm"
+              >
+                <SendArrowIcon className="h-4 w-4" />
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -687,16 +665,11 @@ function Composer({
   );
 }
 
-// Header status: stays quiet when the connection is healthy (no "connected"
-// noise). A colored dot + label appears only while connecting or after a
-// drop; once connected it yields to the agent's transient turn phase, if any.
-function ConnState({
-  link,
-  phase,
-}: {
-  link: 'connecting' | 'connected' | 'disconnected';
-  phase: string;
-}) {
+// Header status: stays quiet when the connection is healthy. A colored dot +
+// label appears only while connecting or after a drop (turn-phase narration
+// now lives inside the work block as a status step, so the header no longer
+// surfaces it).
+function ConnState({ link }: { link: 'connecting' | 'connected' | 'disconnected' }) {
   if (link === 'connecting') {
     return (
       <span className="flex shrink-0 items-center gap-2 font-mono text-xs text-ink-soft">
@@ -713,16 +686,21 @@ function ConnState({
       </span>
     );
   }
-  return <span className="shrink-0 font-mono text-xs text-ink-soft">{phase}</span>;
+  return null;
 }
 
-function MessageBubble({ role, text }: { role: string; text: string }) {
+function MessageBubble({ role, text, pending }: { role: string; text: string; pending?: boolean }) {
   if (role === 'user') {
     // Right-aligned, washed-gold chip — lighter than work/approval cards but
-    // unmistakably Aura (gold, not Codex grey).
+    // unmistakably Aura (gold, not Codex grey). Dimmed while the optimistic
+    // row awaits the server's echo.
     return (
       <div className="flex justify-end">
-        <div className="max-w-[80%] rounded-brutal border-2 border-border bg-rail/60 px-4 py-2.5 text-sm font-medium shadow-brutal-sm">
+        <div
+          className={`max-w-[80%] rounded-brutal border-2 border-border bg-rail/60 px-4 py-2.5 text-sm font-medium shadow-brutal-sm ${
+            pending ? 'opacity-60' : ''
+          }`}
+        >
           {text}
         </div>
       </div>
@@ -737,42 +715,131 @@ function MessageBubble({ role, text }: { role: string; text: string }) {
   );
 }
 
-function WorkBlock({ item }: { item: WorkItem }) {
-  const [open, setOpen] = useState(false);
-  if (!item.reasoning && item.tools.length === 0) return null;
+// One step inside a turn's work block: streamed reasoning, a status line, a
+// mid-turn prose chunk, or a tool call with its result summary.
+function WorkStepView({ step }: { step: WorkStep }) {
+  if (step.kind === 'reasoning') {
+    return (
+      <div className="flex items-start gap-2 whitespace-pre-wrap font-mono text-xs text-ink-soft">
+        <span className="select-none">✻</span>
+        <span className="italic">{step.text}</span>
+      </div>
+    );
+  }
+  if (step.kind === 'status') {
+    return (
+      <div className="flex items-center gap-2 font-mono text-xs text-ink-soft">
+        <span className="select-none">⟳</span>
+        <span>{step.text}</span>
+      </div>
+    );
+  }
+  if (step.kind === 'prose') {
+    return (
+      <div className="markdown font-mono text-xs text-ink-soft">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{step.text ?? ''}</ReactMarkdown>
+      </div>
+    );
+  }
+  const statusColor =
+    step.toolStatus === 'error'
+      ? 'text-err'
+      : step.toolStatus === 'denied'
+        ? 'text-warn'
+        : 'text-ink-soft';
+  return (
+    <div className="flex flex-col gap-0.5 font-mono text-xs">
+      <div className="flex items-center gap-1.5">
+        <span className="text-info">⏺</span>
+        <span className="font-bold text-ink">{step.tool}</span>
+        {step.toolLabel ? <span className="text-ink-soft">({step.toolLabel})</span> : null}
+        {step.toolStatus === 'running' ? <span className="text-ink-soft">…</span> : null}
+      </div>
+      {step.toolSummary ? (
+        <div className={`flex items-start gap-1.5 pl-1 ${statusColor}`}>
+          <span className="select-none">⎿</span>
+          <span className="whitespace-pre-wrap">{step.toolSummary}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// The turn's aggregated progress. A live turn shows a pulsing "处理中" header
+// with a live elapsed timer; on completion it collapses to a dim
+// `Worked Xs ▸` line (click to re-expand) — or "Cancelled" when `/stop`'d.
+function WorkBlock({ row }: { row: TranscriptRow }) {
+  const active = !!row.workActive;
+  const steps = row.steps ?? [];
+  const [expanded, setExpanded] = useState(false);
+  if (!active && steps.length === 0) return null;
+  const { panelOpen } = workBlockDisplay(active, steps.length > 0, expanded);
+  const secs =
+    row.workEndedAt && row.workStartedAt
+      ? Math.max(0, Math.round((row.workEndedAt - row.workStartedAt) / 1000))
+      : 0;
+  const label = formatWorkedLabel(secs, !!row.workCancelled);
   return (
     <div className="w-full space-y-2">
       <button
-        onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1.5 font-mono text-xs text-ink-soft hover:text-ink"
+        onClick={() => {
+          if (!active) setExpanded((e) => !e);
+        }}
+        className={`flex items-center gap-1.5 font-mono text-xs ${
+          active ? 'text-ink' : 'text-ink-soft hover:text-ink'
+        }`}
       >
-        <span className={`text-[9px] transition-transform ${open ? 'rotate-90' : ''}`}>▸</span>
-        {open ? '隐藏过程' : `已使用 ${item.tools.length} 个工具`}
+        {active ? (
+          <>
+            <span className="h-2 w-2 animate-pulse rounded-full bg-accent" />
+            <span className="font-bold uppercase tracking-wider">处理中</span>
+            {row.workStartedAt ? (
+              <span className="tabular-nums text-ink-soft">
+                <LiveElapsed startedAt={row.workStartedAt} />
+              </span>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <span className={`text-[9px] transition-transform ${expanded ? 'rotate-90' : ''}`}>▸</span>
+            <span className={row.workCancelled ? 'text-warn' : ''}>{label}</span>
+          </>
+        )}
       </button>
-      {open && (
+      {panelOpen && (
         <div className="space-y-1.5 border-l-2 border-border/25 pl-3">
-          {item.reasoning && (
-            <pre className="whitespace-pre-wrap font-mono text-xs text-ink-soft">{item.reasoning}</pre>
-          )}
-          {item.tools.map((t) => (
-            <div key={t.callId} className="flex items-start gap-2 font-mono text-xs">
-              <span className="text-ink-soft">
-                {t.status === 'completed' || t.status === 'ok'
-                  ? '✓'
-                  : t.status?.includes('err')
-                    ? '✕'
-                    : t.status
-                      ? '…'
-                      : '○'}
-              </span>
-              <span>
-                <span className="font-bold">{t.tool}</span>
-                {t.label ? ` ${t.label}` : ''}
-              </span>
-            </div>
+          {steps.map((s) => (
+            <WorkStepView key={s.key} step={s} />
           ))}
         </div>
       )}
+      {!active && !expanded ? (
+        <div aria-hidden className="w-full border-t border-border/20" />
+      ) : null}
+    </div>
+  );
+}
+
+// Live-ticking elapsed seconds for the active work header. Self-contained 1s
+// interval so the rest of the transcript doesn't re-render on the tick; held
+// back below 1s so a just-started turn never reads "0s".
+function LiveElapsed({ startedAt }: { startedAt: number }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  const secs = Math.max(0, Math.floor((now - startedAt) / 1000));
+  return secs < 1 ? null : <>{secs}s</>;
+}
+
+// Shown between sending a turn and the agent's first output frame
+// (`SessionView.awaitingReply`), before any work block exists.
+function WorkingIndicator() {
+  return (
+    <div className="flex items-center gap-2 font-mono text-xs text-ink-soft">
+      <span className="h-2 w-2 animate-pulse rounded-full bg-accent" />
+      <span className="font-bold uppercase tracking-wider">处理中…</span>
     </div>
   );
 }
@@ -781,7 +848,7 @@ function ApprovalCard({
   approval,
   onResolve,
 }: {
-  approval: Approval;
+  approval: PendingApproval;
   onResolve: (callId: string, d: 'approve' | 'approve_always' | 'deny') => void;
 }) {
   return (
@@ -791,7 +858,7 @@ function ApprovalCard({
       </p>
       {approval.description && <p className="mb-2 text-sm text-ink-soft">{approval.description}</p>}
       <pre className="mb-3 overflow-x-auto rounded-brutal border-2 border-border bg-canvas p-2 font-mono text-xs">
-        {approval.preview}
+        {approval.paramsPreview}
       </pre>
       <div className="flex gap-2">
         <button
