@@ -52,9 +52,12 @@ run loop, not a user message.
   is still `Active`, the actor fires the next continuation turn **right away**
   (Codex's `try_start_turn_if_idle`). There is no inter-turn delay — progress is
   continuous, so the actor is effectively never idle while a goal runs. A queued
-  user message always drains first (mailbox priority), and a message that
-  arrives mid-turn is folded in as a normal interjection (see
-  [mid-turn interjection](agent.md)).
+  user message always drains first (mailbox priority): the actor will not fire
+  the next continuation while a user message is waiting. Unlike a normal user
+  turn, a continuation does **not** drain mid-turn interjections (see
+  [mid-turn interjection](agent.md)) — a message that lands *during* a
+  continuation turn waits in the mailbox and runs as its own turn at the next
+  boundary, the same clean separation cron and subagent-notification turns use.
 - **The continuation turn is its own job.** It runs through `AgentLoop::run` as
   a distinct `JobInput::GoalContinuation` (a fourth axis alongside `UserChat` /
   `Cron` / `Spawned`), so the job's `origin` records that the turn was
@@ -182,7 +185,7 @@ completes from every channel.
 
 | User command | Effect |
 |--------------|--------|
-| `/goal <objective> [--budget N]` | Create the goal (direct durable write) and start the loop. Fails if an unfinished goal exists. |
+| `/goal <objective> [--budget N]` | Create the goal (direct durable write) and start the loop. If an unfinished goal already exists, edits its objective (and budget) in place instead — unlike the `create_goal` tool, which fails. |
 | `/goal` | View the current goal: objective, status, tokens used / budget, time. |
 | `/goal pause` | Stop the goal loop (status → `Paused`). **Does not cancel the in-flight turn.** |
 | `/goal resume` | Re-arm a non-`Active` goal (status → `Active`, fresh blocked audit). |

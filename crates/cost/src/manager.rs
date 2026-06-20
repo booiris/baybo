@@ -78,8 +78,11 @@ pub struct CostManager {
     /// The `/goal` continuation engine reads a *delta* of this around each turn
     /// to accrue [`aura_model::Goal::tokens_used`]; it is purely an in-process
     /// meter (resets to zero on restart), which is correct because only the
-    /// within-turn delta is ever consumed. Hot (every LLM call across all
-    /// sessions), so `DashMap` rather than a global mutex.
+    /// within-turn delta is ever consumed. Bounded to resident actors:
+    /// [`Self::forget_session`] drops the entry when a session's actor stops, so
+    /// a long-running daemon doesn't accumulate one entry per session it ever
+    /// billed. Hot (every LLM call across all sessions), so `DashMap` rather
+    /// than a global mutex.
     session_tokens: DashMap<SessionId, u64>,
 }
 
@@ -235,6 +238,14 @@ impl CostManager {
     /// restart).
     pub fn session_tokens(&self, session_id: &SessionId) -> u64 {
         self.session_tokens.get(session_id).map(|t| *t).unwrap_or(0)
+    }
+
+    /// Drop a session's running token tally. Called when the session's actor
+    /// stops (idle reap or shutdown): the meter is only ever read as a
+    /// within-turn delta by the goal loop, and turns never straddle an actor
+    /// stop, so eviction is safe and keeps the map bounded to resident actors.
+    pub fn forget_session(&self, session_id: &SessionId) {
+        self.session_tokens.remove(session_id);
     }
 
     /// Add a call's (input + output) tokens to the per-session meter. Called
@@ -969,6 +980,54 @@ mod tests {
         );
         assert_eq!(cm.session_tokens(&SessionId::from("s1")), 1_550);
         assert_eq!(cm.session_tokens(&SessionId::from("s2")), 15);
+    }
+
+    #[tokio::test]
+    async fn forget_session_evicts_only_the_named_session() {
+        let cm = manager_with(SpendingLimits::default());
+        cm.record_call(
+            "u1",
+            SessionId::from("s1"),
+            JobId::new(),
+            SpanId::new(),
+            CallReason::Chat,
+            "m1",
+            1_000,
+            200,
+            0,
+            0,
+        );
+        cm.record_call(
+            "u1",
+            SessionId::from("s2"),
+            JobId::new(),
+            SpanId::new(),
+            CallReason::Chat,
+            "m1",
+            10,
+            5,
+            0,
+            0,
+        );
+        cm.forget_session(&SessionId::from("s1"));
+        // Evicted session reads back as zero; the next bill re-creates it from
+        // scratch (delta math the goal loop relies on still holds). Other
+        // sessions are untouched.
+        assert_eq!(cm.session_tokens(&SessionId::from("s1")), 0);
+        assert_eq!(cm.session_tokens(&SessionId::from("s2")), 15);
+        cm.record_call(
+            "u1",
+            SessionId::from("s1"),
+            JobId::new(),
+            SpanId::new(),
+            CallReason::Chat,
+            "m1",
+            7,
+            3,
+            0,
+            0,
+        );
+        assert_eq!(cm.session_tokens(&SessionId::from("s1")), 10);
     }
 
     #[tokio::test]

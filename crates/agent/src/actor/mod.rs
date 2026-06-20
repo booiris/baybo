@@ -205,11 +205,21 @@ fn is_cost_gate_denial(err: &anyhow::Error) -> bool {
         .is_some_and(|e| matches!(e, aura_llm::LlmError::GuardRejected(_)))
 }
 
+/// Typed marker for a turn cancelled via its cancel token (`/stop` or parent
+/// shutdown), minted by [`AgentActor::run_agent_loop`] from the authoritative
+/// `turn_token.is_cancelled()` signal. Replaces classifying cancellation by the
+/// underlying error's text (which varies — iteration-boundary abort vs mid-call
+/// `CancelledTurn`), so an unrelated error whose message happens to contain
+/// "cancel" can't be misread as a `/stop`.
+#[derive(Debug, thiserror::Error)]
+#[error("turn cancelled")]
+struct TurnCancelled;
+
 /// Whether a turn error was a cancellation (`/stop`, parent shutdown) rather
 /// than a genuine failure. A `/stop` mid-goal leaves the goal `Active`, so the
 /// boundary re-fires immediately rather than backing off.
 fn was_cancelled(err: &anyhow::Error) -> bool {
-    err.to_string().to_ascii_lowercase().contains("cancel")
+    err.is::<TurnCancelled>()
 }
 
 /// Whether `content` leads with any slash command (`/compact`, `/<skill>`,
@@ -428,6 +438,11 @@ impl AgentActor {
                         &self.volatile.span_recorder,
                         &self.durable.session,
                     );
+                    // Release this session's per-turn token meter so the cost
+                    // manager's map stays bounded to resident actors (the goal
+                    // loop only ever reads a within-turn delta, never across a
+                    // stop). Hydration re-creates it lazily on the next bill.
+                    self.volatile.cost_manager.forget_session(&session_id);
                     // Cancelling our `actor_token` cascades into every
                     // child we spawned — a subagent actor derives its
                     // `actor_token` from ours via the parent context the
@@ -567,27 +582,34 @@ impl AgentActor {
                 interjections,
             )
             .await;
-        // A user is waiting on this turn — a genuine failure must surface as
-        // a terminal notice, not silence (the log line alone leaves the chat
-        // dangling on its last progress frame). Cancellation stays quiet:
-        // `/stop` already acknowledged with its own notice. Non-user turns
-        // keep their own policies (cron logs, subagent-notification retries).
-        if is_user_turn
-            && !turn_token.is_cancelled()
-            && let Err(e) = &result
-        {
-            let notice = AgentOutput {
-                session_id: self.durable.session.id.clone(),
-                user_id: self.durable.session.user.id.clone(),
-                channel: self.durable.session.channel.clone(),
-                event: AgentEvent::Notice {
-                    level: NoticeLevel::Error,
-                    text: format!("The turn failed before producing a reply: {e}"),
-                },
-            };
-            self.send_response(notice, "user_turn_failed").await;
+        match result {
+            // Cancelled via the cancel token (`/stop` or parent shutdown), not a
+            // genuine failure. Collapse the varying underlying error to a typed
+            // `TurnCancelled` so callers (the goal loop) classify it from the
+            // authoritative token rather than its text. Stays quiet: `/stop`
+            // already acknowledged with its own notice.
+            Err(_) if turn_token.is_cancelled() => Err(anyhow::Error::new(TurnCancelled)),
+            // A user is waiting on this turn — a genuine failure must surface as
+            // a terminal notice, not silence (the log line alone leaves the chat
+            // dangling on its last progress frame). Non-user turns keep their own
+            // policies (cron logs, subagent-notification retries).
+            Err(e) => {
+                if is_user_turn {
+                    let notice = AgentOutput {
+                        session_id: self.durable.session.id.clone(),
+                        user_id: self.durable.session.user.id.clone(),
+                        channel: self.durable.session.channel.clone(),
+                        event: AgentEvent::Notice {
+                            level: NoticeLevel::Error,
+                            text: format!("The turn failed before producing a reply: {e}"),
+                        },
+                    };
+                    self.send_response(notice, "user_turn_failed").await;
+                }
+                Err(e)
+            }
+            Ok(msg) => Ok(msg),
         }
-        result
     }
 
     /// Dispatch a fired cron job through the agent loop and send the
@@ -1651,6 +1673,7 @@ fn parse_goal_command(command_text: &str) -> GoalCommand {
         _ => {}
     }
     // Objective with an optional `--budget N` / `--budget=N` flag anywhere.
+    let budget_eq = format!("{GOAL_BUDGET_FLAG}=");
     let mut budget: Option<u64> = None;
     let mut objective_tokens: Vec<&str> = Vec::new();
     let mut iter = rest.split_whitespace();
@@ -1658,7 +1681,7 @@ fn parse_goal_command(command_text: &str) -> GoalCommand {
         let raw_value = if token == GOAL_BUDGET_FLAG {
             Some(iter.next())
         } else {
-            token.strip_prefix("--budget=").map(Some)
+            token.strip_prefix(budget_eq.as_str()).map(Some)
         };
         match raw_value {
             Some(Some(value)) => match value.replace('_', "").parse::<u64>() {
