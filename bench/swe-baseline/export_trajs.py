@@ -21,6 +21,16 @@ def trunc(s, n):
     return s if len(s) <= n else s[:n] + f"\n…[truncated {len(s) - n} chars]"
 
 
+def fence(body, lang=""):
+    """Wrap body in a code fence longer than any backtick run inside it, so
+    content containing ``` (e.g. mini's instruction template, which shows a
+    ```bash example) can't prematurely close the fence."""
+    import re
+    longest = max((len(r) for r in re.findall(r"`+", body)), default=0)
+    bt = "`" * max(3, longest + 1)
+    return f"{bt}{lang}\n{body}\n{bt}"
+
+
 def assistant_cmd(msg):
     """The bash command from a mini assistant turn (tool_calls or extra.actions)."""
     for tc in (msg.get("tool_calls") or []):
@@ -52,9 +62,7 @@ def render(traj, resolved, max_out, max_task):
     if user:
         out.append("## Task")
         out.append("")
-        out.append("```")
-        out.append(trunc(str(user.get("content", "")).strip(), max_task))
-        out.append("```")
+        out.append(fence(trunc(str(user.get("content", "")).strip(), max_task)))
         out.append("")
 
     out.append("## Trajectory")
@@ -64,36 +72,36 @@ def render(traj, resolved, max_out, max_task):
     for m in msgs:
         role = m.get("role")
         if role == "assistant":
+            # deepseek-style turns carry BOTH: reasoning_content (the hidden CoT)
+            # and content (the THOUGHT mini acts on). Keep both — they differ.
             reasoning = (m.get("reasoning_content")
                          or (m.get("provider_specific_fields", {}) or {}).get("reasoning_content")
-                         or str(m.get("content", "")).strip())
-            pending = (reasoning, assistant_cmd(m))
+                         or "")
+            thought = str(m.get("content", "")).strip()
+            pending = (reasoning.strip(), thought, assistant_cmd(m))
         elif role == "tool" and pending is not None:
             step += 1
-            reasoning, cmd = pending
+            reasoning, thought, cmd = pending
             pending = None
             out.append(f"### Step {step}")
             if reasoning:
                 out.append("")
-                out.append(f"> {reasoning.strip().replace(chr(10), chr(10) + '> ')}")
+                out.append(f"> {reasoning.replace(chr(10), chr(10) + '> ')}")
+            if thought:
+                out.append("")
+                out.append(thought)
             if cmd:
                 out.append("")
-                out.append("```bash")
-                out.append(cmd.strip())
-                out.append("```")
+                out.append(fence(cmd.strip(), "bash"))
             content = str(m.get("content", ""))
             out.append("")
-            out.append("```")
-            out.append(trunc(content, max_out))
-            out.append("```")
+            out.append(fence(trunc(content, max_out)))
             out.append("")
 
     sub = info.get("submission")
     out.append("## Final submission (diff)")
     out.append("")
-    out.append("```diff")
-    out.append(sub.strip() if sub else "(no submission)")
-    out.append("```")
+    out.append(fence(sub.strip() if sub else "(no submission)", "diff"))
     out.append("")
     return "\n".join(out), step, info.get("exit_status"), stats.get("api_calls")
 

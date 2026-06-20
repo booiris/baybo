@@ -12,7 +12,7 @@ Usage:
   python export_aura_trajs.py --run-id <RID> [--out DIR] [--only id,id]
                               [--max-output-chars N] [--max-task-chars N]
 """
-import argparse, glob, json, os
+import argparse, glob, json, os, re
 
 DEFAULT_MAX_OUTPUT = 4000
 DEFAULT_MAX_TASK = 6000
@@ -21,6 +21,15 @@ DEFAULT_MAX_TASK = 6000
 def trunc(s, n):
     s = s or ""
     return s if len(s) <= n else s[:n] + f"\n…[truncated {len(s) - n} chars]"
+
+
+def fence(body, lang=""):
+    """Wrap body in a code fence longer than any backtick run inside it, so
+    content containing ``` (e.g. a problem statement with code blocks) can't
+    prematurely close the fence."""
+    longest = max((len(r) for r in re.findall(r"`+", body)), default=0)
+    bt = "`" * max(3, longest + 1)
+    return f"{bt}{lang}\n{body}\n{bt}"
 
 
 def blocks_of(msg):
@@ -66,7 +75,7 @@ def render_tool_call(name, inp):
     the mini export; non-bash tools show their core inputs)."""
     inp = inp or {}
     if name == "Bash":
-        return "```bash\n" + (inp.get("command", "") or "").strip() + "\n```"
+        return fence((inp.get("command", "") or "").strip(), "bash")
     if name == "Read":
         loc = inp.get("file_path", "")
         rng = ""
@@ -83,9 +92,10 @@ def render_tool_call(name, inp):
         if name == "Edit":
             old = trunc(inp.get("old_string", ""), 600)
             new = trunc(inp.get("new_string", ""), 600)
-            return head + "\n```diff\n" + "\n".join(
-                ["- " + l for l in old.splitlines()] + ["+ " + l for l in new.splitlines()]) + "\n```"
-        return head + "\n```\n" + trunc(inp.get("content", ""), 1200) + "\n```"
+            diff = "\n".join(["- " + l for l in old.splitlines()]
+                             + ["+ " + l for l in new.splitlines()])
+            return head + "\n" + fence(diff, "diff")
+        return head + "\n" + fence(trunc(inp.get("content", ""), 1200))
     # generic
     compact = json.dumps(inp, ensure_ascii=False)
     return f"**{name}** " + (compact if len(compact) <= 400 else compact[:400] + " …")
@@ -118,9 +128,7 @@ def render(iid, msgs, meta, patch, max_out, max_task):
     if task:
         out.append("## Task")
         out.append("")
-        out.append("```")
-        out.append(trunc(task, max_task))
-        out.append("```")
+        out.append(fence(trunc(task, max_task)))
         out.append("")
 
     # index ToolResults by tool_use_id
@@ -169,16 +177,12 @@ def render(iid, msgs, meta, patch, max_out, max_task):
             out.append(render_tool_call(tu.get("name"), tu.get("input")))
             res_content = strip_tool_output(results.get(tu.get("id"), ""))
             out.append("")
-            out.append("```")
-            out.append(trunc(res_content, max_out))
-            out.append("```")
+            out.append(fence(trunc(res_content, max_out)))
             out.append("")
 
     out.append("## Final submission (diff)")
     out.append("")
-    out.append("```diff")
-    out.append(patch.strip() if patch else "(no patch / empty submission)")
-    out.append("```")
+    out.append(fence(patch.strip() if patch else "(no patch / empty submission)", "diff"))
     out.append("")
     return "\n".join(out), step
 
