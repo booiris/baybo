@@ -9,7 +9,7 @@ import {
   markLastWorkCancelled,
   type TranscriptRow,
   type WorkStep,
-} from './ChatPage';
+} from '@aura/chat-core';
 
 // Pins the "Working" affordance UX: a live turn shows a compact spinner and
 // only expands into the steps panel once it has actually produced a step,

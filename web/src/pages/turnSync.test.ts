@@ -3,11 +3,11 @@ import { describe, it, expect } from 'vitest';
 import {
   applyTurnState,
   routeInboundFrame,
+  type Frame,
   type SessionView,
   type TranscriptRow,
   type WorkStep,
-} from './ChatPage';
-import type { Frame } from '../api/chatWs';
+} from '@aura/chat-core';
 
 // These suites pin the server-authoritative TurnState contract on the
 // client: a tab's "Working…" box opens/closes only from the server's

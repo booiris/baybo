@@ -11,6 +11,7 @@
     "gen:api": "openapi-typescript ../../docs/openapi.json -o src/api/schema.d.ts"
   },
   "dependencies": {
+    "@aura/chat-core": "workspace:*",
     "@msgpack/msgpack": "^3.0.0-beta2",
     "@tauri-apps/api": "^2",
     "openapi-fetch": "^0.13.0",

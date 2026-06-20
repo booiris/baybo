@@ -7,7 +7,7 @@ import {
   RiLoader4Line,
 } from 'react-icons/ri';
 
-import type { TaskView } from '../../api/chatWs';
+import type { TaskView } from '@aura/chat-core';
 
 /** The wire's `status` is an open `string`; narrow it to the four
  *  states the agent emits so the marker/colour lookup is exhaustive.

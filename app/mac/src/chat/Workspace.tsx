@@ -9,7 +9,7 @@ import {
 } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { ChatWs, type Frame, type TaskView, type WireAttachment } from '../api/chatWs';
+import { ChatWs, type Frame, type TaskView, type WireAttachment } from '@aura/chat-core';
 import {
   admin,
   createSession,
