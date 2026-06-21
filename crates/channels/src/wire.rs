@@ -171,6 +171,44 @@ pub struct SlashCommandSpec {
     pub description: String,
 }
 
+/// One chat-list folder on the wire — a presentation projection of a
+/// session folder for the web sidebar. Carried in the full-snapshot
+/// [`Frame::FoldersChanged`]. `parent_id` is `null`/absent for a
+/// top-level folder.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub struct FolderView {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub parent_id: Option<String>,
+    pub name: String,
+    pub position: i64,
+    #[cfg_attr(feature = "ts-export", ts(type = "string"))]
+    pub created_at: DateTime<Utc>,
+}
+
+/// A folder reassignment carried on [`SessionPatch::folder_id`]. Modelled
+/// as an explicit two-state enum (NOT `Option<Option<String>>`) so the
+/// MessagePack + ts-rs round-trip cleanly distinguishes the two meanings
+/// from "field absent" (= no change): `Set` moves the session into a
+/// folder, `Uncategorized` clears the assignment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub enum FolderChange {
+    Set { id: String },
+    Uncategorized,
+}
+
 /// One task on the wire — a flattened, presentation-only projection of a
 /// `session_tasks` row for the web checklist. `subject` is the title shown in
 /// the list (the `description` body stays server-side). `status` is a
@@ -273,6 +311,16 @@ pub enum Frame {
     /// echo of inbound to other subscribers of the same session
     /// (role=User).
     Message(Message),
+    /// Client → server. Several user messages for **one** session that
+    /// must run as a single coalesced turn — the web "send every queued
+    /// message at once" affordance. Delivered to the actor atomically (as
+    /// one mailbox item) so the actor's coalescing can't lose stragglers to
+    /// the per-message router latency, which a burst of separate
+    /// [`Frame::Message`]s would. The server echoes each entry back as its
+    /// own [`Frame::Message`] (role=User) so every subscriber renders the
+    /// same N rows, then runs one merged turn with one reply. Outbound never
+    /// uses this kind.
+    Messages { messages: Vec<Message> },
     /// Server → client: media a tool produced mid-turn (a sent file, a
     /// screenshot), delivered as its **own** message. Unlike a terminal
     /// [`Frame::Message`] it carries no `role` / `ordinal` and no turn-
@@ -509,6 +557,13 @@ pub enum Frame {
     /// prior list. Sidecars that don't surface client-side autocomplete
     /// may ignore this.
     SlashManifest { commands: Vec<SlashCommandSpec> },
+    /// Server → client: the chat-list folder tree changed (create /
+    /// rename / delete / reorder / reparent). Broadcast to every
+    /// `http` connection as a full snapshot — clients replace their local
+    /// folder list wholesale, no patch-merge. Folders are few, so the
+    /// snapshot is tiny. Per-session `folder_id` reassignment rides
+    /// [`SessionPatch`] instead. Sidecars and non-web channels ignore it.
+    FoldersChanged { folders: Vec<FolderView> },
     /// Server → client: structural session-metadata change. Broadcast
     /// to every connection on the `http` channel regardless of
     /// subscription so every open chat tab converges on the new state
@@ -624,6 +679,20 @@ pub struct SessionPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-export", ts(optional))]
     pub hidden: Option<bool>,
+    /// Flipped by `PUT /v1/chat/sessions/:id/pin`. `true` moves the row
+    /// into the sidebar's pinned block, `false` moves it back into the
+    /// regular list. Carried on Create / Unhide too so a sibling tab
+    /// re-adding the row renders it in the right block immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub pinned: Option<bool>,
+    /// Set by `PUT /v1/chat/sessions/:id/folder` (and on folder delete,
+    /// which clears every direct member to `Uncategorized`). Present means
+    /// "the assignment changed to this value"; absent means "no change".
+    /// `Set { id }` files the session under `id`; `Uncategorized` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(optional))]
+    pub folder_id: Option<FolderChange>,
 }
 
 /// Serialize a frame with named fields (MessagePack map representation).
@@ -908,6 +977,8 @@ mod tests {
                 created_at: Some(now),
                 last_active: Some(now),
                 hidden: Some(false),
+                pinned: Some(false),
+                folder_id: Some(FolderChange::Set { id: "f1".into() }),
             },
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
@@ -925,7 +996,73 @@ mod tests {
                 created_at: None,
                 last_active: Some(now),
                 hidden: None,
+                pinned: None,
+                folder_id: None,
             },
+        };
+        assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn round_trip_session_updated_folder_change() {
+        // Both arms of the three-state folder field survive the msgpack
+        // round-trip, distinct from "absent" (no change).
+        let to_folder = Frame::SessionUpdated {
+            session_id: "sess-abc".into(),
+            patch: SessionPatch {
+                folder_id: Some(FolderChange::Set { id: "work".into() }),
+                ..SessionPatch::default()
+            },
+        };
+        assert_eq!(to_folder, decode(&encode(&to_folder).unwrap()).unwrap());
+
+        let uncategorized = Frame::SessionUpdated {
+            session_id: "sess-abc".into(),
+            patch: SessionPatch {
+                folder_id: Some(FolderChange::Uncategorized),
+                ..SessionPatch::default()
+            },
+        };
+        assert_eq!(
+            uncategorized,
+            decode(&encode(&uncategorized).unwrap()).unwrap()
+        );
+
+        // Absent folder_id decodes back to None (no change).
+        let no_change = Frame::SessionUpdated {
+            session_id: "sess-abc".into(),
+            patch: SessionPatch {
+                pinned: Some(true),
+                ..SessionPatch::default()
+            },
+        };
+        let decoded = decode(&encode(&no_change).unwrap()).unwrap();
+        assert_eq!(no_change, decoded);
+        if let Frame::SessionUpdated { patch, .. } = decoded {
+            assert!(patch.folder_id.is_none());
+        }
+    }
+
+    #[test]
+    fn round_trip_folders_changed() {
+        let now = chrono::Utc::now();
+        let frame = Frame::FoldersChanged {
+            folders: vec![
+                FolderView {
+                    id: "p".into(),
+                    parent_id: None,
+                    name: "Parent".into(),
+                    position: 0,
+                    created_at: now,
+                },
+                FolderView {
+                    id: "c".into(),
+                    parent_id: Some("p".into()),
+                    name: "Child".into(),
+                    position: 0,
+                    created_at: now,
+                },
+            ],
         };
         assert_eq!(frame, decode(&encode(&frame).unwrap()).unwrap());
     }

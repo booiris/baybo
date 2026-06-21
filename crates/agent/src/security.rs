@@ -832,6 +832,8 @@ mod tests {
             trigger: aura_model::TriggerSource::User,
             lineage: None,
             hidden: false,
+            pinned: false,
+            folder_id: None,
         }
     }
 

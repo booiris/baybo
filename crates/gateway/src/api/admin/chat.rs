@@ -14,6 +14,9 @@
 //!   admin / trace surfaces still see it. Reversible via
 //!   `POST /v1/chat/sessions/:id/unhide`.
 //! * `POST /v1/chat/sessions/:id/unhide` — undo the hide.
+//! * `PUT /v1/chat/sessions/:id/pin` — pin (or unpin) the session to
+//!   the top of the chat list. Presentation only; the row is otherwise
+//!   unchanged.
 //! * `POST /v1/chat/sessions/:id/token` — refresh the channel-token
 //!   (drop old, mint new). Used by the web client when its existing
 //!   token's lifetime is close to expiring.
@@ -30,14 +33,16 @@
 use std::collections::HashMap;
 
 use aura_agent::actor::AgentMessage;
-use aura_channels::wire::{SessionPatch, SlashCommandSpec};
+use aura_channels::wire::{FolderChange, FolderView, SessionPatch, SlashCommandSpec};
 use aura_channels::{
     AgentEvent, STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, SessionEvent, ToolStatus,
 };
 use aura_model::{
-    ChannelType, ChatMessage, ContentBlock, ControlEvent, ControlEventKind, LlmEntryName,
-    MessageSource, Role, Session, SessionId, ThinkingContent, TriggerSource, User,
+    ChannelType, ChatMessage, ContentBlock, ControlEvent, ControlEventKind, FolderId,
+    FolderSummary, LlmEntryName, MessageSource, Role, Session, SessionId, ThinkingContent,
+    TriggerSource, User,
 };
+use aura_session::SessionError;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use chrono::{DateTime, Utc};
@@ -60,11 +65,19 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(list_sessions))
         .routes(routes!(get_session))
         .routes(routes!(set_session_model))
+        .routes(routes!(set_session_pin))
+        .routes(routes!(set_session_folder))
         .routes(routes!(delete_session))
         .routes(routes!(unhide_session))
         .routes(routes!(refresh_session_token))
         .routes(routes!(slash_manifest))
         .routes(routes!(list_cron_messages))
+        .routes(routes!(list_folders))
+        .routes(routes!(create_folder))
+        .routes(routes!(update_folder))
+        .routes(routes!(move_folder))
+        .routes(routes!(reorder_folders))
+        .routes(routes!(delete_folder))
 }
 
 /// Query string for `GET /v1/chat/sessions`.
@@ -345,6 +358,10 @@ pub struct ChatSessionSummary {
     /// `include_hidden=true` was requested.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden: bool,
+    /// True when the user has pinned this session to the top of their
+    /// chat list. Always emitted so the sidebar can place every row in
+    /// the right block; set via `PUT /v1/chat/sessions/{id}/pin`.
+    pub pinned: bool,
     /// Preview text drawn from the session's most-recent user-authored
     /// message, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar
     /// renders this as the row label so users can scan past
@@ -353,6 +370,11 @@ pub struct ChatSessionSummary {
     /// transcript holds only system/tool rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_text: Option<String>,
+    /// The user-created folder this session is filed under, or absent for
+    /// uncategorized. Set via `PUT /v1/chat/sessions/{id}/folder`; the web
+    /// sidebar groups rows by this id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -462,6 +484,11 @@ async fn create_session(State(state): State<AdminState>) -> Result<Json<ChatSess
             created_at: Some(session.created_at),
             last_active: Some(session.last_active),
             hidden: Some(false),
+            pinned: Some(false),
+            // A freshly-created session is always uncategorized; absent =
+            // no change, which a newly-constructed client row renders as
+            // uncategorized.
+            folder_id: None,
         },
     );
     Ok(Json(cred))
@@ -524,7 +551,9 @@ async fn list_sessions(
             created_at: s.created_at,
             last_active: s.last_active,
             hidden: s.hidden,
+            pinned: s.pinned,
             last_user_text,
+            folder_id: s.folder_id.as_ref().map(|f| f.to_string()),
         })
         .collect();
     Ok(Json(ChatSessionsList { items }))
@@ -755,6 +784,55 @@ async fn set_session_model(
     }))
 }
 
+/// Request body for `PUT /v1/chat/sessions/{session_id}/pin`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetSessionPinRequest {
+    /// `true` to pin this session to the top of the chat list, `false`
+    /// to unpin it back into the regular list.
+    pub pinned: bool,
+}
+
+#[utoipa::path(
+    put,
+    path = "/chat/sessions/{session_id}/pin",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Session id to pin or unpin"),
+    ),
+    request_body = SetSessionPinRequest,
+    responses(
+        (status = 204, description = "Pin state updated"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session not found", body = ErrorBody),
+    )
+)]
+async fn set_session_pin(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<SetSessionPinRequest>,
+) -> Result<axum::http::StatusCode> {
+    // Same web-chat scoping as get/hide/model — a non-`http` id 404s.
+    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
+    // Targeted flat-column write — like `set_hidden`, it survives a
+    // concurrent `touch` (full-blob save) so the pin can't be clobbered.
+    state
+        .session_manager
+        .set_pinned(&sid, req.pinned)
+        .await
+        .map_err(|e| GatewayError::Internal(format!("set session pin: {e}")))?;
+    // Broadcast so every open chat tab moves the row to the right block
+    // without a list refetch.
+    broadcast_session_patch(
+        &state,
+        &sid,
+        SessionPatch {
+            pinned: Some(req.pinned),
+            ..SessionPatch::default()
+        },
+    );
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 #[utoipa::path(
     delete,
     path = "/chat/sessions/{session_id}",
@@ -826,8 +904,341 @@ async fn unhide_session(
             created_at: Some(session.created_at),
             last_active: Some(session.last_active),
             hidden: Some(false),
+            // Carry the live pin state so a sibling tab re-adding the
+            // row drops it straight into the correct block.
+            pinned: Some(session.pinned),
+            // Carry the folder assignment too so the re-added row lands in
+            // the right folder (absent ⇒ uncategorized).
+            folder_id: session.folder_id.as_ref().map(|f| FolderChange::Set {
+                id: f.as_str().to_owned(),
+            }),
         },
     );
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ── Folders ──────────────────────────────────────────────────────────
+
+/// Map a folder-op [`SessionError`] onto the right HTTP status: invariant
+/// violations (depth, cycle, name length) are 400; a missing folder /
+/// session is 404; anything else is 500.
+fn folder_err(e: SessionError) -> GatewayError {
+    match e {
+        SessionError::NotFound(m) => GatewayError::NotFound(m),
+        SessionError::InvalidFolderOp(m) => GatewayError::BadRequest(m),
+        other => GatewayError::Internal(format!("folder op: {other}")),
+    }
+}
+
+/// Broadcast the current folder tree as a full snapshot to every open
+/// chat tab. Called after any folder mutation. No-op when the http
+/// channel isn't installed (test fixtures with no live web clients).
+async fn broadcast_folders(state: &AdminState) -> Result<()> {
+    let folders: Vec<FolderView> = state
+        .session_manager
+        .list_folders()
+        .await
+        .map_err(folder_err)?
+        .into_iter()
+        .map(|f| FolderView {
+            id: f.id.to_string(),
+            parent_id: f.parent_id.as_ref().map(|p| p.to_string()),
+            name: f.name,
+            position: f.position,
+            created_at: f.created_at,
+        })
+        .collect();
+    let Some(channel) = state.channel_registry.get(&ChannelType::http()) else {
+        return Ok(());
+    };
+    if let Some(sub) = channel.as_subscribed() {
+        sub.broadcast_folders_changed(folders);
+    }
+    Ok(())
+}
+
+/// Request body for `PUT /v1/chat/sessions/{session_id}/folder`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetSessionFolderRequest {
+    /// Target folder id, or `null` to clear the assignment (uncategorized).
+    #[serde(default)]
+    pub folder_id: Option<String>,
+}
+
+#[utoipa::path(
+    put,
+    path = "/chat/sessions/{session_id}/folder",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Session id to file"),
+    ),
+    request_body = SetSessionFolderRequest,
+    responses(
+        (status = 204, description = "Folder assignment updated"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session or folder not found", body = ErrorBody),
+    )
+)]
+async fn set_session_folder(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<SetSessionFolderRequest>,
+) -> Result<axum::http::StatusCode> {
+    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
+    let folder = req.folder_id.map(FolderId::from);
+    state
+        .session_manager
+        .set_folder(&sid, folder.as_ref())
+        .await
+        .map_err(folder_err)?;
+    let change = match &folder {
+        Some(f) => FolderChange::Set {
+            id: f.as_str().to_owned(),
+        },
+        None => FolderChange::Uncategorized,
+    };
+    broadcast_session_patch(
+        &state,
+        &sid,
+        SessionPatch {
+            folder_id: Some(change),
+            ..SessionPatch::default()
+        },
+    );
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// One folder in a folder-list / create response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FolderDto {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    pub name: String,
+    pub position: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<FolderSummary> for FolderDto {
+    fn from(f: FolderSummary) -> Self {
+        Self {
+            id: f.id.to_string(),
+            parent_id: f.parent_id.as_ref().map(|p| p.to_string()),
+            name: f.name,
+            position: f.position,
+            created_at: f.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FolderList {
+    pub items: Vec<FolderDto>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/chat/folders",
+    tag = "chat",
+    responses(
+        (status = 200, description = "The chat-list folder tree", body = FolderList),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
+async fn list_folders(State(state): State<AdminState>) -> Result<Json<FolderList>> {
+    let items = state
+        .session_manager
+        .list_folders()
+        .await
+        .map_err(folder_err)?
+        .into_iter()
+        .map(FolderDto::from)
+        .collect();
+    Ok(Json(FolderList { items }))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateFolderRequest {
+    pub name: String,
+    /// Parent folder id (`null`/absent = top-level).
+    #[serde(default)]
+    pub parent_id: Option<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/chat/folders",
+    tag = "chat",
+    request_body = CreateFolderRequest,
+    responses(
+        (status = 200, description = "The created folder", body = FolderDto),
+        (status = 400, description = "Invalid name / depth", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Parent folder not found", body = ErrorBody),
+    )
+)]
+async fn create_folder(
+    State(state): State<AdminState>,
+    Json(req): Json<CreateFolderRequest>,
+) -> Result<Json<FolderDto>> {
+    let parent = req.parent_id.map(FolderId::from);
+    let folder = state
+        .session_manager
+        .create_folder(parent, req.name)
+        .await
+        .map_err(folder_err)?;
+    broadcast_folders(&state).await?;
+    Ok(Json(FolderDto::from(folder)))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateFolderRequest {
+    /// New name (absent = unchanged).
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[utoipa::path(
+    patch,
+    path = "/chat/folders/{folder_id}",
+    tag = "chat",
+    params(
+        ("folder_id" = String, Path, description = "Folder id to rename"),
+    ),
+    request_body = UpdateFolderRequest,
+    responses(
+        (status = 204, description = "Folder updated"),
+        (status = 400, description = "Invalid name", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Folder not found", body = ErrorBody),
+    )
+)]
+async fn update_folder(
+    State(state): State<AdminState>,
+    Path(folder_id): Path<String>,
+    Json(req): Json<UpdateFolderRequest>,
+) -> Result<axum::http::StatusCode> {
+    let fid = FolderId::from(folder_id);
+    if let Some(name) = req.name {
+        state
+            .session_manager
+            .rename_folder(&fid, name)
+            .await
+            .map_err(folder_err)?;
+    }
+    broadcast_folders(&state).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MoveFolderRequest {
+    /// New parent id, or `null` to promote the folder to top-level.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/chat/folders/{folder_id}/move",
+    tag = "chat",
+    params(
+        ("folder_id" = String, Path, description = "Folder id to reparent"),
+    ),
+    request_body = MoveFolderRequest,
+    responses(
+        (status = 204, description = "Folder moved"),
+        (status = 400, description = "Cycle / depth violation", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Folder not found", body = ErrorBody),
+    )
+)]
+async fn move_folder(
+    State(state): State<AdminState>,
+    Path(folder_id): Path<String>,
+    Json(req): Json<MoveFolderRequest>,
+) -> Result<axum::http::StatusCode> {
+    let fid = FolderId::from(folder_id);
+    let parent = req.parent_id.map(FolderId::from);
+    state
+        .session_manager
+        .reparent_folder(&fid, parent)
+        .await
+        .map_err(folder_err)?;
+    broadcast_folders(&state).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ReorderFoldersRequest {
+    /// Parent of the sibling group being reordered (`null` = top-level).
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// The sibling ids in their new order.
+    pub ordered_ids: Vec<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/chat/folders/reorder",
+    tag = "chat",
+    request_body = ReorderFoldersRequest,
+    responses(
+        (status = 204, description = "Sibling group reordered"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
+async fn reorder_folders(
+    State(state): State<AdminState>,
+    Json(req): Json<ReorderFoldersRequest>,
+) -> Result<axum::http::StatusCode> {
+    let parent = req.parent_id.map(FolderId::from);
+    let ids = req.ordered_ids.into_iter().map(FolderId::from).collect();
+    state
+        .session_manager
+        .reorder_folders(parent, ids)
+        .await
+        .map_err(folder_err)?;
+    broadcast_folders(&state).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/chat/folders/{folder_id}",
+    tag = "chat",
+    params(
+        ("folder_id" = String, Path, description = "Folder id to delete"),
+    ),
+    responses(
+        (status = 204, description = "Folder dissolved (sessions preserved)"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Folder not found", body = ErrorBody),
+    )
+)]
+async fn delete_folder(
+    State(state): State<AdminState>,
+    Path(folder_id): Path<String>,
+) -> Result<axum::http::StatusCode> {
+    let fid = FolderId::from(folder_id);
+    let affected = state
+        .session_manager
+        .delete_folder(&fid)
+        .await
+        .map_err(folder_err)?;
+    // Folder structure converges via the snapshot; the chats that fell
+    // back to uncategorized converge via a per-session patch each, so a
+    // sibling tab moves them live without a list refetch.
+    broadcast_folders(&state).await?;
+    for sid in affected {
+        broadcast_session_patch(
+            &state,
+            &sid,
+            SessionPatch {
+                folder_id: Some(FolderChange::Uncategorized),
+                ..SessionPatch::default()
+            },
+        );
+    }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -1384,48 +1795,23 @@ fn reconstruct_transcript(
                     }
                 }
             }
-            // Final answer (no tool calls): close the work block, then the
+            // Final answer (tool-free row): close the work block, then the
             // reply bubble lands below it. A direct-answer turn (no tool
             // iterations, so nothing accumulated yet) still carries its
             // reasoning in this same row; rebuild a single-step work block
             // from it so a reload shows the same `Worked Xs` + reasoning the
             // tool path produces, rather than dropping the thinking on the
             // floor in `message_item`.
-            // A cancelled turn's trailing partial row (the next entry is a
-            // `/stop` that actually cancelled the reply): fold its reasoning +
-            // partial text into the open work block and leave it for the
-            // `/stop` flush to emit cancelled, rather than spinning the text
-            // off as a bubble that reads like a finished answer. A no-op
-            // `/stop` after a finished turn does NOT match here, so a completed
-            // answer is never folded away.
-            Role::Assistant if next_is_cancelling_stop[idx] => {
-                if work.started.is_none() {
-                    work.started = Some(turn_started.unwrap_or(created_at));
-                    work.ordinal = Some(ordinal);
-                }
-                work.last = Some(created_at);
-                for block in &msg.content {
-                    match block {
-                        ContentBlock::Thinking { content, .. } => {
-                            let text = thinking_text(content);
-                            if !text.is_empty() {
-                                work.steps.push(ChatWorkStep::reasoning(text));
-                            }
-                        }
-                        ContentBlock::Text(t) if !t.trim().is_empty() => {
-                            work.steps.push(ChatWorkStep::prose(t.clone()));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            // Final answer (no tool calls): close the work block, then the
-            // reply bubble lands below it. A direct-answer turn (no tool
-            // iterations, so nothing accumulated yet) still carries its
-            // reasoning in this same row; rebuild a single-step work block
-            // from it so a reload shows the same `Worked Xs` + reasoning the
-            // tool path produces, rather than dropping the thinking on the
-            // floor in `message_item`.
+            //
+            // A turn cut short by a cancelling `/stop` (the next entry is the
+            // cancelling echo) takes the SAME shape: its reasoning folds into
+            // the work block and its partial text lands as a reply bubble —
+            // the agent's cut-short final output stays a bubble rather than
+            // being folded inside the work card. The only difference is the
+            // block is flagged `cancelled` so it collapses to "Cancelled", and
+            // the model-facing cancelled-turn marker is stripped from the
+            // bubble. A no-op `/stop` after a finished turn does NOT match
+            // `next_is_cancelling_stop`, so a completed answer is never marked.
             Role::Assistant => {
                 if work.started.is_none() {
                     for block in &msg.content {
@@ -1446,9 +1832,23 @@ fn reconstruct_transcript(
                         }
                     }
                 }
+                let cancelled = next_is_cancelling_stop[idx];
+                if cancelled {
+                    work.cancelled = true;
+                }
                 work.flush(&mut items, Some(created_at));
-                if let Some(item) = message_item(ordinal, created_at, "assistant", &msg) {
-                    items.push(item);
+                if let Some(mut item) = message_item(ordinal, created_at, "assistant", &msg) {
+                    if cancelled {
+                        // Drop the model-facing cancelled-turn marker so the
+                        // salvaged reply renders as clean partial output.
+                        item.text = aura_context::prompts::cancelled_turn::strip_marker(&item.text)
+                            .to_string();
+                    }
+                    // A marker-only salvage (thinking-only cancelled turn)
+                    // leaves nothing to show once stripped — no empty bubble.
+                    if !item.text.is_empty() || item.has_attachments {
+                        items.push(item);
+                    }
                 }
                 // Turn boundary: a later turn that has no user row on this
                 // page (a cron fire) must not inherit this turn's start.
@@ -1861,18 +2261,23 @@ mod tests {
     }
 
     #[test]
-    fn reconstruct_stopped_partial_turn_is_a_cancelled_work_block_not_an_answer() {
+    fn reconstruct_stopped_partial_turn_salvages_reply_as_bubble_below_cancelled_block() {
         use aura_model::ControlEventKind::{Command, NoticeInfo};
         // A turn cancelled mid-LLM-call: the loop persisted a partial assistant
         // row (reasoning + partial answer text, no tool calls) before aborting,
         // then the `/stop` echo + notice anchored right after it (the ordering
-        // the `/stop` settle-wait guarantees).
+        // the `/stop` settle-wait guarantees). The persisted partial carries
+        // the model-facing cancelled-turn marker, which display must strip.
+        let partial = format!(
+            "a b-tree is{}",
+            aura_context::prompts::cancelled_turn::SUFFIX
+        );
         let tail = vec![
             (2, ts(2), ChatMessage::user(vec![text("explain b-trees")])),
             (
                 3,
                 ts(3),
-                ChatMessage::assistant(vec![thinking("weighing the options"), text("a b-tree is")]),
+                ChatMessage::assistant(vec![thinking("weighing the options"), text(&partial)]),
             ),
         ];
         let stop_notice = format!("Stopped.\n{}", aura_channels::STOP_CANCELLED_REPLY_LINE);
@@ -1882,9 +2287,10 @@ mod tests {
         ];
         let items = reconstruct_transcript(tail, events, None, Vec::new());
 
-        // user, cancelled work block, /stop echo, /stop notice — and crucially
-        // NO assistant answer bubble for the cut-short turn.
-        assert_eq!(items.len(), 4, "got {items:?}");
+        // user, cancelled work block, the salvaged reply bubble, /stop echo,
+        // /stop notice — the cut-short reply is its OWN bubble below the
+        // collapsed "Cancelled" block, not folded inside it.
+        assert_eq!(items.len(), 5, "got {items:?}");
         assert!(matches!(items[0].kind, TranscriptItemKind::Message));
         assert_eq!(items[0].role, "user");
 
@@ -1894,27 +2300,59 @@ mod tests {
             work.cancelled,
             "a /stop'd partial turn's work block is cancelled"
         );
-        assert_eq!(
-            work.work_ended_at,
-            Some(ts(5)),
-            "bounded at the stop instant"
-        );
-        // Both the reasoning and the partial answer text fold into the block,
-        // instead of the text spinning off as a finished-looking answer bubble.
-        assert_eq!(work.steps.len(), 2, "reasoning + folded partial text");
+        // Reasoning stays in the block; the partial answer text does NOT.
+        assert_eq!(work.steps.len(), 1, "only reasoning folds into the block");
         assert!(matches!(work.steps[0].kind, WorkStepKind::Reasoning));
         assert_eq!(work.steps[0].text, "weighing the options");
-        assert!(matches!(work.steps[1].kind, WorkStepKind::Prose));
-        assert_eq!(work.steps[1].text, "a b-tree is");
 
-        assert_eq!(items[2].text, "/stop");
-        assert!(matches!(items[3].kind, TranscriptItemKind::Notice));
+        let reply = &items[2];
+        assert!(matches!(reply.kind, TranscriptItemKind::Message));
+        assert_eq!(reply.role, "assistant");
+        assert_eq!(
+            reply.text, "a b-tree is",
+            "the salvaged reply renders as a bubble with the model-facing marker stripped"
+        );
+
+        assert_eq!(items[3].text, "/stop");
+        assert!(matches!(items[4].kind, TranscriptItemKind::Notice));
+    }
+
+    #[test]
+    fn reconstruct_stopped_thinking_only_turn_has_no_reply_bubble() {
+        use aura_model::ControlEventKind::{Command, NoticeInfo};
+        // Cancelled before any answer text streamed — only reasoning was
+        // salvaged (so the persisted partial is a marker-only block). The
+        // cancelled work block carries the reasoning; there is no reply bubble.
+        let tail = vec![
+            (2, ts(2), ChatMessage::user(vec![text("explain b-trees")])),
+            (
+                3,
+                ts(3),
+                ChatMessage::assistant(vec![
+                    thinking("weighing the options"),
+                    text(&aura_context::prompts::cancelled_turn::marker_block_text()),
+                ]),
+            ),
+        ];
+        let stop_notice = format!("Stopped.\n{}", aura_channels::STOP_CANCELLED_REPLY_LINE);
+        let events = vec![
+            ctl(1, 3, Command, "/stop", 5),
+            ctl(2, 3, NoticeInfo, &stop_notice, 5),
+        ];
+        let items = reconstruct_transcript(tail, events, None, Vec::new());
+
         assert!(
             !items
                 .iter()
                 .any(|i| matches!(i.kind, TranscriptItemKind::Message) && i.role == "assistant"),
-            "a cancelled partial must not render as a finished answer bubble: {items:?}"
+            "a marker-only (thinking-only) salvage must not render an empty reply bubble: {items:?}"
         );
+        let work = items
+            .iter()
+            .find(|i| matches!(i.kind, TranscriptItemKind::Work))
+            .expect("cancelled work block");
+        assert!(work.cancelled);
+        assert_eq!(work.steps.len(), 1, "the reasoning is preserved");
     }
 
     #[test]

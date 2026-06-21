@@ -25,6 +25,7 @@ import { getMockJobTrace, getMockTraceOverview } from '../api/mock';
 import { useMockMode } from '../api/mock';
 import type {
   ChatMessage,
+  ContentBlock,
   JobTrace,
   LifecycleState,
   ReplayStep,
@@ -258,10 +259,12 @@ function stepSummaryText(step: Step, spans: Span[]): string {
 function SpanRow({
   span,
   selected,
+  interjected,
   onSelect,
 }: {
   span: Span;
   selected: boolean;
+  interjected: boolean;
   onSelect: (id: string) => void;
 }) {
   const visual = spanVisual(span.kind.kind);
@@ -317,6 +320,15 @@ function SpanRow({
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 min-w-0">
           <span className="font-bold uppercase tracking-wide text-[0.85rem] truncate">{title}</span>
+          {interjected && (
+            <span
+              title="A mid-turn user interjection was folded into this iteration's input"
+              className="shrink-0 inline-flex items-center gap-1 text-[0.7rem] font-bold uppercase tracking-wider text-warn border-2 border-warn rounded px-1"
+            >
+              <RiCornerDownLeftLine className="text-[0.75rem]" />
+              interjected
+            </span>
+          )}
           {span.parallel_group && (
             <span className="text-[0.7rem] font-bold uppercase tracking-wider text-warn border-2 border-warn rounded px-1">
               ‖ parallel
@@ -342,10 +354,12 @@ function SpanRow({
 function StepBlock({
   rs,
   selectedSpanId,
+  interjectionSpanIds,
   onSelect,
 }: {
   rs: ReplayStep;
   selectedSpanId: string | null;
+  interjectionSpanIds: Set<string>;
   onSelect: (id: string) => void;
 }) {
   const { step, spans } = rs;
@@ -394,6 +408,7 @@ function StepBlock({
             key={span.id}
             span={span}
             selected={selectedSpanId === span.id}
+            interjected={interjectionSpanIds.has(span.id)}
             onSelect={onSelect}
           />
         ))}
@@ -979,6 +994,20 @@ function traceTokens(trace: JobTrace): JobTokenTotals {
   return { input, output, cached, cacheCreate, inputTotal: input + cached + cacheCreate };
 }
 
+// Flatten a message's content blocks into a single display string (text
+// verbatim; non-text blocks as a `[kind …]` placeholder).
+function contentText(content: ContentBlock[]): string {
+  const parts: string[] = [];
+  for (const block of content) {
+    if ('Text' in block) parts.push(block.Text);
+    else if ('ToolResult' in block) parts.push(`[tool_result ${block.ToolResult.tool_use_id}]`);
+    else if ('Image' in block) parts.push(`[image ${block.Image.mime_type}]`);
+    else if ('Audio' in block) parts.push(`[audio ${block.Audio.mime_type}]`);
+    else if ('File' in block) parts.push(`[file ${block.File.filename}]`);
+  }
+  return parts.join('\n');
+}
+
 // Derive the user-facing input that kicked off the job: the last
 // message in the *first* LLM call's input_messages whose `source` is
 // 'user'. The agent injects several `Role::User` messages of its own
@@ -996,16 +1025,8 @@ function jobInputText(trace: JobTrace, messageLog: SessionMessageRow[]): string 
         );
         for (let i = messages.length - 1; i >= 0; i--) {
           if (messages[i].source === 'user') {
-            const parts: string[] = [];
-            for (const block of messages[i].content) {
-              if ('Text' in block) parts.push(block.Text);
-              else if ('ToolResult' in block)
-                parts.push(`[tool_result ${block.ToolResult.tool_use_id}]`);
-              else if ('Image' in block) parts.push(`[image ${block.Image.mime_type}]`);
-              else if ('Audio' in block) parts.push(`[audio ${block.Audio.mime_type}]`);
-              else if ('File' in block) parts.push(`[file ${block.File.filename}]`);
-            }
-            return parts.length > 0 ? parts.join('\n') : null;
+            const text = contentText(messages[i].content);
+            return text.length > 0 ? text : null;
           }
         }
         return null;
@@ -1102,7 +1123,7 @@ function JobSummaryPanel({
   messageLog,
   jobIndex,
   totalJobs,
-  interjectionCount,
+  interjections,
 }: {
   summary: TraceJobSummary | undefined;
   trace: JobTrace | undefined;
@@ -1110,8 +1131,9 @@ function JobSummaryPanel({
   messageLog: SessionMessageRow[];
   jobIndex: number;
   totalJobs: number;
-  interjectionCount: number;
+  interjections: SessionMessageRow[];
 }) {
+  const interjectionCount = interjections.length;
   if (!summary) {
     return (
       <div className="w-[480px] shrink-0 border-l-[3px] border-black bg-surface flex flex-col z-20 shadow-[-4px_0_0_0_rgba(0,0,0,0.1)]">
@@ -1190,6 +1212,27 @@ function JobSummaryPanel({
             <div className="text-ink-soft text-[0.8rem] italic">No user input recorded.</div>
           )}
         </section>
+
+        {interjectionCount > 0 && (
+          <section>
+            <h4 className="flex items-center gap-1.5 font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-warn pb-1 text-warn">
+              <RiCornerDownLeftLine className="text-[0.9rem]" />
+              Interjections ({interjectionCount})
+            </h4>
+            <div className="space-y-2">
+              {interjections.map((r) => (
+                <div key={r.ordinal} className="border-2 border-warn rounded-md bg-warn/5 p-3">
+                  <div className="mb-1 font-mono text-[0.65rem] uppercase tracking-wider text-warn">
+                    {formatTime(r.created_at)}
+                  </div>
+                  <pre className="whitespace-pre-wrap break-all font-mono text-[0.85rem] text-ink max-h-48 overflow-y-auto">
+                    {contentText(r.message.content) || '[no text]'}
+                  </pre>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
 
         <section>
           <h4 className="font-bold uppercase tracking-wider text-[0.8rem] mb-2 border-b-2 border-black pb-1">
@@ -1388,30 +1431,66 @@ export function TraceSessionPage() {
   const activeJobTrace = activeJobId ? jobTraces.get(activeJobId) : undefined;
   const messageLog = overview?.session_messages ?? [];
 
-  // Map each job to the count of mid-turn user interjections folded into
-  // it. A `user_interjection` row is only persisted mid-drain, so it
-  // belongs to the job whose [started_at, ended_at) window contains its
-  // `created_at` — jobs run sequentially, so the assignment is unambiguous.
-  const interjectionCountByJob = useMemo(() => {
-    const counts = new Map<string, number>();
+  // Map each job to the mid-turn user interjections folded into it. A
+  // `user_interjection` row is only persisted mid-drain, so it belongs to the
+  // job whose [started_at, ended_at) window contains its `created_at` — jobs
+  // run sequentially, so the assignment is unambiguous.
+  const interjectionsByJob = useMemo(() => {
+    const byJob = new Map<string, SessionMessageRow[]>();
     const interjections = (overview?.session_messages ?? []).filter(
       (r) => r.message.source === 'user_interjection',
     );
-    if (interjections.length === 0) return counts;
+    if (interjections.length === 0) return byJob;
     for (const job of overview?.jobs ?? []) {
       const startIso = job.started_at ?? job.created_at;
       if (!startIso) continue;
       const start = new Date(startIso).getTime();
       const end = job.ended_at ? new Date(job.ended_at).getTime() : Number.POSITIVE_INFINITY;
-      let n = 0;
-      for (const r of interjections) {
+      const rows = interjections.filter((r) => {
         const t = new Date(r.created_at).getTime();
-        if (t >= start && t < end) n += 1;
-      }
-      if (n > 0) counts.set(job.job_id, n);
+        return t >= start && t < end;
+      });
+      if (rows.length > 0) byJob.set(job.job_id, rows);
     }
-    return counts;
+    return byJob;
   }, [overview]);
+  const interjectionCountByJob = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const [id, rows] of interjectionsByJob) counts.set(id, rows.length);
+    return counts;
+  }, [interjectionsByJob]);
+
+  // LLM-call spans of the active job whose input first folds in a mid-turn
+  // interjection — i.e. the iteration where the user's steering message
+  // entered the context. Walk LLM calls in time order: the interjection count
+  // in a call's resolved input is monotonic across the job (the row persists in
+  // later contexts), so a count that JUMPS marks the iteration that absorbed
+  // the new message(s). Marked in the step tree so a reader sees exactly where
+  // a turn was steered.
+  const interjectionSpanIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (!activeJobTrace) return ids;
+    const llmSpans: Span[] = [];
+    for (const rs of activeJobTrace.steps) {
+      for (const span of rs.spans) {
+        if (span.kind.kind === 'llm_call') llmSpans.push(span);
+      }
+    }
+    llmSpans.sort((a, b) => new Date(a.started_at).getTime() - new Date(b.started_at).getTime());
+    let seen = 0;
+    for (const span of llmSpans) {
+      if (span.kind.kind !== 'llm_call') continue;
+      const messages = resolveInputMessages(
+        span.kind.begin.input_messages,
+        messageLog,
+        span.started_at,
+      );
+      const count = messages.filter((m) => m.source === 'user_interjection').length;
+      if (count > seen) ids.add(span.id);
+      seen = Math.max(seen, count);
+    }
+    return ids;
+  }, [activeJobTrace, messageLog]);
 
   // Fetch the active job's step/span tree on demand. Re-fires when the
   // user picks a different sidebar entry or the polling tick bumps
@@ -1631,7 +1710,12 @@ export function TraceSessionPage() {
           <div className="max-w-4xl mx-auto space-y-4 pb-10">
             {activeJobTrace?.steps.map((rs) => (
               <div key={rs.step.id} data-step-id={rs.step.id}>
-                <StepBlock rs={rs} selectedSpanId={spanIdParam} onSelect={handleSelectSpan} />
+                <StepBlock
+                  rs={rs}
+                  selectedSpanId={spanIdParam}
+                  interjectionSpanIds={interjectionSpanIds}
+                  onSelect={handleSelectSpan}
+                />
               </div>
             ))}
             {activeJobLoading && !activeJobTrace && (
@@ -1675,7 +1759,7 @@ export function TraceSessionPage() {
             messageLog={messageLog}
             jobIndex={activeJobIndex}
             totalJobs={overview.jobs.length}
-            interjectionCount={interjectionCountByJob.get(activeJobId) ?? 0}
+            interjections={interjectionsByJob.get(activeJobId) ?? []}
           />
         )}
       </div>

@@ -60,6 +60,8 @@ fn root_session(id: &str) -> Session {
         trigger: TriggerSource::User,
         lineage: None,
         hidden: false,
+        pinned: false,
+        folder_id: None,
     }
 }
 
@@ -84,7 +86,11 @@ async fn record_then_read_summary_metadata_via_session_manager() {
     let session = root_session("user-A");
     store.session.save(&session).await.unwrap();
 
-    let mgr = SessionManager::new(store.session.clone(), store.session_summary.clone());
+    let mgr = SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        store.session_folder.clone(),
+    );
 
     // Initially no metadata.
     let none = mgr.summary_metadata(&session.id).await.unwrap();
@@ -183,6 +189,7 @@ async fn background_pass_writes_summary_and_advances_cursor_without_extra_sessio
     let mgr = Arc::new(SessionManager::new(
         store.session.clone(),
         store.session_summary.clone(),
+        store.session_folder.clone(),
     ));
 
     // Two persisted parent turns so `load_active_session_messages_up_to`
@@ -280,6 +287,7 @@ async fn orphan_reaper_cleans_fs_orphans_only() {
     let mgr = Arc::new(SessionManager::new(
         store.session.clone(),
         store.session_summary.clone(),
+        store.session_folder.clone(),
     ));
 
     let paths = WorkspacePaths::new(dir.path().join("workspace"));
@@ -328,6 +336,7 @@ async fn orphan_reaper_no_op_when_sessions_dir_missing() {
     let mgr = Arc::new(SessionManager::new(
         store.session.clone(),
         store.session_summary.clone(),
+        store.session_folder.clone(),
     ));
     // Point at a workspace whose state/sessions dir was never created.
     let paths = WorkspacePaths::new(dir.path().join("empty-workspace"));
@@ -344,7 +353,11 @@ async fn parent_delete_cascades_summary_metadata() {
     let parent = root_session("parent-cascade");
     store.session.save(&parent).await.unwrap();
 
-    let mgr = SessionManager::new(store.session.clone(), store.session_summary.clone());
+    let mgr = SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        store.session_folder.clone(),
+    );
 
     mgr.record_summary_success(&parent.id, 1, 1, "m", "span", Utc::now())
         .await
@@ -364,7 +377,11 @@ async fn rapid_record_calls_accumulate_cost_and_pass_count() {
     let parent = root_session("rapid");
     store.session.save(&parent).await.unwrap();
 
-    let mgr = SessionManager::new(store.session.clone(), store.session_summary.clone());
+    let mgr = SessionManager::new(
+        store.session.clone(),
+        store.session_summary.clone(),
+        store.session_folder.clone(),
+    );
 
     // 5 quick passes — same span_id pattern as production "many
     // refreshes per session" exercise.

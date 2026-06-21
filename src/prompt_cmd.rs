@@ -273,7 +273,10 @@ async fn run_in_process(
     tokio::spawn(handle.router.run(handle.incoming_rx, handle.response_rx));
 
     incoming_tx
-        .send(build_incoming(&session_id, &opts.prompt))
+        .send(aura_channels::RouterInbound::One(Box::new(build_incoming(
+            &session_id,
+            &opts.prompt,
+        ))))
         .await
         .map_err(|e| anyhow::anyhow!("failed to submit prompt to router: {e}"))?;
 

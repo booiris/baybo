@@ -11,8 +11,8 @@ import {
   applyToolCompletedStep,
   applyTurnState,
   closeActiveWork,
-  closeWorkForFinalReply,
   finalizeMessage,
+  finalizeTrailingAnswer,
   isStopCancellationNotice,
   markLastWorkCancelled,
   mergeView,
@@ -185,7 +185,7 @@ export function routeInboundFrame(
         setViews((prev) => {
           const view = prev[sid];
           if (!view) return prev;
-          const transcript = closeWorkForFinalReply(view.transcript);
+          const transcript = closeActiveWork(view.transcript);
           if (transcript === view.transcript && !view.awaitingReply) return prev;
           return { ...prev, [sid]: { ...view, transcript, awaitingReply: false } };
         });
@@ -439,10 +439,15 @@ export function routeInboundFrame(
         // originator (which marked it optimistically) and with a reload.
         // `markLast` also covers the case where `turn_state{inactive}`
         // already closed the block to "Worked" a moment earlier.
-        const closed = closeActiveWork(view.transcript);
-        const base = isStopCancellationNotice(frame.text)
-          ? markLastWorkCancelled(closed)
-          : closed;
+        const isStopCancel = isStopCancellationNotice(frame.text);
+        // On a cancelling /stop, keep the in-progress reply as its own bubble
+        // (finalizeTrailingAnswer) below the collapsed, "Cancelled"-labelled
+        // work block — mirroring the REST reload path — rather than folding it
+        // into the block.
+        const closed = closeActiveWork(
+          isStopCancel ? finalizeTrailingAnswer(view.transcript) : view.transcript,
+        );
+        const base = isStopCancel ? markLastWorkCancelled(closed) : closed;
         return {
           ...prev,
           [sid]: {

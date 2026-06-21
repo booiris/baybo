@@ -34,10 +34,12 @@ export interface WireMessage {
   attachments?: WireAttachment[];
   platform_msg_id?: string;
   role: WireRole;
-  /** Persisted `session_messages.ordinal`, set by the server on
-   *  catch-up replays so the client can advance its per-session
-   *  cursor. Live emissions (echo / agent reply at emit time) leave
-   *  this `undefined`. */
+  /** Persisted `session_messages.ordinal`, set by the server so the
+   *  client can advance its per-session cursor. Present on catch-up
+   *  replays AND stamped onto the live final assistant reply at emit
+   *  time (see `OutgoingMessage::ordinal`), so it is NOT a reliable
+   *  live-vs-replay discriminator; a live user echo / streaming delta
+   *  leaves it `undefined`. */
   ordinal?: number;
 }
 
@@ -49,6 +51,23 @@ export interface ResourceAccess {
   vars?: string[];
 }
 
+/** Mirror of Rust `FolderView` — one folder in a `Frame::FoldersChanged`
+ *  snapshot. `position` orders siblings within their parent. `parent_id`
+ *  absent ⇒ top-level. */
+export interface WireFolder {
+  id: string;
+  parent_id?: string;
+  name: string;
+  position: number;
+  created_at: string;
+}
+
+/** Mirror of Rust `FolderChange` — the two-state folder reassignment
+ *  carried on `SessionPatch.folder_id`. `{ set: { id } }` files the
+ *  session under a folder; `'uncategorized'` clears it. The field being
+ *  absent (undefined) means "no change". */
+export type FolderChange = { set: { id: string } } | 'uncategorized';
+
 /** Sparse mutation surface — mirror of Rust `SessionPatch`. Every
  *  field independently optional; absent means "no change". A patch
  *  for an unknown session_id constructs a row iff it carries enough
@@ -58,6 +77,14 @@ export interface SessionPatch {
   created_at?: string;
   last_active?: string;
   hidden?: boolean;
+  /** Flipped by `PUT /v1/chat/sessions/:id/pin`. `true` moves the row
+   *  into the sidebar's pinned block; `false` moves it back. */
+  pinned?: boolean;
+  /** Changed by `PUT /v1/chat/sessions/:id/folder` and on folder delete.
+   *  Present means the assignment changed to this value; absent means no
+   *  change. `{ set: { id } }` files under a folder; `'uncategorized'`
+   *  clears it. */
+  folder_id?: FolderChange;
 }
 
 /** Source of a `Frame::SessionActivity` event — mirror of Rust
@@ -86,6 +113,11 @@ export type Frame =
   | { kind: 'unsubscribe'; session_id: string }
   | { kind: 'reset'; reason: string }
   | ({ kind: 'message' } & WireMessage)
+  /** Client → server. Several user messages for one session that the
+   *  server runs as a single coalesced turn (the "send every queued
+   *  message at once" path). Delivered to the actor atomically so its
+   *  coalescing can't lose stragglers to per-message intake latency. */
+  | { kind: 'messages'; messages: WireMessage[] }
   | {
       kind: 'attachment';
       session_id: string;
@@ -156,6 +188,7 @@ export type Frame =
   | { kind: 'stop_bot'; bot_id: string }
   | { kind: 'bot_status'; bot_id: string; ok: boolean; message?: string }
   | { kind: 'slash_manifest'; commands: { command: string; description: string }[] }
+  | { kind: 'folders_changed'; folders: WireFolder[] }
   | { kind: 'session_updated'; session_id: string; patch: SessionPatch }
   | { kind: 'session_activity'; session_id: string; source: ActivityKind; at: string }
   | { kind: 'ping' }
@@ -350,6 +383,33 @@ export class ChatWs {
       ...(input.attachments && input.attachments.length > 0
         ? { attachments: input.attachments }
         : {}),
+    });
+  }
+
+  /** Send several user messages for one session as a single batch frame.
+   *  The server runs them as one coalesced turn (one reply) while keeping
+   *  each as its own transcript row — used by the web "fire every queued
+   *  message at once" path so they merge deterministically instead of
+   *  racing the per-message intake. Each entry's `clientMsgId` rides as
+   *  `platform_msg_id` for the same optimistic-row reconciliation +
+   *  dedup as {@link sendMessage}. */
+  sendMessages(
+    sessionId: string,
+    messages: { content: string; clientMsgId: string; attachments?: WireAttachment[] }[],
+    channelType = 'http',
+  ): void {
+    if (messages.length === 0) return;
+    this.sendFrame({
+      kind: 'messages',
+      messages: messages.map((m) => ({
+        content: m.content,
+        session_id: sessionId,
+        user_id: 'web-operator',
+        channel_type: channelType,
+        role: 'user' as const,
+        platform_msg_id: m.clientMsgId,
+        ...(m.attachments && m.attachments.length > 0 ? { attachments: m.attachments } : {}),
+      })),
     });
   }
 

@@ -20,7 +20,7 @@
     "test": "node esbuild.config.mjs && node --test 'test/**/*.test.mjs'"
   },
   "dependencies": {
-    "chrome-devtools-mcp": "0.23.0",
+    "chrome-devtools-mcp": "1.1.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@mozilla/readability": "^0.6.0",
     "@puppeteer/browsers": "^2.13.0",

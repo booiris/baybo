@@ -75,6 +75,12 @@ export interface TranscriptRow {
   /** True when this block's turn was cancelled (`/stop`) rather than run to a
    *  normal reply — the collapsed summary reads "Cancelled · Worked Xs". */
   workCancelled?: boolean;
+  /** True for a block closed mid-turn by a user interjection: relabelled
+   *  "Worked Xs" but kept EXPANDED (steps visible) until the turn fully ends,
+   *  so the work the interjection split off doesn't vanish behind a collapse
+   *  while the agent is still replying. Cleared (→ collapse) by
+   *  `closeActiveWork` at turn-end. */
+  workSettling?: boolean;
 }
 
 export interface PendingApproval {

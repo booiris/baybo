@@ -1,0 +1,18 @@
+# Persistent, uv-managed Python environment for the SWE-bench **baseline**:
+# the official minimal agent `mini-swe-agent` (SWE-agent/mini-swe-agent) +
+# the official `swebench` grader. `uv sync` provisions a pinned CPython and a
+# reused on-disk `.venv` here — never `pip install` into the system interpreter.
+# Deps-only env (`package = false`), not an installable package.
+[project]
+name = "aura-bench-swe-baseline-pytools"
+version = "0.0.0"
+description = "SWE-bench baseline: run mini-swe-agent + ds4-flash, grade with the official swebench harness."
+# swebench's stack (datasets/pyarrow/...) lags the newest CPython; mini needs >=3.10.
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "mini-swe-agent",
+    "swebench",
+]
+
+[tool.uv]
+package = false

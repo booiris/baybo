@@ -1,17 +1,46 @@
 use std::sync::Arc;
 
 use aura_model::{
-    ChannelType, ChatMessage, ControlEvent, ControlEventKind, LlmEntryName, Session, SessionId,
-    SessionState, TriggerSource, User,
+    ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId, FolderSummary,
+    LlmEntryName, MAX_FOLDER_NAME_LEN, Session, SessionId, SessionState, TriggerSource, User,
 };
 use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, warn};
 
 use crate::SessionError;
+use aura_store::{SessionFolderRow, SessionFolderStore};
 use aura_store::{SessionStore, StoredMessage};
 use aura_store::{SessionSummaryRow, SessionSummaryStore};
 
 type Result<T> = std::result::Result<T, SessionError>;
+
+/// Map a store row into the domain summary.
+fn folder_row_to_summary(row: SessionFolderRow) -> FolderSummary {
+    FolderSummary {
+        id: row.id,
+        parent_id: row.parent_id,
+        name: row.name,
+        position: row.position,
+        created_at: row.created_at,
+    }
+}
+
+/// Trim and bound-check a folder name. Empty (after trim) or over the
+/// length cap is a client error.
+fn validate_folder_name(name: String) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(SessionError::InvalidFolderOp(
+            "folder name cannot be empty".to_owned(),
+        ));
+    }
+    if trimmed.chars().count() > MAX_FOLDER_NAME_LEN {
+        return Err(SessionError::InvalidFolderOp(format!(
+            "folder name exceeds {MAX_FOLDER_NAME_LEN} characters"
+        )));
+    }
+    Ok(trimmed.to_owned())
+}
 
 /// Higher-level session management logic wrapping a `SessionStore`.
 pub struct SessionManager {
@@ -20,13 +49,21 @@ pub struct SessionManager {
     /// production wires the libsql backend; tests pass
     /// `crate::test_support::MemorySessionSummaryStore`.
     summary_store: Arc<dyn SessionSummaryStore>,
+    /// Chat-list folder store. Required at construction — production wires
+    /// the libsql backend; tests pass `MemorySessionFolderStore`.
+    folder_store: Arc<dyn SessionFolderStore>,
 }
 
 impl SessionManager {
-    pub fn new(store: Arc<dyn SessionStore>, summary_store: Arc<dyn SessionSummaryStore>) -> Self {
+    pub fn new(
+        store: Arc<dyn SessionStore>,
+        summary_store: Arc<dyn SessionSummaryStore>,
+        folder_store: Arc<dyn SessionFolderStore>,
+    ) -> Self {
         Self {
             store,
             summary_store,
+            folder_store,
         }
     }
 
@@ -155,6 +192,8 @@ impl SessionManager {
             trigger: parent.trigger.clone(),
             lineage: Some(lineage),
             hidden: false,
+            pinned: false,
+            folder_id: None,
         };
         self.store.save(&session).await?;
         debug!(
@@ -184,6 +223,8 @@ impl SessionManager {
             trigger,
             lineage: None,
             hidden: false,
+            pinned: false,
+            folder_id: None,
         };
         self.store.save(&session).await?;
         debug!(session_id = %session.id, "created new session");
@@ -507,6 +548,184 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Flip the session's chat-list `pinned` flag — the sidebar "pin to
+    /// top" affordance. Targeted flat-column write that survives a
+    /// concurrent `touch`; see [`aura_store::SessionStore::set_pinned`].
+    /// Returns `Err(NotFound)` when the session id is unknown.
+    pub async fn set_pinned(&self, session_id: &SessionId, pinned: bool) -> Result<()> {
+        let updated = self.store.set_pinned(session_id, pinned).await?;
+        if !updated {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        debug!(session_id = %session_id, pinned, "toggled session pinned");
+        Ok(())
+    }
+
+    /// Move (or clear, with `None`) a session's chat-list folder
+    /// assignment. Targeted flat-column write that survives a concurrent
+    /// `touch`; see [`aura_store::SessionStore::set_folder`]. When
+    /// `folder_id` is `Some`, the folder must exist. Returns
+    /// `Err(NotFound)` when the session id or folder id is unknown.
+    pub async fn set_folder(
+        &self,
+        session_id: &SessionId,
+        folder_id: Option<&FolderId>,
+    ) -> Result<()> {
+        if let Some(fid) = folder_id
+            && self.folder_store.get(fid).await?.is_none()
+        {
+            return Err(SessionError::NotFound(format!("folder {fid}")));
+        }
+        let updated = self.store.set_folder(session_id, folder_id).await?;
+        if !updated {
+            return Err(SessionError::NotFound(format!("session {session_id}")));
+        }
+        debug!(session_id = %session_id, folder_id = ?folder_id, "set session folder");
+        Ok(())
+    }
+
+    /// Every chat-list folder, sibling-ordered. Drives `GET /v1/chat/folders`
+    /// and seeds the realtime folder snapshot broadcast.
+    pub async fn list_folders(&self) -> Result<Vec<FolderSummary>> {
+        let rows = self.folder_store.list().await?;
+        Ok(rows.into_iter().map(folder_row_to_summary).collect())
+    }
+
+    /// Create a folder under `parent_id` (`None` = top-level). Enforces the
+    /// name-length cap and the two-level depth limit. Returns the created
+    /// folder so the caller can echo it without a re-list.
+    pub async fn create_folder(
+        &self,
+        parent_id: Option<FolderId>,
+        name: String,
+    ) -> Result<FolderSummary> {
+        let name = validate_folder_name(name)?;
+        if let Some(parent) = parent_id.as_ref() {
+            // Depth cap: a sub-folder's parent must itself be top-level.
+            let parent_row = self
+                .folder_store
+                .get(parent)
+                .await?
+                .ok_or_else(|| SessionError::NotFound(format!("folder {parent}")))?;
+            if parent_row.parent_id.is_some() {
+                return Err(SessionError::InvalidFolderOp(
+                    "folders nest at most two levels deep".to_owned(),
+                ));
+            }
+        }
+        let position = self.next_sibling_position(parent_id.as_ref()).await?;
+        let row = SessionFolderRow {
+            id: FolderId::generate(),
+            parent_id,
+            name,
+            position,
+            created_at: Utc::now(),
+        };
+        self.folder_store.create(&row).await?;
+        debug!(folder_id = %row.id, "created folder");
+        Ok(folder_row_to_summary(row))
+    }
+
+    /// Rename a folder. Enforces the name-length cap.
+    pub async fn rename_folder(&self, id: &FolderId, name: String) -> Result<()> {
+        let name = validate_folder_name(name)?;
+        if !self.folder_store.rename(id, &name).await? {
+            return Err(SessionError::NotFound(format!("folder {id}")));
+        }
+        Ok(())
+    }
+
+    /// Move a folder under a new parent (`None` = promote to top-level),
+    /// appended to the end of the new sibling group. Enforces the depth cap
+    /// and rejects cycles (self-parent, nesting under a non-top-level
+    /// folder, or nesting a folder that itself has children).
+    pub async fn reparent_folder(&self, id: &FolderId, new_parent: Option<FolderId>) -> Result<()> {
+        if self.folder_store.get(id).await?.is_none() {
+            return Err(SessionError::NotFound(format!("folder {id}")));
+        }
+        if let Some(parent) = new_parent.as_ref() {
+            if parent == id {
+                return Err(SessionError::InvalidFolderOp(
+                    "a folder cannot be its own parent".to_owned(),
+                ));
+            }
+            let parent_row = self
+                .folder_store
+                .get(parent)
+                .await?
+                .ok_or_else(|| SessionError::NotFound(format!("folder {parent}")))?;
+            if parent_row.parent_id.is_some() {
+                return Err(SessionError::InvalidFolderOp(
+                    "folders nest at most two levels deep".to_owned(),
+                ));
+            }
+            // Nesting a folder that has its own children would push them to
+            // a third level.
+            let has_children = self
+                .folder_store
+                .list()
+                .await?
+                .iter()
+                .any(|f| f.parent_id.as_ref() == Some(id));
+            if has_children {
+                return Err(SessionError::InvalidFolderOp(
+                    "move the sub-folders out first — a folder with sub-folders can't be nested"
+                        .to_owned(),
+                ));
+            }
+        }
+        let position = self.next_sibling_position(new_parent.as_ref()).await?;
+        if !self
+            .folder_store
+            .reparent(id, new_parent.as_ref(), position)
+            .await?
+        {
+            return Err(SessionError::NotFound(format!("folder {id}")));
+        }
+        Ok(())
+    }
+
+    /// Renumber a sibling group to match `ordered_ids`.
+    pub async fn reorder_folders(
+        &self,
+        parent_id: Option<FolderId>,
+        ordered_ids: Vec<FolderId>,
+    ) -> Result<()> {
+        self.folder_store
+            .reorder(parent_id.as_ref(), &ordered_ids)
+            .await?;
+        Ok(())
+    }
+
+    /// Delete a folder (organisational only — sessions are never removed).
+    /// Its direct chats fall back to uncategorized and its sub-folders are
+    /// promoted to top-level. Returns the ids of the sessions whose
+    /// assignment was cleared so the caller can broadcast per-session
+    /// "now uncategorized" patches. Returns `Err(NotFound)` for an unknown
+    /// folder.
+    pub async fn delete_folder(&self, id: &FolderId) -> Result<Vec<SessionId>> {
+        match self.folder_store.delete(id).await? {
+            Some(affected) => {
+                debug!(folder_id = %id, cleared = affected.len(), "deleted folder");
+                Ok(affected)
+            }
+            None => Err(SessionError::NotFound(format!("folder {id}"))),
+        }
+    }
+
+    /// Next append position within a sibling group (max existing + 1, or 0).
+    async fn next_sibling_position(&self, parent_id: Option<&FolderId>) -> Result<i64> {
+        let max = self
+            .folder_store
+            .list()
+            .await?
+            .iter()
+            .filter(|f| f.parent_id.as_ref() == parent_id)
+            .map(|f| f.position)
+            .max();
+        Ok(max.map(|m| m + 1).unwrap_or(0))
+    }
+
     pub async fn touch(&self, session_id: &SessionId) -> Result<()> {
         let session = self.store.get(session_id).await?;
         match session {
@@ -546,11 +765,13 @@ impl SessionManager {
 mod tests {
     use std::sync::Arc;
 
-    use aura_model::{ChannelType, SessionId, User};
+    use aura_model::{ChannelType, FolderId, MAX_FOLDER_NAME_LEN, SessionId, User};
     use chrono::{Duration, Utc};
 
     use super::{SessionError, SessionManager, SessionStore};
-    use crate::test_support::{MemorySessionStore, MemorySessionSummaryStore};
+    use crate::test_support::{
+        MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
+    };
 
     fn test_user() -> User {
         User {
@@ -563,7 +784,11 @@ mod tests {
     #[tokio::test]
     async fn create_session_returns_valid_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -580,7 +805,11 @@ mod tests {
     #[tokio::test]
     async fn get_or_create_returns_existing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -598,7 +827,11 @@ mod tests {
     #[tokio::test]
     async fn get_or_create_creates_new_when_missing() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let id = SessionId::from("cli-abc");
         let session = mgr
@@ -611,10 +844,142 @@ mod tests {
         assert!(reloaded.is_some());
     }
 
+    fn folder_mgr() -> SessionManager {
+        SessionManager::new(
+            Arc::new(MemorySessionStore::new()),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn create_folder_enforces_depth_cap() {
+        let mgr = folder_mgr();
+        let top = mgr.create_folder(None, "Top".into()).await.unwrap();
+        let sub = mgr
+            .create_folder(Some(top.id.clone()), "Sub".into())
+            .await
+            .unwrap();
+        assert_eq!(sub.parent_id, Some(top.id.clone()));
+
+        // A third level is rejected.
+        let err = mgr
+            .create_folder(Some(sub.id.clone()), "Deep".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::InvalidFolderOp(_)));
+
+        // Unknown parent → NotFound.
+        let err = mgr
+            .create_folder(Some(FolderId::from("ghost")), "X".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn create_folder_validates_name() {
+        let mgr = folder_mgr();
+        let blank = mgr.create_folder(None, "   ".into()).await.unwrap_err();
+        assert!(matches!(blank, SessionError::InvalidFolderOp(_)));
+
+        let long = "x".repeat(MAX_FOLDER_NAME_LEN + 1);
+        let too_long = mgr.create_folder(None, long).await.unwrap_err();
+        assert!(matches!(too_long, SessionError::InvalidFolderOp(_)));
+
+        // Names are trimmed.
+        let f = mgr.create_folder(None, "  Work  ".into()).await.unwrap();
+        assert_eq!(f.name, "Work");
+    }
+
+    #[tokio::test]
+    async fn reparent_rejects_self_cycle_and_depth() {
+        let mgr = folder_mgr();
+        let a = mgr.create_folder(None, "A".into()).await.unwrap();
+        let b = mgr.create_folder(None, "B".into()).await.unwrap();
+        let a1 = mgr
+            .create_folder(Some(a.id.clone()), "A1".into())
+            .await
+            .unwrap();
+
+        // Self-parent.
+        assert!(matches!(
+            mgr.reparent_folder(&a.id, Some(a.id.clone()))
+                .await
+                .unwrap_err(),
+            SessionError::InvalidFolderOp(_)
+        ));
+        // Nesting under a non-top-level folder (a1 is a child).
+        assert!(matches!(
+            mgr.reparent_folder(&b.id, Some(a1.id.clone()))
+                .await
+                .unwrap_err(),
+            SessionError::InvalidFolderOp(_)
+        ));
+        // Nesting a folder that itself has children (a has child a1).
+        assert!(matches!(
+            mgr.reparent_folder(&a.id, Some(b.id.clone()))
+                .await
+                .unwrap_err(),
+            SessionError::InvalidFolderOp(_)
+        ));
+
+        // Valid: move the leaf a1 under b, then promote it to top-level.
+        mgr.reparent_folder(&a1.id, Some(b.id.clone()))
+            .await
+            .unwrap();
+        mgr.reparent_folder(&a1.id, None).await.unwrap();
+        let listed = mgr.list_folders().await.unwrap();
+        let a1_now = listed.iter().find(|f| f.id == a1.id).unwrap();
+        assert_eq!(a1_now.parent_id, None);
+    }
+
+    #[tokio::test]
+    async fn set_folder_requires_existing_folder_and_session() {
+        let store = Arc::new(MemorySessionStore::new());
+        let mgr = SessionManager::new(
+            store.clone(),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
+        let session = mgr
+            .create_session(test_user(), ChannelType::http())
+            .await
+            .unwrap();
+        let folder = mgr.create_folder(None, "Inbox".into()).await.unwrap();
+
+        // Unknown folder → NotFound (folder existence checked first).
+        assert!(matches!(
+            mgr.set_folder(&session.id, Some(&FolderId::from("ghost")))
+                .await
+                .unwrap_err(),
+            SessionError::NotFound(_)
+        ));
+        // Unknown session → NotFound.
+        assert!(matches!(
+            mgr.set_folder(&SessionId::from("nope"), Some(&folder.id))
+                .await
+                .unwrap_err(),
+            SessionError::NotFound(_)
+        ));
+        // Valid assignment, then clear.
+        mgr.set_folder(&session.id, Some(&folder.id)).await.unwrap();
+        assert_eq!(
+            mgr.get(&session.id).await.unwrap().unwrap().folder_id,
+            Some(folder.id.clone())
+        );
+        mgr.set_folder(&session.id, None).await.unwrap();
+        assert_eq!(mgr.get(&session.id).await.unwrap().unwrap().folder_id, None);
+    }
+
     #[tokio::test]
     async fn touch_updates_last_active() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store.clone(),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let mut session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -637,7 +1002,11 @@ mod tests {
     #[tokio::test]
     async fn touch_nonexistent_returns_not_found() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let err = mgr
             .touch(&SessionId::from("nonexistent"))
@@ -649,7 +1018,11 @@ mod tests {
     #[tokio::test]
     async fn idle_sessions_lists_without_deleting() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store.clone(),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let mut idle = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -674,7 +1047,11 @@ mod tests {
     #[tokio::test]
     async fn list_returns_all_sessions_newest_first() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store.clone(),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let mut first = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -697,7 +1074,11 @@ mod tests {
     #[tokio::test]
     async fn history_returns_messages_for_existing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -711,7 +1092,11 @@ mod tests {
     #[tokio::test]
     async fn history_errors_for_missing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let err = mgr
             .history(&SessionId::from("nonexistent"))
@@ -731,7 +1116,11 @@ mod tests {
         use aura_model::{ChatMessage, ContentBlock};
 
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store.clone(),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
             .await
@@ -780,7 +1169,11 @@ mod tests {
     #[tokio::test]
     async fn full_transcript_errors_for_missing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let err = mgr
             .full_transcript(&SessionId::from("nonexistent"))
@@ -792,7 +1185,11 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_existing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -806,7 +1203,11 @@ mod tests {
     #[tokio::test]
     async fn delete_errors_for_missing_session() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let err = mgr
             .delete(&SessionId::from("nonexistent"))
@@ -824,7 +1225,11 @@ mod tests {
         // in-memory only (router/supervisor drop the actor); history
         // stays put.
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store.clone(), Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store.clone(),
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let mut session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -856,7 +1261,11 @@ mod tests {
         use aura_model::{ChatMessage, ContentBlock, Role};
 
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())
@@ -901,7 +1310,11 @@ mod tests {
     #[tokio::test]
     async fn load_active_messages_empty_for_session_without_turns() {
         let store = Arc::new(MemorySessionStore::new());
-        let mgr = SessionManager::new(store, Arc::new(MemorySessionSummaryStore::new()));
+        let mgr = SessionManager::new(
+            store,
+            Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
+        );
 
         let session = mgr
             .create_session(test_user(), ChannelType::tui())

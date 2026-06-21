@@ -165,6 +165,12 @@ Every agent run also writes its **verbatim transcript + call-tree trace** to
 exactly what the agent did and why it stopped. Default-on; `NO_TRACE=1` (or
 `--no-trace`) disables it; `trace/` is gitignored.
 
+For a readable rendering, `export_aura_trajs.py --run-id <run_id>` turns those
+traces into per-instance Markdown (`Task → per-step thinking/command/output →
+final diff`) under `trace/<run_id>/_export/`. To compare against the
+mini-swe-agent baseline side by side, see `bench/swe-baseline/view_compare.sh`
+(one-click export + diff page).
+
 ## Caveats
 
 - **musl build is effectively mandatory for the agent arm.** A glibc `aura`

@@ -1404,6 +1404,8 @@ mod resume_validation_tests {
             trigger: TriggerSource::User,
             lineage: None,
             hidden: false,
+            pinned: false,
+            folder_id: None,
         }
     }
 
@@ -1603,7 +1605,9 @@ mod foreground_job_tests {
     //! the convert/escort plumbing it calls is exercised end-to-end by the
     //! integration suite.
     use super::*;
-    use aura_session::test_support::{MemorySessionStore, MemorySessionSummaryStore};
+    use aura_session::test_support::{
+        MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
+    };
 
     fn test_supervisor() -> AgentSupervisor {
         let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
@@ -1614,6 +1618,7 @@ mod foreground_job_tests {
         Arc::new(SessionManager::new(
             Arc::new(MemorySessionStore::new()),
             Arc::new(MemorySessionSummaryStore::new()),
+            Arc::new(MemorySessionFolderStore::new()),
         ))
     }
 

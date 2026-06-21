@@ -292,6 +292,9 @@ fn map_frame(
                 msg.content,
             )]))
         }
+        // Client → server only (the web "send every queued message at once"
+        // batch); never arrives inbound.
+        Frame::Messages { .. } => None,
         Frame::Notice {
             session_id,
             level,
@@ -400,7 +403,9 @@ fn map_frame(
             }
             Some(TransportEvent::Status { phase })
         }
-        Frame::SessionUpdated { .. } | Frame::SessionActivity { .. } => {
+        Frame::SessionUpdated { .. }
+        | Frame::SessionActivity { .. }
+        | Frame::FoldersChanged { .. } => {
             // Web-chat sidebar signals — TUI tracks a single session
             // of its own and has no list view, so it ignores rather
             // than warning.

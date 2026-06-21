@@ -3,6 +3,8 @@ import { createRoot } from 'react-dom/client';
 import { HashRouter } from 'react-router-dom';
 import App from './App';
 import { AdminAuthProvider } from './api/auth';
+import { QueueProvider } from './pages/chat/queueStore';
+import { FolderProvider } from './pages/chat/folderStore';
 import './index.css';
 
 const root = document.getElementById('root');
@@ -13,9 +15,13 @@ if (!root) {
 createRoot(root).render(
   <StrictMode>
     <AdminAuthProvider>
-      <HashRouter>
-        <App />
-      </HashRouter>
+      <QueueProvider>
+        <FolderProvider>
+          <HashRouter>
+            <App />
+          </HashRouter>
+        </FolderProvider>
+      </QueueProvider>
     </AdminAuthProvider>
   </StrictMode>,
 );

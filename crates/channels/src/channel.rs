@@ -20,7 +20,7 @@ use crate::connection::{Connection, ConnectionId, SendOutcome};
 use crate::error::ConnectionNotFoundError;
 use crate::kind::ChannelKind;
 use crate::types::{AgentEvent, AgentOutput, IncomingMessage, SessionEvent};
-use crate::wire::{ActivityKind, Frame, SessionPatch};
+use crate::wire::{ActivityKind, FolderView, Frame, SessionPatch};
 
 /// Side-effect callback invoked at the top of [`Channel::dispatch_event`],
 /// before any fan-out. The observer receives the event by reference
@@ -531,6 +531,14 @@ impl<'a> SubscribedView<'a> {
     pub fn broadcast_session_patch(&self, session_id: SessionId, patch: SessionPatch) {
         self.0
             .broadcast_frame(Frame::SessionUpdated { session_id, patch });
+    }
+
+    /// Broadcast a [`Frame::FoldersChanged`] snapshot to every connection
+    /// on this channel. Used by the admin chat API after any folder
+    /// create / rename / delete / reorder / reparent so every
+    /// open web tab converges on the new folder tree without a refetch.
+    pub fn broadcast_folders_changed(&self, folders: Vec<FolderView>) {
+        self.0.broadcast_frame(Frame::FoldersChanged { folders });
     }
 
     /// Broadcast a [`Frame::SessionActivity`] pulse for sidebar

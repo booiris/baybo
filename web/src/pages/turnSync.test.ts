@@ -104,9 +104,11 @@ describe('applyTurnState — turn-state reconciliation', () => {
     expect(applyTurnState([workRow({ startedAt: 1000, active: true, steps: [] })], false, null)).toHaveLength(0);
   });
 
-  it('leaves a prose-tailed open block for the terminal Message to peel', () => {
-    const prev = [workRow({ startedAt: 1000, active: true, steps: [proseStep('partial answer')] })];
-    expect(applyTurnState(prev, false, null)).toBe(prev);
+  it('collapses a prose-tailed open block on active:false (answer streams in its own bubble)', () => {
+    const prev = [workRow({ startedAt: 1000, active: true, steps: [proseStep('intermediate')] })];
+    const next = applyTurnState(prev, false, null);
+    expect(next[0].workActive).toBe(false);
+    expect(typeof next[0].workEndedAt).toBe('number');
   });
 });
 

@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::auth::ChannelTokenTable;
 use aura_agent::service::ShutdownSignal;
 use aura_agent::{CronScheduler, SessionManager};
-use aura_channels::{ChannelRegistry, IncomingMessage};
+use aura_channels::{ChannelRegistry, RouterInbound};
 use aura_config::AuraConfig;
 use aura_job::JobLifecycle;
 use aura_llm::{LlmProviderConfig, LlmProviderRegistry};
@@ -123,7 +123,7 @@ pub struct TestGateway {
     /// Receiver paired with `deps.incoming_tx`. Exposed so tests that
     /// exercise the router-intake path (e.g. the WS channel server)
     /// can assert on frames forwarded by the gateway.
-    pub incoming_rx: mpsc::Receiver<IncomingMessage>,
+    pub incoming_rx: mpsc::Receiver<RouterInbound>,
     /// Capability table shared with `deps.channel_tokens`. Tests mint
     /// tokens here to authenticate sidecar clients.
     pub channel_tokens: ChannelTokenTable,
@@ -146,6 +146,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     let session_manager = Arc::new(SessionManager::new(
         stores.session.clone(),
         stores.session_summary.clone(),
+        stores.session_folder.clone(),
     ));
     let job_lifecycle = Arc::new(JobLifecycle::new(stores.job.clone()));
 

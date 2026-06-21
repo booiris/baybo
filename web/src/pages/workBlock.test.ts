@@ -4,6 +4,8 @@ import {
   workBlockDisplay,
   formatWorkedLabel,
   closeActiveWork,
+  settleActiveWork,
+  finalizeTrailingAnswer,
   isStopCommand,
   isStopCancellationNotice,
   markLastWorkCancelled,
@@ -36,6 +38,12 @@ describe('workBlockDisplay — spinner first, expand on the first step', () => {
     // `expanded` is meaningless while active; the live turn stays boxed
     // regardless, so toggling can't hide an in-flight turn.
     expect(workBlockDisplay(true, false, true).boxed).toBe(true);
+  });
+
+  it('a settling block (interjection-paused) stays boxed with its panel open', () => {
+    // workActive=false (reads "Worked"), not user-expanded, but settling keeps
+    // it open until the turn ends.
+    expect(workBlockDisplay(false, true, false, true)).toEqual({ boxed: true, panelOpen: true });
   });
 });
 
@@ -102,6 +110,42 @@ describe('closeActiveWork — optimistic cancel on /stop', () => {
   });
 });
 
+describe('settleActiveWork — interjection pauses the block open until turn-end', () => {
+  const step: WorkStep = { key: 's', kind: 'tool', tool: 'edit_file', toolStatus: 'ok' };
+  const activeBlock = (): TranscriptRow => ({
+    key: 'w',
+    role: 'system',
+    text: '',
+    kind: 'work',
+    steps: [step],
+    workActive: true,
+    workStartedAt: 1000,
+  });
+
+  it('relabels to "Worked" (workActive false) but marks the block settling (kept open)', () => {
+    const [row] = settleActiveWork([activeBlock()]);
+    expect(row.workActive).toBe(false);
+    expect(row.workSettling).toBe(true);
+    expect(row.workCancelled).toBeFalsy();
+    expect(typeof row.workEndedAt).toBe('number');
+  });
+
+  it('drops an empty block (no work to keep open)', () => {
+    const empty: TranscriptRow = { ...activeBlock(), steps: [] };
+    expect(settleActiveWork([empty])).toHaveLength(0);
+  });
+
+  it('closeActiveWork collapses a settling block at turn-end (clears the flag)', () => {
+    const settled = settleActiveWork([activeBlock()]);
+    expect(settled[0].workSettling).toBe(true);
+    // A later turn-end close (no active block left) still clears settling so the
+    // block collapses to its summary.
+    const [row] = closeActiveWork(settled);
+    expect(row.workSettling).toBe(false);
+    expect(row.workActive).toBe(false);
+  });
+});
+
 describe('isStopCancellationNotice — only a real cancel', () => {
   it('true when the /stop actually cancelled the reply', () => {
     expect(isStopCancellationNotice('Stopped.\n- Cancelled the in-progress reply.')).toBe(true);
@@ -139,5 +183,69 @@ describe('markLastWorkCancelled — label the turn just stopped', () => {
     const out = markLastWorkCancelled(rows);
     expect(out[0].workCancelled).toBeFalsy();
     expect(out).toBe(rows); // unchanged reference — no work tail to mark
+  });
+
+  it('marks the work block above a salvaged trailing reply bubble', () => {
+    // After a /stop the partial reply is kept as its own bubble below the
+    // work block, so the block is no longer the last row — it must still get
+    // the "Cancelled" label.
+    const rows: TranscriptRow[] = [
+      closedWork(),
+      { key: 'a', role: 'assistant', text: 'a partial answer' },
+    ];
+    const out = markLastWorkCancelled(rows);
+    expect(out[0].workCancelled).toBe(true);
+    expect(out[1].text).toBe('a partial answer'); // bubble untouched
+  });
+});
+
+describe('finalizeTrailingAnswer — keep the /stop reply as a bubble', () => {
+  const streamingAnswer = (text: string): TranscriptRow => ({
+    key: 'a',
+    role: 'assistant',
+    text,
+    streaming: true,
+  });
+  const activeWork = (): TranscriptRow => ({
+    key: 'w',
+    role: 'system',
+    text: '',
+    kind: 'work',
+    steps: [{ key: 's', kind: 'tool', tool: 'edit_file', toolStatus: 'ok' }],
+    workActive: true,
+    workStartedAt: 1000,
+  });
+
+  it('finalizes a trailing streaming answer into a permanent bubble', () => {
+    const out = finalizeTrailingAnswer([activeWork(), streamingAnswer('a b-tree is')]);
+    expect(out).toHaveLength(2);
+    expect(out[1].role).toBe('assistant');
+    expect(out[1].streaming).toBe(false);
+    expect(out[1].text).toBe('a b-tree is');
+  });
+
+  it('drops an empty partial (nothing streamed yet)', () => {
+    const out = finalizeTrailingAnswer([activeWork(), streamingAnswer('   ')]);
+    expect(out).toHaveLength(1);
+    expect(out[0].kind).toBe('work');
+  });
+
+  it('is a no-op when the tail is not a streaming assistant bubble', () => {
+    const rows = [activeWork()];
+    expect(finalizeTrailingAnswer(rows)).toBe(rows);
+  });
+
+  it('the /stop composition leaves the reply a bubble below a Cancelled block', () => {
+    // The exact shape the live cancellation path produces:
+    // finalizeTrailingAnswer → closeActiveWork → markLastWorkCancelled.
+    const rows = [activeWork(), streamingAnswer('a b-tree is')];
+    const out = markLastWorkCancelled(closeActiveWork(finalizeTrailingAnswer(rows)));
+    expect(out).toHaveLength(2);
+    expect(out[0].kind).toBe('work');
+    expect(out[0].workActive).toBe(false);
+    expect(out[0].workCancelled).toBe(true);
+    expect(out[1].role).toBe('assistant');
+    expect(out[1].streaming).toBe(false);
+    expect(out[1].text).toBe('a b-tree is');
   });
 });

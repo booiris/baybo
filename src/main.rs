@@ -244,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
             .session(Arc::new(aura_agent::SessionManager::new(
                 stores.session.clone(),
                 stores.session_summary.clone(),
+                stores.session_folder.clone(),
             )))
             .job(Arc::new(aura_job::JobLifecycle::new(stores.job.clone())))
             .trace(stores.trace.clone())

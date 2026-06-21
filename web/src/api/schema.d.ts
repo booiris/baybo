@@ -72,6 +72,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/folders": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_folders"];
+        put?: never;
+        post: operations["create_folder"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/folders/reorder": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["reorder_folders"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/folders/{folder_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["delete_folder"];
+        options?: never;
+        head?: never;
+        patch: operations["update_folder"];
+        trace?: never;
+    };
+    "/v1/chat/folders/{folder_id}/move": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["move_folder"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions": {
         parameters: {
             query?: never;
@@ -104,6 +168,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/{session_id}/folder": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_session_folder"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}/model": {
         parameters: {
             query?: never;
@@ -113,6 +193,22 @@ export interface paths {
         };
         get?: never;
         put: operations["set_session_model"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/sessions/{session_id}/pin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_session_pin"];
         post?: never;
         delete?: never;
         options?: never;
@@ -728,6 +824,12 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             /**
+             * @description The user-created folder this session is filed under, or absent for
+             *     uncategorized. Set via `PUT /v1/chat/sessions/{id}/folder`; the web
+             *     sidebar groups rows by this id.
+             */
+            folder_id?: string | null;
+            /**
              * @description True when the user has hidden this session from their chat
              *     list. Only ever populated in responses when
              *     `include_hidden=true` was requested.
@@ -744,6 +846,12 @@ export interface components {
              *     transcript holds only system/tool rows).
              */
             last_user_text?: string | null;
+            /**
+             * @description True when the user has pinned this session to the top of their
+             *     chat list. Always emitted so the sidebar can place every row in
+             *     the right block; set via `PUT /v1/chat/sessions/{id}/pin`.
+             */
+            pinned: boolean;
             session_id: string;
         };
         ChatSessionsList: {
@@ -879,6 +987,11 @@ export interface components {
             timezone: string;
             user_id: string;
         };
+        CreateFolderRequest: {
+            name: string;
+            /** @description Parent folder id (`null`/absent = top-level). */
+            parent_id?: string | null;
+        };
         /** @description Mirror of [`aura_cron::CronJob`]. */
         CronJob: {
             channel: components["schemas"]["ChannelType"];
@@ -923,6 +1036,19 @@ export interface components {
          */
         ErrorBody: {
             error: string;
+        };
+        /** @description One folder in a folder-list / create response. */
+        FolderDto: {
+            /** Format: date-time */
+            created_at: string;
+            id: string;
+            name: string;
+            parent_id?: string | null;
+            /** Format: int64 */
+            position: number;
+        };
+        FolderList: {
+            items: components["schemas"]["FolderDto"][];
         };
         /**
          * @description Wire mirror of [`aura_job::Job`]. Inner shape reflects the new
@@ -1171,6 +1297,10 @@ export interface components {
              */
             total: number;
         };
+        MoveFolderRequest: {
+            /** @description New parent id, or `null` to promote the folder to top-level. */
+            parent_id?: string | null;
+        };
         /** @description Response body for `PUT` / `DELETE /v1/config`. */
         MutateResponse: {
             path: string;
@@ -1194,6 +1324,12 @@ export interface components {
             /** @description All entry names present in the rebuilt pool. */
             entries: string[];
         };
+        ReorderFoldersRequest: {
+            /** @description The sibling ids in their new order. */
+            ordered_ids: string[];
+            /** @description Parent of the sibling group being reordered (`null` = top-level). */
+            parent_id?: string | null;
+        };
         /**
          * @description Wire mirror of [`aura_query::SessionKind`]. Coarse trigger/lineage
          *     label for the trace browser list view.
@@ -1209,6 +1345,11 @@ export interface components {
         /** @description `PUT /v1/llm/default` body. */
         SetDefaultLlmRequest: {
             name: string;
+        };
+        /** @description Request body for `PUT /v1/chat/sessions/{session_id}/folder`. */
+        SetSessionFolderRequest: {
+            /** @description Target folder id, or `null` to clear the assignment (uncategorized). */
+            folder_id?: string | null;
         };
         /** @description Request body for `PUT /v1/chat/sessions/{session_id}/model`. */
         SetSessionModelRequest: {
@@ -1229,6 +1370,14 @@ export interface components {
             applied_to_live_actor: boolean;
             /** @description The pin now in effect: the entry name, or `null` for `default-llm`. */
             last_llm?: string | null;
+        };
+        /** @description Request body for `PUT /v1/chat/sessions/{session_id}/pin`. */
+        SetSessionPinRequest: {
+            /**
+             * @description `true` to pin this session to the top of the chat list, `false`
+             *     to unpin it back into the regular list.
+             */
+            pinned: boolean;
         };
         /**
          * @description Wire DTO for slash command entries. Mirror of
@@ -1283,6 +1432,10 @@ export interface components {
         /** @description `DELETE /v1/config` body. */
         UnsetConfigRequest: {
             path: string;
+        };
+        UpdateFolderRequest: {
+            /** @description New name (absent = unchanged). */
+            name?: string | null;
         };
         /**
          * @description `PUT /v1/llm/models/{name}` body. Every field is optional — only
@@ -1452,6 +1605,260 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_folders: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The chat-list folder tree */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FolderList"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_folder: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateFolderRequest"];
+            };
+        };
+        responses: {
+            /** @description The created folder */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FolderDto"];
+                };
+            };
+            /** @description Invalid name / depth */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Parent folder not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    reorder_folders: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReorderFoldersRequest"];
+            };
+        };
+        responses: {
+            /** @description Sibling group reordered */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_folder: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Folder id to delete */
+                folder_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Folder dissolved (sessions preserved) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Folder not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_folder: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Folder id to rename */
+                folder_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateFolderRequest"];
+            };
+        };
+        responses: {
+            /** @description Folder updated */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Folder not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    move_folder: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Folder id to reparent */
+                folder_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MoveFolderRequest"];
+            };
+        };
+        responses: {
+            /** @description Folder moved */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Cycle / depth violation */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Folder not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1631,6 +2038,49 @@ export interface operations {
             };
         };
     };
+    set_session_folder: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id to file */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSessionFolderRequest"];
+            };
+        };
+        responses: {
+            /** @description Folder assignment updated */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session or folder not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     set_session_model: {
         parameters: {
             query?: never;
@@ -1664,6 +2114,49 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_session_pin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session id to pin or unpin */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSessionPinRequest"];
+            };
+        };
+        responses: {
+            /** @description Pin state updated */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Unauthorized */
             401: {

@@ -240,6 +240,8 @@ mod tests {
             trigger: TriggerSource::User,
             lineage: None,
             hidden: false,
+            pinned: false,
+            folder_id: None,
         }
     }
 

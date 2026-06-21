@@ -28,7 +28,7 @@ use aura_agent::service::{ShutdownSignal, TaskTracker};
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::tool_executor::ToolExecutor;
 use aura_agent::{CronScheduler, CronTriggerEvent, SecretVault, SecurityGateway, SessionManager};
-use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
+use aura_channels::{AgentOutput, ChannelRegistry, RouterInbound};
 use aura_config::{AuraConfig, LlmEntryName};
 use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer, Tokenizer};
 use aura_cost::{CostManager, SpendingLimits};
@@ -436,6 +436,7 @@ pub async fn build_managers(
     let session_manager = Arc::new(SessionManager::new(
         stores.session.clone(),
         stores.session_summary.clone(),
+        stores.session_folder.clone(),
     ));
 
     // Delete orphan summary directories under `state/sessions/` left by
@@ -754,8 +755,8 @@ pub async fn build_managers(
 /// or drop the whole graph together.
 pub struct RouterRunHandle {
     pub router: Router,
-    pub incoming_tx: mpsc::Sender<IncomingMessage>,
-    pub incoming_rx: mpsc::Receiver<IncomingMessage>,
+    pub incoming_tx: mpsc::Sender<RouterInbound>,
+    pub incoming_rx: mpsc::Receiver<RouterInbound>,
     pub response_rx: mpsc::Receiver<AgentOutput>,
     /// Clone of the actor registry, handed to the gateway so the chat
     /// `PUT /v1/chat/sessions/{id}/model` endpoint can route an

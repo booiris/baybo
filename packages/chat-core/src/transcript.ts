@@ -18,42 +18,29 @@ export function mergeView(
 // The second arg is the *full* visible text (not an increment), so each
 // rAF tick replaces rather than appends.
 //
-// While a turn's work block is open, the answer streams **inside** it as
-// its trailing `prose` step — that's what keeps mid-turn output (and the
-// final answer as it types out) from popping out below the working bubble.
-// When the terminal `Frame::Message` lands, `closeWorkForFinalReply` peels
-// that prose step back off into the standalone answer bubble. With no open
-// block (a direct answer, no reasoning/tools) it streams straight into a
-// standalone bubble, finalized by the message path as today.
+// The answer always streams into a standalone assistant bubble — even when a
+// work block is open above it — so the reply types out *below* the working
+// card, not inside it. If a progress frame (reasoning / tool / status)
+// interrupts the stream, `ensureWork` folds the bubble-so-far into the block
+// as an intermediate `prose` step; the terminal `Frame::Message` finalizes the
+// bubble in place. A still-open block with no steps yet (a turn that opened the
+// "Working" affordance but produced no reasoning/tools) is dropped as the
+// answer starts — the streaming bubble is itself the activity signal, so an
+// empty card must not hover above it.
 export function writeStreamingAnswer(prev: TranscriptRow[], text: string): TranscriptRow[] {
   const last = prev[prev.length - 1];
-  if (last?.kind === 'work' && last.workActive) {
-    const steps = last.steps ?? [];
-    const lastStep = steps[steps.length - 1];
-    if (lastStep?.kind === 'prose') {
-      if (lastStep.text === text) return prev;
-      const next = prev.slice();
-      next[next.length - 1] = {
-        ...last,
-        steps: [...steps.slice(0, -1), { ...lastStep, text }],
-      };
-      return next;
-    }
-    const next = prev.slice();
-    next[next.length - 1] = {
-      ...last,
-      steps: [...steps, { key: `prose-${steps.length}-${Date.now()}`, kind: 'prose', text }],
-    };
-    return next;
-  }
   if (last?.streaming && last.role === 'assistant') {
     if (last.text === text) return prev;
     return [...prev.slice(0, -1), { ...last, text }];
   }
+  const base =
+    last?.kind === 'work' && last.workActive && (last.steps?.length ?? 0) === 0
+      ? prev.slice(0, -1)
+      : prev;
   return [
-    ...prev,
+    ...base,
     {
-      key: `stream-${prev.length}-${Date.now()}`,
+      key: `stream-${base.length}-${Date.now()}`,
       role: 'assistant',
       text,
       streaming: true,
@@ -291,6 +278,39 @@ export function pushStatusStep(
  *  `/stop` path, where the user's own action is proof the turn was cancelled
  *  (so the block flips instantly, without waiting on a backend signal). */
 export function closeActiveWork(prev: TranscriptRow[], cancelled = false): TranscriptRow[] {
+  // The turn is ending, so any block left "settling" by a mid-turn interjection
+  // (kept expanded so its split-off work stayed visible) now collapses to its
+  // summary too. Clear the flag here — co-located with the active-block close so
+  // every turn-end path collapses settling blocks without a separate sweep.
+  const hasSettling = prev.some((r) => r.kind === 'work' && r.workSettling);
+  const rows = hasSettling
+    ? prev.map((r) => (r.kind === 'work' && r.workSettling ? { ...r, workSettling: false } : r))
+    : prev;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+    if (row.kind !== 'work' || !row.workActive) continue;
+    if (!row.steps || row.steps.length === 0) {
+      return [...rows.slice(0, i), ...rows.slice(i + 1)];
+    }
+    const next = rows.slice();
+    next[i] = {
+      ...row,
+      workActive: false,
+      workEndedAt: Date.now(),
+      workCancelled: row.workCancelled || cancelled,
+    };
+    return next;
+  }
+  return rows;
+}
+
+/** Close the open work block on a mid-turn user interjection: relabel it
+ *  "Worked Xs" (clear `workActive`) but keep it EXPANDED via `workSettling`
+ *  until the turn fully ends, so the work the interjection split off stays
+ *  visible instead of collapsing mid-reply. An empty block (no steps) is still
+ *  dropped — nothing to keep open. `closeActiveWork` clears the flag (→
+ *  collapse) at turn-end. */
+export function settleActiveWork(prev: TranscriptRow[]): TranscriptRow[] {
   for (let i = prev.length - 1; i >= 0; i--) {
     const row = prev[i];
     if (row.kind !== 'work' || !row.workActive) continue;
@@ -301,12 +321,34 @@ export function closeActiveWork(prev: TranscriptRow[], cancelled = false): Trans
     next[i] = {
       ...row,
       workActive: false,
+      workSettling: true,
       workEndedAt: Date.now(),
-      workCancelled: row.workCancelled || cancelled,
     };
     return next;
   }
   return prev;
+}
+
+/** Finalize a trailing streaming answer bubble on `/stop`: the cut-short
+ *  reply is the agent's final output, so it stays as its own (now non-
+ *  streaming) bubble below the collapsed "Cancelled" work block rather than
+ *  being folded inside it. No-op unless the tail is a streaming assistant
+ *  bubble; an empty partial (nothing streamed yet) is dropped so no blank
+ *  bubble lingers. */
+export function finalizeTrailingAnswer(prev: TranscriptRow[]): TranscriptRow[] {
+  const last = prev[prev.length - 1];
+  if (!last?.streaming || last.role !== 'assistant') return prev;
+  if (last.text.trim().length === 0) return prev.slice(0, -1);
+  return [...prev.slice(0, -1), { ...last, streaming: false }];
+}
+
+/** Whether `text` leads with any slash command, mirroring the backend's
+ *  `is_slash_command` (a `/` immediately followed by a non-whitespace char).
+ *  Such a message is a hard coalescing barrier on the server, so it must not
+ *  ride in a "send all at once" batch frame — the drain sends these
+ *  individually instead. */
+export function isSlashText(text: string): boolean {
+  return /^\/\S/.test(text.trim());
 }
 
 /** Recognise a `/stop` the user typed, mirroring the gateway's parser
@@ -332,14 +374,19 @@ export function isStopCancellationNotice(text: string): boolean {
   return text.includes(STOP_CANCELLED_NOTICE_MARKER);
 }
 
-/** Mark the transcript's trailing work block cancelled. Only the *last* row is
- *  touched, so a cancelled turn whose own block was dropped (no steps) can't
- *  mis-label an earlier turn's block. Idempotent. */
+/** Mark the turn-just-stopped's work block cancelled. The block is the last
+ *  row, or sits just above a salvaged trailing reply bubble (a /stop'd partial
+ *  answer kept as its own bubble). Only that one block is touched and only an
+ *  *assistant* tail is skipped — a newer user message (a fresh turn) is the
+ *  barrier, so an earlier turn's block can't be mis-labelled. Idempotent. */
 export function markLastWorkCancelled(rows: TranscriptRow[]): TranscriptRow[] {
-  const last = rows[rows.length - 1];
-  if (last?.kind !== 'work' || last.workCancelled) return rows;
+  let i = rows.length - 1;
+  const last = rows[i];
+  if (last && last.kind !== 'work' && last.role === 'assistant') i -= 1;
+  const block = rows[i];
+  if (block?.kind !== 'work' || block.workCancelled) return rows;
   const next = rows.slice();
-  next[next.length - 1] = { ...last, workCancelled: true };
+  next[i] = { ...block, workCancelled: true };
   return next;
 }
 
@@ -370,23 +417,13 @@ export function applyTurnState(
   startedAt: number | null,
 ): TranscriptRow[] {
   if (!active) {
-    // The actor emits `active: false` when its loop returns, BEFORE the
-    // terminal Message/Notice ships on the same ordered stream. A block
-    // whose tail is `prose` is holding the streamed answer that the
-    // imminent Message will peel into the real bubble
-    // (`closeWorkForFinalReply`) — closing it here would fossilise that
-    // prose inside the collapsed block and the answer would render
-    // twice. Leave it for the terminal frame; close everything else
-    // (tool/reasoning tails, turns that end with no terminal frame at
-    // all — cancel, blank cron reply). A *failed* user turn now always
-    // gets a terminal error notice (see `run_agent_loop`), whose handler
-    // closes the block via `closeActiveWork` — so the prose-tail block
-    // doesn't dangle on the error path either.
-    const last = prev[prev.length - 1];
-    if (last?.kind === 'work' && last.workActive) {
-      const steps = last.steps ?? [];
-      if (steps[steps.length - 1]?.kind === 'prose') return prev;
-    }
+    // Turn end. Collapse the open work block to its `Worked Xs` summary. The
+    // actor emits `active: false` when its loop returns, BEFORE the terminal
+    // Message/Notice ships on the same ordered stream — but any answer the
+    // model is still streaming lives in its own bubble *below* the block, so
+    // collapsing here never swallows the reply (the imminent Message finalizes
+    // that bubble in place). Also covers turns that end with no terminal frame
+    // at all — error, cancel, blank cron reply.
     return closeActiveWork(prev);
   }
   // A server `active:true` ALWAYS carries a real `started_at` (the
@@ -414,31 +451,6 @@ export function applyTurnState(
     return next;
   }
   return [...prev, newWorkRow(startedAt, prev.length)];
-}
-
-/** Close the open work block at the turn's terminal reply, peeling off a
- *  trailing `prose` step — that's the final answer the model streamed
- *  into the block — so the caller renders it as the standalone answer
- *  bubble below (from the authoritative `Frame::Message` content, so the
- *  peeled step's own text is just discarded). If peeling empties the
- *  block (a direct answer that only opened a block to stream into, e.g.
- *  reasoning-less), the block is dropped so no `Worked Xs` line shows. */
-export function closeWorkForFinalReply(prev: TranscriptRow[]): TranscriptRow[] {
-  for (let i = prev.length - 1; i >= 0; i--) {
-    const row = prev[i];
-    if (row.kind !== 'work' || !row.workActive) continue;
-    let steps = row.steps ?? [];
-    if (steps.length > 0 && steps[steps.length - 1].kind === 'prose') {
-      steps = steps.slice(0, -1);
-    }
-    if (steps.length === 0) {
-      return [...prev.slice(0, i), ...prev.slice(i + 1)];
-    }
-    const next = prev.slice();
-    next[i] = { ...row, steps, workActive: false, workEndedAt: Date.now() };
-    return next;
-  }
-  return prev;
 }
 
 export function finalizeMessage(
@@ -586,10 +598,13 @@ export function workBlockDisplay(
   active: boolean,
   hasSteps: boolean,
   expanded: boolean,
+  settling = false,
 ): { boxed: boolean; panelOpen: boolean } {
   return {
-    boxed: active || expanded,
-    panelOpen: (active && hasSteps) || expanded,
+    // `settling` (an interjection-paused block, still mid-turn) reads like an
+    // expanded finished block: bordered card with its steps panel open.
+    boxed: active || expanded || settling,
+    panelOpen: (active && hasSteps) || expanded || (settling && hasSteps),
   };
 }
 

@@ -198,6 +198,27 @@ pub struct Session {
     /// sessions. Default `false` so legacy JSON blobs deserialize.
     #[serde(default)]
     pub hidden: bool,
+
+    /// User-facing "pin to top" flag for the chat list. Set via the
+    /// chat admin `PUT /v1/chat/sessions/:id/pin` endpoint. The chat
+    /// list surfaces pinned sessions in their own block above the rest;
+    /// it changes presentation only — the row is otherwise an ordinary
+    /// session. Like [`Self::hidden`] it is a flat column owned by a
+    /// targeted UPDATE (`set_pinned`), not the JSON blob, so a
+    /// concurrent `touch` can't clobber it. Default `false` so legacy
+    /// JSON blobs deserialize.
+    #[serde(default)]
+    pub pinned: bool,
+
+    /// Which user-created folder this session is filed under in the chat
+    /// list (`None` = uncategorized). Set via the chat admin
+    /// `PUT /v1/chat/sessions/:id/folder` endpoint. Like [`Self::pinned`]
+    /// it is a flat column owned by a targeted UPDATE (`set_folder`), not
+    /// the JSON blob, so a concurrent `touch` can't clobber it; `get`
+    /// patches it from the column on read. Default `None` so legacy JSON
+    /// blobs deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<crate::FolderId>,
 }
 
 impl Session {
@@ -516,6 +537,30 @@ mod tests {
         let s = serde_json::to_string(&state).unwrap();
         let back: SessionState = serde_json::from_str(&s).unwrap();
         assert_eq!(back.last_llm, Some(LlmEntryName::from("claude-opus")));
+    }
+
+    #[test]
+    fn session_folder_id_defaults_to_none_and_skips_when_unset() {
+        // A legacy session row persisted before folders existed must load
+        // with `folder_id == None`, and an uncategorized session must not
+        // emit the key (skip_serializing_if) so the blob stays lean.
+        let json = r#"{
+            "id":"s1",
+            "user":{"id":"u1","name":null,"channel":"http"},
+            "channel":"http",
+            "created_at":"2024-01-01T00:00:00Z",
+            "last_active":"2024-01-01T00:00:00Z",
+            "state":{},
+            "root_session_id":"s1",
+            "trigger":{"kind":"user"}
+        }"#;
+        let sess: Session = serde_json::from_str(json).expect("legacy row without folder_id loads");
+        assert_eq!(sess.folder_id, None);
+        let s = serde_json::to_string(&sess).unwrap();
+        assert!(
+            !s.contains("folder_id"),
+            "unset folder_id must not serialize: {s}"
+        );
     }
 
     #[test]

@@ -196,6 +196,297 @@
         }
       }
     },
+    "/v1/chat/folders": {
+      "get": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "list_folders",
+        "responses": {
+          "200": {
+            "description": "The chat-list folder tree",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FolderList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "create_folder",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFolderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The created folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FolderDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid name / depth",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Parent folder not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/folders/reorder": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "reorder_folders",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReorderFoldersRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Sibling group reordered"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/folders/{folder_id}": {
+      "delete": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "delete_folder",
+        "parameters": [
+          {
+            "name": "folder_id",
+            "in": "path",
+            "description": "Folder id to delete",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Folder dissolved (sessions preserved)"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Folder not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "update_folder",
+        "parameters": [
+          {
+            "name": "folder_id",
+            "in": "path",
+            "description": "Folder id to rename",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateFolderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Folder updated"
+          },
+          "400": {
+            "description": "Invalid name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Folder not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/folders/{folder_id}/move": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "move_folder",
+        "parameters": [
+          {
+            "name": "folder_id",
+            "in": "path",
+            "description": "Folder id to reparent",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MoveFolderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Folder moved"
+          },
+          "400": {
+            "description": "Cycle / depth violation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Folder not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions": {
       "get": {
         "tags": [
@@ -403,6 +694,60 @@
         }
       }
     },
+    "/v1/chat/sessions/{session_id}/folder": {
+      "put": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "set_session_folder",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to file",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSessionFolderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Folder assignment updated"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session or folder not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}/model": {
       "put": {
         "tags": [
@@ -450,6 +795,60 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/sessions/{session_id}/pin": {
+      "put": {
+        "tags": [
+          "chat"
+        ],
+        "operationId": "set_session_pin",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Session id to pin or unpin",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSessionPinRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Pin state updated"
           },
           "401": {
             "description": "Unauthorized",
@@ -2605,12 +3004,20 @@
         "required": [
           "session_id",
           "created_at",
-          "last_active"
+          "last_active",
+          "pinned"
         ],
         "properties": {
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "folder_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The user-created folder this session is filed under, or absent for\nuncategorized. Set via `PUT /v1/chat/sessions/{id}/folder`; the web\nsidebar groups rows by this id."
           },
           "hidden": {
             "type": "boolean",
@@ -2626,6 +3033,10 @@
               "null"
             ],
             "description": "Preview text drawn from the session's most-recent user-authored\nmessage, truncated to [`PREVIEW_MAX_CHARS`]. The web sidebar\nrenders this as the row label so users can scan past\nconversations by what they last asked. `None` for sessions\nwithout a user turn yet (a freshly-created row, or one whose\ntranscript holds only system/tool rows)."
+          },
+          "pinned": {
+            "type": "boolean",
+            "description": "True when the user has pinned this session to the top of their\nchat list. Always emitted so the sidebar can place every row in\nthe right block; set via `PUT /v1/chat/sessions/{id}/pin`."
           },
           "session_id": {
             "type": "string"
@@ -2804,6 +3215,24 @@
           }
         }
       },
+      "CreateFolderRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "parent_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Parent folder id (`null`/absent = top-level)."
+          }
+        }
+      },
       "CronJob": {
         "type": "object",
         "description": "Mirror of [`aura_cron::CronJob`].",
@@ -2930,6 +3359,52 @@
         "properties": {
           "error": {
             "type": "string"
+          }
+        }
+      },
+      "FolderDto": {
+        "type": "object",
+        "description": "One folder in a folder-list / create response.",
+        "required": [
+          "id",
+          "name",
+          "position",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "position": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "FolderList": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FolderDto"
+            }
           }
         }
       },
@@ -3513,6 +3988,18 @@
           }
         }
       },
+      "MoveFolderRequest": {
+        "type": "object",
+        "properties": {
+          "parent_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "New parent id, or `null` to promote the folder to top-level."
+          }
+        }
+      },
       "MutateResponse": {
         "type": "object",
         "description": "Response body for `PUT` / `DELETE /v1/config`.",
@@ -3567,6 +4054,28 @@
           }
         }
       },
+      "ReorderFoldersRequest": {
+        "type": "object",
+        "required": [
+          "ordered_ids"
+        ],
+        "properties": {
+          "ordered_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The sibling ids in their new order."
+          },
+          "parent_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Parent of the sibling group being reordered (`null` = top-level)."
+          }
+        }
+      },
       "SessionKind": {
         "type": "string",
         "description": "Wire mirror of [`aura_query::SessionKind`]. Coarse trigger/lineage\nlabel for the trace browser list view.",
@@ -3605,6 +4114,19 @@
           }
         }
       },
+      "SetSessionFolderRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/chat/sessions/{session_id}/folder`.",
+        "properties": {
+          "folder_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Target folder id, or `null` to clear the assignment (uncategorized)."
+          }
+        }
+      },
       "SetSessionModelRequest": {
         "type": "object",
         "description": "Request body for `PUT /v1/chat/sessions/{session_id}/model`.",
@@ -3634,6 +4156,19 @@
               "null"
             ],
             "description": "The pin now in effect: the entry name, or `null` for `default-llm`."
+          }
+        }
+      },
+      "SetSessionPinRequest": {
+        "type": "object",
+        "description": "Request body for `PUT /v1/chat/sessions/{session_id}/pin`.",
+        "required": [
+          "pinned"
+        ],
+        "properties": {
+          "pinned": {
+            "type": "boolean",
+            "description": "`true` to pin this session to the top of the chat list, `false`\nto unpin it back into the regular list."
           }
         }
       },
@@ -3784,6 +4319,18 @@
         "properties": {
           "path": {
             "type": "string"
+          }
+        }
+      },
+      "UpdateFolderRequest": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "New name (absent = unchanged)."
           }
         }
       },
