@@ -9,8 +9,8 @@ pub mod test_support;
 // import them from `aura_store` directly, not via this adapter.
 use aura_store::{
     BlobStore, ChannelBotStore, ChannelPairingStore, ChannelSessionStore, CostStore, CronStore,
-    JobStore, SecretStore, SessionStore, SessionSummaryStore, SkillRiskStore, TaskStore,
-    TraceStore,
+    JobStore, SecretStore, SessionFolderStore, SessionStore, SessionSummaryStore, SkillRiskStore,
+    TaskStore, TraceStore,
 };
 
 /// Bundles all store implementations into a single container
@@ -24,6 +24,7 @@ use aura_store::{
 pub struct Store {
     pub session: std::sync::Arc<dyn SessionStore>,
     pub session_summary: std::sync::Arc<dyn SessionSummaryStore>,
+    pub session_folder: std::sync::Arc<dyn SessionFolderStore>,
     pub task: std::sync::Arc<dyn TaskStore>,
     pub trace: std::sync::Arc<dyn TraceStore>,
     pub secret: std::sync::Arc<dyn SecretStore>,
@@ -64,6 +65,9 @@ impl Store {
         Ok(Self {
             session: std::sync::Arc::new(libsql::LibsqlSessionStore::new(pool.clone())),
             session_summary: std::sync::Arc::new(libsql::LibsqlSessionSummaryStore::new(
+                pool.clone(),
+            )),
+            session_folder: std::sync::Arc::new(libsql::LibsqlSessionFolderStore::new(
                 pool.clone(),
             )),
             task: std::sync::Arc::new(libsql::LibsqlTaskStore::new(pool.clone())),

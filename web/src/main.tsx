@@ -4,6 +4,7 @@ import { HashRouter } from 'react-router-dom';
 import App from './App';
 import { AdminAuthProvider } from './api/auth';
 import { QueueProvider } from './pages/chat/queueStore';
+import { FolderProvider } from './pages/chat/folderStore';
 import './index.css';
 
 const root = document.getElementById('root');
@@ -15,9 +16,11 @@ createRoot(root).render(
   <StrictMode>
     <AdminAuthProvider>
       <QueueProvider>
-        <HashRouter>
-          <App />
-        </HashRouter>
+        <FolderProvider>
+          <HashRouter>
+            <App />
+          </HashRouter>
+        </FolderProvider>
       </QueueProvider>
     </AdminAuthProvider>
   </StrictMode>,

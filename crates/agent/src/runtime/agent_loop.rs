@@ -3003,6 +3003,7 @@ mod session_end_gate_tests {
             lineage,
             hidden: false,
             pinned: false,
+            folder_id: None,
         }
     }
 

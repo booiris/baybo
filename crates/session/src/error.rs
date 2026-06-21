@@ -21,6 +21,11 @@ pub enum SessionError {
     #[error("session state error: {0}")]
     InvalidState(String),
 
+    /// A folder operation violated an invariant (name too long, depth cap,
+    /// cycle). Maps to a 400 at the gateway, distinct from `NotFound`.
+    #[error("invalid folder operation: {0}")]
+    InvalidFolderOp(String),
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }

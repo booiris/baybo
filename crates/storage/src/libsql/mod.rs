@@ -7,6 +7,7 @@ mod cron;
 mod job;
 mod secret;
 mod session;
+mod session_folder;
 mod session_summary;
 mod skill_risk;
 mod task;
@@ -22,6 +23,7 @@ pub use cron::LibsqlCronStore;
 pub use job::LibsqlJobStore;
 pub use secret::LibsqlSecretStore;
 pub use session::LibsqlSessionStore;
+pub use session_folder::LibsqlSessionFolderStore;
 pub use session_summary::LibsqlSessionSummaryStore;
 pub use skill_risk::LibsqlSkillRiskStore;
 pub use task::LibsqlTaskStore;
@@ -158,10 +160,37 @@ impl LibsqlPool {
                     -- can't clobber a just-set pin; `get` patches
                     -- `Session.pinned` from this column on read.
                     pinned                INTEGER NOT NULL DEFAULT 0,
+                    -- User-facing chat-list folder assignment, set by
+                    -- PUT /v1/chat/sessions/:id/folder. NULL ⇒ uncategorized.
+                    -- Like `pinned` / `last_llm` it is a flat column owned by
+                    -- a targeted UPDATE (`set_folder`) and omitted from the DO
+                    -- UPDATE in `save`, so a concurrent `touch` can't clobber a
+                    -- just-set assignment; `get` patches `Session.folder_id`
+                    -- from this column on read. No FK to session_folders —
+                    -- SQLite FKs are off (see set_wal_mode), so folder delete
+                    -- nulls this column manually.
+                    folder_id             TEXT,
                     data                  TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_root
                     ON sessions(root_session_id);
+                -- User-created folders for organising the chat-session list.
+                -- Two-level tree via self-referential `parent_id` (NULL =
+                -- top-level; the depth cap of 2 is enforced in the session
+                -- manager, not here). This is the PARENT entity —
+                -- sessions.folder_id points into it — so it is NOT a
+                -- per-session CASCADE child; deleting a folder dissolves the
+                -- grouping in code (nulls child sessions, promotes
+                -- sub-folders) and never removes session rows.
+                CREATE TABLE IF NOT EXISTS session_folders (
+                    id          TEXT PRIMARY KEY,
+                    parent_id   TEXT,
+                    name        TEXT NOT NULL,
+                    position    INTEGER NOT NULL,
+                    created_at  INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_folders_parent
+                    ON session_folders(parent_id);
                 CREATE INDEX IF NOT EXISTS idx_sessions_parent
                     ON sessions(parent_session_id, lineage_kind)
                     WHERE lineage_kind IS NOT NULL;
@@ -492,6 +521,7 @@ impl LibsqlPool {
             "ALTER TABLE sessions ADD COLUMN last_llm TEXT",
             "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE cost_records ADD COLUMN reason TEXT",
+            "ALTER TABLE sessions ADD COLUMN folder_id TEXT",
         ];
         for stmt in migrations {
             if let Err(e) = self.conn.execute(stmt, libsql::params![]).await {
@@ -501,6 +531,20 @@ impl LibsqlPool {
                 }
             }
         }
+
+        // Index on the migration-added `sessions.folder_id` column. Created
+        // AFTER the ALTER loop, not in the schema batch above: on a legacy DB
+        // the column doesn't exist until the ALTER runs, so a batch-time
+        // CREATE INDEX referencing it would fail. `IF NOT EXISTS` keeps it
+        // idempotent on every subsequent boot.
+        self.conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_folder \
+                 ON sessions(folder_id) WHERE folder_id IS NOT NULL",
+                libsql::params![],
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to create idx_sessions_folder: {e}"))?;
 
         Ok(())
     }

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use aura_model::{
-    ChannelType, ChatMessage, ControlEvent, ControlEventKind, LineageKind, LlmEntryName, Session,
-    SessionId,
+    ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId, LineageKind, LlmEntryName,
+    Session, SessionId,
 };
 use chrono::{DateTime, Utc};
 
@@ -78,6 +78,23 @@ pub trait SessionStore: Send + Sync {
     /// in-memory `Session`) can't clobber the flag. `get` patches
     /// `Session.pinned` from the column at read time.
     async fn set_pinned(&self, session_id: &SessionId, pinned: bool) -> Result<bool>;
+
+    /// Set (or clear, with `None`) the session's chat-list folder
+    /// assignment — the sidebar "move to folder" affordance
+    /// (`PUT /v1/chat/sessions/:id/folder`). `None` clears it back to
+    /// uncategorized. Returns `Ok(true)` when the row existed and was
+    /// updated, `Ok(false)` if no row matched.
+    ///
+    /// Same flat-column discipline as [`Self::set_hidden`]: implementations
+    /// write only the `folder_id` column and leave the JSON `data` blob
+    /// alone, so a concurrent `save`/`touch` (full-blob rewrite from a stale
+    /// in-memory `Session`) can't clobber the assignment. `get` patches
+    /// `Session.folder_id` from the column at read time.
+    async fn set_folder(
+        &self,
+        session_id: &SessionId,
+        folder_id: Option<&FolderId>,
+    ) -> Result<bool>;
 
     /// Hard-delete the session.
     ///
