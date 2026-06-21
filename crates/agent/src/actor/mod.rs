@@ -10,6 +10,7 @@ pub mod state;
 pub mod subagent;
 pub mod supervisor;
 
+use crate::runtime::agent_loop::InterjectionSource;
 use aura_channels::{
     AgentEvent, AgentOutput, COMPACT_COMMAND, GOAL_BUDGET_FLAG, GOAL_CLEAR_SUBCOMMAND,
     GOAL_COMMAND, GOAL_PAUSE_SUBCOMMAND, GOAL_RESUME_SUBCOMMAND, IncomingMessage, NoticeLevel,
@@ -63,6 +64,14 @@ use crate::actor::supervisor::ActorRegistryGuard;
 pub enum AgentMessage {
     /// A user sent a message.
     UserInput(Box<IncomingMessage>),
+    /// A client-batched group of user messages for this session, delivered as
+    /// one mailbox item so they run as a single coalesced turn regardless of
+    /// per-message router timing (the web "send every queued message at once"
+    /// path). Equivalent to a run of `UserInput`s the actor would have
+    /// coalesced anyway — `handle_merged_user_turn` appends each as its own
+    /// transcript row and answers the group with one reply. Non-slash only
+    /// (the gateway never batches a slash command).
+    UserInputBatch(Vec<IncomingMessage>),
     /// A cron job fired.
     CronTrigger { job_id: String, prompt: String },
     /// A subagent was spawned. Carries the initial prompt assembled by
@@ -103,6 +112,7 @@ impl mailbox::Prioritized for AgentMessage {
         use mailbox::MessagePriority;
         match self {
             AgentMessage::UserInput(_)
+            | AgentMessage::UserInputBatch(_)
             | AgentMessage::CronTrigger { .. }
             | AgentMessage::SubagentSpawned { .. }
             | AgentMessage::SetModel { .. } => MessagePriority::Trigger,
@@ -270,6 +280,22 @@ impl crate::runtime::agent_loop::InterjectionSource for MailboxInterjections<'_>
             out.push(inc.message.content);
         }
         out
+    }
+
+    /// On a `/stop`, drop the leading run of queued client follow-ups so they
+    /// don't run after the stop — including a coalesced `UserInputBatch`, which
+    /// `is_coalescable_user_input` (mid-turn injection, single-message only)
+    /// deliberately excludes. Without this a batch queued behind the cancelled
+    /// turn would survive and fire as a fresh turn. Still stops at the first
+    /// slash / other-kind message, preserving the same barrier as the drain.
+    fn discard_pending(&mut self) {
+        while self
+            .rx
+            .try_recv_if(|m| {
+                is_coalescable_user_input(m) || matches!(m, AgentMessage::UserInputBatch(_))
+            })
+            .is_some()
+        {}
     }
 }
 
@@ -480,6 +506,25 @@ impl AgentActor {
                         );
                     }
                 }
+                // A pre-coalesced batch (the gateway already grouped these as one
+                // atomic intake item). Run it as a single merged turn; also pull
+                // any further non-slash `UserInput`s queued behind it, same as the
+                // single-message path, so a straggler that landed after the batch
+                // still folds into this turn rather than starting another.
+                AgentMessage::UserInputBatch(mut batch) => {
+                    while let Some(AgentMessage::UserInput(inc)) =
+                        mailbox.try_recv_if(is_coalescable_user_input)
+                    {
+                        batch.push(*inc);
+                    }
+                    if let Err(e) = self.handle_merged_user_turn(batch, &mut mailbox).await {
+                        error!(
+                            session_id = %session_id,
+                            error = %e,
+                            "failed to handle user input batch"
+                        );
+                    }
+                }
                 other => {
                     self.dispatch_one(other).await;
                 }
@@ -530,6 +575,12 @@ impl AgentActor {
             AgentMessage::SetModel { llm } => {
                 self.handle_set_model(llm);
             }
+            AgentMessage::UserInputBatch(_) => {
+                // The run loop owns `UserInputBatch` (it needs `&mut mailbox` to
+                // coalesce + run the merged turn); reaching here would be a
+                // routing bug. Defensive no-op.
+                warn!(session_id = %session_id, "UserInputBatch reached dispatch_one; ignoring");
+            }
             AgentMessage::ActorStop => {
                 // The run loop owns `ActorStop` (it must break); reaching
                 // here would be a routing bug. Defensive no-op.
@@ -557,6 +608,11 @@ impl AgentActor {
         parent_job_id: Option<aura_model::JobId>,
         delta_tx: Option<mpsc::Sender<AgentOutput>>,
         interjections: Option<&mut dyn crate::runtime::agent_loop::InterjectionSource>,
+        // Set to whether this turn ended via cancellation (`/stop` / shutdown),
+        // so the user-turn caller can drop queued interjections a `/stop` would
+        // otherwise leave to run as follow-up turns. Caught after the loop fully
+        // returns, so it covers every cancellation path (incl. mid-LLM-call).
+        stopped_out: Option<&mut bool>,
     ) -> anyhow::Result<OutgoingMessage> {
         let is_user_turn = matches!(job_input.input_kind(), aura_job::JobInputKind::UserChat);
         // Kept so the error path below can tell a user `/stop` (token
@@ -582,6 +638,9 @@ impl AgentActor {
                 interjections,
             )
             .await;
+        if let Some(out) = stopped_out {
+            *out = turn_token.is_cancelled();
+        }
         match result {
             // Cancelled via the cancel token (`/stop` or parent shutdown), not a
             // genuine failure. Collapse the varying underlying error to a typed
@@ -631,7 +690,9 @@ impl AgentActor {
             .agent_loop
             .append_cron_fire(job_id, prompt)
             .await?;
-        let response = self.run_agent_loop(job_input, None, None, None).await?;
+        let response = self
+            .run_agent_loop(job_input, None, None, None, None)
+            .await?;
         if is_blank_reply(&response.content) {
             debug!(
                 session_id = %self.durable.session.id,
@@ -678,6 +739,7 @@ impl AgentActor {
                 JobInput::UserChat { content },
                 None,
                 Some(response_tx),
+                None,
                 None,
             )
             .await?;
@@ -729,14 +791,25 @@ impl AgentActor {
         // already appended; this only pulls messages that land after the turn
         // starts. Anything still queued at turn-end falls to the next turn.
         let mut interjections = MailboxInterjections { rx: mailbox };
-        let response = self
+        let mut stopped = false;
+        let result = self
             .run_agent_loop(
                 JobInput::UserChat { content: combined },
                 None,
                 Some(response_tx),
                 Some(&mut interjections),
+                Some(&mut stopped),
             )
-            .await?;
+            .await;
+        // A `/stop` halts the whole pipeline: drop any interjections the client
+        // already sent that are still queued in the mailbox, so they don't run
+        // as follow-up turns once we return to the actor's main loop. Stops at
+        // the first slash / other-kind message — the same barrier the coalescer
+        // and the in-turn interjection drain use.
+        if stopped {
+            interjections.discard_pending();
+        }
+        let response = result?;
         self.send_user_reply(response).await;
         Ok(())
     }
@@ -1003,7 +1076,13 @@ impl AgentActor {
             .agent_loop
             .append_subagent_notification(content.clone());
         let result = self
-            .run_agent_loop(JobInput::SubagentNotification { content }, None, None, None)
+            .run_agent_loop(
+                JobInput::SubagentNotification { content },
+                None,
+                None,
+                None,
+                None,
+            )
             .await;
         match result {
             Ok(response) => {
@@ -1147,6 +1226,7 @@ impl AgentActor {
                 },
                 Some(parent_job_id),
                 Some(response_tx),
+                None,
                 None,
             )
             .await?;
@@ -1380,7 +1460,7 @@ impl AgentActor {
             .agent_loop
             .append_goal_continuation(content.clone());
         let result = self
-            .run_agent_loop(JobInput::GoalContinuation { content }, None, None, None)
+            .run_agent_loop(JobInput::GoalContinuation { content }, None, None, None, None)
             .await;
         // Accrue usage even on failure (tokens billed before the error still
         // count), and keep `last_active` fresh so the reaper leaves the actor
@@ -1952,6 +2032,76 @@ mod tests {
             }
             other => panic!("expected the slash command still queued, got {other:?}"),
         }
+    }
+
+    /// `/stop` path: `discard_pending` drops the leading non-slash run without
+    /// running it, and (like the drain) stops at the slash barrier — so a
+    /// queued `/compact` and the message behind it survive for the next turn.
+    #[tokio::test]
+    async fn mailbox_interjections_discard_pending_drops_leading_run() {
+        use crate::runtime::agent_loop::InterjectionSource;
+
+        let (tx, mut rx) = mailbox::channel::<AgentMessage>(16);
+        tx.send(user_input("first")).await.unwrap();
+        tx.send(user_input("second")).await.unwrap();
+        tx.send(user_input("/compact")).await.unwrap();
+        tx.send(user_input("third")).await.unwrap();
+
+        {
+            let mut src = MailboxInterjections { rx: &mut rx };
+            src.discard_pending();
+        }
+
+        // The two leading non-slash messages are gone; the slash barrier stays
+        // at the head, the message behind it still queued for the next turn.
+        match rx.try_recv() {
+            Ok(AgentMessage::UserInput(m)) => {
+                assert!(matches!(&m.message.content[0], ContentBlock::Text(t) if t == "/compact"));
+            }
+            other => panic!("expected the slash command still queued, got {other:?}"),
+        }
+        match rx.try_recv() {
+            Ok(AgentMessage::UserInput(m)) => {
+                assert!(matches!(&m.message.content[0], ContentBlock::Text(t) if t == "third"));
+            }
+            other => panic!("expected 'third' still queued behind the slash, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mailbox_interjections_discard_pending_drops_a_queued_batch() {
+        use crate::runtime::agent_loop::InterjectionSource;
+
+        // A coalesced `UserInputBatch` queued behind a stopped turn must ALSO be
+        // dropped on discard — `is_coalescable_user_input` (mid-turn injection)
+        // excludes it, so the discard path needs its own broader predicate.
+        let (tx, mut rx) = mailbox::channel::<AgentMessage>(16);
+        tx.send(user_input("first")).await.unwrap();
+        tx.send(AgentMessage::UserInputBatch(vec![
+            incoming("a"),
+            incoming("b"),
+        ]))
+        .await
+        .unwrap();
+        tx.send(user_input("/compact")).await.unwrap();
+
+        {
+            let mut src = MailboxInterjections { rx: &mut rx };
+            src.discard_pending();
+        }
+
+        // The leading `UserInput` and the `UserInputBatch` are gone; the slash
+        // barrier stays at the head for the next turn.
+        match rx.try_recv() {
+            Ok(AgentMessage::UserInput(m)) => {
+                assert!(matches!(&m.message.content[0], ContentBlock::Text(t) if t == "/compact"));
+            }
+            other => panic!("expected the slash command still queued, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing should remain after the slash barrier",
+        );
     }
 
     /// A non-`UserInput` at the head is never injectable even at the same

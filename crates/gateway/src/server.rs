@@ -33,7 +33,7 @@ use std::sync::Arc;
 use aura_agent::LlmPoolHandle;
 use aura_agent::supervisor::AgentSupervisor;
 use aura_agent::{CronScheduler, SessionManager, service::ShutdownSignal};
-use aura_channels::{ChannelRegistry, IncomingMessage};
+use aura_channels::{ChannelRegistry, RouterInbound};
 use aura_config::AuraConfig;
 use aura_job::JobLifecycle;
 
@@ -96,7 +96,7 @@ pub struct GatewayDeps {
     pub log_buffer: Arc<LogBuffer>,
     /// Router intake. Cloned into the WS channel server so sidecar
     /// frames can be forwarded as `IncomingMessage`s.
-    pub incoming_tx: mpsc::Sender<IncomingMessage>,
+    pub incoming_tx: mpsc::Sender<RouterInbound>,
     /// Per-install capability tokens. The channel TCP listener
     /// passes this to the WS server for Register-frame verification.
     pub channel_tokens: ChannelTokenTable,
@@ -190,7 +190,7 @@ pub struct AdminState {
 pub struct ChannelState {
     pub session_manager: Arc<SessionManager>,
     pub channel_registry: Arc<ChannelRegistry>,
-    pub incoming_tx: mpsc::Sender<IncomingMessage>,
+    pub incoming_tx: mpsc::Sender<RouterInbound>,
     pub channel_tokens: ChannelTokenTable,
 }
 

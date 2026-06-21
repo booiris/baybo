@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura_channels::wire::{self, Frame, Message as WireMessage, SessionPatch};
-use aura_channels::{AgentEvent, AgentOutput, ChannelKind, MessageRole, OutgoingMessage};
+use aura_channels::{
+    AgentEvent, AgentOutput, ChannelKind, MessageRole, OutgoingMessage, RouterInbound,
+};
 use aura_config::ChannelsConfig;
 use aura_gateway::auth::{
     ChannelTokenTable, ClientIdentity, TokenHandle, WEB_CLIENT_LABEL_PREFIX, WEB_OPERATOR_USER_ID,
@@ -921,10 +923,13 @@ async fn duplicate_platform_msg_id_drops_retry_on_subscribed_channel() {
 
     let mut delivered: Vec<String> = Vec::new();
     for _ in 0..2 {
-        let msg = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
+        let inbound = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
             .await
             .expect("router intake delivery timeout")
             .expect("router intake channel closed");
+        let RouterInbound::One(msg) = inbound else {
+            panic!("expected a single inbound message, got a batch");
+        };
         let body = msg
             .message
             .content
@@ -953,6 +958,107 @@ async fn duplicate_platform_msg_id_drops_retry_on_subscribed_channel() {
     assert!(
         extra.is_err(),
         "duplicate platform_msg_id leaked through to the router: {extra:?}",
+    );
+
+    drop(client);
+    shutdown.trigger();
+    let _ = server_handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn messages_batch_reaches_router_as_one_ordered_intake() {
+    // The web "send every queued message at once" path: a single
+    // `Frame::Messages` carrying N user rows must reach the router as ONE
+    // `RouterInbound::Batch` (so the actor coalesces them into a single turn),
+    // preserving order — never as N separate intakes that could race the
+    // actor's coalescing window.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let port_file =
+        aura_workspace::WorkspacePaths::new(tempdir.path().to_path_buf()).channel_port();
+
+    let tg = build_test_deps("127.0.0.1:0".parse().unwrap()).await;
+    let cfg = ChannelsConfig::default();
+    boot::install_channels(&tg.deps.channel_registry, &cfg).expect("install");
+
+    let channel_tokens = tg.channel_tokens.clone();
+    let shutdown = tg.shutdown.clone();
+    let mut incoming_rx = tg.incoming_rx;
+    let server =
+        ChannelServer::bind(&tg.deps, port_file, channel_tokens.clone()).expect("bind server");
+    let port = server.port();
+    let server_shutdown = shutdown.clone();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run(server_shutdown).await;
+    });
+
+    let (token, _handle) = mint_web_token(&channel_tokens, "tab-batch");
+    let mut client = connect_register(port, &token, ChannelType::http())
+        .await
+        .expect("handshake");
+    send_frame(
+        &mut client,
+        Frame::Subscribe {
+            session_id: "sess-batch".into(),
+            since_ordinal: None,
+        },
+    )
+    .await
+    .expect("send Subscribe");
+    expect_empty_pending_snapshot(&mut client, "sess-batch").await;
+
+    let msg = |id: &str, content: &str| WireMessage {
+        content: content.into(),
+        session_id: "sess-batch".into(),
+        user_id: WEB_OPERATOR_USER_ID.into(),
+        channel_type: ChannelType::http(),
+        bot_id: String::new(),
+        attachments: Vec::new(),
+        platform_msg_id: id.into(),
+        role: MessageRole::User,
+        ordinal: None,
+    };
+    send_frame(
+        &mut client,
+        Frame::Messages {
+            messages: vec![msg("a", "alpha"), msg("b", "beta"), msg("c", "gamma")],
+        },
+    )
+    .await
+    .expect("send batch");
+
+    let inbound = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
+        .await
+        .expect("router intake delivery timeout")
+        .expect("router intake channel closed");
+    let RouterInbound::Batch(batch) = inbound else {
+        panic!("expected ONE RouterInbound::Batch, got a single message");
+    };
+    let bodies: Vec<String> = batch
+        .iter()
+        .map(|incoming| {
+            incoming
+                .message
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .collect();
+    assert_eq!(
+        bodies,
+        vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
+        "the batch must reach the router as one ordered group",
+    );
+
+    // The batch is a SINGLE intake — no second item follows it.
+    let extra = tokio::time::timeout(Duration::from_millis(200), incoming_rx.recv()).await;
+    assert!(
+        extra.is_err(),
+        "a batch must produce exactly one intake, not per-message ones: {extra:?}",
     );
 
     drop(client);

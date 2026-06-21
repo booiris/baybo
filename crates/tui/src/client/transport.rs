@@ -292,6 +292,9 @@ fn map_frame(
                 msg.content,
             )]))
         }
+        // Client → server only (the web "send every queued message at once"
+        // batch); never arrives inbound.
+        Frame::Messages { .. } => None,
         Frame::Notice {
             session_id,
             level,

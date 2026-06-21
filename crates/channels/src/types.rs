@@ -30,6 +30,20 @@ pub struct IncomingMessage {
     pub platform_msg_id: String,
 }
 
+/// What a channel transport hands the router over the inbound intake
+/// channel. Most traffic is a [`Self::One`] single message; [`Self::Batch`]
+/// carries several messages for one session that the router must deliver to
+/// the actor as a single mailbox item so they run as one coalesced turn (the
+/// web "send every queued message at once" path). Keeping both on one ordered
+/// channel preserves the order between a batch and any later single send.
+#[derive(Debug, Clone)]
+pub enum RouterInbound {
+    // Boxed so the common single-message variant doesn't bloat the enum to the
+    // size of an `IncomingMessage` (matches `AgentMessage::UserInput`).
+    One(Box<IncomingMessage>),
+    Batch(Vec<IncomingMessage>),
+}
+
 /// Outgoing message to be sent back through a channel adapter.
 #[derive(Debug, Clone)]
 pub struct OutgoingMessage {

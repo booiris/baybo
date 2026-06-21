@@ -23,7 +23,6 @@ import {
   RiCloseLine,
   RiDeleteBin6Line,
   RiFileLine,
-  RiImageLine,
   RiLoader4Line,
   RiSendPlane2Line,
   RiStopFill,
@@ -41,8 +40,11 @@ import {
 } from '../api/chatWs';
 import { CronInbox } from '../components/CronInbox';
 import { TaskChecklist } from '../components/chat/TaskChecklist';
+import { AttachmentImage } from './chat/AttachmentImage';
+import { QueuePanel } from './chat/QueuePanel';
 import { SessionSidebar } from './chat/SessionSidebar';
 import { GoalBanner } from './chat/GoalBanner';
+import { useQueueStore, useSessionQueue, type QueuedItem } from './chat/queueStore';
 import type { SessionSummary } from './chat/types';
 
 /** One progress entry inside a turn's work block. `reasoning`, `status`
@@ -116,6 +118,12 @@ export interface TranscriptRow {
   /** True when this block's turn was cancelled (`/stop`) rather than run to a
    *  normal reply — the collapsed summary reads "Cancelled · Worked Xs". */
   workCancelled?: boolean;
+  /** True for a block closed mid-turn by a user interjection: relabelled
+   *  "Worked Xs" but kept EXPANDED (steps visible) until the turn fully ends,
+   *  so the work the interjection split off doesn't vanish behind a collapse
+   *  while the agent is still replying. Cleared (→ collapse) by
+   *  `closeActiveWork` at turn-end. */
+  workSettling?: boolean;
 }
 
 interface PendingApproval {
@@ -245,11 +253,36 @@ function attachmentKind(mime: string): WireAttachment['kind'] {
   return 'file';
 }
 
+export type ComposerAction = 'noop' | 'stop' | 'direct' | 'park';
+
+/** Pure decision for what a composer submit should do, extracted from
+ *  `handleSend` so the send-vs-park rule is unit-testable independent of the
+ *  component. The rule is intentionally INDEPENDENT of how many items are
+ *  already queued: an idle, unpaused send always goes direct (it starts a turn
+ *  whose completion auto-drains the queue), so a non-empty queue can never
+ *  stall the composer. Parking happens only while a turn is in flight (preserve
+ *  order) or the pipeline is paused after a /stop or error. `/stop` always
+ *  bypasses, even busy/paused. */
+export function decideComposerAction(opts: {
+  hasContent: boolean;
+  isStop: boolean;
+  busy: boolean;
+  paused: boolean;
+}): ComposerAction {
+  if (!opts.hasContent) return 'noop';
+  if (opts.isStop) return 'stop';
+  return !opts.busy && !opts.paused ? 'direct' : 'park';
+}
+
 export function ChatPage() {
   const { sessionId } = useParams<{ sessionId?: string }>();
   const navigate = useNavigate();
   const client = useAdminClient();
   const { baseUrl } = useAuth();
+  const queueStore = useQueueStore();
+  // Reactive interjection queue for the active session (drives the panel, the
+  // park-vs-direct decision, and the Send-button affordance).
+  const queue = useSessionQueue(sessionId);
 
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(true);
@@ -316,6 +349,11 @@ export function ChatPage() {
   const [cronInboxRefresh, setCronInboxRefresh] = useState(0);
 
   const [status, setStatus] = useState<ConnectionStatus>({ state: 'connecting' });
+  // Mirrors `status` in a ref so the captured-once `onFrame` closure and the
+  // session-agnostic `sendToSession` read the live connection state without a
+  // stale 'connecting' after a reconnect. Updated in the same `onStatus`
+  // callback that calls `setStatus`.
+  const statusRef = useRef<ConnectionStatus>({ state: 'connecting' });
   const [composer, setComposer] = useState('');
   const [showSlashHints, setShowSlashHints] = useState(false);
 
@@ -361,6 +399,30 @@ export function ChatPage() {
   // now-collapsed work block. Cleared when a new turn starts (`turn_state`
   // active) or the user sends a non-stop message.
   const stoppedSessionsRef = useRef<Set<string>>(new Set());
+
+  // Sessions whose agent is currently streaming its FINAL reply (an
+  // `answer_delta` is in flight with no tool/reasoning frame since). Firing a
+  // queued item here can't interject — there are no more tool boundaries — so
+  // the row's send button arms the item to fire on turn completion (a persisted
+  // "waiting" state) instead of sending immediately. Set on `answer_delta`,
+  // cleared at turn start/end, on any non-answer progress frame, and on /stop.
+  const streamingAnswerRef = useRef<Set<string>>(new Set());
+
+  // ── Interjection queue: refs for the captured-once onFrame closure ──
+  // Imperative queue handle (ref-backed live reads + mutators). The reactive
+  // composer/panel read the queue through `useSessionQueue` instead.
+  const queueStoreRef = useRef(queueStore);
+  queueStoreRef.current = queueStore;
+  // Auto-fire turn-dedup. A queued item fires at most once per turn. The token
+  // is bumped only on a LIVE turn start (a user send into the session, or a
+  // live `turn_state{active:true}`); a session with no token entry has had no
+  // live turn this page-load, so reload catch-up replays — which arrive before
+  // the turn_state snapshot — never spuriously drain the queue.
+  const turnTokenRef = useRef<Map<string, number>>(new Map());
+  const firedForTurnRef = useRef<Map<string, number>>(new Map());
+  // Latest queue-frame handler (auto-fire + pause detection), kept current so
+  // the WS onFrame closure can call it without rebuilding the socket.
+  const queueFrameRef = useRef<((frame: Frame) => void) | null>(null);
 
   // Streaming pacer: decouples the visual reveal cadence from the wire
   // cadence. Servers tend to flush Delta frames in uneven bursts (a few
@@ -638,7 +700,10 @@ export function ChatPage() {
       baseUrl,
       channelToken,
       initialSessionIds: [],
-      onStatus: setStatus,
+      onStatus: (s) => {
+        statusRef.current = s;
+        setStatus(s);
+      },
       onFrame: (frame) => {
         if (frame.kind === 'session_updated') {
           setSessions((prev) => applySessionPatch(prev, frame.session_id, frame.patch));
@@ -710,6 +775,18 @@ export function ChatPage() {
         // (if any) is over, so stop dropping this session's deltas.
         if (frame.kind === 'turn_state' && frame.active) {
           stoppedSessionsRef.current.delete(frame.session_id);
+          // New turn — not in the final-reply phase yet.
+          streamingAnswerRef.current.delete(frame.session_id);
+          // A live turn started — arm auto-fire for this session's next
+          // completion (re-arm drops any prior fired mark).
+          turnTokenRef.current.set(
+            frame.session_id,
+            (turnTokenRef.current.get(frame.session_id) ?? 0) + 1,
+          );
+          firedForTurnRef.current.delete(frame.session_id);
+        }
+        if (frame.kind === 'turn_state' && !frame.active) {
+          streamingAnswerRef.current.delete(frame.session_id);
         }
         // Route delta frames through the pacer instead of straight to
         // setViews — the pacer's rAF loop owns the bubble's text while
@@ -720,6 +797,8 @@ export function ChatPage() {
           // answer is already settled inside the collapsed work block; a new
           // bubble here is the stray "message after /stop".
           if (stoppedSessionsRef.current.has(frame.session_id)) return;
+          // Final answer is streaming — entering the final-reply phase.
+          streamingAnswerRef.current.add(frame.session_id);
           enqueueDelta(frame.session_id, frame.text);
           return;
         }
@@ -739,20 +818,36 @@ export function ChatPage() {
         ) {
           flushPacerKeepStreaming(frame.session_id);
         }
+        // Non-answer progress (the agent went back to tool/reasoning work, or a
+        // notice interrupted) means we're no longer in the final-reply phase.
+        if (
+          frame.kind === 'reasoning' ||
+          frame.kind === 'tool_started' ||
+          frame.kind === 'tool_completed' ||
+          frame.kind === 'status'
+        ) {
+          streamingAnswerRef.current.delete(frame.session_id);
+        }
         // A broadcast `/stop` cancellation notice stops THIS tab's stream too
         // (the observer never ran the local `/stop`): settle the buffer above,
         // then drop any delta that races in afterwards so it can't spill a
         // bubble below the now-closed work block.
         if (frame.kind === 'notice' && !frame.transient && isStopCancellationNotice(frame.text)) {
           stoppedSessionsRef.current.add(frame.session_id);
+          streamingAnswerRef.current.delete(frame.session_id);
         }
         // An assistant message frame is the authoritative final text
         // for the stream — drop any pacer state so its in-flight rAF
         // doesn't overwrite the finalized bubble a tick later.
         if (frame.kind === 'message' && frame.role !== 'user') {
           cancelPacer(frame.session_id);
+          // Turn's answer is settled — leave the final-reply phase.
+          streamingAnswerRef.current.delete(frame.session_id);
         }
         routeInboundFrame(frame, setViews, setSessions, lastConnectedAtRef.current);
+        // Interjection queue: auto-fire the next parked item on a live normal
+        // completion, and pause the pipeline on a /stop-cancel or error notice.
+        queueFrameRef.current?.(frame);
       },
       onTokenRejected: (reason) => onTokenRejectedRef.current?.(reason),
       onReset: (reason) => {
@@ -919,7 +1014,14 @@ export function ChatPage() {
     } else {
       setHasNewBelow(true);
     }
-  }, [currentView.transcript, currentView.pendingApproval, currentView.awaitingReply]);
+  }, [
+    currentView.transcript,
+    currentView.pendingApproval,
+    currentView.awaitingReply,
+    // A newly deferred bubble grows the scroller without touching the
+    // transcript — re-pin to the bottom when the user is already there.
+    queue.deferred.length,
+  ]);
 
   // Reset pin state when switching sessions — a fresh view should jump
   // to its tail, not inherit the previous view's scroll posture. Also
@@ -1064,48 +1166,42 @@ export function ChatPage() {
     ta.style.height = `${Math.min(ta.scrollHeight, max)}px`;
   }, [composer]);
 
-  const sendText = useCallback(
-    (raw: string, wireAttachments: WireAttachment[] = []) => {
+  // Session-agnostic send used by the composer (active session), the queue
+  // auto-fire pipeline, manual per-item fire, and resume — so a message can be
+  // fired into ANY tracked session, not just the one on screen. Returns true
+  // iff the WS accepted it (connected); false => the caller leaves the item
+  // queued. Unlike `/stop`, this never closes the live work block, so a
+  // mid-turn interjection keeps the in-flight block open.
+  const sendToSession = useCallback(
+    (
+      targetSessionId: string,
+      raw: string,
+      wireAttachments: WireAttachment[] = [],
+      opts?: { foreground?: boolean },
+    ): boolean => {
       const trimmed = raw.trim();
-      if ((!trimmed && wireAttachments.length === 0) || !sessionId || !wsRef.current)
-        return;
-      if (status.state !== 'connected') return;
-      // Same UUID flows two ways: as the WS frame's `platform_msg_id`
-      // (server-side dedup key — a retry between send and echo doesn't
-      // produce a second agent turn) AND as the optimistic row's
-      // `clientMsgId` (reconciliation key — the inbound echo carrying
-      // that same id replaces this row in place rather than appending
-      // a duplicate). Generated once here so both sides agree.
+      if (!trimmed && wireAttachments.length === 0) return false;
+      if (!wsRef.current || statusRef.current.state !== 'connected') return false;
+      // Same UUID is the WS frame's dedup key AND the optimistic row's
+      // reconciliation key (the inbound echo replaces this row in place).
       const clientMsgId = crypto.randomUUID();
-      // `/stop` is the one command we can reflect without the backend: the
-      // user's own action means "cancel", so collapse the live work block to
-      // "Cancelled" and end the turn locally right away. Don't show the
-      // awaiting-reply spinner (we're stopping, not starting a turn); the
-      // server's TurnState/notice frames then reconcile idempotently.
-      const stopping = isStopCommand(trimmed);
-      // Settle any buffered answer text, then keep the partial reply as its own
-      // bubble (`finalizeTrailingAnswer` in the updater below): the cut-short
-      // answer is the agent's final output, so it stays a reply bubble below
-      // the collapsed "Cancelled" work block rather than being folded inside
-      // it. Mark the session stopped so a delta that raced in just after is
-      // dropped rather than spilling a second bubble.
-      if (stopping) {
-        flushPacerKeepStreaming(sessionId);
-        stoppedSessionsRef.current.add(sessionId);
-      } else {
-        stoppedSessionsRef.current.delete(sessionId);
-      }
+      stoppedSessionsRef.current.delete(targetSessionId);
       setViews((prev) => {
-        const view = prev[sessionId] ?? EMPTY_VIEW;
+        const view = prev[targetSessionId] ?? EMPTY_VIEW;
+        // A mid-turn interjection splits the agent's work in two. Relabel the
+        // open work block to "Worked Xs" (so it isn't a live "Working…" next to
+        // the NEW block the agent opens after the interjection — two "Working"
+        // boxes read as two concurrent runs), but KEEP it expanded: its
+        // split-off work stays visible until the turn fully ends (then
+        // `closeActiveWork` collapses it). No-op when idle (no open block). The
+        // working indicator below bridges until the next progress frame.
+        const base = view.turn?.active ? settleActiveWork(view.transcript) : view.transcript;
         return {
           ...prev,
-          [sessionId]: {
+          [targetSessionId]: {
             ...view,
             transcript: [
-              ...closeActiveWork(
-                stopping ? finalizeTrailingAnswer(view.transcript) : view.transcript,
-                stopping,
-              ),
+              ...base,
               {
                 key: `pending-${clientMsgId}`,
                 role: 'user',
@@ -1117,21 +1213,167 @@ export function ChatPage() {
                 createdAt: new Date().toISOString(),
               },
             ],
-            awaitingReply: !stopping,
-            turn: stopping ? { active: false, startedAt: null } : view.turn,
+            awaitingReply: true,
           },
         };
       });
-      // Update the sidebar row's preview optimistically — the server
-      // will repeat the truth in the UserEcho frame (which also flows
-      // into setSessions via applySessionUserText), but reflecting it
-      // here keeps the sidebar in lockstep with the bubble the user
-      // just dropped.
-      setSessions((prev) => applySessionUserText(prev, sessionId, trimmed || '[attachment]'));
-      // The user just hit send — anchor them to the tail regardless of
-      // where they had scrolled to, so the optimistic row + incoming
-      // reply land in view. The transcript-change effect above reads
-      // this ref and jumps to scrollHeight on the next layout pass.
+      setSessions((prev) =>
+        applySessionUserText(prev, targetSessionId, trimmed || '[attachment]'),
+      );
+      // A user send starts (or extends) a turn in this session — arm auto-fire
+      // for its completion and protect its bucket from LRU eviction.
+      turnTokenRef.current.set(
+        targetSessionId,
+        (turnTokenRef.current.get(targetSessionId) ?? 0) + 1,
+      );
+      firedForTurnRef.current.delete(targetSessionId);
+      recencyRef.current.set(targetSessionId, Date.now());
+      if (opts?.foreground ?? targetSessionId === currentSessionIdRef.current) {
+        pinnedToBottomRef.current = true;
+        setHasNewBelow(false);
+      }
+      wsRef.current.sendMessage({
+        sessionId: targetSessionId,
+        userId: 'web-operator',
+        content: trimmed,
+        clientMsgId,
+        attachments: wireAttachments,
+      });
+      return true;
+    },
+    [],
+  );
+
+  // Fire several queued messages into a session as ONE batch frame — the
+  // server runs them as a single coalesced turn (one reply) while keeping each
+  // as its own row, so they merge deterministically instead of racing the
+  // per-message intake. Appends N optimistic rows + one turn-arm, mirroring
+  // sendToSession's bookkeeping. Returns false (nothing sent) if disconnected.
+  const sendBatchToSession = useCallback(
+    (targetSessionId: string, items: QueuedItem[]): boolean => {
+      if (!wsRef.current || statusRef.current.state !== 'connected') return false;
+      const prepared = items
+        .map((it) => ({
+          clientMsgId: crypto.randomUUID(),
+          text: it.text.trim(),
+          attachments: it.attachments,
+        }))
+        .filter((m) => m.text.length > 0 || m.attachments.length > 0);
+      if (prepared.length === 0) return false;
+      stoppedSessionsRef.current.delete(targetSessionId);
+      setViews((prev) => {
+        const view = prev[targetSessionId] ?? EMPTY_VIEW;
+        // Collapse any open work block so it reads "Worked Xs" rather than a
+        // live "Working…" next to the block the batch's turn opens (same as the
+        // single interjection). No-op when idle / already closed.
+        const base = view.turn?.active ? closeActiveWork(view.transcript) : view.transcript;
+        return {
+          ...prev,
+          [targetSessionId]: {
+            ...view,
+            transcript: [
+              ...base,
+              ...prepared.map((m) => ({
+                key: `pending-${m.clientMsgId}`,
+                role: 'user' as const,
+                text: m.text,
+                hasAttachments: m.attachments.length > 0,
+                attachments: m.attachments.length > 0 ? m.attachments : undefined,
+                pending: true,
+                clientMsgId: m.clientMsgId,
+                createdAt: new Date().toISOString(),
+              })),
+            ],
+            awaitingReply: true,
+          },
+        };
+      });
+      const lastText = prepared[prepared.length - 1].text;
+      setSessions((prev) =>
+        applySessionUserText(prev, targetSessionId, lastText || '[attachment]'),
+      );
+      turnTokenRef.current.set(
+        targetSessionId,
+        (turnTokenRef.current.get(targetSessionId) ?? 0) + 1,
+      );
+      firedForTurnRef.current.delete(targetSessionId);
+      recencyRef.current.set(targetSessionId, Date.now());
+      if (targetSessionId === currentSessionIdRef.current) {
+        pinnedToBottomRef.current = true;
+        setHasNewBelow(false);
+      }
+      wsRef.current.sendMessages(
+        targetSessionId,
+        prepared.map((m) => ({
+          content: m.text,
+          clientMsgId: m.clientMsgId,
+          attachments: m.attachments,
+        })),
+      );
+      return true;
+    },
+    [],
+  );
+
+  const sendText = useCallback(
+    (raw: string, wireAttachments: WireAttachment[] = []) => {
+      const trimmed = raw.trim();
+      if ((!trimmed && wireAttachments.length === 0) || !sessionId || !wsRef.current)
+        return;
+      if (status.state !== 'connected') return;
+      // Non-stop sends go through the shared session-agnostic path.
+      if (!isStopCommand(trimmed)) {
+        sendToSession(sessionId, raw, wireAttachments, { foreground: true });
+        return;
+      }
+      // `/stop` is the one command we can reflect without the backend: the
+      // user's own action means "cancel", so collapse the live work block to
+      // "Cancelled" and end the turn locally right away. Don't show the
+      // awaiting-reply spinner (we're stopping, not starting a turn); the
+      // server's TurnState/notice frames then reconcile idempotently. Settle
+      // any buffered answer first, keep the partial reply as its own bubble
+      // below the collapsed block, and mark the session stopped so a delta
+      // that raced in just after is dropped rather than spilling a bubble.
+      const clientMsgId = crypto.randomUUID();
+      flushPacerKeepStreaming(sessionId);
+      stoppedSessionsRef.current.add(sessionId);
+      streamingAnswerRef.current.delete(sessionId);
+      // Pause the interjection queue at once. The cancelled turn salvages its
+      // partial reply as an assistant `message` that races ahead of the cancel
+      // notice; without this it would auto-fire a queued item before the notice
+      // sets the pause. Move any deferred items back to the parked queue first
+      // (synchronously, before any frame) so the salvaged-message drain finds an
+      // empty deferred list and the banner covers them too. Setting the pause
+      // here also surfaces the banner immediately.
+      queueStoreRef.current.restoreDeferred(sessionId);
+      if (queueStoreRef.current.queue(sessionId).items.length > 0) {
+        queueStoreRef.current.setPause(sessionId, 'cancelled');
+      }
+      setViews((prev) => {
+        const view = prev[sessionId] ?? EMPTY_VIEW;
+        return {
+          ...prev,
+          [sessionId]: {
+            ...view,
+            transcript: [
+              ...closeActiveWork(finalizeTrailingAnswer(view.transcript), true),
+              {
+                key: `pending-${clientMsgId}`,
+                role: 'user',
+                text: trimmed,
+                hasAttachments: wireAttachments.length > 0,
+                attachments: wireAttachments.length > 0 ? wireAttachments : undefined,
+                pending: true,
+                clientMsgId,
+                createdAt: new Date().toISOString(),
+              },
+            ],
+            awaitingReply: false,
+            turn: { active: false, startedAt: null },
+          },
+        };
+      });
+      setSessions((prev) => applySessionUserText(prev, sessionId, trimmed));
       pinnedToBottomRef.current = true;
       setHasNewBelow(false);
       wsRef.current.sendMessage({
@@ -1142,19 +1384,23 @@ export function ChatPage() {
         attachments: wireAttachments,
       });
     },
-    [sessionId, status.state, flushPacerKeepStreaming],
+    [sessionId, status.state, sendToSession, flushPacerKeepStreaming],
   );
+
+  // Non-empty draft OR at least one ready attachment — drives the Send/Stop
+  // matrix and whether a submit does anything.
+  const hasContent =
+    composer.trim().length > 0 || attachments.some((a) => a.status === 'ready');
 
   const handleSend = useCallback(
     (e: FormEvent) => {
       e.preventDefault();
-      // While a turn is in flight the composer's action is "stop" (see the
-      // footer button) and new messages are blocked — the user must let the
-      // turn finish or hit stop first.
-      if (busy) return;
-      // Don't send until every picked file has finished uploading, so an
+      // No busy early-out: while a turn is in flight (or the queue is non-empty
+      // / paused) a submit PARKS the message instead of being blocked.
+      // Don't act until every picked file has finished uploading, so an
       // in-flight attachment isn't silently dropped from the message.
       if (attachments.some((a) => a.status === 'uploading')) return;
+      const trimmed = composer.trim();
       const wire: WireAttachment[] = attachments
         .filter((a) => a.status === 'ready' && a.blobId)
         .map((a) => ({
@@ -1164,8 +1410,20 @@ export function ChatPage() {
           size: a.size,
           filename: a.filename,
         }));
-      if (composer.trim().length === 0 && wire.length === 0) return;
-      sendText(composer, wire);
+      const action = decideComposerAction({
+        hasContent: trimmed.length > 0 || wire.length > 0,
+        isStop: isStopCommand(trimmed),
+        busy,
+        paused: queue.pauseReason !== null,
+      });
+      if (action === 'noop') return;
+      if (action === 'stop') {
+        sendText('/stop');
+      } else if (action === 'direct') {
+        sendText(composer, wire);
+      } else {
+        queue.enqueue({ id: crypto.randomUUID(), text: trimmed, attachments: wire });
+      }
       setComposer('');
       attachments.forEach((a) => {
         if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
@@ -1173,7 +1431,7 @@ export function ChatPage() {
       setAttachments([]);
       setShowSlashHints(false);
     },
-    [composer, busy, attachments, sendText],
+    [composer, busy, attachments, sendText, queue],
   );
 
   const handleStop = useCallback(
@@ -1193,6 +1451,124 @@ export function ChatPage() {
     },
     [sendText],
   );
+
+  // Interjection queue: react to inbound frames. On a LIVE normal completion
+  // (an assistant `message` for a turn we armed) fire the top parked item for
+  // that session; on a terminal /stop-cancel or error notice pause the
+  // pipeline so it stops draining until the user resumes via the banner.
+  const drainQueueOnFrame = useCallback(
+    (frame: Frame) => {
+      const store = queueStoreRef.current;
+      if (frame.kind === 'message' && frame.role !== 'user') {
+        const sid = frame.session_id;
+        // A just-/stop'd session salvages its partial reply as an assistant
+        // message — that is NOT a normal completion and must never drain the
+        // queue. Cleared when a new turn starts or a non-stop message is sent.
+        if (stoppedSessionsRef.current.has(sid)) return;
+        const token = turnTokenRef.current.get(sid);
+        // Fire only when a live turn armed this session (token set) — skips
+        // reload catch-up replays — and not already fired for this turn.
+        if (token !== undefined && firedForTurnRef.current.get(sid) !== token) {
+          const snap = store.queue(sid);
+          if (snap.pauseReason !== null) return;
+          // Deferred ("waiting in the thread") messages — the ones the operator
+          // clicked send on mid-final-reply — ALL go out together as soon as the
+          // reply completes, so the agent answers them as one merged turn.
+          // Parked items stay one-per-completion. Sharing the parked-queue token
+          // gate keeps this single-fire-per-live-completion.
+          if (snap.deferred.length > 0) {
+            // Drop any content-less junk (can only arise from an out-of-band
+            // localStorage write — the composer/edit paths refuse blank items)
+            // so it can't wedge the queue or skew the batch threshold/removal.
+            const sendable = snap.deferred.filter(
+              (i) => i.text.trim().length > 0 || i.attachments.length > 0,
+            );
+            for (const item of snap.deferred) {
+              if (!sendable.includes(item)) store.removeDeferred(sid, item.id);
+            }
+            if (sendable.length === 0) return;
+            firedForTurnRef.current.set(sid, token);
+            // 2+ plain messages go as ONE batch frame so the server coalesces
+            // them deterministically (no per-message intake race). A slash
+            // command is a coalescing barrier — those, and the lone-item case,
+            // fall back to individual sends.
+            const canBatch = sendable.length >= 2 && sendable.every((i) => !isSlashText(i.text));
+            if (canBatch) {
+              if (sendBatchToSession(sid, sendable)) {
+                for (const item of sendable) store.removeDeferred(sid, item.id);
+              } else {
+                firedForTurnRef.current.delete(sid);
+              }
+              return;
+            }
+            for (const item of sendable) {
+              if (sendToSession(sid, item.text, item.attachments)) {
+                store.removeDeferred(sid, item.id);
+              } else {
+                // Disconnected — stop here and leave the rest deferred to retry.
+                firedForTurnRef.current.delete(sid);
+                break;
+              }
+            }
+            return;
+          }
+          const top = snap.items[0];
+          if (!top) return;
+          firedForTurnRef.current.set(sid, token);
+          if (sendToSession(sid, top.text, top.attachments)) {
+            store.removeItem(sid, top.id);
+          } else {
+            // Disconnected — leave it queued and allow a later retry.
+            firedForTurnRef.current.delete(sid);
+          }
+        }
+        return;
+      }
+      if (frame.kind === 'turn_state' && !frame.active) {
+        const sid = frame.session_id;
+        const token = turnTokenRef.current.get(sid);
+        // `turn_state{active:false}` is the one turn-end signal that ALWAYS
+        // fires; the assistant `message` does not (a blank/tool-only final
+        // emits none, an errored/cancelled turn emits none, a reload/Reset
+        // never re-delivers the prior completion). So if the message branch did
+        // NOT already dispatch a deferred item this turn (firedForTurn === token
+        // means it did, and the rest keep waiting for the turn that dispatch
+        // started), the still-pending deferred items can't ride this completion.
+        // Move them back to the parked queue — visible/editable and drained on
+        // the next completion — rather than leaving them stranded as a
+        // read-only thread bubble. Restoring (not sending) here also means a
+        // turn that ended via /stop or error can't auto-fire a deferred item
+        // ahead of the pause-setting notice.
+        if (token === undefined || firedForTurnRef.current.get(sid) !== token) {
+          const snap = store.queue(sid);
+          if (snap.deferred.length > 0 && snap.pauseReason === null) {
+            store.restoreDeferred(sid);
+          }
+        }
+        return;
+      }
+      if (frame.kind === 'notice' && !frame.transient) {
+        const sid = frame.session_id;
+        const q = store.queue(sid);
+        if (q.items.length === 0 && q.deferred.length === 0) return;
+        // The reply a deferred message was waiting on was cancelled/failed —
+        // move it back to the parked queue and pause so it isn't auto-sent; the
+        // banner's "Send remaining" is the explicit resume.
+        if (isStopCancellationNotice(frame.text)) {
+          store.restoreDeferred(sid);
+          store.setPause(sid, 'cancelled');
+        } else if (frame.level === 'error') {
+          store.restoreDeferred(sid);
+          store.setPause(sid, 'error');
+        }
+      }
+    },
+    [sendToSession],
+  );
+
+  useEffect(() => {
+    queueFrameRef.current = drainQueueOnFrame;
+  }, [drainQueueOnFrame]);
 
   const uploadAttachment = useCallback(
     async (file: File) => {
@@ -1259,13 +1635,14 @@ export function ChatPage() {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         const hasReady = attachments.some((a) => a.status === 'ready');
-        if (!busy && (composer.trim().length > 0 || hasReady)) {
+        // Enter submits whether idle or busy — handleSend decides send vs park.
+        if (composer.trim().length > 0 || hasReady) {
           const form = e.currentTarget.form;
           form?.requestSubmit();
         }
       }
     },
-    [composer, busy, attachments],
+    [composer, attachments],
   );
 
   const handleComposerChange = useCallback(
@@ -1275,6 +1652,43 @@ export function ChatPage() {
     },
     [slashCommands.length],
   );
+
+  // ── Interjection queue: composer/panel callbacks ────────────────────
+  // Per-item send-icon: fire this item now (jumps the queue); mid-turn it lands
+  // as an interjection, idle it starts a turn. Keeps any pauseReason.
+  const fireQueuedItem = useCallback(
+    (item: QueuedItem) => {
+      if (!sessionId) return;
+      // Mid-final-reply there are no tool boundaries left to interject at, and
+      // sending now would either race the turn's end (double-fire risk) or split
+      // the streaming answer into two bubbles. Instead defer the item: it leaves
+      // the queue panel and renders in the thread below the agent's output,
+      // dispatched on the turn's completion by the queue drain (or moved back to
+      // the parked queue if the turn ends without a normal reply). Outside the
+      // final-reply phase (tool work → interject; idle → start a turn) fire now.
+      if (streamingAnswerRef.current.has(sessionId)) {
+        queue.deferItem(item.id);
+        return;
+      }
+      if (sendToSession(sessionId, item.text, item.attachments, { foreground: true })) {
+        queue.removeItem(item.id);
+      }
+    },
+    [sessionId, sendToSession, queue],
+  );
+
+  // Banner "Send remaining": clear the pause, fire the top item now, and let
+  // the pipeline resume one-per-completion. clearPause then popTop compose in
+  // one tick because the store updates its ref synchronously.
+  const resumeQueue = useCallback(() => {
+    if (!sessionId) return;
+    const top = queue.items[0];
+    if (!top) return;
+    queue.clearPause();
+    if (sendToSession(sessionId, top.text, top.attachments, { foreground: true })) {
+      queue.popTop();
+    }
+  }, [sessionId, queue, sendToSession]);
 
   const handleApprovalDecision = useCallback(
     (decision: ApprovalDecision) => {
@@ -1557,6 +1971,26 @@ export function ChatPage() {
                 }
                 return nodes;
               })}
+              {/* Deferred ("send after the reply") messages render as dimmed
+                  user bubbles pinned below the agent's output — never woven into
+                  the streaming transcript array, so they can't split the answer
+                  bubble. They dispatch (and become real transcript rows) once the
+                  turn completes. */}
+              {queue.deferred.map((item) => (
+                <MessageBubble
+                  key={`deferred-${item.id}`}
+                  row={{
+                    key: `deferred-${item.id}`,
+                    role: 'user',
+                    text: item.text,
+                    attachments: item.attachments,
+                    hasAttachments: item.attachments.length > 0,
+                    pending: true,
+                  }}
+                  channelToken={channelToken}
+                  baseUrl={baseUrl}
+                />
+              ))}
               {currentView.awaitingReply ? <WorkingIndicator /> : null}
               {currentView.pendingApproval ? (
                 <ApprovalCard
@@ -1601,28 +2035,40 @@ export function ChatPage() {
               aria-hidden
               className="pointer-events-none absolute inset-x-0 -bottom-6 -top-20 bg-linear-to-t from-surface from-40% to-transparent"
             />
-            {filteredSlash.length > 0 ? (
-              <div className="absolute bottom-full left-0 right-0 mb-2 border-2 border-black bg-white rounded-2xl shadow-brutal px-2 py-2 flex flex-col gap-0.5">
-                <div className="px-2 pb-1 text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
-                  Slash commands
-                </div>
-                {filteredSlash.map((s) => (
-                  <button
-                    key={s.command}
-                    type="button"
-                    onClick={() => {
-                      handleComposerChange(`/${s.command} `);
-                    }}
-                    className="text-left px-2 py-1.5 border-2 border-transparent hover:border-black hover:bg-canvas rounded font-mono text-sm flex items-center gap-2 cursor-pointer"
-                  >
-                    <span className="font-bold shrink-0">/{s.command}</span>
-                    <span className="text-ink-soft truncate">{s.description}</span>
-                  </button>
-                ))}
-              </div>
+            {sessionId ? (
+              <QueuePanel
+                sessionId={sessionId}
+                baseUrl={baseUrl}
+                channelToken={channelToken}
+                onFire={fireQueuedItem}
+                onResume={resumeQueue}
+              />
             ) : null}
 
             <div className="relative border-2 border-black rounded-2xl bg-white shadow-brutal focus-within:shadow-brutal transition-shadow">
+              {/* Slash-command autocomplete floats directly over the input box.
+                  Anchored to the pill (not the form) so the queue panel sitting
+                  above the pill can't push it up. */}
+              {filteredSlash.length > 0 ? (
+                <div className="absolute bottom-full left-0 right-0 mb-2 z-30 border-2 border-black bg-white rounded-2xl shadow-brutal px-2 py-2 flex flex-col gap-0.5">
+                  <div className="px-2 pb-1 text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
+                    Slash commands
+                  </div>
+                  {filteredSlash.map((s) => (
+                    <button
+                      key={s.command}
+                      type="button"
+                      onClick={() => {
+                        handleComposerChange(`/${s.command} `);
+                      }}
+                      className="text-left px-2 py-1.5 border-2 border-transparent hover:border-black hover:bg-canvas rounded font-mono text-sm flex items-center gap-2 cursor-pointer"
+                    >
+                      <span className="font-bold shrink-0">/{s.command}</span>
+                      <span className="text-ink-soft truncate">{s.description}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
               {attachments.length > 0 ? (
                 <div className="flex flex-wrap gap-1.5 px-3 pt-2.5">
                   {attachments.map((a) =>
@@ -1722,14 +2168,14 @@ export function ChatPage() {
                     onSelect={handleSelectModel}
                   />
                 ) : null}
-                {busy ? (
+                {busy && !hasContent ? (
                   <button
                     key="composer-stop"
                     type="button"
                     onClick={handleStop}
                     disabled={status.state !== 'connected'}
                     className="shrink-0 h-8 w-8 flex items-center justify-center bg-err text-white border-2 border-black rounded-full shadow-brutal-xs hover:opacity-90 active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-                    title="Stop the current turn (/stop)"
+                    title="Stop the current turn (/stop). Type /stop to stop while drafting."
                     aria-label="Stop the current turn"
                   >
                     <RiStopFill className="text-base" />
@@ -1742,11 +2188,14 @@ export function ChatPage() {
                       !sessionId ||
                       status.state !== 'connected' ||
                       attachments.some((a) => a.status === 'uploading') ||
-                      (composer.trim().length === 0 &&
-                        !attachments.some((a) => a.status === 'ready'))
+                      !hasContent
                     }
                     className="shrink-0 h-8 w-8 flex items-center justify-center bg-brand text-ink border-2 border-black rounded-full shadow-brutal-xs hover:bg-brand-hover active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-                    title="Send (Enter)"
+                    title={
+                      busy || queue.pauseReason !== null
+                        ? 'Queue message (Enter)'
+                        : 'Send (Enter)'
+                    }
                   >
                     <RiSendPlane2Line className="text-base" />
                   </button>
@@ -2647,6 +3096,39 @@ function pushStatusStep(
  *  `/stop` path, where the user's own action is proof the turn was cancelled
  *  (so the block flips instantly, without waiting on a backend signal). */
 export function closeActiveWork(prev: TranscriptRow[], cancelled = false): TranscriptRow[] {
+  // The turn is ending, so any block left "settling" by a mid-turn interjection
+  // (kept expanded so its split-off work stayed visible) now collapses to its
+  // summary too. Clear the flag here — co-located with the active-block close so
+  // every turn-end path collapses settling blocks without a separate sweep.
+  const hasSettling = prev.some((r) => r.kind === 'work' && r.workSettling);
+  const rows = hasSettling
+    ? prev.map((r) => (r.kind === 'work' && r.workSettling ? { ...r, workSettling: false } : r))
+    : prev;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+    if (row.kind !== 'work' || !row.workActive) continue;
+    if (!row.steps || row.steps.length === 0) {
+      return [...rows.slice(0, i), ...rows.slice(i + 1)];
+    }
+    const next = rows.slice();
+    next[i] = {
+      ...row,
+      workActive: false,
+      workEndedAt: Date.now(),
+      workCancelled: row.workCancelled || cancelled,
+    };
+    return next;
+  }
+  return rows;
+}
+
+/** Close the open work block on a mid-turn user interjection: relabel it
+ *  "Worked Xs" (clear `workActive`) but keep it EXPANDED via `workSettling`
+ *  until the turn fully ends, so the work the interjection split off stays
+ *  visible instead of collapsing mid-reply. An empty block (no steps) is still
+ *  dropped — nothing to keep open. `closeActiveWork` clears the flag (→
+ *  collapse) at turn-end. */
+export function settleActiveWork(prev: TranscriptRow[]): TranscriptRow[] {
   for (let i = prev.length - 1; i >= 0; i--) {
     const row = prev[i];
     if (row.kind !== 'work' || !row.workActive) continue;
@@ -2657,8 +3139,8 @@ export function closeActiveWork(prev: TranscriptRow[], cancelled = false): Trans
     next[i] = {
       ...row,
       workActive: false,
+      workSettling: true,
       workEndedAt: Date.now(),
-      workCancelled: row.workCancelled || cancelled,
     };
     return next;
   }
@@ -2676,6 +3158,15 @@ export function finalizeTrailingAnswer(prev: TranscriptRow[]): TranscriptRow[] {
   if (!last?.streaming || last.role !== 'assistant') return prev;
   if (last.text.trim().length === 0) return prev.slice(0, -1);
   return [...prev.slice(0, -1), { ...last, streaming: false }];
+}
+
+/** Whether `text` leads with any slash command, mirroring the backend's
+ *  `is_slash_command` (a `/` immediately followed by a non-whitespace char).
+ *  Such a message is a hard coalescing barrier on the server, so it must not
+ *  ride in a "send all at once" batch frame — the drain sends these
+ *  individually instead. */
+export function isSlashText(text: string): boolean {
+  return /^\/\S/.test(text.trim());
 }
 
 /** Recognise a `/stop` the user typed, mirroring the gateway's parser
@@ -3193,69 +3684,6 @@ function MarkdownBody({ text }: { text: string }) {
   );
 }
 
-function AttachmentImage({
-  blobId,
-  alt,
-  baseUrl,
-  channelToken,
-}: {
-  blobId: string;
-  alt: string;
-  baseUrl: string;
-  channelToken: string | null;
-}) {
-  const [url, setUrl] = useState<string | null>(null);
-  const [failed, setFailed] = useState(false);
-  // `<img>` can't carry the `x-aura-channel-token` header, so fetch the
-  // blob ourselves and hand the bitmap to the tag as an object URL.
-  useEffect(() => {
-    let cancelled = false;
-    let objectUrl: string | null = null;
-    void (async () => {
-      try {
-        const base = (baseUrl || '').replace(/\/+$/, '');
-        const res = await fetch(`${base}/v1/blobs/${encodeURIComponent(blobId)}`, {
-          headers: { 'x-aura-channel-token': channelToken ?? '' },
-        });
-        if (!res.ok) throw new Error(`blob ${res.status}`);
-        const blob = await res.blob();
-        if (cancelled) return;
-        objectUrl = URL.createObjectURL(blob);
-        setUrl(objectUrl);
-      } catch {
-        if (!cancelled) setFailed(true);
-      }
-    })();
-    return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [blobId, baseUrl, channelToken]);
-
-  if (failed) {
-    return (
-      <span className="flex items-center gap-1.5 px-2 py-1 bg-canvas border-2 border-black rounded-md font-mono text-[0.7rem] max-w-full">
-        <RiImageLine className="text-sm shrink-0" />
-        <span className="truncate">{alt}</span>
-      </span>
-    );
-  }
-  if (!url) {
-    return (
-      <div className="flex items-center justify-center h-24 w-24 bg-canvas border-2 border-black rounded-md">
-        <RiLoader4Line className="text-lg animate-spin text-ink-soft" />
-      </div>
-    );
-  }
-  return (
-    <img
-      src={url}
-      alt={alt}
-      className="max-h-48 max-w-full rounded-md border-2 border-black object-contain"
-    />
-  );
-}
-
 function AttachmentList({
   attachments,
   baseUrl,
@@ -3472,10 +3900,13 @@ export function workBlockDisplay(
   active: boolean,
   hasSteps: boolean,
   expanded: boolean,
+  settling = false,
 ): { boxed: boolean; panelOpen: boolean } {
   return {
-    boxed: active || expanded,
-    panelOpen: (active && hasSteps) || expanded,
+    // `settling` (an interjection-paused block, still mid-turn) reads like an
+    // expanded finished block: bordered card with its steps panel open.
+    boxed: active || expanded || settling,
+    panelOpen: (active && hasSteps) || expanded || (settling && hasSteps),
   };
 }
 
@@ -3509,7 +3940,10 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
   //    compact spinner and the panel grows in when the first step lands.
   const [expanded, setExpanded] = useState(false);
   const hasSteps = steps.length > 0;
-  const { boxed, panelOpen } = workBlockDisplay(active, hasSteps, expanded);
+  // A block closed mid-turn by an interjection: keep it open ("Worked Xs",
+  // steps shown) until the turn ends and `closeActiveWork` clears the flag.
+  const settling = !!row.workSettling;
+  const { boxed, panelOpen } = workBlockDisplay(active, hasSteps, expanded, settling);
   // The spinner-first state hugs its content instead of stretching the full
   // card width; the panel/steps states take the full width so work has room.
   const compact = boxed && !panelOpen;
@@ -3569,7 +4003,9 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
         <button
           type="button"
           onClick={() => {
-            if (!active) setExpanded((e) => !e);
+            // Live and settling blocks are non-toggleable: a live turn owns its
+            // expansion, and a settling block stays open until the turn ends.
+            if (!active && !settling) setExpanded((e) => !e);
           }}
           className={`w-full flex items-center gap-2 py-2 font-mono text-xs text-left border-b-2 transition-all duration-300 ease-out ${
             // Drop the horizontal padding when collapsed so the summary
@@ -3580,7 +4016,7 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
             // open; the compact spinner card and the collapsed summary keep
             // a seamless, divider-less header.
             panelOpen ? 'border-black bg-canvas' : 'border-transparent bg-transparent'
-          } ${active ? 'cursor-default' : 'cursor-pointer'}`}
+          } ${active || settling ? 'cursor-default' : 'cursor-pointer'}`}
         >
           {active ? (
             <>
@@ -3597,7 +4033,7 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
               <span className={cancelled ? 'text-error' : 'text-ink-soft'}>{workedLabel}</span>
               <RiArrowRightSLine
                 className={`text-sm text-ink-soft shrink-0 transition-transform duration-300 ease-out ${
-                  expanded ? 'rotate-90' : ''
+                  panelOpen ? 'rotate-90' : ''
                 }`}
               />
             </>
@@ -3625,7 +4061,7 @@ function WorkBlock({ row }: { row: TranscriptRow }) {
           </div>
         </div>
       </div>
-      {!active && !expanded ? (
+      {!active && !panelOpen ? (
         <div aria-hidden className="w-full border-t border-black/20" />
       ) : null}
     </div>

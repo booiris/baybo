@@ -273,6 +273,16 @@ pub enum Frame {
     /// echo of inbound to other subscribers of the same session
     /// (role=User).
     Message(Message),
+    /// Client → server. Several user messages for **one** session that
+    /// must run as a single coalesced turn — the web "send every queued
+    /// message at once" affordance. Delivered to the actor atomically (as
+    /// one mailbox item) so the actor's coalescing can't lose stragglers to
+    /// the per-message router latency, which a burst of separate
+    /// [`Frame::Message`]s would. The server echoes each entry back as its
+    /// own [`Frame::Message`] (role=User) so every subscriber renders the
+    /// same N rows, then runs one merged turn with one reply. Outbound never
+    /// uses this kind.
+    Messages { messages: Vec<Message> },
     /// Server → client: media a tool produced mid-turn (a sent file, a
     /// screenshot), delivered as its **own** message. Unlike a terminal
     /// [`Frame::Message`] it carries no `role` / `ordinal` and no turn-
