@@ -44,6 +44,7 @@ import { AttachmentImage } from './chat/AttachmentImage';
 import { QueuePanel } from './chat/QueuePanel';
 import { SessionSidebar } from './chat/SessionSidebar';
 import { useQueueStore, useSessionQueue, type QueuedItem } from './chat/queueStore';
+import { useFolderStore } from './chat/folderStore';
 import type { SessionSummary } from './chat/types';
 
 /** One progress entry inside a turn's work block. `reasoning`, `status`
@@ -279,6 +280,7 @@ export function ChatPage() {
   const client = useAdminClient();
   const { baseUrl } = useAuth();
   const queueStore = useQueueStore();
+  const folderStore = useFolderStore();
   // Reactive interjection queue for the active session (drives the panel, the
   // park-vs-direct decision, and the Send-button affordance).
   const queue = useSessionQueue(sessionId);
@@ -544,10 +546,12 @@ export function ChatPage() {
         { data: list, error: listError },
         { data: manifest, error: manifestError },
         { data: modelList, error: modelError },
+        { data: folderList, error: folderError },
       ] = await Promise.all([
         client.GET('/v1/chat/sessions'),
         client.GET('/v1/chat/slash-manifest'),
         client.GET('/v1/llm/models'),
+        client.GET('/v1/chat/folders'),
       ]);
       if (cancelled) return;
       if (listError) {
@@ -559,6 +563,18 @@ export function ChatPage() {
       if (modelError) {
         console.warn('chat bootstrap: list models failed', modelError);
       }
+      if (folderError) {
+        console.warn('chat bootstrap: list folders failed', folderError);
+      }
+      folderStore.replaceFolders(
+        (folderList?.items ?? []).map((f) => ({
+          id: f.id,
+          parent_id: f.parent_id ?? undefined,
+          name: f.name,
+          position: f.position,
+          created_at: f.created_at,
+        })),
+      );
       setModels(
         (modelList?.items ?? []).map((m) => ({
           name: m.name,
@@ -575,6 +591,7 @@ export function ChatPage() {
         unread: 0,
         pinned: s.pinned,
         last_user_text: s.last_user_text ?? undefined,
+        folder_id: s.folder_id ?? undefined,
       }));
       setSessions(existing);
       setSlashCommands(manifest?.items ?? []);
@@ -656,7 +673,7 @@ export function ChatPage() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client]); // intentionally NOT depending on sessionId — bootstrap is one-shot
+  }, [client, folderStore]); // intentionally NOT depending on sessionId — bootstrap is one-shot
 
   // Always-current handler for register_ack { ok: false }. Mints a
   // fresh token against the anchor session and feeds it back into
@@ -704,6 +721,20 @@ export function ChatPage() {
         setStatus(s);
       },
       onFrame: (frame) => {
+        if (frame.kind === 'folders_changed') {
+          // Full-snapshot convergence — replace the local folder tree
+          // wholesale (folders are few, no patch-merge needed).
+          folderStore.replaceFolders(
+            frame.folders.map((f) => ({
+              id: f.id,
+              parent_id: f.parent_id ?? undefined,
+              name: f.name,
+              position: f.position,
+              created_at: f.created_at,
+            })),
+          );
+          return;
+        }
         if (frame.kind === 'session_updated') {
           setSessions((prev) => applySessionPatch(prev, frame.session_id, frame.patch));
           if (frame.patch.hidden === true) {
@@ -885,7 +916,15 @@ export function ChatPage() {
       ws.close();
       wsRef.current = null;
     };
-  }, [baseUrl, channelToken, releaseSessionView, enqueueDelta, cancelPacer, flushPacerKeepStreaming]);
+  }, [
+    baseUrl,
+    channelToken,
+    releaseSessionView,
+    enqueueDelta,
+    cancelPacer,
+    flushPacerKeepStreaming,
+    folderStore,
+  ]);
 
   // ── Active session: subscribe + lazy-load history ───────────────────
   // Subscribe stays sticky once added: when the user switches away,
@@ -1746,6 +1785,125 @@ export function ChatPage() {
     [client],
   );
 
+  // ── Folder handlers ────────────────────────────────────────────────
+  // Assign (or clear, with null) a session's folder. Optimistic; the
+  // server's SessionPatch broadcast converges every tab. A pinned row
+  // stays pinned (no auto-unpin) — the assignment just takes effect when
+  // it's unpinned. On failure we revert to the prior folder.
+  const handleAssignFolder = useCallback(
+    async (id: string, folderId: string | null) => {
+      let prevFolder: string | undefined;
+      setSessions((prev) => {
+        const idx = prev.findIndex((s) => s.session_id === id);
+        if (idx === -1) return prev;
+        prevFolder = prev[idx].folder_id;
+        const next = prev.slice();
+        next[idx] = { ...prev[idx], folder_id: folderId ?? undefined };
+        return next;
+      });
+      const { error, response } = await client.PUT('/v1/chat/sessions/{session_id}/folder', {
+        params: { path: { session_id: id } },
+        body: { folder_id: folderId },
+      });
+      if (error || !response.ok) {
+        console.warn('assign folder failed', id, error);
+        setSessions((prev) => {
+          const idx = prev.findIndex((s) => s.session_id === id);
+          if (idx === -1) return prev;
+          const next = prev.slice();
+          next[idx] = { ...prev[idx], folder_id: prevFolder };
+          return next;
+        });
+      }
+    },
+    [client],
+  );
+
+  // Folder CRUD — fire-and-converge: the server broadcasts a
+  // Frame::FoldersChanged snapshot that the folderStore swaps in, so we
+  // don't optimistically mutate the (store-owned) folder list here.
+  const handleCreateFolder = useCallback(
+    async (name: string, parentId?: string) => {
+      const { error } = await client.POST('/v1/chat/folders', {
+        body: { name, parent_id: parentId ?? null },
+      });
+      if (error) console.warn('create folder failed', error);
+    },
+    [client],
+  );
+  const handleRenameFolder = useCallback(
+    async (id: string, name: string) => {
+      const { error } = await client.PATCH('/v1/chat/folders/{folder_id}', {
+        params: { path: { folder_id: id } },
+        body: { name },
+      });
+      if (error) console.warn('rename folder failed', error);
+    },
+    [client],
+  );
+  const handleMoveFolder = useCallback(
+    async (id: string, parentId: string | null) => {
+      const { error } = await client.POST('/v1/chat/folders/{folder_id}/move', {
+        params: { path: { folder_id: id } },
+        body: { parent_id: parentId },
+      });
+      if (error) console.warn('move folder failed', error);
+    },
+    [client],
+  );
+  const handleReorderFolders = useCallback(
+    async (parentId: string | null, orderedIds: string[]) => {
+      const { error } = await client.POST('/v1/chat/folders/reorder', {
+        body: { parent_id: parentId, ordered_ids: orderedIds },
+      });
+      if (error) console.warn('reorder folders failed', error);
+    },
+    [client],
+  );
+  const handleDeleteFolder = useCallback(
+    async (id: string) => {
+      const { error } = await client.DELETE('/v1/chat/folders/{folder_id}', {
+        params: { path: { folder_id: id } },
+      });
+      if (error) console.warn('delete folder failed', error);
+    },
+    [client],
+  );
+  const handleNewChatInFolder = useCallback(
+    async (folderId: string) => {
+      setCreating(true);
+      try {
+        const { data } = await client.POST('/v1/chat/sessions', {});
+        if (data?.session_id) {
+          const sid = data.session_id;
+          setSessions((prev) =>
+            prev.some((s) => s.session_id === sid)
+              ? prev
+              : [
+                  {
+                    session_id: sid,
+                    created_at: new Date().toISOString(),
+                    last_active: new Date().toISOString(),
+                    unread: 0,
+                    pinned: false,
+                    folder_id: folderId,
+                  },
+                  ...prev,
+                ],
+          );
+          await client.PUT('/v1/chat/sessions/{session_id}/folder', {
+            params: { path: { session_id: sid } },
+            body: { folder_id: folderId },
+          });
+          navigateRef.current(`/chat/${sid}`);
+        }
+      } finally {
+        setCreating(false);
+      }
+    },
+    [client],
+  );
+
   const cancelHideSession = useCallback(() => {
     if (hideSubmitting) return;
     setHidePrompt(null);
@@ -1903,6 +2061,13 @@ export function ChatPage() {
         onNewChat={handleNewChat}
         onHide={handleHideSession}
         onTogglePin={handleTogglePin}
+        onAssignFolder={handleAssignFolder}
+        onCreateFolder={handleCreateFolder}
+        onRenameFolder={handleRenameFolder}
+        onMoveFolder={handleMoveFolder}
+        onReorderFolders={handleReorderFolders}
+        onDeleteFolder={handleDeleteFolder}
+        onNewChatInFolder={handleNewChatInFolder}
       />
 
       {/* Main column */}
@@ -3441,6 +3606,14 @@ function applySessionPatch(
   if (patch.hidden === true) {
     return prev.filter((s) => s.session_id !== sessionId);
   }
+  // Resolve the three-state folder change: absent ⇒ keep current,
+  // `'uncategorized'` ⇒ clear, `{ set: { id } }` ⇒ that folder.
+  const patchedFolder =
+    patch.folder_id === undefined
+      ? undefined
+      : patch.folder_id === 'uncategorized'
+        ? undefined
+        : patch.folder_id.set.id;
   const idx = prev.findIndex((s) => s.session_id === sessionId);
   if (idx === -1) {
     if (patch.created_at == null || patch.last_active == null) return prev;
@@ -3451,11 +3624,14 @@ function applySessionPatch(
         last_active: patch.last_active,
         unread: 0,
         pinned: patch.pinned ?? false,
+        folder_id: patchedFolder,
       },
       ...prev,
     ];
   }
   const current = prev[idx];
+  const nextFolderId =
+    patch.folder_id === undefined ? current.folder_id : patchedFolder;
   const merged: SessionSummary = {
     session_id: current.session_id,
     created_at: patch.created_at ?? current.created_at,
@@ -3463,11 +3639,13 @@ function applySessionPatch(
     unread: current.unread,
     pinned: patch.pinned ?? current.pinned,
     last_user_text: current.last_user_text,
+    folder_id: nextFolderId,
   };
   if (
     merged.created_at === current.created_at &&
     merged.last_active === current.last_active &&
-    merged.pinned === current.pinned
+    merged.pinned === current.pinned &&
+    merged.folder_id === current.folder_id
   ) {
     return prev;
   }

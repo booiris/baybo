@@ -51,6 +51,23 @@ export interface ResourceAccess {
   vars?: string[];
 }
 
+/** Mirror of Rust `FolderView` — one folder in a `Frame::FoldersChanged`
+ *  snapshot. `position` orders siblings within their parent. `parent_id`
+ *  absent ⇒ top-level. */
+export interface WireFolder {
+  id: string;
+  parent_id?: string;
+  name: string;
+  position: number;
+  created_at: string;
+}
+
+/** Mirror of Rust `FolderChange` — the two-state folder reassignment
+ *  carried on `SessionPatch.folder_id`. `{ set: { id } }` files the
+ *  session under a folder; `'uncategorized'` clears it. The field being
+ *  absent (undefined) means "no change". */
+export type FolderChange = { set: { id: string } } | 'uncategorized';
+
 /** Sparse mutation surface — mirror of Rust `SessionPatch`. Every
  *  field independently optional; absent means "no change". A patch
  *  for an unknown session_id constructs a row iff it carries enough
@@ -63,6 +80,11 @@ export interface SessionPatch {
   /** Flipped by `PUT /v1/chat/sessions/:id/pin`. `true` moves the row
    *  into the sidebar's pinned block; `false` moves it back. */
   pinned?: boolean;
+  /** Changed by `PUT /v1/chat/sessions/:id/folder` and on folder delete.
+   *  Present means the assignment changed to this value; absent means no
+   *  change. `{ set: { id } }` files under a folder; `'uncategorized'`
+   *  clears it. */
+  folder_id?: FolderChange;
 }
 
 /** Source of a `Frame::SessionActivity` event — mirror of Rust
@@ -166,6 +188,7 @@ export type Frame =
   | { kind: 'stop_bot'; bot_id: string }
   | { kind: 'bot_status'; bot_id: string; ok: boolean; message?: string }
   | { kind: 'slash_manifest'; commands: { command: string; description: string }[] }
+  | { kind: 'folders_changed'; folders: WireFolder[] }
   | { kind: 'session_updated'; session_id: string; patch: SessionPatch }
   | { kind: 'session_activity'; session_id: string; source: ActivityKind; at: string }
   | { kind: 'ping' }
