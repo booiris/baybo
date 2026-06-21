@@ -260,12 +260,11 @@ function SectionLabel({ children, action }: { children: ReactNode; action?: Reac
 }
 
 /** A folder header: drag handle (sortable), drop target (droppable), caret,
- *  folder icon, name (or inline rename input), and a direct-chat count badge. */
+ *  folder icon, and name (or inline rename input). */
 function FolderHeader({
   folder,
   depth,
   collapsed,
-  directCount,
   renaming,
   renameDraft,
   onRenameDraft,
@@ -277,7 +276,6 @@ function FolderHeader({
   folder: Folder;
   depth: number;
   collapsed: boolean;
-  directCount: number;
   renaming: boolean;
   renameDraft: string;
   onRenameDraft: (v: string) => void;
@@ -360,12 +358,6 @@ function FolderHeader({
           {folder.name}
         </span>
       )}
-      <span
-        className="shrink-0 min-w-[18px] h-4 px-1 rounded-full bg-canvas border border-black/20 font-mono text-[0.6rem] font-bold text-ink-soft flex items-center justify-center leading-none"
-        title={`${directCount} chat${directCount === 1 ? '' : 's'}`}
-      >
-        {directCount}
-      </span>
     </div>
   );
 }
@@ -701,7 +693,6 @@ export function SessionSidebar({
             folder={folder}
             depth={depth}
             collapsed={isCollapsed}
-            directCount={directChats.length}
             renaming={renamingId === folder.id}
             renameDraft={renameDraft}
             onRenameDraft={setRenameDraft}

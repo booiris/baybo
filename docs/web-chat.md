@@ -97,7 +97,7 @@ A `Folder` (`web/src/pages/chat/types.ts`) is `{ id, parent_id?, name, position,
 
 Chats are bucketed by **reachability, not mere existence** (`reachableFolderIds`): only top-level folders plus folders whose parent is itself top-level are reachable. A chat whose `folder_id` points at a dangling parent, a cycle, or a depth-≥2 grandchild — folders that exist in the list but render nowhere — falls back to Uncategorized instead of vanishing. A chat with a `folder_id` that no longer exists at all does the same.
 
-Each `FolderHeader` shows a collapse caret, a folder glyph (`RiFolder3Line` closed / `RiFolderOpenLine` open), the name (or an inline rename input), and a **direct-chat count badge** (count of chats filed directly under that folder, not including subfolders).
+Each `FolderHeader` shows a collapse caret, a folder glyph (`RiFolder3Line` closed / `RiFolderOpenLine` open), and the name (or an inline rename input).
 
 ### Uncategorized bucket
 
