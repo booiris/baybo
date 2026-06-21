@@ -113,7 +113,7 @@ The job state machine itself is trigger-agnostic, but the actor that drives it f
 | `System`        | Queue                                                            |
 | Subagent (any)  | Preempt: parent's cancellation token tree propagates downward   |
 
-Distinct from a new trigger arriving, the out-of-band `/stop` control command cancels the in-flight turn (and every in-flight descendant subagent) with `Cancelled { UserStopped, ... }` — that reason lets the subagent wait task suppress the terminal `SubagentFinished` delivery so a stopped result never repopulates `pending_subagent_results`.
+Distinct from a new trigger arriving, the out-of-band `/stop` control command cancels the in-flight turn (and every in-flight descendant subagent) with `Cancelled { UserStopped, ... }` — that reason lets the subagent wait task suppress the terminal `BackgroundJobFinished` delivery so a stopped result never repopulates `pending_background_results`.
 
 ### Collaboration with Trace
 

@@ -1,10 +1,17 @@
 # Mid-Turn User Interjection (Steering)
 
-**Status:** ✅ Shipped (branch `user_msg_insert`, 2026-05-25). The runtime
-mechanism is documented in [`docs/modules/agent.md`](modules/agent.md)
-(scheduling section); this doc keeps the **design rationale** — why the forks
-below were settled the way they are — plus the known limitation. Blow-by-blow
+**Status:** ✅ Shipped (branch `user_msg_insert`, 2026-05-25), later extended by
+the web interjection queue + atomic batching (#126/#127). The runtime mechanism
+is documented in [`docs/modules/agent.md`](modules/agent.md) (scheduling
+section); this doc keeps the **design rationale** — why the forks below were
+settled the way they are — plus the known limitation. Blow-by-blow
 review/hardening history lives in PR #35 and the git log.
+
+> This doc covers the **backend** boundary-inject mechanism. The operator-facing
+> **web interjection queue** that sits on top of it — park / defer-to-thread /
+> auto-fire on turn completion / reorder / the "send all at once" batch and the
+> `/stop`-error pause banner — is documented in
+> [`docs/web-chat.md`](web-chat.md) (Interjection queue).
 
 ## Problem
 
@@ -47,7 +54,7 @@ turn ends once the user stops sending and the model returns a no-tool `Final`.
 | **Preemption** | Non-preemptive. The in-flight tool/LLM call is never cancelled; `/stop` stays the only hard interrupt. |
 | **Source of truth** | The existing priority mailbox — no second queue. The loop pulls via a conditional pop (`try_recv_if`) behind a small runtime trait seam (`InterjectionSource`). |
 | **Injection point** | Top of each iteration where `iterations > 1`, before `compress_if_needed`. Iteration 1 and a `Final` response never inject; anything still queued at turn-end falls to the next turn. |
-| **Slash messages** | The drain stops at the first slash-leading message; it (and anything behind it) defers to the next turn. The slash stays at the mailbox **head** as a barrier the drain cannot pop past — it is both the coalescing boundary and the drain boundary, so a burst `[A, /compact, B]` never pulls `B` into `A`'s turn ahead of the slash. (`/stop` is intercepted in the Router before the mailbox.) |
+| **Slash messages** | The drain stops at the first slash-leading message; it (and anything behind it) defers to the next turn. The slash stays at the mailbox **head** as a barrier the drain cannot pop past — it is both the coalescing boundary and the drain boundary, so a burst `[A, /compact, B]` never pulls `B` into `A`'s turn ahead of the slash. (`/stop` is intercepted in the Router before the mailbox; a `/stop`-cancelled turn additionally calls `interjections.discard_pending()` (#126) to drop the leading run of already-queued client follow-ups — including a coalesced `UserInputBatch` — so they don't auto-fire after the stop.) |
 | **Marker** | Faithful persisted user-bubble row via `MessageSource::UserInterjection`; the `<user_interjection>` envelope is applied **wire-only** in `messages_for_llm`, re-derived each call from the source flag (so it survives compaction/rebuild). Not breakout-escaped — the content is the user's own message, the trusted principal of their own turn, unlike the untrusted `tool_output` envelope. |
 | **Framing** | Fold in if it refines the current task; if unrelated, finish the current task first, then handle it — don't restart. Acknowledge briefly. |
 | **Batching** | Drain the whole leading non-slash run; each stays its own faithful row; wrapped together under one wire envelope. |
@@ -59,7 +66,7 @@ turn ends once the user stops sending and the model returns a no-tool `Final`.
 ## Key correctness properties
 - `from_user()` is the **render-as-bubble** predicate (broadened to include `UserInterjection`); exact `source == User` is the **slash-detection** predicate (left exact — interjections are never slashes). The web `TraceSessionPage` mirrors this: its `source === 'user'` genuine-prompt check stays exact.
 - Drained-and-persisted interjections survive turn cancel/error: once popped from the mailbox **and** appended to the transcript they live in context regardless of the turn outcome and surface next turn — never re-drained, never duplicated.
-- On a user session the only `Trigger`-priority mailbox messages are `UserInput` (cron mints a fresh one-shot session; subagent-spawn / background-compression go to child sessions), so the conditional pop only ever faces the slash/non-slash distinction. The pop predicate is shared (`is_coalescable_user_input`) between the coalescer and the drain so the barrier invariant can't drift.
+- On a user session the `Trigger`-priority mailbox messages the drain faces are `UserInput` and `UserInputBatch` (#126) — the latter the web's "send all queued at once" atomic batch coalesced into one message (cron mints a fresh one-shot session; subagent-spawn / background-compression go to child sessions). The pop predicate is shared (`is_coalescable_user_input`, which accepts both kinds) between the coalescer and the drain so the barrier invariant can't drift; the slash/non-slash distinction is the only branch within it.
 - Mailbox messages were already run through `SecurityGateway::sanitize_input` at Router ingress — no re-sanitization at drain time.
 - `try_recv_if`'s predicate runs under the queue lock — it must be a pure inspection and must not re-enter the mailbox.
 
