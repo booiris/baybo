@@ -555,11 +555,19 @@ POST   /v1/chat/sessions                create http session + mint web channel-t
 GET    /v1/chat/sessions                ?include_hidden=&include_cron=  newest-first list
 GET    /v1/chat/sessions/:id            ?before_ordinal=&limit=  detail + transcript slice (+ last_llm pin)
 PUT    /v1/chat/sessions/:id/model      pin this session's LLM (re-pins live actor; null ⇒ default-llm)
+PUT    /v1/chat/sessions/:id/pin        pin/unpin (lifts to the sidebar's Pinned block)
+PUT    /v1/chat/sessions/:id/folder     file into a folder (null ⇒ Uncategorized)
 DELETE /v1/chat/sessions/:id            hide (row preserved); 204
 POST   /v1/chat/sessions/:id/unhide     restore a hidden session
 POST   /v1/chat/sessions/:id/token      refresh the web channel-token
 GET    /v1/chat/cron-messages           cron-fire sessions with prompt/response previews
 GET    /v1/chat/slash-manifest          slash commands for the composer's /-autocomplete
+GET    /v1/chat/folders                 the conversation-folder tree
+POST   /v1/chat/folders                 create a folder
+PATCH  /v1/chat/folders/:id             rename / reparent a folder
+POST   /v1/chat/folders/:id/move        move a folder under a new parent
+POST   /v1/chat/folders/reorder         reorder folders among siblings
+DELETE /v1/chat/folders/:id             delete (dissolves; member sessions ⇒ Uncategorized); 204
 
 GET    /v1/analytics                    aggregated tokens / cost / sessions over a time range
 GET    /v1/logs                         paged snapshot from LogBuffer
@@ -634,10 +642,14 @@ The full frame set (see `crates/channels/src/wire.rs`):
   since_ordinal? }`, `Unsubscribe { session_id }`. `Multiplexed`
   channels (telegram/weixin/discord) auto-wildcard and ignore these.
 - **Messages:** `Message` (user input in; agent's final response or an
-  echo of inbound to other subscribers out), `AnswerDelta` (incremental
-  answer text, server → client), `Notice` (out-of-band warn/error).
+  echo of inbound to other subscribers out), `Messages { messages }` (a
+  client → server **atomic batch** — the web "send all queued at once"
+  path, coalesced into one turn), `AnswerDelta` (incremental answer text,
+  server → client), `Notice` (out-of-band warn/error), `Attachment
+  { session_id, user_id, attachments }` (mid-turn tool-emitted media).
 - **Turn progress (server → client):** `Reasoning` (incremental thinking),
-  `ToolStarted` / `ToolCompleted` (tool-call lifecycle), `TurnState
+  `ToolStarted` / `ToolCompleted` (tool-call lifecycle), `TaskList { items }`
+  (the agent's live task-checklist), `TurnState
   { active, started_at? }` (is a turn in flight). Both edges are projected
   from the job store by `spawn_turn_state_projector` (subscribed to the job
   lifecycle bus, which carries the `start` edge and the terminal edges), and
@@ -655,7 +667,10 @@ The full frame set (see `crates/channels/src/wire.rs`):
   (server → client), `BotStatus` (client → server), `SlashManifest`
   (server → client).
 - **Web-chat session signalling (http channel):** `SessionUpdated
-  { session_id, patch }`, `SessionActivity { session_id, source, at }`.
+  { session_id, patch }` (the `SessionPatch` carries Create/Hide/Unhide
+  plus `pinned` and `folder_id` changes), `SessionActivity { session_id,
+  source, at }`, `FoldersChanged { folders }` (a full folder-tree snapshot
+  re-broadcast after any folder mutation).
 
 A note on `AnswerDelta`: `agent_output_to_frame` maps
 `AgentEvent::AnswerDelta` to `Frame::AnswerDelta` and the

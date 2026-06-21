@@ -61,8 +61,16 @@ gateway's `api::admin::chat::reconstruct_transcript` (REST `GET
 /v1/chat/sessions/:id`) folds each tool-using turn's intermediate rows
 (`Thinking` → reasoning, `ToolUse` + paired `ToolResult` → tool step, mid-turn
 `Text` → prose) into one `work` transcript item before the turn's final reply;
-the client maps it onto the same `WorkBlock` it builds live. Two consequences
-worth knowing:
+the client maps it onto the same `WorkBlock` it builds live.
+
+For a tab that loads **mid-turn**, reconstruction has a second source: when the
+session has an active turn, `get_session` also folds the http channel's live,
+**not-yet-persisted** in-flight progress buffer (reasoning / answer-delta / tool
+steps that streamed before this tab joined) into the trailing work block via
+`in_flight_work_steps()`, aligning its start with the live `TurnState` — so the
+late joiner sees the steps it missed rather than an empty in-progress block.
+
+Two consequences worth knowing:
 
 - **Reconstructed tool summaries are not content-light.** Unlike the live
   `ToolCompleted.summary` (which is structural and passes
