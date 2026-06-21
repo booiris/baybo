@@ -3,7 +3,8 @@ use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
 use aura_model::{
-    ChatMessage, ControlEvent, ControlEventKind, LineageKind, LlmEntryName, Session, SessionId,
+    ChatMessage, ControlEvent, ControlEventKind, FolderId, LineageKind, LlmEntryName, Session,
+    SessionId,
 };
 use aura_store::StorageError;
 use aura_store::session::{Result, SessionStore, StoredMessage};
@@ -67,7 +68,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data, hidden, last_llm, pinned FROM sessions WHERE id = ?1",
+                "SELECT data, hidden, last_llm, pinned, folder_id FROM sessions WHERE id = ?1",
                 libsql::params![session_id.as_str().to_string()],
             )
             .await
@@ -92,15 +93,19 @@ impl SessionStore for LibsqlSessionStore {
                 let pinned_col: i64 = row
                     .get(3)
                     .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+                let folder_id_col: Option<String> = row
+                    .get(4)
+                    .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
                 let mut session: Session = serde_json::from_str(&data)
                     .map_err(|e| StorageError::Storage(format!("deserialize session: {e}")))?;
                 // Flat columns are authoritative — `set_hidden` /
-                // `set_last_llm` / `set_pinned` update them directly while
-                // leaving the JSON blob untouched, to avoid load/save races
-                // against `touch`.
+                // `set_last_llm` / `set_pinned` / `set_folder` update them
+                // directly while leaving the JSON blob untouched, to avoid
+                // load/save races against `touch`.
                 session.hidden = hidden_col != 0;
                 session.state.last_llm = last_llm_col.map(LlmEntryName::from);
                 session.pinned = pinned_col != 0;
+                session.folder_id = folder_id_col.map(FolderId::from);
                 Ok(Some(session))
             }
             None => Ok(None),
@@ -233,6 +238,28 @@ impl SessionStore for LibsqlSessionStore {
         Ok(affected > 0)
     }
 
+    async fn set_folder(
+        &self,
+        session_id: &SessionId,
+        folder_id: Option<&FolderId>,
+    ) -> Result<bool> {
+        let conn = self.pool.conn();
+        // Targeted UPDATE on the flat column only — like `set_hidden` /
+        // `set_pinned`, the JSON `data` blob is left alone so a concurrent
+        // `touch` (load + full save) can't lose this write. `get` patches
+        // `Session.folder_id` from the column on read. `NULL` clears the
+        // assignment back to uncategorized.
+        let value: Option<String> = folder_id.map(|f| f.as_str().to_string());
+        let affected = conn
+            .execute(
+                "UPDATE sessions SET folder_id = ?2 WHERE id = ?1",
+                libsql::params![session_id.as_str().to_string(), value],
+            )
+            .await
+            .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql set_folder: {e}")))?;
+        Ok(affected > 0)
+    }
+
     async fn delete(&self, session_id: &SessionId) -> Result<bool> {
         // The message-log cascade and the session-row delete must commit
         // as a unit (see below); BEGIN IMMEDIATE takes the write lock up
@@ -306,7 +333,7 @@ impl SessionStore for LibsqlSessionStore {
         // know) can be named in the skip warning.
         let mut rows = conn
             .query(
-                "SELECT data, hidden, last_llm, pinned, id FROM sessions \
+                "SELECT data, hidden, last_llm, pinned, id, folder_id FROM sessions \
                  ORDER BY last_active DESC",
                 (),
             )
@@ -334,6 +361,9 @@ impl SessionStore for LibsqlSessionStore {
             let id_col: String = row
                 .get(4)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let folder_id_col: Option<String> = row
+                .get(5)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             // A single undeserializable row (e.g. one written by an older
             // build whose `lineage.kind` this build doesn't know) must
             // degrade to "silently absent from the listing", never fail
@@ -351,6 +381,7 @@ impl SessionStore for LibsqlSessionStore {
             session.hidden = hidden_col != 0;
             session.state.last_llm = last_llm_col.map(LlmEntryName::from);
             session.pinned = pinned_col != 0;
+            session.folder_id = folder_id_col.map(FolderId::from);
             sessions.push(session);
         }
         Ok(sessions)
@@ -368,7 +399,7 @@ impl SessionStore for LibsqlSessionStore {
         let conn = self.pool.conn();
         let mut rows = conn
             .query(
-                "SELECT data, hidden, last_llm, pinned, id FROM sessions \
+                "SELECT data, hidden, last_llm, pinned, id, folder_id FROM sessions \
                  WHERE json_extract(data, '$.channel') = ?1 \
                  ORDER BY last_active DESC",
                 libsql::params![channel.as_str().to_string()],
@@ -397,6 +428,9 @@ impl SessionStore for LibsqlSessionStore {
             let id_col: String = row
                 .get(4)
                 .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
+            let folder_id_col: Option<String> = row
+                .get(5)
+                .map_err(|e| StorageError::Internal(anyhow::anyhow!("libsql get: {e}")))?;
             // Same skip-on-error discipline as `list_all`: a row whose
             // blob fails to deserialize drops out of the listing rather
             // than failing the whole chat-list query.
@@ -413,6 +447,7 @@ impl SessionStore for LibsqlSessionStore {
             session.hidden = hidden_col != 0;
             session.state.last_llm = last_llm_col.map(LlmEntryName::from);
             session.pinned = pinned_col != 0;
+            session.folder_id = folder_id_col.map(FolderId::from);
             sessions.push(session);
         }
         Ok(sessions)
@@ -1127,6 +1162,7 @@ mod tests {
             lineage: None,
             hidden: false,
             pinned: false,
+            folder_id: None,
         }
     }
 
@@ -1509,6 +1545,132 @@ mod tests {
             Some(aura_model::LlmEntryName::from("gpt-4o")),
             "last_llm must reflect the column in list projections"
         );
+    }
+
+    #[tokio::test]
+    async fn set_folder_round_trips_and_clears() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+        let s = make_root_session("fld-1");
+        store.save(&s).await.unwrap();
+
+        let fid = aura_model::FolderId::from("folder-x");
+        assert!(store.set_folder(&s.id, Some(&fid)).await.unwrap());
+        assert_eq!(
+            store.get(&s.id).await.unwrap().unwrap().folder_id,
+            Some(fid.clone())
+        );
+
+        // None clears back to uncategorized.
+        assert!(store.set_folder(&s.id, None).await.unwrap());
+        assert_eq!(store.get(&s.id).await.unwrap().unwrap().folder_id, None);
+
+        // Unknown session id reports no row updated.
+        assert!(
+            !store
+                .set_folder(&SessionId::from("nope"), Some(&fid))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn save_does_not_clobber_folder_id_set_by_set_folder() {
+        // Same race the `pinned` / `hidden` guards defend against: a
+        // concurrent full-blob `save` carrying a stale in-memory `Session`
+        // (folder_id = None) must NOT wipe an assignment set via the
+        // targeted `set_folder`.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let s = make_root_session("fld-then-save");
+        store.save(&s).await.unwrap();
+        let fid = aura_model::FolderId::from("keepme");
+        assert!(store.set_folder(&s.id, Some(&fid)).await.unwrap());
+
+        // Re-save the stale in-memory copy (still folder_id = None).
+        store.save(&s).await.unwrap();
+
+        assert_eq!(
+            store.get(&s.id).await.unwrap().unwrap().folder_id,
+            Some(fid),
+            "save must preserve the folder_id column owned by set_folder"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_by_channel_reflects_folder_id_column() {
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        let store = LibsqlSessionStore::new(pool);
+
+        let mut s = make_root_session("fld-list");
+        s.channel = ChannelType::http();
+        store.save(&s).await.unwrap();
+        let fid = aura_model::FolderId::from("folder-list");
+        assert!(store.set_folder(&s.id, Some(&fid)).await.unwrap());
+
+        let listed = store.list_by_channel(&ChannelType::http()).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].folder_id,
+            Some(fid),
+            "folder_id must reflect the column in list projections (guards the index renumber)"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_sessions_table_without_folder_id_is_migrated() {
+        // The "DB created before `folder_id` existed" case. Drop the column
+        // the fresh `init_db` created, write a row the old way, then re-run
+        // `init_db` (the boot path) — the idempotent ALTER re-adds it and
+        // the old row defaults to uncategorized.
+        let pool = LibsqlPool::open_in_memory().await.unwrap();
+        // SQLite refuses to drop an indexed column, so drop the index first
+        // — this also recreates the genuine pre-folder_id schema (no column,
+        // no index), the exact state `init_db`'s migration must recover from.
+        pool.conn()
+            .execute(
+                "DROP INDEX IF EXISTS idx_sessions_folder",
+                libsql::params![],
+            )
+            .await
+            .unwrap();
+        pool.conn()
+            .execute(
+                "ALTER TABLE sessions DROP COLUMN folder_id",
+                libsql::params![],
+            )
+            .await
+            .unwrap();
+        let data = serde_json::to_string(&make_root_session("legacy-fld")).unwrap();
+        pool.conn()
+            .execute(
+                "INSERT INTO sessions \
+                 (id, root_session_id, trigger_kind, created_at, last_active, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                libsql::params![
+                    "legacy-fld".to_string(),
+                    "legacy-fld".to_string(),
+                    "user".to_string(),
+                    super::super::time::to_us(Utc::now()),
+                    super::super::time::to_us(Utc::now()),
+                    data,
+                ],
+            )
+            .await
+            .unwrap();
+        pool.init_db().await.unwrap();
+
+        let store = LibsqlSessionStore::new(pool);
+        let id = SessionId::from("legacy-fld");
+        let loaded = store.get(&id).await.unwrap().expect("legacy row present");
+        assert_eq!(
+            loaded.folder_id, None,
+            "migrated legacy row defaults to uncategorized"
+        );
+        let fid = aura_model::FolderId::from("now-filed");
+        assert!(store.set_folder(&id, Some(&fid)).await.unwrap());
+        assert_eq!(store.get(&id).await.unwrap().unwrap().folder_id, Some(fid));
     }
 
     #[tokio::test]

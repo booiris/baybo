@@ -3,6 +3,7 @@ mod control_event;
 mod cost;
 mod cron;
 mod external_agent;
+mod folder;
 mod governance;
 mod ids;
 mod llm_entry_name;
@@ -22,6 +23,7 @@ pub use cron::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus
 pub use external_agent::{
     AURA_BACKEND_TAG, ExternalAgentKind, SubagentBackend, SubagentBackendKind, SubagentBackendTag,
 };
+pub use folder::{FolderId, FolderSummary, MAX_FOLDER_NAME_LEN};
 pub use governance::{ArtifactSource, ExtensionKind, ExtensionManifest, TrustLevel};
 pub use ids::{CostRecordId, JobId, ParallelGroup, SessionId, SpanId, StepId, TaskId};
 pub use llm_entry_name::LlmEntryName;

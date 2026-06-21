@@ -33,14 +33,16 @@
 use std::collections::HashMap;
 
 use aura_agent::actor::AgentMessage;
-use aura_channels::wire::{SessionPatch, SlashCommandSpec};
+use aura_channels::wire::{FolderChange, FolderView, SessionPatch, SlashCommandSpec};
 use aura_channels::{
     AgentEvent, STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, SessionEvent, ToolStatus,
 };
 use aura_model::{
-    ChannelType, ChatMessage, ContentBlock, ControlEvent, ControlEventKind, LlmEntryName,
-    MessageSource, Role, Session, SessionId, ThinkingContent, TriggerSource, User,
+    ChannelType, ChatMessage, ContentBlock, ControlEvent, ControlEventKind, FolderId,
+    FolderSummary, LlmEntryName, MessageSource, Role, Session, SessionId, ThinkingContent,
+    TriggerSource, User,
 };
+use aura_session::SessionError;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use chrono::{DateTime, Utc};
@@ -64,11 +66,18 @@ pub fn routes() -> OpenApiRouter<AdminState> {
         .routes(routes!(get_session))
         .routes(routes!(set_session_model))
         .routes(routes!(set_session_pin))
+        .routes(routes!(set_session_folder))
         .routes(routes!(delete_session))
         .routes(routes!(unhide_session))
         .routes(routes!(refresh_session_token))
         .routes(routes!(slash_manifest))
         .routes(routes!(list_cron_messages))
+        .routes(routes!(list_folders))
+        .routes(routes!(create_folder))
+        .routes(routes!(update_folder))
+        .routes(routes!(move_folder))
+        .routes(routes!(reorder_folders))
+        .routes(routes!(delete_folder))
 }
 
 /// Query string for `GET /v1/chat/sessions`.
@@ -361,6 +370,11 @@ pub struct ChatSessionSummary {
     /// transcript holds only system/tool rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_text: Option<String>,
+    /// The user-created folder this session is filed under, or absent for
+    /// uncategorized. Set via `PUT /v1/chat/sessions/{id}/folder`; the web
+    /// sidebar groups rows by this id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -471,6 +485,10 @@ async fn create_session(State(state): State<AdminState>) -> Result<Json<ChatSess
             last_active: Some(session.last_active),
             hidden: Some(false),
             pinned: Some(false),
+            // A freshly-created session is always uncategorized; absent =
+            // no change, which a newly-constructed client row renders as
+            // uncategorized.
+            folder_id: None,
         },
     );
     Ok(Json(cred))
@@ -535,6 +553,7 @@ async fn list_sessions(
             hidden: s.hidden,
             pinned: s.pinned,
             last_user_text,
+            folder_id: s.folder_id.as_ref().map(|f| f.to_string()),
         })
         .collect();
     Ok(Json(ChatSessionsList { items }))
@@ -888,8 +907,338 @@ async fn unhide_session(
             // Carry the live pin state so a sibling tab re-adding the
             // row drops it straight into the correct block.
             pinned: Some(session.pinned),
+            // Carry the folder assignment too so the re-added row lands in
+            // the right folder (absent ⇒ uncategorized).
+            folder_id: session.folder_id.as_ref().map(|f| FolderChange::Set {
+                id: f.as_str().to_owned(),
+            }),
         },
     );
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ── Folders ──────────────────────────────────────────────────────────
+
+/// Map a folder-op [`SessionError`] onto the right HTTP status: invariant
+/// violations (depth, cycle, name length) are 400; a missing folder /
+/// session is 404; anything else is 500.
+fn folder_err(e: SessionError) -> GatewayError {
+    match e {
+        SessionError::NotFound(m) => GatewayError::NotFound(m),
+        SessionError::InvalidFolderOp(m) => GatewayError::BadRequest(m),
+        other => GatewayError::Internal(format!("folder op: {other}")),
+    }
+}
+
+/// Broadcast the current folder tree as a full snapshot to every open
+/// chat tab. Called after any folder mutation. No-op when the http
+/// channel isn't installed (test fixtures with no live web clients).
+async fn broadcast_folders(state: &AdminState) -> Result<()> {
+    let folders: Vec<FolderView> = state
+        .session_manager
+        .list_folders()
+        .await
+        .map_err(folder_err)?
+        .into_iter()
+        .map(|f| FolderView {
+            id: f.id.to_string(),
+            parent_id: f.parent_id.as_ref().map(|p| p.to_string()),
+            name: f.name,
+            position: f.position,
+            created_at: f.created_at,
+        })
+        .collect();
+    let Some(channel) = state.channel_registry.get(&ChannelType::http()) else {
+        return Ok(());
+    };
+    if let Some(sub) = channel.as_subscribed() {
+        sub.broadcast_folders_changed(folders);
+    }
+    Ok(())
+}
+
+/// Request body for `PUT /v1/chat/sessions/{session_id}/folder`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetSessionFolderRequest {
+    /// Target folder id, or `null` to clear the assignment (uncategorized).
+    #[serde(default)]
+    pub folder_id: Option<String>,
+}
+
+#[utoipa::path(
+    put,
+    path = "/chat/sessions/{session_id}/folder",
+    tag = "chat",
+    params(
+        ("session_id" = String, Path, description = "Session id to file"),
+    ),
+    request_body = SetSessionFolderRequest,
+    responses(
+        (status = 204, description = "Folder assignment updated"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Session or folder not found", body = ErrorBody),
+    )
+)]
+async fn set_session_folder(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Json(req): Json<SetSessionFolderRequest>,
+) -> Result<axum::http::StatusCode> {
+    let (sid, _) = load_web_chat_session(&state, &session_id).await?;
+    let folder = req.folder_id.map(FolderId::from);
+    state
+        .session_manager
+        .set_folder(&sid, folder.as_ref())
+        .await
+        .map_err(folder_err)?;
+    let change = match &folder {
+        Some(f) => FolderChange::Set {
+            id: f.as_str().to_owned(),
+        },
+        None => FolderChange::Uncategorized,
+    };
+    broadcast_session_patch(
+        &state,
+        &sid,
+        SessionPatch {
+            folder_id: Some(change),
+            ..SessionPatch::default()
+        },
+    );
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// One folder in a folder-list / create response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FolderDto {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    pub name: String,
+    pub position: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<FolderSummary> for FolderDto {
+    fn from(f: FolderSummary) -> Self {
+        Self {
+            id: f.id.to_string(),
+            parent_id: f.parent_id.as_ref().map(|p| p.to_string()),
+            name: f.name,
+            position: f.position,
+            created_at: f.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FolderList {
+    pub items: Vec<FolderDto>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/chat/folders",
+    tag = "chat",
+    responses(
+        (status = 200, description = "The chat-list folder tree", body = FolderList),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
+async fn list_folders(State(state): State<AdminState>) -> Result<Json<FolderList>> {
+    let items = state
+        .session_manager
+        .list_folders()
+        .await
+        .map_err(folder_err)?
+        .into_iter()
+        .map(FolderDto::from)
+        .collect();
+    Ok(Json(FolderList { items }))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateFolderRequest {
+    pub name: String,
+    /// Parent folder id (`null`/absent = top-level).
+    #[serde(default)]
+    pub parent_id: Option<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/chat/folders",
+    tag = "chat",
+    request_body = CreateFolderRequest,
+    responses(
+        (status = 200, description = "The created folder", body = FolderDto),
+        (status = 400, description = "Invalid name / depth", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Parent folder not found", body = ErrorBody),
+    )
+)]
+async fn create_folder(
+    State(state): State<AdminState>,
+    Json(req): Json<CreateFolderRequest>,
+) -> Result<Json<FolderDto>> {
+    let parent = req.parent_id.map(FolderId::from);
+    let folder = state
+        .session_manager
+        .create_folder(parent, req.name)
+        .await
+        .map_err(folder_err)?;
+    broadcast_folders(&state).await?;
+    Ok(Json(FolderDto::from(folder)))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateFolderRequest {
+    /// New name (absent = unchanged).
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[utoipa::path(
+    patch,
+    path = "/chat/folders/{folder_id}",
+    tag = "chat",
+    params(
+        ("folder_id" = String, Path, description = "Folder id to rename"),
+    ),
+    request_body = UpdateFolderRequest,
+    responses(
+        (status = 204, description = "Folder updated"),
+        (status = 400, description = "Invalid name", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Folder not found", body = ErrorBody),
+    )
+)]
+async fn update_folder(
+    State(state): State<AdminState>,
+    Path(folder_id): Path<String>,
+    Json(req): Json<UpdateFolderRequest>,
+) -> Result<axum::http::StatusCode> {
+    let fid = FolderId::from(folder_id);
+    if let Some(name) = req.name {
+        state
+            .session_manager
+            .rename_folder(&fid, name)
+            .await
+            .map_err(folder_err)?;
+    }
+    broadcast_folders(&state).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MoveFolderRequest {
+    /// New parent id, or `null` to promote the folder to top-level.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/chat/folders/{folder_id}/move",
+    tag = "chat",
+    params(
+        ("folder_id" = String, Path, description = "Folder id to reparent"),
+    ),
+    request_body = MoveFolderRequest,
+    responses(
+        (status = 204, description = "Folder moved"),
+        (status = 400, description = "Cycle / depth violation", body = ErrorBody),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Folder not found", body = ErrorBody),
+    )
+)]
+async fn move_folder(
+    State(state): State<AdminState>,
+    Path(folder_id): Path<String>,
+    Json(req): Json<MoveFolderRequest>,
+) -> Result<axum::http::StatusCode> {
+    let fid = FolderId::from(folder_id);
+    let parent = req.parent_id.map(FolderId::from);
+    state
+        .session_manager
+        .reparent_folder(&fid, parent)
+        .await
+        .map_err(folder_err)?;
+    broadcast_folders(&state).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ReorderFoldersRequest {
+    /// Parent of the sibling group being reordered (`null` = top-level).
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// The sibling ids in their new order.
+    pub ordered_ids: Vec<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/chat/folders/reorder",
+    tag = "chat",
+    request_body = ReorderFoldersRequest,
+    responses(
+        (status = 204, description = "Sibling group reordered"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+    )
+)]
+async fn reorder_folders(
+    State(state): State<AdminState>,
+    Json(req): Json<ReorderFoldersRequest>,
+) -> Result<axum::http::StatusCode> {
+    let parent = req.parent_id.map(FolderId::from);
+    let ids = req.ordered_ids.into_iter().map(FolderId::from).collect();
+    state
+        .session_manager
+        .reorder_folders(parent, ids)
+        .await
+        .map_err(folder_err)?;
+    broadcast_folders(&state).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/chat/folders/{folder_id}",
+    tag = "chat",
+    params(
+        ("folder_id" = String, Path, description = "Folder id to delete"),
+    ),
+    responses(
+        (status = 204, description = "Folder dissolved (sessions preserved)"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 404, description = "Folder not found", body = ErrorBody),
+    )
+)]
+async fn delete_folder(
+    State(state): State<AdminState>,
+    Path(folder_id): Path<String>,
+) -> Result<axum::http::StatusCode> {
+    let fid = FolderId::from(folder_id);
+    let affected = state
+        .session_manager
+        .delete_folder(&fid)
+        .await
+        .map_err(folder_err)?;
+    // Folder structure converges via the snapshot; the chats that fell
+    // back to uncategorized converge via a per-session patch each, so a
+    // sibling tab moves them live without a list refetch.
+    broadcast_folders(&state).await?;
+    for sid in affected {
+        broadcast_session_patch(
+            &state,
+            &sid,
+            SessionPatch {
+                folder_id: Some(FolderChange::Uncategorized),
+                ..SessionPatch::default()
+            },
+        );
+    }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

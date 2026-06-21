@@ -436,6 +436,7 @@ pub async fn build_managers(
     let session_manager = Arc::new(SessionManager::new(
         stores.session.clone(),
         stores.session_summary.clone(),
+        stores.session_folder.clone(),
     ));
 
     // Delete orphan summary directories under `state/sessions/` left by

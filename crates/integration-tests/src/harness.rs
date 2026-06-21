@@ -397,9 +397,12 @@ impl AgentTestHarnessBuilder {
             Arc::clone(&memory_session_store) as Arc<dyn aura_session::SessionStore>;
         let summary_store = Arc::new(aura_session::test_support::MemorySessionSummaryStore::new())
             as Arc<dyn aura_session::SessionSummaryStore>;
+        let folder_store = Arc::new(aura_session::test_support::MemorySessionFolderStore::new())
+            as Arc<dyn aura_session::SessionFolderStore>;
         let session_manager = Arc::new(aura_agent::SessionManager::new(
             session_store,
             summary_store,
+            folder_store,
         ));
         let virtual_reads: Option<Arc<dyn aura_tools::VirtualReadResolver>> =
             Some(Arc::new(aura_agent::SessionTranscriptReader::new(

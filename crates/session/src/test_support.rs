@@ -9,13 +9,15 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use aura_model::{
-    ChannelType, ChatMessage, ControlEvent, ControlEventKind, LineageKind, Session, SessionId,
+    ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId, LineageKind, Session,
+    SessionId,
 };
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 
 use aura_store::StorageError;
 use aura_store::session::{Result, SessionStore, StoredMessage};
+use aura_store::session_folder::{SessionFolderRow, SessionFolderStore};
 use aura_store::session_summary::{SessionSummaryRow, SessionSummaryStore};
 
 /// One stored row in the in-memory session transcript log — mirrors
@@ -63,13 +65,14 @@ impl SessionStore for MemorySessionStore {
     async fn save(&self, session: &Session) -> Result<()> {
         let mut data = self.data.lock();
         let mut to_store = session.clone();
-        // `hidden` / `pinned` are owned by `set_hidden` / `set_pinned`;
-        // preserve the existing row's values so a stale in-memory save
-        // can't un-hide or un-pin it. Mirrors the libsql impl, whose
-        // upsert omits both flat columns.
+        // `hidden` / `pinned` / `folder_id` are owned by their targeted
+        // setters; preserve the existing row's values so a stale in-memory
+        // save can't un-hide, un-pin, or re-file it. Mirrors the libsql
+        // impl, whose upsert omits all three flat columns.
         if let Some(existing) = data.get(&session.id) {
             to_store.hidden = existing.hidden;
             to_store.pinned = existing.pinned;
+            to_store.folder_id = existing.folder_id.clone();
         }
         data.insert(session.id.clone(), to_store);
         Ok(())
@@ -91,6 +94,21 @@ impl SessionStore for MemorySessionStore {
         match data.get_mut(session_id) {
             Some(s) => {
                 s.pinned = pinned;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn set_folder(
+        &self,
+        session_id: &SessionId,
+        folder_id: Option<&aura_model::FolderId>,
+    ) -> Result<bool> {
+        let mut data = self.data.lock();
+        match data.get_mut(session_id) {
+            Some(s) => {
+                s.folder_id = folder_id.cloned();
                 Ok(true)
             }
             None => Ok(false),
@@ -473,5 +491,102 @@ impl SessionSummaryStore for MemorySessionSummaryStore {
 
     async fn list_session_ids(&self) -> Result<Vec<SessionId>> {
         Ok(self.rows.lock().keys().cloned().collect())
+    }
+}
+
+/// In-memory `SessionFolderStore` for tests. Folder structure only —
+/// `delete` promotes sub-folders and removes the row but cannot reach a
+/// sibling `SessionStore` to null member sessions (it returns an empty
+/// affected list). Tests asserting the session-nulling side of dissolve
+/// should use the real libsql store via a tempfile.
+#[derive(Default)]
+pub struct MemorySessionFolderStore {
+    rows: Mutex<HashMap<FolderId, SessionFolderRow>>,
+}
+
+impl MemorySessionFolderStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl SessionFolderStore for MemorySessionFolderStore {
+    async fn list(&self) -> Result<Vec<SessionFolderRow>> {
+        let mut rows: Vec<SessionFolderRow> = self.rows.lock().values().cloned().collect();
+        rows.sort_by(|a, b| {
+            (
+                a.parent_id.as_ref().map(|p| p.as_str().to_owned()),
+                a.position,
+            )
+                .cmp(&(
+                    b.parent_id.as_ref().map(|p| p.as_str().to_owned()),
+                    b.position,
+                ))
+        });
+        Ok(rows)
+    }
+
+    async fn get(&self, id: &FolderId) -> Result<Option<SessionFolderRow>> {
+        Ok(self.rows.lock().get(id).cloned())
+    }
+
+    async fn create(&self, row: &SessionFolderRow) -> Result<()> {
+        self.rows.lock().insert(row.id.clone(), row.clone());
+        Ok(())
+    }
+
+    async fn rename(&self, id: &FolderId, name: &str) -> Result<bool> {
+        let mut rows = self.rows.lock();
+        match rows.get_mut(id) {
+            Some(r) => {
+                r.name = name.to_owned();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn reparent(
+        &self,
+        id: &FolderId,
+        parent_id: Option<&FolderId>,
+        position: i64,
+    ) -> Result<bool> {
+        let mut rows = self.rows.lock();
+        match rows.get_mut(id) {
+            Some(r) => {
+                r.parent_id = parent_id.cloned();
+                r.position = position;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn reorder(&self, parent_id: Option<&FolderId>, ordered_ids: &[FolderId]) -> Result<()> {
+        let mut rows = self.rows.lock();
+        for (idx, id) in ordered_ids.iter().enumerate() {
+            if let Some(r) = rows.get_mut(id)
+                && r.parent_id.as_ref() == parent_id
+            {
+                r.position = idx as i64;
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete(&self, id: &FolderId) -> Result<Option<Vec<SessionId>>> {
+        let mut rows = self.rows.lock();
+        if !rows.contains_key(id) {
+            return Ok(None);
+        }
+        for row in rows.values_mut() {
+            if row.parent_id.as_ref() == Some(id) {
+                row.parent_id = None;
+            }
+        }
+        rows.remove(id);
+        Ok(Some(Vec::new()))
     }
 }
