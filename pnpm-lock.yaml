@@ -19,6 +19,9 @@ importers:
       '@aura/chat-core':
         specifier: workspace:*
         version: link:../../packages/chat-core
+      '@aura/chat-react':
+        specifier: workspace:*
+        version: link:../../packages/chat-react
       '@msgpack/msgpack':
         specifier: ^3.0.0-beta2
         version: 3.1.3
@@ -159,6 +162,22 @@ importers:
         specifier: ^3.0.0-beta2
         version: 3.1.3
     devDependencies:
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/chat-react:
+    dependencies:
+      '@aura/chat-core':
+        specifier: workspace:*
+        version: link:../chat-core
+    devDependencies:
+      '@types/react':
+        specifier: ^19.0.0
+        version: 19.2.14
+      react:
+        specifier: ^19.0.0
+        version: 19.2.5
       typescript:
         specifier: ^5.7.0
         version: 5.9.3

@@ -10,23 +10,17 @@ import {
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
-  ChatWs,
-  EMPTY_VIEW,
-  closeActiveWork,
   formatWorkedLabel,
-  historyRowToTranscript,
-  isStopCancellationNotice,
   isStopCommand,
-  routeInboundFrame,
   workBlockDisplay,
   type HistoryRowDto,
   type PendingApproval,
-  type SessionView,
   type TaskView,
   type TranscriptRow,
   type WireAttachment,
   type WorkStep,
 } from '@aura/chat-core';
+import { useChatSession, type ChatHistory } from '@aura/chat-react';
 import {
   admin,
   createSession,
@@ -216,184 +210,52 @@ function Thread({
   slash: SlashCommand[];
   onActivity: () => void;
 }) {
-  // One per-session bucket map (mirrors web). The Thread is keyed by
-  // `sessionId` so it only ever holds the active session, but routing
-  // through the shared `routeInboundFrame` keeps the reducer identical to
-  // web's — the mac UI just renders the resulting `SessionView`.
-  const [views, setViews] = useState<Record<string, SessionView>>({});
-  const v = views[sessionId] ?? EMPTY_VIEW;
-  // A turn is in flight either optimistically (between send and the first
-  // response) or per the server's authoritative TurnState. While busy the
-  // composer's send button becomes a stop button and new sends are blocked.
-  const busy = v.awaitingReply || (v.turn?.active ?? false);
-  const [link, setLink] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
-  const [model, setModel] = useState<string>('');
   const [input, setInput] = useState('');
   const [pending, setPending] = useState<WireAttachment[]>([]);
-  const wsRef = useRef<ChatWs | null>(null);
-  const tokenRef = useRef<string>('');
-  const newestOrdinalRef = useRef<number>(-1);
-  const lastConnectedAtRef = useRef<number>(0);
-  // Sessions just `/stop`'d locally: a late `answer_delta` the server had
-  // already put on the wire is dropped instead of spilling a stray bubble
-  // below the now-collapsed work block. Cleared when a new turn starts.
-  const stoppedRef = useRef<Set<string>>(new Set());
   const fileRef = useRef<HTMLInputElement | null>(null);
   const threadRef = useRef<HTMLDivElement | null>(null);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // History + token are app concerns (the openapi client lives here); the
+  // shared hook owns the rest of the live lifecycle (WS, frame routing,
+  // optimistic send/stop, approval) and hands back a ready-to-render view.
+  const fetchHistory = useCallback(async (): Promise<ChatHistory | null> => {
+    const { data } = await client.GET('/v1/chat/sessions/{session_id}', {
+      params: { path: { session_id: sessionId } },
+    });
+    if (!data) return null;
+    return {
+      transcript: (data.transcript ?? []) as unknown as HistoryRowDto[],
+      oldestOrdinal: data.oldest_ordinal ?? null,
+      newestOrdinal: data.newest_ordinal ?? null,
+      hasMore: data.has_more ?? false,
+      model: data.last_llm ?? null,
+    };
+  }, [client, sessionId]);
+  const mintToken = useCallback(() => refreshToken(client, sessionId), [client, sessionId]);
+
+  const session = useChatSession({
+    baseUrl: conn.baseUrl,
+    sessionId,
+    userId: OPERATOR,
+    mintToken,
+    fetchHistory,
+    onActivity,
+  });
+  const v = session.view;
 
   useEffect(() => {
     threadRef.current?.scrollTo({ top: threadRef.current.scrollHeight });
   }, [v.transcript, v.pendingApproval, v.awaitingReply]);
 
-  // Load history, pin the model picker, then open the live stream.
-  useEffect(() => {
-    let ws: ChatWs | null = null;
-    let cancelled = false;
-
-    (async () => {
-      // History via REST, then seed the live cursor so the WS only streams new.
-      const { data } = await client.GET('/v1/chat/sessions/{session_id}', {
-        params: { path: { session_id: sessionId } },
-      });
-      if (cancelled) return;
-      if (data) {
-        setModel(data.last_llm ?? '');
-        const rows = ((data.transcript ?? []) as unknown as HistoryRowDto[]).map((r) =>
-          historyRowToTranscript(sessionId, r),
-        );
-        setViews((prev) => ({
-          ...prev,
-          [sessionId]: {
-            ...EMPTY_VIEW,
-            transcript: rows,
-            historyLoaded: true,
-            oldestOrdinal: data.oldest_ordinal ?? null,
-            hasMore: data.has_more ?? false,
-            model: data.last_llm ?? null,
-          },
-        }));
-        newestOrdinalRef.current = data.newest_ordinal ?? -1;
-      }
-      const token = await refreshToken(client, sessionId);
-      if (cancelled) return;
-      tokenRef.current = token;
-      ws = new ChatWs({
-        baseUrl: conn.baseUrl,
-        channelToken: token,
-        initialSessionIds: [sessionId],
-        onStatus: (s) => {
-          setLink(s.state);
-          // The snapshot-approval reconciliation uses this cutoff to tell a
-          // card from before the reconnect (droppable) from one that raced in
-          // after it (kept).
-          if (s.state === 'connected') lastConnectedAtRef.current = Date.now();
-        },
-        onFrame: (frame) => {
-          if (frame.kind === 'session_activity') onActivity();
-          // A fresh turn supersedes any prior local `/stop`.
-          if (frame.kind === 'turn_state' && frame.active) {
-            stoppedRef.current.delete(frame.session_id);
-          }
-          // Drop a delta that raced in after a local `/stop` — the partial
-          // answer is already settled inside the collapsed work block.
-          if (frame.kind === 'answer_delta' && stoppedRef.current.has(frame.session_id)) {
-            return;
-          }
-          // A broadcast `/stop` cancellation notice stops this tab's stream
-          // too (an observer never ran the local `/stop`).
-          if (frame.kind === 'notice' && !frame.transient && isStopCancellationNotice(frame.text)) {
-            stoppedRef.current.add(frame.session_id);
-          }
-          routeInboundFrame(frame, setViews, () => undefined, lastConnectedAtRef.current);
-        },
-        onTokenRejected: () => {
-          // The channel token expired or was revoked (the common cause is the
-          // gateway restarting on a config reload). Without this the socket
-          // suspends and the chat sits dead — mint a fresh token and resume.
-          void (async () => {
-            try {
-              const fresh = await refreshToken(client, sessionId);
-              if (cancelled) return;
-              tokenRef.current = fresh;
-              wsRef.current?.replaceToken(fresh);
-            } catch {
-              /* stay disconnected; the header badge surfaces it */
-            }
-          })();
-        },
-      });
-      if (newestOrdinalRef.current >= 0) ws.recordOrdinal(sessionId, newestOrdinalRef.current);
-      wsRef.current = ws;
-    })();
-
-    return () => {
-      cancelled = true;
-      ws?.close();
-      wsRef.current = null;
-    };
-  }, [client, conn, sessionId, onActivity]);
-
-  // Optimistically close the live work block as Cancelled and tell the server.
-  // A typed `/stop` and the composer's stop button both land here.
-  const doStop = (text: string) => {
-    const ws = wsRef.current;
-    if (!ws) return;
-    ws.sendMessage({ sessionId, userId: OPERATOR, content: text || '/stop' });
-    stoppedRef.current.add(sessionId);
-    setViews((prev) => {
-      const view = prev[sessionId] ?? EMPTY_VIEW;
-      return {
-        ...prev,
-        [sessionId]: {
-          ...view,
-          transcript: closeActiveWork(view.transcript, true),
-          awaitingReply: false,
-          turn: { active: false, startedAt: null },
-        },
-      };
-    });
-    setInput('');
-    const ta = taRef.current;
-    if (ta) ta.style.height = 'auto';
-  };
-
   const send = () => {
     const text = input.trim();
-    const ws = wsRef.current;
-    if ((!text && pending.length === 0) || !ws) return;
-    // A `/stop` is a control command, not a chat turn — no optimistic bubble.
-    if (isStopCommand(text)) {
-      doStop(text);
-      return;
-    }
-    // The agent is already working — block new turns; only `/stop` gets through.
-    if (busy) return;
-    const clientMsgId = crypto.randomUUID();
-    const attachments = pending.length ? pending : undefined;
-    // Optimistic user bubble keyed by `clientMsgId`; the server's echo
-    // reconciles against it in `routeInboundFrame` (clears `pending`, keeps
-    // the row identity) instead of appending a duplicate.
-    setViews((prev) => {
-      const view = prev[sessionId] ?? EMPTY_VIEW;
-      const row: TranscriptRow = {
-        key: `local-${clientMsgId}`,
-        role: 'user',
-        text,
-        pending: true,
-        clientMsgId,
-        hasAttachments: attachments ? true : undefined,
-        attachments,
-        createdAt: new Date().toISOString(),
-      };
-      return {
-        ...prev,
-        [sessionId]: { ...view, transcript: [...view.transcript, row], awaitingReply: true },
-      };
-    });
-    ws.sendMessage({ sessionId, userId: OPERATOR, content: text, attachments, clientMsgId });
+    if (!text && pending.length === 0) return;
+    // `/stop` keeps any staged attachments (it isn't a real send).
+    const stopping = isStopCommand(text);
+    session.send(text, pending.length ? pending : undefined);
     setInput('');
-    setPending([]);
+    if (!stopping) setPending([]);
     const ta = taRef.current;
     if (ta) ta.style.height = 'auto';
   };
@@ -407,14 +269,14 @@ function Thread({
 
   const onAttach = async (file: File) => {
     try {
-      const blobId = await uploadBlob(conn, tokenRef.current, file);
+      const blobId = await uploadBlob(conn, session.getToken(), file);
       const kind: WireAttachment['kind'] = file.type.startsWith('image/')
         ? 'image'
         : file.type.startsWith('audio/')
           ? 'audio'
           : 'file';
-      setPending((p) => [
-        ...p,
+      setPending((pp) => [
+        ...pp,
         {
           kind,
           blob_id: blobId,
@@ -428,17 +290,8 @@ function Thread({
     }
   };
 
-  const resolve = (callId: string, decision: 'approve' | 'approve_always' | 'deny') => {
-    wsRef.current?.resolveApproval(callId, decision);
-    setViews((prev) => {
-      const view = prev[sessionId];
-      if (!view?.pendingApproval) return prev;
-      return { ...prev, [sessionId]: { ...view, pendingApproval: null } };
-    });
-  };
-
   const onModelChange = async (m: string) => {
-    setModel(m);
+    session.setModel(m);
     try {
       await setSessionModel(client, sessionId, m || null);
     } catch {
@@ -458,7 +311,7 @@ function Thread({
         className="flex items-center justify-between gap-3 border-b-[3px] border-border bg-canvas px-6 py-3"
       >
         <h1 className="min-w-0 flex-1 truncate text-sm font-bold">{title || '新对话'}</h1>
-        <ConnState link={link} />
+        <ConnState link={session.status} />
       </header>
 
       {v.tasks.length > 0 && <TasksPanel tasks={v.tasks} />}
@@ -479,7 +332,9 @@ function Thread({
 
           {v.awaitingReply && <WorkingIndicator />}
 
-          {v.pendingApproval && <ApprovalCard approval={v.pendingApproval} onResolve={resolve} />}
+          {v.pendingApproval && (
+            <ApprovalCard approval={v.pendingApproval} onResolve={session.resolveApproval} />
+          )}
         </div>
       </div>
 
@@ -487,17 +342,17 @@ function Thread({
         input={input}
         pending={pending}
         slashMatches={slashMatches}
-        model={model}
+        model={session.model ?? ''}
         models={models}
-        busy={busy}
+        busy={session.busy}
         taRef={taRef}
         fileRef={fileRef}
         onInputChange={onInputChange}
         onSend={send}
-        onStop={() => doStop('/stop')}
+        onStop={session.stop}
         onPickSlash={(cmd) => setInput(`/${cmd} `)}
         onAttach={onAttach}
-        onRemovePending={(i) => setPending((p) => p.filter((_, j) => j !== i))}
+        onRemovePending={(i) => setPending((pp) => pp.filter((_, j) => j !== i))}
         onModelChange={(value) => void onModelChange(value)}
       />
     </>

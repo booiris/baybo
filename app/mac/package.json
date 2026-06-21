@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@aura/chat-core": "workspace:*",
+    "@aura/chat-react": "workspace:*",
     "@msgpack/msgpack": "^3.0.0-beta2",
     "@tauri-apps/api": "^2",
     "openapi-fetch": "^0.13.0",
