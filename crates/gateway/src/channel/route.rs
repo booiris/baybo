@@ -10,7 +10,9 @@ use std::time::Duration;
 use aura_channels::wire::{
     self, AttachmentKind, Frame, Message as WireMessage, TaskView, WireAttachment,
 };
-use aura_channels::{ChannelKind, IncomingMessage, Message as AgentMessage, MessageRole};
+use aura_channels::{
+    ChannelKind, IncomingMessage, Message as AgentMessage, MessageRole, RouterInbound,
+};
 use aura_model::{
     BlobRef, ChannelType, ChatMessage, ContentBlock, MessageMetadata, Role, SessionId, User,
 };
@@ -488,39 +490,11 @@ async fn run_inbound_loop(
                         sub.unsubscribe(sidecar.connection_id(), &session_id);
                     }
                     Frame::Message(wire_msg) => {
-                        let session_id = match resolve_inbound_session(
-                            state,
-                            sidecar,
-                            channel_type,
-                            kind,
-                            &wire_msg,
-                        )
-                        .await
-                        {
-                            Some(sid) => sid,
-                            None => continue,
-                        };
-
-                        let sender = User {
-                            id: wire_msg.user_id.clone(),
-                            name: None,
-                            channel: channel_type.clone(),
-                        };
-                        let content =
-                            wire_to_content_blocks(wire_msg.content, wire_msg.attachments);
-                        let timestamp = Utc::now();
-                        let incoming = IncomingMessage {
-                            message: AgentMessage {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                session_id: session_id.clone(),
-                                channel: channel_type.clone(),
-                                sender,
-                                content,
-                                timestamp,
-                                reply_to: None,
-                                metadata: MessageMetadata::default(),
-                            },
-                            platform_msg_id: wire_msg.platform_msg_id,
+                        let Some(incoming) =
+                            build_inbound_message(state, sidecar, channel_type, kind, wire_msg)
+                                .await
+                        else {
+                            continue;
                         };
                         // Echo to every subscriber of this session
                         // (including the sender) so multi-tab views
@@ -542,7 +516,41 @@ async fn run_inbound_loop(
                         if let Some(sub) = sidecar.channel.as_subscribed() {
                             sub.echo_inbound(incoming.clone());
                         }
-                        if let Err(e) = state.incoming_tx.send(incoming).await {
+                        if let Err(e) = state
+                            .incoming_tx
+                            .send(RouterInbound::One(Box::new(incoming)))
+                            .await
+                        {
+                            tracing::error!(error = %e, "router intake closed; tearing down");
+                            break;
+                        }
+                    }
+                    Frame::Messages { messages } => {
+                        // A client batch ("send every queued message at once"):
+                        // build each row, echo each (same fan-out as a single
+                        // Message so every tab renders the N rows), then hand the
+                        // whole group to the router as ONE intake item — the
+                        // router delivers it to the actor atomically so its
+                        // coalescing runs them as a single merged turn instead of
+                        // racing the per-message intake latency. Rows that fail
+                        // session resolution are skipped, not fatal.
+                        let mut batch = Vec::with_capacity(messages.len());
+                        for wire_msg in messages {
+                            let Some(incoming) =
+                                build_inbound_message(state, sidecar, channel_type, kind, wire_msg)
+                                    .await
+                            else {
+                                continue;
+                            };
+                            if let Some(sub) = sidecar.channel.as_subscribed() {
+                                sub.echo_inbound(incoming.clone());
+                            }
+                            batch.push(incoming);
+                        }
+                        if batch.is_empty() {
+                            continue;
+                        }
+                        if let Err(e) = state.incoming_tx.send(RouterInbound::Batch(batch)).await {
                             tracing::error!(error = %e, "router intake closed; tearing down");
                             break;
                         }
@@ -765,6 +773,39 @@ async fn chat_to_visible_wire_message(
         platform_msg_id: String::new(),
         role,
         ordinal: Some(ordinal),
+    })
+}
+
+/// Resolve a single inbound wire message to an `IncomingMessage` (session
+/// resolution + content-block conversion). `None` when the session can't be
+/// resolved (the caller skips it). Shared by the single-`Frame::Message` and
+/// the batched-`Frame::Messages` arms so both build identical rows.
+async fn build_inbound_message(
+    state: &WsChannelState,
+    sidecar: &Sidecar,
+    channel_type: &ChannelType,
+    kind: ChannelKind,
+    wire_msg: aura_channels::wire::Message,
+) -> Option<IncomingMessage> {
+    let session_id = resolve_inbound_session(state, sidecar, channel_type, kind, &wire_msg).await?;
+    let sender = User {
+        id: wire_msg.user_id.clone(),
+        name: None,
+        channel: channel_type.clone(),
+    };
+    let content = wire_to_content_blocks(wire_msg.content, wire_msg.attachments);
+    Some(IncomingMessage {
+        message: AgentMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id,
+            channel: channel_type.clone(),
+            sender,
+            content,
+            timestamp: Utc::now(),
+            reply_to: None,
+            metadata: MessageMetadata::default(),
+        },
+        platform_msg_id: wire_msg.platform_msg_id,
     })
 }
 

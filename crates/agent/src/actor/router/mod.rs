@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use aura_channels::{AgentOutput, ChannelRegistry, IncomingMessage};
+use aura_channels::{AgentOutput, ChannelRegistry, RouterInbound};
 use aura_cron::CronTriggerEvent;
 use aura_model::{LlmEntryName, Session};
 use tokio::sync::mpsc;
@@ -229,7 +229,7 @@ impl Router {
     /// Start all channels and begin routing messages.
     pub async fn run(
         mut self,
-        mut incoming_rx: mpsc::Receiver<IncomingMessage>,
+        mut incoming_rx: mpsc::Receiver<RouterInbound>,
         mut response_rx: mpsc::Receiver<AgentOutput>,
     ) {
         let channel_count = self.channels.len();
@@ -239,9 +239,18 @@ impl Router {
 
         loop {
             tokio::select! {
-                Some(incoming) = incoming_rx.recv() => {
-                    if let Err(e) = self.handle_incoming(incoming).await {
-                        error!(error = %e, "failed to handle incoming message");
+                Some(inbound) = incoming_rx.recv() => {
+                    match inbound {
+                        RouterInbound::One(incoming) => {
+                            if let Err(e) = self.handle_incoming(*incoming).await {
+                                error!(error = %e, "failed to handle incoming message");
+                            }
+                        }
+                        RouterInbound::Batch(batch) => {
+                            if let Err(e) = self.handle_incoming_batch(batch).await {
+                                error!(error = %e, "failed to handle incoming batch");
+                            }
+                        }
                     }
                 }
                 Some(output) = response_rx.recv() => {

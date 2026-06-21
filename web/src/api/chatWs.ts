@@ -34,10 +34,12 @@ export interface WireMessage {
   attachments?: WireAttachment[];
   platform_msg_id?: string;
   role: WireRole;
-  /** Persisted `session_messages.ordinal`, set by the server on
-   *  catch-up replays so the client can advance its per-session
-   *  cursor. Live emissions (echo / agent reply at emit time) leave
-   *  this `undefined`. */
+  /** Persisted `session_messages.ordinal`, set by the server so the
+   *  client can advance its per-session cursor. Present on catch-up
+   *  replays AND stamped onto the live final assistant reply at emit
+   *  time (see `OutgoingMessage::ordinal`), so it is NOT a reliable
+   *  live-vs-replay discriminator; a live user echo / streaming delta
+   *  leaves it `undefined`. */
   ordinal?: number;
 }
 
@@ -89,6 +91,11 @@ export type Frame =
   | { kind: 'unsubscribe'; session_id: string }
   | { kind: 'reset'; reason: string }
   | ({ kind: 'message' } & WireMessage)
+  /** Client → server. Several user messages for one session that the
+   *  server runs as a single coalesced turn (the "send every queued
+   *  message at once" path). Delivered to the actor atomically so its
+   *  coalescing can't lose stragglers to per-message intake latency. */
+  | { kind: 'messages'; messages: WireMessage[] }
   | {
       kind: 'attachment';
       session_id: string;
@@ -353,6 +360,33 @@ export class ChatWs {
       ...(input.attachments && input.attachments.length > 0
         ? { attachments: input.attachments }
         : {}),
+    });
+  }
+
+  /** Send several user messages for one session as a single batch frame.
+   *  The server runs them as one coalesced turn (one reply) while keeping
+   *  each as its own transcript row — used by the web "fire every queued
+   *  message at once" path so they merge deterministically instead of
+   *  racing the per-message intake. Each entry's `clientMsgId` rides as
+   *  `platform_msg_id` for the same optimistic-row reconciliation +
+   *  dedup as {@link sendMessage}. */
+  sendMessages(
+    sessionId: string,
+    messages: { content: string; clientMsgId: string; attachments?: WireAttachment[] }[],
+    channelType = 'http',
+  ): void {
+    if (messages.length === 0) return;
+    this.sendFrame({
+      kind: 'messages',
+      messages: messages.map((m) => ({
+        content: m.content,
+        session_id: sessionId,
+        user_id: 'web-operator',
+        channel_type: channelType,
+        role: 'user' as const,
+        platform_msg_id: m.clientMsgId,
+        ...(m.attachments && m.attachments.length > 0 ? { attachments: m.attachments } : {}),
+      })),
     });
   }
 

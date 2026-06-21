@@ -4,6 +4,7 @@ import {
   workBlockDisplay,
   formatWorkedLabel,
   closeActiveWork,
+  settleActiveWork,
   finalizeTrailingAnswer,
   isStopCommand,
   isStopCancellationNotice,
@@ -37,6 +38,12 @@ describe('workBlockDisplay — spinner first, expand on the first step', () => {
     // `expanded` is meaningless while active; the live turn stays boxed
     // regardless, so toggling can't hide an in-flight turn.
     expect(workBlockDisplay(true, false, true).boxed).toBe(true);
+  });
+
+  it('a settling block (interjection-paused) stays boxed with its panel open', () => {
+    // workActive=false (reads "Worked"), not user-expanded, but settling keeps
+    // it open until the turn ends.
+    expect(workBlockDisplay(false, true, false, true)).toEqual({ boxed: true, panelOpen: true });
   });
 });
 
@@ -100,6 +107,42 @@ describe('closeActiveWork — optimistic cancel on /stop', () => {
   it('drops an empty block even when stopping (nothing to label)', () => {
     const empty: TranscriptRow = { ...activeBlock(), steps: [] };
     expect(closeActiveWork([empty], true)).toHaveLength(0);
+  });
+});
+
+describe('settleActiveWork — interjection pauses the block open until turn-end', () => {
+  const step: WorkStep = { key: 's', kind: 'tool', tool: 'edit_file', toolStatus: 'ok' };
+  const activeBlock = (): TranscriptRow => ({
+    key: 'w',
+    role: 'system',
+    text: '',
+    kind: 'work',
+    steps: [step],
+    workActive: true,
+    workStartedAt: 1000,
+  });
+
+  it('relabels to "Worked" (workActive false) but marks the block settling (kept open)', () => {
+    const [row] = settleActiveWork([activeBlock()]);
+    expect(row.workActive).toBe(false);
+    expect(row.workSettling).toBe(true);
+    expect(row.workCancelled).toBeFalsy();
+    expect(typeof row.workEndedAt).toBe('number');
+  });
+
+  it('drops an empty block (no work to keep open)', () => {
+    const empty: TranscriptRow = { ...activeBlock(), steps: [] };
+    expect(settleActiveWork([empty])).toHaveLength(0);
+  });
+
+  it('closeActiveWork collapses a settling block at turn-end (clears the flag)', () => {
+    const settled = settleActiveWork([activeBlock()]);
+    expect(settled[0].workSettling).toBe(true);
+    // A later turn-end close (no active block left) still clears settling so the
+    // block collapses to its summary.
+    const [row] = closeActiveWork(settled);
+    expect(row.workSettling).toBe(false);
+    expect(row.workActive).toBe(false);
   });
 });
 

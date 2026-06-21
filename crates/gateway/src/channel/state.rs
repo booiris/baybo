@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use aura_agent::SessionManager;
-use aura_channels::{ChannelRegistry, IncomingMessage};
+use aura_channels::{ChannelRegistry, RouterInbound};
 use aura_pairing::PairingService;
 use aura_security::SecretVault;
 use aura_store::{BlobStore, ChannelBotStore, TaskStore};
@@ -32,7 +32,7 @@ use dashmap::DashMap;
 #[derive(Clone)]
 pub struct WsChannelState {
     pub registry: Arc<ChannelRegistry>,
-    pub incoming_tx: mpsc::Sender<IncomingMessage>,
+    pub incoming_tx: mpsc::Sender<RouterInbound>,
     pub tokens: ChannelTokenTable,
     /// Stash of live web-chat token handles. The admin mint
     /// endpoint inserts here keyed by the token string; the channel

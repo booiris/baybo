@@ -6,8 +6,10 @@ import {
   RiLoader4Line,
   RiPushpin2Fill,
   RiPushpin2Line,
+  RiStackLine,
 } from 'react-icons/ri';
 import type { SessionSummary } from './types';
+import { useQueueCounts } from './queueStore';
 
 // Chat zone 2: the session list sidebar (the global icon rail is zone 1, the
 // thread + floating composer is zone 3). A newest-first conversation list of
@@ -34,6 +36,7 @@ function SessionRow({
   active,
   hasPending,
   unreadCount,
+  queueCount,
   onHide,
   onTogglePin,
 }: {
@@ -41,6 +44,7 @@ function SessionRow({
   active: boolean;
   hasPending: boolean;
   unreadCount: number;
+  queueCount: number;
   onHide: (id: string) => void;
   onTogglePin: (id: string, pinned: boolean) => void;
 }) {
@@ -80,6 +84,20 @@ function SessionRow({
       >
         {session.last_user_text ?? 'New conversation'}
       </span>
+      {/* Parked interjection-queue count — shown for ALL sessions (incl. the
+          active row); reads the shared queue store, independent of WS subs. */}
+      {queueCount > 0 ? (
+        <span
+          className={`shrink-0 inline-flex items-center gap-0.5 min-w-[20px] h-5 px-1.5 rounded-full border-2 border-black font-mono text-[0.65rem] font-bold leading-none ${
+            active ? 'bg-white/60 text-ink' : 'bg-canvas text-ink-soft'
+          }`}
+          title={`${queueCount} queued message${queueCount === 1 ? '' : 's'}`}
+          aria-label={`${queueCount} queued message${queueCount === 1 ? '' : 's'}`}
+        >
+          <RiStackLine className="text-[0.7rem]" aria-hidden />
+          {queueCount > 99 ? '99+' : queueCount}
+        </span>
+      ) : null}
       {showUnread ? (
         <span
           className="shrink-0 min-w-[20px] h-5 px-1.5 rounded-full bg-brand text-ink border-2 border-black font-mono text-[0.65rem] font-bold flex items-center justify-center leading-none"
@@ -169,6 +187,7 @@ export function SessionSidebar({
   // so pinning never reshuffles the relative order of conversations.
   const pinned = sessions.filter((s) => s.pinned);
   const rest = sessions.filter((s) => !s.pinned);
+  const queueCounts = useQueueCounts();
   const renderRow = (s: SessionSummary) => (
     <SessionRow
       key={s.session_id}
@@ -176,6 +195,7 @@ export function SessionSidebar({
       active={s.session_id === activeSessionId}
       hasPending={pendingIds.has(s.session_id)}
       unreadCount={s.unread}
+      queueCount={queueCounts.get(s.session_id) ?? 0}
       onHide={onHide}
       onTogglePin={onTogglePin}
     />
