@@ -322,6 +322,12 @@ struct PendingMemoryWrite {
 /// `.await` points keeps the agent task `Send`.
 pub trait InterjectionSource: Send {
     fn drain_injectable(&mut self) -> Vec<Vec<ContentBlock>>;
+    /// Drop any queued injectable messages without running them. Used when a
+    /// turn is `/stop`-cancelled so client-fired interjections still sitting in
+    /// the mailbox don't run as follow-up turns once the actor resumes its loop.
+    fn discard_pending(&mut self) {
+        let _ = self.drain_injectable();
+    }
 }
 
 /// Core conversation loop: LLM call -> parse -> Tool/Skill dispatch -> repeat.

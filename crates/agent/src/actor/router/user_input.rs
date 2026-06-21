@@ -164,6 +164,161 @@ impl Router {
         Ok(())
     }
 
+    /// Route a client batch ("send every queued message at once") as ONE
+    /// coalesced turn. Mirrors [`Self::handle_incoming`]'s terminal-error
+    /// reply so a pre-actor rejection still closes the turn for the client.
+    pub(super) async fn handle_incoming_batch(
+        &mut self,
+        batch: Vec<IncomingMessage>,
+    ) -> anyhow::Result<()> {
+        let Some(first) = batch.first() else {
+            return Ok(());
+        };
+        let session_id = SessionId::from(first.message.session_id.as_str());
+        let user_id = first.message.sender.id.clone();
+        let channel = first.message.channel.clone();
+        let result = self.route_incoming_batch(batch).await;
+        if let Err(e) = &result {
+            let reply = OutgoingMessage {
+                session_id,
+                user_id,
+                channel,
+                content: vec![ContentBlock::Text(format!("⚠️ {e}"))],
+                reply_to: None,
+                metadata: MessageMetadata::default(),
+                ordinal: None,
+            };
+            self.handle_agent_output(reply.into()).await;
+        }
+        result
+    }
+
+    /// Gate + sanitize a batch and route it as a single
+    /// [`AgentMessage::UserInputBatch`]. The whole group is one user action, so
+    /// rate-limit and cost gate once; each row is sanitized individually. The
+    /// actor's `handle_merged_user_turn` then appends each as its own transcript
+    /// row and answers the group with one reply. The batch is non-slash by
+    /// construction — the client never batches a slash command (a coalescing
+    /// barrier), sending those as individual messages instead.
+    async fn route_incoming_batch(&mut self, batch: Vec<IncomingMessage>) -> anyhow::Result<()> {
+        // Non-empty: handle_incoming_batch returned early otherwise. All entries
+        // share one session — the client batches per session.
+        let first = &batch[0];
+        let session_id = first.message.session_id.clone();
+        let user = first.message.sender.clone();
+        let channel = first.message.channel.clone();
+        let span = tracing::info_span!(
+            "handle_incoming_batch",
+            session_id = %session_id,
+            count = batch.len(),
+            channel = %channel,
+        );
+        let _guard = span.enter();
+
+        if !self.rate_limiter.check(&user.id) {
+            warn!(user_id = %user.id, session_id = %session_id, "user rate-limited (batch)");
+            anyhow::bail!("rate limit exceeded for user '{}'", user.id);
+        }
+        self.cost_manager.check().map_err(|e| {
+            warn!(user_id = %user.id, session_id = %session_id, error = %e, "cost manager rejected batch");
+            anyhow::anyhow!(e)
+        })?;
+
+        let typed_session_id = SessionId::from(session_id.as_str());
+        let mut session = self
+            .session_manager
+            .get_or_create(&typed_session_id, user, channel)
+            .await?;
+
+        // Sanitize each row independently. A message the security gateway
+        // rejects is DROPPED (matching the single-message path's per-message
+        // granularity) rather than failing the whole batch — one blocked
+        // message must not silently discard the user's other valid ones.
+        let mut sanitized = Vec::with_capacity(batch.len());
+        for mut incoming in batch {
+            if let Err(e) = self
+                .security_gateway
+                .sanitize_input(&mut incoming.message, &mut session)
+                .await
+            {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "security gateway blocked a batched message; dropping it"
+                );
+                continue;
+            }
+            sanitized.push(incoming);
+        }
+        if sanitized.is_empty() {
+            return Ok(());
+        }
+
+        self.session_manager.touch(&typed_session_id).await?;
+
+        // Defense-in-depth: a slash command is a coalescing barrier and must run
+        // as its own turn (the web client never batches one, but a misbehaving
+        // client could). If any survivor is a slash, route every message
+        // INDIVIDUALLY so the actor's normal path applies slash semantics,
+        // instead of merging a slash into `handle_merged_user_turn` as plain
+        // text. The common all-non-slash case routes one atomic batch.
+        if sanitized
+            .iter()
+            .any(|m| crate::actor::is_slash_command(&m.message.content))
+        {
+            for incoming in sanitized {
+                if !self
+                    .route_one_to_actor(
+                        &session_id,
+                        &session,
+                        AgentMessage::UserInput(Box::new(incoming)),
+                    )
+                    .await
+                {
+                    anyhow::bail!(
+                        "failed to route batched message to actor for session '{session_id}'"
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        if !self
+            .route_one_to_actor(
+                &session_id,
+                &session,
+                AgentMessage::UserInputBatch(sanitized),
+            )
+            .await
+        {
+            anyhow::bail!("failed to route user batch to actor for session '{session_id}'");
+        }
+        Ok(())
+    }
+
+    /// Route one `AgentMessage` to the session's actor, cold-spawning from
+    /// `session` if needed. The spawn closure clones `session` so this can be
+    /// called repeatedly (the slash-split batch path); the clone is only paid on
+    /// the rare cold-spawn branch.
+    async fn route_one_to_actor(
+        &self,
+        session_id: &SessionId,
+        session: &aura_model::Session,
+        message: AgentMessage,
+    ) -> bool {
+        let response_tx = self.supervisor.response_tx().clone();
+        let parent_token = self.actor_parent_token.clone();
+        let actor_spawner = self.actor_spawner.as_ref();
+        let session = session.clone();
+        self.supervisor
+            .route_or_spawn(session_id, message, || {
+                let actor_token = parent_token.child_token();
+                let pinned = session.state.last_llm.clone();
+                actor_spawner(session, pinned, response_tx, actor_token)
+            })
+            .await
+    }
+
     /// Execute `/stop`: cancel the session's in-flight turn + every in-flight
     /// subagent it spawned, then acknowledge what was stopped. Results from
     /// subagents that already *completed* but haven't been reported yet are
