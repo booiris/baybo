@@ -706,7 +706,9 @@ mod tests {
     use crate::actor::mailbox;
     use aura_model::{ChannelType, SessionId, User};
     use aura_session::SessionStore;
-    use aura_session::test_support::{MemorySessionStore, MemorySessionSummaryStore};
+    use aura_session::test_support::{
+        MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
+    };
 
     fn make_supervisor() -> AgentSupervisor {
         let (tx, _rx) = mpsc::channel::<AgentOutput>(8);
@@ -897,7 +899,9 @@ mod tests {
 
         let session_store = Arc::new(MemorySessionStore::new());
         let summary_store = Arc::new(MemorySessionSummaryStore::new());
-        let sessions = SessionManager::new(session_store.clone(), summary_store.clone());
+        let folder_store = Arc::new(MemorySessionFolderStore::new());
+        let sessions =
+            SessionManager::new(session_store.clone(), summary_store.clone(), folder_store);
 
         let user = User {
             id: "u-1".to_string(),
@@ -1107,7 +1111,9 @@ mod tests {
 
         let session_store = Arc::new(MemorySessionStore::new());
         let summary_store = Arc::new(MemorySessionSummaryStore::new());
-        let sessions = SessionManager::new(session_store.clone(), summary_store.clone());
+        let folder_store = Arc::new(MemorySessionFolderStore::new());
+        let sessions =
+            SessionManager::new(session_store.clone(), summary_store.clone(), folder_store);
 
         let user = User {
             id: "u".to_string(),

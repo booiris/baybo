@@ -340,8 +340,10 @@ mod tests {
     // pre-compaction content for the owning session.
     #[tokio::test]
     async fn recovers_compacted_away_content_via_real_manager() {
-        use aura_session::test_support::{MemorySessionStore, MemorySessionSummaryStore};
-        use aura_session::{SessionStore, SessionSummaryStore};
+        use aura_session::test_support::{
+            MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
+        };
+        use aura_session::{SessionFolderStore, SessionStore, SessionSummaryStore};
 
         let now = chrono::Utc::now();
         let sid = SessionId::from("recover-sess");
@@ -357,6 +359,7 @@ mod tests {
             lineage: None,
             hidden: false,
             pinned: false,
+            folder_id: None,
         };
         let store = Arc::new(MemorySessionStore::new());
         store.seed_session(&session);
@@ -381,6 +384,7 @@ mod tests {
         let mgr = crate::SessionManager::new(
             store as Arc<dyn SessionStore>,
             Arc::new(MemorySessionSummaryStore::new()) as Arc<dyn SessionSummaryStore>,
+            Arc::new(MemorySessionFolderStore::new()) as Arc<dyn SessionFolderStore>,
         );
 
         let reader = SessionTranscriptReader::new(Arc::new(mgr), paths());

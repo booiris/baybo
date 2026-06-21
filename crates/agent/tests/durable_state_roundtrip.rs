@@ -19,7 +19,9 @@ use aura_agent::state::DurableActorState;
 use aura_model::{ChannelType, SessionId, User};
 use aura_session::SessionManager;
 use aura_session::SessionStore;
-use aura_session::test_support::{MemorySessionStore, MemorySessionSummaryStore};
+use aura_session::test_support::{
+    MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
+};
 
 fn test_user() -> User {
     User {
@@ -50,6 +52,7 @@ fn durable_actor_state_json_roundtrip_preserves_all_fields() {
         lineage: None,
         hidden: false,
         pinned: false,
+        folder_id: None,
     };
 
     let original = DurableActorState::new(session);
@@ -71,7 +74,8 @@ fn durable_actor_state_json_roundtrip_preserves_all_fields() {
 async fn rehydrate_after_idle_eviction_preserves_session_state() {
     let session_store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
     let summary_store = Arc::new(MemorySessionSummaryStore::new());
-    let sessions = SessionManager::new(session_store.clone(), summary_store);
+    let folder_store = Arc::new(MemorySessionFolderStore::new());
+    let sessions = SessionManager::new(session_store.clone(), summary_store, folder_store);
 
     // First actor: create session, mutate observable session state
     // (skills + compression count), persist.
@@ -123,7 +127,8 @@ async fn pending_background_results_survive_session_round_trip() {
 
     let session_store: Arc<dyn SessionStore> = Arc::new(MemorySessionStore::new());
     let summary_store = Arc::new(MemorySessionSummaryStore::new());
-    let sessions = SessionManager::new(session_store.clone(), summary_store);
+    let folder_store = Arc::new(MemorySessionFolderStore::new());
+    let sessions = SessionManager::new(session_store.clone(), summary_store, folder_store);
 
     let mut session = sessions
         .create_session(test_user(), ChannelType::tui())

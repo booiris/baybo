@@ -45,6 +45,8 @@ import { QueuePanel } from './chat/QueuePanel';
 import { SessionSidebar } from './chat/SessionSidebar';
 import { GoalBanner } from './chat/GoalBanner';
 import { useQueueStore, useSessionQueue, type QueuedItem } from './chat/queueStore';
+import { useFolderStore } from './chat/folderStore';
+import { useInputHistory } from './chat/inputHistory';
 import type { SessionSummary } from './chat/types';
 
 /** One progress entry inside a turn's work block. `reasoning`, `status`
@@ -274,12 +276,39 @@ export function decideComposerAction(opts: {
   return !opts.busy && !opts.paused ? 'direct' : 'park';
 }
 
+/** Accept slash-command completion: replace the leading `/command` token of
+ *  `text` (up to the first whitespace) with `/name ` plus any trailing args —
+ *  the web port of the TUI's `completion_accept`. Returns the new composer
+ *  value and the caret offset, which lands just after the inserted `/name `. */
+export function applySlashCompletion(
+  text: string,
+  name: string,
+): { text: string; caret: number } {
+  const firstWs = text.search(/\s/);
+  const prefixEnd = firstWs === -1 ? text.length : firstWs;
+  const suffix = text.slice(prefixEnd).replace(/^\s+/, '');
+  return { text: `/${name} ${suffix}`, caret: name.length + 2 };
+}
+
+/** Whether the slash-command popup should be active: the draft is a `/command`
+ *  and the caret still sits on that leading token (no whitespace before it) —
+ *  the web port of the TUI's `completion_candidates` cursor ≤ prefix_end guard.
+ *  Once the caret enters the args, the popup closes and Up/Down/Tab revert to
+ *  history recall / focus-trap. */
+export function caretOnSlashToken(text: string, caret: number): boolean {
+  if (!text.startsWith('/')) return false;
+  const firstWs = text.search(/\s/);
+  const prefixEnd = firstWs === -1 ? text.length : firstWs;
+  return caret <= prefixEnd;
+}
+
 export function ChatPage() {
   const { sessionId } = useParams<{ sessionId?: string }>();
   const navigate = useNavigate();
   const client = useAdminClient();
   const { baseUrl } = useAuth();
   const queueStore = useQueueStore();
+  const folderStore = useFolderStore();
   // Reactive interjection queue for the active session (drives the panel, the
   // park-vs-direct decision, and the Send-button affordance).
   const queue = useSessionQueue(sessionId);
@@ -356,6 +385,14 @@ export function ChatPage() {
   const statusRef = useRef<ConnectionStatus>({ state: 'connecting' });
   const [composer, setComposer] = useState('');
   const [showSlashHints, setShowSlashHints] = useState(false);
+  // Highlighted row in the slash-command popup; Up/Down move it, Tab/click accept.
+  const [selectedSlash, setSelectedSlash] = useState(0);
+  // Shell-style input ring (Up/Down recalls submitted messages), a port of the
+  // TUI history. `pendingCaret` parks the caret at a target offset once React
+  // has committed a programmatic composer replace (history recall → end of the
+  // recalled entry; slash completion → just after the inserted command).
+  const inputHistory = useInputHistory();
+  const pendingCaret = useRef<number | null>(null);
 
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
@@ -545,10 +582,12 @@ export function ChatPage() {
         { data: list, error: listError },
         { data: manifest, error: manifestError },
         { data: modelList, error: modelError },
+        { data: folderList, error: folderError },
       ] = await Promise.all([
         client.GET('/v1/chat/sessions'),
         client.GET('/v1/chat/slash-manifest'),
         client.GET('/v1/llm/models'),
+        client.GET('/v1/chat/folders'),
       ]);
       if (cancelled) return;
       if (listError) {
@@ -560,6 +599,18 @@ export function ChatPage() {
       if (modelError) {
         console.warn('chat bootstrap: list models failed', modelError);
       }
+      if (folderError) {
+        console.warn('chat bootstrap: list folders failed', folderError);
+      }
+      folderStore.replaceFolders(
+        (folderList?.items ?? []).map((f) => ({
+          id: f.id,
+          parent_id: f.parent_id ?? undefined,
+          name: f.name,
+          position: f.position,
+          created_at: f.created_at,
+        })),
+      );
       setModels(
         (modelList?.items ?? []).map((m) => ({
           name: m.name,
@@ -576,6 +627,7 @@ export function ChatPage() {
         unread: 0,
         pinned: s.pinned,
         last_user_text: s.last_user_text ?? undefined,
+        folder_id: s.folder_id ?? undefined,
       }));
       setSessions(existing);
       setSlashCommands(manifest?.items ?? []);
@@ -657,7 +709,7 @@ export function ChatPage() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client]); // intentionally NOT depending on sessionId — bootstrap is one-shot
+  }, [client, folderStore]); // intentionally NOT depending on sessionId — bootstrap is one-shot
 
   // Always-current handler for register_ack { ok: false }. Mints a
   // fresh token against the anchor session and feeds it back into
@@ -705,6 +757,20 @@ export function ChatPage() {
         setStatus(s);
       },
       onFrame: (frame) => {
+        if (frame.kind === 'folders_changed') {
+          // Full-snapshot convergence — replace the local folder tree
+          // wholesale (folders are few, no patch-merge needed).
+          folderStore.replaceFolders(
+            frame.folders.map((f) => ({
+              id: f.id,
+              parent_id: f.parent_id ?? undefined,
+              name: f.name,
+              position: f.position,
+              created_at: f.created_at,
+            })),
+          );
+          return;
+        }
         if (frame.kind === 'session_updated') {
           setSessions((prev) => applySessionPatch(prev, frame.session_id, frame.patch));
           if (frame.patch.hidden === true) {
@@ -886,7 +952,15 @@ export function ChatPage() {
       ws.close();
       wsRef.current = null;
     };
-  }, [baseUrl, channelToken, releaseSessionView, enqueueDelta, cancelPacer, flushPacerKeepStreaming]);
+  }, [
+    baseUrl,
+    channelToken,
+    releaseSessionView,
+    enqueueDelta,
+    cancelPacer,
+    flushPacerKeepStreaming,
+    folderStore,
+  ]);
 
   // ── Active session: subscribe + lazy-load history ───────────────────
   // Subscribe stays sticky once added: when the user switches away,
@@ -1166,6 +1240,21 @@ export function ChatPage() {
     ta.style.height = `${Math.min(ta.scrollHeight, max)}px`;
   }, [composer]);
 
+  // After a programmatic composer replace (history recall / slash completion),
+  // place the caret at the requested offset. Runs only when a replace set the
+  // target, so ordinary typing leaves the caret untouched. Refocuses so a
+  // mouse-driven slash pick lands the user back in the box ready to type args.
+  useLayoutEffect(() => {
+    if (pendingCaret.current === null) return;
+    const target = pendingCaret.current;
+    pendingCaret.current = null;
+    const ta = composerRef.current;
+    if (!ta) return;
+    const pos = Math.min(target, ta.value.length);
+    ta.focus();
+    ta.setSelectionRange(pos, pos);
+  }, [composer]);
+
   // Session-agnostic send used by the composer (active session), the queue
   // auto-fire pipeline, manual per-item fire, and resume — so a message can be
   // fired into ANY tracked session, not just the one on screen. Returns true
@@ -1417,6 +1506,9 @@ export function ChatPage() {
         paused: queue.pauseReason !== null,
       });
       if (action === 'noop') return;
+      // Record the submitted line in the input ring (send, park, or a typed
+      // `/stop` all count; `commit` trims, dedupes, and ignores empties).
+      inputHistory.commit(composer);
       if (action === 'stop') {
         sendText('/stop');
       } else if (action === 'direct') {
@@ -1431,7 +1523,7 @@ export function ChatPage() {
       setAttachments([]);
       setShowSlashHints(false);
     },
-    [composer, busy, attachments, sendText, queue],
+    [composer, busy, attachments, sendText, queue, inputHistory],
   );
 
   const handleStop = useCallback(
@@ -1630,8 +1722,42 @@ export function ChatPage() {
     });
   }, []);
 
+  // Slash-command completion candidates: when the draft starts with `/`, the
+  // commands whose name prefix-matches the typed token. Mirrors the TUI's
+  // `completion_candidates`.
+  const filteredSlash = useMemo(() => {
+    if (!showSlashHints) return [];
+    const query = composer.slice(1).split(/\s/)[0]?.toLowerCase() ?? '';
+    return slashCommands.filter(
+      (s) => query.length === 0 || s.command.toLowerCase().startsWith(query),
+    );
+  }, [showSlashHints, composer, slashCommands]);
+
+  // Accept a slash candidate, replacing the command token up to the first
+  // whitespace with `/name ` plus any trailing args — a port of the TUI's
+  // `completion_accept`. The caret lands just after the inserted `/name `.
+  const completeSlash = useCallback(
+    (index: number) => {
+      const name = filteredSlash[index]?.command;
+      if (name === undefined) return;
+      const { text, caret } = applySlashCompletion(composer, name);
+      setShowSlashHints(false);
+      setSelectedSlash(0);
+      // Guard the no-op replace so a bailed-out render can't strand pendingCaret.
+      if (text === composer) return;
+      setComposer(text);
+      pendingCaret.current = caret;
+    },
+    [composer, filteredSlash],
+  );
+
   const handleComposerKey = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
+      // An IME composition is active: let the textarea finalize the candidate.
+      // Must precede Enter — the Enter that commits a CJK candidate fires a
+      // keydown with isComposing=true and must NOT submit the half-composed
+      // draft (nor navigate history / hijack arrows).
+      if (e.nativeEvent.isComposing) return;
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         const hasReady = attachments.some((a) => a.status === 'ready');
@@ -1640,17 +1766,100 @@ export function ChatPage() {
           const form = e.currentTarget.form;
           form?.requestSubmit();
         }
+        return;
+      }
+      // Tab never leaves the composer (no focus jump to the footer buttons); it
+      // accepts the highlighted slash candidate when the popup is open.
+      if (e.key === 'Tab' && !e.shiftKey) {
+        e.preventDefault();
+        if (filteredSlash.length > 0) {
+          completeSlash(Math.min(selectedSlash, filteredSlash.length - 1));
+        }
+        return;
+      }
+      // Slash popup open: Up/Down move the highlight (wrapping), like the TUI's
+      // completion nav — taking precedence over the input ring.
+      if (filteredSlash.length > 0) {
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          setSelectedSlash((i) => (i <= 0 ? filteredSlash.length - 1 : i - 1));
+          return;
+        }
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          setSelectedSlash((i) => (i + 1) % filteredSlash.length);
+          return;
+        }
+      }
+      const recall = (text: string) => {
+        e.preventDefault();
+        // Re-pressing Up at the oldest entry returns the same text; skip the
+        // no-op setState so the caret effect always runs (a bailed-out render
+        // would strand `pendingCaret`).
+        if (text === composer) return;
+        setComposer(text);
+        setShowSlashHints(false);
+        pendingCaret.current = text.length;
+      };
+      // Unmodified Up/Down walk the input ring like the TUI — but only when the
+      // caret is on the composer's edge line, so multi-line drafts keep native
+      // cursor movement. A no-op recall (empty ring, or a non-empty fresh draft)
+      // falls through to the browser default.
+      const bareArrow = !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey;
+      if (e.key === 'ArrowUp' && bareArrow) {
+        const ta = e.currentTarget;
+        const caretOnFirstLine = !composer.slice(0, ta.selectionStart).includes('\n');
+        if (!caretOnFirstLine) return;
+        const recalled = inputHistory.recallPrev(composer.length === 0);
+        if (recalled !== null) recall(recalled);
+        return;
+      }
+      if (e.key === 'ArrowDown' && bareArrow) {
+        const ta = e.currentTarget;
+        const caretOnLastLine = !composer.slice(ta.selectionEnd).includes('\n');
+        if (!caretOnLastLine) return;
+        const recalled = inputHistory.recallNext();
+        if (recalled !== null) recall(recalled);
+        return;
+      }
+      // Any other caret move or selection change (Left/Right, Home/End, a
+      // modified arrow) exits history navigation, matching the TUI's reset on
+      // every non-history action — so a later Down can't jump to a stale entry.
+      if (
+        e.key === 'ArrowUp' ||
+        e.key === 'ArrowDown' ||
+        e.key === 'ArrowLeft' ||
+        e.key === 'ArrowRight' ||
+        e.key === 'Home' ||
+        e.key === 'End'
+      ) {
+        inputHistory.reset();
       }
     },
-    [composer, attachments],
+    [composer, attachments, inputHistory, filteredSlash, selectedSlash, completeSlash],
+  );
+
+  // Slash hints are open only while the draft is a `/command` AND the caret is
+  // still on that token — so editing args closes the popup (and a caret move
+  // back onto the token via onSelect reopens it). React bails out of the
+  // setState when the boolean is unchanged, so onSelect is cheap.
+  const refreshSlashHints = useCallback(
+    (value: string, caret: number) => {
+      setShowSlashHints(slashCommands.length > 0 && caretOnSlashToken(value, caret));
+    },
+    [slashCommands.length],
   );
 
   const handleComposerChange = useCallback(
-    (value: string) => {
+    (value: string, caret: number = value.length) => {
       setComposer(value);
-      setShowSlashHints(value.startsWith('/') && slashCommands.length > 0);
+      refreshSlashHints(value, caret);
+      // A refiltered list invalidates the old highlight — start at the top.
+      setSelectedSlash(0);
+      // Any edit leaves history-navigation mode, like the TUI.
+      inputHistory.reset();
     },
-    [slashCommands.length],
+    [refreshSlashHints, inputHistory],
   );
 
   // ── Interjection queue: composer/panel callbacks ────────────────────
@@ -1742,6 +1951,125 @@ export function ChatPage() {
           next[idx] = { ...prev[idx], pinned: !pinned };
           return next;
         });
+      }
+    },
+    [client],
+  );
+
+  // ── Folder handlers ────────────────────────────────────────────────
+  // Assign (or clear, with null) a session's folder. Optimistic; the
+  // server's SessionPatch broadcast converges every tab. A pinned row
+  // stays pinned (no auto-unpin) — the assignment just takes effect when
+  // it's unpinned. On failure we revert to the prior folder.
+  const handleAssignFolder = useCallback(
+    async (id: string, folderId: string | null) => {
+      let prevFolder: string | undefined;
+      setSessions((prev) => {
+        const idx = prev.findIndex((s) => s.session_id === id);
+        if (idx === -1) return prev;
+        prevFolder = prev[idx].folder_id;
+        const next = prev.slice();
+        next[idx] = { ...prev[idx], folder_id: folderId ?? undefined };
+        return next;
+      });
+      const { error, response } = await client.PUT('/v1/chat/sessions/{session_id}/folder', {
+        params: { path: { session_id: id } },
+        body: { folder_id: folderId },
+      });
+      if (error || !response.ok) {
+        console.warn('assign folder failed', id, error);
+        setSessions((prev) => {
+          const idx = prev.findIndex((s) => s.session_id === id);
+          if (idx === -1) return prev;
+          const next = prev.slice();
+          next[idx] = { ...prev[idx], folder_id: prevFolder };
+          return next;
+        });
+      }
+    },
+    [client],
+  );
+
+  // Folder CRUD — fire-and-converge: the server broadcasts a
+  // Frame::FoldersChanged snapshot that the folderStore swaps in, so we
+  // don't optimistically mutate the (store-owned) folder list here.
+  const handleCreateFolder = useCallback(
+    async (name: string, parentId?: string) => {
+      const { error } = await client.POST('/v1/chat/folders', {
+        body: { name, parent_id: parentId ?? null },
+      });
+      if (error) console.warn('create folder failed', error);
+    },
+    [client],
+  );
+  const handleRenameFolder = useCallback(
+    async (id: string, name: string) => {
+      const { error } = await client.PATCH('/v1/chat/folders/{folder_id}', {
+        params: { path: { folder_id: id } },
+        body: { name },
+      });
+      if (error) console.warn('rename folder failed', error);
+    },
+    [client],
+  );
+  const handleMoveFolder = useCallback(
+    async (id: string, parentId: string | null) => {
+      const { error } = await client.POST('/v1/chat/folders/{folder_id}/move', {
+        params: { path: { folder_id: id } },
+        body: { parent_id: parentId },
+      });
+      if (error) console.warn('move folder failed', error);
+    },
+    [client],
+  );
+  const handleReorderFolders = useCallback(
+    async (parentId: string | null, orderedIds: string[]) => {
+      const { error } = await client.POST('/v1/chat/folders/reorder', {
+        body: { parent_id: parentId, ordered_ids: orderedIds },
+      });
+      if (error) console.warn('reorder folders failed', error);
+    },
+    [client],
+  );
+  const handleDeleteFolder = useCallback(
+    async (id: string) => {
+      const { error } = await client.DELETE('/v1/chat/folders/{folder_id}', {
+        params: { path: { folder_id: id } },
+      });
+      if (error) console.warn('delete folder failed', error);
+    },
+    [client],
+  );
+  const handleNewChatInFolder = useCallback(
+    async (folderId: string) => {
+      setCreating(true);
+      try {
+        const { data } = await client.POST('/v1/chat/sessions', {});
+        if (data?.session_id) {
+          const sid = data.session_id;
+          setSessions((prev) =>
+            prev.some((s) => s.session_id === sid)
+              ? prev
+              : [
+                  {
+                    session_id: sid,
+                    created_at: new Date().toISOString(),
+                    last_active: new Date().toISOString(),
+                    unread: 0,
+                    pinned: false,
+                    folder_id: folderId,
+                  },
+                  ...prev,
+                ],
+          );
+          await client.PUT('/v1/chat/sessions/{session_id}/folder', {
+            params: { path: { session_id: sid } },
+            body: { folder_id: folderId },
+          });
+          navigateRef.current(`/chat/${sid}`);
+        }
+      } finally {
+        setCreating(false);
       }
     },
     [client],
@@ -1874,14 +2202,6 @@ export function ChatPage() {
     }
   }, [client]);
 
-  const filteredSlash = useMemo(() => {
-    if (!showSlashHints) return [];
-    const query = composer.slice(1).split(/\s/)[0]?.toLowerCase() ?? '';
-    return slashCommands.filter(
-      (s) => query.length === 0 || s.command.toLowerCase().startsWith(query),
-    );
-  }, [showSlashHints, composer, slashCommands]);
-
   const pendingApprovalIds = useMemo(
     () =>
       new Set(
@@ -1904,6 +2224,13 @@ export function ChatPage() {
         onNewChat={handleNewChat}
         onHide={handleHideSession}
         onTogglePin={handleTogglePin}
+        onAssignFolder={handleAssignFolder}
+        onCreateFolder={handleCreateFolder}
+        onRenameFolder={handleRenameFolder}
+        onMoveFolder={handleMoveFolder}
+        onReorderFolders={handleReorderFolders}
+        onDeleteFolder={handleDeleteFolder}
+        onNewChatInFolder={handleNewChatInFolder}
       />
 
       {/* Main column */}
@@ -2054,19 +2381,27 @@ export function ChatPage() {
                   <div className="px-2 pb-1 text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft">
                     Slash commands
                   </div>
-                  {filteredSlash.map((s) => (
-                    <button
-                      key={s.command}
-                      type="button"
-                      onClick={() => {
-                        handleComposerChange(`/${s.command} `);
-                      }}
-                      className="text-left px-2 py-1.5 border-2 border-transparent hover:border-black hover:bg-canvas rounded font-mono text-sm flex items-center gap-2 cursor-pointer"
-                    >
-                      <span className="font-bold shrink-0">/{s.command}</span>
-                      <span className="text-ink-soft truncate">{s.description}</span>
-                    </button>
-                  ))}
+                  {filteredSlash.map((s, i) => {
+                    const active = i === Math.min(selectedSlash, filteredSlash.length - 1);
+                    return (
+                      <button
+                        key={s.command}
+                        type="button"
+                        onMouseEnter={() => setSelectedSlash(i)}
+                        // Keep focus in the textarea; the click handler completes.
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => completeSlash(i)}
+                        className={`text-left px-2 py-1.5 border-2 rounded font-mono text-sm flex items-center gap-2 cursor-pointer ${
+                          active
+                            ? 'border-black bg-canvas'
+                            : 'border-transparent hover:border-black hover:bg-canvas'
+                        }`}
+                      >
+                        <span className="font-bold shrink-0">/{s.command}</span>
+                        <span className="text-ink-soft truncate">{s.description}</span>
+                      </button>
+                    );
+                  })}
                 </div>
               ) : null}
               {attachments.length > 0 ? (
@@ -2129,8 +2464,19 @@ export function ChatPage() {
               <textarea
                 ref={composerRef}
                 value={composer}
-                onChange={(e) => handleComposerChange(e.target.value)}
+                onChange={(e) =>
+                  handleComposerChange(e.target.value, e.target.selectionStart ?? e.target.value.length)
+                }
                 onKeyDown={handleComposerKey}
+                onMouseDown={() => inputHistory.reset()}
+                // Caret moves (click/arrow) re-evaluate whether it's still on the
+                // slash token, so the popup tracks the caret in both directions.
+                onSelect={(e) =>
+                  refreshSlashHints(
+                    e.currentTarget.value,
+                    e.currentTarget.selectionStart ?? e.currentTarget.value.length,
+                  )
+                }
                 placeholder={
                   status.state === 'connected'
                     ? 'Message Aura…  (Shift+Enter for newline)'
@@ -3444,6 +3790,14 @@ function applySessionPatch(
   if (patch.hidden === true) {
     return prev.filter((s) => s.session_id !== sessionId);
   }
+  // Resolve the three-state folder change: absent ⇒ keep current,
+  // `'uncategorized'` ⇒ clear, `{ set: { id } }` ⇒ that folder.
+  const patchedFolder =
+    patch.folder_id === undefined
+      ? undefined
+      : patch.folder_id === 'uncategorized'
+        ? undefined
+        : patch.folder_id.set.id;
   const idx = prev.findIndex((s) => s.session_id === sessionId);
   if (idx === -1) {
     if (patch.created_at == null || patch.last_active == null) return prev;
@@ -3454,11 +3808,14 @@ function applySessionPatch(
         last_active: patch.last_active,
         unread: 0,
         pinned: patch.pinned ?? false,
+        folder_id: patchedFolder,
       },
       ...prev,
     ];
   }
   const current = prev[idx];
+  const nextFolderId =
+    patch.folder_id === undefined ? current.folder_id : patchedFolder;
   const merged: SessionSummary = {
     session_id: current.session_id,
     created_at: patch.created_at ?? current.created_at,
@@ -3466,11 +3823,13 @@ function applySessionPatch(
     unread: current.unread,
     pinned: patch.pinned ?? current.pinned,
     last_user_text: current.last_user_text,
+    folder_id: nextFolderId,
   };
   if (
     merged.created_at === current.created_at &&
     merged.last_active === current.last_active &&
-    merged.pinned === current.pinned
+    merged.pinned === current.pinned &&
+    merged.folder_id === current.folder_id
   ) {
     return prev;
   }

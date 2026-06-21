@@ -2046,7 +2046,13 @@ mod tests {
             as Arc<dyn aura_session::SessionStore>;
         let summary_store = Arc::new(aura_session::test_support::MemorySessionSummaryStore::new())
             as Arc<dyn aura_session::SessionSummaryStore>;
-        Arc::new(aura_session::SessionManager::new(store, summary_store))
+        let folder_store = Arc::new(aura_session::test_support::MemorySessionFolderStore::new())
+            as Arc<dyn aura_session::SessionFolderStore>;
+        Arc::new(aura_session::SessionManager::new(
+            store,
+            summary_store,
+            folder_store,
+        ))
     }
 
     /// Workspace rooted at a non-existent path so the fast-path read

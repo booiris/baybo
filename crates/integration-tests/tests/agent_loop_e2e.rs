@@ -181,9 +181,12 @@ async fn turn_state_projector_brackets_a_slow_turn() {
     };
     let summary_store = Arc::new(aura_session::test_support::MemorySessionSummaryStore::new())
         as Arc<dyn aura_session::SessionSummaryStore>;
+    let folder_store = Arc::new(aura_session::test_support::MemorySessionFolderStore::new())
+        as Arc<dyn aura_session::SessionFolderStore>;
     let sessions = Arc::new(aura_agent::SessionManager::new(
         session_store,
         summary_store,
+        folder_store,
     ));
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentOutput>(16);

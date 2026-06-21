@@ -3,6 +3,7 @@ mod control_event;
 mod cost;
 mod cron;
 mod external_agent;
+mod folder;
 mod goal;
 mod governance;
 mod ids;
@@ -23,6 +24,7 @@ pub use cron::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus
 pub use external_agent::{
     AURA_BACKEND_TAG, ExternalAgentKind, SubagentBackend, SubagentBackendKind, SubagentBackendTag,
 };
+pub use folder::{FolderId, FolderSummary, MAX_FOLDER_NAME_LEN};
 pub use goal::{
     CREATE_GOAL_TOOL_NAME, GET_GOAL_TOOL_NAME, GOAL_MUTATING_TOOL_NAMES, Goal, GoalStatus,
     UPDATE_GOAL_TOOL_NAME,

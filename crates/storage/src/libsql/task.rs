@@ -241,6 +241,7 @@ mod tests {
             lineage: None,
             hidden: false,
             pinned: false,
+            folder_id: None,
         }
     }
 
