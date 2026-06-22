@@ -1,14 +1,10 @@
-//! `/v1/goals` + `/v1/chat/sessions/{id}/goal` endpoints — the operator's
-//! window into autonomous goals (the dashboard column + the chat banner) and
-//! the cross-session pause/clear controls.
+//! `/v1/goals` + per-session goal read/pause/clear endpoints.
 //!
-//! Reads go straight through the `GoalStore`. Pause/clear write the store via
-//! [`aura_goal::GoalService`]: the running actor reads the live goal status at
-//! every turn boundary, so a store-level pause/clear is honoured on the next
-//! boundary without any actor round-trip. Resume is **not** an operator control
-//! (the user runs `/goal resume` in their own session) — it must re-arm the
-//! continuation loop, which the in-session command path does and a bare store
-//! write cannot.
+//! Pause/clear write the store via [`aura_goal::GoalService`]; the running actor
+//! reads live goal status at every turn boundary, so the store write is honoured
+//! on the next boundary without an actor round-trip. Resume is deliberately not
+//! an operator control: it must re-arm the continuation loop, which only the
+//! in-session `/goal resume` path does — a bare store write cannot.
 
 use std::sync::Arc;
 
@@ -17,8 +13,8 @@ use axum::extract::{Path, State};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use aura_goal::GoalService;
-use aura_model::{GoalStatus, SessionId};
+use aura_goal::{GoalService, PauseOutcome};
+use aura_model::SessionId;
 
 use crate::api::dto::{ErrorBody, GoalItem, GoalsResponse, SessionGoalResponse};
 use crate::server::AdminState;
@@ -104,21 +100,14 @@ async fn pause_session_goal(
     Path(session_id): Path<String>,
 ) -> Result<Json<SessionGoalResponse>> {
     let sid = SessionId::from(session_id);
-    let svc = service(&state);
-    let current = svc
-        .current(&sid)
-        .await
-        .map_err(|e| GatewayError::Internal(e.to_string()))?;
-    if matches!(&current, Some(g) if g.status == GoalStatus::Active) {
-        svc.set_status(&sid, GoalStatus::Paused)
-            .await
-            .map_err(|e| GatewayError::Internal(e.to_string()))?;
-    }
-    let goal = svc
-        .current(&sid)
+    let goal = match service(&state)
+        .pause(&sid)
         .await
         .map_err(|e| GatewayError::Internal(e.to_string()))?
-        .map(|g| GoalItem::from_goal(&sid, &g));
+    {
+        PauseOutcome::Paused(g) | PauseOutcome::NotActive(g) => Some(GoalItem::from_goal(&sid, &g)),
+        PauseOutcome::NoGoal => None,
+    };
     Ok(Json(SessionGoalResponse { goal }))
 }
 

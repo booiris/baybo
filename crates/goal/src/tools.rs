@@ -1,12 +1,8 @@
 //! The goal tools (`create_goal` / `get_goal` / `update_goal`): the model's
 //! lifecycle controls over the session's autonomous objective. Each holds an
-//! `Arc<GoalService>` (over the shared `session_goals` table) and writes
-//! directly from `execute` — no actor round-trip, like the `Task*` tools.
-//!
-//! The tools cannot pause/resume/budget a goal — those are user/system
-//! controlled (`/goal`, the budget/cost gates). The model only *starts* a goal
-//! (`create_goal`), *reads* it (`get_goal`), and marks it
-//! complete/blocked (`update_goal`).
+//! `Arc<GoalService>` and writes directly from `execute` — no actor round-trip,
+//! like the `Task*` tools. The tools cannot pause/resume/budget a goal; those
+//! are user/system controlled (`/goal`, the budget/cost gates).
 
 use std::sync::Arc;
 
@@ -23,10 +19,8 @@ use crate::service::{GoalError, GoalService};
 
 /// Build the three goal tools with their manifests, ready to register with a
 /// `ToolRegistry`. Always `Trusted` with no capabilities — they operate on
-/// agent-internal goal state, not on the host filesystem or network, so the
-/// approval gate is a no-op (`accessed_resources` stays empty). The `store` is
-/// wrapped in a single shared [`GoalService`] so the "one current goal" policy
-/// lives in one place.
+/// agent-internal goal state, not the host filesystem or network, so the
+/// approval gate is a no-op (`accessed_resources` stays empty).
 pub fn agent_tools(store: Arc<dyn GoalStore>) -> Vec<(Arc<dyn Tool>, ToolManifest)> {
     let service = Arc::new(GoalService::new(store));
     let tools: Vec<Arc<dyn Tool>> = vec![
@@ -73,10 +67,6 @@ fn render_goal(goal: &Goal) -> Value {
     obj.insert("updated_at".into(), json!(goal.updated_at.to_rfc3339()));
     Value::Object(obj)
 }
-
-// ---------------------------------------------------------------------------
-// create_goal
-// ---------------------------------------------------------------------------
 
 struct CreateGoalTool {
     service: Arc<GoalService>,
@@ -154,10 +144,6 @@ impl Tool for CreateGoalTool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// get_goal
-// ---------------------------------------------------------------------------
-
 struct GetGoalTool {
     service: Arc<GoalService>,
 }
@@ -201,10 +187,6 @@ impl Tool for GetGoalTool {
         })))
     }
 }
-
-// ---------------------------------------------------------------------------
-// update_goal
-// ---------------------------------------------------------------------------
 
 struct UpdateGoalTool {
     service: Arc<GoalService>,
@@ -258,7 +240,6 @@ impl Tool for UpdateGoalTool {
     async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
         let p: UpdateGoalParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
-        // Only the two model-driven transitions are accepted here.
         let status = match p.status.as_str() {
             "complete" => GoalStatus::Complete,
             "blocked" => GoalStatus::Blocked,

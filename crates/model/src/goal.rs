@@ -23,17 +23,10 @@ pub const UPDATE_GOAL_TOOL_NAME: &str = "update_goal";
 pub const GOAL_MUTATING_TOOL_NAMES: &[&str] = &[CREATE_GOAL_TOOL_NAME, UPDATE_GOAL_TOOL_NAME];
 
 /// Lifecycle of a session's current goal, classified by **who** triggers each
-/// transition (see `docs/modules/goal.md`):
-///
-/// - `Active` — running; the actor self-fires a continuation turn at every turn
-///   boundary. The only self-firing state.
-/// - `Complete` / `Blocked` — model-driven via `update_goal`. `Complete` is
-///   terminal; `Blocked` is resumable.
-/// - `Paused` — user-driven via `/goal pause` (or left behind by `/new`).
-/// - `BudgetLimited` / `SpendCapped` — system-driven spend stops (the per-goal
-///   token budget, the global cost gate).
-///
-/// Every non-`Active`, non-`Complete` state is recoverable via `/goal resume`.
+/// transition (`Active` self-fires; model-driven `Complete`/`Blocked`;
+/// user-driven `Paused`; system spend-stops `BudgetLimited`/`SpendCapped`).
+/// Only `Active` self-fires; only `Complete` is terminal; every other state is
+/// recoverable via `/goal resume`. See `docs/modules/goal.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalStatus {
@@ -96,6 +89,13 @@ impl GoalStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Complete)
     }
+
+    /// A stopped state that `/goal resume` can return to `Active` — i.e. neither
+    /// `Active` nor terminal (`Blocked` / `Paused` / `BudgetLimited` /
+    /// `SpendCapped`).
+    pub fn is_resumable(&self) -> bool {
+        !self.is_active() && !self.is_terminal()
+    }
 }
 
 /// A session's current autonomous objective.
@@ -115,8 +115,7 @@ pub struct Goal {
     /// case); the global daily/monthly cost gate is the backstop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<u64>,
-    /// Tokens billed to this session while a goal turn was running. Checked
-    /// against `token_budget`.
+    /// Tokens billed to this session while a goal turn was running.
     pub tokens_used: u64,
     /// Wall-clock seconds accumulated while the goal was `Active`.
     pub time_used_seconds: u64,
@@ -132,7 +131,7 @@ impl Goal {
             .map(|b| b.saturating_sub(self.tokens_used))
     }
 
-    /// Whether the per-goal token budget has been reached (only when one is set).
+    /// `false` when no budget is set.
     pub fn is_over_budget(&self) -> bool {
         self.token_budget.is_some_and(|b| self.tokens_used >= b)
     }
@@ -172,6 +171,15 @@ mod tests {
     fn only_complete_is_terminal() {
         for s in GoalStatus::ALL {
             assert_eq!(s.is_terminal(), s == GoalStatus::Complete);
+        }
+    }
+
+    #[test]
+    fn resumable_is_every_stopped_non_terminal_state() {
+        use GoalStatus::*;
+        for s in GoalStatus::ALL {
+            let expected = matches!(s, Blocked | Paused | BudgetLimited | SpendCapped);
+            assert_eq!(s.is_resumable(), expected);
         }
     }
 

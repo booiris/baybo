@@ -111,13 +111,11 @@ pub enum MessageSource {
     /// every later turn (the failure mode that retired the prior memory
     /// pipeline).
     RecalledMemory,
-    /// A goal continuation turn's framed steering prompt: synthesized by the
-    /// agent at the turn boundary (so hidden from the chat transcript like
-    /// [`MessageSource::Agent`]), but tracked distinctly so operator surfaces can
-    /// tell autonomous continuation turns from genuine input. Always rides as a
-    /// framed `Role::User` row — never `Role::System`, which would re-assert
-    /// itself on every later turn. The analog of Codex's `ContextualUserFragment`
-    /// (`aura_goal::prompts`). See `docs/modules/goal.md`.
+    /// A goal continuation turn's framed steering prompt, synthesized by the agent
+    /// at the turn boundary. Hidden from chat like [`MessageSource::Agent`], but
+    /// tracked distinctly so operator surfaces can tell autonomous continuation
+    /// turns from genuine input. Always a framed `Role::User` row — never
+    /// `Role::System`, which would re-assert itself on every later turn.
     GoalSteering,
     /// Any other agent-originated row: skill reminders, a spawned/subagent task
     /// prompt, the subagent-finished notification, summary instructions, the
@@ -228,12 +226,9 @@ impl ChatMessage {
         }
     }
 
-    /// A goal continuation turn's framed steering prompt — a `Role::User` turn
-    /// the agent synthesized at the turn boundary (see `aura_goal::prompts`) to
-    /// keep the model rigorously driving toward the objective. Carries
-    /// [`MessageSource::GoalSteering`] so it never surfaces as a user bubble and
-    /// operator surfaces can tell it apart from a genuine prompt. The **only**
-    /// constructor that marks a row [`MessageSource::GoalSteering`].
+    /// Constructs a [`MessageSource::GoalSteering`] row (the only constructor that
+    /// does so) — a framed `Role::User` continuation turn, hidden from chat. See
+    /// the variant doc and `aura_goal::prompts`.
     pub fn goal_steering(content: Vec<ContentBlock>) -> Self {
         Self {
             role: Role::User,

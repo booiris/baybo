@@ -347,9 +347,8 @@ fn memory_recall_query(input: &JobInput) -> Option<Vec<ContentBlock>> {
     }
 }
 
-/// Whether `name` is one of the autonomous-goal tools (`create_goal` /
-/// `get_goal` / `update_goal`) — hidden from sessions that aren't goal-eligible
-/// (see [`AgentLoop::call_llm`]).
+/// Whether `name` is one of the autonomous-goal tools — hidden from sessions
+/// that aren't goal-eligible (see [`AgentLoop::call_llm`]).
 fn is_goal_tool_name(name: &str) -> bool {
     name == aura_model::CREATE_GOAL_TOOL_NAME
         || name == aura_model::GET_GOAL_TOOL_NAME
@@ -1369,13 +1368,9 @@ impl AgentLoop {
     ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
         let model_info = self.llm_client.model_info();
 
-        // The goal tools are registered globally but are only meaningful on a
-        // goal-eligible (top-level UserChat) session — a cron/subagent turn that
-        // called `create_goal` would write an `Active` goal whose continuation
-        // loop is never eligible to fire. Hide them from every other session so
-        // the model is never offered a control it can't honour. (See
-        // `crate::actor::goal_eligible` — the same gate the continuation loop
-        // uses.)
+        // The goal tools are registered globally; hide them on non-goal-eligible
+        // sessions so the model is never offered a control it can't honour (see
+        // `crate::actor::goal_eligible`, the same gate the continuation loop uses).
         let hide_goal_tools = !crate::actor::goal_eligible(session);
         let tool_defs: Vec<ToolDefinitionForLlm> = self
             .tool_registry
@@ -1904,15 +1899,12 @@ impl AgentLoop {
         self.context_manager.append_in_memory(&msg);
     }
 
-    /// Append the framed goal continuation steering **in-memory only** (the
-    /// analog of [`Self::append_subagent_notification`]). The steering is
-    /// re-derived from the live goal every turn, so persisting per-turn would
-    /// stack identical long `GoalSteering` rows in the transcript and grow the
-    /// `session_messages` table without bound; keeping it in-memory also lets a
-    /// transiently-failed continuation roll the row back. Only the model's
-    /// proactive reply (if any) is persisted by the turn. The caller seeds the
-    /// system prompt and snapshots the transcript *before* this so a failed turn
-    /// can roll the row back; `content` is built via `aura_goal::prompts`.
+    /// Append the framed goal continuation steering **in-memory only** (the analog
+    /// of [`Self::append_subagent_notification`]). It is re-derived from the live
+    /// goal every turn, so persisting it would stack identical `GoalSteering` rows
+    /// in `session_messages` without bound; in-memory also lets a failed turn roll
+    /// the row back. Only the model's proactive reply is persisted. `content` is
+    /// built via `aura_goal::prompts`.
     pub fn append_goal_continuation(&mut self, content: Vec<ContentBlock>) {
         let seeded = self
             .context_manager

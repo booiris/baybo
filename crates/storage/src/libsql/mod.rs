@@ -314,14 +314,11 @@ impl LibsqlPool {
                 CREATE INDEX IF NOT EXISTS idx_session_tasks_session
                     ON session_tasks(session_id);
 
-                -- A session's current autonomous objective (`/goal`). One
-                -- current goal per session (the PRIMARY KEY is session_id).
-                -- Mutated out-of-band of the turn (the model's update_goal, the
-                -- /goal command, per-turn token/time accounting), so it gets a
-                -- dedicated row-keyed table — it never clobbers, and is never
-                -- clobbered by, the full-blob writers on the `sessions` row.
-                -- CASCADE reaps the goal on user-triggered session delete; the
-                -- only explicit DELETE is `/goal clear`.
+                -- A session's current autonomous objective (`/goal`), keyed by
+                -- session_id. Dedicated row-keyed table so out-of-band goal
+                -- writes never clobber, and are never clobbered by, the
+                -- full-blob writers on the `sessions` row. CASCADE reaps it on
+                -- session delete; the only explicit DELETE is `/goal clear`.
                 CREATE TABLE IF NOT EXISTS session_goals (
                     session_id        TEXT    PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
                     goal_id           TEXT    NOT NULL,

@@ -528,16 +528,12 @@ pub fn spawn_idle_reaper(
     })
 }
 
-/// One-shot boot scan that re-arms every `Active` goal which survived a process
-/// restart. For each goal-eligible session whose durable goal is `Active`, it
-/// builds + registers the actor (when not already resident); the actor's `run`
-/// loop then fires the next continuation turn on its own — so "keep working on
-/// X" resumes after a restart instead of stalling until the user sends another
-/// message (Codex's `restore_after_resume`). Detached so boot isn't blocked on
-/// loading sessions; idempotent against the normal message path via
-/// [`AgentSupervisor::spawn_if_absent`].
-///
-/// The returned [`JoinHandle`] is ignorable; the task runs once and exits.
+/// One-shot, detached boot scan that re-arms every `Active` goal which survived
+/// a process restart: for each goal-eligible session with an `Active` durable
+/// goal it registers the actor (when not already resident) and the actor's `run`
+/// loop fires the next continuation on its own, so "keep working on X" resumes
+/// after a restart instead of stalling until the next user message. Idempotent
+/// against the normal message path via [`AgentSupervisor::spawn_if_absent`].
 pub fn spawn_goal_rearm(
     supervisor: AgentSupervisor,
     sessions: Arc<SessionManager>,
@@ -733,7 +729,6 @@ mod tests {
         let supervisor = make_supervisor();
         let session_id = SessionId::from("s-rearm");
 
-        // First call spawns + registers.
         let mut spawn_count = 0;
         let spawned = supervisor.spawn_if_absent(&session_id, || {
             spawn_count += 1;

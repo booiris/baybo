@@ -33,8 +33,7 @@ pub const GOAL_COMMAND_NAME: &str = "goal";
 
 /// Full leading-slash form of the goal command. Recognised by the agent actor
 /// to set / view / pause / resume / clear the session's autonomous objective
-/// (see `docs/modules/goal.md`). `/goal <objective> [--budget N]` starts the
-/// loop; bare `/goal` views it; `/goal pause|resume|clear` control it.
+/// (see `docs/modules/goal.md`).
 pub const GOAL_COMMAND: &str = "/goal";
 
 /// One-line description shared by every surface that lists `/goal`.

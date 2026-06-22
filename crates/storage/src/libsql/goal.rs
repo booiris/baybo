@@ -30,7 +30,6 @@ fn try_goal_from_row(row: &libsql::Row, base: i32) -> Option<Goal> {
     let goal_id_s: String = row.get(base).ok()?;
     let objective: String = row.get(base + 1).ok()?;
     let status_s: String = row.get(base + 2).ok()?;
-    // token_budget is nullable.
     let token_budget: Option<i64> = row.get(base + 3).ok()?;
     let tokens_used: i64 = row.get(base + 4).ok()?;
     let time_used_seconds: i64 = row.get(base + 5).ok()?;
@@ -204,8 +203,7 @@ impl GoalStore for LibsqlGoalStore {
                     continue;
                 }
             };
-            // Columns shift by one (session_id leads); parse the goal from
-            // column 1 onward.
+            // session_id leads; goal columns start at 1.
             if let Some(goal) = try_goal_from_row(&row, 1) {
                 out.push((SessionId::from(session_id_s), goal));
             }
@@ -240,6 +238,7 @@ mod tests {
             lineage: None,
             hidden: false,
             pinned: false,
+            folder_id: None,
         }
     }
 

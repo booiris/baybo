@@ -18,15 +18,37 @@ pub enum GoalError {
     /// (any status other than `Complete`). One current goal per session.
     #[error("a goal is already active for this session: {objective}")]
     AlreadyActive { objective: String },
-    /// An operation targeting an existing goal found none.
     #[error("no goal is set for this session")]
     NotFound,
-    /// The backing store failed.
     #[error("goal store error: {0}")]
     Store(String),
 }
 
 type Result<T> = std::result::Result<T, GoalError>;
+
+/// Outcome of [`GoalService::pause`]. The transition guard ("pause is valid only
+/// from `Active`") lives here so every caller — the `/goal pause` command and
+/// the operator REST control — shares one rule instead of re-deriving it.
+pub enum PauseOutcome {
+    /// Was `Active`; now `Paused`.
+    Paused(Goal),
+    /// A goal exists but wasn't `Active` (terminal or already stopped); unchanged.
+    NotActive(Goal),
+    /// No goal is set.
+    NoGoal,
+}
+
+/// Outcome of [`GoalService::resume`] — the mirror guard of [`PauseOutcome`].
+pub enum ResumeOutcome {
+    /// Was resumable (a stopped, non-terminal state); now `Active`.
+    Resumed(Goal),
+    /// Already `Active`; unchanged.
+    AlreadyActive(Goal),
+    /// `Complete` — nothing to resume; unchanged.
+    Terminal(Goal),
+    /// No goal is set.
+    NoGoal,
+}
 
 /// CRUD + transitions over one session's current goal.
 pub struct GoalService {
@@ -93,7 +115,10 @@ impl GoalService {
         Ok(goal)
     }
 
-    /// Flip the goal's status. `Ok(false)` when no goal is set.
+    /// Flip the goal's status unconditionally. `Ok(false)` when no goal is set.
+    /// The single-site model-driven (`update_goal` → `Complete`/`Blocked`) and
+    /// system spend-stop (`BudgetLimited`/`SpendCapped`) transitions use this;
+    /// the guarded user transitions go through [`Self::pause`]/[`Self::resume`].
     pub async fn set_status(&self, session_id: &SessionId, status: GoalStatus) -> Result<bool> {
         self.store
             .update(
@@ -105,6 +130,41 @@ impl GoalService {
             )
             .await
             .map_err(|e| GoalError::Store(e.to_string()))
+    }
+
+    /// Pause an `Active` goal so the continuation loop stops at the next turn
+    /// boundary. A no-op for any non-`Active` goal (or none).
+    pub async fn pause(&self, session_id: &SessionId) -> Result<PauseOutcome> {
+        let Some(goal) = self.current(session_id).await? else {
+            return Ok(PauseOutcome::NoGoal);
+        };
+        if !goal.status.is_active() {
+            return Ok(PauseOutcome::NotActive(goal));
+        }
+        self.set_status(session_id, GoalStatus::Paused).await?;
+        Ok(match self.current(session_id).await? {
+            Some(updated) => PauseOutcome::Paused(updated),
+            None => PauseOutcome::NoGoal,
+        })
+    }
+
+    /// Re-activate a stopped, non-terminal goal so the continuation loop resumes.
+    /// A no-op for an `Active` or `Complete` goal (or none).
+    pub async fn resume(&self, session_id: &SessionId) -> Result<ResumeOutcome> {
+        let Some(goal) = self.current(session_id).await? else {
+            return Ok(ResumeOutcome::NoGoal);
+        };
+        if goal.status.is_active() {
+            return Ok(ResumeOutcome::AlreadyActive(goal));
+        }
+        if goal.status.is_terminal() {
+            return Ok(ResumeOutcome::Terminal(goal));
+        }
+        self.set_status(session_id, GoalStatus::Active).await?;
+        Ok(match self.current(session_id).await? {
+            Some(updated) => ResumeOutcome::Resumed(updated),
+            None => ResumeOutcome::NoGoal,
+        })
     }
 
     /// Edit an existing goal in place (the `/goal <new objective> [--budget N]`
@@ -123,7 +183,6 @@ impl GoalService {
                 session_id,
                 &GoalPatch {
                     objective: Some(objective.to_string()),
-                    // `Some(n)` → set the cap to `n`; `None` → leave untouched.
                     token_budget: budget.map(Some),
                     ..GoalPatch::new()
                 },
@@ -208,7 +267,6 @@ mod tests {
         let sid = SessionId::from("s1");
         svc.create(&sid, "first", None).await.unwrap();
         assert!(svc.set_status(&sid, GoalStatus::Complete).await.unwrap());
-        // A completed goal is finished; a new one can replace it.
         let g = svc.create(&sid, "second", None).await.unwrap();
         assert_eq!(g.objective, "second");
         assert_eq!(g.status, GoalStatus::Active);
@@ -254,12 +312,11 @@ mod tests {
         let svc = service();
         let sid = SessionId::from("s1");
         svc.create(&sid, "obj", Some(1_000)).await.unwrap();
-        // Edit objective only (no budget) → cap preserved.
         svc.edit(&sid, "obj2", None).await.unwrap();
         let g = svc.current(&sid).await.unwrap().unwrap();
         assert_eq!(g.objective, "obj2");
         assert_eq!(g.token_budget, Some(1_000));
-        // Edit with a new budget → cap raised (the post-BudgetLimited path).
+        // The post-BudgetLimited raise-the-cap path.
         svc.edit(&sid, "obj2", Some(5_000)).await.unwrap();
         assert_eq!(
             svc.current(&sid).await.unwrap().unwrap().token_budget,
@@ -276,5 +333,56 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn pause_then_resume_round_trips_active() {
+        let svc = service();
+        let sid = SessionId::from("s1");
+        svc.create(&sid, "x", None).await.unwrap();
+        assert!(matches!(
+            svc.pause(&sid).await.unwrap(),
+            PauseOutcome::Paused(g) if g.status == GoalStatus::Paused
+        ));
+        assert!(matches!(
+            svc.resume(&sid).await.unwrap(),
+            ResumeOutcome::Resumed(g) if g.status == GoalStatus::Active
+        ));
+    }
+
+    #[tokio::test]
+    async fn pause_is_a_no_op_off_active() {
+        let svc = service();
+        let sid = SessionId::from("s1");
+        assert!(matches!(
+            svc.pause(&sid).await.unwrap(),
+            PauseOutcome::NoGoal
+        ));
+        svc.create(&sid, "x", None).await.unwrap();
+        svc.set_status(&sid, GoalStatus::Complete).await.unwrap();
+        assert!(matches!(
+            svc.pause(&sid).await.unwrap(),
+            PauseOutcome::NotActive(g) if g.status == GoalStatus::Complete
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_active_and_terminal() {
+        let svc = service();
+        let sid = SessionId::from("s1");
+        assert!(matches!(
+            svc.resume(&sid).await.unwrap(),
+            ResumeOutcome::NoGoal
+        ));
+        svc.create(&sid, "x", None).await.unwrap();
+        assert!(matches!(
+            svc.resume(&sid).await.unwrap(),
+            ResumeOutcome::AlreadyActive(_)
+        ));
+        svc.set_status(&sid, GoalStatus::Complete).await.unwrap();
+        assert!(matches!(
+            svc.resume(&sid).await.unwrap(),
+            ResumeOutcome::Terminal(_)
+        ));
     }
 }

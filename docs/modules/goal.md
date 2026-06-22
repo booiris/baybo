@@ -191,6 +191,13 @@ completes from every channel.
 | `/goal resume` | Re-arm a non-`Active` goal (status → `Active`, fresh blocked audit). |
 | `/goal clear` | Terminal delete (the one explicit per-row `DELETE`). |
 
+Setting an objective records it as a `User` transcript row, so the objective
+joins the agent-loop context and the session reloads with a real `last_user_text`
+title instead of "New conversation" (the continuation steering is in-memory only,
+leaving no user-authored row otherwise). The control-only subcommands
+(`view`/`pause`/`resume`/`clear`) persist a command echo + confirmation as
+out-of-band control events, like `/compact`.
+
 The model drives the lifecycle through three tools (ported verbatim from
 `ext/goal`):
 

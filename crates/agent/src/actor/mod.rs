@@ -3,6 +3,7 @@
 //! routed to by [`Router`](crate::actor::router::Router), and
 //! checkpointed via [`DurableActorState`](crate::actor::state::DurableActorState).
 
+mod goal;
 pub mod mailbox;
 pub mod router;
 pub mod runner;
@@ -12,10 +13,10 @@ pub mod supervisor;
 
 use crate::runtime::agent_loop::InterjectionSource;
 use aura_channels::{
-    AgentEvent, AgentOutput, COMPACT_COMMAND, GOAL_BUDGET_FLAG, GOAL_CLEAR_SUBCOMMAND,
-    GOAL_COMMAND, GOAL_PAUSE_SUBCOMMAND, GOAL_RESUME_SUBCOMMAND, IncomingMessage, NoticeLevel,
-    OutgoingMessage,
+    AgentEvent, AgentOutput, COMPACT_COMMAND, GOAL_COMMAND, GOAL_COMMAND_NAME, IncomingMessage,
+    NoticeLevel, OutgoingMessage,
 };
+use aura_goal::{PauseOutcome, ResumeOutcome};
 use aura_job::JobInput;
 use aura_model::{
     ContentBlock, ControlEventKind, Goal, GoalStatus, LlmEntryName, PendingBackgroundResult,
@@ -56,6 +57,10 @@ const NOTIFY_RETRY_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_
 const EMPTY_USER_REPLY_NOTICE: &str =
     "The assistant did not produce a response to your message. Please try again or rephrase.";
 
+use crate::actor::goal::{
+    GoalCommand, budget_note, goal_blocked_text, goal_budget_reached_text, goal_complete_text,
+    goal_paused_text, goal_set_text, goal_spend_capped_text, goal_status_text, parse_goal_command,
+};
 use crate::actor::state::{DurableActorState, VolatileResources};
 use crate::actor::supervisor::ActorRegistryGuard;
 
@@ -153,12 +158,10 @@ fn is_compact_command(content: &[ContentBlock]) -> bool {
         .is_some_and(|t| t.eq_ignore_ascii_case(COMPACT_COMMAND.trim_start_matches('/')))
 }
 
-/// Mirrors [`is_compact_command`] for `/goal` (set / view / pause / resume /
-/// clear the session's autonomous objective). Routed to the actor like
+/// Mirrors [`is_compact_command`] for `/goal`, routed to the actor like
 /// `/compact` so it can drive the continuation loop and the goal store.
 fn is_goal_command(content: &[ContentBlock]) -> bool {
-    slash_command_name(content)
-        .is_some_and(|t| t.eq_ignore_ascii_case(GOAL_COMMAND.trim_start_matches('/')))
+    slash_command_name(content).is_some_and(|t| t.eq_ignore_ascii_case(GOAL_COMMAND_NAME))
 }
 
 /// Transient (non-persisted) per-actor goal continuation state. The goal itself
@@ -642,11 +645,9 @@ impl AgentActor {
             *out = turn_token.is_cancelled();
         }
         match result {
-            // Cancelled via the cancel token (`/stop` or parent shutdown), not a
-            // genuine failure. Collapse the varying underlying error to a typed
-            // `TurnCancelled` so callers (the goal loop) classify it from the
-            // authoritative token rather than its text. Stays quiet: `/stop`
-            // already acknowledged with its own notice.
+            // Cancelled via the cancel token, not a genuine failure: collapse to the
+            // typed `TurnCancelled` (see its doc) so the goal loop classifies from the
+            // token, not the error text. Stays quiet — `/stop` already acknowledged.
             Err(_) if turn_token.is_cancelled() => Err(anyhow::Error::new(TurnCancelled)),
             // A user is waiting on this turn — a genuine failure must surface as
             // a terminal notice, not silence (the log line alone leaves the chat
@@ -1312,10 +1313,9 @@ impl AgentActor {
         )
     }
 
-    /// Fire one autonomous continuation turn for the session's `Active` goal.
-    /// Re-reads the live goal first (a pause/complete that landed since the last
-    /// boundary stops the loop), applies the per-goal budget wind-down, runs the
-    /// turn, then classifies the result into a [`GoalTurnOutcome`].
+    /// Fire one autonomous continuation turn for the session's `Active` goal,
+    /// classifying the result into a [`GoalTurnOutcome`]. Re-reads the live goal
+    /// first so a pause/complete since the last boundary stops the loop.
     async fn run_goal_continuation(&mut self) -> GoalTurnOutcome {
         let goal = match self
             .volatile
@@ -1337,14 +1337,11 @@ impl AgentActor {
         if !goal.status.is_active() {
             return GoalTurnOutcome::Stopped;
         }
-        // Per-goal budget reached: give the model ONE wind-down turn with the
-        // BUDGET_LIMIT steering, then stop. Soft, graceful.
+        // Per-goal budget reached: give the model ONE wind-down turn (BUDGET_LIMIT
+        // steering), then stop.
         if goal.is_over_budget() {
-            self.run_goal_winddown(&goal).await;
-            return GoalTurnOutcome::Stopped;
+            return self.run_goal_winddown(&goal).await;
         }
-        // Build the continuation steering, prepending OBJECTIVE_UPDATED once if
-        // the user edited the objective since the last turn.
         let mut text = String::new();
         if let Some(new_objective) = self.goal.pending_objective_update.take() {
             text.push_str(&aura_goal::prompts::frame_objective_updated(&new_objective));
@@ -1373,19 +1370,25 @@ impl AgentActor {
                 }
             }
             Err(e) if is_cost_gate_denial(&e) => {
-                // Hard stop: the global daily/monthly cap denied the next call.
-                // Retrying before it resets would only busy-loop.
-                if let Err(e) = self
+                // Hard stop (global cap): persist SpendCapped, then notify. If the
+                // write fails the goal is still `Active`, so back off rather than
+                // return Stopped onto a live row (which would re-fire and tight-loop).
+                match self
                     .volatile
                     .goal_service
                     .set_status(&self.durable.session.id, GoalStatus::SpendCapped)
                     .await
                 {
-                    warn!(session_id = %self.durable.session.id, error = %e, "goal: failed to set SpendCapped");
+                    Ok(_) => {
+                        self.goal_notice(NoticeLevel::Warn, &goal_spend_capped_text())
+                            .await;
+                        GoalTurnOutcome::Stopped
+                    }
+                    Err(e) => {
+                        warn!(session_id = %self.durable.session.id, error = %e, "goal: failed to persist SpendCapped; backing off");
+                        GoalTurnOutcome::TransientError
+                    }
                 }
-                self.goal_notice(NoticeLevel::Warn, &goal_spend_capped_text())
-                    .await;
-                GoalTurnOutcome::Stopped
             }
             Err(e) if was_cancelled(&e) => {
                 // `/stop` cancelled the turn but does not touch the goal — it
@@ -1407,8 +1410,10 @@ impl AgentActor {
 
     /// Run the budget wind-down turn (BUDGET_LIMIT steering), then record the
     /// terminal state: `Complete` if the model verifiably finished during the
-    /// wind-down, else `BudgetLimited`.
-    async fn run_goal_winddown(&mut self, goal: &Goal) {
+    /// wind-down, else `BudgetLimited`. `TransientError` only if the terminal
+    /// write fails — so a still-`Active` goal backs off instead of being claimed
+    /// stopped on a row that would immediately re-fire.
+    async fn run_goal_winddown(&mut self, goal: &Goal) -> GoalTurnOutcome {
         let content = vec![ContentBlock::Text(aura_goal::prompts::frame_budget_limit(
             goal,
         ))];
@@ -1422,32 +1427,49 @@ impl AgentActor {
             .ok()
             .flatten();
         match after {
-            Some(g) if g.status == GoalStatus::Complete => self.notify_goal_status(&g).await,
+            Some(g) if g.status == GoalStatus::Complete => {
+                self.notify_goal_status(&g).await;
+                GoalTurnOutcome::Stopped
+            }
             Some(g) if g.status.is_active() => {
-                if let Err(e) = self
+                // Model didn't finish within the wind-down → mark BudgetLimited.
+                // Only notify on a successful persist; on failure the goal is
+                // still `Active`, so back off rather than claim an unwritten state.
+                match self
                     .volatile
                     .goal_service
                     .set_status(&self.durable.session.id, GoalStatus::BudgetLimited)
                     .await
                 {
-                    warn!(session_id = %self.durable.session.id, error = %e, "goal: failed to set BudgetLimited");
+                    Ok(_) => {
+                        self.goal_notice(NoticeLevel::Warn, &goal_budget_reached_text(goal))
+                            .await;
+                        GoalTurnOutcome::Stopped
+                    }
+                    Err(e) => {
+                        warn!(session_id = %self.durable.session.id, error = %e, "goal: failed to persist BudgetLimited; backing off");
+                        GoalTurnOutcome::TransientError
+                    }
                 }
-                self.goal_notice(NoticeLevel::Warn, &goal_budget_reached_text(goal))
-                    .await;
             }
             // Model set blocked, or the user cleared/paused mid-wind-down: report
-            // whatever the live status is (or nothing if cleared).
-            Some(g) => self.notify_goal_status(&g).await,
-            None => {}
+            // whatever the live status is (already not Active).
+            Some(g) => {
+                self.notify_goal_status(&g).await;
+                GoalTurnOutcome::Stopped
+            }
+            None => GoalTurnOutcome::Stopped,
         }
     }
 
-    /// Run one goal turn over `content` (continuation or wind-down steering):
-    /// seed + snapshot, append the in-memory steering, run the loop, accrue the
-    /// turn's token + wall-clock usage, bump `last_active` (so the idle reaper
-    /// never targets a running goal), send a non-blank proactive reply, and roll
-    /// the steering row back on failure. Returns the loop result so the caller
-    /// can classify cancel / cost-gate / transient.
+    /// Run one goal turn over `content` (continuation or wind-down steering),
+    /// rolling the in-memory steering row back on failure and bumping `last_active`
+    /// so the idle reaper never targets a running goal. Returns the loop result so
+    /// the caller can classify cancel / cost-gate / transient.
+    ///
+    /// Streams its deltas / tool lifecycle through the session's response channel
+    /// (unlike cron / subagent turns): a continuation runs in the user's *visible*
+    /// chat, so the live execution must show as it happens, not only on reload.
     async fn run_one_goal_turn(&mut self, content: Vec<ContentBlock>) -> anyhow::Result<()> {
         let tokens_before = self
             .volatile
@@ -1459,8 +1481,15 @@ impl AgentActor {
         self.volatile
             .agent_loop
             .append_goal_continuation(content.clone());
+        let delta_tx = self.volatile.response_tx.clone();
         let result = self
-            .run_agent_loop(JobInput::GoalContinuation { content }, None, None, None, None)
+            .run_agent_loop(
+                JobInput::GoalContinuation { content },
+                None,
+                Some(delta_tx),
+                None,
+                None,
+            )
             .await;
         // Accrue usage even on failure (tokens billed before the error still
         // count), and keep `last_active` fresh so the reaper leaves the actor
@@ -1533,8 +1562,10 @@ impl AgentActor {
     }
 
     /// Handle the `/goal` central command (set / view / pause / resume / clear).
-    /// Mirrors [`Self::handle_compact`]: emits a `Notice` and records the command
-    /// echo + confirmation as out-of-band control events so a reload shows them.
+    /// A `Set` records the objective as a real `User` transcript row (so it joins
+    /// the agent-loop context and titles the session); the control-only
+    /// subcommands mirror [`Self::handle_compact`] — a `Notice` plus the command
+    /// echo + confirmation persisted as out-of-band control events.
     async fn handle_goal(
         &mut self,
         command_text: String,
@@ -1548,17 +1579,46 @@ impl AgentActor {
             .await;
             return Ok(());
         }
-        let confirmation = match parse_goal_command(&command_text) {
+        let command = parse_goal_command(&command_text);
+        let is_set = matches!(command, GoalCommand::Set { .. });
+        let confirmation = match command {
             GoalCommand::View => self.goal_view().await,
             GoalCommand::Pause => self.goal_pause().await,
             GoalCommand::Resume => self.goal_resume().await,
             GoalCommand::Clear => self.goal_clear().await,
-            GoalCommand::Set { objective, budget } => self.goal_set(objective, budget).await,
+            GoalCommand::Set { objective, budget } => {
+                // The objective is a genuine user request: persist it as a `User`
+                // row (in the canonical `/goal <objective>` form) so it joins the
+                // agent-loop context and shows in the thread, and gives the session
+                // a real sidebar title. The continuation steering is in-memory only,
+                // so a goal-only session leaves no user-authored row otherwise and
+                // reloads as "New conversation". The sidebar strips the `/goal`
+                // prefix for its preview; the thread bubble keeps it.
+                let user_row = format!("{GOAL_COMMAND} {objective}");
+                if let Err(e) = self
+                    .volatile
+                    .agent_loop
+                    .append_user_message(vec![ContentBlock::Text(user_row)])
+                    .await
+                {
+                    warn!(session_id = %self.durable.session.id, error = %e, "goal: failed to persist objective as a user message");
+                }
+                self.goal_set(objective, budget).await
+            }
             GoalCommand::Error(msg) => msg,
         };
         if let Some(after) = self.current_after_ordinal().await {
-            self.persist_control_event(after, ControlEventKind::Command, &command_text, sent_at)
+            // A `Set` already recorded the objective as a real user row above; the
+            // control-only subcommands echo their command line instead.
+            if !is_set {
+                self.persist_control_event(
+                    after,
+                    ControlEventKind::Command,
+                    &command_text,
+                    sent_at,
+                )
                 .await;
+            }
             self.persist_control_event(
                 after,
                 ControlEventKind::NoticeInfo,
@@ -1611,7 +1671,7 @@ impl AgentActor {
                     budget_note(budget)
                 )
             }
-            Ok(Some(g)) if !g.status.is_terminal() => {
+            Ok(Some(g)) if g.status.is_resumable() => {
                 // Apply `--budget` here too: after a `BudgetLimited` stop the
                 // user is told to raise the budget and `/goal resume`, so the
                 // new cap must actually land or resume would hit the same stop.
@@ -1648,29 +1708,19 @@ impl AgentActor {
         match self
             .volatile
             .goal_service
-            .current(&self.durable.session.id)
+            .pause(&self.durable.session.id)
             .await
         {
-            Ok(Some(g)) if g.status.is_active() => {
-                if let Err(e) = self
-                    .volatile
-                    .goal_service
-                    .set_status(&self.durable.session.id, GoalStatus::Paused)
-                    .await
-                {
-                    return format!("Failed to pause goal: {e}");
-                }
-                goal_paused_text().to_string()
-            }
-            Ok(Some(g)) if g.status.is_terminal() => {
+            Ok(PauseOutcome::Paused(_)) => goal_paused_text().to_string(),
+            Ok(PauseOutcome::NotActive(g)) if g.status.is_terminal() => {
                 "The goal is already complete; nothing to pause.".to_string()
             }
-            Ok(Some(g)) => format!(
+            Ok(PauseOutcome::NotActive(g)) => format!(
                 "The goal is already {}; the autonomous loop is stopped. Run `/goal resume` to continue.",
                 g.status.as_str()
             ),
-            Ok(None) => "No goal is set.".to_string(),
-            Err(e) => format!("Failed to read goal: {e}"),
+            Ok(PauseOutcome::NoGoal) => "No goal is set.".to_string(),
+            Err(e) => format!("Failed to pause goal: {e}"),
         }
     }
 
@@ -1678,26 +1728,18 @@ impl AgentActor {
         match self
             .volatile
             .goal_service
-            .current(&self.durable.session.id)
+            .resume(&self.durable.session.id)
             .await
         {
-            Ok(Some(g)) if g.status.is_active() => "The goal is already active.".to_string(),
-            Ok(Some(g)) if g.status.is_terminal() => {
-                "The goal is complete. Start a new one with `/goal <objective>`.".to_string()
-            }
-            Ok(Some(_)) => {
-                if let Err(e) = self
-                    .volatile
-                    .goal_service
-                    .set_status(&self.durable.session.id, GoalStatus::Active)
-                    .await
-                {
-                    return format!("Failed to resume goal: {e}");
-                }
+            Ok(ResumeOutcome::Resumed(_)) => {
                 "▶️ Goal resumed — continuing autonomously toward the objective.".to_string()
             }
-            Ok(None) => "No goal is set.".to_string(),
-            Err(e) => format!("Failed to read goal: {e}"),
+            Ok(ResumeOutcome::AlreadyActive(_)) => "The goal is already active.".to_string(),
+            Ok(ResumeOutcome::Terminal(_)) => {
+                "The goal is complete. Start a new one with `/goal <objective>`.".to_string()
+            }
+            Ok(ResumeOutcome::NoGoal) => "No goal is set.".to_string(),
+            Err(e) => format!("Failed to resume goal: {e}"),
         }
     }
 
@@ -1713,168 +1755,6 @@ impl AgentActor {
             Err(e) => format!("Failed to clear goal: {e}"),
         }
     }
-}
-
-/// Parsed form of a `/goal` command (everything after the leading `/goal`).
-#[derive(Debug, PartialEq, Eq)]
-enum GoalCommand {
-    View,
-    Pause,
-    Resume,
-    Clear,
-    Set {
-        objective: String,
-        budget: Option<u64>,
-    },
-    Error(String),
-}
-
-/// Parse the joined `/goal ...` slash text. Tolerant of casing and a Telegram
-/// `@bot` suffix on the command token (both stripped by taking everything after
-/// the first whitespace).
-fn parse_goal_command(command_text: &str) -> GoalCommand {
-    let rest = command_text
-        .trim()
-        .strip_prefix('/')
-        .and_then(|s| s.split_once(char::is_whitespace).map(|(_, r)| r))
-        .unwrap_or("")
-        .trim();
-    if rest.is_empty() {
-        return GoalCommand::View;
-    }
-    // Subcommands match case-insensitively (the command token itself already
-    // does), so `/Goal Pause` stops the goal rather than overwriting it with a
-    // new objective "Pause". Only the bare subcommand word is normalized; the
-    // objective (the `Set` fallback below) keeps its original casing.
-    match rest.to_ascii_lowercase().as_str() {
-        GOAL_PAUSE_SUBCOMMAND => return GoalCommand::Pause,
-        GOAL_RESUME_SUBCOMMAND => return GoalCommand::Resume,
-        GOAL_CLEAR_SUBCOMMAND => return GoalCommand::Clear,
-        _ => {}
-    }
-    // Objective with an optional `--budget N` / `--budget=N` flag anywhere.
-    let budget_eq = format!("{GOAL_BUDGET_FLAG}=");
-    let mut budget: Option<u64> = None;
-    let mut objective_tokens: Vec<&str> = Vec::new();
-    let mut iter = rest.split_whitespace();
-    while let Some(token) = iter.next() {
-        let raw_value = if token == GOAL_BUDGET_FLAG {
-            Some(iter.next())
-        } else {
-            token.strip_prefix(budget_eq.as_str()).map(Some)
-        };
-        match raw_value {
-            Some(Some(value)) => match value.replace('_', "").parse::<u64>() {
-                Ok(n) if n > 0 => budget = Some(n),
-                _ => {
-                    return GoalCommand::Error(format!(
-                        "Invalid `--budget` value {value:?} — it must be a positive integer."
-                    ));
-                }
-            },
-            Some(None) => {
-                return GoalCommand::Error(
-                    "`--budget` needs a number, e.g. `/goal <objective> --budget 50000`.".into(),
-                );
-            }
-            None => objective_tokens.push(token),
-        }
-    }
-    let objective = objective_tokens.join(" ");
-    if objective.trim().is_empty() {
-        return GoalCommand::Error(
-            "Provide an objective, e.g. `/goal keep the tests green --budget 50000`.".into(),
-        );
-    }
-    GoalCommand::Set { objective, budget }
-}
-
-/// Human-readable `Hh Mm` / `Mm Ss` / `Ss` duration for goal usage display.
-fn fmt_goal_duration(seconds: u64) -> String {
-    let (h, m, s) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
-    if h > 0 {
-        format!("{h}h {m}m")
-    } else if m > 0 {
-        format!("{m}m {s}s")
-    } else {
-        format!("{s}s")
-    }
-}
-
-/// `" (token budget: N)"` when a budget was just set, else empty — appended to
-/// the goal-edit confirmation so the user sees the cap actually changed.
-fn budget_note(budget: Option<u64>) -> String {
-    budget
-        .map(|b| format!(" (token budget: {b})"))
-        .unwrap_or_default()
-}
-
-fn goal_set_text(goal: &Goal) -> String {
-    let budget = match goal.token_budget {
-        Some(b) => format!(" (token budget: {b})"),
-        None => String::new(),
-    };
-    format!(
-        "🎯 Goal set{budget}: \"{}\"\nI'll keep working toward it autonomously, turn after turn, until it's done. Send `/goal` to check progress, or `/goal pause` to stop.",
-        goal.objective
-    )
-}
-
-fn goal_status_text(goal: &Goal) -> String {
-    let mut s = format!(
-        "🎯 Goal ({}): \"{}\"\n",
-        goal.status.as_str(),
-        goal.objective
-    );
-    match goal.token_budget {
-        Some(b) => s.push_str(&format!(
-            "Tokens: {} / {} ({} remaining)\n",
-            goal.tokens_used,
-            b,
-            goal.remaining_budget().unwrap_or(0)
-        )),
-        None => s.push_str(&format!("Tokens used: {}\n", goal.tokens_used)),
-    }
-    s.push_str(&format!(
-        "Time: {}",
-        fmt_goal_duration(goal.time_used_seconds)
-    ));
-    s
-}
-
-fn goal_complete_text(goal: &Goal) -> String {
-    format!(
-        "✅ Goal complete: \"{}\" — {} tokens used over {}.",
-        goal.objective,
-        goal.tokens_used,
-        fmt_goal_duration(goal.time_used_seconds)
-    )
-}
-
-fn goal_blocked_text(goal: &Goal) -> String {
-    format!(
-        "⛔ Goal blocked: \"{}\". The agent hit a recurring impasse it couldn't get past. Run `/goal resume` to retry, or `/goal clear` to drop it.",
-        goal.objective
-    )
-}
-
-fn goal_budget_reached_text(goal: &Goal) -> String {
-    let budget = goal
-        .token_budget
-        .map(|b| b.to_string())
-        .unwrap_or_else(|| "—".to_string());
-    format!(
-        "⏳ Goal token budget reached ({} / {}). I wrapped up; raise the budget and run `/goal resume` to continue.",
-        goal.tokens_used, budget
-    )
-}
-
-fn goal_spend_capped_text() -> String {
-    "🛑 Goal stopped: the global spend limit was reached, so the next turn could not run. Run `/goal resume` once the limit resets.".to_string()
-}
-
-fn goal_paused_text() -> &'static str {
-    "⏸️ Goal paused. The autonomous loop is stopped; run `/goal resume` to continue."
 }
 
 /// The plain text of a message's content blocks, space-joined — used to echo a
@@ -1931,51 +1811,10 @@ mod tests {
         // Group-chat form: `/goal@BotName ...` must still route to handle_goal.
         assert!(is_goal_command(&text("/goal@MyBot pause")));
         assert!(is_goal_command(&text("/GOAL@MyBot")));
-        // The same `@bot` tolerance now covers `/compact` too.
+        // `@bot` tolerance covers `/compact` as well.
         assert!(is_compact_command(&text("/compact@MyBot")));
         assert!(!is_goal_command(&text("/goalkeeper")));
         assert!(!is_goal_command(&text("goal")));
-    }
-
-    #[test]
-    fn parse_goal_subcommands_are_case_insensitive() {
-        assert!(matches!(parse_goal_command("/goal"), GoalCommand::View));
-        assert!(matches!(
-            parse_goal_command("/goal pause"),
-            GoalCommand::Pause
-        ));
-        // `/Goal Pause` must pause, NOT create a goal named "Pause".
-        assert!(matches!(
-            parse_goal_command("/Goal Pause"),
-            GoalCommand::Pause
-        ));
-        assert!(matches!(
-            parse_goal_command("/goal@Bot RESUME"),
-            GoalCommand::Resume
-        ));
-        assert!(matches!(
-            parse_goal_command("/goal Clear"),
-            GoalCommand::Clear
-        ));
-    }
-
-    #[test]
-    fn parse_goal_set_preserves_objective_casing_and_budget() {
-        match parse_goal_command("/goal Ship The Feature --budget 5000") {
-            GoalCommand::Set { objective, budget } => {
-                assert_eq!(objective, "Ship The Feature");
-                assert_eq!(budget, Some(5000));
-            }
-            other => panic!("expected Set, got {other:?}"),
-        }
-        // `--budget=N` form, objective casing intact, no accidental subcommand.
-        match parse_goal_command("/goal Pause The World --budget=10_000") {
-            GoalCommand::Set { objective, budget } => {
-                assert_eq!(objective, "Pause The World");
-                assert_eq!(budget, Some(10_000));
-            }
-            other => panic!("expected Set, got {other:?}"),
-        }
     }
 
     fn incoming(body: &str) -> IncomingMessage {

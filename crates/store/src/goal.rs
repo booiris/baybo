@@ -1,15 +1,12 @@
 //! Persistence interface for a session's current autonomous objective
-//! (`session_goals` table) behind the `/goal` continuation engine and the
-//! goal tool family.
+//! (`session_goals` table) behind the `/goal` continuation engine.
 //!
-//! One **current** goal per session — the table is keyed by `session_id`. The
-//! row is mutated out-of-band of the turn (the model's `update_goal`, the
-//! `/goal` command, the per-turn token/time accounting) concurrently with the
-//! `sessions`-row writers (`touch`, the actor's full-blob `save`). A dedicated
-//! row-keyed table gives the same anti-clobber property the `sessions.last_llm`
-//! flat column buys, but for goal state. The row is reaped by `ON DELETE
-//! CASCADE` from `sessions`; the only explicit `DELETE` is `/goal clear`. The
-//! runtime never sweeps goals (session data is core data).
+//! One **current** goal per session — keyed by `session_id`. The row is mutated
+//! out-of-band of the turn (model `update_goal`, the `/goal` command, per-turn
+//! token/time accounting), so a dedicated row-keyed table gives the same
+//! anti-clobber property `sessions.last_llm` buys, but for goal state. Reaped by
+//! `ON DELETE CASCADE` from `sessions`; the only explicit `DELETE` is `/goal
+//! clear`. The runtime never sweeps goals (session data is core data).
 
 use async_trait::async_trait;
 use aura_model::{Goal, GoalStatus, SessionId};
@@ -35,12 +32,10 @@ pub struct GoalPatch {
 }
 
 impl GoalPatch {
-    /// A patch that touches nothing.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// `true` when no field would change.
     pub fn is_empty(&self) -> bool {
         self.status.is_none()
             && self.objective.is_none()
@@ -62,9 +57,8 @@ pub trait GoalStore: Send + Sync {
     /// calling — the store unconditionally replaces.
     async fn upsert(&self, session_id: &SessionId, goal: &Goal) -> Result<()>;
 
-    /// Apply a sparse patch to the session's goal. Per-row `UPDATE` touching
-    /// only the changed columns — clobber-isolated against the `sessions`
-    /// writers. `Ok(false)` when no goal exists for the session.
+    /// Apply a sparse patch to the session's goal (only the patched columns
+    /// change). `Ok(false)` when no goal exists for the session.
     async fn update(&self, session_id: &SessionId, patch: &GoalPatch) -> Result<bool>;
 
     /// Hard-delete the session's goal (plain `DELETE`, no tombstone) — the one

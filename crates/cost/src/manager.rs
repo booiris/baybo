@@ -71,18 +71,12 @@ pub struct CostManager {
     /// can wake and re-check the count.
     inflight_done: Notify,
     /// Per-session running total of (input + output) tokens billed to that
-    /// session, incremented synchronously on **every** billed/external call —
-    /// the single chokepoint that already attributes spend to a session, so it
-    /// captures the main agent loop, compression, the progress observer, and
-    /// tool sub-LLM calls (`CallReason`) without any of them knowing about it.
-    /// The `/goal` continuation engine reads a *delta* of this around each turn
-    /// to accrue [`aura_model::Goal::tokens_used`]; it is purely an in-process
-    /// meter (resets to zero on restart), which is correct because only the
-    /// within-turn delta is ever consumed. Bounded to resident actors:
-    /// [`Self::forget_session`] drops the entry when a session's actor stops, so
-    /// a long-running daemon doesn't accumulate one entry per session it ever
-    /// billed. Hot (every LLM call across all sessions), so `DashMap` rather
-    /// than a global mutex.
+    /// session, bumped synchronously on every billed/external call. The `/goal`
+    /// loop reads a *within-turn delta* of this to accrue
+    /// [`aura_model::Goal::tokens_used`] — so it can be an in-process meter that
+    /// resets to zero on restart. Bounded to resident actors: turns never
+    /// straddle an actor stop, so [`Self::forget_session`] can evict on stop.
+    /// Hot path, hence `DashMap` over a global mutex.
     session_tokens: DashMap<SessionId, u64>,
 }
 
@@ -231,11 +225,10 @@ impl CostManager {
         })
     }
 
-    /// The running total of (input + output) tokens billed to `session_id`
-    /// this process lifetime. Used by the `/goal` continuation engine as a
-    /// before/after delta around each goal turn — see [`Self::session_tokens`]
-    /// field docs. `0` for a session that has billed nothing (or after a
-    /// restart).
+    /// Running total of (input + output) tokens billed to `session_id` this
+    /// process lifetime — `0` if it has billed nothing (or after a restart).
+    /// Read as a within-turn delta by the `/goal` loop; see
+    /// [`Self::session_tokens`].
     pub fn session_tokens(&self, session_id: &SessionId) -> u64 {
         self.session_tokens.get(session_id).map(|t| *t).unwrap_or(0)
     }
@@ -248,8 +241,7 @@ impl CostManager {
         self.session_tokens.remove(session_id);
     }
 
-    /// Add a call's (input + output) tokens to the per-session meter. Called
-    /// from both the billed and external (subscription) record paths so the
+    /// Bumped from both the billed and external (subscription) record paths so the
     /// meter reflects every token attributed to the session.
     fn bump_session_tokens(
         &self,
@@ -952,8 +944,6 @@ mod tests {
             0,
             0,
         );
-        // Second call on the same session accumulates; a different session is
-        // isolated.
         cm.record_call(
             "u1",
             SessionId::from("s1"),
@@ -1010,9 +1000,8 @@ mod tests {
             0,
         );
         cm.forget_session(&SessionId::from("s1"));
-        // Evicted session reads back as zero; the next bill re-creates it from
-        // scratch (delta math the goal loop relies on still holds). Other
-        // sessions are untouched.
+        // Re-creating the entry from zero is fine: the goal loop only reads a
+        // within-turn delta.
         assert_eq!(cm.session_tokens(&SessionId::from("s1")), 0);
         assert_eq!(cm.session_tokens(&SessionId::from("s2")), 15);
         cm.record_call(
