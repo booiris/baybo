@@ -1,49 +1,37 @@
-import { useCallback, useEffect, useState } from 'react';
-import {
-  RiFocus3Line,
-  RiPauseCircleLine,
-  RiPlayCircleLine,
-  RiCloseCircleLine,
-} from 'react-icons/ri';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { RiFocus3Line, RiCloseLine } from 'react-icons/ri';
 import { useAdminClient } from '../../api/auth';
 import type { components } from '../../api/schema';
+import { fmtTokens, statusLabel, statusPillClass } from '../goalFormat';
 
 type GoalItem = components['schemas']['GoalItem'];
 
-const POLL_MS = 4000;
-
-const STATUS_STYLE: Record<string, string> = {
-  active: 'bg-brand text-ink',
-  complete: 'bg-ok text-white',
-  blocked: 'bg-err text-white',
-  paused: 'bg-selected text-ink',
-  budget_limited: 'bg-warn text-white',
-  spend_capped: 'bg-warn text-white',
-};
-
-function tokensLabel(goal: GoalItem): string {
-  const used = goal.tokens_used.toLocaleString();
-  if (goal.token_budget == null) return `${used} tokens`;
-  return `${used} / ${goal.token_budget.toLocaleString()} tokens`;
-}
+// Goals move slowly — a token tick lands once per continuation turn (seconds to
+// minutes). Poll an *active* goal at a modest cadence; back off hard when there's
+// nothing live to watch (no goal, or a stopped one) so an idle chat isn't
+// hammering the endpoint.
+const POLL_ACTIVE_MS = 8000;
+const POLL_IDLE_MS = 20000;
 
 /**
- * Compact strip under the chat header showing the session's autonomous goal:
- * objective, status pill, token usage, and pause/resume/clear controls. Renders
- * nothing when no goal is set. Controls are issued as `/goal …` slash commands
- * through `onCommand` (the normal send path) so resume correctly re-arms the
- * continuation loop, not just the durable status.
+ * Goal strip under the chat header; renders nothing when no goal is set. The
+ * only control is a close (✕) on a *completed* goal, which clears it (the goal
+ * is done, so this removes the row and the banner with it). Pause / resume are
+ * issued as `/goal …` slash commands from the composer.
  */
 export function GoalBanner({
   sessionId,
-  onCommand,
+  refreshSignal,
 }: {
   sessionId: string | undefined;
-  onCommand: (command: string) => void;
+  // Incremented by ChatPage when a `/goal …` send goes out (see its
+  // `goalRefresh`); each bump triggers a prompt retry-burst refetch.
+  refreshSignal: number;
 }) {
   const client = useAdminClient();
   const [goal, setGoal] = useState<GoalItem | null>(null);
   const [tick, setTick] = useState(0);
+  const lastSignalRef = useRef(refreshSignal);
 
   const fetchGoal = useCallback(
     async (canceled: () => boolean) => {
@@ -73,15 +61,46 @@ export function GoalBanner({
   }, [fetchGoal, tick]);
 
   useEffect(() => {
-    const handle = window.setInterval(() => setTick((t) => t + 1), POLL_MS);
+    const interval = goal?.status === 'active' ? POLL_ACTIVE_MS : POLL_IDLE_MS;
+    const handle = window.setInterval(() => setTick((t) => t + 1), interval);
     return () => window.clearInterval(handle);
-  }, []);
+  }, [goal?.status]);
+
+  // A `/goal …` send just went out: the goal row is created only after the
+  // message round-trips, so refetch a few times to absorb that latency instead
+  // of waiting for the idle poll. The ref-compare fires the burst only on a real
+  // signal increment — not on mount or a `fetchGoal` identity change (session
+  // switch), which the deps would otherwise re-trigger.
+  useEffect(() => {
+    if (refreshSignal === lastSignalRef.current) return;
+    lastSignalRef.current = refreshSignal;
+    let canceled = false;
+    const timers = [250, 800, 2000].map((delay) =>
+      window.setTimeout(() => void fetchGoal(() => canceled), delay),
+    );
+    return () => {
+      canceled = true;
+      timers.forEach((t) => window.clearTimeout(t));
+    };
+  }, [refreshSignal, fetchGoal]);
 
   if (!goal) return null;
 
-  const isActive = goal.status === 'active';
   const isComplete = goal.status === 'complete';
-  const pill = STATUS_STYLE[goal.status] ?? 'bg-white text-ink';
+
+  const handleClear = async () => {
+    if (!sessionId) return;
+    setGoal(null); // optimistic — the banner closes immediately
+    try {
+      await client.DELETE('/v1/chat/sessions/{session_id}/goal', {
+        params: { path: { session_id: sessionId } },
+      });
+    } catch {
+      void fetchGoal(() => false); // restore on failure
+    }
+  };
+
+  const pill = statusPillClass(goal.status);
   const iconBtn =
     'flex h-7 w-7 items-center justify-center rounded-brutal border-2 border-black transition-[transform] duration-100 hover:bg-brand active:translate-x-[1px] active:translate-y-[1px] cursor-pointer';
 
@@ -91,41 +110,22 @@ export function GoalBanner({
       <span
         className={`shrink-0 rounded-brutal border-2 border-black px-2 py-0.5 text-[0.65rem] font-bold uppercase tracking-wider ${pill}`}
       >
-        {goal.status.replace('_', ' ')}
+        {statusLabel(goal.status)}
       </span>
       <span className="flex-1 min-w-0 truncate text-sm font-medium" title={goal.objective}>
         {goal.objective}
       </span>
-      <span className="shrink-0 font-mono text-[0.7rem] text-ink-soft">{tokensLabel(goal)}</span>
-      <div className="shrink-0 flex items-center gap-1.5">
-        {isActive ? (
-          <button
-            type="button"
-            title="Pause the goal loop"
-            className={iconBtn}
-            onClick={() => onCommand('/goal pause')}
-          >
-            <RiPauseCircleLine className="text-base" />
-          </button>
-        ) : !isComplete ? (
-          <button
-            type="button"
-            title="Resume the goal"
-            className={iconBtn}
-            onClick={() => onCommand('/goal resume')}
-          >
-            <RiPlayCircleLine className="text-base" />
-          </button>
-        ) : null}
+      <span className="shrink-0 font-mono text-[0.7rem] text-ink-soft">{fmtTokens(goal)} tokens</span>
+      {isComplete ? (
         <button
           type="button"
-          title="Clear (delete) the goal"
-          className={`${iconBtn} text-err hover:bg-err hover:text-white`}
-          onClick={() => onCommand('/goal clear')}
+          title="Clear the completed goal"
+          className={`${iconBtn} shrink-0`}
+          onClick={() => void handleClear()}
         >
-          <RiCloseCircleLine className="text-base" />
+          <RiCloseLine className="text-base" />
         </button>
-      </div>
+      ) : null}
     </div>
   );
 }

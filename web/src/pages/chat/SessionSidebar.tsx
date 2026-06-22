@@ -517,6 +517,16 @@ export function SessionSidebar({
         loose.push(s);
       }
     }
+    // Keep every bucket newest-first by last_active (the server's
+    // `ORDER BY last_active DESC`), re-applied here so a `session_activity`
+    // pulse — which updates `last_active` in place — actually lifts the row.
+    // Without it an autonomously-active session (a running `/goal`, a cron
+    // fire) refreshes its timestamp/unread but never rises to the top.
+    const byRecency = (a: SessionSummary, b: SessionSummary) =>
+      Date.parse(b.last_active) - Date.parse(a.last_active);
+    pinnedRows.sort(byRecency);
+    for (const arr of byFolder.values()) arr.sort(byRecency);
+    loose.sort(byRecency);
     return { pinned: pinnedRows, chatsByFolder: byFolder, uncategorized: loose };
   }, [sessions, reachableFolderIds]);
 

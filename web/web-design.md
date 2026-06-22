@@ -24,7 +24,7 @@ The Aura Dashboard follows a **warm** "Neo-Brutalist" design language characteri
 | **Ink Soft**    | `#6b6258` | Secondary text and metadata                    |
 | **Brand**       | `#f2c14e` | Warm gold — primary actions, active states, the icon rail, and the user message bubble (at 60%). Pair with `text-ink` (dark on gold), never `text-white` |
 | **Brand Hover** | `#f5b400` | Action hover states                            |
-| **Selected**    | `#ff8c90` | Soft coral-pink for the *selected* chat row. Light enough that **dark `text-ink`** reads best on it (same dark-on-warm pairing as the brand) |
+| **Selected**    | `#f08a5d` | Warm coral-orange for the *selected* chat row. Light enough that **dark `text-ink`** reads best on it (same dark-on-warm pairing as the brand) |
 | **Error**       | `#e53e3e` | Destructive actions, Error logs                |
 | **Warning**     | `#dd6b20` | Warning logs                                   |
 | **Info**        | `#3182ce` | Informational logs                             |

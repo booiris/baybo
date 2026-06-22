@@ -10,53 +10,28 @@ import { Button } from '../components/Button';
 import { useAdminClient, useAuth } from '../api/auth';
 import type { components } from '../api/schema';
 import { useMockMode, MOCK_GOALS } from '../api/mock';
+import { fmtDuration, fmtTokens, statusLabel, statusPillClass } from './goalFormat';
 
 type GoalsResponse = components['schemas']['GoalsResponse'];
 type GoalItem = components['schemas']['GoalItem'];
 
-// Goals are long-lived but their token usage ticks every continuation turn,
-// so poll while the tab is open.
-const POLL_MS = 4000;
+// Goals are long-lived and their token usage only ticks once per continuation
+// turn (seconds to minutes), so a slow poll while the tab is open is plenty.
+const POLL_MS = 10000;
 
 const thCell =
   'px-6 py-4 text-left font-bold text-[0.85rem] uppercase tracking-wider border-b-2 border-black sticky top-0 z-10 bg-white';
 
 const EMPTY: GoalsResponse = { goals: [] };
 
-// Status pill colours, dark-on-warm to match the design system.
-const STATUS_STYLE: Record<string, string> = {
-  active: 'bg-brand text-ink',
-  complete: 'bg-ok text-white',
-  blocked: 'bg-err text-white',
-  paused: 'bg-selected text-ink',
-  budget_limited: 'bg-warn text-white',
-  spend_capped: 'bg-warn text-white',
-};
-
 function statusPill(status: string) {
-  const style = STATUS_STYLE[status] ?? 'bg-white text-ink';
   return (
     <span
-      className={`inline-block rounded-brutal border-2 border-black px-2 py-0.5 text-[0.7rem] font-bold uppercase tracking-wider ${style}`}
+      className={`inline-block rounded-brutal border-2 border-black px-2 py-0.5 text-[0.7rem] font-bold uppercase tracking-wider ${statusPillClass(status)}`}
     >
-      {status.replace('_', ' ')}
+      {statusLabel(status)}
     </span>
   );
-}
-
-function fmtDuration(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
-}
-
-function fmtTokens(goal: GoalItem): string {
-  const used = goal.tokens_used.toLocaleString();
-  if (goal.token_budget == null) return used;
-  return `${used} / ${goal.token_budget.toLocaleString()}`;
 }
 
 export function GoalsPage() {

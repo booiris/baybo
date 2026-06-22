@@ -13,9 +13,9 @@
      user message bubble. Dark `text-ink` rides on top. */
   --color-brand: #f2c14e;
   --color-brand-hover: #f5b400;
-  /* Selected chat row: a warm coral. Light enough that dark `text-ink`
+  /* Selected chat row: a warm coral-orange. Light enough that dark `text-ink`
      reads better on it than white (same dark-on-warm pairing as the brand). */
-  --color-selected: #ff8c90;
+  --color-selected: #f08a5d;
   --color-err: #e53e3e;
   --color-warn: #dd6b20;
   --color-info: #3182ce;

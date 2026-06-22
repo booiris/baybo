@@ -376,6 +376,10 @@ export function ChatPage() {
   // CronInbox panel so it can refetch right when something new lands
   // instead of waiting on the next 30s poll.
   const [cronInboxRefresh, setCronInboxRefresh] = useState(0);
+  // Bumped when a `/goal …` send goes out on the visible session, so the goal
+  // banner refetches promptly instead of waiting on its slow idle poll (the row
+  // is created out-of-band after the message round-trips).
+  const [goalRefresh, setGoalRefresh] = useState(0);
 
   const [status, setStatus] = useState<ConnectionStatus>({ state: 'connecting' });
   // Mirrors `status` in a ref so the captured-once `onFrame` closure and the
@@ -626,7 +630,11 @@ export function ChatPage() {
         last_active: s.last_active,
         unread: 0,
         pinned: s.pinned,
-        last_user_text: s.last_user_text ?? undefined,
+        // Strip a leading `/goal` for the sidebar preview, matching the live
+        // optimistic path — the persisted row (and the thread bubble) keep it.
+        last_user_text: s.last_user_text
+          ? (previewForUserText(s.last_user_text) ?? undefined)
+          : undefined,
         folder_id: s.folder_id ?? undefined,
       }));
       setSessions(existing);
@@ -1309,6 +1317,14 @@ export function ChatPage() {
       setSessions((prev) =>
         applySessionUserText(prev, targetSessionId, trimmed || '[attachment]'),
       );
+      // A `/goal …` send mutates the visible session's goal — nudge the banner to
+      // refetch promptly rather than wait on its idle poll.
+      if (
+        isGoalCommand(trimmed) &&
+        (opts?.foreground ?? targetSessionId === currentSessionIdRef.current)
+      ) {
+        setGoalRefresh((n) => n + 1);
+      }
       // A user send starts (or extends) a turn in this session — arm auto-fire
       // for its completion and protect its bucket from LRU eviction.
       turnTokenRef.current.set(
@@ -2255,7 +2271,7 @@ export function ChatPage() {
           </div>
         </header>
 
-        <GoalBanner sessionId={sessionId} onCommand={(c) => sendText(c, [])} />
+        <GoalBanner sessionId={sessionId} refreshSignal={goalRefresh} />
 
         <div className="flex-1 flex flex-col overflow-hidden relative xl:pr-[260px]">
         <div className="flex-1 flex justify-center min-h-0 relative">
@@ -3874,6 +3890,35 @@ function applySessionActivity(
  *  regardless of which path filled it. */
 const PREVIEW_MAX_CHARS = 120;
 
+// Subcommand words that control an existing goal (no objective). Mirror the
+// backend `GOAL_*_SUBCOMMAND` consts — those forms aren't user-authored turns,
+// so they never become a sidebar preview.
+const GOAL_SUBCOMMANDS = new Set(['pause', 'resume', 'clear']);
+
+// A leading `/goal` slash command (optional `@bot` suffix) — the trigger for
+// both the sidebar-preview strip and the goal-banner prompt refetch.
+const GOAL_COMMAND_RE = /^\/goal(?:@\S+)?(?:\s+|$)/i;
+
+/** Whether `text` is a `/goal …` slash command (set / view / pause / resume /
+ *  clear) — any of which mutates the session's goal, so the banner refetches. */
+export function isGoalCommand(text: string): boolean {
+  return GOAL_COMMAND_RE.test(text.trimStart());
+}
+
+/** Sidebar preview text for a raw user send, special-casing `/goal`. A
+ *  `/goal <objective>` shows just the objective (what the agent persists as the
+ *  `User` row), not the slash command. Bare `/goal` and the control subcommands
+ *  return `null` — they leave no user row server-side, so they don't touch the
+ *  preview. Any non-`/goal` text passes through unchanged. */
+export function previewForUserText(text: string): string | null {
+  const head = text.trimStart();
+  const match = GOAL_COMMAND_RE.exec(head);
+  if (!match) return text;
+  const rest = head.slice(match[0].length).trim();
+  if (!rest || GOAL_SUBCOMMANDS.has(rest.toLowerCase())) return null;
+  return rest;
+}
+
 /** Replace `session_id`'s preview text with the freshest user turn.
  *  Collapses whitespace + truncates to mirror the server's
  *  `truncate_preview`. Returns `prev` unchanged when the target row
@@ -3885,9 +3930,11 @@ function applySessionUserText(
   sessionId: string,
   text: string,
 ): SessionSummary[] {
+  const preview = previewForUserText(text);
+  if (preview === null) return prev;
   const idx = prev.findIndex((s) => s.session_id === sessionId);
   if (idx === -1) return prev;
-  const collapsed = text.replace(/\s+/g, ' ').trim();
+  const collapsed = preview.replace(/\s+/g, ' ').trim();
   if (!collapsed) return prev;
   const truncated =
     collapsed.length > PREVIEW_MAX_CHARS
