@@ -70,6 +70,7 @@ dependencies = [
  "aura-wire",
  "snow",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

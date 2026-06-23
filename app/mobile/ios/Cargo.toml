@@ -26,3 +26,5 @@ thiserror = "2"
 # Same major as aura-device-proto's snow so the handshake/transport types
 # unify across the two crates.
 snow = "0.9"
+# Test-only: drive the async connection-policy tests.
+tokio = { version = "1", features = ["rt", "macros"] }
