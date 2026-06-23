@@ -22,7 +22,7 @@ pub use apns::{ApnsEnv, ApnsOutcome, ApnsRequest, ApnsSender};
 pub use error::PushError;
 pub use http::{PushState, router};
 pub use jwt::ApnsProviderToken;
-pub use notify::{NotifyOutcome, NotifyRequest, NotifyService};
+pub use notify::{NotifyOutcome, NotifyRequest, NotifyService, RegisterOutcome, RegisterRequest};
 pub use store::{
     Admission, DeviceRegistration, DeviceTokenStore, InMemoryAdmission, InMemoryDeviceTokenStore,
 };

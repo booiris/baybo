@@ -88,6 +88,10 @@ pub struct WsChannelState {
     /// SPAKE2 K-channel (`GatewayWelcome.direct_candidates`). Empty when
     /// `gateway.direct.enabled` is false.
     pub device_direct_candidates: Vec<String>,
+    /// Gateway-mediated APNs registrar: on a successful pairing, A relays the
+    /// device's APNs token to the remote host (C). `None` when push isn't
+    /// configured, so the device-pair route simply skips registration.
+    pub apns_registrar: Option<Arc<dyn crate::push::ApnsRegistrar>>,
     /// Backing store for non-text media. Sidecars upload via
     /// `POST /v1/blobs`, the agent emits replies that reference blobs
     /// the gateway already has, and `GET /v1/blobs/{id}` lets sidecars
@@ -133,6 +137,16 @@ impl WsChannelState {
         } else {
             Vec::new()
         };
+        let push = &deps.config.gateway.push;
+        let apns_registrar: Option<Arc<dyn crate::push::ApnsRegistrar>> =
+            if push.enabled && !push.gateway_url.is_empty() {
+                Some(Arc::new(crate::push::HttpApnsRegistrar::new(
+                    &push.gateway_url,
+                    push.instance_key.clone(),
+                )))
+            } else {
+                None
+            };
         Self {
             registry: Arc::clone(&deps.channel_registry),
             incoming_tx: deps.incoming_tx.clone(),
@@ -149,6 +163,7 @@ impl WsChannelState {
             pairing,
             device_pairing,
             device_direct_candidates,
+            apns_registrar,
             blob_store: deps.stores.blob.clone(),
             task_store: deps.stores.task.clone(),
             job_lifecycle: Arc::clone(&deps.job_lifecycle),

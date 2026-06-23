@@ -98,6 +98,76 @@ impl NotifySink for HttpNotifySink {
     }
 }
 
+/// Body A POSTs to C's `/register` to bind a device's APNs token. Matches the
+/// remote-host push role's `RegisterRequest` JSON shape (agreed by contract; C
+/// is a separate workspace). `env` serializes to `"sandbox"`/`"production"`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct RegisterBody {
+    instance_key: String,
+    device_id: String,
+    apns_token: String,
+    env: aura_device_proto::pairing::ApnsEnv,
+}
+
+/// Seam over the POST to C's `/register`. The device-pair route calls it
+/// (best-effort, gateway-mediated) after a successful handshake so the app
+/// never holds a C credential. Real impl uses reqwest; tests use a mock.
+#[async_trait::async_trait]
+pub trait ApnsRegistrar: Send + Sync {
+    async fn register_device(
+        &self,
+        device_id: &str,
+        apns_token: &str,
+        env: aura_device_proto::pairing::ApnsEnv,
+    ) -> Result<(), String>;
+}
+
+/// reqwest-backed registrar POSTing to `<gateway_url>/register`.
+pub struct HttpApnsRegistrar {
+    client: reqwest::Client,
+    register_url: String,
+    instance_key: String,
+}
+
+impl HttpApnsRegistrar {
+    pub fn new(gateway_url: &str, instance_key: impl Into<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            register_url: format!("{}/register", gateway_url.trim_end_matches('/')),
+            instance_key: instance_key.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApnsRegistrar for HttpApnsRegistrar {
+    async fn register_device(
+        &self,
+        device_id: &str,
+        apns_token: &str,
+        env: aura_device_proto::pairing::ApnsEnv,
+    ) -> Result<(), String> {
+        let body = RegisterBody {
+            instance_key: self.instance_key.clone(),
+            device_id: device_id.to_string(),
+            apns_token: apns_token.to_string(),
+            env,
+        };
+        let resp = self
+            .client
+            .post(&self.register_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("register post: {e}"))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("register status {}", resp.status()))
+        }
+    }
+}
+
 /// Composes the stores, vault, and sink into the per-turn dispatch.
 pub struct PushDispatcher {
     device_store: Arc<dyn DeviceStore>,
@@ -441,5 +511,27 @@ mod tests {
         let b = build_notify_body("i", "d", &s, &key, "same").unwrap();
         assert_ne!(a.n, b.n, "nonce must be random per message");
         assert_ne!(a.enc, b.enc, "ciphertext differs under a fresh nonce");
+    }
+
+    #[test]
+    fn register_body_matches_remote_host_wire_shape() {
+        let body = RegisterBody {
+            instance_key: "inst-A".into(),
+            device_id: "dev-1".into(),
+            apns_token: "tok".into(),
+            env: aura_device_proto::pairing::ApnsEnv::Sandbox,
+        };
+        let v: serde_json::Value = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["instance_key"], "inst-A");
+        assert_eq!(v["device_id"], "dev-1");
+        assert_eq!(v["apns_token"], "tok");
+        // Must serialize the same as the push role's RegisterRequest.env.
+        assert_eq!(v["env"], "sandbox");
+    }
+
+    #[test]
+    fn register_url_is_derived_from_gateway_url() {
+        let r = HttpApnsRegistrar::new("https://remote.example/", "inst-A");
+        assert_eq!(r.register_url, "https://remote.example/register");
     }
 }

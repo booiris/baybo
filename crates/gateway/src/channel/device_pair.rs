@@ -91,9 +91,17 @@ async fn drive(socket: &mut WebSocket, state: &WsChannelState) -> Result<(), Str
         .store_secret(&push_key_name, &keys.push_key)
         .await
         .map_err(|e| format!("store push key: {e}"))?;
-    // Gateway-mediated APNs registration with the remote host (C) is phase 2;
-    // the token/env ride DeviceHello so the wire is stable, but go unused here.
-    let _ = (&hello.apns_token, hello.apns_env);
+    // Gateway-mediated APNs registration: relay the device's APNs token to the
+    // remote host (C), authenticated by A's instance key. Best-effort — pairing
+    // already succeeded; a failed registration only delays pushes until the
+    // next attempt, and is skipped entirely when push isn't configured.
+    if let Some(registrar) = &state.apns_registrar
+        && let Err(e) = registrar
+            .register_device(&hello.device_id, &hello.apns_token, hello.apns_env)
+            .await
+    {
+        tracing::warn!(error = %e, "device APNs registration with remote host failed");
+    }
 
     // 7. A's static Noise identity (lazily loaded/created from the vault).
     let static_key = load_or_create_static_keypair(&state.secret_vault)

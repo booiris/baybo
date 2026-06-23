@@ -12,9 +12,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::apns::{ApnsOutcome, ApnsRequest, ApnsSender};
+use crate::apns::{ApnsEnv, ApnsOutcome, ApnsRequest, ApnsSender};
 use crate::jwt::ApnsProviderToken;
-use crate::store::{Admission, DeviceTokenStore};
+use crate::store::{Admission, DeviceRegistration, DeviceTokenStore};
 
 /// The body a gateway POSTs to `/notify`. `enc`/`n` are the opaque base64 AEAD
 /// ciphertext+tag and nonce, already encrypted by A with the device's push key
@@ -29,6 +29,26 @@ pub struct NotifyRequest {
     pub bid: String,
     pub enc: String,
     pub n: String,
+}
+
+/// The body a gateway POSTs to `/register` to bind (or rebind) a device's APNs
+/// token. Gateway-mediated: A registers on the device's behalf so the app never
+/// holds a C credential; `env` is tracked per device (a sandbox token is
+/// rejected by the production host and vice versa).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterRequest {
+    pub instance_key: String,
+    pub device_id: String,
+    pub apns_token: String,
+    pub env: ApnsEnv,
+}
+
+/// Result of processing one `/register`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterOutcome {
+    Registered,
+    /// `instance_key` is not admitted.
+    Unadmitted,
 }
 
 /// Result of processing one notify.
@@ -71,6 +91,22 @@ impl NotifyService {
             signer,
             topic: topic.into(),
         }
+    }
+
+    /// Bind (or rebind) a device's APNs token, authenticated by the gateway's
+    /// instance key. The push role's only per-device write outside `/notify`.
+    pub fn register(&self, req: RegisterRequest) -> RegisterOutcome {
+        if !self.admission.is_admitted(&req.instance_key) {
+            return RegisterOutcome::Unadmitted;
+        }
+        self.store.register(
+            &req.device_id,
+            DeviceRegistration {
+                apns_token: req.apns_token,
+                env: req.env,
+            },
+        );
+        RegisterOutcome::Registered
     }
 
     /// Process one notify. `now` (unix seconds) stamps the provider token.
@@ -184,6 +220,41 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             signer(),
             "com.aura.app",
         )
+    }
+
+    #[test]
+    fn register_binds_token_when_admitted_else_rejects() {
+        let store = Arc::new(InMemoryDeviceTokenStore::new());
+        let svc = service(Arc::new(MockApns::new(ApnsOutcome::Delivered)), Arc::clone(&store));
+
+        assert_eq!(
+            svc.register(RegisterRequest {
+                instance_key: "inst-A".into(),
+                device_id: "dev-9".into(),
+                apns_token: "tok-9".into(),
+                env: ApnsEnv::Production,
+            }),
+            RegisterOutcome::Registered,
+        );
+        assert_eq!(
+            store.get("dev-9").unwrap(),
+            DeviceRegistration {
+                apns_token: "tok-9".into(),
+                env: ApnsEnv::Production,
+            },
+        );
+
+        // An unadmitted instance can't bind a token.
+        assert_eq!(
+            svc.register(RegisterRequest {
+                instance_key: "nope".into(),
+                device_id: "dev-x".into(),
+                apns_token: "t".into(),
+                env: ApnsEnv::Sandbox,
+            }),
+            RegisterOutcome::Unadmitted,
+        );
+        assert!(store.get("dev-x").is_none());
     }
 
     #[tokio::test]

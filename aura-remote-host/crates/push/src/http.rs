@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 
-use crate::notify::{NotifyOutcome, NotifyRequest, NotifyService};
+use crate::notify::{NotifyOutcome, NotifyRequest, NotifyService, RegisterOutcome, RegisterRequest};
 
 /// Shared state for the push HTTP server.
 #[derive(Clone)]
@@ -20,11 +20,19 @@ pub struct PushState {
     pub service: Arc<NotifyService>,
 }
 
-/// Build the push router (`POST /notify`).
+/// Build the push router (`POST /notify`, `POST /register`).
 pub fn router(state: PushState) -> Router {
     Router::new()
         .route("/notify", post(notify))
+        .route("/register", post(register))
         .with_state(state)
+}
+
+async fn register(State(state): State<PushState>, Json(req): Json<RegisterRequest>) -> StatusCode {
+    match state.service.register(req) {
+        RegisterOutcome::Registered => StatusCode::OK,
+        RegisterOutcome::Unadmitted => StatusCode::UNAUTHORIZED,
+    }
 }
 
 async fn notify(State(state): State<PushState>, Json(req): Json<NotifyRequest>) -> StatusCode {
@@ -109,6 +117,34 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             "enc": "Y2lwaGVy",
             "n": "bm9uY2U=",
         })
+    }
+
+    async fn post_register(body: serde_json::Value) -> StatusCode {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/register")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        app().oneshot(req).await.unwrap().status()
+    }
+
+    fn reg_body(instance: &str) -> serde_json::Value {
+        serde_json::json!({
+            "instance_key": instance,
+            "device_id": "dev-new",
+            "apns_token": "apns-tok-new",
+            "env": "sandbox",
+        })
+    }
+
+    #[tokio::test]
+    async fn register_admitted_returns_200_unadmitted_401() {
+        assert_eq!(post_register(reg_body("inst-A")).await, StatusCode::OK);
+        assert_eq!(
+            post_register(reg_body("nope")).await,
+            StatusCode::UNAUTHORIZED,
+        );
     }
 
     #[tokio::test]
