@@ -112,10 +112,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
-name = "aura-mobile-app"
+name = "autocfg"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[package]]
+name = "base64"
+version = "0.21.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
+
+[[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "baybo-mobile-app"
 version = "0.1.0"
 dependencies = [
- "aura-mobile-core",
+ "baybo-mobile-core",
  "block2",
  "core-foundation",
  "core-foundation-sys",
@@ -136,10 +154,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "aura-mobile-core"
+name = "baybo-mobile-core"
 version = "0.1.0"
 dependencies = [
- "aura-model",
+ "baybo-model",
  "device-proto",
  "snow",
  "thiserror 2.0.18",
@@ -148,7 +166,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "aura-model"
+name = "baybo-model"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -162,24 +180,6 @@ dependencies = [
  "ulid",
  "uuid",
 ]
-
-[[package]]
-name = "autocfg"
-version = "1.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
-
-[[package]]
-name = "base64"
-version = "0.21.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
-
-[[package]]
-name = "base64"
-version = "0.22.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bit-set"
@@ -4884,7 +4884,7 @@ dependencies = [
 name = "wire"
 version = "0.1.0"
 dependencies = [
- "aura-model",
+ "baybo-model",
  "chrono",
  "rmp-serde",
  "serde",
