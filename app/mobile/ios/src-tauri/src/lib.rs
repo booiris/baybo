@@ -68,8 +68,7 @@ pub fn run() {
     let result = builder
         .setup(|_app| {
             // Request provisional notification auth + remote-notification
-            // registration once the app is up (main thread).
-            #[cfg(target_os = "ios")]
+            // registration once the app is up (main thread). No-op off iOS.
             push_register::register();
             Ok(())
         })
