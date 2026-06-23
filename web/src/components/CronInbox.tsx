@@ -1,11 +1,15 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  RiAlarmLine,
   RiArrowDownSLine,
   RiArrowUpSLine,
+  RiCheckDoubleLine,
+  RiHashtag,
   RiLoader4Line,
-  RiNotification3Line,
+  RiNotification3Fill,
+  RiNotificationOffLine,
+  RiQuillPenLine,
   RiRefreshLine,
+  RiRobot2Line,
 } from 'react-icons/ri';
 
 import { useAdminClient } from '../api/auth';
@@ -149,24 +153,41 @@ export function CronInbox({ refreshSignal }: CronInboxProps) {
     [items, seen],
   );
 
+  // Kept short on purpose: at 260px the mark-all + refresh buttons leave the
+  // subtitle ~110px, so a combined "N unread · M fires" clips. Lead with the
+  // count that matters — unread when there is any, total otherwise.
+  const subtitle =
+    items.length === 0
+      ? loading
+        ? 'Loading…'
+        : 'No fires yet'
+      : unreadCount > 0
+        ? `${unreadCount} unread`
+        : `${items.length} ${items.length === 1 ? 'fire' : 'fires'}`;
+
   return (
     <aside className="hidden xl:flex flex-col w-[260px] border-l-2 border-black bg-canvas absolute right-0 top-12 bottom-0 z-10">
-      <header className="px-3 py-3 border-b-2 border-black flex items-center gap-2">
-        <RiNotification3Line
-          className={`text-lg shrink-0 ${unreadCount > 0 ? 'text-brand' : ''}`}
-        />
-        <span className="font-bold uppercase tracking-wider text-[0.85rem] flex-1">
-          Cron Inbox
+      <header className="px-3 h-14 shrink-0 border-b-2 border-black flex items-center gap-2.5">
+        <span className="inline-flex items-center justify-center w-8 h-8 rounded-md border-2 border-black bg-brand shadow-brutal-xs shrink-0">
+          <RiNotification3Fill className="text-[1.05rem] text-ink" />
         </span>
+        <div className="flex-1 min-w-0">
+          <div className="font-bold uppercase tracking-wider text-[0.8rem] leading-none">
+            Notifications
+          </div>
+          <div className="text-[0.62rem] text-ink-soft mt-1.5 leading-none truncate">
+            {subtitle}
+          </div>
+        </div>
         {unreadCount > 0 ? (
           <button
             type="button"
             onClick={markAllSeen}
             title="Mark all as read"
             aria-label={`${unreadCount} new cron fires — mark all as read`}
-            className="inline-flex items-center justify-center min-w-[20px] h-[20px] px-1.5 bg-brand text-ink border-2 border-black rounded-md text-[0.65rem] font-bold shadow-brutal-xs hover:bg-brand-hover active:translate-x-[1px] active:translate-y-[1px] active:shadow-none cursor-pointer"
+            className="inline-flex items-center justify-center w-8 h-8 rounded-md border-2 border-transparent text-ink-soft hover:text-ink hover:border-black hover:bg-white transition-colors cursor-pointer"
           >
-            {unreadCount}
+            <RiCheckDoubleLine className="text-base" />
           </button>
         ) : null}
         <button
@@ -177,28 +198,34 @@ export function CronInbox({ refreshSignal }: CronInboxProps) {
           }}
           disabled={loading}
           aria-label="Refresh cron messages"
-          className="inline-flex items-center justify-center w-7 h-7 border-2 border-black rounded-md bg-white shadow-brutal-xs hover:bg-canvas active:translate-x-[1px] active:translate-y-[1px] active:shadow-none disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+          className="inline-flex items-center justify-center w-8 h-8 rounded-md border-2 border-transparent text-ink-soft hover:text-ink hover:border-black hover:bg-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
         >
           <RiRefreshLine className={`text-base ${loading ? 'animate-spin' : ''}`} />
         </button>
       </header>
 
-      <div className="chat-scroll flex-1 overflow-y-auto overflow-x-hidden">
+      <div className="chat-scroll flex-1 overflow-y-auto overflow-x-hidden flex flex-col">
         {error ? (
-          <div className="m-3 p-3 border-[2px] border-err text-err rounded-md text-[0.75rem] font-mono">
+          <div className="m-2.5 p-2.5 border-2 border-err/60 bg-err/10 text-err rounded-md text-[0.72rem] font-mono break-words">
             {error}
           </div>
         ) : null}
         {loading && items.length === 0 ? (
-          <div className="flex justify-center py-6 text-ink-soft">
+          <div className="flex-1 flex items-center justify-center py-12 text-ink-soft">
             <RiLoader4Line className="text-2xl animate-spin" />
           </div>
         ) : items.length === 0 ? (
-          <div className="px-4 py-8 text-center text-ink-soft text-[0.8rem] font-mono">
-            No cron fires yet.
+          <div className="flex-1 flex flex-col items-center justify-center text-center px-6 gap-2.5 py-12">
+            <span className="inline-flex items-center justify-center w-12 h-12 rounded-full border-2 border-dashed border-ink/30 text-ink-soft">
+              <RiNotificationOffLine className="text-xl" />
+            </span>
+            <div className="text-[0.82rem] font-bold text-ink/80">All caught up</div>
+            <div className="text-[0.72rem] text-ink-soft leading-snug max-w-[200px]">
+              Scheduled cron fires show up here as they run.
+            </div>
           </div>
         ) : (
-          <ul className="flex flex-col">
+          <ul className="flex flex-col gap-2 px-2 py-2.5">
             {items.map((msg) => (
               <CronMessageRow
                 key={msg.session_id}
@@ -223,57 +250,91 @@ interface CronMessageRowProps {
 }
 
 function CronMessageRow({ message, isNew, expanded, onToggle }: CronMessageRowProps) {
-  const summary = useMemo(() => {
-    const text = message.response?.trim() || message.prompt.trim();
-    if (!text) return '(no content)';
-    const oneLine = text.replace(/\s+/g, ' ');
-    return oneLine.length > 96 ? `${oneLine.slice(0, 96)}…` : oneLine;
-  }, [message.prompt, message.response]);
+  // Title leads with the instruction (first non-empty line of the prompt);
+  // the preview leads with the agent's reply. Length is left to CSS
+  // (`truncate` / `line-clamp-2`) so the full text stays available on hover.
+  const title = useMemo(() => {
+    const firstLine = message.prompt
+      .split('\n')
+      .map((l) => l.trim())
+      .find((l) => l.length > 0);
+    return firstLine ?? 'Cron fire';
+  }, [message.prompt]);
+
+  const preview = useMemo(() => {
+    const text = message.response?.trim();
+    return text ? text.replace(/\s+/g, ' ') : null;
+  }, [message.response]);
 
   const fireLabel = useMemo(() => formatRelative(message.fired_at), [message.fired_at]);
 
   return (
     <li
-      className={`border-b-2 border-black ${isNew ? 'border-l-4 border-l-brand' : ''}`}
+      className={`relative rounded-md overflow-hidden border-2 ${
+        isNew ? 'border-black bg-surface shadow-brutal-xs' : 'border-ink/25 bg-canvas'
+      }`}
     >
+      {isNew ? (
+        <span className="absolute left-0 top-0 bottom-0 w-1 bg-brand" aria-hidden />
+      ) : null}
       <button
         type="button"
         onClick={onToggle}
         aria-expanded={expanded}
-        className="w-full text-left px-3 py-2.5 flex flex-col gap-1 hover:bg-canvas cursor-pointer"
+        className={`w-full text-left ${
+          isNew ? 'pl-3.5' : 'pl-3'
+        } pr-2.5 py-2.5 flex flex-col gap-1.5 hover:bg-brand/5 cursor-pointer`}
       >
-        <div className="flex items-center gap-2 text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft">
-          <RiAlarmLine className="text-sm text-ink shrink-0" />
-          <code
-            className="font-mono text-[0.7rem] text-ink truncate"
-            title={message.cron_job_id}
+        <div className="flex items-center gap-1.5">
+          <span
+            className={`text-[0.8rem] leading-tight flex-1 min-w-0 truncate ${
+              isNew ? 'font-bold text-ink' : 'font-medium text-ink/90'
+            }`}
+            title={message.prompt}
           >
-            {message.cron_job_id.slice(0, 8)}
-          </code>
-          {isNew ? (
-            <span className="px-1 py-0.5 bg-brand text-ink border border-black rounded text-[0.55rem] leading-none">
-              new
-            </span>
-          ) : null}
-          <span className="flex-1" />
-          <span title={message.fired_at}>{fireLabel}</span>
+            {title}
+          </span>
+          <span
+            className="text-[0.62rem] text-ink-soft tabular-nums shrink-0"
+            title={message.fired_at}
+          >
+            {fireLabel}
+          </span>
           {expanded ? (
-            <RiArrowUpSLine className="text-base shrink-0 text-ink" />
+            <RiArrowUpSLine className="text-base shrink-0 text-ink-soft" />
           ) : (
-            <RiArrowDownSLine className="text-base shrink-0 text-ink" />
+            <RiArrowDownSLine className="text-base shrink-0 text-ink-soft" />
           )}
         </div>
         {!expanded ? (
-          <p className="text-[0.8rem] line-clamp-2 leading-snug">{summary}</p>
+          preview ? (
+            <p
+              className={`text-[0.78rem] leading-snug line-clamp-2 ${
+                isNew ? 'text-ink/80' : 'text-ink-soft'
+              }`}
+            >
+              {preview}
+            </p>
+          ) : (
+            <p className="flex items-center gap-1 text-[0.72rem] italic text-ink-soft">
+              <RiLoader4Line className="text-[0.85rem] animate-spin shrink-0" />
+              Awaiting response…
+            </p>
+          )
         ) : null}
       </button>
       {expanded ? (
-        <div className="px-3 pb-3 flex flex-col gap-2">
-          <Section label="Prompt" body={message.prompt} />
-          <Section label="Response" body={message.response ?? null} />
-          <div className="text-[0.65rem] font-mono text-ink-soft break-all">
-            <span className="font-bold uppercase tracking-wider mr-1">Session</span>
-            {message.session_id}
+        <div className={`${isNew ? 'pl-3.5' : 'pl-3'} pr-2.5 pb-3 flex flex-col gap-2.5`}>
+          <Section icon={<RiQuillPenLine />} label="Prompt" body={message.prompt} />
+          <Section icon={<RiRobot2Line />} label="Response" body={message.response ?? null} />
+          <div className="flex items-center gap-1.5 text-[0.6rem] font-mono text-ink-soft/80 pt-0.5">
+            <RiHashtag className="text-[0.8rem] shrink-0" />
+            <span
+              className="truncate"
+              title={`job ${message.cron_job_id}\nsession ${message.session_id}`}
+            >
+              {message.cron_job_id.slice(0, 8)} · {message.session_id}
+            </span>
           </div>
         </div>
       ) : null}
@@ -281,20 +342,27 @@ function CronMessageRow({ message, isNew, expanded, onToggle }: CronMessageRowPr
   );
 }
 
-function Section({ label, body }: { label: string; body: string | null }) {
+function Section({
+  icon,
+  label,
+  body,
+}: {
+  icon: ReactNode;
+  label: string;
+  body: string | null;
+}) {
   return (
     <div>
-      <div className="text-[0.65rem] font-bold uppercase tracking-wider text-ink-soft mb-1">
+      <div className="flex items-center gap-1.5 text-[0.6rem] font-bold uppercase tracking-wider text-ink-soft mb-1">
+        <span className="text-[0.85rem] shrink-0">{icon}</span>
         {label}
       </div>
       {body ? (
-        <div className="border-2 border-black bg-canvas rounded-md px-2 py-1.5 font-mono text-[0.8rem] whitespace-pre-wrap break-words leading-snug">
+        <div className="rounded border border-ink/10 bg-ink/[0.04] px-2.5 py-1.5 font-mono text-[0.76rem] whitespace-pre-wrap break-words leading-snug">
           {body}
         </div>
       ) : (
-        <div className="text-[0.75rem] text-ink-soft italic">
-          (pending)
-        </div>
+        <div className="text-[0.72rem] text-ink-soft italic">(pending)</div>
       )}
     </div>
   );
