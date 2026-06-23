@@ -10,6 +10,10 @@ doctest = false
 tokio = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
+# The data-leg WS adapter: pump axum WebSocket frames in/out of a RelayLeg.
+axum = { workspace = true, features = ["ws"] }
+futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio-tungstenite = { workspace = true }
