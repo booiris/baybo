@@ -27,6 +27,7 @@ pub mod error;
 pub mod installer;
 pub mod log_buffer;
 pub mod push;
+pub mod relay;
 pub mod reload;
 pub mod server;
 pub mod sidecar;

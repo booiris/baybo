@@ -74,6 +74,9 @@ base64 = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
+# A holds an outbound control WS to the remote host (C); `handshake` is enough
+# (the caller dials TCP/TLS and hands us the stream).
+tokio-tungstenite = { workspace = true }
 libc = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

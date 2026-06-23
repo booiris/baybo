@@ -599,6 +599,7 @@ name = "aura-janitor"
 version = "0.1.0"
 dependencies = [
  "aura-model",
+ "aura-storage",
  "aura-store",
  "aura-workspace",
  "chrono",
