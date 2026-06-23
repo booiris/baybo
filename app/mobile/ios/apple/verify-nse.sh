@@ -4,16 +4,22 @@
 # Simulator, using the pinned cross-language fixture from `device_proto::fixtures`.
 #
 # WHY a script you run (not CI): the App Group keychain the NSE reads is gated by
-# the `com.apple.security.application-groups` entitlement, which is only honored
-# for a *code-signed* build. Signing needs your Apple Development identity, whose
-# private key requires interactive keychain authorization (Touch ID / password) —
-# so this can't run headlessly. Everything else (build, objc2 provisional-auth
-# registration, the push pipeline) is already verified; this closes the loop.
+# the `com.apple.security.application-groups` entitlement, and signing needs your
+# Apple Development identity (its private key requires interactive Touch ID /
+# password), so this can't run headlessly.
 #
-# Steps: build (debug, sim) → code-sign app + NSE with your Dev identity and the
-# App Group entitlement → boot an iOS 26 sim → install → launch (the debug build
-# seeds the fixture push key into the keychain and requests provisional auth) →
-# push the fixture payload → open the Simulator so you can see the result.
+# IMPORTANT — App Group *provisioning*: the simulator only launches an app whose
+# App Group is REGISTERED to the signing team. Manual codesign (what this script
+# does) cannot register an App Group — only Xcode automatic signing can, and App
+# Groups are a paid Apple Developer capability. So unless group.com.aura.app is
+# already provisioned for your team, the launch is denied (the script detects
+# this and prints the Xcode-automatic-signing path). Re-signing also requires the
+# `com.apple.security.get-task-allow` entitlement or the sim refuses to launch.
+#
+# Steps: build (debug, sim) → code-sign app + NSE with your Dev identity +
+# get-task-allow + the App Group → boot an iOS 26 sim → install → launch (the
+# debug build seeds the fixture push key into the keychain + requests provisional
+# auth) → push the fixture payload → open the Simulator to see the result.
 #
 # PASS  = a notification reading:  Aura / The agent finished replying.
 # FAIL  = the placeholder:         New message / Open Aura
@@ -43,21 +49,26 @@ IDENTITY="${AURA_SIGN_ID:-$(security find-identity -v -p codesigning | awk -F'"'
 [ -n "$IDENTITY" ] || { echo "✗ no 'Apple Development' code-signing identity found"; exit 1; }
 echo "▸ signing with: $IDENTITY"
 
-# App Group + keychain entitlements ONLY. (aps-environment is a restricted push
-# entitlement that AMFI rejects without a matching profile; it is not needed for
-# a local simctl push, which targets the bundle id directly.)
+# Sim-launch entitlements: get-task-allow (REQUIRED — the simulator only launches
+# apps that carry it; the --no-sign linker signature includes it, so re-signing
+# without it gets the launch denied by SBMainWorkspace) + the App Group / keychain
+# sharing the NSE needs. aps-environment is intentionally omitted: it is a
+# restricted push entitlement that needs a provisioning profile, and a local
+# simctl push targets the bundle id directly without it.
 ENT="$(mktemp -t aura-sim-ent).plist"
 cat > "$ENT" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
+  <key>com.apple.security.get-task-allow</key><true/>
   <key>com.apple.security.application-groups</key><array><string>group.com.aura.app</string></array>
   <key>keychain-access-groups</key><array><string>group.com.aura.app</string></array>
 </dict></plist>
 PLIST
 
-codesign -f -s "$IDENTITY" --entitlements "$GEN/NotificationExtension/NotificationExtension.entitlements" \
-  "$APP/PlugIns/NotificationExtension.appex"
+# Same entitlements for the embedded NSE (it is launched as its own process when
+# a push arrives, so it needs get-task-allow + the shared App Group too).
+codesign -f -s "$IDENTITY" --entitlements "$ENT" "$APP/PlugIns/NotificationExtension.appex"
 codesign -f -s "$IDENTITY" --entitlements "$ENT" "$APP"
 echo "▸ signed app + NSE"
 
@@ -69,7 +80,27 @@ xcrun simctl bootstatus "$UDID" -b >/dev/null
 xcrun simctl uninstall "$UDID" com.aura.app 2>/dev/null || true
 xcrun simctl install "$UDID" "$APP"
 echo "▸ installed; launching with the fixture seed…"
-SIMCTL_CHILD_AURA_SEED_PUSH_KEY="$BID:$KEY" xcrun simctl launch "$UDID" com.aura.app >/dev/null
+if ! SIMCTL_CHILD_AURA_SEED_PUSH_KEY="$BID:$KEY" xcrun simctl launch "$UDID" com.aura.app >/dev/null 2>&1; then
+  cat <<'GUIDE'
+
+✗ The app would not launch — the simulator rejects the App Group entitlement
+  (com.apple.security.application-groups: group.com.aura.app) because it is not
+  PROVISIONED for your team. Manual codesign (this script) cannot register an
+  App Group; only Xcode automatic signing can, and App Groups are a paid Apple
+  Developer capability. The reliable path:
+
+    1. open src-tauri/gen/apple/aura-mobile-app.xcodeproj in Xcode
+    2. for BOTH targets (Aura + NotificationExtension), Signing & Capabilities:
+       pick your Team (Xcode registers group.com.aura.app + provisions; you may
+       need a unique bundle id if com.aura.app is taken — keep the App Group id
+       in sync across both targets and PushKeyStore.swift / keychain.rs)
+    3. Run the app once (seeds the key), then: xcrun simctl push <udid> <id> the
+       fixture payload this script wrote, and check Notification Center.
+
+  See docs/todo/mobile/phase1.md § "What's verified, and the external boundary".
+GUIDE
+  exit 1
+fi
 
 DATA="$(xcrun simctl get_app_container "$UDID" com.aura.app data)"
 for _ in $(seq 1 10); do [ -f "$DATA/tmp/aura-seed-result.txt" ] && break; sleep 1; done

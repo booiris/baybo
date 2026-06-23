@@ -129,20 +129,32 @@ Verified locally (iOS 26 simulator, Xcode 26):
   `verify-crypto.swift`, runnable on macOS without Xcode).
 
 The **App Group keychain** (and thus the live NSE decrypt, and real APNs) is
-gated on a **code-signed** build — an unavoidable Apple boundary, evidenced
-empirically:
+gated on a **provisioned, code-signed** build — an unavoidable Apple boundary,
+nailed down empirically on the iOS 26 simulator:
 
 - Unsigned build → `SecItemAdd` returns **`errSecMissingEntitlement` (-34018)**:
   the code reaches the keychain correctly; only the entitlement is unhonored.
-- Ad-hoc signing with the App Group entitlement → **AMFI denies launch**.
-- A real "Apple Development" identity works, but `codesign` needs interactive
-  keychain authorization (it fails headlessly with `errSecInternalComponent`).
+- **`get-task-allow` is mandatory** to launch *any* re-signed build — the
+  `--no-sign` linker signature carries it; a `codesign --entitlements` that drops
+  it gets the launch denied by `SBMainWorkspace`.
+- The simulator **rejects the App Group access group `group.com.aura.app`**
+  (whether in `application-groups` *or* `keychain-access-groups`) **unless the
+  App Group is provisioned for the signing team**. Manual `codesign` — ad-hoc
+  *or* with a real Development identity — **cannot register an App Group**; the
+  launch is denied. (A bare `get-task-allow`-only sign launches fine, isolating
+  the App Group as the blocker.)
+- `codesign` with a real identity also needs interactive keychain authorization
+  (it fails headlessly with `errSecInternalComponent`).
 
-App Groups additionally require a **paid Apple Developer** membership to
-provision the group + App ID. `apple/verify-nse.sh` is the turnkey signed check:
-it builds, signs the app + NSE with your Dev identity + the App Group
-entitlement, installs, seeds the pinned fixture key, and pushes the fixture
-payload — PASS = a notification reading *"Aura / The agent finished replying."*
+The reliable path is therefore **Xcode automatic signing**: open
+`src-tauri/gen/apple/aura-mobile-app.xcodeproj`, set your team under Signing &
+Capabilities for **both** the app and the NSE target — Xcode registers
+`group.com.aura.app` and provisions it (a **paid Apple Developer** capability;
+`com.aura.app` may need a team-unique bundle id, kept in sync with the App Group
+id in `PushKeyStore.swift` / `keychain.rs`). `apple/verify-nse.sh` automates the
+build + signing + seed + push and, when the App Group is not yet provisioned,
+detects the launch denial and prints this path. PASS = a notification reading
+*"Aura / The agent finished replying."*
 
 ## Remaining M4 work (needs the external resources above)
 
