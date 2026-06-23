@@ -14,6 +14,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
+  RiAlertLine,
   RiArrowDownLine,
   RiArrowDownSLine,
   RiArrowRightSLine,
@@ -22,7 +23,9 @@ import {
   RiClipboardLine,
   RiCloseLine,
   RiDeleteBin6Line,
+  RiErrorWarningLine,
   RiFileLine,
+  RiInformation2Line,
   RiLoader4Line,
   RiSendPlane2Line,
   RiStopFill,
@@ -4088,19 +4091,47 @@ function MessageBubble({
     return <WorkBlock row={row} />;
   }
   if (row.notice) {
-    const palette =
+    // The icon + colored left rail + soft tint carry the severity, so the body
+    // text stays readable `ink` rather than the whole line being tinted (which
+    // got garish on longer error messages). Rail mirrors the brutalist accent
+    // used elsewhere in the chat.
+    const { Icon, accent, tint, ring, iconColor } =
       row.notice.level === 'error'
-        ? 'bg-err/10 border-err text-err'
+        ? {
+            Icon: RiErrorWarningLine,
+            accent: 'bg-err',
+            tint: 'bg-err/10',
+            ring: 'border-err/30',
+            iconColor: 'text-err',
+          }
         : row.notice.level === 'warn'
-          ? 'bg-warn/10 border-warn text-warn'
-          : 'bg-info/10 border-info text-info';
+          ? {
+              Icon: RiAlertLine,
+              accent: 'bg-warn',
+              tint: 'bg-warn/10',
+              ring: 'border-warn/30',
+              iconColor: 'text-warn',
+            }
+          : {
+              Icon: RiInformation2Line,
+              accent: 'bg-info',
+              tint: 'bg-info/10',
+              ring: 'border-info/25',
+              iconColor: 'text-info',
+            };
     return (
       <div className="flex flex-col items-start min-w-0">
-        <div className="flex flex-col w-fit min-w-0">
+        <div className="flex flex-col w-fit max-w-full min-w-0">
           <div
-            className={`border-2 rounded-md px-3 py-2 font-mono text-sm whitespace-pre-wrap ${palette}`}
+            className={`relative w-fit max-w-full overflow-hidden rounded-md border ${ring} ${tint}`}
           >
-            {row.notice.text}
+            <span className={`absolute left-0 top-0 bottom-0 w-1 ${accent}`} aria-hidden />
+            <div className="flex items-start gap-2 pl-3.5 pr-3 py-2">
+              <Icon className={`${iconColor} text-base shrink-0 mt-[0.15rem]`} aria-hidden />
+              <span className="font-mono text-sm text-ink/90 whitespace-pre-wrap break-words [overflow-wrap:anywhere] leading-snug">
+                {row.notice.text}
+              </span>
+            </div>
           </div>
           {row.createdAt ? (
             <span
