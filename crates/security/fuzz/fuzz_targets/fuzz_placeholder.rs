@@ -2,10 +2,10 @@
 
 use std::sync::OnceLock;
 
-use aura_security::{EncryptionKey, PlaceholderMinter};
+use baybo_security::{EncryptionKey, PlaceholderMinter};
 use libfuzzer_sys::fuzz_target;
 
-const FIXED_KEY: [u8; 32] = *b"aura-fuzz-placeholder-master-key";
+const FIXED_KEY: [u8; 32] = *b"baybo-fuzz-placeholder-masterkey";
 
 static MINTER: OnceLock<PlaceholderMinter> = OnceLock::new();
 

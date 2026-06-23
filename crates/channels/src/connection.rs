@@ -8,12 +8,12 @@
 //! The connection itself owns no socket and runs no task. The gateway
 //! provides a `ConnectionSink` impl that wraps its outbound mpsc
 //! channels, and the channels crate's fan-out logic talks to that
-//! sink. This keeps `aura-channels` free of any wire-format or
+//! sink. This keeps `baybo-channels` free of any wire-format or
 //! transport details.
 
 use std::sync::Arc;
 
-use aura_model::SessionId;
+use baybo_model::SessionId;
 use dashmap::DashSet;
 use uuid::Uuid;
 

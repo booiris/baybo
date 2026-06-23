@@ -1,8 +1,8 @@
-//! Shared device-pairing + secure-channel protocol for the Aura mobile
+//! Shared device-pairing + secure-channel protocol for the Baybo mobile
 //! companion.
 //!
 //! This crate is the single source of truth for the cryptography the user's
-//! aura gateway (**A**) and the app's `aura-mobile-core` (**P**) must agree on
+//! baybo gateway (**A**) and the app's `baybo-mobile-core` (**P**) must agree on
 //! byte-for-byte:
 //!
 //! - [`pake`] — SPAKE2 over the untrusted rendezvous (the operator-run

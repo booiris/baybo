@@ -54,7 +54,7 @@ guard let ct = Data(hexString: ciphertextHex) else {
 guard let p = openPreview(key: SymmetricKey(data: key), nonce: nonce, ciphertextAndTag: ct) else {
     print("FAIL: decrypt returned nil"); exit(1)
 }
-guard p.title == "Aura", p.body == "The agent finished replying." else {
+guard p.title == "Baybo", p.body == "The agent finished replying." else {
     print("FAIL: got title=\(p.title) body=\(p.body)"); exit(1)
 }
 print("PASS: CryptoKit decrypt matches the Rust AEAD fixture (title=\(p.title), body=\(p.body))")

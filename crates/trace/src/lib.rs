@@ -2,14 +2,14 @@
 //! `docs/modules/trace.md` for the design.
 //!
 //! Hierarchy: `Session > Job > Step > Span (+ SpanEvent)`. `Session`
-//! lives in `aura-model`; `Job` lives in `aura-job`; this crate owns
+//! lives in `baybo-model`; `Job` lives in `baybo-job`; this crate owns
 //! `Step`, `Span`, `SpanEvent`, the `SpanRecorder` persistence
 //! orchestrator, and the row conversions that persist them.
 //!
-//! The `TraceStore` trait lives in `aura-store` (the ports crate) and
+//! The `TraceStore` trait lives in `baybo-store` (the ports crate) and
 //! trades in `StepRow` / `SpanRow` / `SpanEventRow`; this crate owns the
 //! `to_row` / `from_row` conversions and converts at the recorder
-//! boundary, while `aura-storage` provides the libsql implementation.
+//! boundary, while `baybo-storage` provides the libsql implementation.
 
 mod error;
 mod event;
@@ -22,7 +22,7 @@ mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub use aura_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
+pub use baybo_store::{SpanEventRow, SpanRow, StepRow, TraceStore};
 pub use error::TraceError;
 pub use event::{SpanEvent, SpanEventKind, ToolEventPayload};
 pub use outcome::{LifecycleOutcome, LifecycleState};

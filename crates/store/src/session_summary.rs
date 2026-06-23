@@ -7,7 +7,7 @@
 //! for the full design.
 
 use async_trait::async_trait;
-use aura_model::SessionId;
+use baybo_model::SessionId;
 use chrono::{DateTime, Utc};
 
 use crate::StorageError;

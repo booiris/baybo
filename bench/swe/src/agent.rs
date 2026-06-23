@@ -1,12 +1,12 @@
-//! Drive the REAL aura agent inside each instance's **official SWE-bench Docker
+//! Drive the REAL baybo agent inside each instance's **official SWE-bench Docker
 //! image** — the faithful, leaderboard-comparable way to measure issue
 //! resolution. Per instance we `docker run` the eval image (the repo checked out
 //! at `base_commit` at `/testbed`, all deps installed), copy in a static-musl
-//! `aura` binary configured with `sandbox.mode = none`, run `aura prompt` with
+//! `baybo` binary configured with `sandbox.mode = none`, run `baybo prompt` with
 //! cwd `/testbed`, then capture `git diff` as the prediction and read the turn's
-//! cost from aura's ledger.
+//! cost from baybo's ledger.
 //!
-//! `mode = none` (no OS sandbox) is mandatory here: aura's normal sandbox (bwrap)
+//! `mode = none` (no OS sandbox) is mandatory here: baybo's normal sandbox (bwrap)
 //! can't nest in the container, and the container is already the isolation
 //! boundary. The grader runs separately, in its own hermetic containers — see
 //! [`crate::grader`].
@@ -21,28 +21,28 @@ use tokio::process::Command;
 
 use crate::SweInstance;
 
-/// Container paths. The aura state dir is **outside** `/testbed` so its vault /
+/// Container paths. The baybo state dir is **outside** `/testbed` so its vault /
 /// sessions / logs never show up in the captured `git diff`.
-const CONTAINER_AURA_DIR: &str = "/installed-agent";
-const CONTAINER_AURA_BIN: &str = "/installed-agent/aura";
-const CONTAINER_CONFIG: &str = "/installed-agent/aura.json";
-/// `-e` arg pointing aura at the in-container config (mirrors [`CONTAINER_CONFIG`]).
-const CONTAINER_CONFIG_ENV: &str = "AURA_CONFIG_PATH=/installed-agent/aura.json";
+const CONTAINER_BAYBO_DIR: &str = "/installed-agent";
+const CONTAINER_BAYBO_BIN: &str = "/installed-agent/baybo";
+const CONTAINER_CONFIG: &str = "/installed-agent/baybo.json";
+/// `-e` arg pointing baybo at the in-container config (mirrors [`CONTAINER_CONFIG`]).
+const CONTAINER_CONFIG_ENV: &str = "BAYBO_CONFIG_PATH=/installed-agent/baybo.json";
 const CONTAINER_KEY_FILE: &str = "/installed-agent/encryption.key";
 /// Bundled static-musl `rg` (ripgrep). SWE-bench eval images don't ship it, but
-/// aura's `Grep` tool spawns bare `rg` (PATH lookup) — without it the tool errors
+/// baybo's `Grep` tool spawns bare `rg` (PATH lookup) — without it the tool errors
 /// and the agent limps along on Bash `grep`. `/usr/local/bin` is on the images'
 /// PATH, so dropping it here makes the tool work.
 const CONTAINER_RG_BIN: &str = "/usr/local/bin/rg";
-const CONTAINER_WORKSPACE: &str = "/aura-home";
+const CONTAINER_WORKSPACE: &str = "/baybo-home";
 /// SWE-bench eval images check the repo out here.
 const TESTBED: &str = "/testbed";
 /// SWE-bench images install the repo (editable, at base_commit) into a conda env
 /// named `testbed`; bare `python` is the base env with no project installed. We
-/// launch aura through a login shell that activates it, so the agent's
+/// launch baybo through a login shell that activates it, so the agent's
 /// `python`/`pip` resolve to the right interpreter and it can actually run the
 /// project's tests to verify its fix. Best-effort: if activation fails (a
-/// non-conda image), `exec "$@"` still runs aura directly.
+/// non-conda image), `exec "$@"` still runs baybo directly.
 const CONDA_ACTIVATE_WRAP: &str = "source /opt/miniconda3/etc/profile.d/conda.sh 2>/dev/null; \
      conda activate testbed 2>/dev/null; exec \"$@\"";
 /// Effectively-unlimited per-user rate limit for the bench (one user, one turn).
@@ -58,7 +58,7 @@ pub struct AgentModel {
     pub base_url: Option<String>,
 }
 
-/// Render the in-container `aura.json`: `none` sandbox, the agent model,
+/// Render the in-container `baybo.json`: `none` sandbox, the agent model,
 /// an isolated workspace, and a lifted rate limit. Returned as text to pipe into
 /// the container (no host temp file).
 pub fn render_agent_config(model: &AgentModel) -> String {
@@ -95,7 +95,7 @@ pub struct InstanceRun {
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
     pub cost_micro_usd: i64,
-    /// Wall time of the `aura prompt` turn (the agent's actual work).
+    /// Wall time of the `baybo prompt` turn (the agent's actual work).
     pub latency_ms: u64,
     pub error: Option<String>,
 }
@@ -118,13 +118,13 @@ impl InstanceRun {
 /// Inputs for one instance's containerized agent run.
 pub struct RunOpts<'a> {
     pub docker_bin: &'a str,
-    /// Host path of the static-musl `aura` binary.
-    pub aura_bin_host: &'a Path,
+    /// Host path of the static-musl `baybo` binary.
+    pub baybo_bin_host: &'a Path,
     /// Host path of the static-musl `rg` (ripgrep) binary, copied onto the
-    /// container's PATH so aura's `Grep` tool works (the eval images don't ship
+    /// container's PATH so baybo's `Grep` tool works (the eval images don't ship
     /// ripgrep).
     pub rg_bin_host: &'a Path,
-    /// Rendered `aura.json` text (see [`render_agent_config`]).
+    /// Rendered `baybo.json` text (see [`render_agent_config`]).
     pub config_json: &'a str,
     pub instance: &'a SweInstance,
     pub api_key_env: &'a str,
@@ -168,7 +168,7 @@ pub async fn pull_image(docker_bin: &str, image_key: &str) -> bool {
 /// Run one instance end-to-end. Tears the container down by default; never
 /// returns `Err` (per-instance failures become `InstanceRun.error`). Set
 /// `BENCH_KEEP_CONTAINERS=1` to leave the container up for debugging (e.g. to
-/// export aura's session transcript from `/aura-home/state/storage.db`).
+/// export baybo's session transcript from `/baybo-home/state/storage.db`).
 pub async fn run_instance(opts: RunOpts<'_>) -> InstanceRun {
     let result = run_instance_inner(&opts).await;
     if std::env::var_os("BENCH_KEEP_CONTAINERS").is_some() {
@@ -237,7 +237,7 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
         }
     };
 
-    // 2. Lay down the aura dir, binary, config, and a fresh encryption key.
+    // 2. Lay down the baybo dir, binary, config, and a fresh encryption key.
     docker(
         opts.docker_bin,
         &[
@@ -245,24 +245,24 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
             name,
             "mkdir",
             "-p",
-            CONTAINER_AURA_DIR,
+            CONTAINER_BAYBO_DIR,
             CONTAINER_WORKSPACE,
         ],
     )
     .await?;
     let host_bin = opts
-        .aura_bin_host
+        .baybo_bin_host
         .to_str()
-        .context("aura binary path is not utf-8")?;
+        .context("baybo binary path is not utf-8")?;
     docker(
         opts.docker_bin,
-        &["cp", host_bin, &format!("{name}:{CONTAINER_AURA_BIN}")],
+        &["cp", host_bin, &format!("{name}:{CONTAINER_BAYBO_BIN}")],
     )
     .await
-    .context("docker cp aura binary into container")?;
+    .context("docker cp baybo binary into container")?;
     docker(
         opts.docker_bin,
-        &["exec", name, "chmod", "+x", CONTAINER_AURA_BIN],
+        &["exec", name, "chmod", "+x", CONTAINER_BAYBO_BIN],
     )
     .await?;
     let host_rg = opts
@@ -293,7 +293,7 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
         opts.config_json,
     )
     .await
-    .context("write aura.json into container")?;
+    .context("write baybo.json into container")?;
     docker(
         opts.docker_bin,
         &[
@@ -321,15 +321,15 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
         // `docker run -e NAME`), and exec inherits the container env. Keeps the
         // secret out of this argv too.
         name,
-        // `bash -lc '<activate>; exec "$@"' aura <cmd...>`: activate the testbed
-        // conda env, then exec aura. The aura command + the framed instruction
+        // `bash -lc '<activate>; exec "$@"' baybo <cmd...>`: activate the testbed
+        // conda env, then exec baybo. The baybo command + the framed instruction
         // ride in as positionals ($1…), so no re-quoting and the multi-line
         // instruction stays a single safe argv.
         "bash",
         "-lc",
         CONDA_ACTIVATE_WRAP,
-        "aura",
-        CONTAINER_AURA_BIN,
+        "baybo",
+        CONTAINER_BAYBO_BIN,
         "prompt",
         "--json",
         "-y",
@@ -344,14 +344,14 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
     let (stdout, stderr, success) = docker_capture(
         opts.docker_bin,
         &prompt_args,
-        // Hard safety net above aura's own `--timeout`, in case the turn wedges.
+        // Hard safety net above baybo's own `--timeout`, in case the turn wedges.
         Duration::from_secs(opts.prompt_timeout_secs + 120),
     )
     .await?;
     let latency_ms = started.elapsed().as_millis() as u64;
     let mut prompt_error = if !success {
         Some(format!(
-            "aura prompt exited non-zero: {}",
+            "baybo prompt exited non-zero: {}",
             err_tail(&stderr)
         ))
     } else {
@@ -376,7 +376,7 @@ async fn run_instance_inner(opts: &RunOpts<'_>) -> Result<InstanceRun> {
         }
     };
 
-    // 5. Read the turn's cost from aura's ledger (best-effort → zeros).
+    // 5. Read the turn's cost from baybo's ledger (best-effort → zeros).
     let (input_tokens, output_tokens, cached_input_tokens, cost_micro_usd) = match read_cost(
         opts.docker_bin,
         name,
@@ -426,7 +426,7 @@ async fn read_cost(docker_bin: &str, name: &str, session: &str) -> Result<(u64, 
             "-e",
             "RUST_LOG=off",
             name,
-            CONTAINER_AURA_BIN,
+            CONTAINER_BAYBO_BIN,
             "cost",
             "show",
             "--session",
@@ -470,7 +470,7 @@ async fn export_trace(docker_bin: &str, container: &str, session: &str, dir: &Pa
     .await;
 }
 
-/// Run one `aura session …` subcommand in the container (stdout = JSON) and
+/// Run one `baybo session …` subcommand in the container (stdout = JSON) and
 /// write it to `out`. Failures warn and return — see [`export_trace`].
 async fn write_session_dump(docker_bin: &str, container: &str, sub: &[&str], out: &Path) {
     let mut args = vec![
@@ -480,7 +480,7 @@ async fn write_session_dump(docker_bin: &str, container: &str, sub: &[&str], out
         "-e",
         "RUST_LOG=off",
         container,
-        CONTAINER_AURA_BIN,
+        CONTAINER_BAYBO_BIN,
     ];
     args.extend_from_slice(sub);
     match docker(docker_bin, &args).await {
@@ -579,18 +579,18 @@ async fn docker_capture(
         .output();
     match tokio::time::timeout(hard_timeout, fut).await {
         Ok(res) => {
-            let out = res.context("run docker exec (aura prompt)")?;
+            let out = res.context("run docker exec (baybo prompt)")?;
             Ok((
                 String::from_utf8_lossy(&out.stdout).into_owned(),
                 String::from_utf8_lossy(&out.stderr).into_owned(),
                 out.status.success(),
             ))
         }
-        Err(_) => bail!("aura prompt exceeded the hard timeout ({hard_timeout:?})"),
+        Err(_) => bail!("baybo prompt exceeded the hard timeout ({hard_timeout:?})"),
     }
 }
 
-/// Detect an error object in `aura prompt --json` stdout. Returns `Some(reason)`
+/// Detect an error object in `baybo prompt --json` stdout. Returns `Some(reason)`
 /// if the turn was rejected; `None` if it answered (or emitted no JSON).
 fn prompt_output_error(stdout: &str) -> Option<String> {
     for line in stdout.lines().rev() {
@@ -605,24 +605,24 @@ fn prompt_output_error(stdout: &str) -> Option<String> {
             return None;
         }
         if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
-            return Some(format!("aura prompt turn error: {e}"));
+            return Some(format!("baybo prompt turn error: {e}"));
         }
     }
     None
 }
 
 /// Parse `(input_tokens, output_tokens, cached_input_tokens, cost_micro_usd)`
-/// from `aura cost show --json`; tolerates leading log lines (parse from the
+/// from `baybo cost show --json`; tolerates leading log lines (parse from the
 /// first `{`).
 fn parse_cost_summary(stdout: &str) -> Result<(u64, u64, u64, i64)> {
     let start = stdout
         .find('{')
-        .with_context(|| format!("no JSON in aura cost output: {}", err_tail(stdout)))?;
+        .with_context(|| format!("no JSON in baybo cost output: {}", err_tail(stdout)))?;
     let value: serde_json::Value = serde_json::from_str(stdout[start..].trim())
-        .with_context(|| format!("parse aura cost JSON: {}", err_tail(stdout)))?;
+        .with_context(|| format!("parse baybo cost JSON: {}", err_tail(stdout)))?;
     let summary = value
         .get("summary")
-        .context("aura cost output has no `summary`")?;
+        .context("baybo cost output has no `summary`")?;
     let u = |key: &str| {
         summary
             .get(key)
@@ -711,7 +711,7 @@ mod tests {
         AgentModel {
             provider: "deepseek".to_string(),
             model: "deepseek-v4-flash".to_string(),
-            api_key_env: "AURA_API_KEY".to_string(),
+            api_key_env: "BAYBO_API_KEY".to_string(),
             base_url: None,
         }
     }
@@ -720,7 +720,7 @@ mod tests {
     fn config_has_none_sandbox_and_isolated_workspace() {
         let cfg: serde_json::Value = serde_json::from_str(&render_agent_config(&model())).unwrap();
         assert_eq!(cfg["sandbox"]["mode"], "none");
-        // Workspace must be outside /testbed so aura state never pollutes the diff.
+        // Workspace must be outside /testbed so baybo state never pollutes the diff.
         assert_eq!(cfg["workspace"]["path"], CONTAINER_WORKSPACE);
         assert!(
             !cfg["workspace"]["path"]

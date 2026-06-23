@@ -170,7 +170,7 @@ pub enum LineageKind {
 /// trigger names the business source of work, lineage names the parent
 /// session relationship.
 ///
-/// The conversation transcript itself lives in the `aura-context`
+/// The conversation transcript itself lives in the `baybo-context`
 /// `ContextManager` for the actor handling this session. `Session`
 /// holds only metadata: identifiers, ownership, lineage, soul binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,7 +200,7 @@ pub struct Session {
     /// `DELETE /v1/chat/sessions/:id` endpoint, which intentionally
     /// does not remove the row — agent state, transcript, and
     /// channel-token all stay live. The chat list endpoint filters
-    /// `hidden = true` out; `aura_store::SessionStore::list_all`
+    /// `hidden = true` out; `baybo_store::SessionStore::list_all`
     /// does not, so admin / trace browsers continue to see hidden
     /// sessions. Default `false` so legacy JSON blobs deserialize.
     #[serde(default)]
@@ -256,7 +256,7 @@ pub struct SessionState {
     /// Tool resources the user has granted permanent approval for in this
     /// session. Populated on each `ApproveAlways` decision by the approval
     /// gate; persisted with the session so restored sessions remember the
-    /// grants. See `aura_model::approval` for matching semantics.
+    /// grants. See `baybo_model::approval` for matching semantics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approved_resources: Vec<ApprovedResource>,
 
@@ -265,7 +265,7 @@ pub struct SessionState {
     /// was between turns. Drained into a notification turn once no
     /// higher-priority work is queued. Persisted with the session so an
     /// actor evicted by the idle reaper still surfaces the deliveries on
-    /// hydration. See `aura_model::spawn_protocol::PendingBackgroundResult`.
+    /// hydration. See `baybo_model::spawn_protocol::PendingBackgroundResult`.
     ///
     /// No `serde(alias)` for the old `pending_subagent_results`: that field
     /// held the *old* element shape, which can't deserialize as the new type
@@ -300,7 +300,7 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_type: Option<String>,
 
-    /// Per-session LLM pin: the `aura.json` entry name this session's
+    /// Per-session LLM pin: the `baybo.json` entry name this session's
     /// turns should resolve against, overriding `default-llm`. `None`
     /// (the default) means "follow the pool default", so a session that
     /// was never switched tracks global `default-llm` changes. Set via

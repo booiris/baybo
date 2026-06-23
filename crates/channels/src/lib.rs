@@ -10,10 +10,10 @@ pub mod register_wire;
 pub mod registration;
 
 /// The wire types (`Frame`, `Message`, …) + MessagePack codec, now their own
-/// crate so the iOS companion can speak the protocol without `aura-channels`'
+/// crate so the iOS companion can speak the protocol without `baybo-channels`'
 /// server-only dependency chain. Re-exported here as `wire` so existing
-/// `aura_channels::wire::*` consumers are unchanged.
-pub use wire as wire;
+/// `baybo_channels::wire::*` consumers are unchanged.
+pub use wire;
 
 pub use channel::{ApprovalSurface, Channel, DispatchObserver, SubscribedView};
 pub use connection::{Connection, ConnectionId, ConnectionSink, SendOutcome};
@@ -27,11 +27,11 @@ pub use slash::{
     SlashCommand, SlashHandler, SlashOutcome, ViewKind,
 };
 pub use types::{
-    AgentEvent, AgentOutput, IncomingMessage, Message, NoticeLevel, OutgoingMessage,
-    RouterInbound, SessionEvent, ToolStatus, TurnStatus,
+    AgentEvent, AgentOutput, IncomingMessage, Message, NoticeLevel, OutgoingMessage, RouterInbound,
+    SessionEvent, ToolStatus, TurnStatus,
 };
 // `MessageRole` now lives in `wire`; keep it at the crate root so
-// `aura_channels::MessageRole` consumers are unchanged.
+// `baybo_channels::MessageRole` consumers are unchanged.
 pub use wire::MessageRole;
 
 pub type Result<T> = std::result::Result<T, ChannelError>;

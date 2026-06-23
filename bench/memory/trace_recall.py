@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Show the memory aura actually recalled while answering each bench question.
+"""Show the memory baybo actually recalled while answering each bench question.
 
-Each QA question runs in its own aura session, exported (default-on; NO_TRACE=1
+Each QA question runs in its own baybo session, exported (default-on; NO_TRACE=1
 disables) by run.sh to
   trace/<run_id>/<arm>/qa-<run_id>-<arm>-c<conv>-q<idx>.messages.json
-— the JSON that `aura session history --include-superseded --json` emits. Inside
+— the JSON that `baybo session history --include-superseded --json` emits. Inside
 it the backend's recall rides as a `role=user`, `source="recalled_memory"`
 message. This tool prints, per question: the question + gold + correct (from the
-results JSON), every recalled_memory block, and aura's final answer — so you can
+results JSON), every recalled_memory block, and baybo's final answer — so you can
 tell whether a wrong answer was a recall miss (the fact was never recalled) or an
 integration failure (it was recalled but unused).
 
@@ -38,7 +38,7 @@ def _text(content):
 
 def session_recall(path):
     """Return (recall_blocks, final_answer) from one session's exported transcript
-    — the single object `aura session history --include-superseded --json` emits:
+    — the single object `baybo session history --include-superseded --json` emits:
     `{"session", "messages": [{"ordinal", "superseded_by", "message"}, …]}`."""
     blocks, answer = [], None
     data = json.load(open(path))

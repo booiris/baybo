@@ -1,4 +1,4 @@
-// NotificationService.swift — the Aura push Notification Service Extension (NSE).
+// NotificationService.swift — the Baybo push Notification Service Extension (NSE).
 //
 // APNs delivers a generic, visible "New message" alert with `mutable-content: 1`
 // plus the operator-encrypted lock-screen preview (`enc`/`n`/`kid`/`bid`). This

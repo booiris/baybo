@@ -3,7 +3,7 @@ use std::path::Path;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use aura_model::ContentBlock;
+use baybo_model::ContentBlock;
 
 use crate::Result;
 

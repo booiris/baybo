@@ -1,10 +1,10 @@
 # User-Managed Secrets + Bash `secret_env` Injection
 
 **Status:** ✅ Shipped (branch `secret-management`, 2026-05-28). Built across
-`aura-security` (`UserSecretManager` + `SecretVault::list_names`), `aura-tools`
+`baybo-security` (`UserSecretManager` + `SecretVault::list_names`), `baybo-tools`
 (`SecretAccess` trait + `SpawnOpts` + `Secret*` tools + bash `secret_env`),
-`aura-agent` (gateway impl + executor wiring), `aura-sandbox`
-(`EnvPolicy::BaselineWithExtra`), and `aura-cli` (`secret add/list/delete`). The
+`baybo-agent` (gateway impl + executor wiring), `baybo-sandbox`
+(`EnvPolicy::BaselineWithExtra`), and `baybo-cli` (`secret add/list/delete`). The
 per-module source-of-truth docs (`security.md`, `tools.md`, `cli.md`,
 `sandbox.md`, `storage.md`) carry the *what*; this doc is the design
 **rationale** (the *why* — the forks below, rejected alternatives, threat
@@ -21,7 +21,7 @@ plaintext**. The agent only ever passes secret **names**.
 
 Surfaces:
 
-- **CLI** (human, local terminal): `aura secret add | list | delete`.
+- **CLI** (human, local terminal): `baybo secret add | list | delete`.
 - **Agent tools**: `secret_add`, `secret_list`, `secret_check` (no `secret_delete`).
 - **Bash tool**: a new `secret_env: string[]` parameter — the named secrets are
   resolved from the vault and injected into the child process env for that one
@@ -47,11 +47,11 @@ Surfaces:
 
 Reuse `SecretVault` + the `secrets(name, encrypted_value)` table (AES-256-GCM,
 on-disk master key — see Security notes). User secrets are keyed
-`user_env.<NAME>`. A thin **`UserSecretManager`** in `aura-security` (next to
+`user_env.<NAME>`. A thin **`UserSecretManager`** in `baybo-security` (next to
 `SecretVault`) owns the single `USER_SECRET_PREFIX` const, name validation,
 masked-preview, and list-by-prefix. No schema change.
 
-- No collision: internal keys all contain `.` (`mcp.<name>.…`, `aura.tui.…`) or
+- No collision: internal keys all contain `.` (`mcp.<name>.…`, `baybo.tui.…`) or
   are placeholder strings (`[{REDACTED_SECRET_…}]`); a valid env var name (D8)
   has no `.`, and we prefix it anyway.
 - `SecretVault` has no `list()` today → add `SecretVault::list_names()`
@@ -64,26 +64,26 @@ call-site to keep consistent with the vault, for no real isolation win).
 
 | Piece | Home | Why |
 |---|---|---|
-| `UserSecretManager`, `USER_SECRET_PREFIX` | `aura-security` | next to `SecretVault`; reachable by `aura-tools` (dep already exists) |
-| `secret_add` / `secret_list` / `secret_check` | `aura-tools/builtin/secret.rs` | alongside `BashTool`; `Tool` impls cannot live in `aura-security` (would close an `aura-tools ↔ aura-security` cycle) |
-| Bash change | `aura-tools/builtin/bash.rs` | — |
+| `UserSecretManager`, `USER_SECRET_PREFIX` | `baybo-security` | next to `SecretVault`; reachable by `baybo-tools` (dep already exists) |
+| `secret_add` / `secret_list` / `secret_check` | `baybo-tools/builtin/secret.rs` | alongside `BashTool`; `Tool` impls cannot live in `baybo-security` (would close an `baybo-tools ↔ baybo-security` cycle) |
+| Bash change | `baybo-tools/builtin/bash.rs` | — |
 | CLI `secret` family | `crates/cli/src/commands/secret.rs` | — |
-| `SecretAccess` impl | `crates/agent` | only crate that sees both the trait (`aura-tools`) and the manager (`aura-security`) |
+| `SecretAccess` impl | `crates/agent` | only crate that sees both the trait (`baybo-tools`) and the manager (`baybo-security`) |
 
 A standalone `crates/secret` was rejected: the manager must live below
-`aura-tools` (cycle), so the crate would own only three thin tool structs while
+`baybo-tools` (cycle), so the crate would own only three thin tool structs while
 its core type lived elsewhere.
 
 ### D3 — Tool access: `SecretAccess` trait on `ToolContext`
 
-Define `trait SecretAccess` in `aura-tools`; add
+Define `trait SecretAccess` in `baybo-tools`; add
 `ctx.secrets: Option<Arc<dyn SecretAccess>>` to `ToolContext`, bound by the
 agent layer exactly like `ctx.llm` (gateway/runtime path binds `Some`, argv-mode
 leaves `None`). The impl lives in the agent crate over `SecurityGateway`
 (already holds vault + minter) + `UserSecretManager`. This **reverses** the
 "Secret access (deferred)" note in `tools.md` and honors that doc's principle
 ("upper layers inject secrets … no direct dependency"): the trait is in
-`aura-tools`, the impl is injected from above.
+`baybo-tools`, the impl is injected from above.
 
 ```rust
 #[async_trait]
@@ -120,7 +120,7 @@ spawn_command(&self, program: &Path, args: &[String], opts: SpawnOpts) -> Result
 baseline/allowlist resolution (orthogonal to `EnvPolicy`, which stays
 `Baseline`/`Allowlist`) → `bwrap --setenv K V`, macOS env args; the unsandboxed
 paths use `Command::env(k, v)`. Inject on **all** spawn paths (sandboxed,
-aura-CLI bypass, bwrap-failed retry) — each is the user's authorized command.
+baybo-CLI bypass, bwrap-failed retry) — each is the user's authorized command.
 Secrets never enter the command string (kept separate from the `uv_env_prefix`
 string prefix), so they never reach params/trace/logs.
 

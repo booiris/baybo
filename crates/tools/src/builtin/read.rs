@@ -161,7 +161,7 @@ impl Tool for ReadTool {
             }
         }
 
-        if aura_security::is_sensitive_path(&p.file_path) {
+        if baybo_security::is_sensitive_path(&p.file_path) {
             return Err(ToolError::Execution(format!(
                 "refused to read sensitive path {} — credential-bearing files are blocked by security policy",
                 p.file_path.display()
@@ -215,7 +215,7 @@ impl Tool for ReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, User};
+    use baybo_model::{ChannelType, User};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
@@ -223,8 +223,8 @@ mod tests {
     fn ctx() -> ToolContext {
         ToolContext {
             session_id: "test".into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -233,7 +233,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: None,
             notifier: None,
@@ -363,10 +363,10 @@ mod tests {
         assert_eq!(
             ReadTool
                 .progress_label(&json!({
-                    "file_path": "/data/aura/crates/tools/src/builtin/read.rs"
+                    "file_path": "/data/baybo/crates/tools/src/builtin/read.rs"
                 }))
                 .as_deref(),
-            Some("/data/aura/crates/tools/src/builtin/read.rs"),
+            Some("/data/baybo/crates/tools/src/builtin/read.rs"),
         );
     }
 

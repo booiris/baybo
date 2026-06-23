@@ -10,8 +10,8 @@ mod tracing_init;
 mod tui_cmd;
 mod tui_log;
 
-use aura_cli::cli::ShellKind;
-use aura_cli::{Cli, Commands, ContextBuilder, Invocation, OutputFormat, dispatch};
+use baybo_cli::cli::ShellKind;
+use baybo_cli::{Cli, Commands, ContextBuilder, Invocation, OutputFormat, dispatch};
 use clap::CommandFactory;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ use tracing::info;
 
 use crate::tracing_init::{TracingMode, init_tracing};
 
-/// Resolve the effective aura.json path, if any, for display in
+/// Resolve the effective baybo.json path, if any, for display in
 /// diagnostics. Thin wrapper so existing callers keep working; the real
 /// implementation lives in `boot` so `gateway_cmd` can reuse it without
 /// depending on `main.rs`.
@@ -30,12 +30,12 @@ fn resolve_config_path() -> Option<PathBuf> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // `parse_args` checks `AURA_HELP_AGENT` and swaps in an unhidden
+    // `parse_args` checks `BAYBO_HELP_AGENT` and swaps in an unhidden
     // `Command` before clap parses argv; that's how the env-var
     // surfaces extended `--help` output without needing a flag.
-    let cli = aura_cli::cli::parse_args();
+    let cli = baybo_cli::cli::parse_args();
 
-    // Promote `--config <path>` into `AURA_CONFIG_PATH` before any
+    // Promote `--config <path>` into `BAYBO_CONFIG_PATH` before any
     // reader runs, so every downstream caller can stay env-only with a
     // single source of truth.
     //
@@ -44,11 +44,11 @@ async fn main() -> anyhow::Result<()> {
     // torn read on some libc implementations. We write exactly once,
     // exactly here, before `boot::load_config` (the only reader in this
     // binary) runs, and no other code in the process mutates or reads
-    // `AURA_CONFIG_PATH` concurrently — so the race window is empty in
+    // `BAYBO_CONFIG_PATH` concurrently — so the race window is empty in
     // practice.
     if let Some(path) = cli.global.config.as_deref() {
         unsafe {
-            std::env::set_var(aura_workspace::paths::ENV_CONFIG_PATH, path);
+            std::env::set_var(baybo_workspace::paths::ENV_CONFIG_PATH, path);
         }
     }
 
@@ -68,16 +68,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // `setup` is the first-run wizard. It bootstraps the workspace +
-    // master key + default aura.json before any of the normal
+    // master key + default baybo.json before any of the normal
     // `boot::load_config` machinery can run, so it gets its own
     // entry point here, ahead of the argv/chat dispatch.
     if let Some(Commands::Setup) = cli.command.as_ref() {
         return setup_cmd::run().await;
     }
 
-    // Bare `aura` (no subcommand) prints help and exits. The interactive
-    // chat loop is reached via the explicit `aura tui` subcommand, and
-    // one-shot answering via `aura prompt`, so the default invocation
+    // Bare `baybo` (no subcommand) prints help and exits. The interactive
+    // chat loop is reached via the explicit `baybo tui` subcommand, and
+    // one-shot answering via `baybo prompt`, so the default invocation
     // doesn't surprise users with a full-screen app.
     if cli.command.is_none() {
         Cli::command().print_help()?;
@@ -90,13 +90,13 @@ async fn main() -> anyhow::Result<()> {
     let config = boot::load_config().await?;
     let config = Arc::new(config);
     let workspace_paths =
-        aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
+        baybo_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
     let workspace_root = workspace_paths.root().to_path_buf();
-    aura_workspace::WorkspaceManager::new(workspace_root.clone())
+    baybo_workspace::WorkspaceManager::new(workspace_root.clone())
         .ensure_layout()
         .await?;
 
-    // One-shot `aura prompt`: stream a single answer and exit. Sits
+    // One-shot `baybo prompt`: stream a single answer and exit. Sits
     // beside the `tui` early-return because both drive the agent runtime
     // (via a live gateway or in-process) rather than going through the
     // generic argv dispatch.
@@ -148,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
     let cmd = cli.command.expect("non-command branches handled above");
 
     let skill_registry = if needs_skills(&cmd) {
-        let reg = Arc::new(aura_skills::SkillRegistry::new());
+        let reg = Arc::new(baybo_skills::SkillRegistry::new());
         let builtins = reg.register_builtins();
         if builtins > 0 {
             info!(count = builtins, "registered built-in skills");
@@ -164,9 +164,9 @@ async fn main() -> anyhow::Result<()> {
         }
         reg
     } else {
-        Arc::new(aura_skills::SkillRegistry::new())
+        Arc::new(baybo_skills::SkillRegistry::new())
     };
-    let stores = aura_storage::Store::open(boot::storage_db_path(&config.workspace)).await?;
+    let stores = baybo_storage::Store::open(boot::storage_db_path(&config.workspace)).await?;
     // Argv-mode commands (`llm probe`, `doctor`, `status`, `channel add`,
     // …) don't drive WebFetch through an agent loop; the per-call
     // `ToolContext::llm` is left `None` in those paths, so WebFetch
@@ -176,23 +176,23 @@ async fn main() -> anyhow::Result<()> {
         .map(|p| p.to_proxy())
         .transpose()
         .map_err(|e| anyhow::anyhow!("invalid proxy.url: {e}"))?;
-    let tool_registry = Arc::new(aura_tools::ToolRegistry::with_defaults(
+    let tool_registry = Arc::new(baybo_tools::ToolRegistry::with_defaults(
         stores.blob.clone(),
         workspace_paths.clone(),
         tool_proxy,
         // argv one-shots (llm/doctor/status) barely touch Bash; a fresh
         // sandboxed handle with no hot-reload wiring is the safe default.
-        Arc::new(aura_tools::builtin::LiveSandboxMode::new(
-            aura_tools::builtin::BashSandboxMode::Sandboxed,
+        Arc::new(baybo_tools::builtin::LiveSandboxMode::new(
+            baybo_tools::builtin::BashSandboxMode::Sandboxed,
         )),
     ));
-    let workspace = Arc::new(aura_workspace::WorkspaceManager::new(
+    let workspace = Arc::new(baybo_workspace::WorkspaceManager::new(
         workspace_root.clone(),
     ));
-    let channels_registry = Arc::new(aura_channels::ChannelRegistry::new());
+    let channels_registry = Arc::new(baybo_channels::ChannelRegistry::new());
     // Only `llm`, `doctor`, and `status` touch `ctx.llm` in the argv
     // path. Building the client unconditionally meant every run of
-    // `aura channel add` / `aura config get` / etc. emitted a warn-level
+    // `baybo channel add` / `baybo config get` / etc. emitted a warn-level
     // "LLM client unavailable" message when no API key was configured,
     // which users reasonably interpreted as a hard error.
     let llm_client = if needs_llm(&cmd) {
@@ -203,13 +203,13 @@ async fn main() -> anyhow::Result<()> {
         // probes that don't need OAuth tokens; the openai-subscription
         // provider's create() returns a clear error if it's selected
         // without a vault.
-        let provider_registry = aura_llm::LlmProviderRegistry::with_default_providers();
+        let provider_registry = baybo_llm::LlmProviderRegistry::with_default_providers();
         match boot::build_llm_client(
             &config,
             &provider_registry,
             None,
             None,
-            aura_llm::CostHooks::passthrough(),
+            baybo_llm::CostHooks::passthrough(),
         )
         .await
         {
@@ -244,24 +244,24 @@ async fn main() -> anyhow::Result<()> {
         // receiver is fine: nothing in argv would push a trigger anyway,
         // and `ShutdownSignal::new()` returns an un-fired signal.
         builder = builder
-            .session(Arc::new(aura_agent::SessionManager::new(
+            .session(Arc::new(baybo_agent::SessionManager::new(
                 stores.session.clone(),
                 stores.session_summary.clone(),
                 stores.session_folder.clone(),
             )))
-            .job(Arc::new(aura_job::JobLifecycle::new(stores.job.clone())))
+            .job(Arc::new(baybo_job::JobLifecycle::new(stores.job.clone())))
             .trace(stores.trace.clone())
             .cost_store(stores.cost.clone());
         let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(1);
-        let shutdown: Arc<dyn aura_cron::Shutdown> = Arc::new(aura_agent::ShutdownSignal::new());
-        builder = builder.cron(Arc::new(aura_agent::CronScheduler::new(
+        let shutdown: Arc<dyn baybo_cron::Shutdown> = Arc::new(baybo_agent::ShutdownSignal::new());
+        builder = builder.cron(Arc::new(baybo_agent::CronScheduler::new(
             stores.cron.clone(),
             cron_tx,
             shutdown,
         )));
     }
     if let Ok((vault, stores)) = runtime::build_bot_registry_deps(&config).await {
-        let device_service = std::sync::Arc::new(aura_pairing::DevicePairingService::new(
+        let device_service = std::sync::Arc::new(baybo_pairing::DevicePairingService::new(
             stores.device_pairing.clone(),
             stores.device.clone(),
         ));
@@ -296,7 +296,7 @@ async fn main() -> anyhow::Result<()> {
 /// LLM provider configured — they must not trip the bootstrap warning
 /// just by running.
 ///
-/// `aura llm` subcommands intentionally aren't here: their handlers
+/// `baybo llm` subcommands intentionally aren't here: their handlers
 /// construct their own provider client with the vault wired in (see
 /// `cli/src/commands/llm.rs::probe`). Pre-building here would also
 /// fail for the openai-subscription default-llm because argv mode
@@ -308,7 +308,7 @@ fn needs_llm(cmd: &Commands) -> bool {
 /// Subcommands that read `ctx.skills`. Anything else gets an empty
 /// `SkillRegistry`, skipping the per-invocation built-in registration
 /// and on-disk SKILL.md scan that would otherwise fire for every
-/// `aura config get`, `aura cost show`, etc.
+/// `baybo config get`, `baybo cost show`, etc.
 fn needs_skills(cmd: &Commands) -> bool {
     matches!(cmd, Commands::Skills { .. } | Commands::Status { .. })
 }
@@ -316,13 +316,13 @@ fn needs_skills(cmd: &Commands) -> bool {
 /// Subcommands that read `ctx.session` / `ctx.job` / `ctx.trace` /
 /// `ctx.cron` (and therefore the auto-derived `ctx.query_api`).
 ///
-/// Argv mode skips these by default to keep `aura skills list` /
-/// `aura config get` boots cheap; this predicate opts the monitoring
+/// Argv mode skips these by default to keep `baybo skills list` /
+/// `baybo config get` boots cheap; this predicate opts the monitoring
 /// surface back in. `Status { live: false }` stays out — only the
 /// `--live` block needs the live counters.
 ///
 /// Each manager built here uses only storage handles already opened
-/// via `aura_storage::Store::open`. No actors, supervisors, or LLM
+/// via `baybo_storage::Store::open`. No actors, supervisors, or LLM
 /// dependencies — pure read-side wiring.
 fn needs_query_graph(cmd: &Commands) -> bool {
     match cmd {
@@ -345,12 +345,12 @@ fn pick_format(cli: &Cli) -> OutputFormat {
     }
 }
 
-/// Resolve the effective `aura prompt` text: the positional argument,
-/// optionally merged with piped stdin. `aura prompt` with no argument
-/// reads the prompt entirely from stdin (`cat task.md | aura prompt`); an
+/// Resolve the effective `baybo prompt` text: the positional argument,
+/// optionally merged with piped stdin. `baybo prompt` with no argument
+/// reads the prompt entirely from stdin (`cat task.md | baybo prompt`); an
 /// argument *plus* piped stdin appends the stdin as extra context
-/// (`git diff | aura prompt "review this"`). Stdin is read only when it
-/// isn't a terminal, so an interactive `aura prompt` with no argument
+/// (`git diff | baybo prompt "review this"`). Stdin is read only when it
+/// isn't a terminal, so an interactive `baybo prompt` with no argument
 /// can't hang waiting on a human.
 fn resolve_prompt(arg: String) -> anyhow::Result<String> {
     let mut prompt = arg;
@@ -368,7 +368,7 @@ fn resolve_prompt(arg: String) -> anyhow::Result<String> {
     }
     if prompt.trim().is_empty() {
         anyhow::bail!(
-            "no prompt provided — pass it as an argument (`aura prompt \"...\"`) or pipe it via stdin"
+            "no prompt provided — pass it as an argument (`baybo prompt \"...\"`) or pipe it via stdin"
         );
     }
     Ok(prompt)
@@ -376,7 +376,7 @@ fn resolve_prompt(arg: String) -> anyhow::Result<String> {
 
 /// Emit a shell completion script without running the rest of the boot chain.
 fn print_completion(shell: ShellKind) -> anyhow::Result<()> {
-    let out = aura_cli::completion_script(shell).map_err(|e| anyhow::anyhow!(e))?;
+    let out = baybo_cli::completion_script(shell).map_err(|e| anyhow::anyhow!(e))?;
     let rendered = out.render(OutputFormat::Plain);
     print!("{rendered}");
     Ok(())

@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 /// Error returned by every `*Store` trait. Concrete adapters (e.g. the
-/// libsql impls in `aura-storage`) map their backend failures onto these
+/// libsql impls in `baybo-storage`) map their backend failures onto these
 /// variants; callers that need a domain-specific error convert at the
 /// boundary (e.g. `impl From<StorageError> for SessionError`).
 #[derive(Debug, Error)]

@@ -1,7 +1,7 @@
 //! Prompt construction and response parsing for the LLM risk check.
 
-use aura_skills::SkillDefinition;
-use aura_store::RiskLevel;
+use baybo_skills::SkillDefinition;
+use baybo_store::RiskLevel;
 use serde::Deserialize;
 
 /// Max total characters of skill file content sent to the LLM. A huge
@@ -39,8 +39,8 @@ pub(crate) fn build_messages(
     skill: &SkillDefinition,
     scope: Scope,
     files: &[(String, Vec<u8>)],
-) -> Vec<aura_model::ChatMessage> {
-    let system = aura_model::ChatMessage::system(vec![aura_model::ContentBlock::Text(
+) -> Vec<baybo_model::ChatMessage> {
+    let system = baybo_model::ChatMessage::system(vec![baybo_model::ContentBlock::Text(
         SYSTEM_PROMPT.to_string(),
     )]);
 
@@ -108,7 +108,7 @@ pub(crate) fn build_messages(
     user_body.push_str("\nRespond with a single JSON object only — no commentary.");
 
     let user =
-        aura_model::ChatMessage::agent_context(vec![aura_model::ContentBlock::Text(user_body)]);
+        baybo_model::ChatMessage::agent_context(vec![baybo_model::ContentBlock::Text(user_body)]);
 
     vec![system, user]
 }
@@ -165,7 +165,7 @@ struct RawVerdict {
 /// after the JSON body, because real models sometimes add both despite
 /// the system prompt.
 pub(crate) fn parse_verdict(raw: &str) -> Option<(RiskLevel, String)> {
-    let obj = aura_llm::extract_json_object(raw)?;
+    let obj = baybo_llm::extract_json_object(raw)?;
     let parsed: RawVerdict = serde_json::from_str(obj).ok()?;
     let level = RiskLevel::parse(&parsed.level)?;
     let rationale = if parsed.rationale.is_empty() {

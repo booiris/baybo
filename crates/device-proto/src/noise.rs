@@ -72,7 +72,10 @@ impl StaticKeypair {
     }
 
     /// IK initiator (reconnect) — needs the responder's known static pubkey.
-    pub fn ik_initiator(&self, remote_static: &[u8; KEY_LEN]) -> Result<HandshakeState, ProtoError> {
+    pub fn ik_initiator(
+        &self,
+        remote_static: &[u8; KEY_LEN],
+    ) -> Result<HandshakeState, ProtoError> {
         Ok(builder(NOISE_IK)?
             .local_private_key(&self.secret)
             .remote_public_key(remote_static)

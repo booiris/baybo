@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { RiImageLine, RiLoader4Line } from 'react-icons/ri';
 
 // Renders a blob-backed image attachment. `<img>` can't carry the
-// `x-aura-channel-token` header, so we fetch the blob ourselves and hand the
+// `x-baybo-channel-token` header, so we fetch the blob ourselves and hand the
 // bitmap to the tag as an object URL. Re-fetches when the channel token lands
 // (e.g. a queued attachment whose preview rebuilds after a page reload).
 export function AttachmentImage({
@@ -25,7 +25,7 @@ export function AttachmentImage({
       try {
         const base = (baseUrl || '').replace(/\/+$/, '');
         const res = await fetch(`${base}/v1/blobs/${encodeURIComponent(blobId)}`, {
-          headers: { 'x-aura-channel-token': channelToken ?? '' },
+          headers: { 'x-baybo-channel-token': channelToken ?? '' },
         });
         if (!res.ok) throw new Error(`blob ${res.status}`);
         const blob = await res.blob();

@@ -8,7 +8,7 @@ use thiserror::Error;
 ///
 /// Storage-layer failures collapse into [`SessionError::Storage`] —
 /// the libsql backend's structured `StorageError` is stringified at
-/// the boundary so callers never need to depend on `aura-storage`'s
+/// the boundary so callers never need to depend on `baybo-storage`'s
 /// error type.
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -32,16 +32,16 @@ pub enum SessionError {
 
 /// Bridge the libsql-backed store error to the public `SessionError`.
 /// Stringifies generic failures into [`SessionError::Storage`].
-impl From<aura_store::StorageError> for SessionError {
-    fn from(e: aura_store::StorageError) -> Self {
+impl From<baybo_store::StorageError> for SessionError {
+    fn from(e: baybo_store::StorageError) -> Self {
         match e {
-            aura_store::StorageError::NotFound(s) => SessionError::NotFound(s),
-            aura_store::StorageError::Storage(s) => SessionError::Storage(s),
-            aura_store::StorageError::Conflict(s) => SessionError::Storage(s),
-            other @ aura_store::StorageError::TooLarge { .. } => {
+            baybo_store::StorageError::NotFound(s) => SessionError::NotFound(s),
+            baybo_store::StorageError::Storage(s) => SessionError::Storage(s),
+            baybo_store::StorageError::Conflict(s) => SessionError::Storage(s),
+            other @ baybo_store::StorageError::TooLarge { .. } => {
                 SessionError::Storage(other.to_string())
             }
-            aura_store::StorageError::Internal(e) => SessionError::Internal(e),
+            baybo_store::StorageError::Internal(e) => SessionError::Internal(e),
         }
     }
 }

@@ -156,15 +156,15 @@ fn run_glob(base: &std::path::Path, pattern: &str) -> crate::Result<ToolOutput> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, User};
+    use baybo_model::{ChannelType, User};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
     fn ctx() -> ToolContext {
         ToolContext {
             session_id: "t".into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -173,7 +173,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: None,
             notifier: None,

@@ -19,9 +19,9 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use aura_gateway::{LogBuffer, LogBufferLayer};
-use aura_security::{LeakDetector, RedactingMakeWriter};
-use aura_tui::TuiLogSink;
+use baybo_gateway::{LogBuffer, LogBufferLayer};
+use baybo_security::{LeakDetector, RedactingMakeWriter};
+use baybo_tui::TuiLogSink;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
@@ -46,10 +46,10 @@ pub enum TracingMode<'a> {
     Stdout,
     /// One-shot `-p` prompt path: fmt layer to stderr (stdout is reserved
     /// for the assistant's answer), defaulting to `warn` so a piped
-    /// `aura -p` stays quiet unless `RUST_LOG` opts into more.
+    /// `baybo -p` stays quiet unless `RUST_LOG` opts into more.
     Stderr,
     /// Gateway server path: writes rolling daily logs to
-    /// `<log_dir>/aura.log` through a [`RedactingMakeWriter`] so
+    /// `<log_dir>/baybo.log` through a [`RedactingMakeWriter`] so
     /// secrets matching any detector rule are masked on disk.
     File {
         log_dir: &'a Path,
@@ -92,7 +92,7 @@ impl TracingGuards {
 /// `eprintln!` (they don't panic). All entrypoints in this binary are
 /// mutually exclusive, so the single-init invariant holds in practice.
 pub fn init_tracing(mode: TracingMode<'_>) -> TracingGuards {
-    // `aura-tools`'s BashTool exports `AURA_HELP_AGENT=1` around every
+    // `baybo-tools`'s BashTool exports `BAYBO_HELP_AGENT=1` around every
     // CLI invocation, which is how we can tell the binary is being
     // driven by the agent loop rather than a human at a TTY. In that
     // case Stdout-mode tracing has to keep two promises: (a) stay
@@ -102,17 +102,18 @@ pub fn init_tracing(mode: TracingMode<'_>) -> TracingGuards {
     // stdout as JSON, and ESC bytes would become literal `[..]`
     // text and break downstream parsers. `RUST_LOG` always wins if
     // explicitly set.
-    let agent_mode = std::env::var_os(aura_cli::cli::ENV_HELP_AGENT).is_some_and(|v| !v.is_empty());
+    let agent_mode =
+        std::env::var_os(baybo_cli::cli::ENV_HELP_AGENT).is_some_and(|v| !v.is_empty());
     // Keep routine boot chatter out of the way when the payload is the
     // point: agent-driven argv (stdout is captured as JSON) and the `-p`
     // prompt path (stderr is a sidebar to the streamed answer) both
     // default to `warn`. `RUST_LOG` always wins.
     let quiet =
         matches!(mode, TracingMode::Stderr) || (agent_mode && matches!(mode, TracingMode::Stdout));
-    let default_filter = if quiet { "aura=warn" } else { "aura=info" };
+    let default_filter = if quiet { "baybo=warn" } else { "baybo=info" };
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
-    let json = std::env::var("AURA_LOG_FORMAT").unwrap_or_default() == "json";
+    let json = std::env::var("BAYBO_LOG_FORMAT").unwrap_or_default() == "json";
     let log_buffer = LogBuffer::new(LOG_BUFFER_CAPACITY);
     let buffer_layer = LogBufferLayer::new(Arc::clone(&log_buffer));
 
@@ -186,7 +187,7 @@ pub fn init_tracing(mode: TracingMode<'_>) -> TracingGuards {
                 return init_tracing(TracingMode::Stdout);
             }
             let appender =
-                tracing_appender::rolling::daily(log_dir, aura_workspace::paths::LOG_FILE_PREFIX);
+                tracing_appender::rolling::daily(log_dir, baybo_workspace::paths::LOG_FILE_PREFIX);
             let (writer, guard) = tracing_appender::non_blocking(appender);
             let writer = RedactingMakeWriter::new(leak_detector, writer);
             let fmt_layer = fmt::layer()

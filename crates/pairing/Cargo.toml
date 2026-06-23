@@ -1,5 +1,5 @@
 [package]
-name = "aura-pairing"
+name = "baybo-pairing"
 version.workspace = true
 edition.workspace = true
 
@@ -7,8 +7,8 @@ edition.workspace = true
 doctest = false
 
 [dependencies]
-aura-model = { workspace = true }
-aura-store = { workspace = true }
+baybo-model = { workspace = true }
+baybo-store = { workspace = true }
 
 chrono = { workspace = true }
 hex = { workspace = true }
@@ -17,5 +17,5 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-aura-storage = { workspace = true, features = ["test-support"] }
+baybo-storage = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

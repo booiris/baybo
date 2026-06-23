@@ -16,9 +16,9 @@ use spake2::{Ed25519Group, Identity, Password, Spake2};
 use crate::error::ProtoError;
 
 /// Identity label bound into the app side of the handshake.
-pub const ID_APP: &[u8] = b"aura-device-app";
+pub const ID_APP: &[u8] = b"baybo-device-app";
 /// Identity label bound into the gateway side of the handshake.
-pub const ID_GATEWAY: &[u8] = b"aura-device-gateway";
+pub const ID_GATEWAY: &[u8] = b"baybo-device-gateway";
 
 /// One side of an in-flight SPAKE2 exchange. Construct with
 /// [`Pake::start_app`] or [`Pake::start_gateway`], send the returned message

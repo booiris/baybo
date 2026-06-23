@@ -29,12 +29,12 @@ use crate::server::AdminState;
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title = "Aura Admin API",
+        title = "Baybo Admin API",
         description = "TCP + bearer-token surface: config, jobs, cron, traces, skills, tools, channels, LLM."
     ),
     tags(
         (name = "status", description = "Gateway process status"),
-        (name = "config", description = "Read and mutate on-disk AuraConfig"),
+        (name = "config", description = "Read and mutate on-disk BayboConfig"),
         (name = "jobs", description = "Async operation tracking"),
         (name = "cron", description = "Scheduled prompts / tool calls"),
         (name = "traces", description = "Per-session trace export"),

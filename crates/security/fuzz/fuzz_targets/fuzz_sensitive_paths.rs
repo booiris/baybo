@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use aura_security::is_sensitive_path;
+use baybo_security::is_sensitive_path;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

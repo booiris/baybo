@@ -12,10 +12,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use aura_channels::wire::{Frame, Message as WireMessage};
-use aura_channels::{ChannelError, IncomingMessage, MessageRole, NoticeLevel, Result};
-use aura_model::{ChannelType, ContentBlock, SessionId};
-use aura_tools::{ApprovalQueue, ApprovalRequest};
+use baybo_channels::wire::{Frame, Message as WireMessage};
+use baybo_channels::{ChannelError, IncomingMessage, MessageRole, NoticeLevel, Result};
+use baybo_model::{ChannelType, ContentBlock, SessionId};
+use baybo_tools::{ApprovalQueue, ApprovalRequest};
 use parking_lot::RwLock;
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -136,7 +136,7 @@ impl WsTransport {
             attachments: Vec::new(),
             // TUI is selective-kind — dedup is not relevant.
             platform_msg_id: String::new(),
-            role: aura_channels::MessageRole::User,
+            role: baybo_channels::MessageRole::User,
             // Inbound to gateway — server picks up the ordinal on
             // persistence; outbound frames never need it set here.
             ordinal: None,

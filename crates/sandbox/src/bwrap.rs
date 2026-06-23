@@ -107,7 +107,7 @@ pub(crate) fn validate_spec(spec: &SandboxSpec, has_systemd_run: bool) -> Result
                 "resource_limits {:?} (no working `systemd-run --user`)",
                 spec.resource_limits
             ),
-            hint: "install systemd user manager, run aura under a systemd user unit, or pass `ResourceLimits::unlimited()`",
+            hint: "install systemd user manager, run baybo under a systemd user unit, or pass `ResourceLimits::unlimited()`",
         });
     }
     Ok(())

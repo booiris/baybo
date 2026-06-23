@@ -1,5 +1,5 @@
 [package]
-name = "aura-trace"
+name = "baybo-trace"
 version.workspace = true
 edition.workspace = true
 
@@ -10,9 +10,9 @@ doctest = false
 test-support = []
 
 [dependencies]
-aura-model = { workspace = true }
-aura-store = { workspace = true }
-aura-job = { workspace = true }
+baybo-model = { workspace = true }
+baybo-store = { workspace = true }
+baybo-job = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

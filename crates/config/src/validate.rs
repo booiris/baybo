@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use aura_model::MicroUsd;
+use baybo_model::MicroUsd;
 
-use crate::AuraConfig;
+use crate::BayboConfig;
 use crate::browser::BrowserConfig;
 use crate::channels::ChannelsConfig;
 use crate::cost::CostConfig;
@@ -12,7 +12,7 @@ use crate::gateway::GatewayConfig;
 use crate::llm::LlmEntry;
 use crate::workspace::WorkspaceConfig;
 
-impl AuraConfig {
+impl BayboConfig {
     /// Validate the config, collecting every violation. Returns `Ok(())` when
     /// the config is well-formed, or [`ConfigError::Validation`] with the list
     /// of problems otherwise.
@@ -37,9 +37,9 @@ impl AuraConfig {
 
 fn validate_llm_entries(entries: &[LlmEntry], errors: &mut Vec<ValidationError>) {
     // An empty list is valid: a fresh install has no LLM configured
-    // until `aura llm add` runs. Runtime paths that actually need an
+    // until `baybo llm add` runs. Runtime paths that actually need an
     // LLM (boot's build_llm_client, agent loop) error there with a
-    // pointer to `aura llm add`.
+    // pointer to `baybo llm add`.
     let mut seen: HashSet<&str> = HashSet::new();
     for (i, entry) in entries.iter().enumerate() {
         let prefix = format!("llm[{i}]");
@@ -78,7 +78,7 @@ fn validate_llm_entries(entries: &[LlmEntry], errors: &mut Vec<ValidationError>)
     }
 }
 
-fn validate_agent(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
+fn validate_agent(config: &BayboConfig, errors: &mut Vec<ValidationError>) {
     let agent = &config.agent;
     if agent.max_iterations == 0 {
         errors.push(ValidationError::new("agent.max_iterations", "must be >= 1"));
@@ -261,7 +261,7 @@ fn validate_proxy(proxy: Option<&crate::proxy::ProxyConfig>, errors: &mut Vec<Va
 /// Cross-section consistency rules. Runs after per-section validation so that
 /// field-level errors surface first and cross-section rules can assume each
 /// section is internally coherent.
-fn validate_cross_section(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
+fn validate_cross_section(config: &BayboConfig, errors: &mut Vec<ValidationError>) {
     validate_encryption_key_source(&config.security, errors);
     validate_default_llm(config, errors);
     validate_model_tiers(config, errors);
@@ -272,7 +272,7 @@ fn validate_cross_section(config: &AuraConfig, errors: &mut Vec<ValidationError>
 /// Without this the misconfig only surfaces at next startup in
 /// `LlmClientPool::with_tier_map`, after a CLI/gateway mutator has
 /// already persisted the broken config.
-fn validate_model_tiers(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
+fn validate_model_tiers(config: &BayboConfig, errors: &mut Vec<ValidationError>) {
     if config.agent.model_tiers.is_empty() {
         return;
     }
@@ -292,7 +292,7 @@ fn validate_model_tiers(config: &AuraConfig, errors: &mut Vec<ValidationError>) 
     }
 }
 
-fn validate_default_external_agent(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
+fn validate_default_external_agent(config: &BayboConfig, errors: &mut Vec<ValidationError>) {
     let enabled = config.external_agents.enabled_kinds();
     match (
         enabled.len(),
@@ -333,7 +333,7 @@ fn validate_default_external_agent(config: &AuraConfig, errors: &mut Vec<Validat
     }
 }
 
-fn validate_default_llm(config: &AuraConfig, errors: &mut Vec<ValidationError>) {
+fn validate_default_llm(config: &BayboConfig, errors: &mut Vec<ValidationError>) {
     // Empty `default-llm` is fine when `llm` is empty too — a fresh
     // install has nothing to point at. Once any entry exists,
     // `default-llm` must name one of them.
@@ -380,7 +380,7 @@ fn validate_encryption_key_source(
         Some(file) => require_absolute(file, "security.encryption_key_file", errors),
         None => errors.push(ValidationError::new(
             "security.encryption_key_file",
-            "must be set (run `aura setup` to mint a key under <workspace>/.key/encryption.key)",
+            "must be set (run `baybo setup` to mint a key under <workspace>/.key/encryption.key)",
         )),
     }
 }

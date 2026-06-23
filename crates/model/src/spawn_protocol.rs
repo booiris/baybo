@@ -1,15 +1,15 @@
 //! Cross-crate spawn protocol types.
 //!
-//! `aura-subagent` (the `spawn_subagent` tool) and `aura-agent` (the
+//! `baybo-subagent` (the `spawn_subagent` tool) and `baybo-agent` (the
 //! actor-backed spawner, agent loop, and child wait routine) both need to
 //! construct and pattern-match these values. They live here in
-//! `aura-model` so the dependency direction stays one-way without an
+//! `baybo-model` so the dependency direction stays one-way without an
 //! intermediate trait.
 //!
 //! The `Subagent*` family — the per-spawn request / parent-context /
 //! result / exit-status quadruple — is what the LLM-facing
-//! `spawn_subagent` tool hands to the `aura_subagent::SubagentSpawner`
-//! capability (its actor-backed impl lives in `aura-agent`).
+//! `spawn_subagent` tool hands to the `baybo_subagent::SubagentSpawner`
+//! capability (its actor-backed impl lives in `baybo-agent`).
 
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -83,7 +83,7 @@ pub struct SubagentSpawnRequest {
     /// resolves it back to a system prompt via the subagent profile registry
     /// (re-resolved on compaction), so the profile owns the child's identity
     /// for the session's life. Stored as a plain `String` so this crate stays
-    /// a leaf (no dependency on `aura-subagent`).
+    /// a leaf (no dependency on `baybo-subagent`).
     pub subagent_type: String,
     /// 3-5 word summary the parent LLM authored. Trace display only;
     /// not part of the child's initial prompt.
@@ -91,7 +91,7 @@ pub struct SubagentSpawnRequest {
     /// Self-contained brief — becomes the child actor's first user
     /// message.
     pub prompt: String,
-    /// Coarse model tier for the Aura backend. Resolution precedence
+    /// Coarse model tier for the Baybo backend. Resolution precedence
     /// (highest first): this field → profile's `default_tier` → pool
     /// default. Ignored for the External backend, which runs its own
     /// model.
@@ -116,7 +116,7 @@ pub struct SubagentSpawnRequest {
     /// programmatic call sites that don't go through the limiter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fan_out_root: Option<SessionId>,
-    /// Backend that runs this subagent. `Aura` is the default (full
+    /// Backend that runs this subagent. `Baybo` is the default (full
     /// in-process `AgentActor`). `External` routes to a registered
     /// external-agent impl (claude_cli, …) for one-shot delegation.
     #[serde(default)]

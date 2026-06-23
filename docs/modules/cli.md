@@ -2,20 +2,20 @@
 
 ## Overview
 
-The `aura-cli` crate is the **operator-facing command layer** for Aura. It does two things and only two things:
+The `baybo-cli` crate is the **operator-facing command layer** for Baybo. It does two things and only two things:
 
-1. **Argv mode** — `aura <command>` executes a one-shot command against the running (or freshly-loaded) domain graph and exits. Example: `aura config show`, `aura job list`, `aura session export <id>`.
+1. **Argv mode** — `baybo <command>` executes a one-shot command against the running (or freshly-loaded) domain graph and exits. Example: `baybo config show`, `baybo job list`, `baybo session export <id>`.
 2. **Slash mode** — while a user is chatting over any channel, lines starting with `/` (e.g. `/config show`, `/cron list`) are intercepted by the channel adapter, dispatched through the same parser and handlers as Argv mode, and their output returned to the user as a normal response. Slash commands **do not** enter the agent's conversation context.
 
-`aura-cli` adds no business logic. Every command is a thin adapter that turns parsed flags into an existing manager call (`SessionManager`, `JobLifecycle`, `ToolRegistry`, `SkillRegistry`, `CronScheduler`, `SecretVault`, `WorkspaceManager`, `AuraConfig`). When a subsystem is not yet implemented, its command family is omitted — the CLI never surfaces a "zombie" command that prints `not implemented`.
+`baybo-cli` adds no business logic. Every command is a thin adapter that turns parsed flags into an existing manager call (`SessionManager`, `JobLifecycle`, `ToolRegistry`, `SkillRegistry`, `CronScheduler`, `SecretVault`, `WorkspaceManager`, `BayboConfig`). When a subsystem is not yet implemented, its command family is omitted — the CLI never surfaces a "zombie" command that prints `not implemented`.
 
-The command taxonomy is organized by subsystem: one family per manager exposed in `src/main.rs`. Subsystems that do not yet exist in Aura (e.g. service-mode gateway, device pairing, browser control) get no command family at all.
+The command taxonomy is organized by subsystem: one family per manager exposed in `src/main.rs`. Subsystems that do not yet exist in Baybo (e.g. service-mode gateway, device pairing, browser control) get no command family at all.
 
 ## Design Decisions
 
 ### Single parser, two entry points
 
-`Argv` and `Slash` share one `clap::Command` tree built by the `#[derive(Parser)]` types in `cli.rs`. Slash input is shell-tokenized (`shell-words`), the leading `/` is stripped, and the tokens are fed to `Cli::try_parse_from`. The resulting `Commands` enum goes through the same `dispatch::run(ctx, cmd)` async function. This guarantees that `aura foo --bar baz` and `/foo --bar baz` always produce identical results — there is no second parser to drift.
+`Argv` and `Slash` share one `clap::Command` tree built by the `#[derive(Parser)]` types in `cli.rs`. Slash input is shell-tokenized (`shell-words`), the leading `/` is stripped, and the tokens are fed to `Cli::try_parse_from`. The resulting `Commands` enum goes through the same `dispatch::run(ctx, cmd)` async function. This guarantees that `baybo foo --bar baz` and `/foo --bar baz` always produce identical results — there is no second parser to drift.
 
 ### Slash commands do not touch agent context
 
@@ -25,7 +25,7 @@ Reserved slash tokens (`/quit`, `/exit`, `/clear`) stay local to the adapter and
 
 ### `CommandContext` is the only handle
 
-Every command receives a `CommandContext` carrying `Arc` clones of the managers plus the loaded `AuraConfig` and an `OutputSink`. The same struct is used in both modes; only the sink differs (`StdoutSink` vs `ChannelResponseSink`). Commands never reach for globals, never construct their own `Arc`s, and never take `&mut` to any manager — concurrency safety is the manager's responsibility.
+Every command receives a `CommandContext` carrying `Arc` clones of the managers plus the loaded `BayboConfig` and an `OutputSink`. The same struct is used in both modes; only the sink differs (`StdoutSink` vs `ChannelResponseSink`). Commands never reach for globals, never construct their own `Arc`s, and never take `&mut` to any manager — concurrency safety is the manager's responsibility.
 
 ### Explicit mutation confirmation in slash mode
 
@@ -43,44 +43,44 @@ Commands return `CommandOutput`, not `String`. The sink decides how to render:
 
 ### Shell completion is built-in
 
-`aura completion <shell>` uses `clap_complete` to emit bash/zsh/fish/powershell/elvish scripts. No extra scaffolding is needed because clap already owns the tree.
+`baybo completion <shell>` uses `clap_complete` to emit bash/zsh/fish/powershell/elvish scripts. No extra scaffolding is needed because clap already owns the tree.
 
 ### No new error enum
 
-`CliError` (thiserror) carries CLI-specific variants (`Parse`, `ConfirmationRequired`, `UnknownCommand`, `AgentSendForbiddenInSlash`, `NotAvailableInSlash`) plus catch-all wrapper variants (`Config`, `Io`, `Serialization`, `Manager`). `From` impls cover `std::io::Error`, `serde_json::Error`, `aura_config::ConfigError`, and `aura_setup::SetupError`; every other domain error is wrapped via `.to_string()` so `aura-cli` does not take a hard dependency on every domain crate's error enum.
+`CliError` (thiserror) carries CLI-specific variants (`Parse`, `ConfirmationRequired`, `UnknownCommand`, `AgentSendForbiddenInSlash`, `NotAvailableInSlash`) plus catch-all wrapper variants (`Config`, `Io`, `Serialization`, `Manager`). `From` impls cover `std::io::Error`, `serde_json::Error`, `baybo_config::ConfigError`, and `baybo_setup::SetupError`; every other domain error is wrapped via `.to_string()` so `baybo-cli` does not take a hard dependency on every domain crate's error enum.
 
 ### `SlashHandler` lives in `channels`
 
-The trait that lets a channel adapter intercept `/` input is defined in `aura-channels` (not `aura-cli`). `aura-cli` _implements_ the trait but does not own it. This matters for dependency direction: the gateway WS transport and any future telegram/discord sidecar can accept an `Arc<dyn SlashHandler>` without any of them depending on `aura-cli`.
+The trait that lets a channel adapter intercept `/` input is defined in `baybo-channels` (not `baybo-cli`). `baybo-cli` _implements_ the trait but does not own it. This matters for dependency direction: the gateway WS transport and any future telegram/discord sidecar can accept an `Arc<dyn SlashHandler>` without any of them depending on `baybo-cli`.
 
 ## Command Reference
 
 **Global flags** (apply to every command in both modes):
 `--config <path>` · `--json` · `--plain` · `--no-color`
 
-(`-V`/`--version` is clap's root `aura --version`, derived on the top-level `Cli`, not a `GlobalArgs` member.)
+(`-V`/`--version` is clap's root `baybo --version`, derived on the top-level `Cli`, not a `GlobalArgs` member.)
 
-`--config` is UX sugar: `main` writes its value into `AURA_CONFIG_PATH`
+`--config` is UX sugar: `main` writes its value into `BAYBO_CONFIG_PATH`
 once at startup, and every downstream reader goes through the env var.
-So both `aura --config /foo/aura.json …` and
-`AURA_CONFIG_PATH=/foo/aura.json aura …` hit the same code path, and
+So both `baybo --config /foo/baybo.json …` and
+`BAYBO_CONFIG_PATH=/foo/baybo.json baybo …` hit the same code path, and
 installed services (systemd/launchd) that only have env available work
 without special cases.
 
-### `AURA_HELP_AGENT` (extended help)
+### `BAYBO_HELP_AGENT` (extended help)
 
-When `AURA_HELP_AGENT` is set to any non-empty value, `aura --help` (and
-every `aura <subcmd> --help`) surfaces the flags and subcommands hidden
+When `BAYBO_HELP_AGENT` is set to any non-empty value, `baybo --help` (and
+every `baybo <subcmd> --help`) surfaces the flags and subcommands hidden
 from the default view. The goal is to keep the headline surface focused
 on what most operators reach for and keep agent / log / trace inspection
 one env var away for the moments it matters.
 
-The mechanism lives in `aura_cli::cli::parse_args`: it checks the env
+The mechanism lives in `baybo_cli::cli::parse_args`: it checks the env
 var, swaps in an unhidden clap `Command` *before* parsing, and then
 clap's own `--help` machinery prints the extended view. There is no
 custom help printer to keep in sync.
 
-Hidden by default — only listed when `AURA_HELP_AGENT` is set:
+Hidden by default — only listed when `BAYBO_HELP_AGENT` is set:
 
 - Subcommands: `config`, `session`, `job`, `cron`, `log`, `cost`
 
@@ -93,7 +93,7 @@ execution-trace summary (jobs / steps / spans counts) is now appended
 to `session show` directly when the trace graph is wired.
 
 `log` is a distinct family because it reads the **rolling tracing
-files on disk** (`logs/aura.log.<date>`, `logs/channel/<ch>.log.<date>`),
+files on disk** (`logs/baybo.log.<date>`, `logs/channel/<ch>.log.<date>`),
 not the structured `TraceStore`. Different store, different read
 shape — kept top-level.
 
@@ -104,67 +104,67 @@ walks the `Command` flipping `hide(false)` when the env var is set.
 Add a new debug-only surface by setting `hide = true` on its
 arg/variant — `unhide_recursive` picks it up automatically.
 
-**Agent-side opt-in**: `aura-tools::builtin::bash::inject_aura_env`
-prefixes any tool command containing the literal token `aura` with
-`export AURA_HELP_AGENT=1; export AURA_CONFIG_PATH=<absolute path>;`
+**Agent-side opt-in**: `baybo-tools::builtin::bash::inject_baybo_env`
+prefixes any tool command containing the literal token `baybo` with
+`export BAYBO_HELP_AGENT=1; export BAYBO_CONFIG_PATH=<absolute path>;`
 before the subshell runs. The agent gets:
 
-* the full help inventory out of the box (`AURA_HELP_AGENT`);
+* the full help inventory out of the box (`BAYBO_HELP_AGENT`);
 * the same config the parent process is reading — reads
-  `AURA_CONFIG_PATH` from the parent env, falling back to
-  `aura_workspace::paths::default_config_file` so the child `aura`
+  `BAYBO_CONFIG_PATH` from the parent env, falling back to
+  `baybo_workspace::paths::default_config_file` so the child `baybo`
   never silently looks at a different workspace. The path is
   resolved to absolute via `std::path::absolute` so a relative
   debug-mode default still points at the right place after the
   bash tool changes cwd.
 
-The substring match is loose; non-aura processes inherit the
+The substring match is loose; non-baybo processes inherit the
 variables and ignore them, so a false-positive injection is a no-op.
 
 "Status" shows what actually ships today. Rows marked **deferred** are kept here so future contributors can see the target surface; the missing backing APIs land with their subsystems — the original mass-tracker was completed and archived at `docs/todo/archives/cli-write-commands.md`. Handlers for deferred subcommands do not exist — the clap tree in `crates/cli/src/cli.rs` only exposes the shipped rows.
 
 | Family       | Subcommands                                                                                               | Backing module                                                               | Mutation                                                                                           | Status                                            |
 | ------------ | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
-| `config`     | `show [section]` · `file` · `schema` · `validate`                                                         | `AuraConfig` + `boot::load_config`                                           | read-only                                                                                          | shipped                                           |
-| `config`     | `get <path>` · `set <path> <value>` · `unset <path>`                                                      | `AuraConfig::{set_at_path, unset_at_path, write_to_file}`                    | `set`/`unset` write `aura.json`; take effect after restart (hot-reload deferred — see `config.md`) | shipped                                           |
+| `config`     | `show [section]` · `file` · `schema` · `validate`                                                         | `BayboConfig` + `boot::load_config`                                           | read-only                                                                                          | shipped                                           |
+| `config`     | `get <path>` · `set <path> <value>` · `unset <path>`                                                      | `BayboConfig::{set_at_path, unset_at_path, write_to_file}`                    | `set`/`unset` write `baybo.json`; take effect after restart (hot-reload deferred — see `config.md`) | shipped                                           |
 | `skills`     | `list` · `info <name>`                                                                                    | `SkillRegistry`                                                              | read-only                                                                                          | shipped                                           |
 | `skills`     | `search [query]` · `check [name]`                                                                         | `SkillRegistry::search` / `validate_all`                                     | read-only; `check` validates declared `required_bins` on `$PATH`, `required_env` in env, and basic declarative shape; `required_models` is reported as a note only | shipped                                           |
 | `channel`    | `list` · `add` · `remove`                                                                                 | `ChannelBotStore` + vault                                                    | `add`/`remove` mutate; `list` is read-only                                                         | shipped                                           |
 | `channel`    | `status` · `logs [channel]`                                                                               | `ChannelRegistry` / adapter logs                                             | read-only                                                                                          | deferred — needs per-adapter status + log drain   |
-| `mcp`        | `add <name> <command-or-url> [...]` · `list` · `get <name>` · `remove <name>`                              | `aura-tools::mcp` (config: `<workspace>/.mcp.json`) + `SecretVault` (tokens) | `add`/`remove` mutate `.mcp.json` + vault; `add` runs the OAuth flow inline when an OAuth flag is passed for an HTTP server. The running gateway's `McpReconciler` picks up changes within ~5s. | shipped                                           |
+| `mcp`        | `add <name> <command-or-url> [...]` · `list` · `get <name>` · `remove <name>`                              | `baybo-tools::mcp` (config: `<workspace>/.mcp.json`) + `SecretVault` (tokens) | `add`/`remove` mutate `.mcp.json` + vault; `add` runs the OAuth flow inline when an OAuth flag is passed for an HTTP server. The running gateway's `McpReconciler` picks up changes within ~5s. | shipped                                           |
 | `llm`        | `status`                                                                                                  | `LlmClient`                                                                  | read-only                                                                                          | shipped                                           |
 | `llm`        | `probe [name]` · `live-model [name]`                                                                      | `LlmProviderRegistry::list_models` / `LlmClient::probe`                      | `probe` issues a minimal chat request                                                              | shipped                                           |
-| `llm`        | `add` · `edit` · `remove` · `default`                                                                     | Interactive editors that write the active config + vault                     | mutates `aura.json` and per-entry vault keys                                                       | shipped                                           |
-| `memory`     | `status` · `setup` · `test` · `disable`                                                                   | `aura-memory` backends + `UserSecretManager` (`user_env.<NAME>` shared with `aura secret`) | `status` / `test` are read-only (test runs the backend's startup health probe); `setup` is interactive (single-select provider picker + endpoint for openviking) and persists to `aura.json`; the actual API-key value goes through `aura secret add <NAME>` (defaults: `MEM0_API_KEY` / `OPENVIKING_API_KEY`); `disable` flips `provider = noop` and clears `extra`. Memory config is **not** hot-reload, so each mutating command prints a restart hint. | shipped                                           |
-| `external-agent` | `status` · `setup` · `disable` · `default`                                                            | `aura-agent::external_agent` CLI backends (Claude Code / Codex / Gemini)     | `status` re-probes each kind offline (read-only); `setup` is an interactive wizard that probes a binary path and writes the resolved **absolute** `external_agents.<kind>.binary_path` to `aura.json` (empty input = PATH lookup, still recorded as a concrete path); `disable` is a multi-select that flips `external_agents.<kind>.enabled = false` for the checked kinds and re-resolves the default (no-op success when nothing is enabled); `default` sets `external_agents.default_external_agent` to an enabled kind (operator-facing designation — nothing reads it at runtime yet, so no restart) | shipped                                           |
+| `llm`        | `add` · `edit` · `remove` · `default`                                                                     | Interactive editors that write the active config + vault                     | mutates `baybo.json` and per-entry vault keys                                                       | shipped                                           |
+| `memory`     | `status` · `setup` · `test` · `disable`                                                                   | `baybo-memory` backends + `UserSecretManager` (`user_env.<NAME>` shared with `baybo secret`) | `status` / `test` are read-only (test runs the backend's startup health probe); `setup` is interactive (single-select provider picker + endpoint for openviking) and persists to `baybo.json`; the actual API-key value goes through `baybo secret add <NAME>` (defaults: `MEM0_API_KEY` / `OPENVIKING_API_KEY`); `disable` flips `provider = noop` and clears `extra`. Memory config is **not** hot-reload, so each mutating command prints a restart hint. | shipped                                           |
+| `external-agent` | `status` · `setup` · `disable` · `default`                                                            | `baybo-agent::external_agent` CLI backends (Claude Code / Codex / Gemini)     | `status` re-probes each kind offline (read-only); `setup` is an interactive wizard that probes a binary path and writes the resolved **absolute** `external_agents.<kind>.binary_path` to `baybo.json` (empty input = PATH lookup, still recorded as a concrete path); `disable` is a multi-select that flips `external_agents.<kind>.enabled = false` for the checked kinds and re-resolves the default (no-op success when nothing is enabled); `default` sets `external_agents.default_external_agent` to an enabled kind (operator-facing designation — nothing reads it at runtime yet, so no restart) | shipped                                           |
 | `session`    | `list` · `show <id>` · `history <id> [--include-superseded \| --superseded-only]` · `export <id> [--out <path>]` | `SessionManager` + `QueryApi::replay`                                        | read-only. `show` returns metadata + message count + (when `QueryApi` is wired) jobs/steps/spans counts from the trace store. `history` defaults to the *active* (non-superseded) transcript; `--include-superseded` walks the full log and tags each row `[active]` or `[→ #N]`, `--superseded-only` keeps just the dropped rows. `export` writes the full call tree as pretty JSON (stdout, or `--out <path>` with `--yes` required in slash mode). | shipped                                           |
 | `job`        | `list [--status]` · `show <id>` · `cancel <id>`                                                           | `JobLifecycle`                                                               | `cancel` mutates                                                                                   | shipped                                           |
-| `cron`       | `list` · `show <id>`                                                                                      | `CronScheduler::list_all_jobs` / `get_job`                                   | read-only operator view. `show` returns the full job row (prompt body + `origin_session_id` + timestamps); cron jobs are bound to `user_id + channel`, not to a session, so a session's audit trail of cron creations is better viewed via `session export` than a cron-side filter. All cron mutations (create/delete/enable/disable/run) are driven through the LLM tools (`CronCreate`, `CronDelete`, `CronList`) registered by `aura-cron::tools::agent_tools`. | shipped                                           |
-| `log`        | `main [--date <YYYY-MM-DD>] [-n <limit>] [-f/--follow]` · `channel <channel> [--date] [-n] [-f]` | Workspace `logs/` files (`logs/aura.log.<date>`, `logs/channel/<ch>.log.<date>`) written by the tracing appender | read-only. Tails the last `--limit` lines (default 200) by seeking backwards from EOF; `--follow` polls for appended bytes until Ctrl-C (incompatible with `--json`). | shipped                                           |
-| `secret`     | `add [NAME] [--force]` · `list` · `delete [NAME] [--yes]`                                                 | `aura_security::UserSecretManager` over `SecretVault` (`user_env.<NAME>`)    | `add`/`delete` mutate the vault. `add` reads the value via masked TTY input (never an argument that would hit shell history) and is terminal-only (rejected in slash); `list` shows a masked first/last-char preview; `delete` with no NAME is an interactive single-select picker and needs `--yes` in slash mode. Agent-side counterparts are the `SecretAdd`/`SecretList`/`SecretCheck` tools — there is no agent delete. | shipped |
+| `cron`       | `list` · `show <id>`                                                                                      | `CronScheduler::list_all_jobs` / `get_job`                                   | read-only operator view. `show` returns the full job row (prompt body + `origin_session_id` + timestamps); cron jobs are bound to `user_id + channel`, not to a session, so a session's audit trail of cron creations is better viewed via `session export` than a cron-side filter. All cron mutations (create/delete/enable/disable/run) are driven through the LLM tools (`CronCreate`, `CronDelete`, `CronList`) registered by `baybo-cron::tools::agent_tools`. | shipped                                           |
+| `log`        | `main [--date <YYYY-MM-DD>] [-n <limit>] [-f/--follow]` · `channel <channel> [--date] [-n] [-f]` | Workspace `logs/` files (`logs/baybo.log.<date>`, `logs/channel/<ch>.log.<date>`) written by the tracing appender | read-only. Tails the last `--limit` lines (default 200) by seeking backwards from EOF; `--follow` polls for appended bytes until Ctrl-C (incompatible with `--json`). | shipped                                           |
+| `secret`     | `add [NAME] [--force]` · `list` · `delete [NAME] [--yes]`                                                 | `baybo_security::UserSecretManager` over `SecretVault` (`user_env.<NAME>`)    | `add`/`delete` mutate the vault. `add` reads the value via masked TTY input (never an argument that would hit shell history) and is terminal-only (rejected in slash); `list` shows a masked first/last-char preview; `delete` with no NAME is an interactive single-select picker and needs `--yes` in slash mode. Agent-side counterparts are the `SecretAdd`/`SecretList`/`SecretCheck` tools — there is no agent delete. | shipped |
 | `security`   | `audit` · `leaks check <file>`                                                                            | `SecurityGateway::audit` / `LeakDetector::check_file`                        | read-only; `audit` would return rule count by action + vault master-key flag (never secret material); `leaks check` would report blocked/hits via the shared detector | deferred — no `Security` variant in the clap tree yet |
 | `cost`       | `show [--user <u> \| --session <id> \| --job <id>] [--since <YYYY-MM-DD>] [--until <YYYY-MM-DD>]`        | `QueryApi::cost_summary` (`CostScope::{User, Session, Job, TimeRange}`)      | read-only. Scopes are mutually exclusive: `--user` is bounded by `--since`/`--until` (default = current UTC day); `--session`/`--job` ignore the time range. Output reports total micro-USD + token aggregates (input / output / cached input / cache writes). | shipped (requires the full domain graph; returns a `Manager` error in argv-light boots that lack `QueryApi`) |
 | `status`     | `[--live]`                                                                                                | Static: registries + `LlmClient`. Live: `JobLifecycle::list` + `QueryApi::cost_summary` | `--live` adds in-flight job count, failed-jobs-last-24h, and today's spend (USD + token counts). Each live counter degrades to `(unavailable)` when its manager isn't wired in the current invocation. | shipped (live block populated where managers are wired)  |
-| `gateway`    | `start` · `install [--system] [--exec-start <p>]` · `enable` · `disable` · `uninstall` · `status` · `token {show, rotate}` | `aura-gateway` installer + `AdminToken`                                      | `start` runs the long-lived server; `install`/`enable`/`disable`/`uninstall` and `token rotate` mutate; `status`/`token show` are read-only | shipped (intercepted in `src/main.rs` before dispatch, runs in `src/gateway_cmd.rs`) |
-| `pair`       | `list [--pending\|--approved]` · `approve <code>` · `revoke <channel-type> <bot-id> <user-id>`            | `aura-pair` store via `ChannelPairingStore`                                  | `approve`/`revoke` mutate                                                                          | shipped                                           |
+| `gateway`    | `start` · `install [--system] [--exec-start <p>]` · `enable` · `disable` · `uninstall` · `status` · `token {show, rotate}` | `baybo-gateway` installer + `AdminToken`                                      | `start` runs the long-lived server; `install`/`enable`/`disable`/`uninstall` and `token rotate` mutate; `status`/`token show` are read-only | shipped (intercepted in `src/main.rs` before dispatch, runs in `src/gateway_cmd.rs`) |
+| `pair`       | `list [--pending\|--approved]` · `approve <code>` · `revoke <channel-type> <bot-id> <user-id>`            | `baybo-pair` store via `ChannelPairingStore`                                  | `approve`/`revoke` mutate                                                                          | shipped                                           |
 | `prompt`     | `[PROMPT] [--session <id>] [-y/--dangerously-allow-all] [--timeout <secs>]`                               | Hybrid: WS into a live gateway, else in-process `runtime::build_managers` + `wire_router` | runs one agent turn — persists the session row + transcript + traces + cost like any conversation | shipped (intercepted before dispatch, runs in `src/prompt_cmd.rs`) |
 | `tui`        | `[--session <id>]`                                                                                        | WS client into the gateway's channel listener                                | read-only                                                                                          | shipped (intercepted before dispatch, runs in `src/tui_cmd.rs`) |
-| `setup`      | —                                                                                                         | Interactive first-run wizard (`aura-setup`)                                  | bootstraps workspace + master key + default `aura.json`                                            | shipped (intercepted before dispatch, runs in `src/setup_cmd.rs`) |
-| `doctor`     | —                                                                                                         | Aggregates `AuraConfig::validate`, storage ping, `llm::probe`, env-var audit | read-only                                                                                          | shipped (LLM probe gated on `llm probe` landing)  |
+| `setup`      | —                                                                                                         | Interactive first-run wizard (`baybo-setup`)                                  | bootstraps workspace + master key + default `baybo.json`                                            | shipped (intercepted before dispatch, runs in `src/setup_cmd.rs`) |
+| `doctor`     | —                                                                                                         | Aggregates `BayboConfig::validate`, storage ping, `llm::probe`, env-var audit | read-only                                                                                          | shipped (LLM probe gated on `llm probe` landing)  |
 | `completion` | `<shell>`                                                                                                 | `clap_complete`                                                              | stdout only                                                                                        | shipped                                           |
 
 ### `prompt` — headless one-shot turns
 
-`aura prompt [PROMPT]` runs a single agent turn non-interactively: stream
+`baybo prompt [PROMPT]` runs a single agent turn non-interactively: stream
 the assistant's answer to stdout, then exit. It is the non-interactive
 sibling of `tui` — same agent, no UI. With no `PROMPT` argument the text
-is read from stdin (`git diff | aura prompt "review this"`, `cat task.md |
-aura prompt`); an argument *plus* piped stdin are concatenated. Lives in
+is read from stdin (`git diff | baybo prompt "review this"`, `cat task.md |
+baybo prompt`); an argument *plus* piped stdin are concatenated. Lives in
 `src/prompt_cmd.rs`, intercepted in `main.rs` before the generic argv
 dispatch (same as `tui`).
 
 **Hybrid runtime, keyed off the singleton lock.** A running gateway holds
-the `<workspace>/state/aura.lock` flock for its lifetime (`src/singleton.rs`),
+the `<workspace>/state/baybo.lock` flock for its lifetime (`src/singleton.rs`),
 so `prompt` uses lock acquisition as a gateway-presence probe:
 
 - **Lock held** (a gateway is up) → connect over the same `/v1/channel-ws`
@@ -172,8 +172,8 @@ so `prompt` uses lock acquisition as a gateway-presence probe:
   gateway. One owner of the session state, no contention.
 - **Lock free** (no gateway) → acquire it and build the agent runtime
   in-process for the single turn via `runtime::build_managers` +
-  `wire_router`, then tear it down. This is what lets `aura prompt` work
-  standalone with no separate `aura gateway` process. The lock is held for
+  `wire_router`, then tear it down. This is what lets `baybo prompt` work
+  standalone with no separate `baybo gateway` process. The lock is held for
   the whole turn, so a concurrent `prompt` or a gateway start can't race
   the same workspace (the "session data has a single owner" invariant).
   Output is collected by attaching an in-process `ConnectionSink` to the
@@ -182,7 +182,7 @@ so `prompt` uses lock acquisition as a gateway-presence probe:
 
 **Output.** stdout carries only the assistant's answer (streamed as it
 generates); reasoning / tool / status events are dropped and notices go to
-stderr, so `aura prompt … > out.txt` captures just the answer. Tracing
+stderr, so `baybo prompt … > out.txt` captures just the answer. Tracing
 goes to stderr too (`TracingMode::Stderr`, default `warn`). `--json`
 instead buffers and emits one object on stdout: `{"session_id",
 "response"}` on success, or `{"session_id", "error"}` (with a non-zero
@@ -192,16 +192,16 @@ parseable result *and* the session id, whichever way the turn goes.
 **Session id & resume.** The *client* pins the session id — either an
 explicit `--session <id>` (pick a memorable one up front) or a fresh UUID
 minted per run. A run started without `--session` exposes its id **only**
-via `--json` (`sid=$(aura prompt "…" --json | jq -r .session_id)`);
+via `--json` (`sid=$(baybo prompt "…" --json | jq -r .session_id)`);
 plain-text output is just the answer, so capture the id with `--json` (or
 choose your own up front with `--session`) when you intend to resume.
 
-Resume with `aura prompt --session <id> "next turn"`: the agent rehydrates
+Resume with `baybo prompt --session <id> "next turn"`: the agent rehydrates
 that session's context (server-side under a gateway, from the durable row
 in-process) and only the new turn's output is printed — the prior
 transcript is not replayed (the client subscribes with `since_ordinal:
 None`). This mirrors Claude Code's `claude -p --output-format json` →
-`--resume <id>`, except Aura's client (not the server) assigns the id.
+`--resume <id>`, except Baybo's client (not the server) assigns the id.
 
 **Tool approvals** have no human to answer them. Default is `Deny`
 (fail-closed — the turn continues and the model adapts to the denial);
@@ -231,10 +231,10 @@ wait for the turn's reply: on expiry the turn errors out (surfaced as the
 
 Listed so future contributors see the gap explicitly. Each one waits for its subsystem to land:
 
-- **Service lifecycle**: `daemon` — service installation lives under `aura gateway`; no separate `daemon` surface.
-- **Device and node fabric**: `nodes`, `devices` — no paired-peer concept in Aura today. (Per-user pairing approval ships as `aura pair`.)
-- **IDE / external bridges**: `acp`, `mcp serve`, `dashboard` — out of scope until the corresponding subsystems exist. The MCP **client** ships as `aura mcp {add,list,get,remove}` (see the row above); only the *server-side* `mcp serve` family remains deferred.
-- **Rich media**: `browser`, inference over image/audio/video/tts — no Aura counterpart.
+- **Service lifecycle**: `daemon` — service installation lives under `baybo gateway`; no separate `daemon` surface.
+- **Device and node fabric**: `nodes`, `devices` — no paired-peer concept in Baybo today. (Per-user pairing approval ships as `baybo pair`.)
+- **IDE / external bridges**: `acp`, `mcp serve`, `dashboard` — out of scope until the corresponding subsystems exist. The MCP **client** ships as `baybo mcp {add,list,get,remove}` (see the row above); only the *server-side* `mcp serve` family remains deferred.
+- **Rich media**: `browser`, inference over image/audio/video/tts — no Baybo counterpart.
 - **Plugin distribution & installer**: `plugins`, `backup`, `update`, `onboard`, `reset` — release-engineering concerns, not runtime.
 - **Auxiliary directories**: `directory`, `wiki`, `webhooks`, `dns` — deferred until each subsystem lands.
 
@@ -244,9 +244,9 @@ Each family is added under the same naming scheme when its subsystem ships.
 
 ### Wiring
 
-`aura tui` is a `/v1/channel-ws` client into a running gateway: `src/tui_cmd.rs` connects via `WsTransport`, builds `aura_tui::client::TuiSlashHandler` and `TuiDashboardProvider` (both forward calls over the WS to the gateway), and hands them to `TuiAdapter::new().with_slash_handler(...).with_dashboard_provider(...)`. The CLI's `CliSlashHandler` / `CliDashboardProvider` are defined in `aura-cli` for use by future in-process adapters but are not wired by the binary today. Other adapters (HTTP/Telegram/Discord) accept the same `Arc<dyn SlashHandler>` when they land; `DashboardProvider` is only consumed by adapters that can render interactive views (i.e. TUI).
+`baybo tui` is a `/v1/channel-ws` client into a running gateway: `src/tui_cmd.rs` connects via `WsTransport`, builds `baybo_tui::client::TuiSlashHandler` and `TuiDashboardProvider` (both forward calls over the WS to the gateway), and hands them to `TuiAdapter::new().with_slash_handler(...).with_dashboard_provider(...)`. The CLI's `CliSlashHandler` / `CliDashboardProvider` are defined in `baybo-cli` for use by future in-process adapters but are not wired by the binary today. Other adapters (HTTP/Telegram/Discord) accept the same `Arc<dyn SlashHandler>` when they land; `DashboardProvider` is only consumed by adapters that can render interactive views (i.e. TUI).
 
-Persistent TUI input history is owned by the gateway, not `aura-cli`. The TUI loads and appends the ring over the channel WS via `Frame::HistorySnapshot` and `Frame::HistoryAppend`; see [`tui.md`](./tui.md) and [`security.md`](./security.md). This keeps the TUI decoupled from `aura-security` and ensures a single writer (the gateway) owns the encrypted blob, so concurrent `aura tui` clients can't clobber each other.
+Persistent TUI input history is owned by the gateway, not `baybo-cli`. The TUI loads and appends the ring over the channel WS via `Frame::HistorySnapshot` and `Frame::HistoryAppend`; see [`tui.md`](./tui.md) and [`security.md`](./security.md). This keeps the TUI decoupled from `baybo-security` and ensures a single writer (the gateway) owns the encrypted blob, so concurrent `baybo tui` clients can't clobber each other.
 
 ### Dashboard shortcut
 
@@ -266,7 +266,7 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 
 ## Constraints
 
-- `aura-cli` holds no mutable state; all managers are `Arc`. The crate is `Send + Sync + 'static`.
+- `baybo-cli` holds no mutable state; all managers are `Arc`. The crate is `Send + Sync + 'static`.
 - Slash input **must not** be forwarded to the agent when it parses as a known CLI command. Unknown `/` input (parse error `UnknownCommand`) falls back to `PassThrough` only if the dispatcher explicitly says so — never by default. The skill shortcut is the one sanctioned `PassThrough` path: a `/<token>` whose first token matches a user-invocable skill is forwarded to the agent as a normal chat message.
 - Commands that mutate must route their effect through the manager (never touching a store directly), so traces fire naturally.
 - The `SecretVault` value of any secret is never rendered; `security` and `config` commands redact to `********`.
@@ -277,8 +277,8 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 
 | Module                                                                                                              | Role                                                                                                                                                             |
 | ------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `bootstrap` — the `aura` binary at the **workspace root** (`src/main.rs`, `src/boot.rs`, `src/runtime.rs`, `src/gateway_cmd.rs`, `src/tui_cmd.rs`, `src/setup_cmd.rs`), not `crates/cli` (`aura-cli` is lib-only, no `main.rs`) | Promotes `--config` into `AURA_CONFIG_PATH`, then routes to a per-subcommand entry: `gateway_cmd::run` for `gateway`, `setup_cmd::run` for `setup`, `tui_cmd::run` for `tui`, and the lightweight argv path (`aura_cli::dispatch::run` against a `CommandContext`) for everything else. The TUI side (`tui_cmd`) wires `aura-tui`'s WS-backed `TuiSlashHandler` / `TuiDashboardProvider`, not the in-crate `CliSlashHandler`. |
-| `config`                                                                                                            | `config` family directly reads/writes `AuraConfig`; `doctor` calls `validate`.                                                                                   |
+| `bootstrap` — the `baybo` binary at the **workspace root** (`src/main.rs`, `src/boot.rs`, `src/runtime.rs`, `src/gateway_cmd.rs`, `src/tui_cmd.rs`, `src/setup_cmd.rs`), not `crates/cli` (`baybo-cli` is lib-only, no `main.rs`) | Promotes `--config` into `BAYBO_CONFIG_PATH`, then routes to a per-subcommand entry: `gateway_cmd::run` for `gateway`, `setup_cmd::run` for `setup`, `tui_cmd::run` for `tui`, and the lightweight argv path (`baybo_cli::dispatch::run` against a `CommandContext`) for everything else. The TUI side (`tui_cmd`) wires `baybo-tui`'s WS-backed `TuiSlashHandler` / `TuiDashboardProvider`, not the in-crate `CliSlashHandler`. |
+| `config`                                                                                                            | `config` family directly reads/writes `BayboConfig`; `doctor` calls `validate`.                                                                                   |
 | `agent`                                                                                                             | Supplies all manager `Arc`s.                                                                                              |
 | `channels`                                                                                                          | Owns `SlashHandler`, `SlashOutcome`, `DashboardProvider`, `ViewKind`; `TuiAdapter` is the first consumer of all four.                                            |
 | `job` / `cron` / `skills` / `tools` / `session` / `security` / `llm` | Each exposes the read/write APIs that a command family calls. CLI contains no business logic — it is a parameter adapter only.                                   |
@@ -294,10 +294,10 @@ When a command with `Mutating = true` runs in slash mode, its response always in
 **Phase 2a — read-only commands** — complete.
 
 - `cargo fmt && cargo clippy --all --benches --tests --examples --all-features` — zero warnings.
-- `cargo test -p aura-cli` — 14 parser tests + 11 dispatch smoke tests pass.
-- `aura --help` / `aura <family> --help` render; slash `/config file`, `/skills list`, `/channel list` return the same payloads as their argv twins.
-- `aura completion zsh > /tmp/_aura && zsh -c 'source /tmp/_aura'` loads without error.
-- `aura doctor` reports an error when `security.encryption_key_file` is missing or unreadable, and when no LLM client is configured.
+- `cargo test -p baybo-cli` — 14 parser tests + 11 dispatch smoke tests pass.
+- `baybo --help` / `baybo <family> --help` render; slash `/config file`, `/skills list`, `/channel list` return the same payloads as their argv twins.
+- `baybo completion zsh > /tmp/_baybo && zsh -c 'source /tmp/_baybo'` loads without error.
+- `baybo doctor` reports an error when `security.encryption_key_file` is missing or unreadable, and when no LLM client is configured.
 
 **Phase 2b — write-mutating commands** — complete. Tracked in `docs/todo/archives/cli-write-commands.md` (archived). Each shipped family landed with the following:
 

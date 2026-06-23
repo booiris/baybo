@@ -6,12 +6,12 @@
 //!
 //!   1. **Inline `Image`** — base64 in the MCP frame. Decoded here,
 //!      stored in the gateway's [`BlobStore`], and surfaced as a
-//!      [`aura_model::ContentBlock::Image`]. 16 MiB cap.
-//!   2. **`ResourceLink` with an `aura://blob/<id>` URI** — for the
+//!      [`baybo_model::ContentBlock::Image`]. 16 MiB cap.
+//!   2. **`ResourceLink` with an `baybo://blob/<id>` URI** — for the
 //!      browser MCP server's large screenshots. Bytes already landed
 //!      in the blob store via the sidecar's earlier
 //!      `POST /v1/blobs`; the URI's path is the blob_id, so we just
-//!      construct a [`aura_model::BlobRef`] directly. No second
+//!      construct a [`baybo_model::BlobRef`] directly. No second
 //!      download, no size cap (the cap rides on the upload endpoint).
 //!
 //! Other `ResourceLink` URI schemes are elided — handing arbitrary
@@ -21,19 +21,19 @@
 
 use std::sync::Arc;
 
-use aura_model::BlobRef;
-use aura_store::BlobStore;
 use base64::Engine;
+use baybo_model::BlobRef;
+use baybo_store::BlobStore;
 use rmcp::model::{Annotated, RawContent};
 
 use crate::{ToolError, ToolOutput};
 
 /// URI scheme reserved for "this blob is already in the gateway's
 /// BlobStore — here is its id". Embedded MCP servers (the browser
-/// sidecar today) emit `aura://blob/<sha256:hex>` after streaming
+/// sidecar today) emit `baybo://blob/<sha256:hex>` after streaming
 /// bytes via `POST /v1/blobs`. The adapter parses the path and
-/// produces a [`aura_model::BlobRef`] without a second fetch.
-const AURA_BLOB_URI_PREFIX: &str = "aura://blob/";
+/// produces a [`baybo_model::BlobRef`] without a second fetch.
+const BAYBO_BLOB_URI_PREFIX: &str = "baybo://blob/";
 
 /// Hard cap on decoded image bytes per `Image` content part. Mirrors
 /// the cap the deleted `browser_screenshot` enforced — well above any
@@ -50,7 +50,7 @@ pub async fn adapt_call_result(
     blob_store: Option<&Arc<dyn BlobStore>>,
 ) -> crate::Result<ToolOutput> {
     let mut text_parts: Vec<String> = Vec::new();
-    let mut images: Vec<aura_model::ContentBlock> = Vec::new();
+    let mut images: Vec<baybo_model::ContentBlock> = Vec::new();
 
     for part in parts {
         match &part.raw {
@@ -68,19 +68,19 @@ pub async fn adapt_call_result(
             }
             RawContent::Audio(_) => text_parts.push("[audio content elided]".into()),
             RawContent::Resource(_) => text_parts.push("[resource content elided]".into()),
-            RawContent::ResourceLink(link) => match parse_aura_blob_uri(&link.uri) {
+            RawContent::ResourceLink(link) => match parse_baybo_blob_uri(&link.uri) {
                 Some(blob_id) => {
                     let mime = link
                         .mime_type
                         .clone()
                         .unwrap_or_else(|| "application/octet-stream".into());
-                    images.push(aura_model::ContentBlock::Image {
+                    images.push(baybo_model::ContentBlock::Image {
                         blob: BlobRef { blob_id },
                         mime_type: mime,
                     });
                 }
                 None => {
-                    // Non-aura:// URI — could be any http://, file://, …
+                    // Non-baybo:// URI — could be any http://, file://, …
                     // Fetching arbitrary URIs from MCP servers would be
                     // a generic SSRF surface, so we elide.
                     text_parts.push(format!("[external resource link elided: {}]", link.uri));
@@ -114,12 +114,12 @@ pub async fn adapt_call_result(
     Ok(ToolOutput::multi_modal_text(display_text, images))
 }
 
-/// Parse `aura://blob/<blob_id>` and return the `<blob_id>` portion.
+/// Parse `baybo://blob/<blob_id>` and return the `<blob_id>` portion.
 /// Returns `None` when the URI doesn't match the prefix or when the
 /// blob_id segment is empty / contains a path separator (defensive
 /// against a sidecar trying to navigate into an unrelated blob).
-fn parse_aura_blob_uri(uri: &str) -> Option<String> {
-    let rest = uri.strip_prefix(AURA_BLOB_URI_PREFIX)?;
+fn parse_baybo_blob_uri(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix(BAYBO_BLOB_URI_PREFIX)?;
     if rest.is_empty() || rest.contains('/') || rest.contains('\\') {
         return None;
     }
@@ -130,7 +130,7 @@ async fn decode_image(
     b64: &str,
     mime_type: &str,
     blob_store: &Arc<dyn BlobStore>,
-) -> crate::Result<aura_model::ContentBlock> {
+) -> crate::Result<baybo_model::ContentBlock> {
     // Reject upstream of base64 decode using the `b64.len() * 3 / 4`
     // upper bound so we never allocate a 16 MiB buffer just to discard
     // it. Same trick the deleted `browser_screenshot` used.
@@ -158,7 +158,7 @@ async fn decode_image(
         .put(&bytes, mime, None)
         .await
         .map_err(|e| ToolError::Execution(format!("store MCP image blob: {e}")))?;
-    Ok(aura_model::ContentBlock::Image {
+    Ok(baybo_model::ContentBlock::Image {
         blob: blob_ref,
         mime_type: mime.to_string(),
     })
@@ -167,7 +167,7 @@ async fn decode_image(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_storage::test_support::MemoryBlobStore;
+    use baybo_storage::test_support::MemoryBlobStore;
     use rmcp::model::{Annotated, RawImageContent, RawResource, RawTextContent};
 
     fn text(s: &str) -> Annotated<RawContent> {
@@ -234,7 +234,7 @@ mod tests {
                 assert_eq!(llm_images.len(), 1);
                 assert!(matches!(
                     &llm_images[0],
-                    aura_model::ContentBlock::Image { mime_type, .. } if mime_type == "image/png"
+                    baybo_model::ContentBlock::Image { mime_type, .. } if mime_type == "image/png"
                 ));
             }
             other => panic!("expected MultiModalText, got {other:?}"),
@@ -275,37 +275,37 @@ mod tests {
     }
 
     #[test]
-    fn aura_blob_uri_parser_accepts_well_formed() {
+    fn baybo_blob_uri_parser_accepts_well_formed() {
         assert_eq!(
-            parse_aura_blob_uri("aura://blob/sha256:abc123"),
+            parse_baybo_blob_uri("baybo://blob/sha256:abc123"),
             Some("sha256:abc123".to_string()),
         );
     }
 
     #[test]
-    fn aura_blob_uri_parser_rejects_path_traversal() {
+    fn baybo_blob_uri_parser_rejects_path_traversal() {
         // A sidecar embedding `..` in the blob id would otherwise let
         // it construct a BlobRef with whatever path component it
         // wants. Defensive check before the BlobStore lookup.
-        assert!(parse_aura_blob_uri("aura://blob/sha256:..").is_some()); // colon ok
-        assert!(parse_aura_blob_uri("aura://blob/foo/bar").is_none());
-        assert!(parse_aura_blob_uri("aura://blob/foo\\bar").is_none());
-        assert!(parse_aura_blob_uri("aura://blob/").is_none());
+        assert!(parse_baybo_blob_uri("baybo://blob/sha256:..").is_some()); // colon ok
+        assert!(parse_baybo_blob_uri("baybo://blob/foo/bar").is_none());
+        assert!(parse_baybo_blob_uri("baybo://blob/foo\\bar").is_none());
+        assert!(parse_baybo_blob_uri("baybo://blob/").is_none());
     }
 
     #[test]
-    fn aura_blob_uri_parser_rejects_other_schemes() {
-        assert!(parse_aura_blob_uri("http://gateway/v1/blobs/abc").is_none());
-        assert!(parse_aura_blob_uri("file:///tmp/x").is_none());
-        assert!(parse_aura_blob_uri("aura://other/abc").is_none());
+    fn baybo_blob_uri_parser_rejects_other_schemes() {
+        assert!(parse_baybo_blob_uri("http://gateway/v1/blobs/abc").is_none());
+        assert!(parse_baybo_blob_uri("file:///tmp/x").is_none());
+        assert!(parse_baybo_blob_uri("baybo://other/abc").is_none());
     }
 
     #[tokio::test]
-    async fn aura_blob_resource_link_becomes_image_block() {
+    async fn baybo_blob_resource_link_becomes_image_block() {
         let blob_store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         let parts = vec![
             text("here it is"),
-            resource_link("aura://blob/sha256:deadbeef", Some("image/png")),
+            resource_link("baybo://blob/sha256:deadbeef", Some("image/png")),
         ];
         let out = adapt_call_result(&parts, false, Some(&blob_store))
             .await
@@ -315,7 +315,7 @@ mod tests {
                 assert_eq!(text, "here it is");
                 assert_eq!(llm_images.len(), 1);
                 match &llm_images[0] {
-                    aura_model::ContentBlock::Image { blob, mime_type } => {
+                    baybo_model::ContentBlock::Image { blob, mime_type } => {
                         assert_eq!(blob.blob_id, "sha256:deadbeef");
                         assert_eq!(mime_type, "image/png");
                     }

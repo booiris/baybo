@@ -1,5 +1,5 @@
-//! Approval-related value types shared between `aura-tools` (which produces
-//! them at runtime) and `aura-context` / `aura-model` (which persists
+//! Approval-related value types shared between `baybo-tools` (which produces
+//! them at runtime) and `baybo-context` / `baybo-model` (which persists
 //! "approve always" grants on the session).
 //!
 //! Matching semantics (see each enum for details):
@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 
 /// Decision returned by an approval gate.
 ///
-/// Lives in `aura-model` so trace `SpanEvent`s can record approval
-/// outcomes without `aura-trace` having to depend on `aura-tools`.
-/// `aura-tools` re-exports this type so existing call sites keep
+/// Lives in `baybo-model` so trace `SpanEvent`s can record approval
+/// outcomes without `baybo-trace` having to depend on `baybo-tools`.
+/// `baybo-tools` re-exports this type so existing call sites keep
 /// working unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

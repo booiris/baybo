@@ -1,9 +1,9 @@
 //! Outbound HTTP proxy plumbing.
 //!
 //! A single optional egress proxy applied uniformly to every outbound HTTP
-//! call Aura makes. [`ProxySettings`] is the runtime form of the operator's
-//! `proxy` config; the boot layer maps `aura_config::ProxyConfig` into it so
-//! this crate stays free of a `aura-config` dependency.
+//! call Baybo makes. [`ProxySettings`] is the runtime form of the operator's
+//! `proxy` config; the boot layer maps `baybo_config::ProxyConfig` into it so
+//! this crate stays free of a `baybo-config` dependency.
 //!
 //! Two consumption shapes:
 //! - [`client`] / [`client_builder`] for in-process `reqwest` clients (LLM

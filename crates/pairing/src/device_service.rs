@@ -10,8 +10,8 @@
 
 use std::sync::Arc;
 
-use aura_store::device::{DeviceRow, DeviceStatus, DeviceStore};
-use aura_store::device_pairing::{DevicePairingSlot, DevicePairingStore};
+use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore};
+use baybo_store::device_pairing::{DevicePairingSlot, DevicePairingStore};
 use chrono::Utc;
 use rand::RngExt;
 
@@ -42,7 +42,7 @@ impl DevicePairingService {
     }
 
     /// Mint a one-time pairing slot for `user_id`. Returns the short code to
-    /// render in the QR (`aura device pair`). The slot authorizes the SPAKE2
+    /// render in the QR (`baybo device pair`). The slot authorizes the SPAKE2
     /// handshake; it carries no key material.
     pub async fn mint(&self, user_id: &str, label: &str) -> Result<String, DevicePairingError> {
         let now = Utc::now().timestamp();
@@ -103,7 +103,7 @@ impl DevicePairingService {
     }
 
     /// Approve a pending device by its retained pairing code
-    /// (`aura device approve <code>`). Returns the activated row, or `None`
+    /// (`baybo device approve <code>`). Returns the activated row, or `None`
     /// for an unknown / non-pending code.
     pub async fn approve(&self, code: &str) -> Result<Option<DeviceRow>, DevicePairingError> {
         let now = Utc::now().timestamp();
@@ -116,7 +116,7 @@ impl DevicePairingService {
         Ok(self.devices.revoke(user_id, device_id).await?)
     }
 
-    /// List device rows, optionally filtered by status (`aura device list`).
+    /// List device rows, optionally filtered by status (`baybo device list`).
     pub async fn list(
         &self,
         status: Option<DeviceStatus>,
@@ -158,7 +158,7 @@ fn mint_auth_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_storage::test_support::{MemoryDevicePairingStore, MemoryDeviceStore};
+    use baybo_storage::test_support::{MemoryDevicePairingStore, MemoryDeviceStore};
 
     fn service() -> DevicePairingService {
         DevicePairingService::new(
@@ -176,13 +176,14 @@ mod tests {
         let slot = svc.claim_slot(&code).await.unwrap().unwrap();
         assert_eq!(slot.user_id, "user-1");
 
-        let row = svc
-            .complete(&slot, "dev-abc", vec![3u8; 32])
-            .await
-            .unwrap();
+        let row = svc.complete(&slot, "dev-abc", vec![3u8; 32]).await.unwrap();
         assert_eq!(row.status, DeviceStatus::Pending);
         assert_eq!(row.device_pubkey, vec![3u8; 32]);
-        assert_eq!(row.auth_token.len(), AUTH_TOKEN_BYTES * 2, "hex of 32 bytes");
+        assert_eq!(
+            row.auth_token.len(),
+            AUTH_TOKEN_BYTES * 2,
+            "hex of 32 bytes"
+        );
         assert_eq!(row.pairing_code.as_deref(), Some(code.as_str()));
 
         // Slot is consumed — can't be claimed again.
@@ -217,6 +218,11 @@ mod tests {
         svc.approve(&code).await.unwrap();
         assert!(svc.revoke(&row.user_id, "d1").await.unwrap());
         // Revoked devices don't show under the Approved filter.
-        assert!(svc.list(Some(DeviceStatus::Approved)).await.unwrap().is_empty());
+        assert!(
+            svc.list(Some(DeviceStatus::Approved))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -36,11 +36,11 @@ The job read path needs `JobLifecycle::list` (pre-sorted, status-filtered). Usin
 
 ### `Option<Arc<dyn CostStore>>` so trace-only callers can skip cost wiring
 
-`QueryApi::without_costs` constructs an API without a `CostStore`; `cost_summary` then returns `Unsupported`. CLI `aura trace …` commands use this path so they don't need to open the cost table.
+`QueryApi::without_costs` constructs an API without a `CostStore`; `cost_summary` then returns `Unsupported`. CLI `baybo trace …` commands use this path so they don't need to open the cost table.
 
 ## Constraints
 
-- No dependency on `aura-agent` — the query path is pure read, no manager state. `aura-agent` consumes `QueryApi`, not the other way around.
+- No dependency on `baybo-agent` — the query path is pure read, no manager state. `baybo-agent` consumes `QueryApi`, not the other way around.
 - Deletes are upstream stores' responsibility — `QueryApi` never calls `record_transition` or any other mutation method.
 
 ## Collaboration
@@ -49,7 +49,7 @@ The job read path needs `JobLifecycle::list` (pre-sorted, status-filtered). Usin
 | --------- | ------------------------------------------------------------------------------------------------------------- |
 | `store`   | Owns the `SessionStore` / `JobStore` / `TraceStore` / `CostStore` trait contracts, the `StoredMessage` row type, and `StorageError`; `QueryApi` reads through these trait objects |
 | `storage` | Provides the libsql implementations those trait objects resolve to (and the in-memory fakes its tests use)      |
-| `job`     | `JobLifecycle` facade + domain types (`Job`, `JobStatus`, …); the `JobStore` it wraps is an `aura-store` trait  |
+| `job`     | `JobLifecycle` facade + domain types (`Job`, `JobStatus`, …); the `JobStore` it wraps is an `baybo-store` trait  |
 | `trace`   | `Step`, `Span`, `SpanEvent` + their `from_row` conversions — `QueryApi` rehydrates rows into rich types here    |
 | `cost`    | DTOs (`CostSummary`, `TimeRange`); `CostScope` lives here in `query` as the scope enum                          |
 | `model`   | `SessionId`, `JobId`, `StepId`, `MicroUsd`, `Lineage`, `LineageKind`                                           |

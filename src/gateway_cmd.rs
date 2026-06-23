@@ -1,4 +1,4 @@
-//! CLI entrypoint for `aura gateway …` subcommands.
+//! CLI entrypoint for `baybo gateway …` subcommands.
 //!
 //! Intercepted from `main.rs` before the normal argv dispatch path
 //! (same pattern as `Commands::Tui`). The non-serving subcommands
@@ -19,11 +19,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::service::{ShutdownSignal, TaskTracker};
-use aura_cli::cli::{GatewayCmd, GatewayTokenCmd};
-use aura_config::AuraConfig;
-use aura_gateway::installer::{self, InstallContext, ServiceInstaller};
-use aura_gateway::{
+use baybo_agent::service::{ShutdownSignal, TaskTracker};
+use baybo_cli::cli::{GatewayCmd, GatewayTokenCmd};
+use baybo_config::BayboConfig;
+use baybo_gateway::installer::{self, InstallContext, ServiceInstaller};
+use baybo_gateway::{
     AdminToken, ChannelServer, ChannelSpawner, ChannelTokenTable, ClientIdentity, GatewayDeps,
     GatewayServer, RuntimeGatewayConfig, SidecarSupervisor, TUI_CLIENT_LABEL, TUI_TOKEN_VAULT_KEY,
 };
@@ -62,14 +62,14 @@ fn make_installer(user_mode: bool) -> anyhow::Result<Box<dyn ServiceInstaller>> 
 }
 
 fn install_context(
-    config: &AuraConfig,
+    config: &BayboConfig,
     explicit_exec: Option<PathBuf>,
 ) -> anyhow::Result<InstallContext> {
     let exec_start = installer::resolve_exec_start(explicit_exec.as_deref())
         .map_err(|e| anyhow::anyhow!("cannot resolve executable path: {e}"))?;
     let config_path = resolve_install_config_path()?;
     let log_dir =
-        aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path)).logs_dir();
+        baybo_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path)).logs_dir();
     Ok(InstallContext {
         exec_start,
         config_path,
@@ -81,9 +81,9 @@ fn install_context(
 /// Pick the config path to bake into the unit file.
 ///
 /// Resolution order:
-/// 1. `AURA_CONFIG_PATH` — canonicalized; errors if it cannot be
+/// 1. `BAYBO_CONFIG_PATH` — canonicalized; errors if it cannot be
 ///    resolved to an existing file.
-/// 2. `<default_workspace_root>/config/aura.json` — if it already exists.
+/// 2. `<default_workspace_root>/config/baybo.json` — if it already exists.
 /// 3. Otherwise `None`, with a loud stderr warning: the service will
 ///    launch against built-in defaults (no LLM key, default workspace),
 ///    which is almost never what the user actually wants.
@@ -92,7 +92,7 @@ fn install_context(
 /// has to be baked into the unit file at install time — there's no
 /// second chance to pick it up later.
 fn resolve_install_config_path() -> anyhow::Result<Option<PathBuf>> {
-    use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
+    use baybo_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
 
     if let Some(raw) = std::env::var_os(ENV_CONFIG_PATH) {
         let p = PathBuf::from(&raw);
@@ -125,14 +125,14 @@ fn resolve_install_config_path() -> anyhow::Result<Option<PathBuf>> {
     eprintln!(
         "install: WARNING — no {ENV_CONFIG_PATH} and no {} on disk; the installed \
          service will run with built-in defaults (no LLM key, default workspace). Set \
-         {ENV_CONFIG_PATH} and re-run `aura gateway install` if that's not what you want.",
+         {ENV_CONFIG_PATH} and re-run `baybo gateway install` if that's not what you want.",
         default_path.display(),
     );
     Ok(None)
 }
 
 fn install_service(
-    config: &AuraConfig,
+    config: &BayboConfig,
     system: bool,
     explicit_exec: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -146,7 +146,7 @@ fn install_service(
     Ok(())
 }
 
-fn disable(_config: &AuraConfig) -> anyhow::Result<()> {
+fn disable(_config: &BayboConfig) -> anyhow::Result<()> {
     let installer = make_installer(true)?;
     installer
         .disable()
@@ -155,7 +155,7 @@ fn disable(_config: &AuraConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn status(_config: &AuraConfig) -> anyhow::Result<()> {
+fn status(_config: &BayboConfig) -> anyhow::Result<()> {
     let installer = make_installer(true)?;
     let status = installer
         .status()
@@ -164,7 +164,7 @@ fn status(_config: &AuraConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn uninstall(_config: &AuraConfig) -> anyhow::Result<()> {
+async fn uninstall(_config: &BayboConfig) -> anyhow::Result<()> {
     let installer = make_installer(true)?;
     installer
         .uninstall()
@@ -175,7 +175,7 @@ async fn uninstall(_config: &AuraConfig) -> anyhow::Result<()> {
 
 // ---- vault-backed subcommands ----
 
-async fn enable(config: &AuraConfig) -> anyhow::Result<()> {
+async fn enable(config: &BayboConfig) -> anyhow::Result<()> {
     let vault = runtime::build_secret_vault(config).await?;
     let token_mgr = AdminToken::new(vault);
     let token = token_mgr.mint_if_absent().await?;
@@ -185,7 +185,7 @@ async fn enable(config: &AuraConfig) -> anyhow::Result<()> {
     match make_installer(true) {
         Ok(installer) => {
             if let Err(e) = installer.enable() {
-                tracing::warn!(error = %e, "unit not enabled; run `aura gateway install` first");
+                tracing::warn!(error = %e, "unit not enabled; run `baybo gateway install` first");
             }
         }
         Err(e) => tracing::warn!(error = %e, "no installer available"),
@@ -195,21 +195,21 @@ async fn enable(config: &AuraConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn token_show(config: &AuraConfig) -> anyhow::Result<()> {
+async fn token_show(config: &BayboConfig) -> anyhow::Result<()> {
     let vault = runtime::build_secret_vault(config).await?;
     let token_mgr = AdminToken::new(vault);
     match token_mgr.get().await? {
         Some(t) => println!("{t}"),
         None => {
             return Err(anyhow::anyhow!(
-                "no token minted; run `aura gateway enable` first"
+                "no token minted; run `baybo gateway enable` first"
             ));
         }
     }
     Ok(())
 }
 
-async fn token_rotate(config: &AuraConfig) -> anyhow::Result<()> {
+async fn token_rotate(config: &BayboConfig) -> anyhow::Result<()> {
     let vault = runtime::build_secret_vault(config).await?;
     let token_mgr = AdminToken::new(vault);
     let token = token_mgr.rotate().await?;
@@ -219,20 +219,20 @@ async fn token_rotate(config: &AuraConfig) -> anyhow::Result<()> {
 
 // ---- start (long-running) ----
 
-async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
+async fn start(config: Arc<BayboConfig>) -> anyhow::Result<()> {
     // Per-workspace singleton. The gateway owns the same libsql store as
     // the TUI, runs job recovery, and drives cron ticks — two instances
     // against the same workspace would race.
     let workspace_paths =
-        aura_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
-    aura_workspace::WorkspaceManager::new(workspace_paths.root().to_path_buf())
+        baybo_workspace::WorkspacePaths::new(PathBuf::from(&config.workspace.path));
+    baybo_workspace::WorkspaceManager::new(workspace_paths.root().to_path_buf())
         .ensure_layout()
         .await?;
     let _workspace_lock = singleton::acquire(workspace_paths.root())?;
 
     // Register SIGHUP **before** the long boot work below (manager build,
     // sidecar install, router wiring). Until a signal stream exists SIGHUP
-    // sits at its default disposition — terminate — so a concurrent `aura
+    // sits at its default disposition — terminate — so a concurrent `baybo
     // llm` edit that signals our freshly-recorded pid (singleton wrote it
     // just above) would kill the gateway mid-boot. Creating the stream now
     // flips the disposition and buffers any boot-time signal; the reload
@@ -253,7 +253,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // `LeakAction::Replace` rules on the LeakDetector, which happens
     // inside `build_managers` before the detector is sealed into an
     // Arc. The admin token is auto-minted on first run so a fresh
-    // workspace can `aura gateway start` without a prior `enable`. The
+    // workspace can `baybo gateway start` without a prior `enable`. The
     // TUI token is rotated unconditionally on every start — semantics
     // of a "temporary" token: any TUI still holding the previous
     // generation's value must reconnect via the freshly published
@@ -261,7 +261,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     let (token, tui_token) = {
         let vault = runtime::build_secret_vault(&config).await?;
         let admin_token = AdminToken::new(Arc::clone(&vault)).mint_if_absent().await?;
-        let tui_token = aura_gateway::generate_token();
+        let tui_token = baybo_gateway::generate_token();
         vault
             .store_secret(TUI_TOKEN_VAULT_KEY, tui_token.as_bytes())
             .await
@@ -302,7 +302,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // Channel-token table for the TUI handshake. The browser MCP
     // sidecar (chrome-devtools-mcp wrapper) does not use the blob
     // upload backchannel — its screenshots flow through the standard
-    // MCP `attachImage` content type and are decoded by Aura's
+    // MCP `attachImage` content type and are decoded by Baybo's
     // gateway-side `content_adapter`. So no tool/* token registration
     // is needed here.
     let channel_tokens = ChannelTokenTable::new();
@@ -327,8 +327,8 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // the MCP-profile collection (browser MCP server) below and the
     // channel-sidecar supervisor further down. Idempotent install but
     // keeping a single Arc avoids the second filesystem walk.
-    let sidecar_runtime: Option<Arc<aura_gateway::SidecarRuntime>> =
-        match aura_gateway::SidecarRuntime::install() {
+    let sidecar_runtime: Option<Arc<baybo_gateway::SidecarRuntime>> =
+        match baybo_gateway::SidecarRuntime::install() {
             Ok(rt) => Some(Arc::new(rt)),
             Err(e) => {
                 tracing::info!(
@@ -338,10 +338,10 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
                 None
             }
         };
-    let embedded_mcp_servers: Vec<aura_tools::mcp::EmbeddedMcpServer> = sidecar_runtime
+    let embedded_mcp_servers: Vec<baybo_tools::mcp::EmbeddedMcpServer> = sidecar_runtime
         .as_deref()
         .map(|rt| {
-            aura_tools::mcp::embedded_servers(&aura_gateway::collect_profiles(
+            baybo_tools::mcp::embedded_servers(&baybo_gateway::collect_profiles(
                 rt,
                 &config,
                 &workspace_paths,
@@ -351,14 +351,14 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
 
     let shutdown = ShutdownSignal::new();
     // The resolved config path, or the default path when none existed at
-    // boot — so a first-run `aura llm add` that creates the file and
+    // boot — so a first-run `baybo llm add` that creates the file and
     // SIGHUPs us still hot-reloads instead of silently returning
     // `NoConfigPath`. This single value feeds both the reloader and the
     // admin read/mutate surface (`GatewayDeps.config_path`) so the two
     // never diverge — otherwise `GET /v1/config` would keep reporting the
     // boot snapshot after a first-run reload had already applied the file.
     let reload_config_path =
-        boot::resolve_config_path().or_else(|| Some(aura_workspace::paths::default_config_file()));
+        boot::resolve_config_path().or_else(|| Some(baybo_workspace::paths::default_config_file()));
     let mut graph = runtime::build_managers(
         Arc::clone(&config),
         reload_config_path.clone(),
@@ -376,7 +376,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     runtime::install_signal_handler(&mut task_tracker, shutdown.clone());
 
     // SIGHUP → config hot-reload, draining the stream registered before
-    // boot. Covers hand-edits to aura.json and the `aura llm` CLI (which
+    // boot. Covers hand-edits to baybo.json and the `baybo llm` CLI (which
     // signals after writing config and/or rotating a vault credential).
     // `reload` always rebuilds the LLM pool, so a vault key rotation —
     // invisible in the config diff — still takes effect. A signal that
@@ -406,13 +406,13 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     }));
 
     {
-        let mut janitor = aura_janitor::Janitor::new(workspace_paths.clone())
+        let mut janitor = baybo_janitor::Janitor::new(workspace_paths.clone())
             .with_pairing_store(graph.stores.channel_pairing.clone())
             .with_device_pairing_store(graph.stores.device_pairing.clone());
         if let Some(runtime) = sidecar_runtime.as_ref()
             && let Some(cache_root) = runtime.sidecars_cache_root()
         {
-            janitor = janitor.with_sidecar_cache(aura_janitor::SidecarCache {
+            janitor = janitor.with_sidecar_cache(baybo_janitor::SidecarCache {
                 cache_root,
                 live_dirs: runtime.live_dir_names(),
             });
@@ -425,14 +425,14 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         }));
     }
 
-    let channel_control = Arc::new(aura_gateway::ChannelControlRegistry::new());
+    let channel_control = Arc::new(baybo_gateway::ChannelControlRegistry::new());
 
     // CLI-driven bot add/remove writes straight to libsql + vault. The
     // reconciler polls those stores on a short tick and pushes
     // `StartBot` / `StopBot` frames to whichever sidecars are
     // connected. Spawning here so it rides the shared shutdown signal
     // alongside the cron loop and axum servers.
-    let bot_reconciler = Arc::new(aura_gateway::channel::ChannelBotReconciler::new(
+    let bot_reconciler = Arc::new(baybo_gateway::channel::ChannelBotReconciler::new(
         Arc::clone(&channel_control),
         graph.stores.channel_bot.clone(),
         Arc::clone(&graph.secret_vault),
@@ -456,7 +456,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // `WebTokenJanitor::DEFAULT_TTL`. Without this, mints that never
     // reach a `/v1/channel-ws` upgrade leak until process exit.
     {
-        let janitor = aura_gateway::channel::WebTokenJanitor::new(Arc::clone(&web_chat_tokens));
+        let janitor = baybo_gateway::channel::WebTokenJanitor::new(Arc::clone(&web_chat_tokens));
         let shutdown_for_janitor = shutdown.clone();
         task_tracker.track(tokio::spawn(async move {
             janitor.run(shutdown_for_janitor).await;
@@ -468,16 +468,18 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
     // `push` block is configured.
     if graph.config.gateway.push.enabled {
         let push_cfg = &graph.config.gateway.push;
-        let dispatcher = Arc::new(aura_gateway::push::PushDispatcher::new(
+        let dispatcher = Arc::new(baybo_gateway::push::PushDispatcher::new(
             graph.stores.device.clone(),
             graph.stores.session.clone(),
             Arc::clone(&graph.session_manager),
             Arc::clone(&graph.secret_vault),
-            Arc::new(aura_gateway::push::HttpNotifySink::new(&push_cfg.gateway_url)),
+            Arc::new(baybo_gateway::push::HttpNotifySink::new(
+                &push_cfg.gateway_url,
+            )),
             push_cfg.instance_key.clone(),
         ));
         let push_shutdown = shutdown.clone();
-        task_tracker.track(aura_gateway::push::spawn(
+        task_tracker.track(baybo_gateway::push::spawn(
             dispatcher,
             Arc::clone(&graph.job_lifecycle),
             async move { push_shutdown.wait().await },
@@ -542,7 +544,7 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         }
 
         let channel_only: Vec<String> = runtime
-            .names_in_domain(aura_gateway::sidecar::domains::CHANNEL)
+            .names_in_domain(baybo_gateway::sidecar::domains::CHANNEL)
             .map(String::from)
             .collect();
         if !channel_only.is_empty() {

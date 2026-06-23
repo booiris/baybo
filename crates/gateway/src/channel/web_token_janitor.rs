@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aura_agent::service::ShutdownSignal;
+use baybo_agent::service::ShutdownSignal;
 use dashmap::DashMap;
 
 use crate::auth::TokenHandle;

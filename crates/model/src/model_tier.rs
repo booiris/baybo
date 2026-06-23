@@ -1,17 +1,17 @@
 //! Cross-crate model-tier enum used by:
 //!  - `spawn_subagent` (parent LLM picks a tier per spawn)
 //!  - `SubagentProfile.default_tier` (per-type default)
-//!  - `LlmClientPool` (resolves tier → entry name via `aura.json`)
+//!  - `LlmClientPool` (resolves tier → entry name via `baybo.json`)
 //!
 //! The tier abstraction lets the parent LLM express intent ("this is a
 //! cheap exploration", "this is a deep reasoning task") without knowing
-//! which specific `aura.json` entry name happens to be bound to that
+//! which specific `baybo.json` entry name happens to be bound to that
 //! tier in the current deployment. Mapping lives in config.
 
 use serde::{Deserialize, Serialize};
 
 /// Three coarse model-cost tiers. Operators map each tier to a concrete
-/// `llm[*].name` in `aura.json`; if a tier is unmapped the resolver
+/// `llm[*].name` in `baybo.json`; if a tier is unmapped the resolver
 /// falls back to the pool default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

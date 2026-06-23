@@ -45,7 +45,7 @@ pub const ORIGINATOR: &str = "codex_cli_rs";
 /// response when the request comes in without a recognizable browser-like
 /// User-Agent (reqwest's default `reqwest/0.x` triggers it). Pin our own
 /// so the device-code endpoints actually return JSON.
-const USER_AGENT: &str = concat!("aura/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("baybo/", env!("CARGO_PKG_VERSION"));
 const PKCE_VERIFIER_BYTES: usize = 64;
 /// Cap on the body snippet we surface in decode errors, in chars. Long
 /// HTML error pages from the edge can run into the tens of kilobytes —
@@ -101,7 +101,7 @@ pub async fn pkce_login(
     let listener = bind_local_listener(CALLBACK_PORT).map_err(|e| {
         LlmError::Config(format!(
             "openai-subscription: cannot bind 127.0.0.1:{CALLBACK_PORT} for OAuth callback ({e}) \
-             — close any other Codex / aura login in flight, or pass --device-code"
+             — close any other Codex / baybo login in flight, or pass --device-code"
         ))
     })?;
 
@@ -537,7 +537,7 @@ fn await_callback(listener: TcpListener, expected_state: &str) -> io::Result<Str
     }
 
     let body =
-        b"<html><body><h1>aura: ChatGPT subscription linked</h1><p>You can close this tab.</p></body></html>";
+        b"<html><body><h1>baybo: ChatGPT subscription linked</h1><p>You can close this tab.</p></body></html>";
     write_response(&mut stream, 200, "text/html; charset=utf-8", body).ok();
     Ok(code)
 }
@@ -721,13 +721,13 @@ mod tests {
     }
 
     #[test]
-    fn user_agent_pinned_to_aura_crate_version() {
+    fn user_agent_pinned_to_baybo_crate_version() {
         // The default reqwest User-Agent (`reqwest/0.x`) trips the edge's
         // bot heuristics on `auth.openai.com` and the body comes back
         // empty/HTML — pinning a stable identifier is what makes the
         // device-code endpoint return JSON. Lock the shape so a refactor
         // doesn't accidentally drop it back to default.
-        assert!(USER_AGENT.starts_with("aura/"));
+        assert!(USER_AGENT.starts_with("baybo/"));
     }
 
     #[test]

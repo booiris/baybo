@@ -94,12 +94,12 @@ mod tests {
 
     #[test]
     fn plan_tries_each_direct_then_relay() {
-        let plan = connection_plan(&paired(&["wss://aura.lan", "wss://aura.ts"], "node-1"));
+        let plan = connection_plan(&paired(&["wss://baybo.lan", "wss://baybo.ts"], "node-1"));
         assert_eq!(
             plan,
             vec![
-                Endpoint::Direct("wss://aura.lan".into()),
-                Endpoint::Direct("wss://aura.ts".into()),
+                Endpoint::Direct("wss://baybo.lan".into()),
+                Endpoint::Direct("wss://baybo.ts".into()),
                 Endpoint::Relay { node_id: "node-1".into() },
             ],
         );
@@ -107,8 +107,8 @@ mod tests {
 
     #[test]
     fn plan_omits_relay_when_unassigned() {
-        let plan = connection_plan(&paired(&["wss://aura.lan"], ""));
-        assert_eq!(plan, vec![Endpoint::Direct("wss://aura.lan".into())]);
+        let plan = connection_plan(&paired(&["wss://baybo.lan"], ""));
+        assert_eq!(plan, vec![Endpoint::Direct("wss://baybo.lan".into())]);
     }
 
     #[tokio::test]

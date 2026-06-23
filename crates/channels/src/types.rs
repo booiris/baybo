@@ -1,6 +1,6 @@
-use aura_model::{ChannelType, ResourceAccess, SessionId, User};
-use aura_model::{ContentBlock, MessageMetadata};
-use aura_tools::ApprovalDecision;
+use baybo_model::{ChannelType, ResourceAccess, SessionId, User};
+use baybo_model::{ContentBlock, MessageMetadata};
+use baybo_tools::ApprovalDecision;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -48,7 +48,7 @@ pub enum RouterInbound {
 #[derive(Debug, Clone)]
 pub struct OutgoingMessage {
     pub session_id: SessionId,
-    /// Aura user id this response is addressed to — the same value the
+    /// Baybo user id this response is addressed to — the same value the
     /// inbound `Message.sender.id` carried. Channel adapters that route
     /// replies by user (e.g. the Telegram sidecar keying `user_id` to
     /// `chat_id`) consume this instead of reverse-mapping from
@@ -84,7 +84,7 @@ pub struct AgentOutput {
     /// for selective-kind channels; broadcast channels still expose it
     /// for logging.
     pub session_id: SessionId,
-    /// Aura user id this emission is addressed to. See
+    /// Baybo user id this emission is addressed to. See
     /// [`OutgoingMessage::user_id`] for the per-channel routing
     /// rationale. Empty string when not user-addressed (cron / system).
     pub user_id: String,
@@ -147,7 +147,7 @@ pub enum AgentEvent {
     /// changed, or at turn start. An idempotent snapshot — channels that
     /// render a live checklist (the web dashboard) replace their stored list
     /// for the session; surfaces without one drop it.
-    TaskList(Vec<aura_model::Task>),
+    TaskList(Vec<baybo_model::Task>),
     /// Whether a turn (an agent-loop run producing this session's reply)
     /// is in flight. An idempotent snapshot, not an edge. Every emission
     /// is derived from one truth — a non-terminal turn-kind job in the job
@@ -242,7 +242,7 @@ pub enum SessionEvent {
     /// state.
     UserEcho(IncomingMessage),
     /// A tool call is blocked waiting for a human decision. Emitted by
-    /// the channel's [`aura_tools::ApprovalGate`] waker so every
+    /// the channel's [`baybo_tools::ApprovalGate`] waker so every
     /// subscriber to the call's `session_id` can show the approval UI
     /// concurrently; the first `ResolveApproval` wins, and the channel
     /// publishes [`SessionEvent::ApprovalResolved`] to dismiss the

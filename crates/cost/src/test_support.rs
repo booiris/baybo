@@ -1,17 +1,17 @@
 //! In-memory `CostStore` for downstream tests.
 //!
 //! Gated behind the `test-support` cargo feature so it never ships in
-//! release builds. Lives in `aura-cost` (next to the trait it
-//! implements) so crates that depend on `aura-cost` but not on
-//! `aura-storage` can still spin up a fake store for unit tests.
+//! release builds. Lives in `baybo-cost` (next to the trait it
+//! implements) so crates that depend on `baybo-cost` but not on
+//! `baybo-storage` can still spin up a fake store for unit tests.
 
 use async_trait::async_trait;
-use aura_model::{JobId, SessionId};
+use baybo_model::{JobId, SessionId};
 use parking_lot::Mutex;
 
 use crate::error::CostError;
-use aura_model::{CostRecord, CostSummary, TimeRange};
-use aura_store::cost::{CostStore, Result as CostResult};
+use baybo_model::{CostRecord, CostSummary, TimeRange};
+use baybo_store::cost::{CostStore, Result as CostResult};
 
 const fn assert_send<T: Send>() {}
 const _: () = assert_send::<CostError>();

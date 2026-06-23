@@ -23,11 +23,11 @@
 
 use std::sync::Arc;
 
-use aura_agent::SecurityGateway;
-use aura_integration_tests::gateway_with_memory_vault;
-use aura_llm::test_support::StubLlm;
-use aura_llm::{ChatRequest, LlmCompletion, StreamEvent};
-use aura_model::{ChatMessage, ContentBlock};
+use baybo_agent::SecurityGateway;
+use baybo_integration_tests::gateway_with_memory_vault;
+use baybo_llm::test_support::StubLlm;
+use baybo_llm::{ChatRequest, LlmCompletion, StreamEvent};
+use baybo_model::{ChatMessage, ContentBlock};
 use futures::StreamExt;
 
 const AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
@@ -92,7 +92,7 @@ async fn s6_placeholder_split_across_chunks_is_delivered_whole() {
     // Mint a real placeholder and then drive it as a stream that
     // chunks 1 char at a time, forcing `[{` and `}]` across boundaries.
     let (gw, _store, vault) = gateway_with_memory_vault();
-    let minter = aura_security::PlaceholderMinter::from_master_key(vault.master_key());
+    let minter = baybo_security::PlaceholderMinter::from_master_key(vault.master_key());
     let ph = minter.mint(AWS_KEY.as_bytes());
     vault.store_secret(&ph, AWS_KEY.as_bytes()).await.unwrap();
 
@@ -157,7 +157,7 @@ async fn placeholder_already_in_stream_round_trips_unchanged() {
     // other side intact and continue to resolve via the vault.
     let (gw, _store, vault) = gateway_with_memory_vault();
     // Pre-populate the vault as if a prior turn had minted this secret.
-    let minter = aura_security::PlaceholderMinter::from_master_key(vault.master_key());
+    let minter = baybo_security::PlaceholderMinter::from_master_key(vault.master_key());
     let ph = minter.mint(AWS_KEY.as_bytes());
     vault.store_secret(&ph, AWS_KEY.as_bytes()).await.unwrap();
 

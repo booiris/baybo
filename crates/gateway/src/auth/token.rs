@@ -1,11 +1,11 @@
 //! Channel-listener token primitives shared by the gateway server, the
-//! bundled TUI, and the bin's `aura gateway` / `aura tui` boot paths.
+//! bundled TUI, and the bin's `baybo gateway` / `baybo tui` boot paths.
 //!
 //! Two flavours of token end up in the same [`ChannelTokenTable`]:
 //!
 //! * **TUI token** — generated when the gateway boots, stashed in the
 //!   secret vault under [`TUI_TOKEN_VAULT_KEY`], and registered with
-//!   the reserved [`TUI_CLIENT_LABEL`]. The bundled `aura tui` reads
+//!   the reserved [`TUI_CLIENT_LABEL`]. The bundled `baybo tui` reads
 //!   it from the vault and presents it on the channel WebSocket
 //!   upgrade in [`CHANNEL_TOKEN_HEADER`]. The gateway holds the
 //!   returned [`TokenHandle`] for its whole lifetime so the token is
@@ -21,7 +21,7 @@ use dashmap::DashMap;
 use rand::Rng;
 
 /// HTTP header the child or TUI sends to present its capability token.
-pub const CHANNEL_TOKEN_HEADER: &str = "x-aura-channel-token";
+pub const CHANNEL_TOKEN_HEADER: &str = "x-baybo-channel-token";
 
 /// Reserved [`ClientIdentity::label`] value the gateway uses when it
 /// registers the bundled-TUI token at startup. The auth middleware uses
@@ -63,8 +63,8 @@ pub const WEB_CLIENT_LABEL_PREFIX: &str = "web/";
 pub const WEB_OPERATOR_USER_ID: &str = "web-operator";
 
 /// Secret-vault key under which the gateway publishes the current
-/// generation of the TUI channel token. Rotated on every `aura
-/// gateway start`; the bundled `aura tui` reads it back from the vault
+/// generation of the TUI channel token. Rotated on every `baybo
+/// gateway start`; the bundled `baybo tui` reads it back from the vault
 /// to authenticate against the channel listener. Both ends must agree
 /// on the key, hence pinning it here.
 pub const TUI_TOKEN_VAULT_KEY: &str = "gateway.tui_token";

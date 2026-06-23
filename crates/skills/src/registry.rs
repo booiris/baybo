@@ -29,7 +29,7 @@ pub struct SkillSummary {
     pub description: String,
     pub argument_hint: Option<String>,
     pub agent_invocable: bool,
-    pub trust_level: aura_model::TrustLevel,
+    pub trust_level: baybo_model::TrustLevel,
 }
 
 impl From<&SkillDefinition> for SkillSummary {
@@ -87,7 +87,7 @@ impl SkillRegistry {
     /// builtin/*/SKILL.md`).
     ///
     /// Built-ins ship with the cargo `[[bin]]` and are available even on
-    /// a fresh workspace before any `aura skills install` has run.
+    /// a fresh workspace before any `baybo skills install` has run.
     /// Workspace skills registered later (via `load_dir`) with the same
     /// name override the built-in — operators can always patch the
     /// shipped behaviour locally.
@@ -422,7 +422,7 @@ fn binary_on_path(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::{SkillDefinition, SkillRequirements};
-    use aura_model::{ArtifactSource, TrustLevel};
+    use baybo_model::{ArtifactSource, TrustLevel};
 
     fn mk(name: &str, description: &str) -> SkillDefinition {
         SkillDefinition {
@@ -482,7 +482,7 @@ mod tests {
     fn validate_flags_missing_binary_and_env_var() {
         let mut skill = mk("needs-deps", "calls external tool");
         skill.requirements.required_bins = vec!["definitely_not_a_real_binary_12345".into()];
-        skill.requirements.required_env = vec!["AURA_NONEXISTENT_ENV_VAR_FOR_TESTS".into()];
+        skill.requirements.required_env = vec!["BAYBO_NONEXISTENT_ENV_VAR_FOR_TESTS".into()];
 
         let reg = SkillRegistry::new();
         reg.register(skill);
@@ -594,7 +594,8 @@ mod tests {
 
     #[test]
     fn load_dir_reads_skill_md_per_subdirectory() {
-        let dir = std::env::temp_dir().join(format!("aura-skills-load-dir-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("baybo-skills-load-dir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -629,7 +630,7 @@ mod tests {
     #[test]
     fn load_dir_missing_directory_returns_zero() {
         let reg = SkillRegistry::new();
-        let loaded = reg.load_dir(Path::new("/definitely/does/not/exist/aura-skills"));
+        let loaded = reg.load_dir(Path::new("/definitely/does/not/exist/baybo-skills"));
         assert_eq!(loaded, 0);
     }
 
@@ -644,7 +645,7 @@ mod tests {
 
     #[test]
     fn reload_picks_up_additions_edits_and_deletions() {
-        let dir = std::env::temp_dir().join(format!("aura-skills-reload-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("baybo-skills-reload-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let write_skill = |name: &str, desc: &str| {

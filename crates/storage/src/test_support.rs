@@ -9,13 +9,13 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use async_trait::async_trait;
-use aura_model::BlobRef;
+use baybo_model::BlobRef;
 use futures::StreamExt;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
-use aura_store::StorageError;
-use aura_store::blob::{
+use baybo_store::StorageError;
+use baybo_store::blob::{
     BlobMeta, BlobReader, BlobStore, ByteStream, Result as BlobResult, SHA256_PREFIX,
 };
 
@@ -178,13 +178,11 @@ fn split_id(blob_id: &str) -> BlobResult<(&str, &str)> {
 }
 
 // ---------------------------------------------------------------------------
-// Device registry + pairing-slot fakes (used by `aura-pairing` service tests)
+// Device registry + pairing-slot fakes (used by `baybo-pairing` service tests)
 // ---------------------------------------------------------------------------
 
-use aura_store::device::{DeviceRow, DeviceStatus, DeviceStore, Result as DeviceResult};
-use aura_store::device_pairing::{
-    DevicePairingSlot, DevicePairingStore, Result as SlotResult,
-};
+use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore, Result as DeviceResult};
+use baybo_store::device_pairing::{DevicePairingSlot, DevicePairingStore, Result as SlotResult};
 
 /// In-memory [`DeviceStore`] keyed by `(user_id, device_id)`.
 #[derive(Default)]
@@ -256,9 +254,10 @@ impl DeviceStore for MemoryDeviceStore {
 
     async fn approve_by_code(&self, code: &str, now: i64) -> DeviceResult<Option<DeviceRow>> {
         let mut g = self.rows.lock();
-        let Some(row) = g.values_mut().find(|r| {
-            r.pairing_code.as_deref() == Some(code) && r.status == DeviceStatus::Pending
-        }) else {
+        let Some(row) = g
+            .values_mut()
+            .find(|r| r.pairing_code.as_deref() == Some(code) && r.status == DeviceStatus::Pending)
+        else {
             return Ok(None);
         };
         row.status = DeviceStatus::Approved;

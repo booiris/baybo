@@ -1,5 +1,5 @@
 //! The `pair` command's transport: dial the gateway's `/v1/device/pair` WS and
-//! drive the 4-message SPAKE2 handshake through `aura_mobile_core::PairingClient`.
+//! drive the 4-message SPAKE2 handshake through `baybo_mobile_core::PairingClient`.
 //!
 //! The crypto + state machine live in the host-tested core; this file is just
 //! the WebSocket pump (msgpack `PairFrame`s as binary frames) + the bits the
@@ -7,7 +7,7 @@
 
 use device_proto::noise::StaticKeypair;
 use device_proto::pairing::{self, ApnsEnv, PairFrame};
-use aura_mobile_core::{PairedGateway, PairingClient, PairingRequest};
+use baybo_mobile_core::{PairedGateway, PairingClient, PairingRequest};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio_tungstenite::connect_async;
@@ -33,7 +33,7 @@ impl From<&PairedGateway> for PairedSummary {
             relay_node_id: p.relay_node_id.clone(),
             direct_candidates: p.direct_candidates.clone(),
             pairing_code: p.pairing_code.clone(),
-            // The token is inert until the operator runs `aura device approve`.
+            // The token is inert until the operator runs `baybo device approve`.
             pending_approval: true,
         }
     }
@@ -83,7 +83,7 @@ pub async fn run_pairing(
         .map_err(|e| e.to_string())?;
 
     // Persist the push key to the shared App Group keychain so the NSE can
-    // decrypt lock-screen previews (account `aura.push-key.<device_id>`, since
+    // decrypt lock-screen previews (account `baybo.push-key.<device_id>`, since
     // the gateway stamps `bid = device_id` into every push payload).
     crate::keychain::store_push_key(&device_id, &paired.push_key)
         .map_err(|e| format!("persist push key: {e}"))?;

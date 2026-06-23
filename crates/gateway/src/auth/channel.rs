@@ -1,6 +1,6 @@
 //! Channel auth middleware.
 //!
-//! Single authentication mode — the `x-aura-channel-token` header (or
+//! Single authentication mode — the `x-baybo-channel-token` header (or
 //! `?token=` query for runtimes that can't set custom headers on a WS
 //! upgrade). Every entry in [`ChannelTokenTable`] carries a
 //! [`ClientIdentity`] (pid + label); the middleware looks up the
@@ -11,7 +11,7 @@
 //! The TUI token is minted by the gateway at startup, written to the
 //! secret vault under [`super::token::TUI_TOKEN_VAULT_KEY`], and
 //! registered in the same [`ChannelTokenTable`] with
-//! [`TUI_CLIENT_LABEL`]. The bundled `aura tui` reads it back from
+//! [`TUI_CLIENT_LABEL`]. The bundled `baybo tui` reads it back from
 //! the vault and presents the same hex string. Subprocess sidecars
 //! get their token via env var (see [`crate::spawn`]); each
 //! [`crate::spawn::ChildHandle`] owns the
@@ -30,12 +30,12 @@ use super::token::{
     CHANNEL_TOKEN_HEADER, ChannelTokenTable, ClientIdentity, TOOL_CLIENT_LABEL_PREFIX,
     TUI_CLIENT_LABEL, WEB_CLIENT_LABEL_PREFIX,
 };
-use aura_store::DeviceStore;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::Response;
+use baybo_store::DeviceStore;
 
 /// Tag placed on the request after auth succeeds so downstream
 /// handlers know how the caller was authenticated.
@@ -155,9 +155,9 @@ where
 /// Middleware: validates the channel token header (or `?token=` query),
 /// stashes [`AuthedClient`] in request extensions, forwards.
 ///
-/// All failure paths log at `debug!` under `aura_gateway::auth::channel`
+/// All failure paths log at `debug!` under `baybo_gateway::auth::channel`
 /// with enough context to diagnose "why 401?" without leaking the
-/// secret. Enable with `RUST_LOG=aura_gateway::auth::channel=debug`.
+/// secret. Enable with `RUST_LOG=baybo_gateway::auth::channel=debug`.
 pub async fn require_channel_auth(
     State(state): State<ChannelAuthState>,
     mut req: Request<Body>,
@@ -221,7 +221,7 @@ pub async fn require_channel_auth(
                 has_tok_query,
                 live_tokens = state.tokens.len(),
                 "channel auth: no credential; rejecting with 401 \
-                 (no x-aura-channel-token header and no ?token= query)",
+                 (no x-baybo-channel-token header and no ?token= query)",
             );
             Err(StatusCode::UNAUTHORIZED)
         }
@@ -488,18 +488,18 @@ mod tests {
 
     #[tokio::test]
     async fn approved_device_token_resolves_to_device() {
-        use aura_storage::test_support::MemoryDeviceStore;
+        use baybo_storage::test_support::MemoryDeviceStore;
         use std::sync::Arc;
 
         let store = Arc::new(MemoryDeviceStore::new());
         store
-            .create(&aura_store::DeviceRow {
+            .create(&baybo_store::DeviceRow {
                 user_id: "u1".into(),
                 device_id: "d1".into(),
                 label: "iPhone".into(),
                 device_pubkey: vec![0u8; 32],
                 auth_token: "devtok".into(),
-                status: aura_store::DeviceStatus::Approved,
+                status: baybo_store::DeviceStatus::Approved,
                 pairing_code: Some("CODE12".into()),
                 created_at: 1,
                 approved_at: Some(2),
@@ -525,18 +525,18 @@ mod tests {
 
     #[tokio::test]
     async fn pending_device_token_is_rejected() {
-        use aura_storage::test_support::MemoryDeviceStore;
+        use baybo_storage::test_support::MemoryDeviceStore;
         use std::sync::Arc;
 
         let store = Arc::new(MemoryDeviceStore::new());
         store
-            .create(&aura_store::DeviceRow {
+            .create(&baybo_store::DeviceRow {
                 user_id: "u1".into(),
                 device_id: "d1".into(),
                 label: "iPhone".into(),
                 device_pubkey: vec![0u8; 32],
                 auth_token: "pendtok".into(),
-                status: aura_store::DeviceStatus::Pending,
+                status: baybo_store::DeviceStatus::Pending,
                 pairing_code: Some("CODE12".into()),
                 created_at: 1,
                 approved_at: None,

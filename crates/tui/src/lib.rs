@@ -1,6 +1,6 @@
-//! Ratatui-based TUI for `aura tui`.
+//! Ratatui-based TUI for `baybo tui`.
 //!
-//! The TUI is a thin client on top of an `aura-gateway` reached over
+//! The TUI is a thin client on top of an `baybo-gateway` reached over
 //! a WS+MessagePack channel socket (see [`client::WsTransport`]).
 //!
 //! Rendering model:
@@ -30,7 +30,7 @@ mod keymap;
 pub mod smoke_contract;
 pub mod transport;
 
-pub use aura_tools::ApprovalQueue;
+pub use baybo_tools::ApprovalQueue;
 pub use event::{LogLevel, LogRecord, TuiLogSink};
 pub use transport::{TransportEvent, TransportEventStream};
 
@@ -39,12 +39,12 @@ use std::panic;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use aura_channels::{
+use baybo_channels::{
     ChannelError, DashboardProvider, IncomingMessage, Message, NoticeLevel, Result, STOP_COMMAND,
     STOP_COMMAND_NAME, SlashHandler, SlashOutcome, ViewKind,
 };
-use aura_model::{ChannelType, SessionId, User};
-use aura_model::{ContentBlock, MessageMetadata};
+use baybo_model::{ChannelType, SessionId, User};
+use baybo_model::{ContentBlock, MessageMetadata};
 use chrono::Utc;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyEvent,
@@ -1353,13 +1353,17 @@ async fn handle_key(
             }
         }
         Action::ApprovalApprove => {
-            resolve_approval(state, terminal, aura_tools::ApprovalDecision::Approve)?;
+            resolve_approval(state, terminal, baybo_tools::ApprovalDecision::Approve)?;
         }
         Action::ApprovalApproveAlways => {
-            resolve_approval(state, terminal, aura_tools::ApprovalDecision::ApproveAlways)?;
+            resolve_approval(
+                state,
+                terminal,
+                baybo_tools::ApprovalDecision::ApproveAlways,
+            )?;
         }
         Action::ApprovalDeny => {
-            resolve_approval(state, terminal, aura_tools::ApprovalDecision::Deny)?;
+            resolve_approval(state, terminal, baybo_tools::ApprovalDecision::Deny)?;
         }
         Action::ApprovalSelectPrev => {
             state.approval_select_prev();
@@ -1500,7 +1504,7 @@ async fn interrupt_turn(
 fn resolve_approval(
     state: &mut AppState,
     terminal: &mut Term,
-    decision: aura_tools::ApprovalDecision,
+    decision: baybo_tools::ApprovalDecision,
 ) -> io::Result<()> {
     let Some(outcome) = state.resolve_active_approval(decision) else {
         return Ok(());
@@ -1592,7 +1596,7 @@ fn enter_dashboard_mode(
     in_alt_screen: &Arc<std::sync::atomic::AtomicBool>,
     state: &mut AppState,
     kind: ViewKind,
-    snapshot: aura_channels::DashboardSnapshot,
+    snapshot: baybo_channels::DashboardSnapshot,
 ) -> io::Result<()> {
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     in_alt_screen.store(true, std::sync::atomic::Ordering::Relaxed);

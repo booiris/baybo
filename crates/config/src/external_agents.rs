@@ -1,6 +1,6 @@
 //! Per-external-agent operator config.
 
-use aura_model::ExternalAgentKind;
+use baybo_model::ExternalAgentKind;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -25,8 +25,8 @@ pub struct ClaudeConfig {
     /// `false` is the trust signal: an installed `claude` on PATH
     /// does NOT auto-grant the LLM access to a host-execution
     /// channel — the operator must opt in explicitly (via
-    /// `aura external-agent setup`, `aura setup`, or by editing
-    /// `aura.json`).
+    /// `baybo external-agent setup`, `baybo setup`, or by editing
+    /// `baybo.json`).
     pub enabled: bool,
     /// Path to the `claude` binary. `None` falls back to `PATH`
     /// lookup. Only consulted when `enabled = true`.
@@ -78,7 +78,7 @@ impl ExternalAgentsConfig {
     }
 
     /// One entry per `ExternalAgentKind`, in `ALL` order. The boot
-    /// path feeds this to `aura_agent::external_agent::build_registry`
+    /// path feeds this to `baybo_agent::external_agent::build_registry`
     /// without further per-kind translation. Adding a new kind: extend
     /// `ExternalAgentKind::ALL`, add a config struct field, extend
     /// this iterator.

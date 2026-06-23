@@ -17,11 +17,11 @@ use crate::error::ProtoError;
 
 /// HKDF `info` label for the push key (the AEAD key the NSE decrypts previews
 /// with). Versioned so a future rotation scheme can bump it without ambiguity.
-pub const PUSH_KEY_INFO: &[u8] = b"aura/device/push-key/v1";
+pub const PUSH_KEY_INFO: &[u8] = b"baybo/device/push-key/v1";
 
 /// HKDF `info` label for the one-time SPAKE2 K-channel key (protects the
 /// static-key exchange + push registration during pairing).
-pub const CHANNEL_KEY_INFO: &[u8] = b"aura/device/pair-channel/v1";
+pub const CHANNEL_KEY_INFO: &[u8] = b"baybo/device/pair-channel/v1";
 
 /// The subkeys both ends derive from the SPAKE2 master secret at pairing.
 #[derive(Clone)]

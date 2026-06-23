@@ -1,6 +1,6 @@
 //! Shared dial path for CLI commands that act as a WS channel client of
-//! a running `aura gateway` — the interactive TUI (`aura tui`) and the
-//! headless one-shot prompt (`aura -p`).
+//! a running `baybo gateway` — the interactive TUI (`baybo tui`) and the
+//! headless one-shot prompt (`baybo -p`).
 //!
 //! Both connect the same way: resolve the gateway's admin listener from
 //! config, read the per-start TUI token the gateway published to the
@@ -13,16 +13,16 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use aura_channels::ChannelError;
-use aura_config::AuraConfig;
-use aura_gateway::TUI_TOKEN_VAULT_KEY;
-use aura_tui::client::WsTransport;
+use baybo_channels::ChannelError;
+use baybo_config::BayboConfig;
+use baybo_gateway::TUI_TOKEN_VAULT_KEY;
+use baybo_tui::client::WsTransport;
 
 /// Resolve the admin listener address from the loaded config. When the
 /// gateway is bound to a wildcard interface (`0.0.0.0` / `::`), a
 /// same-host client rewrites it to loopback — the wildcard is a server-
 /// side bind directive, not a dialable target.
-pub fn admin_addr_from_config(config: &AuraConfig) -> anyhow::Result<SocketAddr> {
+pub fn admin_addr_from_config(config: &BayboConfig) -> anyhow::Result<SocketAddr> {
     let host = config.gateway.bind_address.as_str();
     let ip: IpAddr = host
         .parse()
@@ -41,7 +41,7 @@ pub fn admin_addr_from_config(config: &AuraConfig) -> anyhow::Result<SocketAddr>
 /// caller as the same "no live gateway" fallback path. A loud error
 /// would only mask the more specific connect-failure message that the
 /// dial attempt produces a moment later.
-pub async fn read_tui_token(config: &AuraConfig) -> Option<String> {
+pub async fn read_tui_token(config: &BayboConfig) -> Option<String> {
     let vault = match crate::runtime::build_secret_vault(config).await {
         Ok(v) => v,
         Err(e) => {
@@ -76,7 +76,7 @@ pub async fn read_tui_token(config: &AuraConfig) -> Option<String> {
 pub async fn try_connect_with_token(
     admin_addr: SocketAddr,
     tui_token: Option<&str>,
-    session_id: &aura_model::SessionId,
+    session_id: &baybo_model::SessionId,
 ) -> Result<WsTransport, ChannelError> {
     let token = tui_token.ok_or_else(|| {
         ChannelError::NotReachable(format!(
@@ -90,6 +90,6 @@ pub async fn try_connect_with_token(
 /// that fixes it.
 pub fn unreachable_gateway_error(admin_addr: SocketAddr, underlying: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "no aura gateway reachable at {admin_addr}\n  - start it with:       aura gateway start\n  (underlying error: {underlying})"
+        "no baybo gateway reachable at {admin_addr}\n  - start it with:       baybo gateway start\n  (underlying error: {underlying})"
     )
 }

@@ -1,6 +1,6 @@
-# Aura iOS — Apple-side artifacts (NSE)
+# Baybo iOS — Apple-side artifacts (NSE)
 
-The Rust client core (`app/mobile/ios/core`, crate `aura-mobile-core`) is the
+The Rust client core (`app/mobile/ios/core`, crate `baybo-mobile-core`) is the
 FFI-free, host-tested protocol engine: pairing (scan-to-connect), the Noise
 content session (self-pull), and the direct-first/relay-fallback connection
 policy. It cross-compiles to `aarch64-apple-ios` unchanged.
@@ -31,7 +31,7 @@ verifiable **without Xcode** — `verify-crypto.swift` runs the same
 
 ```
 $ swift app/mobile/ios/apple/verify-crypto.swift
-PASS: CryptoKit decrypt matches the Rust AEAD fixture (title=Aura, body=The agent finished replying.)
+PASS: CryptoKit decrypt matches the Rust AEAD fixture (title=Baybo, body=The agent finished replying.)
 PASS: wrong key -> nil (placeholder kept)
 ```
 
@@ -54,7 +54,7 @@ The gateway (A) encrypts the preview and the push role (C) sends APNs this body
 
 ```json
 {
-  "aps": { "alert": { "title": "Aura", "body": "New message" }, "mutable-content": 1 },
+  "aps": { "alert": { "title": "Baybo", "body": "New message" }, "mutable-content": 1 },
   "enc": "<base64 ciphertext||tag>",
   "n":   "<base64 12-byte nonce>",
   "kid": "<key id>",
@@ -69,15 +69,15 @@ the 32-byte push key for `bid`, nonce = `n`, empty AAD) into
 ## Wiring it into the Tauri app (needs the iOS toolchain)
 
 1. `cd app/mobile/ios && cargo tauri ios init` — generates the Xcode project
-   under `src-tauri/gen/apple/` wrapping `aura-mobile-core`.
+   under `src-tauri/gen/apple/` wrapping `baybo-mobile-core`.
 2. In Xcode, **File ▸ New ▸ Target ▸ Notification Service Extension**; replace
    its generated `NotificationService.swift` with the two `.swift` sources here
    and add `NotificationServiceTests.swift` to a test target.
 3. **App Group + keychain sharing**: add an App Group (e.g.
-   `group.com.aura.app`) to *both* the app and the NSE targets, and a shared
+   `group.com.baybo.app`) to *both* the app and the NSE targets, and a shared
    `keychain-access-groups` entitlement. Set `PushKeyStore.accessGroup` to it.
 4. At pairing, the host app must write the derived 32-byte push key to the
-   shared keychain at account `aura.push-key.<bid>` (generic password,
+   shared keychain at account `baybo.push-key.<bid>` (generic password,
    `kSecAttrAccessGroup` = the App Group) — the read side is `PushKeyStore`.
 5. Enable the **Push Notifications** + **Background Modes ▸ Remote
    notifications** capabilities on the app target (M4: real APNs needs an Apple
@@ -88,6 +88,6 @@ the 32-byte push key for `bid`, nonce = `n`, empty AAD) into
 
 - **Tauri app shell + any UI** — needs the iOS toolchain (`cargo tauri ios init`,
   Xcode, Simulator). Phase 1 may stay UI-less; the Rust commands wrap
-  `aura-mobile-core`.
+  `baybo-mobile-core`.
 - **M4 real APNs** — needs an Apple Developer account + a physical device to
   obtain a device token and exercise the live `.p8` send.

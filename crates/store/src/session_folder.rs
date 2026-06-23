@@ -7,7 +7,7 @@
 //! cascade that removes conversations.
 
 use async_trait::async_trait;
-use aura_model::FolderId;
+use baybo_model::FolderId;
 use chrono::{DateTime, Utc};
 
 use crate::StorageError;
@@ -68,5 +68,5 @@ pub trait SessionFolderStore: Send + Sync {
     /// Returns the ids of sessions whose assignment was cleared so the
     /// caller can broadcast per-session "now uncategorized" patches for live
     /// convergence without a refetch.
-    async fn delete(&self, id: &FolderId) -> Result<Option<Vec<aura_model::SessionId>>>;
+    async fn delete(&self, id: &FolderId) -> Result<Option<Vec<baybo_model::SessionId>>>;
 }

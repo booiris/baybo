@@ -4,12 +4,12 @@
 //! data)` shape they always have — `data` carries the full
 //! [`CronJob`] / [`CronExecution`] as JSON, and the queryable columns
 //! are projected out at write time. The translation lives here (not
-//! in the cron scheduler) so `aura-cron` can stay free of `aura-storage`.
+//! in the cron scheduler) so `baybo-cron` can stay free of `baybo-storage`.
 
 use async_trait::async_trait;
-use aura_model::{CronExecution, CronJob, ExecutionStatus};
-use aura_store::StorageError;
-use aura_store::cron::{CronStore, Result};
+use baybo_model::{CronExecution, CronJob, ExecutionStatus};
+use baybo_store::StorageError;
+use baybo_store::cron::{CronStore, Result};
 
 use super::LibsqlPool;
 
@@ -410,8 +410,8 @@ impl CronStore for LibsqlCronStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::ChannelType;
-    use aura_model::{CronSchedule, CronStatus};
+    use baybo_model::ChannelType;
+    use baybo_model::{CronSchedule, CronStatus};
     use chrono::Utc;
 
     fn future_dt() -> chrono::DateTime<Utc> {

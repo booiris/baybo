@@ -1,7 +1,7 @@
 //! Per-connection control-plane handles for registered sidecars.
 //!
 //! The agent's output path already has a home: `AgentOutput`s flow
-//! through the [`aura_channels::Channel`] + its `mpsc::Sender<AgentOutput>`.
+//! through the [`baybo_channels::Channel`] + its `mpsc::Sender<AgentOutput>`.
 //! But the admin surface needs to push **raw wire frames** (specifically
 //! `Frame::StartBot` / `Frame::StopBot`) to the currently-connected
 //! sidecar, bypassing `AgentOutput` entirely. This registry hands out
@@ -12,8 +12,8 @@
 //! TUI) don't participate — only sidecars that multiplex tenants on
 //! their end care about `StartBot`/`StopBot`.
 
-use aura_channels::wire::Frame;
-use aura_model::ChannelType;
+use baybo_channels::wire::Frame;
+use baybo_model::ChannelType;
 use dashmap::DashMap;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -39,7 +39,7 @@ impl ChannelControlRegistry {
 
     /// Record the sidecar's outbound frame mpsc so the admin thread
     /// can later push control frames to it. Replacing a previously
-    /// registered entry is intentional — [`aura_channels::ChannelRegistry`]
+    /// registered entry is intentional — [`baybo_channels::ChannelRegistry`]
     /// already rejects duplicate sidecars at the same layer, and if
     /// somehow two connections get past that guard the newer pump is
     /// the one still live.

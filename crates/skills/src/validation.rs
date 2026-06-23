@@ -2,7 +2,7 @@
 //!
 //! A `SKILL.md` file is untrusted input until it has been verified: a
 //! hostile manifest can try to forge a higher trust level by breaking
-//! out of the XML attributes Aura uses when surfacing the active skill
+//! out of the XML attributes Baybo uses when surfacing the active skill
 //! to the model (`<skill name="..." version="...">`). These validators
 //! reject the dangerous shapes at load time. Rendering-time escaping
 //! lives in [`crate::render`].
@@ -21,7 +21,7 @@ static SKILL_NAME_PATTERN: LazyLock<Regex> =
 /// Valid skill versions: a permissive semver-ish subset (alphanumerics
 /// plus `.-+_~`), 1-32 chars. Excludes `<`, `>`, `"`, whitespace, and
 /// control characters — anything that could break out of an XML
-/// attribute when Aura renders the active-skill tag.
+/// attribute when Baybo renders the active-skill tag.
 static SKILL_VERSION_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9._\-+~]{1,32}$").expect("hardcoded regex"));
 

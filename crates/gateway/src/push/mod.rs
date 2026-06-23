@@ -18,13 +18,13 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use device_proto::aead;
-use aura_job::{JobInputKind, JobLifecycle, JobLifecycleEvent, JobPhase, JobShape};
-use aura_model::{ContentBlock, JobId, Role, SessionId};
-use aura_security::SecretVault;
-use aura_session::SessionManager;
-use aura_store::{DeviceStatus, DeviceStore, SessionStore};
 use base64::Engine;
+use baybo_job::{JobInputKind, JobLifecycle, JobLifecycleEvent, JobPhase, JobShape};
+use baybo_model::{ContentBlock, JobId, Role, SessionId};
+use baybo_security::SecretVault;
+use baybo_session::SessionManager;
+use baybo_store::{DeviceStatus, DeviceStore, SessionStore};
+use device_proto::aead;
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::json;
@@ -241,7 +241,13 @@ impl PushDispatcher {
 
     async fn dispatch_completed(&self, ev: &JobLifecycleEvent) -> usize {
         let start_cursor = self.start_cursors.lock().remove(&ev.job_id);
-        let Some(session) = self.session_manager.get(&ev.session_id).await.ok().flatten() else {
+        let Some(session) = self
+            .session_manager
+            .get(&ev.session_id)
+            .await
+            .ok()
+            .flatten()
+        else {
             return 0;
         };
         let devices = self
@@ -255,7 +261,10 @@ impl PushDispatcher {
         let preview = self.build_preview(&ev.session_id, start_cursor).await;
         let mut sent = 0;
         for d in devices {
-            match self.dispatch_to_device(&d.device_id, &ev.session_id, &preview).await {
+            match self
+                .dispatch_to_device(&d.device_id, &ev.session_id, &preview)
+                .await
+            {
                 Ok(()) => sent += 1,
                 Err(e) => tracing::debug!(error = %e, "push: skipped a device"),
             }
@@ -320,12 +329,16 @@ impl PushDispatcher {
             .load_active_session_messages(session_id)
             .await
             .ok()?;
-        messages.iter().rev().find(|m| m.role == Role::Assistant).and_then(|m| {
-            m.content.iter().find_map(|cb| match cb {
-                ContentBlock::Text(t) => Some(t.clone()),
-                _ => None,
+        messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .and_then(|m| {
+                m.content.iter().find_map(|cb| match cb {
+                    ContentBlock::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
             })
-        })
     }
 }
 
@@ -348,7 +361,7 @@ fn preview_json(text: Option<&str>) -> String {
         Some(t) => t.chars().take(PREVIEW_MAX_CHARS).collect::<String>(),
         None => "New message".to_string(),
     };
-    json!({ "title": "Aura", "body": body }).to_string()
+    json!({ "title": "Baybo", "body": body }).to_string()
 }
 
 /// Pure: AEAD-seal `preview` under `key`, base64 the output, and frame the
@@ -361,7 +374,8 @@ fn build_notify_body(
     key: &[u8; PUSH_KEY_LEN],
     preview: &str,
 ) -> Result<NotifyBody, String> {
-    let (nonce, ciphertext) = aead::seal(key, preview.as_bytes()).map_err(|e| format!("seal: {e}"))?;
+    let (nonce, ciphertext) =
+        aead::seal(key, preview.as_bytes()).map_err(|e| format!("seal: {e}"))?;
     let b64 = base64::engine::general_purpose::STANDARD;
     Ok(NotifyBody {
         instance_key: instance_key.to_string(),
@@ -409,7 +423,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::JobId;
+    use baybo_model::JobId;
 
     fn event(phase: JobPhase, shape: JobShape, kind: JobInputKind) -> JobLifecycleEvent {
         JobLifecycleEvent {
@@ -465,9 +479,9 @@ mod tests {
     #[test]
     fn notify_body_is_decryptable_with_the_push_key() {
         let key = [9u8; PUSH_KEY_LEN];
-        let preview = r#"{"title":"Aura","body":"the agent finished"}"#;
-        let body =
-            build_notify_body("inst-A", "dev-1", &SessionId::from("sess-7"), &key, preview).unwrap();
+        let preview = r#"{"title":"Baybo","body":"the agent finished"}"#;
+        let body = build_notify_body("inst-A", "dev-1", &SessionId::from("sess-7"), &key, preview)
+            .unwrap();
 
         assert_eq!(body.instance_key, "inst-A");
         assert_eq!(body.device_id, "dev-1");
@@ -486,9 +500,15 @@ mod tests {
     #[test]
     fn read_after_write_gate_waits_for_a_newer_row() {
         assert!(landed(Some(5), Some(4)), "a newer row landed → go");
-        assert!(!landed(Some(4), Some(4)), "no new row since turn start → wait");
+        assert!(
+            !landed(Some(4), Some(4)),
+            "no new row since turn start → wait"
+        );
         assert!(!landed(Some(3), Some(4)), "stale latest → wait");
-        assert!(landed(Some(9), None), "no start cursor → best-effort accept");
+        assert!(
+            landed(Some(9), None),
+            "no start cursor → best-effort accept"
+        );
         assert!(!landed(None, Some(4)), "empty session → wait");
     }
 
@@ -496,8 +516,11 @@ mod tests {
     fn preview_json_truncates_and_falls_back_to_placeholder() {
         let long = "x".repeat(500);
         let v: serde_json::Value = serde_json::from_str(&preview_json(Some(&long))).unwrap();
-        assert_eq!(v["title"], "Aura");
-        assert_eq!(v["body"].as_str().unwrap().chars().count(), PREVIEW_MAX_CHARS);
+        assert_eq!(v["title"], "Baybo");
+        assert_eq!(
+            v["body"].as_str().unwrap().chars().count(),
+            PREVIEW_MAX_CHARS
+        );
         // None → generic placeholder (never a stale previous-turn reply).
         let g: serde_json::Value = serde_json::from_str(&preview_json(None)).unwrap();
         assert_eq!(g["body"], "New message");

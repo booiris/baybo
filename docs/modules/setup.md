@@ -2,38 +2,38 @@
 
 ## Problem
 
-A fresh Aura install has *nothing* on disk: no workspace dir, no
-master encryption key, no `aura.json`, no libsql storage, no
-configured LLM. The existing argv commands (`aura llm add`,
-`aura channel add`, …) all assume the encryption key + vault are
-already up; the gateway boot path assumes a valid `aura.json`. Without
+A fresh Baybo install has *nothing* on disk: no workspace dir, no
+master encryption key, no `baybo.json`, no libsql storage, no
+configured LLM. The existing argv commands (`baybo llm add`,
+`baybo channel add`, …) all assume the encryption key + vault are
+already up; the gateway boot path assumes a valid `baybo.json`. Without
 a wizard, an operator's first run goes:
 
 1. Generate a 32-byte hex key by hand and write it under a path of
    their choice.
-2. Hand-author `aura.json` with `security.encryption_key_file` set to
+2. Hand-author `baybo.json` with `security.encryption_key_file` set to
    that path, plus enough other sections to validate.
 3. Start the gateway once so the vault opens, *then* run
-   `aura llm add` to register a provider.
+   `baybo llm add` to register a provider.
 4. Restart the gateway so the new entry takes effect.
 
-`aura setup` collapses that down to one interactive command that
+`baybo setup` collapses that down to one interactive command that
 
 - bootstraps the workspace skeleton (`config/`, `profile/`, `skills/`,
   `.key/`, `state/`, `work/`, `logs/`),
 - mints the master encryption key at `<root>/.key/encryption.key`
   with mode 0600,
-- writes a default `aura.json` pinned to that key,
+- writes a default `baybo.json` pinned to that key,
 - opens libsql storage and the secret vault,
 - walks an LLM-provider step (Quick + Full both run it), an optional
   channel-bot step, (Full only) an optional browser-tool step, and an
   external-agents step (Quick + Full both run it),
-- writes the final `aura.json` once at the end (never partway through),
-- and prints a hint with the next commands (`aura gateway start` /
-  `aura tui`) and exits — it never starts the gateway itself.
+- writes the final `baybo.json` once at the end (never partway through),
+- and prints a hint with the next commands (`baybo gateway start` /
+  `baybo tui`) and exits — it never starts the gateway itself.
 
 The command is also idempotent: running it on a workspace that
-already exists reuses the key and the existing `aura.json`, and
+already exists reuses the key and the existing `baybo.json`, and
 re-prompts only the steps the operator chooses (LLM step's
 `Add another / Skip`, channel step's `Add another / Skip`).
 
@@ -42,23 +42,23 @@ re-prompts only the steps the operator chooses (LLM step's
 ### Layering
 
 ```text
-aura-cli (top)            aura-cli::commands::{llm,channel}::add — thin wrappers
+baybo-cli (top)            baybo-cli::commands::{llm,channel}::add — thin wrappers
     │
-    └─► aura-setup ◄──── public API: Prompter, flow::*, run_*, print_exit_hint
+    └─► baybo-setup ◄──── public API: Prompter, flow::*, run_*, print_exit_hint
             │
-            ├─ aura-config / aura-security (vault + encryption key)
-            ├─ aura-llm (provider catalog + OAuth)
-            ├─ aura-channels (sidecar registration protocol)
-            ├─ aura-storage (libsql open + SecretStore + ChannelBotStore)
-            ├─ aura-workspace (paths, ensure_layout)
-            └─ aura-gateway (SidecarRuntime, BUN_BINARY_ENV)
+            ├─ baybo-config / baybo-security (vault + encryption key)
+            ├─ baybo-llm (provider catalog + OAuth)
+            ├─ baybo-channels (sidecar registration protocol)
+            ├─ baybo-storage (libsql open + SecretStore + ChannelBotStore)
+            ├─ baybo-workspace (paths, ensure_layout)
+            └─ baybo-gateway (SidecarRuntime, BUN_BINARY_ENV)
 ```
 
 The wizard's per-step interactive primitives live in
-`aura_setup::flow::*`. The CLI's `aura llm add` / `aura channel add`
+`baybo_setup::flow::*`. The CLI's `baybo llm add` / `baybo channel add`
 are now ~10-line wrappers that build a `TtyPrompter`, call the
 matching `flow::configure_*_step(allow_skip = false)`, and write
-`aura.json`. So "the wizard's LLM step is the same as `aura llm add`"
+`baybo.json`. So "the wizard's LLM step is the same as `baybo llm add`"
 is *structurally* the same code, not a soft promise.
 
 ### Step 0 — workspace bootstrap
@@ -76,9 +76,9 @@ Before showing any picker, `bootstrap_workspace_if_needed`:
    `hex::encode(EncryptionKey::generate().as_bytes())` and write that
    hex to the path with `O_CREAT | O_EXCL` and mode 0600. Exists →
    reused as-is.
-3. Resolves the config path (`AURA_CONFIG_PATH` env override else
-   `<root>/config/aura.json`). Missing → write
-   `AuraConfig::default()` with `security.encryption_key_file`
+3. Resolves the config path (`BAYBO_CONFIG_PATH` env override else
+   `<root>/config/baybo.json`). Missing → write
+   `BayboConfig::default()` with `security.encryption_key_file`
    pointing at the freshly-minted key. Existing → load and reuse;
    patch in the key file pointer only if the existing config
    left `encryption_key_file` unset.
@@ -92,7 +92,7 @@ handed to every flow primitive. `WorkspacePaths` is a local inside
 `config_path` or build their own as needed. Steps mutate `config` in
 memory; the runner commits exactly once at the end.
 
-### β2 — single `aura.json` write at the end
+### β2 — single `baybo.json` write at the end
 
 Each step performs its own external side effects as it runs:
 
@@ -100,13 +100,13 @@ Each step performs its own external side effects as it runs:
 - libsql rows (channel bot metadata),
 - platform-side sidecar registrations (Telegram BotFather, etc.).
 
-The **only** deferred write is `aura.json`. The wizard accumulates
+The **only** deferred write is `baybo.json`. The wizard accumulates
 the desired config in memory, validates the whole thing once at the
-very end, and atomic-writes via `AuraConfig::write_to_file`.
+very end, and atomic-writes via `BayboConfig::write_to_file`.
 
-A Ctrl-C before the final write leaves `aura.json` untouched. Vault
+A Ctrl-C before the final write leaves `baybo.json` untouched. Vault
 and libsql side effects persist; a re-run picks them up via the
-"Add another / Skip" pickers and the new `aura.json` write at the
+"Add another / Skip" pickers and the new `baybo.json` write at the
 end becomes authoritative.
 
 ### OAuth stranding semantics
@@ -144,7 +144,7 @@ editing JSON:
    prompt is hidden when docker is on.
 
 Other knobs (viewport, profile_dir, chrome_path, cdp_url) stay at
-defaults — operators wanting custom values edit `aura.json`
+defaults — operators wanting custom values edit `baybo.json`
 directly.
 
 ### External-agents step (Quick + Full)
@@ -162,8 +162,8 @@ default }` is surfaced on `SetupOutcome`.
 ### Exit hint
 
 Setup never starts the gateway itself. Once the config is committed it
-prints a hint with the `aura gateway start` / `aura tui` commands and
-returns cleanly — the operator starts the daemon themselves. `aura
+prints a hint with the `baybo gateway start` / `baybo tui` commands and
+returns cleanly — the operator starts the daemon themselves. `baybo
 gateway start` then prints the dashboard URL followed by the admin
 token (each on its own line; the token is deliberately not embedded in
 a `?token=` URL, which would leak it into the access log).
@@ -179,14 +179,14 @@ a `?token=` URL, which would leak it into the access log).
   with `allow_skip = true` (Quick + Full).
 
 There is no `setup_state.json` or partial-progress file: a Ctrl-C
-mid-wizard leaves `aura.json` unchanged, and the next run just
+mid-wizard leaves `baybo.json` unchanged, and the next run just
 prompts again.
 
 ### TTY-only / `--json` refusal
 
-`aura setup --json` errors out with a clear message: an interactive
+`baybo setup --json` errors out with a clear message: an interactive
 wizard has no scripted-mode contract, and operators wanting argv
-automation should chain `aura llm add` / `aura channel add` directly
+automation should chain `baybo llm add` / `baybo channel add` directly
 (both reach the same `flow::*` primitives). The slash dispatcher
 returns `AgentSendForbiddenInSlash("setup")` because interactive
 prompts don't fit the slash-command shape.
@@ -234,10 +234,10 @@ pub mod test_support {
   `OpenOptionsExt::mode(0o600)` and the masked-secret reader uses
   termios `ECHO`/`ICANON` toggles. Matches the project-wide Unix
   posture (`docs/modules/cli.md`).
-- **No `aura.json` write before commit**: any flow primitive that
+- **No `baybo.json` write before commit**: any flow primitive that
   needs to write the file is by definition wrong — they must mutate
   `config` in place. The runner is the one allowed writer.
-- **OAuth bundle is single-key**: `aura llm add` and the wizard's
+- **OAuth bundle is single-key**: `baybo llm add` and the wizard's
   LLM step both write `llm.openai-subscription.tokens` as one
   bundle; running setup twice with `openai-subscription` rotates
   the refresh token (each login overwrites).
@@ -249,12 +249,12 @@ pub mod test_support {
 
 | Crate                | What setup uses                                                         |
 | -------------------- | ----------------------------------------------------------------------- |
-| `aura-config`        | `AuraConfig` (load/validate/write), `LlmEntry`, `BrowserConfig`         |
-| `aura-security`      | `EncryptionKey::new`, `SecretVault::new`/`store_secret`                 |
-| `aura-llm`           | `LlmProviderRegistry`, `default_base_url_for_provider`, OAuth (`pkce_login` / `device_code_login`, `VaultTokenStore`). (`BUILTIN_PROVIDERS` is a local `const` in `flow/llm.rs`, not from `aura-llm`.) |
-| `aura-channels`      | `register_wire::*`, `registration::Prompter` + `RegistrationResult`     |
-| `aura-storage`       | `Store::open`, `retry_on_busy`. (`ChannelBotStore` is defined in `aura-store` and imported via `aura_store::ChannelBotStore`.) |
-| `aura-workspace`     | `WorkspacePaths`, `WorkspaceManager::ensure_layout`, `default_workspace_root` |
-| `aura-gateway`       | `SidecarRuntime`, `BUN_BINARY_ENV`, `SIDECAR_ENV_ALLOWLIST`             |
-| `aura-cli`           | Wrappers: `commands::llm::add`, `commands::channel::add_bot`            |
+| `baybo-config`        | `BayboConfig` (load/validate/write), `LlmEntry`, `BrowserConfig`         |
+| `baybo-security`      | `EncryptionKey::new`, `SecretVault::new`/`store_secret`                 |
+| `baybo-llm`           | `LlmProviderRegistry`, `default_base_url_for_provider`, OAuth (`pkce_login` / `device_code_login`, `VaultTokenStore`). (`BUILTIN_PROVIDERS` is a local `const` in `flow/llm.rs`, not from `baybo-llm`.) |
+| `baybo-channels`      | `register_wire::*`, `registration::Prompter` + `RegistrationResult`     |
+| `baybo-storage`       | `Store::open`, `retry_on_busy`. (`ChannelBotStore` is defined in `baybo-store` and imported via `baybo_store::ChannelBotStore`.) |
+| `baybo-workspace`     | `WorkspacePaths`, `WorkspaceManager::ensure_layout`, `default_workspace_root` |
+| `baybo-gateway`       | `SidecarRuntime`, `BUN_BINARY_ENV`, `SIDECAR_ENV_ALLOWLIST`             |
+| `baybo-cli`           | Wrappers: `commands::llm::add`, `commands::channel::add_bot`            |
 | `src/setup_cmd.rs`   | Binary entry point that owns the wizard process; ahead of `boot::load_config` in `main.rs` |

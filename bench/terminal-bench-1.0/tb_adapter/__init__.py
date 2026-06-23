@@ -1,1 +1,1 @@
-"""Terminal-Bench installed-agent adapter for Aura (see aura_agent.AuraAgent)."""
+"""Terminal-Bench installed-agent adapter for Baybo (see baybo_agent.BayboAgent)."""

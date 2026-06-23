@@ -6,12 +6,12 @@
 //! the runtime loaded at startup). Edits land on disk and require a
 //! gateway restart to take effect — same contract as `PUT /v1/config`.
 
-use aura_config::{AuraConfig, LlmEntry};
-use aura_cost::TimeRange;
-use aura_llm::credentials::{resolve_api_key, vault_api_key_name};
-use aura_llm::{CostHooks, LlmProviderConfig, LlmProviderRegistry};
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use baybo_config::{BayboConfig, LlmEntry};
+use baybo_cost::TimeRange;
+use baybo_llm::credentials::{resolve_api_key, vault_api_key_name};
+use baybo_llm::{CostHooks, LlmProviderConfig, LlmProviderRegistry};
 use chrono::{Duration, Utc};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -104,7 +104,7 @@ async fn update_model(
 ) -> Result<Json<MutateResponse>> {
     let target = state.config_path.as_ref().ok_or_else(|| {
         GatewayError::BadRequest(
-            "gateway was started without a config file; set AURA_CONFIG_PATH or pass --config \
+            "gateway was started without a config file; set BAYBO_CONFIG_PATH or pass --config \
              <path> so the mutation has a destination"
                 .into(),
         )
@@ -243,7 +243,7 @@ async fn test_model(
         proxy: cfg
             .proxy
             .as_ref()
-            .map(|p| aura_security::http::ProxySettings {
+            .map(|p| baybo_security::http::ProxySettings {
                 url: p.url.clone(),
                 no_proxy: p.no_proxy.clone(),
             }),
@@ -388,7 +388,7 @@ async fn get_usage(
             let mut output_tokens = 0usize;
             let mut cached = 0usize;
             let mut cache_create = 0usize;
-            let mut cost = aura_model::MicroUsd::ZERO;
+            let mut cost = baybo_model::MicroUsd::ZERO;
             let mut count = 0usize;
             for r in matching {
                 input_tokens += r.input_tokens;
@@ -424,9 +424,9 @@ async fn get_usage(
 /// the cached `state.config` snapshot when no `config_path` was set
 /// (dev mode with implicit defaults) — mutation endpoints still gate
 /// on `config_path` separately.
-pub(crate) async fn read_config_for_dashboard(state: &AdminState) -> GatewayResult<AuraConfig> {
+pub(crate) async fn read_config_for_dashboard(state: &AdminState) -> GatewayResult<BayboConfig> {
     match state.config_path.as_ref() {
-        Some(path) if path.exists() => AuraConfig::load_from_file(path)
+        Some(path) if path.exists() => BayboConfig::load_from_file(path)
             .await
             .map_err(|e| GatewayError::Internal(format!("config reload: {e}"))),
         _ => Ok((*state.config).clone()),
@@ -442,13 +442,13 @@ pub(crate) async fn read_config_for_dashboard(state: &AdminState) -> GatewayResu
 /// dashboard must render entries that aren't yet wired up.
 async fn build_model_entry(
     state: &AdminState,
-    cfg: &AuraConfig,
+    cfg: &BayboConfig,
     entry: &LlmEntry,
 ) -> LlmModelEntry {
-    let caps = aura_llm::openrouter::capabilities_for(&entry.provider, &entry.model);
+    let caps = baybo_llm::openrouter::capabilities_for(&entry.provider, &entry.model);
     let factory_pricing =
-        aura_llm::openrouter::pricing_for(&entry.provider, &entry.model).unwrap_or_default();
-    let defaults = aura_llm::factory_defaults_for(&entry.provider);
+        baybo_llm::openrouter::pricing_for(&entry.provider, &entry.model).unwrap_or_default();
+    let defaults = baybo_llm::factory_defaults_for(&entry.provider);
 
     let effective_context_window = entry
         .context_window

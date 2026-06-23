@@ -31,7 +31,7 @@ const POLL_INTERVAL_MS = 30_000;
  *  Read-state lives only in the browser by design — the gateway has no
  *  per-fire read tracking. `null` means "no baseline yet" (first run),
  *  which is distinct from "baselined, nothing unread". */
-const SEEN_KEY = 'aura.cron.seen';
+const SEEN_KEY = 'baybo.cron.seen';
 
 function readSeen(): Set<string> | null {
   try {

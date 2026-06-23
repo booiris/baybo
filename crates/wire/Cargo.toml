@@ -9,13 +9,13 @@ doctest = false
 [features]
 # Emits ts-rs-generated TypeScript definitions for the wire types
 # (`Frame` / `Message` / …) into `sdks/channel-ts/src/generated/`, the
-# same surface `aura-channels` used to own. Kept behind a feature so CI /
-# release builds don't depend on ts-rs. Enables `aura-model/ts-export` so
+# same surface `baybo-channels` used to own. Kept behind a feature so CI /
+# release builds don't depend on ts-rs. Enables `baybo-model/ts-export` so
 # the transitively-referenced `ApprovalDecision` / `ResourceAccess` emit too.
-ts-export = ["dep:ts-rs", "aura-model/ts-export"]
+ts-export = ["dep:ts-rs", "baybo-model/ts-export"]
 
 [dependencies]
-aura-model = { workspace = true }
+baybo-model = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 rmp-serde = { workspace = true }

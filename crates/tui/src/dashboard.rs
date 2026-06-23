@@ -1,6 +1,6 @@
 //! Dashboard view renderer: titled table with footer hint.
 
-use aura_channels::DashboardSnapshot;
+use baybo_channels::DashboardSnapshot;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};

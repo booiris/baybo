@@ -50,14 +50,14 @@ pub enum InstallerError {
 /// `install` time so the resulting service file is reproducible.
 #[derive(Debug, Clone)]
 pub struct InstallContext {
-    /// Resolved absolute path to the `aura` binary that the service
+    /// Resolved absolute path to the `baybo` binary that the service
     /// invokes. Set by [`resolve_exec_start`].
     pub exec_start: PathBuf,
-    /// Absolute path to the aura config file the service should load.
-    /// Rendered as `Environment=AURA_CONFIG_PATH=…` (systemd) or an
+    /// Absolute path to the baybo config file the service should load.
+    /// Rendered as `Environment=BAYBO_CONFIG_PATH=…` (systemd) or an
     /// `EnvironmentVariables` dict entry (launchd) in the unit file —
     /// systemd/launchd do not inherit the invoking shell's env, so the
-    /// caller must capture `AURA_CONFIG_PATH` at install time.
+    /// caller must capture `BAYBO_CONFIG_PATH` at install time.
     pub config_path: Option<PathBuf>,
     /// Log directory; surfaced as a hint in the rendered unit file.
     pub log_dir: PathBuf,
@@ -121,11 +121,11 @@ pub fn for_current_platform(user_mode: bool) -> Result<Box<dyn ServiceInstaller>
 /// Resolve the `ExecStart` path for the generated unit. Precedence:
 ///
 /// 1. Explicit `--exec-start <path>` (if provided).
-/// 2. `which aura` via PATH lookup.
+/// 2. `which baybo` via PATH lookup.
 /// 3. `std::env::current_exe()`.
 ///
 /// Under debug builds (`cfg(debug_assertions)`) with no explicit
-/// override, we refuse — `target/debug/aura` vanishes after
+/// override, we refuse — `target/debug/baybo` vanishes after
 /// `cargo clean` and would leave the user with a broken service.
 pub fn resolve_exec_start(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
@@ -141,7 +141,7 @@ pub fn resolve_exec_start(explicit: Option<&Path>) -> Result<PathBuf> {
         ));
     }
 
-    if let Some(path) = which_aura() {
+    if let Some(path) = which_baybo() {
         return Ok(path);
     }
 
@@ -150,10 +150,10 @@ pub fn resolve_exec_start(explicit: Option<&Path>) -> Result<PathBuf> {
     Ok(current)
 }
 
-fn which_aura() -> Option<PathBuf> {
+fn which_baybo() -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {
-        let candidate = dir.join("aura");
+        let candidate = dir.join("baybo");
         if candidate.is_file() {
             return Some(candidate);
         }

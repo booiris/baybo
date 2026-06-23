@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use aura_model::{SessionId, User};
+use baybo_model::{SessionId, User};
 
 /// Identity of the caller for a virtual read, so a [`VirtualReadResolver`] can
 /// enforce access control. The resolver keys its content off this principal

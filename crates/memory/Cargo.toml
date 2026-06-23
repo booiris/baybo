@@ -1,5 +1,5 @@
 [package]
-name = "aura-memory"
+name = "baybo-memory"
 version.workspace = true
 edition.workspace = true
 
@@ -10,18 +10,18 @@ doctest = false
 test-support = []
 # Recall-only memory for the LOCOMO benchmark (`bench/memory`): exposes
 # `ReadOnlyMemory`, a wrapper that forwards recall + tools but no-ops the write
-# hooks. `aura`'s runtime applies it under the matching feature so the bench can
+# hooks. `baybo`'s runtime applies it under the matching feature so the bench can
 # drive the real agent (recall live) without QA turns polluting the scope. Not
 # a production path.
 bench-readonly-memory = []
 
 [dependencies]
-aura-model = { workspace = true }
-aura-llm = { workspace = true }
-aura-tools = { workspace = true }
-aura-trace = { workspace = true }
-aura-security = { workspace = true }
-aura-config = { workspace = true }
+baybo-model = { workspace = true }
+baybo-llm = { workspace = true }
+baybo-tools = { workspace = true }
+baybo-trace = { workspace = true }
+baybo-security = { workspace = true }
+baybo-config = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
@@ -40,7 +40,7 @@ axum = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 serde_json = { workspace = true }
-aura-trace = { workspace = true, features = ["test-support"] }
-aura-workspace = { workspace = true }
+baybo-trace = { workspace = true, features = ["test-support"] }
+baybo-workspace = { workspace = true }
 tokio-util = { workspace = true }
 tempfile = { workspace = true }

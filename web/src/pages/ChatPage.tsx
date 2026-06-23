@@ -147,7 +147,7 @@ interface PendingApproval {
 type ApprovalDecision = 'approve' | 'approve_always' | 'deny';
 
 /** One selectable model in the header picker, projected from a
- *  `GET /v1/llm/models` entry. `name` is the `aura.json` entry name
+ *  `GET /v1/llm/models` entry. `name` is the `baybo.json` entry name
  *  (the value `PUT …/model` expects); `provider`/`model` are shown as
  *  the secondary label so two entries on the same provider stay
  *  distinguishable. */
@@ -193,7 +193,7 @@ export interface SessionView {
   awaitingReply: boolean;
   /** Per-session LLM pin (`session.state.last_llm`) for the header
    *  model picker. `null` = follow `default-llm`; a string is the
-   *  pinned `aura.json` entry name. Seeded from the GET-session
+   *  pinned `baybo.json` entry name. Seeded from the GET-session
    *  detail's `last_llm` on history load and updated on a successful
    *  `PUT …/model`. */
   model?: string | null;
@@ -1680,7 +1680,7 @@ export function ChatPage() {
         const res = await fetch(`${base}/v1/blobs`, {
           method: 'POST',
           headers: {
-            'x-aura-channel-token': channelToken ?? '',
+            'x-baybo-channel-token': channelToken ?? '',
             'content-type': mime,
           },
           body: file,
@@ -2476,7 +2476,7 @@ export function ChatPage() {
                 }
                 placeholder={
                   status.state === 'connected'
-                    ? 'Message Aura…  (Shift+Enter for newline)'
+                    ? 'Message Baybo…  (Shift+Enter for newline)'
                     : 'Waiting for connection…'
                 }
                 rows={1}
@@ -3522,7 +3522,7 @@ export function isStopCommand(text: string): boolean {
   return cmd === 'stop';
 }
 
-/** Stable substring of `aura-channels`' `STOP_CANCELLED_REPLY_LINE` — present
+/** Stable substring of `baybo-channels`' `STOP_CANCELLED_REPLY_LINE` — present
  *  in a `/stop` notice ONLY when it actually cancelled an in-progress reply
  *  (a no-op stop says "Nothing in progress to stop."). Keep in sync with that
  *  const; a server-side test pins the producer text. */

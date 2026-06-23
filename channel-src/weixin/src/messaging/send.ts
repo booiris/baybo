@@ -11,7 +11,7 @@
  */
 import crypto from "node:crypto";
 
-import type { Logger } from "@aura/channel-sdk";
+import type { Logger } from "@baybo/channel-sdk";
 
 import { sendMessage } from "../api/endpoints.js";
 import type { WeixinApiOptions } from "../api/endpoints.js";
@@ -28,7 +28,7 @@ function generateClientId(): string {
   // iLink uses `client_id` for server-side dedup. A random 8-byte hex
   // suffix keeps it unique across all sidecar instances on a host —
   // the random part is cheap and the timestamp is a debug hint.
-  return `aura-weixin:${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  return `baybo-weixin:${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
 }
 
 /**

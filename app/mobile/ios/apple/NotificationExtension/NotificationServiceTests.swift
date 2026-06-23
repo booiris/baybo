@@ -27,7 +27,7 @@ final class NotificationServiceTests: XCTestCase {
             nonce: Self.nonce,
             ciphertextAndTag: ct
         )
-        XCTAssertEqual(preview?.title, "Aura")
+        XCTAssertEqual(preview?.title, "Baybo")
         XCTAssertEqual(preview?.body, "The agent finished replying.")
     }
 

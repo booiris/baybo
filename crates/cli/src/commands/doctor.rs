@@ -25,7 +25,7 @@ pub async fn handle(ctx: &CommandContext) -> Result<CommandOutput> {
             rows.push(row(
                 "config.path",
                 CheckStatus::Warn,
-                "no aura.json resolved — running with defaults".into(),
+                "no baybo.json resolved — running with defaults".into(),
             ));
             worst = worst.worse(CheckStatus::Warn);
         }
@@ -52,7 +52,7 @@ pub async fn handle(ctx: &CommandContext) -> Result<CommandOutput> {
             rows.push(row(
                 "security.encryption_key_file",
                 CheckStatus::Error,
-                "not set in aura.json — run `aura setup` to mint a key".into(),
+                "not set in baybo.json — run `baybo setup` to mint a key".into(),
             ));
             worst = worst.worse(CheckStatus::Error);
         }

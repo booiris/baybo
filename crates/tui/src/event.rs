@@ -6,8 +6,8 @@
 //! tasks, warn/error log records echoed from the tracing subscriber, and
 //! explicit shutdown requests.
 
-use aura_channels::{DashboardSnapshot, ViewKind};
-use aura_model::ContentBlock;
+use baybo_channels::{DashboardSnapshot, ViewKind};
+use baybo_model::ContentBlock;
 use tokio::sync::mpsc;
 
 /// Events consumed by the TUI's main loop (non-terminal sources).

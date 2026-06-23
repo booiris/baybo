@@ -47,7 +47,7 @@ impl SandboxExecRunner {
         match &spec.filesystem_policy {
             FilesystemPolicy::Workspace => {
                 let scratch = tempfile::Builder::new()
-                    .prefix(".aura-sandbox-")
+                    .prefix(".baybo-sandbox-")
                     .tempdir_in(&spec.workspace_root)?;
                 let path = scratch.path().to_path_buf();
                 Ok((Some(scratch), path))

@@ -1,5 +1,5 @@
 [package]
-name = "aura-context"
+name = "baybo-context"
 version.workspace = true
 edition.workspace = true
 
@@ -7,18 +7,18 @@ edition.workspace = true
 doctest = false
 
 [dependencies]
-aura-model = { workspace = true }
-aura-llm = { workspace = true }
-aura-skills = { workspace = true }
-aura-session = { workspace = true }
+baybo-model = { workspace = true }
+baybo-llm = { workspace = true }
+baybo-skills = { workspace = true }
+baybo-session = { workspace = true }
 # Subagent profile registry: context resolves a subagent session's system
 # prompt from its profile name (see `ContextManager::subagent_profile`).
-aura-subagent = { workspace = true }
-aura-tools = { workspace = true }
-aura-trace = { workspace = true }
+baybo-subagent = { workspace = true }
+baybo-tools = { workspace = true }
+baybo-trace = { workspace = true }
 # `io` exposes `identity::load_identity_files`, used by prompts::soul to
 # assemble the system prompt from the workspace identity files.
-aura-workspace = { workspace = true, features = ["io"] }
+baybo-workspace = { workspace = true, features = ["io"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
@@ -31,7 +31,7 @@ parking_lot = { workspace = true }
 # Used by the fast-path's async `summary.md` read.
 tokio = { workspace = true, features = ["fs"] }
 # Cancellation tokens: the background-summary tool loop hands a token
-# to `aura_tools::ToolContext` so a parent cancel kills any in-flight
+# to `baybo_tools::ToolContext` so a parent cancel kills any in-flight
 # `Read`/`Edit` along with the LLM call.
 tokio-util = { workspace = true }
 # Per-run identifiers in the session log (`session_log.rs`).
@@ -43,8 +43,8 @@ hex = { workspace = true }
 [dev-dependencies]
 # Pulls the in-memory `MemorySessionStore` / `MemorySessionSummaryStore`
 # fakes the context unit tests build their `SessionManager` from.
-aura-session = { workspace = true, features = ["test-support"] }
-aura-storage = { workspace = true, features = ["test-support"] }
+baybo-session = { workspace = true, features = ["test-support"] }
+baybo-storage = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }

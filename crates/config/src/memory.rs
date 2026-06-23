@@ -1,4 +1,4 @@
-//! Configuration for the pluggable memory subsystem (`aura-memory`).
+//! Configuration for the pluggable memory subsystem (`baybo-memory`).
 //!
 //! Core-wiring knobs are typed; per-plugin settings ride in an opaque
 //! [`extra`](MemoryConfig::extra) bag — a deliberate, documented exception to
@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use aura_model::LlmEntryName;
+use baybo_model::LlmEntryName;
 
 /// Which backend the runtime should construct for the single `Arc<dyn Memory>`
 /// slot. The trait is single-pluggable; the runtime dispatches on this enum.

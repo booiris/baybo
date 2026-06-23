@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use aura_config::AuraConfig;
+use baybo_config::BayboConfig;
 
 use crate::error::Result;
 use crate::prompt::Prompter;
@@ -15,7 +15,7 @@ pub enum BrowserStepOutcome {
 
 pub async fn configure_browser_step<P: Prompter>(
     prompter: &mut P,
-    config: &mut AuraConfig,
+    config: &mut BayboConfig,
 ) -> Result<BrowserStepOutcome> {
     if !prompter.confirm(
         "Enable agent web browsing? Adds the browser/* MCP tools and lazily \
@@ -84,12 +84,12 @@ async fn probe_docker_for_prompt() -> Option<bool> {
 mod tests {
     use super::*;
     use crate::test_support::MockPrompter;
-    use aura_config::AuraConfig;
+    use baybo_config::BayboConfig;
 
     #[tokio::test]
     async fn declining_master_keeps_defaults() {
         let mut prompter = MockPrompter::new().push_confirm(false);
-        let mut cfg = AuraConfig::default();
+        let mut cfg = BayboConfig::default();
         let outcome = configure_browser_step(&mut prompter, &mut cfg)
             .await
             .unwrap();
@@ -105,7 +105,7 @@ mod tests {
             return;
         }
         let mut prompter = MockPrompter::new().push_confirm(true).push_confirm(false);
-        let mut cfg = AuraConfig::default();
+        let mut cfg = BayboConfig::default();
         let outcome = configure_browser_step(&mut prompter, &mut cfg)
             .await
             .unwrap();

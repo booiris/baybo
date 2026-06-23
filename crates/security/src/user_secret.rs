@@ -14,7 +14,7 @@ use crate::{Result, SecurityError};
 
 /// Reserved vault-key namespace for user-managed secrets. A user secret named
 /// `FOO` is stored at `user_env.FOO`. Env var names cannot contain `.`, and
-/// every internal vault key either contains `.` (`mcp.*`, `aura.*`) or is a
+/// every internal vault key either contains `.` (`mcp.*`, `baybo.*`) or is a
 /// placeholder string, so this namespace cannot collide.
 pub const USER_SECRET_PREFIX: &str = "user_env.";
 

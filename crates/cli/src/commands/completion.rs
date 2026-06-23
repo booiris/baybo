@@ -19,7 +19,7 @@ pub fn handle(shell: ShellKind) -> Result<CommandOutput> {
     let mut buf: Vec<u8> = Vec::new();
     {
         let mut sink = Cursor::new(&mut buf);
-        generate(target, &mut cmd, "aura", &mut sink);
+        generate(target, &mut cmd, "baybo", &mut sink);
     }
     let script =
         String::from_utf8(buf).map_err(|e| crate::error::CliError::Serialization(e.to_string()))?;

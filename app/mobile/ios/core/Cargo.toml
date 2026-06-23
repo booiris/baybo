@@ -1,5 +1,5 @@
 [package]
-name = "aura-mobile-core"
+name = "baybo-mobile-core"
 version.workspace = true
 edition.workspace = true
 
@@ -9,7 +9,7 @@ doctest = false
 [dependencies]
 wire = { workspace = true }
 device-proto = { workspace = true }
-aura-model = { workspace = true }
+baybo-model = { workspace = true }
 thiserror = { workspace = true }
 snow = { workspace = true }
 

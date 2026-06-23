@@ -13,7 +13,7 @@
 //! This is the "report a compile error if it isn't there" guarantee.
 //!
 //! Pricing strings are per-token USD; the micros conversion mirrors
-//! `aura_llm::openrouter` / `MicroUsd::from_usd_decimal` step-for-step
+//! `baybo_llm::openrouter` / `MicroUsd::from_usd_decimal` step-for-step
 //! (`round((v * 1e6) * 1e6)`, saturating) so a generated flat default is
 //! bit-identical to the runtime snapshot pricing for the same model.
 
@@ -154,7 +154,7 @@ fn pricing_field<'a>(entry: &'a serde_json::Value, name: &str) -> Option<&'a str
 }
 
 /// Per-token USD string -> micro-USD per 1M tokens, matching
-/// `aura_llm::openrouter::parse_per_token_to_per_million_micros` composed
+/// `baybo_llm::openrouter::parse_per_token_to_per_million_micros` composed
 /// with `MicroUsd::from_usd_decimal` step-for-step. `None` for non-finite,
 /// negative, or unparseable input so build-time filtering mirrors the
 /// runtime snapshot filter exactly.

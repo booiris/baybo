@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# One-shot runner for the aura <-> Terminal-Bench adapter. Builds the
+# One-shot runner for the baybo <-> Terminal-Bench adapter. Builds the
 # musl binary if missing, then runs the harness in the uv-managed
 # env with .env loaded. Any extra args pass through to `tb run`:
 #
 #   ./run.sh                          # defaults: gemini-2.5-flash, core 0.1.1, all tasks
 #   ./run.sh -t fix-permissions       # a single task
 #   ./run.sh --n-tasks 5 -m openai/gpt-4o
-#   AURA_REBUILD=1 ./run.sh           # force a fresh binary build first
+#   BAYBO_REBUILD=1 ./run.sh           # force a fresh binary build first
 #   TB_TEST_TIMEOUT_SEC=600 ./run.sh  # raise the per-task test-phase budget (default 300)
 set -euo pipefail
 
@@ -14,14 +14,14 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 # shellcheck source=../progress.sh
 . "$here/../progress.sh"
-bin="$root/target/x86_64-unknown-linux-musl/release/aura"
+bin="$root/target/x86_64-unknown-linux-musl/release/baybo"
 
-# Build the musl binary when it's missing (or AURA_REBUILD
-# is set). An AURA_BIN override points at your own binary and skips this.
-if [[ -z "${AURA_BIN:-}" ]] && { [[ -n "${AURA_REBUILD:-}" ]] || [[ ! -x "$bin" ]]; }; then
-  echo "==> building musl aura (--features bench-bash; first build ~3 min)…" >&2
+# Build the musl binary when it's missing (or BAYBO_REBUILD
+# is set). An BAYBO_BIN override points at your own binary and skips this.
+if [[ -z "${BAYBO_BIN:-}" ]] && { [[ -n "${BAYBO_REBUILD:-}" ]] || [[ ! -x "$bin" ]]; }; then
+  echo "==> building musl baybo (--features bench-bash; first build ~3 min)…" >&2
   ( cd "$root" && cargo build --release --target x86_64-unknown-linux-musl \
-      --features bench-bash -p aura )
+      --features bench-bash -p baybo )
 fi
 
 if [[ ! -f "$here/.env" ]]; then
@@ -102,8 +102,8 @@ monitor_pid=$!
 # (e.g. -m / -d / --n-tasks / -t / --global-test-timeout-sec) overrides these
 # defaults. tb owns the full run output under runs/<ts>/ (casts, logs, results.json).
 uv run tb run \
-  --agent-import-path tb_adapter.aura_agent:AuraAgent \
-  --model "${AURA_MODEL:-gemini/gemini-2.5-flash}" \
+  --agent-import-path tb_adapter.baybo_agent:BayboAgent \
+  --model "${BAYBO_MODEL:-gemini/gemini-2.5-flash}" \
   -d terminal-bench-core==0.1.1 \
   --global-test-timeout-sec "$test_timeout_sec" \
   --output-path runs \

@@ -1,5 +1,5 @@
 [package]
-name = "aura-channels"
+name = "baybo-channels"
 version.workspace = true
 edition.workspace = true
 
@@ -16,9 +16,9 @@ doctest = false
 ts-export = ["dep:ts-rs"]
 
 [dependencies]
-aura-model = { workspace = true }
+baybo-model = { workspace = true }
 wire = { workspace = true }
-aura-tools = { workspace = true }
+baybo-tools = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }

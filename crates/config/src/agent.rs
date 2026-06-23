@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use aura_model::{LlmEntryName, ModelTier};
+use baybo_model::{LlmEntryName, ModelTier};
 use serde::{Deserialize, Serialize};
 
 /// Top-level agent configuration: execution policy and context window.

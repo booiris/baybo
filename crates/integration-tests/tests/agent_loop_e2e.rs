@@ -23,21 +23,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_agent::actor::AgentMessage;
-use aura_channels::{AgentEvent, AgentOutput, IncomingMessage, Message, ToolStatus};
-use aura_cost::SpendingLimits;
-use aura_integration_tests::{AgentTestHarness, SessionBuilder, capture_tracing};
-use aura_llm::test_support::StubLlm;
-use aura_llm::{LlmError, LlmResponse, ModelPricing, StreamEvent, TokenUsage, ToolCallInfo};
-use aura_memory::test_support::RecordingMemory;
-use aura_memory::{Memory, RecalledMemory};
-use aura_model::{
+use baybo_agent::actor::AgentMessage;
+use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message, ToolStatus};
+use baybo_cost::SpendingLimits;
+use baybo_integration_tests::{AgentTestHarness, SessionBuilder, capture_tracing};
+use baybo_llm::test_support::StubLlm;
+use baybo_llm::{LlmError, LlmResponse, ModelPricing, StreamEvent, TokenUsage, ToolCallInfo};
+use baybo_memory::test_support::RecordingMemory;
+use baybo_memory::{Memory, RecalledMemory};
+use baybo_model::{
     BACKGROUND_DISPATCH_ACK_PREFIX, ContentBlock, MessageMetadata, MicroUsd,
     PendingBackgroundResult, Role, SPAWN_SUBAGENT_TOOL_NAME, SessionId, SubagentExitStatus,
     ThinkingContent, TriggerSource,
 };
-use aura_tools::test_support::RecordingTool;
-use aura_tools::{Tool, ToolOutput};
+use baybo_tools::test_support::RecordingTool;
+use baybo_tools::{Tool, ToolOutput};
 use chrono::Utc;
 use serde_json::json;
 use tracing::Level;
@@ -124,7 +124,7 @@ async fn failed_user_turn_emits_terminal_state_and_error_notice() {
         matches!(
             &o.event,
             AgentEvent::Notice {
-                level: aura_channels::NoticeLevel::Error,
+                level: baybo_channels::NoticeLevel::Error,
                 ..
             }
         )
@@ -165,25 +165,25 @@ async fn next_turn_state(rx: &mut tokio::sync::mpsc::Receiver<AgentOutput>) -> (
 /// before the projector can recompute its start edge.
 #[tokio::test]
 async fn turn_state_projector_brackets_a_slow_turn() {
-    use aura_job::JobInput;
-    use aura_job::test_support::MemoryJobStore;
-    use aura_job::{JobLifecycle, JobOutput};
-    use aura_model::{ContentBlock, TriggerKind};
+    use baybo_job::JobInput;
+    use baybo_job::test_support::MemoryJobStore;
+    use baybo_job::{JobLifecycle, JobOutput};
+    use baybo_model::{ContentBlock, TriggerKind};
 
     let session = SessionBuilder::new().build();
     let job_lifecycle = Arc::new(JobLifecycle::new(
-        Arc::new(MemoryJobStore::new()) as Arc<dyn aura_store::JobStore>
+        Arc::new(MemoryJobStore::new()) as Arc<dyn baybo_store::JobStore>
     ));
     let session_store = {
-        let store = Arc::new(aura_session::test_support::MemorySessionStore::new());
+        let store = Arc::new(baybo_session::test_support::MemorySessionStore::new());
         store.seed_session(&session);
-        store as Arc<dyn aura_session::SessionStore>
+        store as Arc<dyn baybo_session::SessionStore>
     };
-    let summary_store = Arc::new(aura_session::test_support::MemorySessionSummaryStore::new())
-        as Arc<dyn aura_session::SessionSummaryStore>;
-    let folder_store = Arc::new(aura_session::test_support::MemorySessionFolderStore::new())
-        as Arc<dyn aura_session::SessionFolderStore>;
-    let sessions = Arc::new(aura_agent::SessionManager::new(
+    let summary_store = Arc::new(baybo_session::test_support::MemorySessionSummaryStore::new())
+        as Arc<dyn baybo_session::SessionSummaryStore>;
+    let folder_store = Arc::new(baybo_session::test_support::MemorySessionFolderStore::new())
+        as Arc<dyn baybo_session::SessionFolderStore>;
+    let sessions = Arc::new(baybo_agent::SessionManager::new(
         session_store,
         summary_store,
         folder_store,
@@ -191,7 +191,7 @@ async fn turn_state_projector_brackets_a_slow_turn() {
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentOutput>(16);
     let token = tokio_util::sync::CancellationToken::new();
-    aura_agent::supervisor::spawn_turn_state_projector(
+    baybo_agent::supervisor::spawn_turn_state_projector(
         Arc::clone(&job_lifecycle),
         sessions,
         tx,
@@ -204,7 +204,7 @@ async fn turn_state_projector_brackets_a_slow_turn() {
         .start_job(
             session.id.clone(),
             TriggerKind::User,
-            aura_job::JobShape::Turn,
+            baybo_job::JobShape::Turn,
             JobInput::UserChat { content: vec![] },
             None,
         )
@@ -595,8 +595,8 @@ mod sleep_tool {
     use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
-    use aura_model::TrustLevel;
-    use aura_tools::{Tool, ToolConcurrency, ToolContext, ToolManifest, ToolOutput};
+    use baybo_model::TrustLevel;
+    use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolManifest, ToolOutput};
     use parking_lot::Mutex;
     use serde_json::{Value, json};
 
@@ -652,7 +652,7 @@ mod sleep_tool {
             &self,
             _params: Value,
             _ctx: &ToolContext,
-        ) -> aura_tools::Result<ToolOutput> {
+        ) -> baybo_tools::Result<ToolOutput> {
             *self.observed_start.lock() = Some(Instant::now());
             tokio::time::sleep(self.delay).await;
             Ok(ToolOutput::Text(format!("{} done", self.name)))
@@ -805,7 +805,7 @@ async fn background_subagent_finished_runs_autonomous_notification_turn() {
     assert!(
         outputs.iter().any(|o| matches!(
             o,
-            aura_channels::AgentOutput { event: AgentEvent::Message(m), .. }
+            baybo_channels::AgentOutput { event: AgentEvent::Message(m), .. }
                 if m.content.iter().any(|b| matches!(
                     b,
                     ContentBlock::Text(t) if t.contains("FOO lives at lib/foo.rs:7")
@@ -1394,7 +1394,7 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
     // The operator panel recovers the original instruction, not the
     // framing boilerplate.
     assert_eq!(
-        aura_context::prompts::cron::original_cron_prompt(framed),
+        baybo_context::prompts::cron::original_cron_prompt(framed),
         "你好"
     );
 
@@ -1408,10 +1408,10 @@ async fn cron_fire_is_framed_as_a_task_not_a_user_message() {
 /// (mailbox has capacity), so the message is queued by the time iter 2 drains.
 mod interjecting_tool {
     use async_trait::async_trait;
-    use aura_agent::actor::AgentMessage;
-    use aura_agent::actor::mailbox::MailboxSender;
-    use aura_model::TrustLevel;
-    use aura_tools::{Tool, ToolContext, ToolManifest, ToolOutput};
+    use baybo_agent::actor::AgentMessage;
+    use baybo_agent::actor::mailbox::MailboxSender;
+    use baybo_model::TrustLevel;
+    use baybo_tools::{Tool, ToolContext, ToolManifest, ToolOutput};
     use parking_lot::Mutex;
     use serde_json::{Value, json};
 
@@ -1457,7 +1457,7 @@ mod interjecting_tool {
             &self,
             _params: Value,
             _ctx: &ToolContext,
-        ) -> aura_tools::Result<ToolOutput> {
+        ) -> baybo_tools::Result<ToolOutput> {
             // Take out of the lock before awaiting (no lock held across await).
             let armed = self.armed.lock().take();
             if let Some((tx, msg)) = armed {
@@ -1997,7 +1997,7 @@ async fn task_tools_persist_and_emit_checklist_to_the_channel() {
     let mut harness = AgentTestHarness::builder().build();
     let session_id = harness.session.id.clone();
 
-    fn last_task_list(outs: &[AgentOutput]) -> Option<Vec<aura_model::Task>> {
+    fn last_task_list(outs: &[AgentOutput]) -> Option<Vec<baybo_model::Task>> {
         outs.iter().rev().find_map(|o| match &o.event {
             AgentEvent::TaskList(tasks) => Some(tasks.clone()),
             _ => None,
@@ -2030,7 +2030,7 @@ async fn task_tools_persist_and_emit_checklist_to_the_channel() {
     assert_eq!(stored.len(), 2, "TaskCreate persisted both tasks");
     assert_eq!(stored[0].subject, "write the table");
     assert_eq!(stored[1].subject, "wire the runtime");
-    assert_eq!(stored[1].status, aura_model::TaskStatus::InProgress);
+    assert_eq!(stored[1].status, baybo_model::TaskStatus::InProgress);
     let first_id = stored[0].id;
     let second_id = stored[1].id;
 
@@ -2066,14 +2066,15 @@ async fn task_tools_persist_and_emit_checklist_to_the_channel() {
         .find(|t| t.id == first_id)
         .expect("the updated task still exists");
     assert_eq!(updated.subject, "write the table");
-    assert_eq!(updated.status, aura_model::TaskStatus::Completed);
+    assert_eq!(updated.status, baybo_model::TaskStatus::Completed);
 
     let list2 = last_task_list(&outs2).expect("a TaskList event after TaskUpdate");
     assert_eq!(list2.len(), 2);
     assert!(
-        list2.iter().any(
-            |t| t.subject == "write the table" && t.status == aura_model::TaskStatus::Completed
-        ),
+        list2
+            .iter()
+            .any(|t| t.subject == "write the table"
+                && t.status == baybo_model::TaskStatus::Completed),
         "the snapshot reflects the completed task"
     );
 
@@ -2156,7 +2157,7 @@ async fn grouped_subagents_deliver_one_merged_notification() {
     // The cohort is keyed by the dispatching turn's `job_id`
     // (`GroupState::cohort_key`), so a delivered member must carry the same
     // job-scoped group to route into it — exactly as the real spawner stamps it.
-    let cohort_group = aura_model::GroupState::cohort_key(
+    let cohort_group = baybo_model::GroupState::cohort_key(
         spawn
             .last_job_id()
             .expect("the spawn tool ran, so it captured the turn's job_id"),
@@ -2336,7 +2337,7 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
         .mailbox
         .send(finish(
             "bg-a",
-            aura_model::GroupState::cohort_key(job_a, "g"),
+            baybo_model::GroupState::cohort_key(job_a, "g"),
         ))
         .await
         .expect("mailbox open");
@@ -2352,7 +2353,7 @@ async fn grouped_subagents_reusing_a_group_name_across_turns_stay_separate() {
         .mailbox
         .send(finish(
             "bg-b",
-            aura_model::GroupState::cohort_key(job_b, "g"),
+            baybo_model::GroupState::cohort_key(job_b, "g"),
         ))
         .await
         .expect("mailbox open");
@@ -2374,7 +2375,7 @@ mod blocking_llm {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use aura_llm::{ChatRequest, LlmCompletion, LlmResponse, LlmStream, ModelInfo, ModelPricing};
+    use baybo_llm::{ChatRequest, LlmCompletion, LlmResponse, LlmStream, ModelInfo, ModelPricing};
     use tokio::sync::Notify;
 
     pub struct BlockingLlm {
@@ -2402,13 +2403,13 @@ mod blocking_llm {
 
     #[async_trait]
     impl LlmCompletion for BlockingLlm {
-        async fn chat(&self, _request: &ChatRequest) -> aura_llm::Result<LlmResponse> {
+        async fn chat(&self, _request: &ChatRequest) -> baybo_llm::Result<LlmResponse> {
             self.entered.notify_one();
             std::future::pending::<()>().await;
             unreachable!("blocking LLM never returns; the call is ended only by drop-on-cancel")
         }
 
-        async fn chat_stream(&self, _request: &ChatRequest) -> aura_llm::Result<LlmStream> {
+        async fn chat_stream(&self, _request: &ChatRequest) -> baybo_llm::Result<LlmStream> {
             self.entered.notify_one();
             std::future::pending::<()>().await;
             unreachable!("blocking LLM never returns; the call is ended only by drop-on-cancel")
@@ -2434,13 +2435,13 @@ mod blocking_llm {
 /// so `shutdown` would hang forever.
 #[tokio::test]
 async fn stop_aborts_an_in_flight_llm_call() {
-    use aura_job::CancelReason;
+    use baybo_job::CancelReason;
     use blocking_llm::BlockingLlm;
 
     let entered = Arc::new(tokio::sync::Notify::new());
     let llm = Arc::new(BlockingLlm::new(Arc::clone(&entered)));
     let mut harness = AgentTestHarness::builder()
-        .with_llm(llm as Arc<dyn aura_llm::LlmCompletion>)
+        .with_llm(llm as Arc<dyn baybo_llm::LlmCompletion>)
         .build();
 
     harness.send_text("please hang").await.unwrap();
@@ -2499,7 +2500,7 @@ mod partial_stream_llm {
     use std::task::{Context, Poll};
 
     use async_trait::async_trait;
-    use aura_llm::{
+    use baybo_llm::{
         ChatRequest, LlmCompletion, LlmResponse, LlmStream, ModelInfo, ModelPricing, StreamEvent,
     };
     use futures::Stream;
@@ -2512,7 +2513,7 @@ mod partial_stream_llm {
     }
 
     impl Stream for PartialThenBlock {
-        type Item = aura_llm::Result<StreamEvent>;
+        type Item = baybo_llm::Result<StreamEvent>;
         fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             if let Some(ev) = self.events.lock().pop_front() {
                 // Self-wake so the queued events drain back-to-back.
@@ -2552,11 +2553,11 @@ mod partial_stream_llm {
 
     #[async_trait]
     impl LlmCompletion for PartialStreamLlm {
-        async fn chat(&self, _request: &ChatRequest) -> aura_llm::Result<LlmResponse> {
+        async fn chat(&self, _request: &ChatRequest) -> baybo_llm::Result<LlmResponse> {
             unreachable!("the streaming turn never calls chat()")
         }
 
-        async fn chat_stream(&self, _request: &ChatRequest) -> aura_llm::Result<LlmStream> {
+        async fn chat_stream(&self, _request: &ChatRequest) -> baybo_llm::Result<LlmStream> {
             Ok(LlmStream::from_event_stream(PartialThenBlock {
                 events: Mutex::new(self.events.iter().cloned().collect()),
                 drained: Arc::clone(&self.drained),
@@ -2575,8 +2576,8 @@ mod partial_stream_llm {
 /// Regression for the in-flight-cancel path dropping the stream wholesale.
 #[tokio::test]
 async fn stop_persists_partial_work_so_it_survives_reload() {
-    use aura_job::CancelReason;
-    use aura_model::Role;
+    use baybo_job::CancelReason;
+    use baybo_model::Role;
     use partial_stream_llm::PartialStreamLlm;
 
     let drained = Arc::new(tokio::sync::Notify::new());
@@ -2588,7 +2589,7 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
         Arc::clone(&drained),
     ));
     let mut harness = AgentTestHarness::builder()
-        .with_llm(llm as Arc<dyn aura_llm::LlmCompletion>)
+        .with_llm(llm as Arc<dyn baybo_llm::LlmCompletion>)
         .build();
 
     harness.send_text("think out loud then hang").await.unwrap();
@@ -2638,7 +2639,7 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
         .iter()
         .find(|m| m.role == Role::Assistant)
         .expect("a partial assistant turn must be persisted");
-    let text = aura_llm::multimodal::extract_text(&assistant.content);
+    let text = baybo_llm::multimodal::extract_text(&assistant.content);
     assert!(
         text.contains("here is the partial answer"),
         "persisted partial must carry the streamed answer text, got {text:?}"
@@ -2661,7 +2662,7 @@ async fn stop_persists_partial_work_so_it_survives_reload() {
     // detail renders the span's recorded `result`, so a blank result would
     // hide what the model produced before the abort even though the
     // transcript kept it.
-    use aura_trace::{Span, SpanKind, Step, TraceStore};
+    use baybo_trace::{Span, SpanKind, Step, TraceStore};
     let steps: Vec<Step> = trace_store
         .list_steps_by_job(&job_id)
         .await

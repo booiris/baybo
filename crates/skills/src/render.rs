@@ -16,7 +16,7 @@
 //!
 //! Escaping is done lazily at render time, not eagerly at load, so the
 //! `SkillDefinition` in memory still holds the author's original text
-//! (useful for CLI display, `aura skills search`, etc.).
+//! (useful for CLI display, `baybo skills search`, etc.).
 //!
 //! Adapted from nearai/ironclaw `ironclaw_skills`:
 //! <https://github.com/nearai/ironclaw/tree/staging/crates/ironclaw_skills/src>
@@ -97,7 +97,7 @@ fn escape_skill_content(content: &str) -> String {
 mod tests {
     use super::*;
     use crate::SkillRequirements;
-    use aura_model::{ArtifactSource, TrustLevel};
+    use baybo_model::{ArtifactSource, TrustLevel};
 
     fn mk(name: &str, version: &str, body: &str) -> SkillDefinition {
         SkillDefinition {

@@ -132,9 +132,9 @@ const LLM_READ_TIMEOUT: Duration = Duration::from_secs(600);
 /// so a stalled network surfaces as a retriable error instead of hanging the
 /// agent turn indefinitely.
 pub(crate) fn proxied_client(
-    proxy: Option<&aura_security::http::ProxySettings>,
+    proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> Result<reqwest::Client, LlmError> {
-    aura_security::http::client_builder(proxy)
+    baybo_security::http::client_builder(proxy)
         .and_then(|b| {
             b.connect_timeout(LLM_CONNECT_TIMEOUT)
                 .read_timeout(LLM_READ_TIMEOUT)

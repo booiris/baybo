@@ -15,10 +15,10 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "DE57CE9BF2A0DE8879F60390"
-               BuildableName = "aura-mobile-app_iOS.app"
-               BlueprintName = "aura-mobile-app_iOS"
-               ReferencedContainer = "container:aura-mobile-app.xcodeproj">
+               BlueprintIdentifier = "7B9B1CA9AEC5EE9D8512ED28"
+               BuildableName = "baybo-mobile-app_iOS.app"
+               BlueprintName = "baybo-mobile-app_iOS"
+               ReferencedContainer = "container:baybo-mobile-app.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -32,10 +32,10 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "DE57CE9BF2A0DE8879F60390"
-            BuildableName = "aura-mobile-app_iOS.app"
-            BlueprintName = "aura-mobile-app_iOS"
-            ReferencedContainer = "container:aura-mobile-app.xcodeproj">
+            BlueprintIdentifier = "7B9B1CA9AEC5EE9D8512ED28"
+            BuildableName = "baybo-mobile-app_iOS.app"
+            BlueprintName = "baybo-mobile-app_iOS"
+            ReferencedContainer = "container:baybo-mobile-app.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
       <Testables>
@@ -69,10 +69,10 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "DE57CE9BF2A0DE8879F60390"
-            BuildableName = "aura-mobile-app_iOS.app"
-            BlueprintName = "aura-mobile-app_iOS"
-            ReferencedContainer = "container:aura-mobile-app.xcodeproj">
+            BlueprintIdentifier = "7B9B1CA9AEC5EE9D8512ED28"
+            BuildableName = "baybo-mobile-app_iOS.app"
+            BlueprintName = "baybo-mobile-app_iOS"
+            ReferencedContainer = "container:baybo-mobile-app.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
       <CommandLineArguments>
@@ -100,10 +100,10 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "DE57CE9BF2A0DE8879F60390"
-            BuildableName = "aura-mobile-app_iOS.app"
-            BlueprintName = "aura-mobile-app_iOS"
-            ReferencedContainer = "container:aura-mobile-app.xcodeproj">
+            BlueprintIdentifier = "7B9B1CA9AEC5EE9D8512ED28"
+            BuildableName = "baybo-mobile-app_iOS.app"
+            BlueprintName = "baybo-mobile-app_iOS"
+            ReferencedContainer = "container:baybo-mobile-app.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
       <CommandLineArguments>

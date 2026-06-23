@@ -6,7 +6,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { StatusRateLimited } from "@aura/channel-sdk";
+import { StatusRateLimited } from "@baybo/channel-sdk";
 import { GrammyError } from "grammy";
 
 import { TelegramPlatform } from "../dist/platform.js";

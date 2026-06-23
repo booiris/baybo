@@ -1,10 +1,10 @@
 {
-  "name": "@aura/tool-browser",
+  "name": "@baybo/tool-browser",
   "version": "0.1.0",
   "private": true,
-  "description": "Browser tool sidecar — wraps chrome-devtools-mcp as Aura's embedded stdio MCP server",
+  "description": "Browser tool sidecar — wraps chrome-devtools-mcp as Baybo's embedded stdio MCP server",
   "type": "module",
-  "aura": {
+  "baybo": {
     "domain": "tool",
     "kind": "mcp_server",
     "auxAssets": [

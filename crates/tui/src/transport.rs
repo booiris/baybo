@@ -2,14 +2,14 @@
 //!
 //! [`TransportEvent`] is the normalized stream item the TUI's event
 //! loop consumes — the concrete [`crate::client::WsTransport`] maps
-//! `aura-channels` wire frames onto these variants so the run loop
+//! `baybo-channels` wire frames onto these variants so the run loop
 //! doesn't need to know about the underlying MessagePack protocol.
 
 use std::pin::Pin;
 
-use aura_channels::{NoticeLevel, Result};
-use aura_model::ContentBlock;
-use aura_tools::ApprovalDecision;
+use baybo_channels::{NoticeLevel, Result};
+use baybo_model::ContentBlock;
+use baybo_tools::ApprovalDecision;
 use futures::Stream;
 
 /// Event shape surfaced by [`crate::client::WsTransport::subscribe`].
@@ -41,7 +41,7 @@ pub enum TransportEvent {
     /// Out-of-band notice surfaced by the agent.
     Notice { level: NoticeLevel, text: String },
     /// A new tool-call approval was queued on the shared
-    /// [`aura_tools::ApprovalQueue`]; the loop should refresh the
+    /// [`baybo_tools::ApprovalQueue`]; the loop should refresh the
     /// approval UI.
     ApprovalRequested,
     /// An approval was resolved remotely (by another client); the loop

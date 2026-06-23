@@ -11,7 +11,7 @@
 //!
 //! The buffer does not persist across restarts — it's a live
 //! observability aid, not an audit log. The rolling file under
-//! `<workspace>/logs/aura.log` remains the durable record.
+//! `<workspace>/logs/baybo.log` remains the durable record.
 //!
 //! [`LogBufferLayer`]: crate::log_buffer::LogBufferLayer
 

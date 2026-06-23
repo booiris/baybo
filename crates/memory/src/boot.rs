@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use aura_config::{AuraConfig, MemoryProvider};
-use aura_security::SecretVault;
-use aura_security::http::ProxySettings;
+use baybo_config::{BayboConfig, MemoryProvider};
+use baybo_security::SecretVault;
+use baybo_security::http::ProxySettings;
 
 use crate::Memory;
 use crate::backends::{mem0, openviking};
@@ -26,13 +26,13 @@ use crate::backends::{mem0, openviking};
 /// - a required API key is missing (mem0 only — openviking is optional).
 ///
 /// All `None` paths log a `warn!` instead of returning an error: the rest
-/// of aura should still come up, so the operator can fix the credential
+/// of baybo should still come up, so the operator can fix the credential
 /// and restart. The returned handle's `tools()` should be registered into
 /// the builtin tool registry by the caller (see `src/runtime.rs`); we do
 /// not do it here so the function stays free of any mutable-registry
 /// argument.
 pub async fn build_memory_backend(
-    config: &AuraConfig,
+    config: &BayboConfig,
     vault: &Arc<SecretVault>,
     proxy: Option<&ProxySettings>,
 ) -> Option<Arc<dyn Memory>> {
@@ -48,7 +48,7 @@ pub async fn build_memory_backend(
 }
 
 async fn build_mem0(
-    config: &AuraConfig,
+    config: &BayboConfig,
     vault: &Arc<SecretVault>,
     proxy: Option<&ProxySettings>,
 ) -> Option<Arc<dyn Memory>> {
@@ -68,7 +68,7 @@ async fn build_mem0(
         _ => {
             tracing::warn!(
                 "mem0 API key not found; memory disabled. Run \
-                 `aura secret add MEM0_API_KEY` or set the MEM0_API_KEY env var."
+                 `baybo secret add MEM0_API_KEY` or set the MEM0_API_KEY env var."
             );
             return None;
         }
@@ -86,7 +86,7 @@ async fn build_mem0(
 }
 
 async fn build_openviking(
-    config: &AuraConfig,
+    config: &BayboConfig,
     vault: &Arc<SecretVault>,
     proxy: Option<&ProxySettings>,
 ) -> Option<Arc<dyn Memory>> {

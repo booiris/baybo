@@ -1,4 +1,4 @@
-//! **aura-mobile-core** — the FFI-free shared client core for the Aura iOS
+//! **baybo-mobile-core** — the FFI-free shared client core for the Baybo iOS
 //! companion (and a future Android app).
 //!
 //! It runs in the Tauri shell's `src-tauri` (reached from the webview via Tauri

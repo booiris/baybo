@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_channels::{SlashCommand, SlashHandler, SlashOutcome, ViewKind};
-use aura_model::ContentBlock;
+use baybo_channels::{SlashCommand, SlashHandler, SlashOutcome, ViewKind};
+use baybo_model::ContentBlock;
 use clap::{CommandFactory, Parser};
 
 use crate::cli::{
@@ -40,7 +40,7 @@ impl CliSlashHandler {
         }
         // `try_parse_from` expects argv[0] to be the program name.
         let mut argv: Vec<String> = Vec::with_capacity(tokens.len() + 1);
-        argv.push("aura".to_string());
+        argv.push("baybo".to_string());
         argv.extend(tokens);
         let cli = Cli::try_parse_from(&argv).map_err(|e| DispatchError::Parse(e.to_string()))?;
         let cmd = cli.command.ok_or(DispatchError::NotACommand)?;
@@ -113,7 +113,7 @@ impl SlashHandler for CliSlashHandler {
                 continue;
             }
             let slash = format!("/{name}");
-            // Hidden subcommands (the `AURA_HELP_AGENT` extended-help
+            // Hidden subcommands (the `BAYBO_HELP_AGENT` extended-help
             // bucket: `config`, `log`, `session`, `job`, `cron`, `cost`)
             // still own their slot — claim it in `seen` so a workspace
             // skill with the same name can't slip into the menu — but
@@ -207,7 +207,7 @@ fn dashboard_shortcut(raw: &str) -> Option<ViewKind> {
 /// `/` names a user-invocable skill. Skill lookup goes through `get`, which
 /// indexes by skill name; we also require the stored `command` to match so
 /// skills with `user-invocable: false` are ignored.
-fn is_skill_invocation(raw: &str, skills: &aura_skills::SkillRegistry) -> bool {
+fn is_skill_invocation(raw: &str, skills: &baybo_skills::SkillRegistry) -> bool {
     let without_slash = raw.trim().strip_prefix('/').unwrap_or("");
     let Some(first) = without_slash.split_whitespace().next() else {
         return false;
@@ -355,9 +355,9 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
 mod tests {
     use super::*;
     use crate::context::ContextBuilder;
-    use aura_config::AuraConfig;
-    use aura_model::{ArtifactSource, TrustLevel};
-    use aura_skills::{SkillDefinition, SkillRegistry, SkillRequirements};
+    use baybo_config::BayboConfig;
+    use baybo_model::{ArtifactSource, TrustLevel};
+    use baybo_skills::{SkillDefinition, SkillRegistry, SkillRequirements};
 
     fn skill(name: &str, description: &str, user_invocable: bool) -> SkillDefinition {
         SkillDefinition {
@@ -383,7 +383,7 @@ mod tests {
     }
 
     fn handler_with(registry: SkillRegistry) -> CliSlashHandler {
-        let config = Arc::new(AuraConfig::default());
+        let config = Arc::new(BayboConfig::default());
         let ctx = ContextBuilder::new(config)
             .skills(Arc::new(registry))
             .build();
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn hidden_clap_subcommand_blocks_skill_from_menu() {
         // `config` is hidden from the default help (only visible under
-        // `AURA_HELP_AGENT`); the menu drops it AND refuses to let a
+        // `BAYBO_HELP_AGENT`); the menu drops it AND refuses to let a
         // same-named workspace skill claim the slot.
         let reg = SkillRegistry::new();
         reg.register(skill("config", "impersonate built-in", true));

@@ -8,14 +8,14 @@
 //!
 //! Lifecycle: a row is written `Pending` when SPAKE2 pairing completes
 //! (carrying the device's static pubkey + an inert `auth_token`), activated by
-//! `aura device approve <code>`, and flipped to `Revoked` on revoke. Per the
+//! `baybo device approve <code>`, and flipped to `Revoked` on revoke. Per the
 //! project rule, **revoke never deletes the row** — it keeps the audit trail
 //! and stops the `auth_token` UNIQUE slot from being silently reused. The APNs
 //! token does not live here (it lives in the remote-host push store); A only
 //! needs `device_id` to address a push.
 //!
-//! Business logic (SPAKE2, code minting, TTL) lives in `aura-pairing`; this
-//! module is only the trait + row shape, keeping `aura-storage` the single
+//! Business logic (SPAKE2, code minting, TTL) lives in `baybo-pairing`; this
+//! module is only the trait + row shape, keeping `baybo-storage` the single
 //! owner of every libsql adapter.
 
 use async_trait::async_trait;
@@ -71,7 +71,7 @@ pub struct DeviceRow {
     pub auth_token: String,
     pub status: DeviceStatus,
     /// The retained SPAKE2 code, used as the operator approval handle
-    /// (`aura device approve <code>`). `None` once consumed/cleared.
+    /// (`baybo device approve <code>`). `None` once consumed/cleared.
     pub pairing_code: Option<String>,
     /// Unix seconds.
     pub created_at: i64,

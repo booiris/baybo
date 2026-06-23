@@ -1,10 +1,10 @@
 # SWE-bench benchmark. NOT shipped and NOT on the CI/`cargo test` path: the
-# `run` bin starts Docker containers, drives a real `aura` against a model API
+# `run` bin starts Docker containers, drives a real `baybo` against a model API
 # (spends money), and shells out to the `swebench` Python harness for grading.
 # Run it by hand. The library half (IR + pure helpers + report) is unit-tested
-# and has no Aura/Docker/Python dependency.
+# and has no Baybo/Docker/Python dependency.
 [package]
-name = "aura-bench-swe"
+name = "baybo-bench-swe"
 version.workspace = true
 edition.workspace = true
 publish = false

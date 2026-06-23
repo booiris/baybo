@@ -92,7 +92,7 @@ export async function handleReadPage(
     args: ReadPageArgs,
 ): Promise<CallToolResult> {
     // Inject Readability into the page (idempotent across calls thanks
-    // to the `window.__auraReadability` cache), parse the live DOM, and
+    // to the `window.__bayboReadability` cache), parse the live DOM, and
     // return the article object.
     //
     // SECURITY: the only interpolation into this script is the
@@ -118,17 +118,17 @@ export async function handleReadPage(
     const inPageScript = `
 async () => {
   try {
-    if (typeof window.__auraReadability === "undefined") {
+    if (typeof window.__bayboReadability === "undefined") {
       const moduleShim = { exports: undefined };
       const src = ${readabilitySrcLiteral};
       (new Function("module", src))(moduleShim);
-      window.__auraReadability = moduleShim.exports;
-      if (typeof window.__auraReadability !== "function") {
+      window.__bayboReadability = moduleShim.exports;
+      if (typeof window.__bayboReadability !== "function") {
         return { __error: "Readability injection failed: module.exports is " + typeof moduleShim.exports };
       }
     }
     const doc = document.cloneNode(true);
-    const reader = new window.__auraReadability(doc);
+    const reader = new window.__bayboReadability(doc);
     const article = reader.parse();
     if (!article) return { __error: "Readability returned no article (page may be too short or non-prose)" };
     return {

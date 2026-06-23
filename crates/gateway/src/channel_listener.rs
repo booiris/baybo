@@ -8,7 +8,7 @@
 //! address can't leak the channel listener to the network.
 //!
 //! Auth lives in the axum middleware [`crate::auth::channel`]: every
-//! caller — sidecar or bundled TUI — presents `x-aura-channel-token`
+//! caller — sidecar or bundled TUI — presents `x-baybo-channel-token`
 //! and the middleware looks the token up in [`ChannelTokenTable`].
 //! Sidecar tokens are minted at spawn time and handed to the child via
 //! env var; the TUI token is minted at gateway boot, written to the
@@ -34,8 +34,8 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aura_agent::service::ShutdownSignal;
 use axum::Router;
+use baybo_agent::service::ShutdownSignal;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -75,7 +75,7 @@ impl ChannelServer {
         deps: &GatewayDeps,
         port_file: PathBuf,
         tokens: ChannelTokenTable,
-        device_store: Option<std::sync::Arc<dyn aura_store::DeviceStore>>,
+        device_store: Option<std::sync::Arc<dyn baybo_store::DeviceStore>>,
     ) -> Result<Self> {
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         // Use std bind first so we can read `local_addr` before

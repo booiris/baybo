@@ -10,12 +10,12 @@ type PairedSummary = {
   pendingApproval: boolean;
 };
 
-/// Parse an `aura://pair?h=<endpoint>&c=<code>` QR payload, or fall back to
+/// Parse an `baybo://pair?h=<endpoint>&c=<code>` QR payload, or fall back to
 /// treating the whole scanned string as the bare code.
 function parseScan(text: string): { endpoint?: string; code: string } {
   try {
     const url = new URL(text);
-    if (url.protocol === "aura:") {
+    if (url.protocol === "baybo:") {
       const h = url.searchParams.get("h") ?? undefined;
       const c = url.searchParams.get("c");
       if (c) return { endpoint: h, code: c };
@@ -88,8 +88,8 @@ export default function App() {
 
   return (
     <main className="container">
-      <h1>Aura</h1>
-      <p className="muted">Scan the pairing code shown by <code>aura device pair</code>.</p>
+      <h1>Baybo</h1>
+      <p className="muted">Scan the pairing code shown by <code>baybo device pair</code>.</p>
 
       <label>
         Gateway endpoint

@@ -66,8 +66,8 @@ impl Tool for SecretAddTool {
             .add(&p.name, p.value.as_bytes(), p.overwrite)
             .await?;
         let status = match outcome {
-            aura_security::AddOutcome::Created => "created",
-            aura_security::AddOutcome::Replaced => "replaced",
+            baybo_security::AddOutcome::Created => "created",
+            baybo_security::AddOutcome::Replaced => "replaced",
         };
         Ok(ToolOutput::Json(
             json!({ "name": p.name, "status": status }),
@@ -154,8 +154,8 @@ impl Tool for SecretCheckTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, User};
-    use aura_security::AddOutcome;
+    use baybo_model::{ChannelType, User};
+    use baybo_security::AddOutcome;
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -232,8 +232,8 @@ mod tests {
     fn ctx_with(secrets: Option<Arc<dyn SecretAccess>>) -> ToolContext {
         ToolContext {
             session_id: "t".into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -242,7 +242,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: None,
             notifier: None,

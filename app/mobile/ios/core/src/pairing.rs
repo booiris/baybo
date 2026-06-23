@@ -166,7 +166,7 @@ mod tests {
         let welcome = GatewayWelcome {
             static_pubkey: [9u8; KEY_LEN],
             relay_node_id: "node-1".into(),
-            direct_candidates: vec!["wss://aura.lan:8889".into()],
+            direct_candidates: vec!["wss://baybo.lan:8889".into()],
             user_id: "user-1".into(),
             pairing_code: code.clone(),
             auth_token: "issued-token".into(),
@@ -179,7 +179,7 @@ mod tests {
         assert_eq!(paired.auth_token, "issued-token");
         assert_eq!(paired.gateway_static_pubkey, [9u8; KEY_LEN]);
         assert_eq!(paired.relay_node_id, "node-1");
-        assert_eq!(paired.direct_candidates, vec!["wss://aura.lan:8889".to_string()]);
+        assert_eq!(paired.direct_candidates, vec!["wss://baybo.lan:8889".to_string()]);
         // Both ends derived the same push key from the SPAKE2 secret.
         assert_eq!(paired.push_key, gw_keys.push_key);
     }

@@ -7,7 +7,7 @@
 //! matches the store and the prompt-cache prefix stays stable. Mirrors Claude
 //! Code's periodic todo nudge and Codex's `update_plan`.
 
-use aura_model::{Task, TaskStatus};
+use baybo_model::{Task, TaskStatus};
 
 const TASK_LIST_HEADER: &str = r#"Your task list for this session (the user sees this as a live checklist). Keep it accurate with TaskCreate / TaskUpdate: mark a task in_progress when you start it (at most one at a time) and completed the instant it's done. If a task turns out too complex mid-execution, split it into finer sub-tasks with TaskCreate (link prerequisites via depends_on)."#;
 
@@ -52,7 +52,7 @@ pub fn render_task_list(tasks: &[Task]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::TaskId;
+    use baybo_model::TaskId;
     use chrono::Utc;
 
     fn task(subject: &str, status: TaskStatus) -> Task {

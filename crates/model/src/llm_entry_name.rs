@@ -1,11 +1,11 @@
-//! Newtype for an LLM config entry name (`llm[*].name` in `aura.json`).
+//! Newtype for an LLM config entry name (`llm[*].name` in `baybo.json`).
 //!
 //! The same operator-defined key threads through config (`default-llm`,
 //! `model_tiers`), the runtime `LlmClientPool` (entry keys, tier map),
 //! and the subagent spawn path (`initial_llm`). Wrapping it stops a
 //! tier→entry binding from being confused with any other string and
 //! documents intent at every signature. Serialization is transparent,
-//! so on-disk `aura.json` and the admin API wire shape stay plain
+//! so on-disk `baybo.json` and the admin API wire shape stay plain
 //! strings.
 
 use std::fmt;

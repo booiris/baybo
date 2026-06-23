@@ -8,8 +8,8 @@ import {
 } from 'react';
 import { createAdminClient, type AdminClient } from './client';
 
-const TOKEN_KEY = 'aura.admin.token';
-const BASE_URL_KEY = 'aura.admin.base_url';
+const TOKEN_KEY = 'baybo.admin.token';
+const BASE_URL_KEY = 'baybo.admin.base_url';
 
 function readStoredToken(): string | null {
   try {

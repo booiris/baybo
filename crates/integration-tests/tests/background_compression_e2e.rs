@@ -7,7 +7,7 @@
 //!
 //!  1. `record_summary_success` → `summary_metadata` round trip
 //!     across the `SessionManager` API.
-//!  2. A full background-summary pass via `aura_context::run_background_summary`
+//!  2. A full background-summary pass via `baybo_context::run_background_summary`
 //!     (the same flow the in-actor `BackgroundCompressionRunner` delegates to):
 //!     it writes `summary.md`, advances `session_summaries.cursor`, and
 //!     creates no extra session — the pass runs against the parent's storage.
@@ -17,24 +17,24 @@
 //!     metadata row is removed; a known one survives.
 //!
 //! The LLM call / JobLifecycle / SpanRecorder wrapping the pass is
-//! exercised at the `aura-agent` unit layer; this file focuses on the
+//! exercised at the `baybo-agent` unit layer; this file focuses on the
 //! storage + filesystem boundary and the parent-only-session
 //! invariant.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_agent::SessionManager;
-use aura_agent::compression::reap_orphan_summaries;
-use aura_context::{
+use baybo_agent::SessionManager;
+use baybo_agent::compression::reap_orphan_summaries;
+use baybo_context::{
     BackgroundSummaryConfig, SummaryChatRun, TiktokenTokenizer, run_background_summary,
 };
-use aura_llm::{LlmResponse, TokenUsage, ToolCallInfo};
-use aura_model::{
+use baybo_llm::{LlmResponse, TokenUsage, ToolCallInfo};
+use baybo_model::{
     ChannelType, ChatMessage, ContentBlock, Session, SessionId, SessionState, TriggerSource, User,
 };
-use aura_storage::Store;
-use aura_workspace::WorkspacePaths;
+use baybo_storage::Store;
+use baybo_workspace::WorkspacePaths;
 use chrono::Utc;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -134,7 +134,7 @@ async fn record_then_read_summary_metadata_via_session_manager() {
 /// and on every later call returns a no-tool-call response so the
 /// pass terminates. `Arc<AtomicUsize>` tracks the call count so the
 /// `FnMut` closure stays `Send`.
-fn fake_edit_then_stop(notes_path: std::path::PathBuf) -> aura_context::BackgroundSummaryCallback {
+fn fake_edit_then_stop(notes_path: std::path::PathBuf) -> baybo_context::BackgroundSummaryCallback {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let calls = Arc::new(AtomicUsize::new(0));
     Box::new(move |_req, _marker| {

@@ -1,7 +1,7 @@
 //! Persistence contract for **in-flight device-pairing slots**.
 //!
 //! A slot is the short-lived bridge between two processes: the CLI
-//! (`aura device pair`) that mints a code and renders the QR, and the running
+//! (`baybo device pair`) that mints a code and renders the QR, and the running
 //! gateway WS (`/v1/device/pair`) that the app connects to. They share libsql,
 //! not memory, so the minted code must be persisted — the gateway looks the
 //! slot up by code to authorize the SPAKE2 handshake and learn the owning

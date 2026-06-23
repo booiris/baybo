@@ -1,8 +1,8 @@
 //! Sanity check that the fixture wiring compiles and works.
 //! Real e2e suites live in sibling files (security_pipeline, etc.).
 
-use aura_integration_tests::{SessionBuilder, capture_tracing, gateway_with_memory_vault};
-use aura_model::ChannelType;
+use baybo_integration_tests::{SessionBuilder, capture_tracing, gateway_with_memory_vault};
+use baybo_model::ChannelType;
 use tracing::{Level, info};
 
 #[tokio::test]

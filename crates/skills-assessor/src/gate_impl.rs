@@ -1,10 +1,10 @@
 //! Bridges the inherent [`SkillAssessor::check`] (`Result<AssessedSkill, _>`)
 //! onto the trait used by tool-side consumers. Trait lives in
-//! `aura-skills` so neither side needs to depend on the other for
+//! `baybo-skills` so neither side needs to depend on the other for
 //! the gate decision.
 
 use async_trait::async_trait;
-use aura_skills::{SkillDefinition, SkillGate, SkillRiskCheck};
+use baybo_skills::{SkillDefinition, SkillGate, SkillRiskCheck};
 use tracing::warn;
 
 use crate::{AssessError, RiskLevel, SkillAssessor};

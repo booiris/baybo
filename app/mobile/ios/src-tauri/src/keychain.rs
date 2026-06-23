@@ -45,8 +45,8 @@ mod imp {
 
     const ERR_SEC_SUCCESS: OSStatus = 0;
     /// MUST match `PushKeyStore.accessGroup` / `.accountPrefix` in the NSE.
-    const ACCESS_GROUP: &str = "group.com.aura.app";
-    const ACCOUNT_PREFIX: &str = "aura.push-key.";
+    const ACCESS_GROUP: &str = "group.com.baybo.app";
+    const ACCOUNT_PREFIX: &str = "baybo.push-key.";
 
     /// Wrap a `static` Security-framework `CFStringRef` constant as a borrowed
     /// `CFString` (get-rule: we don't own it, so don't release it).
@@ -131,7 +131,7 @@ mod imp {
 }
 
 /// Write the device's push key to the shared App Group keychain at account
-/// `aura.push-key.<bid>`. `bid` is the device id the gateway stamps into every
+/// `baybo.push-key.<bid>`. `bid` is the device id the gateway stamps into every
 /// push payload, so the NSE can look the key back up.
 pub fn store_push_key(bid: &str, key: &[u8; KEY_LEN]) -> Result<(), String> {
     imp::store_push_key(bid, key)

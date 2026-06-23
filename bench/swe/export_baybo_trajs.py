@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Export aura SWE-bench agent traces into readable per-instance Markdown + an
+"""Export baybo SWE-bench agent traces into readable per-instance Markdown + an
 index, in the SAME format as bench/swe-baseline/export_trajs.py (mini-swe-agent)
 so the two arms' conversation flows sit side by side.
 
@@ -9,7 +9,7 @@ Sources (for run <RID>):
   runs/predictions-agent-<RID>.jsonl     — the final graded diff (model_patch)
 
 Usage:
-  python export_aura_trajs.py --run-id <RID> [--out DIR] [--only id,id]
+  python export_baybo_trajs.py --run-id <RID> [--out DIR] [--only id,id]
                               [--max-output-chars N] [--max-task-chars N]
 """
 import argparse, glob, json, os, re
@@ -57,7 +57,7 @@ def thinking_blocks(blocks):
 
 
 def strip_tool_output(content):
-    """Drop the <tool_output name="...">...</tool_output> wrapper aura adds."""
+    """Drop the <tool_output name="...">...</tool_output> wrapper baybo adds."""
     s = content or ""
     i = s.find(">")
     if s.startswith("<tool_output") and i != -1:
@@ -237,7 +237,7 @@ def main():
 
     rows.sort(key=lambda r: (r[1] is True, r[0]))
     nres = sum(1 for r in rows if r[1] is True)
-    idx = [f"# aura SWE-bench traces — {a.run_id}", "",
+    idx = [f"# baybo SWE-bench traces — {a.run_id}", "",
            f"{len(rows)} instances · resolved {nres}/{len(rows)} "
            f"({100 * nres / len(rows):.1f}%)" if rows else "no instances", "",
            "| instance | resolved | steps | cost |", "|---|---|---|---|"]

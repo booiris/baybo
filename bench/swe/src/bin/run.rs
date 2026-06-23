@@ -1,10 +1,10 @@
 //! Run the SWE-bench benchmark for one arm and write a report.
 //!
-//! - **agent** — run aura inside each instance's eval image, capture `git diff`,
-//!   grade the predictions with the `swebench` harness. Needs the musl `aura`
+//! - **agent** — run baybo inside each instance's eval image, capture `git diff`,
+//!   grade the predictions with the `swebench` harness. Needs the musl `baybo`
 //!   (static-musl, `--features bench-bash`), a model key, and pre-built images.
-//! - **oracle** — grade `--predictions_path gold` (the ceiling). No aura, no keys.
-//! - **noop** — grade empty patches (the floor). No aura, no keys.
+//! - **oracle** — grade `--predictions_path gold` (the ceiling). No baybo, no keys.
+//! - **noop** — grade empty patches (the floor). No baybo, no keys.
 //!
 //! One arm per invocation; run once per arm and compare the JSONs. Grading
 //! always runs in the official Docker images, so oracle ≈100% / noop 0% validate
@@ -14,11 +14,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use aura_bench_swe::agent::{self, AgentModel, RunOpts};
-use aura_bench_swe::grader::{self, GraderConfig, Predictions};
-use aura_bench_swe::report::{InstanceResult, ReportMeta, aggregate, print_table};
-use aura_bench_swe::{
-    AURA_API_KEY_ENV, SweInstance, arm_model_name, default_run_id, load_instances, parse_model,
+use baybo_bench_swe::agent::{self, AgentModel, RunOpts};
+use baybo_bench_swe::grader::{self, GraderConfig, Predictions};
+use baybo_bench_swe::report::{InstanceResult, ReportMeta, aggregate, print_table};
+use baybo_bench_swe::{
+    BAYBO_API_KEY_ENV, SweInstance, arm_model_name, default_run_id, load_instances, parse_model,
     prediction_line, predictions_jsonl,
 };
 use clap::{Parser, ValueEnum};
@@ -26,11 +26,11 @@ use futures::{StreamExt, stream};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Arm {
-    /// Run the real aura agent in each eval image (the measurement).
+    /// Run the real baybo agent in each eval image (the measurement).
     Agent,
-    /// Grade the gold patches (ceiling). No aura, no keys.
+    /// Grade the gold patches (ceiling). No baybo, no keys.
     Oracle,
-    /// Grade empty patches (floor). No aura, no keys.
+    /// Grade empty patches (floor). No baybo, no keys.
     Noop,
 }
 
@@ -73,13 +73,13 @@ struct Args {
     #[arg(long, num_args = 0..)]
     instance_ids: Vec<String>,
 
-    /// Host path of the `aura` binary built `--features bench-bash` (static-musl)
+    /// Host path of the `baybo` binary built `--features bench-bash` (static-musl)
     /// (musl-static recommended). Required for the agent arm.
     #[arg(long)]
-    aura_bin: Option<PathBuf>,
+    baybo_bin: Option<PathBuf>,
 
     /// Host path of a static-musl `rg` (ripgrep), bundled into each eval container
-    /// so aura's `Grep` tool works (the SWE-bench images don't ship ripgrep).
+    /// so baybo's `Grep` tool works (the SWE-bench images don't ship ripgrep).
     /// Required for the agent arm.
     #[arg(long)]
     rg_bin: Option<PathBuf>,
@@ -110,7 +110,7 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     max_workers: usize,
 
-    /// Per-instance `aura prompt` timeout, seconds (agent arm).
+    /// Per-instance `baybo prompt` timeout, seconds (agent arm).
     #[arg(long, default_value_t = 1800)]
     prompt_timeout: u64,
 
@@ -185,7 +185,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| args.runs_dir.clone());
     let instance_ids: Vec<String> = instances.iter().map(|i| i.instance_id.clone()).collect();
 
-    // Agent arm: run aura per instance → patches. Other arms have no run metrics.
+    // Agent arm: run baybo per instance → patches. Other arms have no run metrics.
     let runs_by_id: HashMap<String, agent::InstanceRun> = if args.arm == Arm::Agent {
         run_agent(&args, &instances, &run_id).await?
     } else {
@@ -287,17 +287,17 @@ async fn main() -> Result<()> {
 }
 
 /// Run the agent arm: preflight images, then a bounded-concurrency sweep of
-/// `aura prompt` inside each eval image. Returns the runs keyed by instance id.
+/// `baybo prompt` inside each eval image. Returns the runs keyed by instance id.
 async fn run_agent(
     args: &Args,
     instances: &[SweInstance],
     run_id: &str,
 ) -> Result<HashMap<String, agent::InstanceRun>> {
-    let aura_bin = args.aura_bin.as_ref().context(
-        "the agent arm requires --aura-bin (the `--features bench-bash` static-musl build)",
+    let baybo_bin = args.baybo_bin.as_ref().context(
+        "the agent arm requires --baybo-bin (the `--features bench-bash` static-musl build)",
     )?;
-    if !aura_bin.exists() {
-        bail!("aura binary not found at {}", aura_bin.display());
+    if !baybo_bin.exists() {
+        bail!("baybo binary not found at {}", baybo_bin.display());
     }
     let rg_bin = args.rg_bin.as_ref().context(
         "the agent arm requires --rg-bin (a static-musl ripgrep bundled into each eval image)",
@@ -305,10 +305,10 @@ async fn run_agent(
     if !rg_bin.exists() {
         bail!("rg binary not found at {}", rg_bin.display());
     }
-    // Split `<provider>/<model>`; read the key from the canonical `AURA_API_KEY`
+    // Split `<provider>/<model>`; read the key from the canonical `BAYBO_API_KEY`
     // (the bench fixes the env-var name — it's not a user knob).
     let (provider, model) = parse_model(&args.model);
-    let api_key_env = AURA_API_KEY_ENV.to_string();
+    let api_key_env = BAYBO_API_KEY_ENV.to_string();
     let key_value = std::env::var(&api_key_env).map_err(|_| {
         anyhow::anyhow!("the agent arm needs the model key in ${api_key_env} (set it in .env)")
     })?;
@@ -363,20 +363,20 @@ async fn run_agent(
     tracing::info!(
         instances = instances.len(),
         concurrency = args.concurrency,
-        "agent arm: running aura in eval containers"
+        "agent arm: running baybo in eval containers"
     );
     let runs: Vec<agent::InstanceRun> = stream::iter(instances.iter())
         .map(|inst| async move {
             let opts = RunOpts {
                 docker_bin,
-                aura_bin_host: aura_bin,
+                baybo_bin_host: baybo_bin,
                 rg_bin_host: rg_bin,
                 config_json: cfg,
                 instance: inst,
                 api_key_env: key_env,
                 api_key_value: key_val,
                 session_id: format!("swe-{run_id_ref}-{}", inst.instance_id),
-                container_name: format!("aura-swe-{run_id_ref}-{}", inst.instance_id),
+                container_name: format!("baybo-swe-{run_id_ref}-{}", inst.instance_id),
                 prompt_timeout_secs: timeout,
                 trace_dir: trace_ref,
             };
@@ -407,13 +407,13 @@ fn print_plan(arm: Arm, args: &Args, instances: &[SweInstance], run_id: &str) {
     }
     match arm {
         Arm::Agent => println!(
-            "plan: {} aura-in-container runs (concurrency {}) → predictions → grade ({} workers)",
+            "plan: {} baybo-in-container runs (concurrency {}) → predictions → grade ({} workers)",
             instances.len(),
             args.concurrency.max(1),
             args.max_workers
         ),
-        Arm::Oracle => println!("plan: grade gold patches (no aura, no keys)"),
-        Arm::Noop => println!("plan: grade empty patches (no aura, no keys)"),
+        Arm::Oracle => println!("plan: grade gold patches (no baybo, no keys)"),
+        Arm::Noop => println!("plan: grade empty patches (no baybo, no keys)"),
     }
     println!("(no Docker started, no API calls made)");
 }

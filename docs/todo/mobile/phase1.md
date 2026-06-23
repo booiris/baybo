@@ -1,8 +1,8 @@
 # Mobile companion — Phase 1 (iOS)
 
-Phase 1 ships an iOS companion app for Aura with two user-facing features:
+Phase 1 ships an iOS companion app for Baybo with two user-facing features:
 
-1. **Scan-to-connect (扫码连接)** — pair the phone to an Aura gateway by scanning a
+1. **Scan-to-connect (扫码连接)** — pair the phone to an Baybo gateway by scanning a
    QR code; a SPAKE2 handshake establishes a device identity the operator then
    approves.
 2. **Remote notifications (远程通知)** — when an agent turn completes, the phone
@@ -11,18 +11,18 @@ Phase 1 ships an iOS companion app for Aura with two user-facing features:
    phone decrypts locally in a Notification Service Extension (NSE).
 
 The app is a **Tauri 2** shell (`app/mobile/ios`) over a host-tested,
-FFI-free Rust core (`aura-mobile-core`); the protocol + crypto live in shared
+FFI-free Rust core (`baybo-mobile-core`); the protocol + crypto live in shared
 crates so the phone and the gateway agree by construction.
 
 ## Roles
 
 | Role | Who | Trust |
 |---|---|---|
-| **A** | the Aura gateway (the user's `aura` instance) | holds session data; encrypts previews |
+| **A** | the Baybo gateway (the user's `baybo` instance) | holds session data; encrypts previews |
 | **C** | the operator-run remote host (`remote-host/`) | **blind** relay + APNs sender; sees only ciphertext, never plaintext or keys |
 | **P** | the phone (this app) | decrypts previews locally; holds its push key + Noise identity |
 
-C is a **separate Cargo workspace** that deliberately depends on no `aura-*`
+C is a **separate Cargo workspace** that deliberately depends on no `baybo-*`
 crate — its `/notify` + `/register` payloads are a JSON contract, so the
 `.p8`-holding push role stays isolatable.
 
@@ -42,7 +42,7 @@ crate — its `/notify` + `/register` payloads are a JSON contract, so the
   (`serve.rs`), token store.
 - `remote-host/crates/relay` — C-side blind byte-pipe + SPAKE2 rendezvous (the
   relay-fallback data leg).
-- `app/mobile/ios/core` (`aura-mobile-core`) — P-side: `PairingClient`,
+- `app/mobile/ios/core` (`baybo-mobile-core`) — P-side: `PairingClient`,
   `ContentSession` (Noise self-pull), and the direct-first/relay-fallback
   `connect` policy. No FFI, no platform APIs — fully host-unit-testable.
 - `app/mobile/ios/src-tauri` — the Tauri shell: the `pair` command, push-key
@@ -65,13 +65,13 @@ A → P   Sealed( GatewayWelcome )             # user_id, auth_token (inert unti
 Both sides derive the same keys from the SPAKE2 secret via HKDF: a `channel_key`
 (seals the two `DeviceHello`/`GatewayWelcome` messages) and a 32-byte `push_key`
 (the per-device preview key). The `auth_token` is inert until the operator runs
-`aura device approve`.
+`baybo device approve`.
 
 **Push preview** (A encrypts → C relays blind → P's NSE decrypts):
 
 ```jsonc
 // APNs payload C sends (enc/n copied verbatim from A's /notify body):
-{ "aps": { "alert": { "title": "Aura", "body": "New message" }, "mutable-content": 1 },
+{ "aps": { "alert": { "title": "Baybo", "body": "New message" }, "mutable-content": 1 },
   "enc": "<base64 ciphertext||16-byte tag>",   // ChaCha20-Poly1305, empty AAD
   "n":   "<base64 12-byte nonce>",
   "kid": 0,                                     // key epoch (rotation-ready; always 0 in phase 1)
@@ -79,8 +79,8 @@ Both sides derive the same keys from the SPAKE2 secret via HKDF: a `channel_key`
 ```
 
 `mutable-content: 1` wakes the NSE. It reads the 32-byte `push_key` for `bid`
-from the **App Group keychain** (account `aura.push-key.<bid>`, access group
-`group.com.aura.app`), ChaCha20-Poly1305-opens `enc` with nonce `n`, and rewrites
+from the **App Group keychain** (account `baybo.push-key.<bid>`, access group
+`group.com.baybo.app`), ChaCha20-Poly1305-opens `enc` with nonce `n`, and rewrites
 the visible `title`/`body` from the decrypted `{"title","body"}` JSON. On **any**
 failure it keeps the generic placeholder — a bad key / wrong nonce / tamper are
 indistinguishable, and the only safe response is "New message".
@@ -100,13 +100,13 @@ device_id, apns_token, env}` to C, so the phone never holds a C credential.
 | **M0** | Protocol + crypto (`wire`, `device-proto`): SPAKE2, Noise, AEAD, KDF, pinned fixture | ✅ done, host-tested |
 | **M1** | Gateway pairing (A): `/v1/device/pair`, device store, operator approval | ✅ done |
 | **M2** | Remote host (C): push (HTTP/2 APNs, ES256 `.p8` JWT, `/notify`, `/register`) + blind relay | ✅ done |
-| **M3** | Tauri iOS app + React UI + NSE Xcode target | ✅ done — `Aura.app` builds, NSE `.appex` embedded, installs + launches on the iOS 26 simulator |
+| **M3** | Tauri iOS app + React UI + NSE Xcode target | ✅ done — `Baybo.app` builds, NSE `.appex` embedded, installs + launches on the iOS 26 simulator |
 | **M3.5** | Push-key keychain persistence + provisional notification auth (the NSE keystone) | ✅ implemented + verified to the signing boundary (see below) |
 | **M4** | Real end-to-end APNs delivery (device token → C → APNs → device) | ⚠️ blocked on external resources |
 
 ## iOS app structure
 
-- `pair` command → `aura-mobile-core::PairingClient` over a `tokio-tungstenite`
+- `pair` command → `baybo-mobile-core::PairingClient` over a `tokio-tungstenite`
   WS; on success the shell persists `push_key` to the App Group keychain
   (`keychain.rs`, Security-framework `SecItemAdd` from Rust — no Swift added to
   the app target) and returns an operator-pending `PairedSummary` to the webview.
@@ -114,17 +114,17 @@ device_id, apns_token, env}` to C, so the phone never holds a C credential.
   **provisional** notification authorization (granted silently, no prompt, still
   wakes the NSE) and calls `registerForRemoteNotifications`.
 - The NSE is an embedded `app-extension` target (`project.yml`), in the app's
-  `PlugIns`, sharing the `group.com.aura.app` App Group + keychain.
+  `PlugIns`, sharing the `group.com.baybo.app` App Group + keychain.
 
 ## What's verified, and the external boundary
 
 Verified locally (iOS 26 simulator, Xcode 26):
 
-- Full `Aura.app` archive builds and embeds `NotificationExtension.appex`.
+- Full `Baybo.app` archive builds and embeds `NotificationExtension.appex`.
 - The Rust core + keychain + objc2 registration compile, link, and run for
   `aarch64-apple-ios-sim`; clippy-clean across all three workspaces.
 - Provisional auth works: after launch, a `simctl push` is **delivered** through
-  the usernotifications pipeline to `com.aura.app` (it is dropped without auth).
+  the usernotifications pipeline to `com.baybo.app` (it is dropped without auth).
 - The AEAD interop is byte-exact (`device_proto::fixtures` +
   `verify-crypto.swift`, runnable on macOS without Xcode).
 
@@ -137,7 +137,7 @@ nailed down empirically on the iOS 26 simulator:
 - **`get-task-allow` is mandatory** to launch *any* re-signed build — the
   `--no-sign` linker signature carries it; a `codesign --entitlements` that drops
   it gets the launch denied by `SBMainWorkspace`.
-- The simulator **rejects the App Group access group `group.com.aura.app`**
+- The simulator **rejects the App Group access group `group.com.baybo.app`**
   (whether in `application-groups` *or* `keychain-access-groups`) **unless the
   App Group is provisioned for the signing team**. Manual `codesign` — ad-hoc
   *or* with a real Development identity — **cannot register an App Group**; the
@@ -147,14 +147,14 @@ nailed down empirically on the iOS 26 simulator:
   (it fails headlessly with `errSecInternalComponent`).
 
 The reliable path is therefore **Xcode automatic signing**: open
-`src-tauri/gen/apple/aura-mobile-app.xcodeproj`, set your team under Signing &
+`src-tauri/gen/apple/baybo-mobile-app.xcodeproj`, set your team under Signing &
 Capabilities for **both** the app and the NSE target — Xcode registers
-`group.com.aura.app` and provisions it (a **paid Apple Developer** capability;
-`com.aura.app` may need a team-unique bundle id, kept in sync with the App Group
+`group.com.baybo.app` and provisions it (a **paid Apple Developer** capability;
+`com.baybo.app` may need a team-unique bundle id, kept in sync with the App Group
 id in `PushKeyStore.swift` / `keychain.rs`). `apple/verify-nse.sh` automates the
 build + signing + seed + push and, when the App Group is not yet provisioned,
 detects the launch denial and prints this path. PASS = a notification reading
-*"Aura / The agent finished replying."*
+*"Baybo / The agent finished replying."*
 
 ## Remaining M4 work (needs the external resources above)
 

@@ -3,21 +3,21 @@
 //!
 //! Sidecars `POST /v1/blobs` to upload bytes and receive a content-
 //! addressed `blob_id`, then reference that id in
-//! [`aura_channels::wire::WireAttachment`]. Outbound, sidecars
+//! [`baybo_channels::wire::WireAttachment`]. Outbound, sidecars
 //! `GET /v1/blobs/<id>` to pull bytes the agent has produced. Both
 //! routes are mounted under the same router as `/channel-ws` so the
 //! channel auth middleware ([`crate::auth::channel`]) gates them
 //! identically.
 
-use aura_model::ChannelType;
-use aura_pairing::CheckOutcome;
-use aura_store::StorageError;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Extension, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use baybo_model::ChannelType;
+use baybo_pairing::CheckOutcome;
+use baybo_store::StorageError;
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::Serialize;
@@ -32,8 +32,8 @@ use crate::auth::AuthedClient;
 /// `Frame::Message` — without these headers a sidecar could persist a
 /// 100 MiB blob for an unpaired user before the message-side pairing
 /// gate ever runs.
-const HEADER_BOT_ID: &str = "x-aura-bot-id";
-const HEADER_USER_ID: &str = "x-aura-user-id";
+const HEADER_BOT_ID: &str = "x-baybo-bot-id";
+const HEADER_USER_ID: &str = "x-baybo-user-id";
 
 /// Hard cap on a single upload, matched against `DefaultBodyLimit`.
 /// Larger blobs would block the WS-paired connection's Tokio worker
@@ -74,7 +74,7 @@ enum UploadAuth {
         user_id: String,
     },
     /// Subprocess sidecar; pairing not yet approved. Body contains the
-    /// short code the user must run `aura pair approve <code>` for.
+    /// short code the user must run `baybo pair approve <code>` for.
     Pending(String),
     /// Hard reject with status + diagnostic body. Used for missing
     /// headers, unbound tokens, pairing errors, etc.
@@ -82,7 +82,7 @@ enum UploadAuth {
 }
 
 async fn authorize_upload(
-    pairing: &aura_pairing::PairingService,
+    pairing: &baybo_pairing::PairingService,
     authed: &AuthedClient,
     headers: &HeaderMap,
 ) -> UploadAuth {
@@ -113,7 +113,7 @@ async fn authorize_upload(
                 _ => {
                     return UploadAuth::Reject(
                         StatusCode::BAD_REQUEST,
-                        "missing or empty x-aura-bot-id header",
+                        "missing or empty x-baybo-bot-id header",
                     );
                 }
             };
@@ -122,7 +122,7 @@ async fn authorize_upload(
                 _ => {
                     return UploadAuth::Reject(
                         StatusCode::BAD_REQUEST,
-                        "missing or empty x-aura-user-id header",
+                        "missing or empty x-baybo-user-id header",
                     );
                 }
             };
@@ -275,9 +275,9 @@ mod tests {
     //! channel-WS integration tests; here we just assert the gate
     //! shape without spinning a real server.
     use super::*;
-    use aura_pairing::PairingService;
-    use aura_storage::libsql::{LibsqlChannelPairingStore, LibsqlPool};
-    use aura_store::ChannelPairingStore;
+    use baybo_pairing::PairingService;
+    use baybo_storage::libsql::{LibsqlChannelPairingStore, LibsqlPool};
+    use baybo_store::ChannelPairingStore;
     use std::sync::Arc;
 
     async fn fresh_pairing() -> (Arc<dyn ChannelPairingStore>, Arc<PairingService>) {
@@ -326,7 +326,7 @@ mod tests {
     #[tokio::test]
     async fn subprocess_without_bot_id_is_400() {
         let (_store, svc) = fresh_pairing().await;
-        let h = headers_with(&[("x-aura-user-id", "alice")]);
+        let h = headers_with(&[("x-baybo-user-id", "alice")]);
         let out = authorize_upload(&svc, &subprocess("weixin"), &h).await;
         assert!(matches!(
             out,
@@ -337,7 +337,7 @@ mod tests {
     #[tokio::test]
     async fn subprocess_without_user_id_is_400() {
         let (_store, svc) = fresh_pairing().await;
-        let h = headers_with(&[("x-aura-bot-id", "prod-bot")]);
+        let h = headers_with(&[("x-baybo-bot-id", "prod-bot")]);
         let out = authorize_upload(&svc, &subprocess("weixin"), &h).await;
         assert!(matches!(
             out,
@@ -363,7 +363,7 @@ mod tests {
         // `PairingService::check` to mint a code and return Pending —
         // the upload must refuse so no bytes hit disk.
         let (_store, svc) = fresh_pairing().await;
-        let h = headers_with(&[("x-aura-bot-id", "prod-bot"), ("x-aura-user-id", "alice")]);
+        let h = headers_with(&[("x-baybo-bot-id", "prod-bot"), ("x-baybo-user-id", "alice")]);
         match authorize_upload(&svc, &subprocess("weixin"), &h).await {
             UploadAuth::Pending(code) => assert!(!code.is_empty(), "minted code"),
             other => panic!("expected Pending, got {other:?}"),
@@ -388,7 +388,7 @@ mod tests {
             .unwrap();
         store.approve_by_code(&row.code, now).await.unwrap();
 
-        let h = headers_with(&[("x-aura-bot-id", "prod-bot"), ("x-aura-user-id", "alice")]);
+        let h = headers_with(&[("x-baybo-bot-id", "prod-bot"), ("x-baybo-user-id", "alice")]);
         match authorize_upload(&svc, &subprocess("weixin"), &h).await {
             UploadAuth::Approved {
                 bot_id, user_id, ..

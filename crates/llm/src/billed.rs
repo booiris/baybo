@@ -4,19 +4,19 @@
 //! gate → call → record, so a successful return guarantees the spend was
 //! accounted (or explicitly waived via a no-op recorder).
 //!
-//! `aura-llm` never names `CostManager`: the recorder is an opaque
+//! `baybo-llm` never names `CostManager`: the recorder is an opaque
 //! closure the cost layer injects (mirroring the admission guard), so the
-//! `aura-cost → aura-llm` dependency stays one-directional. Response
+//! `baybo-cost → baybo-llm` dependency stays one-directional. Response
 //! *sanitization* is intentionally not part of this layer — the billing
 //! chokepoint records raw spend; scrubbing the response for display is a
-//! separate, caller-side step (`aura-agent`, where the gateway lives).
+//! separate, caller-side step (`baybo-agent`, where the gateway lives).
 
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use aura_model::{CallReason, JobId, MicroUsd, SessionId, SpanId};
+use baybo_model::{CallReason, JobId, MicroUsd, SessionId, SpanId};
 use futures::stream::{Stream, StreamExt};
 
 use crate::guard::{BillableLlm, LlmCallGuard};
@@ -61,7 +61,7 @@ impl Attribution {
 
 /// Post-call cost recorder: invoked after a provider response with the
 /// call's attribution, model id, and token usage; returns the billed
-/// amount. Opaque so `aura-llm` needn't depend on `aura-cost` — the cost
+/// amount. Opaque so `baybo-llm` needn't depend on `baybo-cost` — the cost
 /// layer injects a closure capturing its `CostManager`.
 pub type LlmCostRecorder = Arc<dyn Fn(&Attribution, &str, &TokenUsage) -> MicroUsd + Send + Sync>;
 
@@ -113,7 +113,7 @@ pub struct BilledChatResponse {
 /// In-flow LLM call with built-in cost accounting. Errors are returned as
 /// a sanitized string — implementations scrub leaked secrets before
 /// surfacing the provider message. Implemented downstream (in
-/// `aura-agent`, where the security gateway lives); this crate owns the
+/// `baybo-agent`, where the security gateway lives); this crate owns the
 /// trait so any holder of `Arc<dyn BilledChat>` can make a billed call
 /// without agent-layer types.
 #[async_trait]

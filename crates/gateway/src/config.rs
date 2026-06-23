@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use aura_config::GatewayConfig;
+use baybo_config::GatewayConfig;
 
 use crate::{GatewayError, Result};
 
 /// Runtime-resolved gateway configuration. Thin wrapper over
-/// [`aura_config::GatewayConfig`] that resolves the socket address up
+/// [`baybo_config::GatewayConfig`] that resolves the socket address up
 /// front.
 #[derive(Debug, Clone)]
 pub struct RuntimeGatewayConfig {

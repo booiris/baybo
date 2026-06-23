@@ -7,8 +7,8 @@
 //! half is advertised inside the SPAKE2 K-channel at pairing; the secret half
 //! never leaves the vault.
 
+use baybo_security::SecretVault;
 use device_proto::noise::StaticKeypair;
-use aura_security::SecretVault;
 
 /// `SecretVault` key holding A's static Noise keypair as `public ‖ secret`.
 const NOISE_STATIC_VAULT_KEY: &str = "device.noise_static";
@@ -55,8 +55,8 @@ pub async fn load_or_create_static_keypair(vault: &SecretVault) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_security::EncryptionKey;
-    use aura_security::test_support::MemorySecretStore;
+    use baybo_security::EncryptionKey;
+    use baybo_security::test_support::MemorySecretStore;
     use std::sync::Arc;
 
     fn vault() -> SecretVault {

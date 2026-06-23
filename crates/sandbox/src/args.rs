@@ -122,10 +122,10 @@ pub fn build_bwrap_argv(
 
             // Read-only re-binds (e.g. `skills/`) layered on top of the
             // masking tmpfs, for the same last-wins reason as the
-            // workspace bind below: the denylist masks all of `~/.aura`,
+            // workspace bind below: the denylist masks all of `~/.baybo`,
             // and `skills/` sits inside it, so binding it after the
             // tmpfs re-establishes it as a readable mountpoint while the
-            // rest of the aura state stays hidden. `--ro-bind-try`
+            // rest of the baybo state stays hidden. `--ro-bind-try`
             // tolerates a missing dir (already filtered at the adapter,
             // belt-and-braces here).
             for path in &spec.readable_paths {
@@ -137,12 +137,12 @@ pub fn build_bwrap_argv(
             // workspace_root binds LAST. bwrap processes mounts in
             // order, so a later `--tmpfs P` shadows an earlier
             // `--bind P/x P/x`. The agent's denylist includes
-            // `$AURA_HOME` / `~/.aura`, and the workspace work-dir
-            // lives inside it (e.g. `~/.aura/work`) — binding it
+            // `$BAYBO_HOME` / `~/.baybo`, and the workspace work-dir
+            // lives inside it (e.g. `~/.baybo/work`) — binding it
             // before the tmpfs would leave nothing to chdir into. By
             // binding last, the work dir is re-established as a
             // mountpoint on top of the masking tmpfs and the rest of
-            // the aura state stays masked.
+            // the baybo state stays masked.
             argv.push(OsString::from("--bind"));
             argv.push(spec.workspace_root.as_os_str().to_owned());
             argv.push(spec.workspace_root.as_os_str().to_owned());
@@ -480,8 +480,8 @@ pub fn render_sbpl_profile(
             s.push('\n');
 
             // SBPL is last-match-wins, so a deny on the workspace's
-            // parent (e.g. `~/.aura` masked while the workspace is
-            // `~/.aura/work`) would clobber the earlier allows. Re-
+            // parent (e.g. `~/.baybo` masked while the workspace is
+            // `~/.baybo/work`) would clobber the earlier allows. Re-
             // emit the workspace allows AFTER the denies so the
             // work-dir stays read+write while the rest of the parent
             // stays denied. Same fix shape as the bwrap reordering.
@@ -506,7 +506,7 @@ pub fn render_sbpl_profile(
 
             // Read-only re-allows (e.g. `skills/`) AFTER the denies, so
             // last-match-wins keeps them readable even when they sit
-            // under a denied parent (`~/.aura`). Read-only by design: no
+            // under a denied parent (`~/.baybo`). Read-only by design: no
             // file-write* re-allow is emitted, mirroring the bwrap
             // `--ro-bind-try`.
             for p in &spec.readable_paths {
@@ -618,59 +618,59 @@ mod tests {
 
     #[test]
     fn bwrap_argv_binds_requested_symlink_path_to_canonical_source() {
-        let spec = spec_for(NetworkPolicy::None, "/data/proj/.aura/work");
+        let spec = spec_for(NetworkPolicy::None, "/data/proj/.baybo/work");
         let symlink_mount = WorkspaceSymlinkMount::new(
-            PathBuf::from("/data/proj/.aura/work"),
-            PathBuf::from("/home/u/proj/.aura/work"),
+            PathBuf::from("/data/proj/.baybo/work"),
+            PathBuf::from("/home/u/proj/.baybo/work"),
         );
         let argv = build_bwrap_argv(&spec, Some(&symlink_mount));
         let strs = argv_strs(&argv);
         assert!(
             strs.windows(3).any(|w| w[0] == "--bind"
-                && w[1] == "/data/proj/.aura/work"
-                && w[2] == "/data/proj/.aura/work"),
+                && w[1] == "/data/proj/.baybo/work"
+                && w[2] == "/data/proj/.baybo/work"),
             "primary workspace bind must be present: {strs:?}"
         );
         assert!(
             strs.windows(3).any(|w| w[0] == "--bind"
-                && w[1] == "/data/proj/.aura/work"
-                && w[2] == "/home/u/proj/.aura/work"),
-            "expected --bind /data/proj/.aura/work /home/u/proj/.aura/work in argv: {strs:?}"
+                && w[1] == "/data/proj/.baybo/work"
+                && w[2] == "/home/u/proj/.baybo/work"),
+            "expected --bind /data/proj/.baybo/work /home/u/proj/.baybo/work in argv: {strs:?}"
         );
     }
 
     #[test]
     fn docker_argv_binds_requested_symlink_path_to_canonical_source() {
-        let spec = spec_for(NetworkPolicy::None, "/data/proj/.aura/work");
+        let spec = spec_for(NetworkPolicy::None, "/data/proj/.baybo/work");
         let symlink_mount = WorkspaceSymlinkMount::new(
-            PathBuf::from("/data/proj/.aura/work"),
-            PathBuf::from("/home/u/proj/.aura/work"),
+            PathBuf::from("/data/proj/.baybo/work"),
+            PathBuf::from("/home/u/proj/.baybo/work"),
         );
         let argv = build_docker_argv(
             &spec,
             Some(&symlink_mount),
             "debian:stable-slim",
-            "aura-sandbox-test",
+            "baybo-sandbox-test",
         );
         let strs = argv_strs(&argv);
         assert!(
             strs.iter()
-                .any(|a| a == "/data/proj/.aura/work:/data/proj/.aura/work"),
+                .any(|a| a == "/data/proj/.baybo/work:/data/proj/.baybo/work"),
             "primary -v bind missing: {strs:?}"
         );
         assert!(
             strs.iter()
-                .any(|a| a == "/data/proj/.aura/work:/home/u/proj/.aura/work"),
+                .any(|a| a == "/data/proj/.baybo/work:/home/u/proj/.baybo/work"),
             "symlink path -v bind missing: {strs:?}"
         );
     }
 
     #[test]
     fn sbpl_profile_grants_requested_symlink_path_read_and_write() {
-        let spec = spec_for(NetworkPolicy::None, "/data/proj/.aura/work");
+        let spec = spec_for(NetworkPolicy::None, "/data/proj/.baybo/work");
         let symlink_mount = WorkspaceSymlinkMount::new(
-            PathBuf::from("/data/proj/.aura/work"),
-            PathBuf::from("/home/u/proj/.aura/work"),
+            PathBuf::from("/data/proj/.baybo/work"),
+            PathBuf::from("/home/u/proj/.baybo/work"),
         );
         let s = render_sbpl_profile(&spec, Some(&symlink_mount));
         let read_start = s
@@ -681,7 +681,7 @@ mod tests {
             .expect("file-read* terminator");
         let read_block = &s[read_start..read_start + read_end_rel];
         assert!(
-            read_block.contains("(subpath \"/home/u/proj/.aura/work\")"),
+            read_block.contains("(subpath \"/home/u/proj/.baybo/work\")"),
             "requested symlink path must be readable: {read_block}"
         );
         let write_start = s
@@ -692,7 +692,7 @@ mod tests {
             .expect("file-write* terminator");
         let write_block = &s[write_start..write_start + write_end_rel];
         assert!(
-            write_block.contains("(subpath \"/home/u/proj/.aura/work\")"),
+            write_block.contains("(subpath \"/home/u/proj/.baybo/work\")"),
             "requested symlink path must be writable: {write_block}"
         );
     }
@@ -982,7 +982,7 @@ mod tests {
             &spec_for(NetworkPolicy::None, "/tmp/myws"),
             None,
             "debian:stable-slim",
-            "aura-sandbox-test",
+            "baybo-sandbox-test",
         );
         let strs = argv_strs(&argv);
         assert_eq!(strs[0], "run");
@@ -996,7 +996,7 @@ mod tests {
             &spec_for(NetworkPolicy::None, "/tmp/myws"),
             None,
             "debian:stable-slim",
-            "aura-sandbox-test",
+            "baybo-sandbox-test",
         );
         let strs = argv_strs(&argv);
         let i = strs
@@ -1012,7 +1012,7 @@ mod tests {
             &spec_for(NetworkPolicy::All, "/tmp/myws"),
             None,
             "debian:stable-slim",
-            "aura-sandbox-test",
+            "baybo-sandbox-test",
         );
         let strs = argv_strs(&argv);
         let i = strs
@@ -1028,7 +1028,7 @@ mod tests {
             &spec_for(NetworkPolicy::None, "/tmp/myws"),
             None,
             "debian:stable-slim",
-            "aura-sandbox-test",
+            "baybo-sandbox-test",
         );
         let strs = argv_strs(&argv);
         let i = strs.iter().position(|a| a == "-v").expect("-v present");
@@ -1041,7 +1041,7 @@ mod tests {
             &spec_for(NetworkPolicy::None, "/tmp/myws"),
             None,
             "debian:stable-slim",
-            "aura-sandbox-test",
+            "baybo-sandbox-test",
         );
         let strs = argv_strs(&argv);
         assert!(
@@ -1057,7 +1057,7 @@ mod tests {
             &spec_for(NetworkPolicy::None, "/tmp/myws"),
             None,
             "debian:stable-slim",
-            "aura-sandbox-test",
+            "baybo-sandbox-test",
         );
         let strs = argv_strs(&argv);
         assert!(strs.contains(&"--cap-drop=ALL".to_string()));
@@ -1082,7 +1082,7 @@ mod tests {
             memory_max_bytes: Some(256 * 1024 * 1024),
             pids_max: Some(64),
         };
-        let argv = build_docker_argv(&spec, None, "debian:stable-slim", "aura-sandbox-test");
+        let argv = build_docker_argv(&spec, None, "debian:stable-slim", "baybo-sandbox-test");
         let strs = argv_strs(&argv);
         let mem = strs
             .iter()
@@ -1100,7 +1100,7 @@ mod tests {
     fn docker_argv_omits_caps_when_unlimited() {
         let mut spec = spec_for(NetworkPolicy::None, "/tmp/myws");
         spec.resource_limits = crate::spec::ResourceLimits::unlimited();
-        let argv = build_docker_argv(&spec, None, "debian:stable-slim", "aura-sandbox-test");
+        let argv = build_docker_argv(&spec, None, "debian:stable-slim", "baybo-sandbox-test");
         let strs = argv_strs(&argv);
         assert!(
             !strs.iter().any(|a| a == "--memory"),
@@ -1118,7 +1118,7 @@ mod tests {
             &spec_for(NetworkPolicy::None, "/tmp/myws"),
             None,
             "debian:stable-slim",
-            "aura-sandbox-test",
+            "baybo-sandbox-test",
         );
         let strs = argv_strs(&argv);
         let image_idx = strs
@@ -1208,7 +1208,7 @@ mod tests {
     fn docker_argv_writable_paths_omit_ro_suffix() {
         let mut spec = spec_for(NetworkPolicy::None, "/tmp/myws");
         spec.writable_paths = vec![PathBuf::from("/data/out")];
-        let argv = build_docker_argv(&spec, None, "debian:stable-slim", "aura-sandbox-test");
+        let argv = build_docker_argv(&spec, None, "debian:stable-slim", "baybo-sandbox-test");
         let strs = argv_strs(&argv);
         // `-v <path>:<path>` for writable; `-v <path>:<path>:ro` for
         // readable. Confirm the writable entry uses the bare form.
@@ -1280,16 +1280,16 @@ mod tests {
     #[test]
     fn bwrap_argv_permissive_binds_workspace_after_denied_tmpfs_so_nested_workspace_survives() {
         // Repro of the production bug: workspace lives inside a denied
-        // parent (e.g. `~/.aura/work` while `~/.aura` is masked as a
+        // parent (e.g. `~/.baybo/work` while `~/.baybo` is masked as a
         // credential vault). bwrap processes mounts in order, so if the
         // workspace bind came before the parent tmpfs the chdir would
         // fail with "No such file or directory" inside the empty tmpfs.
-        let mut spec = spec_for(NetworkPolicy::All, "/home/u/.aura/work");
+        let mut spec = spec_for(NetworkPolicy::All, "/home/u/.baybo/work");
         spec.filesystem_policy = FilesystemPolicy::Permissive {
             extra_root: PathBuf::from("/home/u"),
             denied_paths: vec![
                 PathBuf::from("/home/u/.ssh"),
-                PathBuf::from("/home/u/.aura"),
+                PathBuf::from("/home/u/.baybo"),
             ],
         };
         let argv = build_bwrap_argv(&spec, None);
@@ -1298,13 +1298,13 @@ mod tests {
         let bind_idx = strs
             .windows(3)
             .position(|w| {
-                w[0] == "--bind" && w[1] == "/home/u/.aura/work" && w[2] == "/home/u/.aura/work"
+                w[0] == "--bind" && w[1] == "/home/u/.baybo/work" && w[2] == "/home/u/.baybo/work"
             })
             .expect("workspace bind must be present");
         let tmpfs_idx = strs
             .windows(2)
-            .position(|w| w[0] == "--tmpfs" && w[1] == "/home/u/.aura")
-            .expect("denied tmpfs for /home/u/.aura must be present");
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/home/u/.baybo")
+            .expect("denied tmpfs for /home/u/.baybo must be present");
         assert!(
             bind_idx > tmpfs_idx,
             "workspace bind must come AFTER the masking tmpfs so the work-dir \
@@ -1315,23 +1315,23 @@ mod tests {
     #[test]
     fn sbpl_profile_permissive_reallows_workspace_after_denies_so_nested_workspace_stays_writable()
     {
-        let mut spec = spec_for(NetworkPolicy::None, "/Users/u/.aura/work");
+        let mut spec = spec_for(NetworkPolicy::None, "/Users/u/.baybo/work");
         spec.filesystem_policy = FilesystemPolicy::Permissive {
             extra_root: PathBuf::from("/Users/u"),
             denied_paths: vec![
                 PathBuf::from("/Users/u/.ssh"),
-                PathBuf::from("/Users/u/.aura"),
+                PathBuf::from("/Users/u/.baybo"),
             ],
         };
         let s = render_sbpl_profile(&spec, None);
         let deny_pos = s
-            .find(r#"(deny file-write* (subpath "/Users/u/.aura"))"#)
-            .expect("deny for /Users/u/.aura must be present");
+            .find(r#"(deny file-write* (subpath "/Users/u/.baybo"))"#)
+            .expect("deny for /Users/u/.baybo must be present");
         let final_write_allow = s
-            .find(r#"(allow file-write* (subpath "/Users/u/.aura/work"))"#)
+            .find(r#"(allow file-write* (subpath "/Users/u/.baybo/work"))"#)
             .expect("post-deny workspace allow must be emitted");
         let final_read_allow = s
-            .find(r#"(allow file-read* (subpath "/Users/u/.aura/work"))"#)
+            .find(r#"(allow file-read* (subpath "/Users/u/.baybo/work"))"#)
             .expect("post-deny workspace read allow must be emitted");
         assert!(
             final_write_allow > deny_pos,
@@ -1347,17 +1347,17 @@ mod tests {
 
     #[test]
     fn bwrap_argv_permissive_rebinds_readable_paths_ro_after_denied_tmpfs() {
-        // `skills/` lives inside the denied `~/.aura` parent. It must be
+        // `skills/` lives inside the denied `~/.baybo` parent. It must be
         // re-bound read-only AFTER the masking tmpfs (same last-wins
         // ordering as the workspace bind) so an installed skill's
-        // script stays readable while the rest of the aura state stays
+        // script stays readable while the rest of the baybo state stays
         // hidden.
-        let mut spec = spec_for(NetworkPolicy::All, "/home/u/.aura/work");
+        let mut spec = spec_for(NetworkPolicy::All, "/home/u/.baybo/work");
         spec.filesystem_policy = FilesystemPolicy::Permissive {
             extra_root: PathBuf::from("/home/u"),
-            denied_paths: vec![PathBuf::from("/home/u/.aura")],
+            denied_paths: vec![PathBuf::from("/home/u/.baybo")],
         };
-        spec.readable_paths = vec![PathBuf::from("/home/u/.aura/skills")];
+        spec.readable_paths = vec![PathBuf::from("/home/u/.baybo/skills")];
         let argv = build_bwrap_argv(&spec, None);
         let strs = argv_strs(&argv);
 
@@ -1365,14 +1365,14 @@ mod tests {
             .windows(3)
             .position(|w| {
                 w[0] == "--ro-bind-try"
-                    && w[1] == "/home/u/.aura/skills"
-                    && w[2] == "/home/u/.aura/skills"
+                    && w[1] == "/home/u/.baybo/skills"
+                    && w[2] == "/home/u/.baybo/skills"
             })
             .expect("skills/ must be RO re-bound");
         let tmpfs_idx = strs
             .windows(2)
-            .position(|w| w[0] == "--tmpfs" && w[1] == "/home/u/.aura")
-            .expect("denied tmpfs for /home/u/.aura must be present");
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/home/u/.baybo")
+            .expect("denied tmpfs for /home/u/.baybo must be present");
         assert!(
             ro_idx > tmpfs_idx,
             "skills/ RO bind must come AFTER the masking tmpfs; got ro@{ro_idx}, tmpfs@{tmpfs_idx}: {strs:?}"
@@ -1381,26 +1381,26 @@ mod tests {
         assert!(
             !strs
                 .windows(3)
-                .any(|w| w[0] == "--bind" && w[1] == "/home/u/.aura/skills"),
+                .any(|w| w[0] == "--bind" && w[1] == "/home/u/.baybo/skills"),
             "skills/ must be read-only, never RW-bound: {strs:?}"
         );
     }
 
     #[test]
     fn sbpl_profile_permissive_reallows_readable_paths_read_only_after_denies() {
-        let mut spec = spec_for(NetworkPolicy::None, "/Users/u/.aura/work");
+        let mut spec = spec_for(NetworkPolicy::None, "/Users/u/.baybo/work");
         spec.filesystem_policy = FilesystemPolicy::Permissive {
             extra_root: PathBuf::from("/Users/u"),
-            denied_paths: vec![PathBuf::from("/Users/u/.aura")],
+            denied_paths: vec![PathBuf::from("/Users/u/.baybo")],
         };
-        spec.readable_paths = vec![PathBuf::from("/Users/u/.aura/skills")];
+        spec.readable_paths = vec![PathBuf::from("/Users/u/.baybo/skills")];
         let s = render_sbpl_profile(&spec, None);
 
         let deny_pos = s
-            .find(r#"(deny file-read* (subpath "/Users/u/.aura"))"#)
-            .expect("deny for /Users/u/.aura must be present");
+            .find(r#"(deny file-read* (subpath "/Users/u/.baybo"))"#)
+            .expect("deny for /Users/u/.baybo must be present");
         let read_allow = s
-            .find(r#"(allow file-read* (subpath "/Users/u/.aura/skills"))"#)
+            .find(r#"(allow file-read* (subpath "/Users/u/.baybo/skills"))"#)
             .expect("post-deny skills read-allow must be emitted");
         assert!(
             read_allow > deny_pos,
@@ -1408,7 +1408,7 @@ mod tests {
         );
         // Read-only: there must be no write-allow for skills/.
         assert!(
-            !s.contains(r#"(allow file-write* (subpath "/Users/u/.aura/skills"))"#),
+            !s.contains(r#"(allow file-write* (subpath "/Users/u/.baybo/skills"))"#),
             "skills/ must stay read-only (no file-write* allow): {s}"
         );
     }

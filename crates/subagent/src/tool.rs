@@ -8,13 +8,13 @@
 //!    `prompt` brief into a [`SubagentSpawnRequest`]; the child's
 //!    `ContextManager` resolves the name back to a system prompt.
 //! 3. Hands the [`SubagentSpawnRequest`] to the actor-backed
-//!    [`crate::SubagentSpawner`] (impl in `aura-agent`) via a late-set
+//!    [`crate::SubagentSpawner`] (impl in `baybo-agent`) via a late-set
 //!    slot, and returns the [`SubagentResult`] it produces — the child's
 //!    terminal for a foreground spawn, or the dispatch ack for a
 //!    background one.
 //!
 //! Registered by the runtime wiring code (not
-//! [`aura_tools::builtin::default_tools`]) because it needs the
+//! [`baybo_tools::builtin::default_tools`]) because it needs the
 //! runtime-owned spawner slot AND the live `SubagentRegistry` so its
 //! description can enumerate available types every LLM turn.
 
@@ -22,12 +22,13 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_model::{
-    AURA_BACKEND_TAG, ExternalAgentKind, ModelTier, OnTimeout, SPAWN_SUBAGENT_TOOL_NAME, SessionId,
-    SubagentBackend, SubagentParentContext, SubagentResult, SubagentSpawnRequest, TrustLevel,
+use baybo_model::{
+    BAYBO_BACKEND_TAG, ExternalAgentKind, ModelTier, OnTimeout, SPAWN_SUBAGENT_TOOL_NAME,
+    SessionId, SubagentBackend, SubagentParentContext, SubagentResult, SubagentSpawnRequest,
+    TrustLevel,
 };
-use aura_session::SessionManager;
-use aura_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput};
+use baybo_session::SessionManager;
+use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -130,7 +131,7 @@ work is "parent dispatches one or two specialists", not deep trees.
 "#;
 
 /// Backstop for the parent's wait on a `spawn_subagent` call. Subagent
-/// execution is no longer wall-clock-bounded — aura subagents stop at
+/// execution is no longer wall-clock-bounded — baybo subagents stop at
 /// `max_iterations`, external ones at their own internal safety timeout —
 /// so this exists only because the tool executor requires a `max_timeout`.
 /// Pegged high enough never to fire in practice.
@@ -147,7 +148,7 @@ struct SpawnParams {
     description: String,
     /// Self-contained brief the child sees as its first user message.
     prompt: String,
-    /// `"aura"` (default), `"claude"`, `"codex"`, or `"gemini"`.
+    /// `"baybo"` (default), `"claude"`, `"codex"`, or `"gemini"`.
     #[serde(default)]
     backend: Option<String>,
     #[serde(default)]
@@ -233,8 +234,8 @@ fn parse_spawn_request(value: &Value, registry: &SubagentRegistry) -> Result<Par
     };
 
     let backend = match p.backend.as_deref().map(str::trim) {
-        None | Some("") => SubagentBackend::Aura,
-        Some(t) if t == AURA_BACKEND_TAG => SubagentBackend::Aura,
+        None | Some("") => SubagentBackend::Baybo,
+        Some(t) if t == BAYBO_BACKEND_TAG => SubagentBackend::Baybo,
         Some(other) => {
             if let Some(kind) = ExternalAgentKind::parse(other) {
                 SubagentBackend::External {
@@ -351,7 +352,7 @@ impl SpawnSubagentTool {
     async fn lineage_gate_inputs(
         &self,
         parent_session_id: &SessionId,
-    ) -> aura_tools::Result<LineageGateInputs> {
+    ) -> baybo_tools::Result<LineageGateInputs> {
         let parent = self
             .sessions
             .get(parent_session_id)
@@ -482,12 +483,12 @@ fn parameters_schema() -> Value {
             "model_tier": {
                 "type": "string",
                 "enum": ["fast", "balanced", "deep"],
-                "description": "Coarse model selection. Falls back to the profile's default_tier, then the pool default. Only applies to backend='aura'."
+                "description": "Coarse model selection. Falls back to the profile's default_tier, then the pool default. Only applies to backend='baybo'."
             },
             "backend": {
                 "type": "string",
-                "enum": ["aura", "claude", "codex", "gemini"],
-                "description": "Backend that runs the subagent. 'aura' (default) spawns a full in-process aura agent that uses the configured LLMs/tools/skills. 'claude' delegates to a local Claude Code subprocess; 'codex' delegates to OpenAI's codex CLI; 'gemini' delegates to Google's gemini CLI — these three are one-shot, run their own internal tool loops with bypassed permissions, and are best for heavy autonomous tasks where you want that external agent (not aura) to drive."
+                "enum": ["baybo", "claude", "codex", "gemini"],
+                "description": "Backend that runs the subagent. 'baybo' (default) spawns a full in-process baybo agent that uses the configured LLMs/tools/skills. 'claude' delegates to a local Claude Code subprocess; 'codex' delegates to OpenAI's codex CLI; 'gemini' delegates to Google's gemini CLI — these three are one-shot, run their own internal tool loops with bypassed permissions, and are best for heavy autonomous tasks where you want that external agent (not baybo) to drive."
             },
             "background": {
                 "type": "boolean",
@@ -549,10 +550,10 @@ impl Tool for SpawnSubagentTool {
         } else {
             format!("{kind}: {summary}")
         };
-        aura_tools::progress::preview_arg(&label)
+        baybo_tools::progress::preview_arg(&label)
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let ParsedSpawn { request } =
             parse_spawn_request(&params, &self.registry).map_err(ToolError::InvalidParams)?;
 
@@ -633,11 +634,11 @@ pub fn make(config: SpawnSubagentToolConfig) -> (Arc<dyn Tool>, ToolManifest) {
 mod tests {
     use super::*;
     use crate::{SubagentRegistry, unbounded_limiter};
-    use aura_model::{
+    use baybo_model::{
         ChannelType, Lineage, LineageKind, Session, SessionId, SubagentExitStatus, User,
     };
-    use aura_session::SessionStore;
-    use aura_session::test_support::{
+    use baybo_session::SessionStore;
+    use baybo_session::test_support::{
         MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
     };
     use serde_json::json;
@@ -655,8 +656,8 @@ mod tests {
     fn ctx_with_session(session_id: &str) -> ToolContext {
         ToolContext {
             session_id: session_id.into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -665,11 +666,11 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancellation_token: CancellationToken::new(),
             workspace_root: PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: None,
             notifier: None,
-            events: aura_tools::noop_event_sink(),
+            events: baybo_tools::noop_event_sink(),
             llm: None,
             secrets: None,
             virtual_reads: None,
@@ -737,7 +738,7 @@ mod tests {
             trigger: parent.trigger.clone(),
             lineage: Some(Lineage {
                 parent_session_id: parent.id.clone(),
-                parent_job_id: aura_model::JobId::default(),
+                parent_job_id: baybo_model::JobId::default(),
                 parent_span_id: None,
                 kind: LineageKind::Subagent,
             }),
@@ -840,8 +841,8 @@ mod tests {
     #[tokio::test]
     async fn forwards_resolved_profile_and_brief_to_channel() {
         let (spawner, captured) = fake_spawner(SubagentResult {
-            child_session_id: aura_model::SessionId::from("child-1"),
-            final_content: Some(vec![aura_model::ContentBlock::Text("done".into())]),
+            child_session_id: baybo_model::SessionId::from("child-1"),
+            final_content: Some(vec![baybo_model::ContentBlock::Text("done".into())]),
             status: SubagentExitStatus::Completed,
         });
 
@@ -875,8 +876,8 @@ mod tests {
         assert_eq!(req.model_tier, Some(ModelTier::Fast));
         assert!(!req.background);
         assert!(
-            matches!(&req.backend, SubagentBackend::Aura),
-            "default backend should be Aura, got {:?}",
+            matches!(&req.backend, SubagentBackend::Baybo),
+            "default backend should be Baybo, got {:?}",
             req.backend
         );
         assert_eq!(parent_id.as_ref(), "parent-sess");
@@ -934,8 +935,8 @@ mod tests {
         // propagates `background: true` and the ack lands as Text output.
         let ack_text = "[background subagent dispatched]";
         let (spawner, captured) = fake_spawner(SubagentResult {
-            child_session_id: aura_model::SessionId::from("child"),
-            final_content: Some(vec![aura_model::ContentBlock::Text(ack_text.into())]),
+            child_session_id: baybo_model::SessionId::from("child"),
+            final_content: Some(vec![baybo_model::ContentBlock::Text(ack_text.into())]),
             status: SubagentExitStatus::Completed,
         });
         let tool = tool_with_default(spawner).await;
@@ -965,11 +966,11 @@ mod tests {
         // even if its final_content carries an image, the parent boundary
         // surfaces text only.
         let (spawner, _captured) = fake_spawner(SubagentResult {
-            child_session_id: aura_model::SessionId::from("child"),
+            child_session_id: baybo_model::SessionId::from("child"),
             final_content: Some(vec![
-                aura_model::ContentBlock::Text("here's what I found".into()),
-                aura_model::ContentBlock::Image {
-                    blob: aura_model::BlobRef {
+                baybo_model::ContentBlock::Text("here's what I found".into()),
+                baybo_model::ContentBlock::Image {
+                    blob: baybo_model::BlobRef {
                         blob_id: "b-1".into(),
                     },
                     mime_type: "image/png".into(),
@@ -998,8 +999,8 @@ mod tests {
     #[tokio::test]
     async fn text_only_result_stays_as_text_variant() {
         let (spawner, _captured) = fake_spawner(SubagentResult {
-            child_session_id: aura_model::SessionId::from("child"),
-            final_content: Some(vec![aura_model::ContentBlock::Text("just text".into())]),
+            child_session_id: baybo_model::SessionId::from("child"),
+            final_content: Some(vec![baybo_model::ContentBlock::Text("just text".into())]),
             status: SubagentExitStatus::Completed,
         });
         let tool = tool_with_default(spawner).await;
@@ -1082,8 +1083,8 @@ mod tests {
     #[tokio::test]
     async fn lineage_depth_below_cap_is_accepted() {
         let (spawner, _captured) = fake_spawner(SubagentResult {
-            child_session_id: aura_model::SessionId::from("grandchild"),
-            final_content: Some(vec![aura_model::ContentBlock::Text("done".into())]),
+            child_session_id: baybo_model::SessionId::from("grandchild"),
+            final_content: Some(vec![baybo_model::ContentBlock::Text("done".into())]),
             status: SubagentExitStatus::Completed,
         });
         let sessions = sessions_with_root().await;
@@ -1200,7 +1201,7 @@ mod tests {
     impl SubagentDispatchLimiter for RecordingLimiter {
         fn try_reserve(
             &self,
-            _root_session_id: &aura_model::SessionId,
+            _root_session_id: &baybo_model::SessionId,
             _cap: u32,
         ) -> Result<(), u32> {
             let mut held = self.reserved.lock();
@@ -1212,12 +1213,12 @@ mod tests {
             self.events.lock().push("reserve");
             Ok(())
         }
-        fn release(&self, _root_session_id: &aura_model::SessionId) {
+        fn release(&self, _root_session_id: &baybo_model::SessionId) {
             let mut held = self.reserved.lock();
             *held = held.saturating_sub(1);
             self.events.lock().push("release");
         }
-        fn in_flight(&self, _root_session_id: &aura_model::SessionId) -> u32 {
+        fn in_flight(&self, _root_session_id: &baybo_model::SessionId) -> u32 {
             *self.reserved.lock()
         }
     }

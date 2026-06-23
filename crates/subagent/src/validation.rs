@@ -5,7 +5,7 @@
 //! breaking out of any XML/JSON envelope the runtime renders into. The
 //! validators here reject the dangerous shapes at load time.
 //!
-//! Pattern adapted from `aura-skills::validation`.
+//! Pattern adapted from `baybo-skills::validation`.
 //!
 //! [`SubagentProfile`]: crate::SubagentProfile
 

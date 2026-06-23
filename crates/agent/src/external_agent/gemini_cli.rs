@@ -23,7 +23,7 @@
 //! (trust the workspace cwd so YOLO isn't downgraded to interactive
 //! approval in an untrusted folder) are hardcoded — gemini's
 //! interactive approval prompts can't reach a non-TTY subprocess.
-//! aura's sandbox / sensitive_paths / approval gate do NOT apply to
+//! baybo's sandbox / sensitive_paths / approval gate do NOT apply to
 //! gemini's internal tool calls. The workspace cwd pins gemini's
 //! default working area but does not constrain its absolute-path reach.
 
@@ -32,8 +32,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_llm::TokenUsage;
-use aura_model::{ChatMessage, ContentBlock, ExternalAgentKind};
+use baybo_llm::TokenUsage;
+use baybo_model::{ChatMessage, ContentBlock, ExternalAgentKind};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -51,9 +51,9 @@ const AGENT_NAME: &str = "gemini";
 
 const INSTALL_HINT: &str = "Install the Gemini CLI (npm install -g @google/gemini-cli) or configure an explicit binary path.";
 
-/// Prefix attached to gemini's tool names when projected into aura's
+/// Prefix attached to gemini's tool names when projected into baybo's
 /// `ContentBlock::ToolUse`, so a transcript reader can tell at a glance
-/// these are gemini-internal calls that did NOT route through aura's
+/// these are gemini-internal calls that did NOT route through baybo's
 /// tool registry / approval gate (mirrors codex_cli's `codex_` prefix).
 const GEMINI_TOOL_PREFIX: &str = "gemini_";
 
@@ -65,7 +65,7 @@ pub struct GeminiCliAgent {
     model: String,
     /// Egress proxy injected into the child's env so the external CLI's
     /// own LLM calls route through it. `None` = inherit the parent env.
-    proxy: Option<aura_security::http::ProxySettings>,
+    proxy: Option<baybo_security::http::ProxySettings>,
 }
 
 impl GeminiCliAgent {
@@ -73,7 +73,7 @@ impl GeminiCliAgent {
     /// as claude_cli / codex_cli.
     pub fn probe_and_build(
         binary_path: Option<&str>,
-        proxy: Option<aura_security::http::ProxySettings>,
+        proxy: Option<baybo_security::http::ProxySettings>,
     ) -> Result<Arc<Self>> {
         let resolved = resolve_binary(
             binary_path,

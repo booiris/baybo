@@ -1,5 +1,5 @@
 /**
- * TypeScript mirror of the `aura-trace` domain types as they appear on
+ * TypeScript mirror of the `baybo-trace` domain types as they appear on
  * the wire. Ported verbatim from the gateway dashboard
  * (`web/src/types/trace.ts`) — the bench `trace.json` / `messages.json`
  * files ARE this serialization, so the viewer renders them unchanged.
@@ -57,7 +57,7 @@ export interface Step {
   outcome: LifecycleState;
 }
 
-// ── Message content (mirrors aura_model::ContentBlock) ────────────────
+// ── Message content (mirrors baybo_model::ContentBlock) ────────────────
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 
@@ -240,7 +240,7 @@ export interface ReplayStep {
   spans: Span[];
 }
 
-// ── Trace overview / per-job split (matches aura_query) ──────────────
+// ── Trace overview / per-job split (matches baybo_query) ──────────────
 
 export interface SessionMessageRow {
   ordinal: number;

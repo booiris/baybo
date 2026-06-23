@@ -2,19 +2,19 @@
 
 ## Overview
 
-The `agent` crate is Aura's top-level assembly layer, connecting all other modules into an executable engine.
+The `agent` crate is Baybo's top-level assembly layer, connecting all other modules into an executable engine.
 
 Core responsibilities:
 
 - **Message dispatch**: Actor model, one Actor per session for isolation
 - **Agent main loop**: LLM calls, tool/skill execution, reply generation
-- **Business logic managers**: `SessionManager` (in `aura-session`), `JobLifecycle` (in `aura-job`), `SpanRecorder` (in `aura-trace`), the `Memory` trait (in `aura-memory`), `CostManager` (in `aura-cost`), `SecretVault` (in `aura-security`), `SecurityGateway` — all domain managers live in their respective domain crates now; `agent` assembles them. `SecurityGateway` stays here because it is a cross-cutting interception facade tied to the execution path
+- **Business logic managers**: `SessionManager` (in `baybo-session`), `JobLifecycle` (in `baybo-job`), `SpanRecorder` (in `baybo-trace`), the `Memory` trait (in `baybo-memory`), `CostManager` (in `baybo-cost`), `SecretVault` (in `baybo-security`), `SecurityGateway` — all domain managers live in their respective domain crates now; `agent` assembles them. `SecurityGateway` stays here because it is a cross-cutting interception facade tied to the execution path
 - **Long-running execution**: cron scheduling, background notifications
-- **Unified observability**: `SpanRecorder` (in `aura-trace`, Step / Span / SpanEvent) and `JobLifecycle` (in `aura-job`, Job state machine)
-- **Cost management**: `CostManager` (in `aura-cost`) records LLM-call cost and gates spend; agent constructs it and threads it through the loop
+- **Unified observability**: `SpanRecorder` (in `baybo-trace`, Step / Span / SpanEvent) and `JobLifecycle` (in `baybo-job`, Job state machine)
+- **Cost management**: `CostManager` (in `baybo-cost`) records LLM-call cost and gates spend; agent constructs it and threads it through the loop
 - **Runtime logic**: error recovery, timeout control
 
-It does not own low-level storage or backend implementation — it consumes every `*Store` trait from the `aura-store` ports crate through dependency injection, and the libsql impls (`aura-storage`) are wired in at assembly time. Domain managers and rich types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`); the `JobStore` / `TraceStore` it calls trade in row DTOs that `aura-job` / `aura-trace` convert to and from. Each manager defines its own error type for business-level failures (e.g. `JobLifecycle` defines errors for invalid state transitions).
+It does not own low-level storage or backend implementation — it consumes every `*Store` trait from the `baybo-store` ports crate through dependency injection, and the libsql impls (`baybo-storage`) are wired in at assembly time. Domain managers and rich types come from their respective crates (`session`, `model`, `trace`, `security`, `job`, `cron`); the `JobStore` / `TraceStore` it calls trade in row DTOs that `baybo-job` / `baybo-trace` convert to and from. Each manager defines its own error type for business-level failures (e.g. `JobLifecycle` defines errors for invalid state transitions).
 
 ## Source Layout
 
@@ -45,7 +45,7 @@ agent/src/
     └── state/                # DurableActorState + VolatileResources
 ```
 
-For backwards compatibility, `lib.rs` re-exports the submodules at the crate root (`aura_agent::agent_loop`, `aura_agent::supervisor`, etc.), so consumers don't see the directory split unless they want to.
+For backwards compatibility, `lib.rs` re-exports the submodules at the crate root (`baybo_agent::agent_loop`, `baybo_agent::supervisor`, etc.), so consumers don't see the directory split unless they want to.
 
 ## Design Decisions
 
@@ -55,7 +55,7 @@ One Actor per session: natural serialization within a session (no context races)
 
 ### Main execution path (AgentLoop)
 
-1. System-prompt assembly lives in [`aura_context::prompts::soul`](context.md) (`assemble_from_workspace` reads `profile/{SOUL,USER,IDENTITY}.md` and frames them with TOP/TAIL hints). `ContextManager` owns the whole system-prompt lifecycle: `ensure_seeded()` resolves the prompt (`resolve_system_prompt` — a subagent profile looked up by name in the registry, else the workspace soul assembled fresh, else a fallback), seeds the leading `System` row, and appends the skill reminder. `AgentLoop` reaches it only through the thin `ensure_system_prompt_seeded` seam, which delegates to `ensure_seeded()`. The reseed-after-compaction re-resolves from the same source, so a mid-session profile write is picked up on the next compaction (which re-reads the workspace), not mid-turn.
+1. System-prompt assembly lives in [`baybo_context::prompts::soul`](context.md) (`assemble_from_workspace` reads `profile/{SOUL,USER,IDENTITY}.md` and frames them with TOP/TAIL hints). `ContextManager` owns the whole system-prompt lifecycle: `ensure_seeded()` resolves the prompt (`resolve_system_prompt` — a subagent profile looked up by name in the registry, else the workspace soul assembled fresh, else a fallback), seeds the leading `System` row, and appends the skill reminder. `AgentLoop` reaches it only through the thin `ensure_system_prompt_seeded` seam, which delegates to `ensure_seeded()`. The reseed-after-compaction re-resolves from the same source, so a mid-session profile write is picked up on the next compaction (which re-reads the workspace), not mid-turn.
 2. Append current user message to Context
 3. Skill selection (`ContextManager::invocable_skill_summaries()`): `SkillRegistry::all_summaries_sorted()` filtered by `agent_invocable && trust_level != Untrusted`. The same set backs the seed-time skill reminder and the per-turn `/command` candidate list, so the advertised and slash-invocable sets can't drift. Risk assessment fires later, inside `SkillTool` at invocation time (see `crates/skills/src/tools.rs`), not during selection — except an explicit user `/command`, which `ContextManager::expand_slash_command` treats as authorized and injects directly. The skill reminder is seeded once by `ensure_seeded` (and re-inserted after each compaction), not rebroadcast per turn.
 4. Loop: `maybe_compress()` → build `ChatRequest` → call `LlmClient` → parse response → dispatch tool execution
@@ -77,7 +77,7 @@ ToolExecutor: lookup tool → validate trust/capability → consult approval gat
 
 ### Tool-result formatting into LLM context
 
-After `ToolExecutor::execute` returns, `AgentLoop` renders the result into a text blob (`ToolOutput::Text` → raw; `ToolOutput::Json` → serialized; `ToolOutput::Error` and errors → a prefixed error line), then bridges the **detect/format split**: `context_manager.cap_tool_output` first (caps to `MAX_TOOL_OUTPUT_BYTES`, spilling oversize payloads under the workspace's tool-spills dir so the truncation notice lands inside the envelope), then `SecurityGateway::detect_injection` (the scan stays in `aura-security`), then `aura_context::prompts::tool_output::wrap_tool_output(&tool_name, &capped, &warning_rules)` (the `<tool_output>` envelope + breakout-escape + injection banner). The wrapped string populates `ContentBlock::ToolResult { content }`. The framing lives in `aura-context`; only the scan stays in security, and the shared `</tool_output>` delimiter is `aura_model::TOOL_OUTPUT_{OPEN,CLOSE}_PREFIX`.
+After `ToolExecutor::execute` returns, `AgentLoop` renders the result into a text blob (`ToolOutput::Text` → raw; `ToolOutput::Json` → serialized; `ToolOutput::Error` and errors → a prefixed error line), then bridges the **detect/format split**: `context_manager.cap_tool_output` first (caps to `MAX_TOOL_OUTPUT_BYTES`, spilling oversize payloads under the workspace's tool-spills dir so the truncation notice lands inside the envelope), then `SecurityGateway::detect_injection` (the scan stays in `baybo-security`), then `baybo_context::prompts::tool_output::wrap_tool_output(&tool_name, &capped, &warning_rules)` (the `<tool_output>` envelope + breakout-escape + injection banner). The wrapped string populates `ContentBlock::ToolResult { content }`. The framing lives in `baybo-context`; only the scan stays in security, and the shared `</tool_output>` delimiter is `baybo_model::TOOL_OUTPUT_{OPEN,CLOSE}_PREFIX`.
 
 ### Streaming delta reveal
 
@@ -91,7 +91,7 @@ After `ToolExecutor::execute` returns, `AgentLoop` renders the result into a tex
 2. Compute `ResourceAccess` list via the tool's `accessed_resources(params)`.
 3. Filter out entries covered by the snapshot of `SessionState::approved_resources` passed in from `AgentLoop`.
 4. If any remain, call `gate.request(...)` with the uncovered set and a truncated params preview. On `Deny` the call short-circuits to `ToolError::Denied` (recorded on the trace before return).
-5. On `ApproveAlways`, the executor de-dupes and pushes the newly-approved accesses directly into the shared `Mutex<Vec<ApprovedResource>>` passed by `AgentLoop`. After all tool calls complete, `AgentLoop` flushes the contents back into `session.state.approved_resources`, which persists through session save/restore because the types live in `aura-model`.
+5. On `ApproveAlways`, the executor de-dupes and pushes the newly-approved accesses directly into the shared `Mutex<Vec<ApprovedResource>>` passed by `AgentLoop`. After all tool calls complete, `AgentLoop` flushes the contents back into `session.state.approved_resources`, which persists through session save/restore because the types live in `baybo-model`.
 
 Parallel tool calls within a turn each go through the gate independently; the gate implementation is responsible for its own serialization (TUI queues and shows one inline prompt at a time).
 
@@ -99,9 +99,9 @@ Parallel tool calls within a turn each go through the gate independently; the ga
 
 Cron jobs flow through the Actor model and observability chain: `CronScheduler` → `Router` → `AgentSupervisor` → `AgentMessage::CronTrigger` → `AgentLoop`. All create Job and Trace records. Background results are delivered asynchronously without polluting foreground conversation. Cron jobs are bound to `user_id + channel` (not `session_id`) so they survive session expiration; sessions are resolved dynamically at trigger time.
 
-`AgentMessage::CronTrigger { job_id, prompt }` carries the cron job id and the prompt string directly. `AgentActor` dispatches `prompt` through `dispatch_cron_prompt` with `JobInput::Cron`, which appends the fire via `AgentLoop::append_cron_fire` (framed by `aura_context::prompts::cron`, so it reads as a task, not a user message) and runs the normal `AgentLoop` path; the LLM decides what tools (if any) to invoke.
+`AgentMessage::CronTrigger { job_id, prompt }` carries the cron job id and the prompt string directly. `AgentActor` dispatches `prompt` through `dispatch_cron_prompt` with `JobInput::Cron`, which appends the fire via `AgentLoop::append_cron_fire` (framed by `baybo_context::prompts::cron`, so it reads as a task, not a user message) and runs the normal `AgentLoop` path; the LLM decides what tools (if any) to invoke.
 
-Background subagent results arrive as `AgentMessage::BackgroundJobFinished`, are buffered on `session.state.pending_background_results` (dedup by `handle_id`, cap 64 drop-oldest), and — once no higher-priority message is queued — drained into their own autonomous `SubagentNotification` agent-loop turn (same main path / system prompt + toolset, so the prompt cache holds; the model proactively reports to the user, and an empty reply is suppressed). The synthetic XML prompt for that turn (built by `aura_context::prompts::subagent::build_notification_content`) is appended **in-memory only** (`AgentLoop::append_subagent_notification` → `ContextManager::append_in_memory`), never persisted to `session_messages`: it is rebuilt from the durable buffer on every retry, so persisting per-attempt would stack duplicate hidden rows under the infinite-backoff retry. On failure the turn rolls the in-memory context back to a pre-turn snapshot (after seeding the system prompt, so the rollback can't drop it) and re-buffers for retry.
+Background subagent results arrive as `AgentMessage::BackgroundJobFinished`, are buffered on `session.state.pending_background_results` (dedup by `handle_id`, cap 64 drop-oldest), and — once no higher-priority message is queued — drained into their own autonomous `SubagentNotification` agent-loop turn (same main path / system prompt + toolset, so the prompt cache holds; the model proactively reports to the user, and an empty reply is suppressed). The synthetic XML prompt for that turn (built by `baybo_context::prompts::subagent::build_notification_content`) is appended **in-memory only** (`AgentLoop::append_subagent_notification` → `ContextManager::append_in_memory`), never persisted to `session_messages`: it is rebuilt from the durable buffer on every retry, so persisting per-attempt would stack duplicate hidden rows under the infinite-backoff retry. On failure the turn rolls the in-memory context back to a pre-turn snapshot (after seeding the system prompt, so the rollback can't drop it) and re-buffers for retry.
 
 The per-session mailbox is a **priority queue** (`mailbox::channel`): `UserInput`/trigger > `BackgroundJobFinished` > `ActorStop`. A rapid burst of `UserInput`s coalesces into one turn; a leading `/command` is a hard boundary.
 
@@ -120,11 +120,11 @@ The per-session mailbox is a **priority queue** (`mailbox::channel`): `UserInput
 
 ### LLM-invocable cron tools
 
-`aura_cron::tools::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule/cancel/inspect cron jobs mid-conversation. They live in `aura-cron::tools` (not `aura-tools`) because they each hold `Arc<CronScheduler>`, and `aura-tools` cannot depend on `aura-cron` without creating a cycle. `src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
+`baybo_cron::tools::agent_tools` returns `CronCreateTool`, `CronDeleteTool`, and `CronListTool` — `Tool` trait implementations that let the LLM schedule/cancel/inspect cron jobs mid-conversation. They live in `baybo-cron::tools` (not `baybo-tools`) because they each hold `Arc<CronScheduler>`, and `baybo-tools` cannot depend on `baybo-cron` without creating a cycle. `src/runtime.rs` registers them into the `ToolRegistry` after the scheduler is constructed.
 
 ### Startup recovery
 
-On boot, `aura_agent::recovery::recover_orphaned_traces_and_jobs` closes
+On boot, `baybo_agent::recovery::recover_orphaned_traces_and_jobs` closes
 half-open trace rows and cancels non-terminal jobs left by a prior process death
 as `SystemCrash`. During the current process, `actor::runner::spawn_actor`
 watches actor task panics and calls `recover_panicked_actor_session` for that
@@ -142,7 +142,7 @@ Before a message enters an actor, Router completes: session identification/creat
 
 ### Per-session model selection
 
-Each session can pin its own `aura.json` LLM entry via `session.state.last_llm` (`None` ⇒ follow `default-llm`, so an un-switched session keeps tracking global default changes). The pin flows into the loop's `initial_llm`: at a cold spawn / post-eviction hydration, `Router::handle_incoming` reads `session.state.last_llm` and passes it to the actor spawner; for a **live** actor, `AgentMessage::SetModel { llm }` (Trigger-tier, so it lands at a turn boundary — never mid-turn) re-pins the loop in place via `AgentLoop::set_initial_llm`. Either way the swap takes effect on the **next** turn: `AgentLoop::refresh_active_llm` re-resolves `initial_llm` against the hot-swappable `LlmClientPool` at the top of every turn — the same hook that absorbs config hot-reloads — swapping the client and context-window budget when the resolved entry changes. A stranded pin (entry later removed from config) degrades safely: `LlmClientPool::resolve` falls back to the default with a `warn!`.
+Each session can pin its own `baybo.json` LLM entry via `session.state.last_llm` (`None` ⇒ follow `default-llm`, so an un-switched session keeps tracking global default changes). The pin flows into the loop's `initial_llm`: at a cold spawn / post-eviction hydration, `Router::handle_incoming` reads `session.state.last_llm` and passes it to the actor spawner; for a **live** actor, `AgentMessage::SetModel { llm }` (Trigger-tier, so it lands at a turn boundary — never mid-turn) re-pins the loop in place via `AgentLoop::set_initial_llm`. Either way the swap takes effect on the **next** turn: `AgentLoop::refresh_active_llm` re-resolves `initial_llm` against the hot-swappable `LlmClientPool` at the top of every turn — the same hook that absorbs config hot-reloads — swapping the client and context-window budget when the resolved entry changes. A stranded pin (entry later removed from config) degrades safely: `LlmClientPool::resolve` falls back to the default with a `warn!`.
 
 Persistence and the live re-pin are deliberately **split** to avoid a lost-update race. `last_llm` is a **flat `sessions` column**, not a JSON-blob field — exactly like `hidden` — written only by the targeted `SessionStore::set_last_llm` and omitted from `save`'s `DO UPDATE`, so a concurrent `touch` (which is a full-blob `get` + `save` fired on every inbound message) can't clobber it; `get` patches `Session.state.last_llm` from the column on read. The chat `PUT /v1/chat/sessions/{id}/model` validates the name against the pool, then (1) **persists** via `set_last_llm` synchronously — authoritative for any later spawn, and a storage failure surfaces as an error rather than a false 200 — and (2) routes `SetModel` to re-pin the live actor **in memory only** (the gateway holds an `AgentSupervisor` clone for this reach-the-live-actor hop, the same way `/stop` reaches one). `SetModel` does not itself persist. Subagent spawns are the other `initial_llm = Some(...)` path, pinning via `model_tier` instead.
 
@@ -150,8 +150,8 @@ Persistence and the live re-pin are deliberately **split** to avoid a lost-updat
 
 Consolidated reference for every time bound a turn can hit. Two structural facts come first, because they explain why most of the table is about tools and subprocesses rather than the loop itself:
 
-- **A turn is bounded by step count, not a wall clock.** `agent.max_iterations` (default 1000, range 1–1000; `AgentConfig` in `aura-config`, enforced in `config/src/validate.rs`) caps how many LLM↔tool iterations one turn may run. Cancellation is cooperative, checked at the iteration boundary (`/stop` is the only hard interrupt) — there is no per-turn timer.
-- **The main LLM chat call has no Aura-imposed wall-clock timeout.** The shared reqwest client (`aura_security::http::client`) sets no `.timeout()`, so a `chat` / `chat_stream` call is bounded only by the provider/transport. Transient failures (5xx/408/429, connect/transport flake) are absorbed by the retry loop below, not by a deadline.
+- **A turn is bounded by step count, not a wall clock.** `agent.max_iterations` (default 1000, range 1–1000; `AgentConfig` in `baybo-config`, enforced in `config/src/validate.rs`) caps how many LLM↔tool iterations one turn may run. Cancellation is cooperative, checked at the iteration boundary (`/stop` is the only hard interrupt) — there is no per-turn timer.
+- **The main LLM chat call has no Baybo-imposed wall-clock timeout.** The shared reqwest client (`baybo_security::http::client`) sets no `.timeout()`, so a `chat` / `chat_stream` call is bounded only by the provider/transport. Transient failures (5xx/408/429, connect/transport flake) are absorbed by the retry loop below, not by a deadline.
 
 **LLM retry** — `ErrorHandler::default` in `runtime/error_recovery.rs`, wrapping every model call in `AgentLoop::call_llm`. Exponential backoff, capped; not configurable (hardcoded default).
 
@@ -172,7 +172,7 @@ Per-tool `max_timeout()`:
 
 | Tool | `max_timeout` | Where |
 |------|--------------|-------|
-| trait default | 30s | `Tool::max_timeout` in `aura-tools` (`tools/src/lib.rs`) |
+| trait default | 30s | `Tool::max_timeout` in `baybo-tools` (`tools/src/lib.rs`) |
 | Bash | 600s | `tools/src/builtin/bash.rs` — per-call `timeout_ms` and the sandbox spawn tighten further |
 | WebFetch | 120s | `tools/src/builtin/web_fetch.rs` — connect phase capped at 10s independently |
 | Grep / Glob | 60s | `tools/src/builtin/{grep,glob_tool}.rs` |
@@ -225,16 +225,16 @@ Router-level user rate limiting (`actor/router`) uses a sliding window (default 
 | `llm` | `AgentLoop` initiates model calls |
 | `tools` | `ToolExecutor` executes tools |
 | `skills` | `AgentLoop` parses and executes skills |
-| `model` | Provides `MessageSource::RecalledMemory` (the framed recall-injection marker); session domain types (`Session`, `User`, `ChannelType`) used by `aura-session::SessionManager` |
+| `model` | Provides `MessageSource::RecalledMemory` (the framed recall-injection marker); session domain types (`Session`, `User`, `ChannelType`) used by `baybo-session::SessionManager` |
 | `memory` | Owns the pluggable `Memory` trait + `NoopMemory` default. The agent loop drives `recall` / `on_job_complete` for `UserChat` + `Cron` jobs; no real backend ships yet (runtime wires `None`) |
 | `workspace` | Identity files for system prompt |
 | `cron` | Owns `CronJob`, `CronExecution`, and `CronScheduler`; agent re-exports `CronScheduler` / `CronTriggerEvent` for assembly-layer wiring |
 | `context` | Conversation window and compression |
-| `job` | Owns `Job`, `JobStatus`, `JobInputKind` / `JobShape` (+ `Job.origin`), and `JobLifecycle` (persistence orchestrator + cancellation registry + lifecycle-event bus); the `JobStore` trait lives in `aura-store` and this crate owns the `Job` ↔ `JobRow` conversions. Agent constructs and shares one `JobLifecycle` across the loop, router, supervisor, and subagent wait routine |
-| `trace` | Owns `Step`, `Span`, `SpanEvent`, `SpanRecorder` (lifecycle facade), and `TraceEventStream` (broadcast bus); the `TraceStore` trait lives in `aura-store` and this crate owns the row conversions. Agent constructs and shares one `SpanRecorder` per session |
+| `job` | Owns `Job`, `JobStatus`, `JobInputKind` / `JobShape` (+ `Job.origin`), and `JobLifecycle` (persistence orchestrator + cancellation registry + lifecycle-event bus); the `JobStore` trait lives in `baybo-store` and this crate owns the `Job` ↔ `JobRow` conversions. Agent constructs and shares one `JobLifecycle` across the loop, router, supervisor, and subagent wait routine |
+| `trace` | Owns `Step`, `Span`, `SpanEvent`, `SpanRecorder` (lifecycle facade), and `TraceEventStream` (broadcast bus); the `TraceStore` trait lives in `baybo-store` and this crate owns the row conversions. Agent constructs and shares one `SpanRecorder` per session |
 | `query` | Owns `QueryApi` — the read-only analytics facade over session/job/trace/cost. Agent does not consume `QueryApi` directly; gateway and CLI do |
-| `session` | Provides `SessionManager` and its error type (domain types live in `aura-model`) |
+| `session` | Provides `SessionManager` and its error type (domain types live in `baybo-model`) |
 | `security` | Provides crypto primitives, `SecretVault`, `SecretValue`, `LeakDetector`, `PlaceholderMinter`, `InjectionDetector`; `agent::security::SecurityGateway` composes them |
 | `channels` | `Channel` handles + `ChannelRegistry`; Router owns the registry for dispatch by `ChannelType` |
 | `store` | The ports crate: owns every `*Store` trait contract, the row/DTO types they exchange, and `StorageError`. Agent injects these trait objects |
-| `storage` | Provides the libsql implementations of every `*Store` trait (the contracts all live in `aura-store`) and bundles them in `Store` for DI |
+| `storage` | Provides the libsql implementations of every `*Store` trait (the contracts all live in `baybo-store`) and bundles them in `Store` for DI |

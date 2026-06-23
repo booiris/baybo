@@ -13,12 +13,12 @@ import Security
 enum PushKeyStore {
     /// Keychain account prefix; the per-binding key is stored at
     /// `accountPrefix + bid`. The host app writes the same account at pairing.
-    static let accountPrefix = "aura.push-key."
+    static let accountPrefix = "baybo.push-key."
 
     /// The App Group access group. MUST match the `keychain-access-groups`
     /// entitlement shared by the app target and this extension target.
     /// Replace with your published App Group id.
-    static let accessGroup = "group.com.aura.app"
+    static let accessGroup = "group.com.baybo.app"
 
     /// Fetch the 32-byte push key for a binding id, or nil if absent / wrong size.
     static func pushKey(forBinding bid: String) -> SymmetricKey? {

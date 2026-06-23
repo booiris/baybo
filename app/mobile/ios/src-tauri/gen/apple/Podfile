@@ -1,13 +1,13 @@
 # Uncomment the next line to define a global platform for your project
 
-target 'aura-mobile-app_iOS' do
+target 'baybo-mobile-app_iOS' do
 platform :ios, '14.0'
-  # Pods for aura-mobile-app_iOS
+  # Pods for baybo-mobile-app_iOS
 end
 
-target 'aura-mobile-app_macOS' do
+target 'baybo-mobile-app_macOS' do
 platform :osx, '11.0'
-  # Pods for aura-mobile-app_macOS
+  # Pods for baybo-mobile-app_macOS
 end
 
 # Delete the deployment target for iOS and macOS, causing it to be inherited from the Podfile

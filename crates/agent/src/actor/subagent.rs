@@ -1,14 +1,14 @@
 //! Agent-side wait routine the [`crate::runtime::subagent_spawner`] runs
 //! after spawning a child subagent actor. All protocol value types live
-//! in `aura_model::spawn_protocol`; the `spawn_subagent` tool
-//! (`aura_subagent::tool`) hands its request to the spawner through the
-//! `aura_subagent::SubagentSpawner` capability.
+//! in `baybo_model::spawn_protocol`; the `spawn_subagent` tool
+//! (`baybo_subagent::tool`) hands its request to the spawner through the
+//! `baybo_subagent::SubagentSpawner` capability.
 
 use std::sync::Arc;
 
-use aura_channels::{AgentEvent, AgentOutput};
-use aura_job::{JobLifecycle, JobLifecycleEvent, JobStatusKind};
-use aura_model::{ContentBlock, SessionId, SubagentExitStatus, SubagentResult};
+use baybo_channels::{AgentEvent, AgentOutput};
+use baybo_job::{JobLifecycle, JobLifecycleEvent, JobStatusKind};
+use baybo_model::{ContentBlock, SessionId, SubagentExitStatus, SubagentResult};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -185,10 +185,10 @@ async fn drain_for_final_message(
 mod tests {
     use super::*;
     use crate::actor::mailbox::{self, MailboxReceiver};
-    use aura_channels::OutgoingMessage;
-    use aura_job::test_support::MemoryJobStore;
-    use aura_job::{JobInput, JobOutput, JobShape};
-    use aura_model::{ChannelType, MessageMetadata, TriggerKind};
+    use baybo_channels::OutgoingMessage;
+    use baybo_job::test_support::MemoryJobStore;
+    use baybo_job::{JobInput, JobOutput, JobShape};
+    use baybo_model::{ChannelType, MessageMetadata, TriggerKind};
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
@@ -251,7 +251,7 @@ mod tests {
     /// Mirrors what `with_job` does for a real subagent so tests can
     /// drive `JobLifecycle::complete` / observe `JobLifecycle::cancel`
     /// against a real row.
-    async fn start_in_progress_child_job(lc: &JobLifecycle) -> aura_model::JobId {
+    async fn start_in_progress_child_job(lc: &JobLifecycle) -> baybo_model::JobId {
         let job = lc
             .start_job(
                 SessionId::from(CHILD_SESSION),

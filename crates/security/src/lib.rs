@@ -1,4 +1,4 @@
-//! # aura-security
+//! # baybo-security
 //!
 //! Low-level security primitives: AES-256-GCM crypto, deterministic
 //! placeholder minting, leak detection, prompt-injection scanning, and

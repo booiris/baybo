@@ -62,7 +62,7 @@ pub struct GatewayWelcome {
     /// Owning principal on the gateway.
     pub user_id: String,
     /// The retained SPAKE2 code, used by the operator as the approval handle
-    /// (`aura device approve <code>`).
+    /// (`baybo device approve <code>`).
     pub pairing_code: String,
     /// The device's bearer token for the scoped REST/WS surface. **Inert until
     /// the operator approves** — the app stores it and presents it on
@@ -141,7 +141,7 @@ mod tests {
         let welcome = GatewayWelcome {
             static_pubkey: [9u8; KEY_LEN],
             relay_node_id: "node-xyz".into(),
-            direct_candidates: vec!["wss://aura.lan:8889".into()],
+            direct_candidates: vec!["wss://baybo.lan:8889".into()],
             user_id: "user-1".into(),
             pairing_code: "WORMHOLE-7-foo-bar".into(),
             auth_token: "deadbeef".into(),

@@ -20,7 +20,7 @@ const TOOL_TOKEN_PREFIX: &str = "tool:";
 /// name inline rather than degrading to an object, so every reason is one
 /// groupable string.
 ///
-/// Every billed call carries one via [`Attribution`](../../aura_llm/billed/struct.Attribution.html);
+/// Every billed call carries one via [`Attribution`](../../baybo_llm/billed/struct.Attribution.html);
 /// new reasons are added as new call sites appear.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum CallReason {

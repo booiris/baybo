@@ -3,9 +3,9 @@
 //! The TUI deliberately does not open the workspace vault itself — it
 //! only holds a WS connection — so the persistent ring lives here, on
 //! the single process that already owns [`SecretVault`] and the libsql
-//! file. Clients request their snapshot via the [`Frame::HistorySnapshot`](aura_channels::wire::Frame::HistorySnapshot)
+//! file. Clients request their snapshot via the [`Frame::HistorySnapshot`](baybo_channels::wire::Frame::HistorySnapshot)
 //! frame the route emits right after a successful TUI register, and
-//! push new entries with [`Frame::HistoryAppend`](aura_channels::wire::Frame::HistoryAppend).
+//! push new entries with [`Frame::HistoryAppend`](baybo_channels::wire::Frame::HistoryAppend).
 //!
 //! Multiple concurrent TUI processes on the same gateway share this
 //! store, so the read-modify-write of each append is serialized by an
@@ -15,12 +15,12 @@
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use aura_security::SecretVault;
+use baybo_security::SecretVault;
 use tokio::sync::Mutex;
 
 /// Vault key under which the TUI input history lives. Matches the
 /// historical name so an upgrade preserves any pre-existing ring.
-const TUI_HISTORY_SECRET_NAME: &str = "aura.tui.input_history";
+const TUI_HISTORY_SECRET_NAME: &str = "baybo.tui.input_history";
 
 /// Maximum entries retained. Matches the in-memory ring used by the
 /// TUI so a full reload doesn't drop rows the client just saw.
@@ -93,8 +93,8 @@ impl TuiHistoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_security::EncryptionKey;
-    use aura_security::test_support::MemorySecretStore;
+    use baybo_security::EncryptionKey;
+    use baybo_security::test_support::MemorySecretStore;
 
     fn build_store() -> TuiHistoryStore {
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec())

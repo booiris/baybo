@@ -1,11 +1,11 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
-/// Aura operator CLI.
+/// Baybo operator CLI.
 ///
-/// Every subcommand is also reachable from inside an Aura chat session by
+/// Every subcommand is also reachable from inside an Baybo chat session by
 /// typing the same tokens with a leading `/`.
 #[derive(Debug, Parser)]
-#[command(name = "aura", version, about = "Aura operator CLI", long_about = None)]
+#[command(name = "baybo", version, about = "Baybo operator CLI", long_about = None)]
 pub struct Cli {
     #[command(flatten)]
     pub global: GlobalArgs,
@@ -17,17 +17,17 @@ pub struct Cli {
 /// Global flags shared by every subcommand.
 ///
 /// `--config` is pure UX sugar: `main` pushes its value into
-/// `AURA_CONFIG_PATH` once at startup, and every downstream reader goes
+/// `BAYBO_CONFIG_PATH` once at startup, and every downstream reader goes
 /// through the env var. One source of truth at the read site, two
 /// surfaces at the call site.
 #[derive(Debug, clap::Args, Default, Clone)]
 pub struct GlobalArgs {
-    /// Path to the Aura config file. Overrides `AURA_CONFIG_PATH`.
+    /// Path to the Baybo config file. Overrides `BAYBO_CONFIG_PATH`.
     /// Clap's `env = ...` makes the env var the fallback so both
     /// surfaces land in the same field. The variable name comes from
-    /// `aura_workspace::paths::ENV_CONFIG_PATH` so there is one source of
+    /// `baybo_workspace::paths::ENV_CONFIG_PATH` so there is one source of
     /// truth across the codebase.
-    #[arg(long, global = true, env = aura_workspace::paths::ENV_CONFIG_PATH)]
+    #[arg(long, global = true, env = baybo_workspace::paths::ENV_CONFIG_PATH)]
     pub config: Option<String>,
 
     /// Emit machine-readable JSON on stdout. Disables color.
@@ -47,13 +47,13 @@ pub struct GlobalArgs {
 /// Environment variable that, when set to any non-empty value, makes
 /// every CLI invocation surface the extended help (hidden subcommands
 /// like `config`, `log`, `session`, `job`, `cron`, `cost` and the
-/// `-v`/`--verbose` flag become visible in `aura --help`).
+/// `-v`/`--verbose` flag become visible in `baybo --help`).
 ///
 /// The agent-side `BashTool` exports this automatically for any
 /// command containing the bin name, so the model sees the full help
 /// inventory without composing an argv flag. Humans can opt in
-/// per-shell with `export AURA_HELP_AGENT=1`.
-pub const ENV_HELP_AGENT: &str = "AURA_HELP_AGENT";
+/// per-shell with `export BAYBO_HELP_AGENT=1`.
+pub const ENV_HELP_AGENT: &str = "BAYBO_HELP_AGENT";
 
 /// Top-level command families.
 ///
@@ -62,7 +62,7 @@ pub const ENV_HELP_AGENT: &str = "AURA_HELP_AGENT";
 /// gain public read/write methods.
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Read and edit the active `aura.json`: `show`, `get`, `set`,
+    /// Read and edit the active `baybo.json`: `show`, `get`, `set`,
     /// `unset`, `validate`, `file`, `schema`. Mutations take effect
     /// after restart (hot-reload deferred).
     #[command(hide = true)]
@@ -115,7 +115,7 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: DeviceCmd,
     },
-    /// Manage LLM provider entries in `aura.json`: `status` (which
+    /// Manage LLM provider entries in `baybo.json`: `status` (which
     /// entries are registered), `probe [name]` (round-trip a tiny
     /// chat to verify auth + connectivity), `live-model [name]`
     /// (list the provider's catalog), and the interactive editors
@@ -128,7 +128,7 @@ pub enum Commands {
     /// provider + sanitised config), `setup` (interactive wizard for
     /// mem0 / openviking / noop), `test` (health probe), `disable` (back
     /// to noop). The actual API key is stored via the existing
-    /// `aura secret add <NAME>` (defaults: `MEM0_API_KEY` /
+    /// `baybo secret add <NAME>` (defaults: `MEM0_API_KEY` /
     /// `OPENVIKING_API_KEY`). Memory config is not hot-reload — a
     /// restart applies the change.
     Memory {
@@ -140,7 +140,7 @@ pub enum Commands {
     /// wizard that picks a kind, prompts for a binary path (empty
     /// = $PATH lookup), runs an existence + version probe, then
     /// persists the resulting `external_agents.<kind>.binary_path`
-    /// to `aura.json`. `status` lists each kind's current
+    /// to `baybo.json`. `status` lists each kind's current
     /// configuration + offline probe result.
     #[command(name = "external-agent")]
     ExternalAgent {
@@ -176,12 +176,12 @@ pub enum Commands {
         cmd: CronCmd,
     },
     /// Read the rolling tracing log files on disk. `main` reads
-    /// `<workspace>/logs/aura.log.<date>` (gateway/agent output);
+    /// `<workspace>/logs/baybo.log.<date>` (gateway/agent output);
     /// `channel <type>` reads
     /// `<workspace>/logs/channel/<type>.log.<date>` (sidecar output).
     /// Both tail the last `-n` lines (default 200) and `--follow`
     /// streams new lines until Ctrl-C. For structured session
-    /// traces (LLM calls, tool calls) use `aura session export`
+    /// traces (LLM calls, tool calls) use `baybo session export`
     /// instead — different store, different read shape.
     #[command(hide = true)]
     Log {
@@ -198,13 +198,13 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: CostCmd,
     },
-    /// One-shot prompt: send PROMPT to Aura, stream the assistant's
+    /// One-shot prompt: send PROMPT to Baybo, stream the assistant's
     /// answer to stdout, then exit — the non-interactive sibling of
     /// `tui`. With no PROMPT argument the prompt is read from stdin, so
-    /// `git diff | aura prompt "review this"` and `cat task.md | aura
+    /// `git diff | baybo prompt "review this"` and `cat task.md | baybo
     /// prompt` both work.
     ///
-    /// Runs against a live `aura gateway` if one is up; otherwise builds
+    /// Runs against a live `baybo gateway` if one is up; otherwise builds
     /// the agent runtime in-process for the single turn, so no separate
     /// gateway is required.
     Prompt {
@@ -229,7 +229,7 @@ pub enum Commands {
     },
     /// Launch the interactive Ratatui chat session.
     ///
-    /// Connects to an `aura gateway` over the `/v1/channel-ws`
+    /// Connects to an `baybo gateway` over the `/v1/channel-ws`
     /// endpoint on its admin listener (same bind the admin REST API
     /// and the web chat page use). The address is read from
     /// `gateway.bind_address`/`gateway.port` in config, and the
@@ -254,7 +254,7 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: GatewayCmd,
     },
-    /// One-shot snapshot of the running Aura instance.
+    /// One-shot snapshot of the running Baybo instance.
     ///
     /// Default view is the *static* inventory: registered skills /
     /// tools / channels / current LLM model / config path — answers
@@ -270,7 +270,7 @@ pub enum Commands {
         live: bool,
     },
     /// Run readiness checks against config, storage, and env. Aggregates
-    /// `AuraConfig::validate`, a storage ping, an LLM probe, and an
+    /// `BayboConfig::validate`, a storage ping, an LLM probe, and an
     /// env-var audit into a single report.
     Doctor,
     /// Interactive first-run wizard: bootstrap the workspace, mint
@@ -413,33 +413,33 @@ pub enum McpCmd {
     #[command(after_help = "\
 EXAMPLES:
   # HTTP server (no auth)
-  aura mcp add --transport http sentry https://mcp.sentry.dev/mcp
+  baybo mcp add --transport http sentry https://mcp.sentry.dev/mcp
 
   # HTTP server with a static bearer token (stored encrypted in the vault)
-  aura mcp add --transport http corridor https://app.corridor.dev/api/mcp \\
+  baybo mcp add --transport http corridor https://app.corridor.dev/api/mcp \\
       --header \"Authorization: Bearer abc123\"
 
   # HTTP server with OAuth — runs the browser-based authorization flow at add-time;
   # tokens are persisted only on success
-  aura mcp add --transport http github https://api.githubcopilot.com/mcp/ \\
+  baybo mcp add --transport http github https://api.githubcopilot.com/mcp/ \\
       --client-id Iv23liABCDEF
 
   # HTTP server with OAuth, providing a client secret (read from stdin)
-  aura mcp add --transport http figma https://mcp.figma.com/mcp \\
+  baybo mcp add --transport http figma https://mcp.figma.com/mcp \\
       --client-id <id> --client-secret
 
   # HTTP server with OAuth on a fixed callback port (for pre-registered redirect URIs)
-  aura mcp add --transport http acme https://mcp.acme.dev/mcp \\
+  baybo mcp add --transport http acme https://mcp.acme.dev/mcp \\
       --client-id <id> --callback-port 8765
 
   # stdio server with env vars
-  aura mcp add -e API_KEY=xxx my-server -- npx my-mcp-server
+  baybo mcp add -e API_KEY=xxx my-server -- npx my-mcp-server
 
   # stdio server with subprocess flags
-  aura mcp add my-server -- my-command --some-flag arg1
+  baybo mcp add my-server -- my-command --some-flag arg1
 
   # Trust level
-  aura mcp add --transport http trusted-srv https://mcp.example.com/mcp \\
+  baybo mcp add --transport http trusted-srv https://mcp.example.com/mcp \\
       --trust-level trusted
 
 NOTES:
@@ -461,7 +461,7 @@ NOTES:
         #[arg(short = 'H', long = "header")]
         headers: Vec<String>,
         /// Pre-registered OAuth client id. If absent and the server
-        /// requires OAuth, Aura attempts Dynamic Client Registration.
+        /// requires OAuth, Baybo attempts Dynamic Client Registration.
         #[arg(long)]
         client_id: Option<String>,
         /// Prompt for the OAuth client secret (read from stdin).
@@ -549,7 +549,7 @@ pub enum DeviceCmd {
     /// Approve a pending device by its pairing code, activating its (until
     /// now inert) auth token.
     Approve {
-        /// Pairing code from `aura device pair`.
+        /// Pairing code from `baybo device pair`.
         code: String,
     },
     /// List registered devices. With no flag, shows every row; pass
@@ -619,19 +619,19 @@ pub enum ExternalAgentCmd {
     Status,
     /// Interactive wizard: pick a kind, prompt binary path (empty
     /// = $PATH), run the probe, then persist the *resolved absolute*
-    /// path to `external_agents.<kind>.binary_path` in `aura.json` —
+    /// path to `external_agents.<kind>.binary_path` in `baybo.json` —
     /// even an empty answer records the concrete location PATH
     /// resolved to, so the gateway service pins the same binary.
     Setup,
     /// Interactive multi-select: check the currently-enabled kinds to
     /// turn off (`external_agents.<kind>.enabled = false`) in
-    /// `aura.json`. If a disabled kind was `default_external_agent`,
+    /// `baybo.json`. If a disabled kind was `default_external_agent`,
     /// the default is re-resolved (cleared when ≤1 kind remains, else
     /// re-prompted). When nothing is enabled it's a no-op success — the
     /// feature is already off.
     Disable,
     /// Interactive picker that sets `default_external_agent` to one of
-    /// the currently-enabled kinds and persists it to `aura.json`. The
+    /// the currently-enabled kinds and persists it to `baybo.json`. The
     /// default is an operator-facing designation (the spawn protocol
     /// still needs an explicit `backend`), so it only matters once more
     /// than one kind is enabled.
@@ -676,7 +676,7 @@ pub enum LlmCmd {
         name: Option<String>,
     },
     /// List the live catalog reported by an LLM entry's provider —
-    /// useful before running `aura llm add` to see which model ids the
+    /// useful before running `baybo llm add` to see which model ids the
     /// account has access to.
     ///
     /// Without `name`, an interactive picker opens; pass an entry name
@@ -781,8 +781,8 @@ pub enum JobCmd {
     },
 }
 
-/// Status filter accepted by `aura job list --status`. Mirrors
-/// `aura_job::JobStatusKind` 1:1 — adding a new kind here without
+/// Status filter accepted by `baybo job list --status`. Mirrors
+/// `baybo_job::JobStatusKind` 1:1 — adding a new kind here without
 /// the matching `From` arm in `commands/job.rs` is a compile error.
 #[derive(Debug, Copy, Clone, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -813,7 +813,7 @@ pub enum CronCmd {
 #[derive(Debug, Subcommand)]
 pub enum LogCmd {
     /// Read the main gateway / agent log
-    /// (`<workspace>/logs/aura.log.<date>`).
+    /// (`<workspace>/logs/baybo.log.<date>`).
     Main {
         /// Date of the rolling log to read, in `YYYY-MM-DD`.
         /// Defaults to today (UTC — matches the appender's daily rotation).
@@ -935,7 +935,7 @@ pub enum ShellKind {
 
 /// Parse argv into a `Cli`. When [`ENV_HELP_AGENT`] is set, every
 /// hidden subcommand and arg is unhidden *before* clap processes
-/// argv, so `aura --help` and `aura <subcmd> --help` naturally print
+/// argv, so `baybo --help` and `baybo <subcmd> --help` naturally print
 /// the extended view through clap's own help machinery — no separate
 /// printer path to keep in sync.
 ///
@@ -972,7 +972,7 @@ mod tests {
     use clap::CommandFactory;
 
     /// `unhide_recursive` must clear `hide` on every nested subcommand
-    /// and arg — the hide policy fans out into the `AURA_HELP_AGENT`
+    /// and arg — the hide policy fans out into the `BAYBO_HELP_AGENT`
     /// extended-help view via the env-var-driven `parse_args` path.
     /// Walks the tree two levels deep on a representative branch to
     /// keep the guarantee honest.

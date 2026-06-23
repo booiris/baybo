@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_model::{
+use baybo_model::{
     ChannelType, ChatMessage, ControlEvent, ControlEventKind, FolderId, FolderSummary,
     LlmEntryName, MAX_FOLDER_NAME_LEN, Session, SessionId, SessionState, TriggerSource, User,
 };
@@ -8,9 +8,9 @@ use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, warn};
 
 use crate::SessionError;
-use aura_store::{SessionFolderRow, SessionFolderStore};
-use aura_store::{SessionStore, StoredMessage};
-use aura_store::{SessionSummaryRow, SessionSummaryStore};
+use baybo_store::{SessionFolderRow, SessionFolderStore};
+use baybo_store::{SessionStore, StoredMessage};
+use baybo_store::{SessionSummaryRow, SessionSummaryStore};
 
 type Result<T> = std::result::Result<T, SessionError>;
 
@@ -171,10 +171,10 @@ impl SessionManager {
         user: User,
         channel: ChannelType,
         parent: &Session,
-        lineage: aura_model::Lineage,
+        lineage: baybo_model::Lineage,
     ) -> Result<Session> {
         let prefix = match lineage.kind {
-            aura_model::LineageKind::Subagent => "subagent-",
+            baybo_model::LineageKind::Subagent => "subagent-",
         };
         let id = SessionId::from(format!("{prefix}{}", uuid::Uuid::new_v4()));
         let now = Utc::now();
@@ -184,7 +184,7 @@ impl SessionManager {
             channel,
             created_at: now,
             last_active: now,
-            state: aura_model::SessionState::default(),
+            state: baybo_model::SessionState::default(),
             // Spawned sessions inherit `root_session_id` from the
             // ultimate ancestor, not from their direct parent.
             root_session_id: parent.root_session_id.clone(),
@@ -272,7 +272,10 @@ impl SessionManager {
     /// long-running gateway with thousands of bot sessions doesn't
     /// pay an O(all) round-trip when the caller only wants the
     /// http channel.
-    pub async fn list_by_channel(&self, channel: &aura_model::ChannelType) -> Result<Vec<Session>> {
+    pub async fn list_by_channel(
+        &self,
+        channel: &baybo_model::ChannelType,
+    ) -> Result<Vec<Session>> {
         let mut sessions = self.store.list_by_channel(channel).await?;
         sessions.sort_by(|a, b| b.last_active.cmp(&a.last_active));
         Ok(sessions)
@@ -394,7 +397,7 @@ impl SessionManager {
     }
 
     /// Append an out-of-band control/display event (slash-command echo or
-    /// notice) — see [`aura_store::SessionStore::append_control_event`].
+    /// notice) — see [`baybo_store::SessionStore::append_control_event`].
     pub async fn append_control_event(
         &self,
         session_id: &SessionId,
@@ -533,7 +536,7 @@ impl SessionManager {
 
     /// Set (or clear, with `None`) the session's per-session LLM pin —
     /// the chat model switch. Targeted flat-column write that survives a
-    /// concurrent `touch`; see [`aura_store::SessionStore::set_last_llm`].
+    /// concurrent `touch`; see [`baybo_store::SessionStore::set_last_llm`].
     /// Returns `Err(NotFound)` when the session id is unknown.
     pub async fn set_last_llm(
         &self,
@@ -550,7 +553,7 @@ impl SessionManager {
 
     /// Flip the session's chat-list `pinned` flag — the sidebar "pin to
     /// top" affordance. Targeted flat-column write that survives a
-    /// concurrent `touch`; see [`aura_store::SessionStore::set_pinned`].
+    /// concurrent `touch`; see [`baybo_store::SessionStore::set_pinned`].
     /// Returns `Err(NotFound)` when the session id is unknown.
     pub async fn set_pinned(&self, session_id: &SessionId, pinned: bool) -> Result<()> {
         let updated = self.store.set_pinned(session_id, pinned).await?;
@@ -563,7 +566,7 @@ impl SessionManager {
 
     /// Move (or clear, with `None`) a session's chat-list folder
     /// assignment. Targeted flat-column write that survives a concurrent
-    /// `touch`; see [`aura_store::SessionStore::set_folder`]. When
+    /// `touch`; see [`baybo_store::SessionStore::set_folder`]. When
     /// `folder_id` is `Some`, the folder must exist. Returns
     /// `Err(NotFound)` when the session id or folder id is unknown.
     pub async fn set_folder(
@@ -765,7 +768,7 @@ impl SessionManager {
 mod tests {
     use std::sync::Arc;
 
-    use aura_model::{ChannelType, FolderId, MAX_FOLDER_NAME_LEN, SessionId, User};
+    use baybo_model::{ChannelType, FolderId, MAX_FOLDER_NAME_LEN, SessionId, User};
     use chrono::{Duration, Utc};
 
     use super::{SessionError, SessionManager, SessionStore};
@@ -1113,7 +1116,7 @@ mod tests {
         // `history` filters by `superseded_by IS NULL` and would hide
         // the original three turns; `full_transcript` returns every row
         // ever appended.
-        use aura_model::{ChatMessage, ContentBlock};
+        use baybo_model::{ChatMessage, ContentBlock};
 
         let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(
@@ -1258,7 +1261,7 @@ mod tests {
     /// `ContextManager` had in memory after the apply.
     #[tokio::test]
     async fn append_then_compact_round_trip() {
-        use aura_model::{ChatMessage, ContentBlock, Role};
+        use baybo_model::{ChatMessage, ContentBlock, Role};
 
         let store = Arc::new(MemorySessionStore::new());
         let mgr = SessionManager::new(

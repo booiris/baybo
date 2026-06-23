@@ -23,10 +23,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_integration_tests::AgentTestHarness;
-use aura_llm::{StreamEvent, ToolCallInfo};
-use aura_model::TrustLevel;
-use aura_tools::{Tool, ToolConcurrency, ToolContext, ToolManifest, ToolOutput};
+use baybo_integration_tests::AgentTestHarness;
+use baybo_llm::{StreamEvent, ToolCallInfo};
+use baybo_model::TrustLevel;
+use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolManifest, ToolOutput};
 use serde_json::{Value, json};
 
 /// Mirrors `MAX_CONCURRENT_TOOL_CALLS` in
@@ -96,7 +96,7 @@ impl Tool for ProbeTool {
     fn concurrency(&self) -> ToolConcurrency {
         self.mode
     }
-    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let now = self.tracker.inflight.fetch_add(1, Ordering::SeqCst) + 1;
         self.tracker.max_inflight.fetch_max(now, Ordering::SeqCst);
         if self.mode == ToolConcurrency::Exclusive {

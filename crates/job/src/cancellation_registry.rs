@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_model::JobId;
+use baybo_model::JobId;
 use parking_lot::RwLock;
 use tokio_util::sync::CancellationToken;
 

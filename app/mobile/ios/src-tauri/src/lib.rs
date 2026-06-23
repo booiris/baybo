@@ -1,6 +1,6 @@
-//! The Aura iOS companion (Tauri shell).
+//! The Baybo iOS companion (Tauri shell).
 //!
-//! A thin native shell around the host-tested `aura-mobile-core`: the webview
+//! A thin native shell around the host-tested `baybo-mobile-core`: the webview
 //! drives phase-1's two features — scan-to-connect (the [`pair`] command) and
 //! remote notifications (handled out-of-process by the Notification Service
 //! Extension under `../apple`). The protocol/crypto live in the shared crates,
@@ -21,11 +21,11 @@ async fn pair(endpoint: String, code: String, label: String) -> Result<PairedSum
 
 /// Debug-only: seed a known push key into the shared App Group keychain so the
 /// NSE decrypt path can be exercised with `xcrun simctl push` without a live
-/// gateway pairing. Reads `AURA_SEED_PUSH_KEY` as `<bid>:<64-hex-key>` (absent
+/// gateway pairing. Reads `BAYBO_SEED_PUSH_KEY` as `<bid>:<64-hex-key>` (absent
 /// => no-op). Compiled out of release builds; never logs the key or the bid.
 #[cfg(all(debug_assertions, target_os = "ios"))]
 fn debug_seed_push_key() {
-    let Ok(spec) = std::env::var("AURA_SEED_PUSH_KEY") else {
+    let Ok(spec) = std::env::var("BAYBO_SEED_PUSH_KEY") else {
         return;
     };
     let Some((bid, key_hex)) = spec.split_once(':') else {
@@ -52,8 +52,8 @@ fn debug_seed_push_key() {
         },
         Err(e) => format!("store_err={e}"),
     };
-    let _ = std::fs::write(std::env::temp_dir().join("aura-seed-result.txt"), &result);
-    eprintln!("aura(debug): keychain self-check: {result}");
+    let _ = std::fs::write(std::env::temp_dir().join("baybo-seed-result.txt"), &result);
+    eprintln!("baybo(debug): keychain self-check: {result}");
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -76,6 +76,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![pair])
         .run(tauri::generate_context!());
     if let Err(e) = result {
-        eprintln!("aura: fatal error while running the app: {e}");
+        eprintln!("baybo: fatal error while running the app: {e}");
     }
 }

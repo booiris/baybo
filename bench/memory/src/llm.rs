@@ -1,7 +1,7 @@
 //! Minimal OpenAI-compatible chat client (→ DeepSeek by default), used by the
 //! judge. A single non-streaming `POST /chat/completions` at temperature 0,
-//! returning the assistant text. (The answer side runs inside the real Aura
-//! agent via `aura prompt`, not through this client.)
+//! returning the assistant text. (The answer side runs inside the real Baybo
+//! agent via `baybo prompt`, not through this client.)
 
 use std::time::Duration;
 

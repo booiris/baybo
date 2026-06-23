@@ -1,16 +1,16 @@
 //! In-memory `JobStore` for downstream tests.
 //!
 //! Gated behind the `test-support` cargo feature so it never ships in
-//! release builds. Lives in `aura-job` (next to the row conversions it
-//! pairs with) so crates that depend on `aura-job` can spin up a fake
+//! release builds. Lives in `baybo-job` (next to the row conversions it
+//! pairs with) so crates that depend on `baybo-job` can spin up a fake
 //! store without pulling the libsql adapter.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use aura_model::{JobId, SessionId};
-use aura_store::job::Result;
-use aura_store::{JobRow, JobStore, JobTransitionRow};
+use baybo_model::{JobId, SessionId};
+use baybo_store::job::Result;
+use baybo_store::{JobRow, JobStore, JobTransitionRow};
 use parking_lot::Mutex;
 
 /// In-memory `JobStore` for tests. Keyed by `row.id`. `record_transition`

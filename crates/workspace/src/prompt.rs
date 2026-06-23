@@ -1,5 +1,5 @@
 //! Default identity-file templates seeded into `<workspace>/profile/`
-//! by `aura-setup::bootstrap` when an identity markdown file is
+//! by `baybo-setup::bootstrap` when an identity markdown file is
 //! missing. Source of truth for the template shape and intended voice
 //! is openclaw's reference templates:
 //!

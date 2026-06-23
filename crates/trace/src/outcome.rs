@@ -18,7 +18,7 @@
 //! via [`LifecycleStateRepr`], so on-disk JSON blobs round-trip without
 //! a schema migration.
 
-use aura_job::CancelReason;
+use baybo_job::CancelReason;
 use serde::{Deserialize, Serialize};
 
 /// Terminal outcome of a `Step` or `Span`. Constructed only at

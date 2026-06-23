@@ -1,16 +1,16 @@
-//! Shared connection probe used by `aura mcp list` and `aura mcp get`.
+//! Shared connection probe used by `baybo mcp list` and `baybo mcp get`.
 //!
 //! `connect()` against an MCP server is heavier than a typical CLI read —
 //! stdio servers spawn a subprocess, HTTP servers run the rmcp handshake.
-//! `aura mcp` commands accept a `--no-probe` flag for scripting paths that
+//! `baybo mcp` commands accept a `--no-probe` flag for scripting paths that
 //! want config-only output.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_security::SecretVault;
-use aura_tools::mcp::transport::connect;
-use aura_tools::mcp::{McpServerEntry, McpTransportConfig, vault_keys};
+use baybo_security::SecretVault;
+use baybo_tools::mcp::transport::connect;
+use baybo_tools::mcp::{McpServerEntry, McpTransportConfig, vault_keys};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 const HTTP_PRECHECK_TIMEOUT: Duration = Duration::from_secs(12);
@@ -31,7 +31,7 @@ impl ProbeStatus {
             Self::Skipped => "(probe skipped)".into(),
             Self::Ok { tool_count } => format!("ok ({tool_count} tools)"),
             Self::Timeout => "timeout".into(),
-            Self::AuthRequired(_) => "auth required (run `aura mcp add` to re-authorize)".into(),
+            Self::AuthRequired(_) => "auth required (run `baybo mcp add` to re-authorize)".into(),
             Self::Unreachable(msg) => format!("unreachable: {}", clip(msg, 60)),
             Self::Error(msg) => format!("error: {}", clip(msg, 60)),
         }
@@ -66,7 +66,7 @@ impl ProbeStatus {
 pub async fn probe(
     entry: &McpServerEntry,
     vault: &Arc<SecretVault>,
-    proxy: Option<&aura_security::http::ProxySettings>,
+    proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> ProbeStatus {
     // Fast path: for an HTTP server with no stored access token, a single
     // unauthenticated GET tells us whether the server requires auth far
@@ -116,9 +116,9 @@ async fn has_access_token(vault: &Arc<SecretVault>, server_name: &str) -> bool {
 /// cold host occasionally aborts mid-TLS-handshake.
 pub(super) async fn http_auth_precheck(
     url: &str,
-    proxy: Option<&aura_security::http::ProxySettings>,
+    proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> Option<ProbeStatus> {
-    let client = match aura_security::http::client_builder(proxy)
+    let client = match baybo_security::http::client_builder(proxy)
         .and_then(|b| b.timeout(HTTP_PRECHECK_TIMEOUT).build())
     {
         Ok(c) => c,
@@ -130,7 +130,7 @@ pub(super) async fn http_auth_precheck(
         "params": {
             "protocolVersion": "2025-03-26",
             "capabilities": {},
-            "clientInfo": {"name": "aura-mcp-probe", "version": "0"}
+            "clientInfo": {"name": "baybo-mcp-probe", "version": "0"}
         },
         "id": 0
     });

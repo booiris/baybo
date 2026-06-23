@@ -104,7 +104,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             bind_addr: DEFAULT_BIND_ADDR.into(),
             key_id: "KEY123".into(),
             team_id: "TEAM456".into(),
-            topic: "com.aura.app".into(),
+            topic: "com.baybo.app".into(),
             instance_keys: vec!["inst-A".into()],
         }
     }

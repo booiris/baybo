@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `janitor` crate (`aura-janitor`) runs best-effort, cadence-driven maintenance **outside** the agent loop: two filesystem TTL sweeps and one database retention sweep. It does **not** do storage compaction (there is no `VACUUM`); the only table it touches is `channel_pairings`.
+The `janitor` crate (`baybo-janitor`) runs best-effort, cadence-driven maintenance **outside** the agent loop: two filesystem TTL sweeps and one database retention sweep. It does **not** do storage compaction (there is no `VACUUM`); the only table it touches is `channel_pairings`.
 
 A single `Janitor` struct holds the `WorkspacePaths` plus two optional dependencies wired by builders — the pairing store and the sidecar-cache view. `Janitor::run(shutdown)` sweeps once at boot, then ticks every `TICK_INTERVAL` (12h) until `shutdown` resolves. Each sweep is best-effort: a failure in one is logged and the others still run.
 
@@ -12,13 +12,13 @@ A single `Janitor` struct holds the `WorkspacePaths` plus two optional dependenc
 |-------|-----|--------|---------|
 | Log files | `LOG_FILE_TTL` = 30 days | `logs_dir()` + `channel_logs_dir()` (`is_log_file`) | every `TICK_INTERVAL` (12h) |
 | Pairing rows | `PAIRING_APPROVAL_TTL` = 7 days (approved) | `channel_pairings` via `ChannelPairingStore::purge_expired` | every `PAIRING_SWEEP_INTERVAL` (1h), plus once per 12h tick |
-| Sidecar cache | `SIDECAR_CACHE_TTL` = 7 days | `$XDG_CACHE_HOME/aura/sidecars/` stale `<name>-<hash>` dirs | every `SIDECAR_SWEEP_INTERVAL` (24h) |
+| Sidecar cache | `SIDECAR_CACHE_TTL` = 7 days | `$XDG_CACHE_HOME/baybo/sidecars/` stale `<name>-<hash>` dirs | every `SIDECAR_SWEEP_INTERVAL` (24h) |
 
 ### Public surface
 
 - **`Janitor`** — `new(paths)`; builders `with_pairing_store(Arc<dyn ChannelPairingStore>)` and `with_sidecar_cache(SidecarCache)`; sweep entry points `sweep_once()`, `sweep_pairings_once(now)`, `sweep_sidecar_cache()`; and the `run(shutdown)` loop.
 - **`JanitorReport`** — per-sweep counts (`log_files_removed`, `sidecar_dirs_removed`, `pairings_purged`).
-- **`SidecarCache`** — `cache_root: PathBuf` + `live_dirs: HashSet<String>` (the `<name>-<hash>` set the running Aura currently has materialised).
+- **`SidecarCache`** — `cache_root: PathBuf` + `live_dirs: HashSet<String>` (the `<name>-<hash>` set the running Baybo currently has materialised).
 - **`JanitorError`** — single `Filesystem { path, source }` variant.
 
 ## Design Decisions
@@ -31,7 +31,7 @@ Pending pairing codes expire on the order of minutes, so a daily sweep would let
 
 ### Sidecar-cache sweep is the rarest
 
-The sidecar cache only accumulates cruft after a binary upgrade lands a fresh content hash (single-digit MB per upgrade), so it runs on its own 24h cadence (`SIDECAR_SWEEP_INTERVAL`) — every other 12h tick — via a `last_sidecar_sweep` sentinel. It removes only directories under `cache_root` that are **not** in `live_dirs` **and** older than the TTL; the TTL doubles as a safety margin against a concurrent older-version Aura under the same UID still using a dir. Non-directory entries and the live set are always left alone.
+The sidecar cache only accumulates cruft after a binary upgrade lands a fresh content hash (single-digit MB per upgrade), so it runs on its own 24h cadence (`SIDECAR_SWEEP_INTERVAL`) — every other 12h tick — via a `last_sidecar_sweep` sentinel. It removes only directories under `cache_root` that are **not** in `live_dirs` **and** older than the TTL; the TTL doubles as a safety margin against a concurrent older-version Baybo under the same UID still using a dir. Non-directory entries and the live set are always left alone.
 
 ### Best-effort, fail-open, TTL-gated
 
@@ -39,7 +39,7 @@ Every sweep swallows its own errors (`tracing::warn!` then continue) so one bad 
 
 ## Constraints
 
-- Internal deps: `aura-store` (the `ChannelPairingStore` trait for the pairing purge), `aura-workspace` (path resolution), `aura-model`. It depends on the `aura-store` **ports** crate, not `aura-storage`.
+- Internal deps: `baybo-store` (the `ChannelPairingStore` trait for the pairing purge), `baybo-workspace` (path resolution), `baybo-model`. It depends on the `baybo-store` **ports** crate, not `baybo-storage`.
 - Both DB-touching and sidecar sweeps are opt-in: without `with_pairing_store` the pairing sweep is skipped; without `with_sidecar_cache` the sidecar sweep is a no-op.
 
 ## Collaboration
@@ -48,5 +48,5 @@ Every sweep swallows its own errors (`tracing::warn!` then continue) so one bad 
 |--------|------|
 | `gateway` | `src/gateway_cmd.rs` constructs the `Janitor`, wires `with_pairing_store(graph.stores.channel_pairing)` and (when sidecars are active) `with_sidecar_cache`, and spawns `run` against the gateway shutdown signal. (Distinct from the gateway's own `WebTokenJanitor`, which expires web-chat tokens.) |
 | `storage` | `LibsqlChannelPairingStore::purge_expired` issues the `DELETE FROM channel_pairings` the pairing sweep drives |
-| `pairing` | Owns the `channel_pairings` rows the sweep reaps; `aura-janitor` is the cadence that enforces their retention |
+| `pairing` | Owns the `channel_pairings` rows the sweep reaps; `baybo-janitor` is the cadence that enforces their retention |
 | `workspace` | `WorkspacePaths` resolves `sessions_log_dir` / `logs_dir` / `channel_logs_dir` and the sidecar cache root |

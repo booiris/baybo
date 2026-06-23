@@ -1,5 +1,5 @@
 [package]
-name = "aura-llm"
+name = "baybo-llm"
 version.workspace = true
 edition.workspace = true
 
@@ -14,13 +14,13 @@ serde_json = { workspace = true }
 [features]
 # Exposes `StubLlm` and the `LlmStream::from_events` constructor for
 # downstream crates' tests. Pull in via:
-#   aura-llm = { workspace = true, features = ["test-support"] }
+#   baybo-llm = { workspace = true, features = ["test-support"] }
 # inside the consumer's `[dev-dependencies]`.
 test-support = []
 
 [dependencies]
-aura-model = { workspace = true }
-aura-security = { workspace = true }
+baybo-model = { workspace = true }
+baybo-security = { workspace = true }
 parking_lot = { workspace = true }
 rig = { workspace = true }
 async-trait = { workspace = true }
@@ -41,6 +41,6 @@ async-stream = { workspace = true }
 bytes = { workspace = true }
 
 [dev-dependencies]
-aura-security = { workspace = true, features = ["test-support"] }
-aura-storage = { workspace = true, features = ["test-support"] }
-aura-store = { workspace = true }
+baybo-security = { workspace = true, features = ["test-support"] }
+baybo-storage = { workspace = true, features = ["test-support"] }
+baybo-store = { workspace = true }

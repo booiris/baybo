@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use aura_model::{JobId, ParallelGroup, SessionId, SpanId, StepId};
+use baybo_model::{JobId, ParallelGroup, SessionId, SpanId, StepId};
 use chrono::Utc;
 use tokio::sync::broadcast;
 
@@ -15,7 +15,7 @@ use crate::{
     LifecycleOutcome, LifecycleState, Span, SpanEvent, SpanEventKind, SpanFinalize, SpanHandle,
     SpanKind, Step, StepHandle, StepKind, TraceError,
 };
-use aura_store::TraceStore;
+use baybo_store::TraceStore;
 
 type Result<T> = std::result::Result<T, TraceError>;
 
@@ -499,8 +499,8 @@ mod tests {
             span,
             0,
             SpanEventKind::Approval {
-                decision: aura_model::ApprovalDecision::Approve,
-                resource: aura_model::ResourceAccess::ReadFile {
+                decision: baybo_model::ApprovalDecision::Approve,
+                resource: baybo_model::ResourceAccess::ReadFile {
                     path: std::path::PathBuf::from("/tmp/foo"),
                 },
             },

@@ -81,7 +81,7 @@ impl ContentSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, SessionId};
+    use baybo_model::{ChannelType, SessionId};
     use wire::{Message, MessageRole};
 
     /// The app's content session round-trips a self-pull against an in-process

@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use super::LibsqlPool;
-use aura_store::device_pairing::{DevicePairingSlot, DevicePairingStore, Result};
-use aura_store::StorageError;
+use baybo_store::StorageError;
+use baybo_store::device_pairing::{DevicePairingSlot, DevicePairingStore, Result};
 
 pub struct LibsqlDevicePairingStore {
     pool: LibsqlPool,

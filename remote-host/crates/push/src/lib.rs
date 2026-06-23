@@ -1,6 +1,6 @@
 //! **push** — the only `remote-host` component that holds the APNs `.p8`.
 //!
-//! It relays operator-encrypted lock-screen-preview blobs to APNs for any Aura
+//! It relays operator-encrypted lock-screen-preview blobs to APNs for any Baybo
 //! gateway, staying **blind**: the gateway (A) encrypts the preview with the
 //! device's push key, this component copies the opaque `enc`/`n`/`kid`/`bid`
 //! into the APNs payload and signs the provider token — it never decrypts.

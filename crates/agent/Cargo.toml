@@ -1,5 +1,5 @@
 [package]
-name = "aura-agent"
+name = "baybo-agent"
 version.workspace = true
 edition.workspace = true
 
@@ -7,25 +7,25 @@ edition.workspace = true
 doctest = false
 
 [dependencies]
-aura-cron = { workspace = true }
-aura-model = { workspace = true }
-aura-llm = { workspace = true }
-aura-tools = { workspace = true }
-aura-subagent = { workspace = true }
-aura-skills = { workspace = true }
-aura-skills-assessor = { workspace = true }
-aura-workspace = { workspace = true, features = ["io"] }
-aura-context = { workspace = true }
-aura-session = { workspace = true }
-aura-trace = { workspace = true }
-aura-job = { workspace = true }
-aura-memory = { workspace = true }
-aura-cost = { workspace = true }
-aura-security = { workspace = true }
-aura-sandbox = { workspace = true }
-aura-store = { workspace = true }
-aura-storage = { workspace = true }
-aura-channels = { workspace = true }
+baybo-cron = { workspace = true }
+baybo-model = { workspace = true }
+baybo-llm = { workspace = true }
+baybo-tools = { workspace = true }
+baybo-subagent = { workspace = true }
+baybo-skills = { workspace = true }
+baybo-skills-assessor = { workspace = true }
+baybo-workspace = { workspace = true, features = ["io"] }
+baybo-context = { workspace = true }
+baybo-session = { workspace = true }
+baybo-trace = { workspace = true }
+baybo-job = { workspace = true }
+baybo-memory = { workspace = true }
+baybo-cost = { workspace = true }
+baybo-security = { workspace = true }
+baybo-sandbox = { workspace = true }
+baybo-store = { workspace = true }
+baybo-storage = { workspace = true }
+baybo-channels = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
@@ -47,14 +47,14 @@ async-stream = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-aura-cost = { workspace = true, features = ["test-support"] }
-aura-job = { workspace = true, features = ["test-support"] }
-aura-llm = { workspace = true, features = ["test-support"] }
-aura-memory = { workspace = true, features = ["test-support"] }
-aura-security = { workspace = true, features = ["test-support"] }
-aura-session = { workspace = true, features = ["test-support"] }
-aura-storage = { workspace = true, features = ["test-support"] }
-aura-trace = { workspace = true, features = ["test-support"] }
+baybo-cost = { workspace = true, features = ["test-support"] }
+baybo-job = { workspace = true, features = ["test-support"] }
+baybo-llm = { workspace = true, features = ["test-support"] }
+baybo-memory = { workspace = true, features = ["test-support"] }
+baybo-security = { workspace = true, features = ["test-support"] }
+baybo-session = { workspace = true, features = ["test-support"] }
+baybo-storage = { workspace = true, features = ["test-support"] }
+baybo-trace = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 # `test-util` (not in the `full` feature set) for `start_paused` time control
 # in the foreground-wait policy tests.

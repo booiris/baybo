@@ -1,6 +1,6 @@
-# aura-security Fuzz Targets
+# baybo-security Fuzz Targets
 
-Fuzz testing for the `aura-security` crate using
+Fuzz testing for the `baybo-security` crate using
 [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer).
 
 Rule sets and fuzz-harness layout are adapted from NEAR AI's ironclaw

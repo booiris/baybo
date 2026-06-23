@@ -1,14 +1,14 @@
 [package]
-name = "aura-mobile-app"
+name = "baybo-mobile-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Aura iOS companion (Tauri shell)"
+description = "Baybo iOS companion (Tauri shell)"
 
 # The library Tauri's mobile entry point links against. `staticlib`/`cdylib` are
 # required by the iOS/Android build; `rlib` keeps it usable from the desktop bin.
 [lib]
-name = "aura_mobile_app_lib"
+name = "baybo_mobile_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -16,7 +16,7 @@ tauri-build = { workspace = true }
 
 [dependencies]
 tauri = { workspace = true }
-aura-mobile-core = { workspace = true }
+baybo-mobile-core = { workspace = true }
 device-proto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

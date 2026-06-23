@@ -6,7 +6,7 @@
 //! report. We parse that report back into [`GradeReport`].
 //!
 //! The `oracle` arm passes [`Predictions::Gold`] (`--predictions_path gold`),
-//! so the harness supplies the gold patches itself — no aura, no prediction
+//! so the harness supplies the gold patches itself — no baybo, no prediction
 //! file. That, plus the empty-patch `noop` arm, lets the whole Docker+grader
 //! pipeline be validated offline (oracle ≈100%, noop 0%) before the agent arm
 //! spends anything.

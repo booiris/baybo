@@ -1,11 +1,11 @@
-//! `aura device` subcommand family — the operator surface for the iOS
-//! companion's device pairing (orthogonal to `aura pair`, which gates channel
+//! `baybo device` subcommand family — the operator surface for the iOS
+//! companion's device pairing (orthogonal to `baybo pair`, which gates channel
 //! senders). See [`mobile-remote-host`](../../../docs/mobile-remote-host.md).
 
 use std::sync::Arc;
 
-use aura_pairing::DevicePairingService;
-use aura_store::{DeviceRow, DeviceStatus};
+use baybo_pairing::DevicePairingService;
+use baybo_store::{DeviceRow, DeviceStatus};
 use serde_json::json;
 
 use crate::cli::DeviceCmd;
@@ -30,7 +30,7 @@ fn require_service(ctx: &CommandContext) -> Result<&Arc<DevicePairingService>> {
     ctx.device_pairing_service.as_ref().ok_or_else(|| {
         CliError::Config(
             "device pairing service unavailable — run from the workspace root with a valid \
-             aura.json"
+             baybo.json"
                 .into(),
         )
     })
@@ -44,8 +44,8 @@ async fn pair(ctx: &CommandContext, label: String, user: String) -> Result<Comma
         .map_err(|e| CliError::Manager(format!("mint device pairing: {e}")))?;
     let human = format!(
         "Pairing code for \"{label}\": {code}\n\
-         Scan it in the Aura iOS app to start pairing, then approve with:\n  \
-         aura device approve {code}",
+         Scan it in the Baybo iOS app to start pairing, then approve with:\n  \
+         baybo device approve {code}",
     );
     Ok(CommandOutput::structured(
         human,

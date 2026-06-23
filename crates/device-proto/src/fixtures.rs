@@ -24,7 +24,7 @@ pub const NONCE: [u8; NONCE_LEN] = [
 
 /// The preview plaintext — the shape A encrypts and the NSE rewrites into
 /// `title` / `body`.
-pub const PLAINTEXT: &[u8] = br#"{"title":"Aura","body":"The agent finished replying."}"#;
+pub const PLAINTEXT: &[u8] = br#"{"title":"Baybo","body":"The agent finished replying."}"#;
 
 /// `ChaCha20-Poly1305(KEY, NONCE, PLAINTEXT, aad=∅)` = `ciphertext || tag`,
 /// hex-encoded. Pinned so the NSE's CryptoKit decrypt is validated against an

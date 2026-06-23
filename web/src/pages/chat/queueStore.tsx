@@ -13,7 +13,7 @@ import type { WireAttachment } from '../../api/chatWs';
 // Per-session "interjection queue": messages the operator parks while a turn
 // is in flight (or while the session is paused after a /stop / error). They
 // fire one-per-completion (the auto-fire pipeline in ChatPage) or on demand.
-// Persisted to localStorage under `aura.queue.<sessionId>` so a reload keeps
+// Persisted to localStorage under `baybo.queue.<sessionId>` so a reload keeps
 // the queue; attachments persist as blob refs and re-fetch their preview.
 
 export type PauseReason = 'cancelled' | 'error' | null;
@@ -36,7 +36,7 @@ export interface SessionQueue {
 
 type QueueMap = Record<string, SessionQueue>;
 
-const QUEUE_KEY_PREFIX = 'aura.queue.';
+const QUEUE_KEY_PREFIX = 'baybo.queue.';
 const EMPTY_QUEUE: SessionQueue = Object.freeze({ items: [], deferred: [], pauseReason: null });
 const queueKey = (sessionId: string) => `${QUEUE_KEY_PREFIX}${sessionId}`;
 const emptyQueue = (): SessionQueue => ({ items: [], deferred: [], pauseReason: null });

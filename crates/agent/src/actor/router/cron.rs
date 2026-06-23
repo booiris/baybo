@@ -1,5 +1,5 @@
-use aura_cron::CronTriggerEvent;
-use aura_model::{TriggerSource, User};
+use baybo_cron::CronTriggerEvent;
+use baybo_model::{TriggerSource, User};
 use tracing::{debug, warn};
 
 use crate::actor::AgentMessage;

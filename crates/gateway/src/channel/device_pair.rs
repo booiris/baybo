@@ -2,7 +2,7 @@
 //!
 //! Pairing happens *before* any auth token exists, so this route carries no
 //! channel-token middleware — it is gated by the SPAKE2 code itself (a balanced
-//! PAKE allows one online guess per run; the operator's `aura device approve`
+//! PAKE allows one online guess per run; the operator's `baybo device approve`
 //! is the second gate). The 4-message handshake (see
 //! [`device_proto::pairing::PairFrame`]):
 //!
@@ -17,14 +17,14 @@
 
 use std::time::Duration;
 
-use device_proto::kdf::derive_pair_keys;
-use device_proto::pairing::{self, DeviceHello, GatewayWelcome, PairFrame};
-use device_proto::pake::Pake;
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use device_proto::kdf::derive_pair_keys;
+use device_proto::pairing::{self, DeviceHello, GatewayWelcome, PairFrame};
+use device_proto::pake::Pake;
 
 use super::state::WsChannelState;
 use crate::device::load_or_create_static_keypair;
@@ -160,10 +160,10 @@ async fn send(socket: &mut WebSocket, frame: &PairFrame) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::test_support::build_test_deps;
+    use baybo_store::DeviceStatus;
     use device_proto::kdf::derive_pair_keys;
     use device_proto::noise::StaticKeypair;
     use device_proto::pairing::ApnsEnv;
-    use aura_store::DeviceStatus;
     use futures::{SinkExt, StreamExt};
     use tokio::net::TcpStream;
     use tokio_tungstenite::WebSocketStream;
@@ -206,8 +206,12 @@ mod tests {
         let device_store = tg.deps.stores.device.clone();
         let vault = tg.deps.secret_vault.clone();
 
-        // Operator mints a slot (the `aura device pair` step).
-        let code = state.device_pairing.mint("user-1", "Test iPhone").await.unwrap();
+        // Operator mints a slot (the `baybo device pair` step).
+        let code = state
+            .device_pairing
+            .mint("user-1", "Test iPhone")
+            .await
+            .unwrap();
 
         // Serve just the token-free pairing route on an ephemeral port.
         let app = Router::new().nest("/v1", routes().with_state(state));
@@ -259,7 +263,11 @@ mod tests {
 
         // A pending device row landed with the app's static key + the issued
         // (inert) token, and the per-device push key (HKDF of K) is stored.
-        let row = device_store.get("user-1", "dev-xyz").await.unwrap().unwrap();
+        let row = device_store
+            .get("user-1", "dev-xyz")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, DeviceStatus::Pending);
         assert_eq!(row.auth_token, welcome.auth_token);
         assert_eq!(row.device_pubkey, device_static.public().to_vec());

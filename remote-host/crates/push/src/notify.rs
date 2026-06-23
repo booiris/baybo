@@ -147,7 +147,7 @@ impl NotifyService {
 fn build_payload(req: &NotifyRequest) -> Vec<u8> {
     let body = json!({
         "aps": {
-            "alert": { "title": "Aura", "body": "New message" },
+            "alert": { "title": "Baybo", "body": "New message" },
             "mutable-content": 1,
         },
         "enc": req.enc,
@@ -218,7 +218,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             store,
             sender,
             signer(),
-            "com.aura.app",
+            "com.baybo.app",
         )
     }
 
@@ -297,7 +297,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
         let sent = sender.last.lock().clone().expect("apns request sent");
         assert_eq!(sent.env, ApnsEnv::Sandbox);
         assert_eq!(sent.device_token, "apns-tok-xyz");
-        assert_eq!(sent.topic, "com.aura.app");
+        assert_eq!(sent.topic, "com.baybo.app");
         assert_eq!(sent.collapse_id, "dev-1:sess-1");
         assert!(!sent.provider_jwt.is_empty());
 

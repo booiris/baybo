@@ -30,22 +30,22 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_agent::LlmPoolHandle;
-use aura_agent::supervisor::AgentSupervisor;
-use aura_agent::{CronScheduler, SessionManager, service::ShutdownSignal};
-use aura_channels::{ChannelRegistry, RouterInbound};
-use aura_config::AuraConfig;
-use aura_job::JobLifecycle;
+use baybo_agent::LlmPoolHandle;
+use baybo_agent::supervisor::AgentSupervisor;
+use baybo_agent::{CronScheduler, SessionManager, service::ShutdownSignal};
+use baybo_channels::{ChannelRegistry, RouterInbound};
+use baybo_config::BayboConfig;
+use baybo_job::JobLifecycle;
 
 use crate::reload::ConfigReloader;
-use aura_security::SecretVault;
-use aura_skills::SkillRegistry;
-use aura_storage::Store;
-use aura_store::ChannelBotStore;
-use aura_tools::ToolRegistry;
-use aura_trace::TraceStore;
 use axum::Router;
 use axum::middleware;
+use baybo_security::SecretVault;
+use baybo_skills::SkillRegistry;
+use baybo_storage::Store;
+use baybo_store::ChannelBotStore;
+use baybo_tools::ToolRegistry;
+use baybo_trace::TraceStore;
 use tokio::sync::mpsc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -66,10 +66,10 @@ use crate::{GatewayError, Result};
 /// originals so the same managers can be shared with the router / TUI
 /// / cron loop.
 pub struct GatewayDeps {
-    pub config: Arc<AuraConfig>,
-    /// Path to the on-disk `aura.json` the gateway was loaded from, if
+    pub config: Arc<BayboConfig>,
+    /// Path to the on-disk `baybo.json` the gateway was loaded from, if
     /// any. Needed by `PUT/DELETE /v1/config` so remote clients can
-    /// write through to the same file that `aura config set/unset`
+    /// write through to the same file that `baybo config set/unset`
     /// targets. `None` when running with defaults only — mutation
     /// endpoints then reject with `ConfigPathUnset`.
     pub config_path: Option<PathBuf>,
@@ -137,16 +137,16 @@ pub struct GatewayDeps {
 /// State shared with admin TCP handlers. Cheap to clone.
 #[derive(Clone)]
 pub struct AdminState {
-    pub config: Arc<AuraConfig>,
+    pub config: Arc<BayboConfig>,
     pub config_path: Option<PathBuf>,
     pub session_manager: Arc<SessionManager>,
     pub job_lifecycle: Arc<JobLifecycle>,
     pub cron_scheduler: Arc<CronScheduler>,
     pub trace_store: Arc<dyn TraceStore>,
-    pub cost_store: Arc<dyn aura_cost::CostStore>,
+    pub cost_store: Arc<dyn baybo_cost::CostStore>,
     /// Pre-built `QueryApi` so `/v1/traces/{id}` and any future
     /// query-shaped endpoint don't allocate one per request.
-    pub query_api: Arc<aura_query::QueryApi>,
+    pub query_api: Arc<baybo_query::QueryApi>,
     pub skill_registry: Arc<SkillRegistry>,
     pub tool_registry: Arc<ToolRegistry>,
     pub channel_registry: Arc<ChannelRegistry>,
@@ -193,7 +193,7 @@ pub struct ChannelState {
 
 impl AdminState {
     fn from_deps(deps: &GatewayDeps) -> Self {
-        let query_api = Arc::new(aura_query::QueryApi::new(
+        let query_api = Arc::new(baybo_query::QueryApi::new(
             deps.session_manager.store(),
             Arc::clone(&deps.job_lifecycle),
             deps.stores.trace.clone(),

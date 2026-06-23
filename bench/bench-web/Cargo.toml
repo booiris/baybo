@@ -1,9 +1,9 @@
 [package]
-name = "aura-bench-web"
+name = "baybo-bench-web"
 version.workspace = true
 edition.workspace = true
 # The crate ships a second bin (precompute_tool_counts), so `cargo run -p
-# aura-bench-web` (the viewer launcher) would otherwise be ambiguous.
+# baybo-bench-web` (the viewer launcher) would otherwise be ambiguous.
 default-run = "bench-web"
 
 [lib]

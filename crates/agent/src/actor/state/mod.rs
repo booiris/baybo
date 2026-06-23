@@ -26,17 +26,17 @@
 
 use std::sync::Arc;
 
-use aura_channels::AgentOutput;
-use aura_model::Session;
+use baybo_channels::AgentOutput;
+use baybo_model::Session;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::supervisor::AgentSupervisor;
 use crate::runtime::agent_loop::AgentLoop;
-use aura_job::JobLifecycle;
-use aura_session::SessionManager;
-use aura_trace::SpanRecorder;
+use baybo_job::JobLifecycle;
+use baybo_session::SessionManager;
+use baybo_trace::SpanRecorder;
 
 pub mod marker;
 

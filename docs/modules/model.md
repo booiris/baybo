@@ -2,7 +2,7 @@
 
 ## Overview
 
-`model` is Aura's lowest-level shared data crate. It provides the data types — content representations, shared domain records, ID newtypes, and protocol shapes — exchanged across modules, and contains no business traits or error types (each is a plain data definition consumed by higher layers).
+`model` is Baybo's lowest-level shared data crate. It provides the data types — content representations, shared domain records, ID newtypes, and protocol shapes — exchanged across modules, and contains no business traits or error types (each is a plain data definition consumed by higher layers).
 
 Contents:
 
@@ -22,7 +22,7 @@ Contents:
 
 ### Minimal scope
 
-`model` retains the data types that are shared by two or more layers (channel, LLM, storage, agent) and cannot naturally belong to any single one — content primitives, cross-cutting domain records, ID newtypes, and protocol shapes. Session/user domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `Lineage`, `LineageKind`) live here so every consumer (channels, agent, storage, session manager) shares one shape; `aura-session` re-uses them via `aura_model` and adds only the lifecycle manager + error type. Message types live in `channels`, operation types in `job`, and per-module error types replace any shared error enum. Governance types (`TrustLevel`, `ArtifactSource`) also live here as they are consumed by both `tools` and `skills`. Filesystem addresses (`WorkspacePaths`, `IdentityKind`, the workspace-relative filename constants, `AURA_CONFIG_PATH`) live in `aura-workspace::paths`, not here — they are workspace-shaped data, not content primitives.
+`model` retains the data types that are shared by two or more layers (channel, LLM, storage, agent) and cannot naturally belong to any single one — content primitives, cross-cutting domain records, ID newtypes, and protocol shapes. Session/user domain types (`Session`, `User`, `ChannelType`, `SessionState`, `TriggerSource`, `TriggerKind`, `Lineage`, `LineageKind`) live here so every consumer (channels, agent, storage, session manager) shares one shape; `baybo-session` re-uses them via `baybo_model` and adds only the lifecycle manager + error type. Message types live in `channels`, operation types in `job`, and per-module error types replace any shared error enum. Governance types (`TrustLevel`, `ArtifactSource`) also live here as they are consumed by both `tools` and `skills`. Filesystem addresses (`WorkspacePaths`, `IdentityKind`, the workspace-relative filename constants, `BAYBO_CONFIG_PATH`) live in `baybo-workspace::paths`, not here — they are workspace-shaped data, not content primitives.
 
 ### Media by reference, not inline
 
@@ -34,7 +34,7 @@ All `model` types are `Send + Sync + Serialize + Deserialize + Clone`.
 
 ### Memory types
 
-`model` no longer houses memory domain records — the old `MemoryEntry` / `MemoryCategory` CRUD types were removed with the `MemoryManager` facade. What `model` contributes to the new pluggable `Memory` trait (see [`memory.md`](memory.md)) is the recall-injection marker: the `MessageSource::RecalledMemory` variant plus the `ChatMessage::recalled_memory` constructor, so recalled memories ride the transcript as a framed, persisted block rather than a `Role::System` message. The trait, its value types (`MemoryContext`, `RecalledMemory`), and any backend storage live in `aura-memory`, not here.
+`model` no longer houses memory domain records — the old `MemoryEntry` / `MemoryCategory` CRUD types were removed with the `MemoryManager` facade. What `model` contributes to the new pluggable `Memory` trait (see [`memory.md`](memory.md)) is the recall-injection marker: the `MessageSource::RecalledMemory` variant plus the `ChatMessage::recalled_memory` constructor, so recalled memories ride the transcript as a framed, persisted block rather than a `Role::System` message. The trait, its value types (`MemoryContext`, `RecalledMemory`), and any backend storage live in `baybo-memory`, not here.
 
 ## Constraints
 

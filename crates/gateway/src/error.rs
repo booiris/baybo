@@ -10,7 +10,7 @@ pub enum GatewayError {
     #[error("bind to {addr} failed: {reason}")]
     Bind { addr: String, reason: String },
 
-    #[error("auth token not initialized; run `aura gateway enable`")]
+    #[error("auth token not initialized; run `baybo gateway enable`")]
     TokenMissing,
 
     #[error("vault error: {0}")]

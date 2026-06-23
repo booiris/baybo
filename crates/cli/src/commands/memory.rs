@@ -1,19 +1,19 @@
-//! `aura memory` subcommands — inspect / setup / test / disable the
+//! `baybo memory` subcommands — inspect / setup / test / disable the
 //! pluggable memory backend. The API-key value itself rides through
-//! the shared `aura secret add <NAME>` (looking up
+//! the shared `baybo secret add <NAME>` (looking up
 //! `user_env.<NAME>` in the vault).
 //!
 //! Memory config is **not** hot-reload (`reload.rs` classifies it as
 //! non-hot, matching the trait's process-singleton invariant). Each
-//! mutating command prints a `(restart aura to apply this change)` hint
+//! mutating command prints a `(restart baybo to apply this change)` hint
 //! after persisting.
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use aura_config::{AuraConfig, MemoryProvider};
-use aura_memory::backends::{mem0, openviking};
-use aura_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
+use baybo_config::{BayboConfig, MemoryProvider};
+use baybo_memory::backends::{mem0, openviking};
+use baybo_workspace::paths::{ENV_CONFIG_PATH, default_config_file};
 use serde_json::{Value, json};
 
 use crate::cli::MemoryCmd;
@@ -25,7 +25,7 @@ use crate::error::{CliError, Result};
 use crate::format::CommandOutput;
 
 const RESTART_HINT: &str =
-    "\n(restart aura to apply this change — memory config is not hot-reload)";
+    "\n(restart baybo to apply this change — memory config is not hot-reload)";
 
 pub async fn handle(ctx: &CommandContext, cmd: MemoryCmd) -> Result<CommandOutput> {
     match cmd {
@@ -96,7 +96,7 @@ async fn describe_key_status(
             let name = cfg.api_key_name.as_deref().unwrap_or("MEM0_API_KEY");
             match mem0::resolve_api_key(&cfg, ctx.secret_vault.as_deref()).await {
                 Some(k) if !k.is_empty() => format!("set (length {}; key '{name}')", k.len()),
-                _ => format!("MISSING — run `aura secret add {name}` (or set the {name} env var)"),
+                _ => format!("MISSING — run `baybo secret add {name}` (or set the {name} env var)"),
             }
         }
         MemoryProvider::OpenViking => {
@@ -148,7 +148,7 @@ const PROVIDER_CHOICES: &[(MemoryProvider, &str, &str)] = &[
 async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
     require_tty()?;
     let target = resolve_target_path(ctx)?;
-    let mut new_config: AuraConfig = ctx.config.as_ref().clone();
+    let mut new_config: BayboConfig = ctx.config.as_ref().clone();
 
     // Single-select radio list — no typing. Seed the highlight on the
     // currently-configured provider so re-running the wizard with Enter
@@ -189,7 +189,7 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
     // typed default kick in and keeps `extra` JSON tidy (see the
     // `skip_serializing_if` contract on each config struct). The API-key
     // *value* is prompted at the end of the per-provider block and
-    // stored at `user_env.<name>` — the same path `aura secret add`
+    // stored at `user_env.<name>` — the same path `baybo secret add`
     // writes to, so the operator can later rotate/inspect it through
     // the existing secret CLI without learning a memory-specific surface.
     let mut secret_outcome: Option<SecretWriteOutcome> = None;
@@ -218,7 +218,7 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
             // `MEM0_API_KEY` matches the Mem0 docs' env-var convention and
             // covers every realistic deployment. We DO persist the resolved
             // name into `extra.api_key_name` even when it equals the
-            // built-in default — so opening `aura.json` shows the operator
+            // built-in default — so opening `baybo.json` shows the operator
             // exactly which vault entry (`user_env.<NAME>`) and which env
             // var the runtime will resolve at startup. Power users edit
             // this field to use a different name.
@@ -261,7 +261,7 @@ async fn setup(ctx: &CommandContext) -> Result<CommandOutput> {
 
             // Default user-secret name `OPENVIKING_API_KEY`; not asked.
             // Persist the resolved name even when it equals the default
-            // so opening `aura.json` shows where the key lives (same
+            // so opening `baybo.json` shows where the key lives (same
             // rationale as Mem0 above).
             let key_name = cfg
                 .api_key_name
@@ -316,7 +316,7 @@ enum SecretWriteOutcome {
     /// (or env var) — we left it alone.
     Kept { name: String },
     /// User pressed Enter and there was no existing value — point them
-    /// at `aura secret add` so they can set it later.
+    /// at `baybo secret add` so they can set it later.
     Skipped { name: String },
 }
 
@@ -326,7 +326,7 @@ impl SecretWriteOutcome {
             Self::Stored { name } => format!("Stored {name} in vault."),
             Self::Kept { name } => format!("Kept existing {name} (vault or env)."),
             Self::Skipped { name } => format!(
-                "Run `aura secret add {name}` to provide the API key \
+                "Run `baybo secret add {name}` to provide the API key \
                  (or set the {name} env var)."
             ),
         }
@@ -334,7 +334,7 @@ impl SecretWriteOutcome {
 }
 
 /// Prompt the operator for an API-key value, masked, and store it at
-/// `user_env.<name>` — the same vault path `aura secret add` writes to,
+/// `user_env.<name>` — the same vault path `baybo secret add` writes to,
 /// so the value round-trips with the existing secret management surface.
 ///
 /// Empty input leaves the vault untouched. The bracketed label hints
@@ -348,7 +348,7 @@ async fn prompt_and_store_api_key(
     let vault = ctx.secret_vault.as_ref().ok_or_else(|| {
         CliError::Config("secret vault unavailable — run from the workspace root".into())
     })?;
-    let vault_key = format!("{}{name}", aura_security::USER_SECRET_PREFIX);
+    let vault_key = format!("{}{name}", baybo_security::USER_SECRET_PREFIX);
     let already_set = matches!(vault.get_secret(&vault_key).await, Ok(Some(_)));
 
     let label = if already_set {
@@ -399,7 +399,7 @@ async fn test(ctx: &CommandContext) -> Result<CommandOutput> {
             if key.is_empty() {
                 let name = cfg.api_key_name.as_deref().unwrap_or("MEM0_API_KEY");
                 return Err(CliError::Config(format!(
-                    "mem0 API key missing — run `aura secret add {name}` (or set the {name} env var)"
+                    "mem0 API key missing — run `baybo secret add {name}` (or set the {name} env var)"
                 )));
             }
             let proxy = ctx.proxy_settings();
@@ -432,7 +432,7 @@ async fn test(ctx: &CommandContext) -> Result<CommandOutput> {
 
 async fn disable(ctx: &CommandContext) -> Result<CommandOutput> {
     let target = resolve_target_path(ctx)?;
-    let mut new_config: AuraConfig = ctx.config.as_ref().clone();
+    let mut new_config: BayboConfig = ctx.config.as_ref().clone();
     new_config.memory.enabled = false;
     new_config.memory.provider = MemoryProvider::Noop;
     new_config.memory.extra = Value::Null;
@@ -548,8 +548,8 @@ fn require_tty() -> Result<()> {
     Ok(())
 }
 
-impl From<aura_memory::MemoryError> for CliError {
-    fn from(err: aura_memory::MemoryError) -> Self {
+impl From<baybo_memory::MemoryError> for CliError {
+    fn from(err: baybo_memory::MemoryError) -> Self {
         CliError::Config(format!("memory: {err}"))
     }
 }

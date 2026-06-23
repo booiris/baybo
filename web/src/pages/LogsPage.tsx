@@ -225,7 +225,7 @@ export function LogsPage() {
   const handleExport = useCallback(() => {
     const body = JSON.stringify(items, null, 2);
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    triggerDownload(`aura-logs-${stamp}.json`, 'application/json', body);
+    triggerDownload(`baybo-logs-${stamp}.json`, 'application/json', body);
   }, [items]);
 
   const toggleMock = () => {

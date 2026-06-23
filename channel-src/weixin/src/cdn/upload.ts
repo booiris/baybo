@@ -11,7 +11,7 @@
  */
 import crypto from "node:crypto";
 
-import type { Logger } from "@aura/channel-sdk";
+import type { Logger } from "@baybo/channel-sdk";
 
 import { aesEcbPaddedSize } from "./aes-ecb.js";
 import { uploadBufferToCdn } from "./cdn-upload.js";

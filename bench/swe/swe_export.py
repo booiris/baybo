@@ -4,7 +4,7 @@
 Reads a HuggingFace SWE-bench dataset and writes exactly the fields the Rust
 `bench/swe` agent arm needs (`problem_statement` / `repo` / `base_commit`) plus
 the **image key the official grader uses** — obtained from `swebench`'s
-`make_test_spec(...)` with default args, so the agent runs aura in the *same*
+`make_test_spec(...)` with default args, so the agent runs baybo in the *same*
 image grading will build/use. Using the library function (rather than hardcoding
 the `sweb.eval.<arch>.<id>` naming) keeps us version-proof.
 

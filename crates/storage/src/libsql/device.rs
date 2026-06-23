@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use super::LibsqlPool;
-use aura_store::device::{DeviceRow, DeviceStatus, DeviceStore, Result};
-use aura_store::StorageError;
+use baybo_store::StorageError;
+use baybo_store::device::{DeviceRow, DeviceStatus, DeviceStore, Result};
 
 pub struct LibsqlDeviceStore {
     pool: LibsqlPool,
@@ -277,11 +277,12 @@ mod tests {
             .await
             .unwrap();
         // Inert while pending.
-        assert!(s
-            .lookup_approved_by_auth_token("tok1")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            s.lookup_approved_by_auth_token("tok1")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let approved = s.approve_by_code("CODE12", 200).await.unwrap().unwrap();
         assert_eq!(approved.status, DeviceStatus::Approved);
@@ -321,11 +322,12 @@ mod tests {
         let row = s.get("u1", "d1").await.unwrap().unwrap();
         assert_eq!(row.status, DeviceStatus::Revoked);
         assert_eq!(row.auth_token, "tok1", "token slot retained, not reused");
-        assert!(s
-            .lookup_approved_by_auth_token("tok1")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            s.lookup_approved_by_auth_token("tok1")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         // Second revoke is a no-op.
         assert!(!s.revoke("u1", "d1").await.unwrap());
@@ -367,6 +369,9 @@ mod tests {
             .await
             .unwrap();
         s.touch_last_seen("u1", "d1", 555).await.unwrap();
-        assert_eq!(s.get("u1", "d1").await.unwrap().unwrap().last_seen_at, Some(555));
+        assert_eq!(
+            s.get("u1", "d1").await.unwrap().unwrap().last_seen_at,
+            Some(555)
+        );
     }
 }

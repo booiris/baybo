@@ -2,25 +2,25 @@
 //!
 //! Closes the integration seam between the pairing handshake (tested in
 //! `device_pair`) and the content self-pull (tested app-side in
-//! `aura-mobile-core`): a paired+**approved** device's persisted `auth_token`
+//! `baybo-mobile-core`): a paired+**approved** device's persisted `auth_token`
 //! authenticates the scoped channel surface through the full production
 //! middleware stack, while a still-**pending** device is rejected at the same
 //! gate. The post-register content fan-out itself is the exact
 //! `ChannelType`-agnostic `Subscribed`-channel machinery `channel_ws` exercises
-//! over `http`, and the app-side decode is covered by `aura-mobile-core`.
+//! over `http`, and the app-side decode is covered by `baybo-mobile-core`.
 
-use aura_config::ChannelsConfig;
-use aura_gateway::channel::boot;
-use aura_gateway::channel_listener::ChannelServer;
-use aura_gateway::test_support::build_test_deps;
-use aura_store::{DeviceRow, DeviceStatus};
+use baybo_config::ChannelsConfig;
+use baybo_gateway::channel::boot;
+use baybo_gateway::channel_listener::ChannelServer;
+use baybo_gateway::test_support::build_test_deps;
+use baybo_store::{DeviceRow, DeviceStatus};
 use tokio::net::TcpStream;
 use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 fn port_file() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
-    let pf = aura_workspace::WorkspacePaths::new(dir.path().to_path_buf()).channel_port();
+    let pf = baybo_workspace::WorkspacePaths::new(dir.path().to_path_buf()).channel_port();
     (dir, pf)
 }
 
@@ -75,7 +75,9 @@ async fn approved_device_authenticates_channel_ws_upgrade() {
     .expect("bind");
     let port = server.port();
     let server_shutdown = shutdown.clone();
-    let handle = tokio::spawn(async move { let _ = server.run(server_shutdown).await; });
+    let handle = tokio::spawn(async move {
+        let _ = server.run(server_shutdown).await;
+    });
 
     assert!(
         upgrade_accepted(port, "device-auth-token").await,
@@ -108,7 +110,9 @@ async fn pending_device_token_is_rejected_on_channel_ws() {
     .expect("bind");
     let port = server.port();
     let server_shutdown = shutdown.clone();
-    let handle = tokio::spawn(async move { let _ = server.run(server_shutdown).await; });
+    let handle = tokio::spawn(async move {
+        let _ = server.run(server_shutdown).await;
+    });
 
     assert!(
         !upgrade_accepted(port, "pending-token").await,

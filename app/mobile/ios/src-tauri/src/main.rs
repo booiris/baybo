@@ -3,5 +3,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    aura_mobile_app_lib::run()
+    baybo_mobile_app_lib::run()
 }

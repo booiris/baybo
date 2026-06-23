@@ -125,5 +125,5 @@ PY
 # bench viewer's task list reads tiny precomputed counts instead of re-parsing
 # agent traces that can run to hundreds of MB. Incremental + best-effort.
 bench_id="$(basename "$PWD")"
-cargo run -q -p aura-bench-web --bin precompute_tool_counts -- --root .. --bench "$bench_id" \
+cargo run -q -p baybo-bench-web --bin precompute_tool_counts -- --root .. --bench "$bench_id" \
   || echo ">> tool-count precompute skipped (non-fatal); bench/bench-web/run.sh refreshes on launch" >&2

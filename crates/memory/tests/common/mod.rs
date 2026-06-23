@@ -7,12 +7,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_memory::MemoryContext;
-use aura_model::{ChannelType, JobId, SessionId, User};
-use aura_tools::ToolContext;
-use aura_trace::test_support::MemoryTraceStore;
-use aura_trace::{SpanRecorder, StepKind, TraceEventStream};
 use axum::Router;
+use baybo_memory::MemoryContext;
+use baybo_model::{ChannelType, JobId, SessionId, User};
+use baybo_tools::ToolContext;
+use baybo_trace::test_support::MemoryTraceStore;
+use baybo_trace::{SpanRecorder, StepKind, TraceEventStream};
 use tokio::task::JoinHandle;
 
 pub struct TestServer {
@@ -59,7 +59,7 @@ pub fn tool_context(user_id: &str) -> ToolContext {
     ToolContext {
         session_id: SessionId::from("test-session"),
         job_id: JobId::new(),
-        span_id: aura_model::SpanId::default(),
+        span_id: baybo_model::SpanId::default(),
         user: User {
             id: user_id.into(),
             name: Some("tester".into()),
@@ -68,11 +68,11 @@ pub fn tool_context(user_id: &str) -> ToolContext {
         timeout: Duration::from_secs(5),
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         workspace_root: PathBuf::from(&tmp),
-        workspace_paths: aura_workspace::WorkspacePaths::new(tmp),
+        workspace_paths: baybo_workspace::WorkspacePaths::new(tmp),
         sandbox: None,
         approval: None,
         notifier: None,
-        events: aura_tools::noop_event_sink(),
+        events: baybo_tools::noop_event_sink(),
         llm: None,
         secrets: None,
         virtual_reads: None,

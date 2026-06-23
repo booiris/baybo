@@ -88,10 +88,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
     use axum::extract::ws::{Message as AxumMsg, WebSocket, WebSocketUpgrade};
     use axum::response::IntoResponse;
     use axum::routing::get;
-    use axum::Router;
     use parking_lot::Mutex;
     use std::sync::Arc;
     use tokio::net::TcpStream;
@@ -145,9 +145,8 @@ mod tests {
             instance_key: "inst-A".into(),
         };
         let (tx, mut rx) = mpsc::channel(4);
-        let client = tokio::spawn(async move {
-            run_control_connection(&url, stream, &hello, tx).await
-        });
+        let client =
+            tokio::spawn(async move { run_control_connection(&url, stream, &hello, tx).await });
 
         // A receives the OpenDataLeg signal C pushed.
         let sig = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())

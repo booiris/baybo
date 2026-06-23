@@ -85,7 +85,7 @@ export function optimizeToolValue(value: unknown): string {
   return String(value);
 }
 
-/** Strip aura's `<tool_output name="X">…</tool_output>` wrapper from a tool
+/** Strip baybo's `<tool_output name="X">…</tool_output>` wrapper from a tool
  * result string, leaving just the body. No-op when the wrapper is absent. */
 export function stripToolOutputWrapper(content: string): string {
   return content.replace(TOOL_OUTPUT_OPEN, '').replace(TOOL_OUTPUT_CLOSE, '');

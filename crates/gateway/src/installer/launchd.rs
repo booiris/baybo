@@ -3,7 +3,7 @@ use std::process::Command;
 
 use crate::installer::{InstallContext, InstallerError, Result, ServiceInstaller, ServiceStatus};
 
-const LABEL: &str = "com.aura.gateway";
+const LABEL: &str = "com.baybo.gateway";
 
 pub struct LaunchdInstaller;
 
@@ -61,7 +61,7 @@ impl ServiceInstaller for LaunchdInstaller {
             env_block.push_str("    <key>EnvironmentVariables</key>\n    <dict>\n");
             env_block.push_str(&format!(
                 "      <key>{}</key>\n",
-                aura_workspace::paths::ENV_CONFIG_PATH
+                baybo_workspace::paths::ENV_CONFIG_PATH
             ));
             env_block.push_str(&format!("      <string>{}</string>\n", cfg.display()));
             env_block.push_str("    </dict>\n");
@@ -87,9 +87,9 @@ impl ServiceInstaller for LaunchdInstaller {
     <key>ThrottleInterval</key>
     <integer>2</integer>
     <key>StandardOutPath</key>
-    <string>{log}/aura-gateway.out.log</string>
+    <string>{log}/baybo-gateway.out.log</string>
     <key>StandardErrorPath</key>
-    <string>{log}/aura-gateway.err.log</string>
+    <string>{log}/baybo-gateway.err.log</string>
 {env_block}  </dict>
 </plist>
 "#,
@@ -157,9 +157,9 @@ mod tests {
 
     fn ctx() -> InstallContext {
         InstallContext {
-            exec_start: PathBuf::from("/usr/local/bin/aura"),
-            config_path: Some(PathBuf::from("/Users/me/.aura/config/aura.json")),
-            log_dir: PathBuf::from("/Users/me/.aura/logs"),
+            exec_start: PathBuf::from("/usr/local/bin/baybo"),
+            config_path: Some(PathBuf::from("/Users/me/.baybo/config/baybo.json")),
+            log_dir: PathBuf::from("/Users/me/.baybo/logs"),
             user_mode: true,
         }
     }
@@ -168,11 +168,11 @@ mod tests {
     fn render_plist_has_program_arguments_and_env() {
         let inst = LaunchdInstaller::new();
         let body = inst.render_unit(&ctx());
-        assert!(body.contains("<string>com.aura.gateway</string>"));
-        assert!(body.contains("<string>/usr/local/bin/aura</string>"));
+        assert!(body.contains("<string>com.baybo.gateway</string>"));
+        assert!(body.contains("<string>/usr/local/bin/baybo</string>"));
         assert!(body.contains("<string>gateway</string>"));
-        assert!(body.contains("AURA_CONFIG_PATH"));
-        assert!(body.contains("/Users/me/.aura/config/aura.json"));
+        assert!(body.contains("BAYBO_CONFIG_PATH"));
+        assert!(body.contains("/Users/me/.baybo/config/baybo.json"));
         assert!(body.contains("<key>KeepAlive</key>"));
     }
 
@@ -182,6 +182,6 @@ mod tests {
         let mut c = ctx();
         c.config_path = None;
         let body = inst.render_unit(&c);
-        assert!(!body.contains("AURA_CONFIG_PATH"));
+        assert!(!body.contains("BAYBO_CONFIG_PATH"));
     }
 }

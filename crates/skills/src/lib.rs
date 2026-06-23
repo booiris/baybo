@@ -25,7 +25,7 @@ pub use tools::{
 pub const MAX_SKILL_DIR_FILES: usize = 500;
 pub const MAX_SKILL_DIR_BYTES: u64 = 100 * 1024 * 1024;
 
-use aura_model::{ArtifactSource, TrustLevel};
+use baybo_model::{ArtifactSource, TrustLevel};
 use serde::{Deserialize, Serialize};
 
 /// A declarative skill definition.

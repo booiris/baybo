@@ -5,14 +5,14 @@
 //! renders against a real terminal.
 //!
 //! It stands up an in-process stub gateway that speaks just enough of
-//! `aura_channels::wire` to get the TUI talking — `RegisterAck`, an empty
+//! `baybo_channels::wire` to get the TUI talking — `RegisterAck`, an empty
 //! `HistorySnapshot`, then a scripted response per user message — and
 //! connects a real [`WsTransport`] to it driving the real [`TuiAdapter`].
 //! No gateway, agent, or LLM is involved; the UI plumbing under test is
 //! exactly the production path.
 //!
 //! The stub dispatches on the typed message (see
-//! [`aura_tui::smoke_contract`]): `tool`, `subagent`, `approval`, `task`,
+//! [`baybo_tui::smoke_contract`]): `tool`, `subagent`, `approval`, `task`,
 //! or — for anything else — a plain streamed echo. This lets the render
 //! test exercise tool-call lines, the approval modal, and the
 //! TaskList-is-dropped contract from a real terminal.
@@ -24,13 +24,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::MessageRole;
-use aura_channels::wire::{self, Frame, Message};
-use aura_model::ResourceAccess;
-use aura_model::{ChannelType, SessionId};
-use aura_tui::TuiAdapter;
-use aura_tui::client::WsTransport;
-use aura_tui::smoke_contract::*;
+use baybo_channels::MessageRole;
+use baybo_channels::wire::{self, Frame, Message};
+use baybo_model::ResourceAccess;
+use baybo_model::{ChannelType, SessionId};
+use baybo_tui::TuiAdapter;
+use baybo_tui::client::WsTransport;
+use baybo_tui::smoke_contract::*;
 use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
@@ -195,7 +195,7 @@ fn task_list(sid: &SessionId) -> Frame {
     Frame::TaskList {
         session_id: sid.clone(),
         user_id: String::new(),
-        tasks: vec![aura_channels::wire::TaskView {
+        tasks: vec![baybo_channels::wire::TaskView {
             id: "t1".to_string(),
             subject: TASK_SUBJECT.to_string(),
             status: "in_progress".to_string(),

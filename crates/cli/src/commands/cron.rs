@@ -1,4 +1,4 @@
-use aura_cron::CronJob;
+use baybo_cron::CronJob;
 use serde_json::{Value, json};
 
 use crate::cli::CronCmd;
@@ -13,7 +13,7 @@ pub async fn handle(ctx: &CommandContext, cmd: CronCmd) -> Result<CommandOutput>
     }
 }
 
-fn cron(ctx: &CommandContext) -> Result<&aura_agent::CronScheduler> {
+fn cron(ctx: &CommandContext) -> Result<&baybo_agent::CronScheduler> {
     ctx.cron.as_deref().ok_or_else(|| {
         CliError::Manager("cron scheduler is not available in this invocation".into())
     })
