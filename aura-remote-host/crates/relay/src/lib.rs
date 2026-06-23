@@ -12,5 +12,7 @@
 //! [`RelayLeg`]) layers on top.
 
 pub mod broker;
+pub mod control;
 
 pub use broker::{RelayBroker, RelayLeg};
+pub use control::{ControlRegistry, ControlSignal};
