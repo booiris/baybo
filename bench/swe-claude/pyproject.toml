@@ -1,0 +1,21 @@
+# Persistent, uv-managed Python environment for the SWE-bench **claude arm**:
+# a Claude-style agent (the genuine Anthropic Messages API + tool_use scaffold,
+# via the `anthropic` SDK) driving deepseek-v4-flash through a litellm
+# `/v1/messages` -> deepseek proxy, graded by the official `swebench` harness.
+# `uv sync` provisions a pinned CPython + a reused on-disk `.venv` here — never
+# `pip install` into the system interpreter. Deps-only env (`package = false`).
+[project]
+name = "aura-bench-swe-claude-pytools"
+version = "0.0.0"
+description = "SWE-bench claude arm: Anthropic tool_use agent on ds4-flash (litellm proxy), official swebench grader."
+# swebench's stack (datasets/pyarrow/...) lags the newest CPython.
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "anthropic",
+    "litellm[proxy]",
+    "swebench",
+    "datasets",
+]
+
+[tool.uv]
+package = false

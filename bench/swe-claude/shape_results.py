@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-"""Shape a mini-swe-agent SWE-bench run + the official swebench grade into the
+"""Shape a claude-arm SWE-bench run + the official swebench grade into the
 same results JSON schema as `bench/swe` (so it's directly comparable and can
-feed bench-web), and print a baseline-vs-aura comparison.
+feed bench-web), and print a claude-vs-aura comparison.
 
 Inputs (under <runs-dir>/<run-id>/): `preds.json` (mini's predictions, dict
 keyed by instance_id), the harness report `<model_sanitized>.<run-id>.json`,
@@ -122,6 +122,10 @@ def main():
     ap.add_argument("--agent-results", default="")  # aura results JSON for comparison
     a = ap.parse_args()
 
+    # cost = tokens * (USD per 1M tokens), which is numerically micro-USD per token.
+    # Default 0 (tokens reported, cost left 0 until a price is supplied).
+    price_in = float(os.environ.get("PRICE_IN_PER_MTOK", "0"))
+    price_out = float(os.environ.get("PRICE_OUT_PER_MTOK", "0"))
     sanitized = a.model.replace("/", "__")
     run_dir = os.path.join(a.runs_dir, a.run_id)
     preds = json.load(open(os.path.join(run_dir, "preds.json")))
@@ -140,6 +144,10 @@ def main():
             resolved, errored = bool(rec.get("resolved")), False
         else:                                    # no per-instance report => summary fallback
             resolved, errored = iid in resolved_ids, iid in error_ids
+        pe = preds[iid]
+        itok, otok = pe.get("input_tokens", 0), pe.get("output_tokens", 0)
+        cached = pe.get("cache_read_input_tokens", 0)
+        cost = int((itok + cached) * price_in + otok * price_out)
         results.append({
             "instance_id": iid,
             "repo": repo_of(iid),
@@ -147,25 +155,30 @@ def main():
             "empty_patch": (iid in empty_ids) or (patch.strip() == ""),
             "errored": errored,
             "patch_bytes": len(patch.encode()),
-            "latency_ms": 0, "input_tokens": 0, "output_tokens": 0,
-            "cached_input_tokens": 0, "cost_micro_usd": 0, "error": None,
+            "latency_ms": 0, "input_tokens": itok, "output_tokens": otok,
+            "cached_input_tokens": cached, "cost_micro_usd": cost, "error": None,
+            "n_turns": pe.get("n_turns", 0),
             "failure_reason": failure_reason(inst_dir, iid, rec),
         })
 
     n = len(results)
     nres = sum(r["resolved"] for r in results)
+    tin = sum(r["input_tokens"] for r in results)
+    tout = sum(r["output_tokens"] for r in results)
+    tcached = sum(r["cached_input_tokens"] for r in results)
+    tcost = sum(r["cost_micro_usd"] for r in results)
     doc = {
-        "run_id": a.run_id, "dataset": a.dataset_name, "arm": "baseline",
-        "model": a.model, "mean_latency_ms": 0, "input_tokens": 0,
-        "output_tokens": 0, "cached_input_tokens": 0, "total_cost_micro_usd": 0,
+        "run_id": a.run_id, "dataset": a.dataset_name, "arm": "claude",
+        "model": a.model, "mean_latency_ms": 0, "input_tokens": tin,
+        "output_tokens": tout, "cached_input_tokens": tcached, "total_cost_micro_usd": tcost,
         "resolved": nres, "total_instances": n,
         "resolved_rate": (nres / n) if n else 0.0, "results": results,
     }
     os.makedirs(a.results_dir, exist_ok=True)
-    out = os.path.join(a.results_dir, f"results-baseline-{a.run_id}.json")
+    out = os.path.join(a.results_dir, f"results-claude-{a.run_id}.json")
     json.dump(doc, open(out, "w"), indent=2)
     # latest pointer
-    latest = os.path.join(a.results_dir, "latest-baseline.json")
+    latest = os.path.join(a.results_dir, "latest-claude.json")
     try:
         os.path.islink(latest) and os.unlink(latest)
         os.symlink(os.path.basename(out), latest)
@@ -177,7 +190,7 @@ def main():
     for r in results:
         byrepo[r["repo"]][1] += 1
         byrepo[r["repo"]][0] += r["resolved"]
-    print(f"\n=== BASELINE (mini-swe-agent + {a.model}) — run {a.run_id} ===")
+    print(f"\n=== CLAUDE (anthropic tool_use agent + {a.model}) — run {a.run_id} ===")
     print(f"resolved {nres}/{n} = {100*nres/n:.1f}%" if n else "no instances")
     print("by repo:")
     for repo, (rr, tt) in sorted(byrepo.items(), key=lambda kv: -kv[1][1]):
@@ -189,13 +202,13 @@ def main():
         overlap = [r["instance_id"] for r in results if r["instance_id"] in ares]
         b_ok = sum(1 for i in overlap if next(r for r in results if r["instance_id"] == i)["resolved"])
         a_ok = sum(1 for i in overlap if ares[i].get("resolved"))
-        print(f"\n=== AURA vs BASELINE (on {len(overlap)} shared instances) ===")
+        print(f"\n=== AURA vs CLAUDE (on {len(overlap)} shared instances) ===")
         print(f"  aura     : {a_ok}/{len(overlap)} = {100*a_ok/len(overlap):.1f}%")
-        print(f"  baseline : {b_ok}/{len(overlap)} = {100*b_ok/len(overlap):.1f}%")
+        print(f"  claude   : {b_ok}/{len(overlap)} = {100*b_ok/len(overlap):.1f}%")
         # head-to-head
         only_a = [i for i in overlap if ares[i].get("resolved") and not next(r for r in results if r["instance_id"] == i)["resolved"]]
         only_b = [i for i in overlap if not ares[i].get("resolved") and next(r for r in results if r["instance_id"] == i)["resolved"]]
-        print(f"  aura-only solves: {len(only_a)}   baseline-only solves: {len(only_b)}")
+        print(f"  aura-only solves: {len(only_a)}   claude-only solves: {len(only_b)}")
 
     print(f"\nwrote {out}")
 
