@@ -462,6 +462,27 @@ async fn start(config: Arc<AuraConfig>) -> anyhow::Result<()> {
         }));
     }
 
+    // Blind remote-host push: on every completed real user turn, encrypt a
+    // per-device preview and POST it to the remote host (C). Off unless the
+    // `push` block is configured.
+    if graph.config.gateway.push.enabled {
+        let push_cfg = &graph.config.gateway.push;
+        let dispatcher = Arc::new(aura_gateway::push::PushDispatcher::new(
+            graph.stores.device.clone(),
+            graph.stores.session.clone(),
+            Arc::clone(&graph.session_manager),
+            Arc::clone(&graph.secret_vault),
+            Arc::new(aura_gateway::push::HttpNotifySink::new(&push_cfg.gateway_url)),
+            push_cfg.instance_key.clone(),
+        ));
+        let push_shutdown = shutdown.clone();
+        task_tracker.track(aura_gateway::push::spawn(
+            dispatcher,
+            Arc::clone(&graph.job_lifecycle),
+            async move { push_shutdown.wait().await },
+        ));
+    }
+
     // Build the axum server from the assembled graph.
     let deps = GatewayDeps {
         config: Arc::clone(&graph.config),

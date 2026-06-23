@@ -108,6 +108,13 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: PairCmd,
     },
+    /// Manage iOS-companion device pairings: `pair <label>` (mint a QR
+    /// pairing code), `approve <code>`, `list` (pending/approved), and
+    /// `revoke <user> <device>`.
+    Device {
+        #[command(subcommand)]
+        cmd: DeviceCmd,
+    },
     /// Manage LLM provider entries in `aura.json`: `status` (which
     /// entries are registered), `probe [name]` (round-trip a tiny
     /// chat to verify auth + connectivity), `live-model [name]`
@@ -526,6 +533,44 @@ pub enum TrustLevelArg {
     Trusted,
     Installed,
     Untrusted,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DeviceCmd {
+    /// Mint a pairing code + slot for a new device. The code is rendered as
+    /// a QR the iOS app scans to start SPAKE2; it expires in 15 minutes.
+    Pair {
+        /// Device label for the operator's list ("Booiris iPhone").
+        label: String,
+        /// Owning user id. Defaults to the local operator.
+        #[arg(long, default_value = "local")]
+        user: String,
+    },
+    /// Approve a pending device by its pairing code, activating its (until
+    /// now inert) auth token.
+    Approve {
+        /// Pairing code from `aura device pair`.
+        code: String,
+    },
+    /// List registered devices. With no flag, shows every row; pass
+    /// `--pending` or `--approved` to restrict.
+    List {
+        #[arg(long, conflicts_with = "approved")]
+        pending: bool,
+        #[arg(long)]
+        approved: bool,
+    },
+    /// Revoke a device. The row + token slot are retained for audit (the
+    /// token simply stops authenticating).
+    Revoke {
+        /// Owning user id.
+        user_id: String,
+        /// Device id.
+        device_id: String,
+        /// Confirm the destructive action (required in slash mode).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

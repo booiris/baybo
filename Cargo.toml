@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/model",
     "crates/channels",
+    "crates/aura-wire",
+    "crates/aura-device-proto",
     "crates/llm",
     "crates/tools",
     "crates/workspace",
@@ -36,7 +38,7 @@ members = [
     "bench/swe",
     "bench/bench-web",
 ]
-exclude = ["crates/security/fuzz"]
+exclude = ["crates/security/fuzz", "aura-remote-host", "app/mobile/ios"]
 
 [workspace.package]
 version = "0.1.0"
@@ -47,6 +49,8 @@ license = "MIT"
 # Internal crates
 aura-model = { path = "crates/model" }
 aura-channels = { path = "crates/channels" }
+aura-wire = { path = "crates/aura-wire" }
+aura-device-proto = { path = "crates/aura-device-proto" }
 aura-llm = { path = "crates/llm" }
 aura-tools = { path = "crates/tools" }
 aura-workspace = { path = "crates/workspace", default-features = false }
@@ -107,6 +111,13 @@ hmac = "0.12"
 hkdf = "0.12"
 aes-gcm = "0.10"
 rand = "0.10"
+# Device-pairing + E2E secure channel (aura-device-proto, shared by the
+# gateway and the iOS companion's core). SPAKE2 over the rendezvous, Noise
+# for the session, ChaCha20-Poly1305 for the lock-screen-preview framing the
+# iOS NSE decrypts with CryptoKit. All cross-compile to aarch64-apple-ios.
+snow = "0.9"
+spake2 = "0.4"
+chacha20poly1305 = "0.10"
 # Local-only — never connects to a remote turso/libsql server, so we
 # drop default features (`replication`, `remote`, `sync`, `tls`) that
 # would pull in hyper-rustls + an old rustls/webpki tree.
@@ -220,6 +231,7 @@ aura-task = { workspace = true }
 aura-config = { workspace = true }
 aura-cli = { workspace = true }
 aura-gateway = { workspace = true }
+aura-pairing = { workspace = true }
 aura-setup = { workspace = true }
 aura-tui = { workspace = true }
 tokio = { workspace = true }

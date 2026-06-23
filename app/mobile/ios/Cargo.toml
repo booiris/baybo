@@ -1,0 +1,24 @@
+# iOS companion ("P" in the mobile design) — a SEPARATE Cargo workspace (the
+# root `[workspace]` excludes it) so the host `cargo clippy --all` gate never
+# tries to build an iOS/Tauri-configured crate for the host. It path-depends on
+# the two shared crates (`aura-wire`, `aura-device-proto`), which are the
+# single source of truth for the wire protocol + crypto — interop with the
+# gateway is guaranteed by construction.
+#
+# `core/` (aura-mobile-core) is FFI-free and host-testable; the Tauri shell
+# (src-tauri) and the NSE target layer on top later. See
+# docs/todo/mobile/phase1.md.
+[workspace]
+resolver = "2"
+members = ["core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+aura-wire = { path = "../../../crates/aura-wire" }
+aura-device-proto = { path = "../../../crates/aura-device-proto" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"

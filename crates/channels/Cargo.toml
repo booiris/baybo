@@ -7,16 +7,17 @@ edition.workspace = true
 doctest = false
 
 [features]
-# Emits ts-rs-generated TypeScript definitions for `Message` / `Frame`
-# into `sdks/channel-ts/src/generated/`. Kept behind a feature so CI /
-# release builds don't depend on ts-rs. The embedded
-# `aura_model::ChannelType` is emitted as plain `string` via a
-# field-level `#[ts(type = "string")]` override so ts-rs doesn't
-# chase the domain crate.
-ts-export = ["dep:ts-rs", "aura-model/ts-export"]
+# Emits ts-rs-generated TypeScript definitions for the registration-wire
+# types (`PromptKind` / `RegisterIn` / `RegisterOut`) into
+# `sdks/channel-ts/src/generated/`. The `Frame` / `Message` wire types now
+# live in `aura-wire` and carry their own `ts-export`; this feature covers
+# only the types still defined in this crate. Kept behind a feature so CI /
+# release builds don't depend on ts-rs.
+ts-export = ["dep:ts-rs"]
 
 [dependencies]
 aura-model = { workspace = true }
+aura-wire = { workspace = true }
 aura-tools = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }

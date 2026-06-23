@@ -36,6 +36,7 @@ aura-context = { workspace = true }
 aura-config = { workspace = true }
 aura-cron = { workspace = true }
 aura-cost = { workspace = true }
+aura-device-proto = { workspace = true }
 aura-job = { workspace = true }
 aura-llm = { workspace = true }
 aura-model = { workspace = true }
@@ -69,6 +70,8 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true, features = ["ws"] }
 libc = { workspace = true }

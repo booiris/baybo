@@ -4,6 +4,8 @@ mod channel_pairing;
 mod channel_session;
 mod cost;
 mod cron;
+mod device;
+mod device_pairing;
 mod job;
 mod secret;
 mod session;
@@ -20,6 +22,8 @@ pub use channel_pairing::LibsqlChannelPairingStore;
 pub use channel_session::LibsqlChannelSessionStore;
 pub use cost::LibsqlCostStore;
 pub use cron::LibsqlCronStore;
+pub use device::LibsqlDeviceStore;
+pub use device_pairing::LibsqlDevicePairingStore;
 pub use job::LibsqlJobStore;
 pub use secret::LibsqlSecretStore;
 pub use session::LibsqlSessionStore;
@@ -505,7 +509,31 @@ impl LibsqlPool {
                     PRIMARY KEY (channel_type, bot_id, user_id)
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_pairings_code
-                    ON channel_pairings(code);",
+                    ON channel_pairings(code);
+
+                CREATE TABLE IF NOT EXISTS devices (
+                    user_id       TEXT    NOT NULL,
+                    device_id     TEXT    NOT NULL,
+                    label         TEXT    NOT NULL,
+                    device_pubkey BLOB    NOT NULL,
+                    auth_token    TEXT    NOT NULL,
+                    status        TEXT    NOT NULL,
+                    pairing_code  TEXT,
+                    created_at    INTEGER NOT NULL,
+                    approved_at   INTEGER,
+                    last_seen_at  INTEGER,
+                    PRIMARY KEY (user_id, device_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_auth_token
+                    ON devices(auth_token);
+
+                CREATE TABLE IF NOT EXISTS device_pairings (
+                    code        TEXT    PRIMARY KEY,
+                    user_id     TEXT    NOT NULL,
+                    label       TEXT    NOT NULL,
+                    created_at  INTEGER NOT NULL,
+                    expires_at  INTEGER NOT NULL
+                );",
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize libsql schema: {e}"))?;

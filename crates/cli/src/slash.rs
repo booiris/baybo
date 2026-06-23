@@ -6,8 +6,8 @@ use aura_model::ContentBlock;
 use clap::{CommandFactory, Parser};
 
 use crate::cli::{
-    ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, ExternalAgentCmd, JobCmd, LlmCmd,
-    LogCmd, McpCmd, PairCmd, SecretCmd, SessionCmd, SkillsCmd,
+    ChannelCmd, Cli, Commands, ConfigCmd, CostCmd, CronCmd, DeviceCmd, ExternalAgentCmd, JobCmd,
+    LlmCmd, LogCmd, McpCmd, PairCmd, SecretCmd, SessionCmd, SkillsCmd,
 };
 use crate::context::{CommandContext, Invocation};
 use crate::dispatch;
@@ -81,6 +81,7 @@ impl CliSlashHandler {
             skill_assessor: self.ctx.skill_assessor.clone(),
             channel_bot_store: self.ctx.channel_bot_store.clone(),
             channel_pairing_store: self.ctx.channel_pairing_store.clone(),
+            device_pairing_service: self.ctx.device_pairing_service.clone(),
             secret_vault: self.ctx.secret_vault.clone(),
             format,
             invocation: Invocation::Slash,
@@ -311,6 +312,12 @@ fn slash_admissible(cmd: &Commands) -> Result<(), &'static str> {
         },
         Commands::Pair { cmd } => match cmd {
             PairCmd::List { .. } | PairCmd::Approve { .. } | PairCmd::Revoke { .. } => Ok(()),
+        },
+        Commands::Device { cmd } => match cmd {
+            DeviceCmd::Pair { .. }
+            | DeviceCmd::Approve { .. }
+            | DeviceCmd::List { .. }
+            | DeviceCmd::Revoke { .. } => Ok(()),
         },
         Commands::Llm {
             cmd: LlmCmd::Status | LlmCmd::Probe { .. } | LlmCmd::LiveModel { .. },

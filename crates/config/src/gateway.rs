@@ -34,6 +34,41 @@ pub struct GatewayConfig {
     /// Seconds the process waits for graceful shutdown before the
     /// force-exit watchdog kicks in.
     pub shutdown_grace_secs: u64,
+    /// Direct-reachability advertisement for paired iOS devices. The app
+    /// tries these endpoints before falling back to the operator relay, so
+    /// the common "phone + server on the same network" case stays off the
+    /// relay. Handed to the device inside the SPAKE2 K-channel at pairing
+    /// (`GatewayWelcome.direct_candidates`).
+    pub direct: DirectConfig,
+    /// Blind remote-host push: when enabled, A POSTs an operator-encrypted
+    /// lock-screen preview to the remote host (C) on every real user turn.
+    pub push: PushConfig,
+}
+
+/// A-side direct-reachability config (the `direct` block in `aura.json`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct DirectConfig {
+    /// When false, no direct candidates are advertised — pairing devices fall
+    /// straight to the relay.
+    pub enabled: bool,
+    /// Endpoints A is reachable at directly (LAN / Tailscale / reverse proxy),
+    /// e.g. `["wss://aura.lan:8889", "wss://aura.tailnet.ts.net:8889"]`.
+    pub advertise: Vec<String>,
+}
+
+/// A-side push config (the `push` block in `aura.json`). A holds only the
+/// remote-host URL + its per-instance admission key — never the `.p8`, which
+/// lives solely in C.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct PushConfig {
+    /// When false, no push dispatcher runs.
+    pub enabled: bool,
+    /// The remote host's base URL, e.g. `https://remote.aura.example`.
+    pub gateway_url: String,
+    /// Per-instance admission key C validates on every `/notify`.
+    pub instance_key: String,
 }
 
 impl Default for GatewayConfig {
@@ -44,6 +79,8 @@ impl Default for GatewayConfig {
             port: 8888,
             cors_allowed_origins: Vec::new(),
             shutdown_grace_secs: 30,
+            direct: DirectConfig::default(),
+            push: PushConfig::default(),
         }
     }
 }

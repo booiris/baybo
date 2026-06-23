@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use aura_agent::SessionManager;
 use aura_channels::{ChannelRegistry, RouterInbound};
-use aura_pairing::PairingService;
+use aura_pairing::{DevicePairingService, PairingService};
 use aura_security::SecretVault;
 use aura_store::{BlobStore, ChannelBotStore, TaskStore};
 
@@ -79,6 +79,15 @@ pub struct WsChannelState {
     /// triples get a short code back via [`aura_channels::wire::Frame::Notice`]
     /// and their message is dropped. See `docs/modules/pairing.md`.
     pub pairing: Arc<PairingService>,
+    /// iOS-companion device pairing: mints/claims SPAKE2 slots and finalizes a
+    /// completed handshake into a pending device row. Drives the token-free
+    /// `/v1/device/pair` WS route (A's static Noise key is loaded lazily from
+    /// `secret_vault` per handshake).
+    pub device_pairing: Arc<DevicePairingService>,
+    /// Direct-reachability endpoints handed to a pairing device inside the
+    /// SPAKE2 K-channel (`GatewayWelcome.direct_candidates`). Empty when
+    /// `gateway.direct.enabled` is false.
+    pub device_direct_candidates: Vec<String>,
     /// Backing store for non-text media. Sidecars upload via
     /// `POST /v1/blobs`, the agent emits replies that reference blobs
     /// the gateway already has, and `GET /v1/blobs/{id}` lets sidecars
@@ -114,6 +123,16 @@ impl WsChannelState {
             deps.stores.channel_session.clone(),
         ));
         let pairing = Arc::new(PairingService::new(deps.stores.channel_pairing.clone()));
+        let device_pairing = Arc::new(DevicePairingService::new(
+            deps.stores.device_pairing.clone(),
+            deps.stores.device.clone(),
+        ));
+        let direct = &deps.config.gateway.direct;
+        let device_direct_candidates = if direct.enabled {
+            direct.advertise.clone()
+        } else {
+            Vec::new()
+        };
         Self {
             registry: Arc::clone(&deps.channel_registry),
             incoming_tx: deps.incoming_tx.clone(),
@@ -128,6 +147,8 @@ impl WsChannelState {
             secret_vault: Arc::clone(&deps.secret_vault),
             bot_reconciler: Arc::clone(&deps.bot_reconciler),
             pairing,
+            device_pairing,
+            device_direct_candidates,
             blob_store: deps.stores.blob.clone(),
             task_store: deps.stores.task.clone(),
             job_lifecycle: Arc::clone(&deps.job_lifecycle),

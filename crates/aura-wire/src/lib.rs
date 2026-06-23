@@ -1,6 +1,14 @@
 //! Wire protocol shared by the gateway channel server and every
 //! channel client.
 //!
+//! These are the **pure wire types** — `Frame`, `Message`, `MessageRole`,
+//! the attachment / folder / task projections — plus the MessagePack codec.
+//! They were extracted from `aura-channels` into their own crate so the iOS
+//! companion's `aura-mobile-core` can speak the exact same protocol without
+//! pulling `aura-channels → aura-tools → { libsql, axum, reqwest, … }`, a
+//! chain that cannot cross-compile to iOS. `aura-channels` re-exports this
+//! crate as its `wire` module, so server-side consumers are unchanged.
+//!
 //! After the Channel / Connection / Subscription refactor a Register
 //! frame only names the channel a connection serves; per-session
 //! routing is expressed by explicit `Subscribe` / `Unsubscribe` frames
@@ -9,17 +17,33 @@
 //! entirely and see every session of their channel type.
 //!
 //! Consumers: the TypeScript SDK at `sdks/channel-ts/`, the built-in
-//! TUI's WS client, and (forthcoming) the web chat page. All speak the
+//! TUI's WS client, the web chat page, and the iOS companion. All speak the
 //! types below verbatim, both encode/decode via MessagePack with named
 //! fields.
 
-use aura_model::{ChannelType, ResourceAccess, SessionId};
-use aura_tools::ApprovalDecision;
+use aura_model::{ApprovalDecision, ChannelType, ResourceAccess, SessionId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::types::MessageRole;
+/// Role discriminator on a [`Message`].
+///
+/// In-tree producers always set this explicitly: the agent emits
+/// `Assistant`, sidecars and inbound echo emit `User`. Default is
+/// `Assistant` so a wire frame that omits the field decodes as an
+/// agent reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(export, export_to = "../../../sdks/channel-ts/src/generated/")
+)]
+pub enum MessageRole {
+    User,
+    #[default]
+    Assistant,
+}
 
 /// Error surface for frame encode/decode.
 #[derive(Debug, Error)]

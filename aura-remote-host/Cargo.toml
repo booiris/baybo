@@ -1,0 +1,35 @@
+# Operator-run shared infrastructure ("C" in the mobile-companion design).
+#
+# A SEPARATE Cargo workspace (the root `[workspace]` excludes it) so it
+# deploys independently of the `aura` binary and keeps the `.p8`-holding push
+# role isolatable. C is **blind**: it relays operator-encrypted preview blobs
+# and Noise ciphertext, never plaintext, so it deliberately does NOT depend on
+# any `aura-*` crate — the `/notify` payload is agreed by its JSON contract.
+#
+# See docs/mobile-remote-host.md and docs/todo/mobile/phase1.md.
+[workspace]
+resolver = "2"
+members = ["crates/push", "crates/relay"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+axum = "0.8"
+reqwest = { version = "0.13", features = ["json"] }
+# ES256 provider-token signing for APNs (the `.p8` is a PKCS#8 P-256 key).
+jsonwebtoken = "9"
+tower = { version = "0.5", features = ["util"] }
+parking_lot = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"

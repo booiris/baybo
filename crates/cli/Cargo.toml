@@ -23,6 +23,7 @@ aura-gateway = { workspace = true }
 aura-cron = { workspace = true }
 aura-cost = { workspace = true }
 aura-job = { workspace = true }
+aura-pairing = { workspace = true }
 aura-query = { workspace = true }
 aura-skills = { workspace = true }
 aura-skills-assessor = { workspace = true }

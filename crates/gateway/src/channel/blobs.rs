@@ -92,6 +92,12 @@ async fn authorize_upload(
         AuthedClient::Tui | AuthedClient::Tool { .. } | AuthedClient::Web { .. } => {
             UploadAuth::Bypass
         }
+        // iOS devices are receive-only in phase 1 — they self-pull threads and
+        // download attachments, but never upload.
+        AuthedClient::Device { .. } => UploadAuth::Reject(
+            StatusCode::FORBIDDEN,
+            "device tokens are receive-only and may not upload",
+        ),
         AuthedClient::Subprocess {
             channel_type: None, ..
         } => UploadAuth::Reject(

@@ -6,7 +6,9 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::JobStatus;
 use crate::cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
-use crate::{CancelReason, Job, JobError, JobInput, JobShape, JobStatusKind, JobTransition};
+use crate::{
+    CancelReason, Job, JobError, JobInput, JobInputKind, JobShape, JobStatusKind, JobTransition,
+};
 use aura_model::{JobId, SessionId, SpanId, TriggerKind};
 use aura_store::JobStore;
 use tokio::sync::broadcast;
@@ -67,6 +69,14 @@ pub struct JobLifecycleEvent {
     pub session_id: SessionId,
     pub parent_job_id: Option<JobId>,
     pub phase: JobPhase,
+    /// Input class of the job (additive; the turn-state projector ignores it).
+    /// Lets the push dispatcher filter to real user turns
+    /// (`shape == Turn && kind == UserChat`) without re-fetching the Job.
+    pub kind: JobInputKind,
+    /// Execution shape of the job (additive). Pairs with `kind` so a
+    /// `/compact` — a `UserChat`-input but `Maintenance`-shape job — is
+    /// correctly excluded from push.
+    pub shape: JobShape,
 }
 
 /// Owns the job state machine + persistence orchestration. Pure
@@ -407,6 +417,8 @@ impl JobLifecycle {
             session_id: job.session_id.clone(),
             parent_job_id: job.parent_job_id,
             phase,
+            kind: job.input_kind(),
+            shape: job.shape,
         };
         self.persist(job, transition).await?;
         let _ = self.lifecycle_events.send(event);

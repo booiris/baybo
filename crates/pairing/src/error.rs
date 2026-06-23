@@ -1,5 +1,17 @@
 use thiserror::Error;
 
+/// Error surface for the iOS-companion device-pairing flow. Unlike
+/// [`PairingError`] (whose store returns `String`), the device stores return a
+/// typed [`aura_store::StorageError`], so it threads through directly.
+#[derive(Debug, Error)]
+pub enum DevicePairingError {
+    #[error("storage: {0}")]
+    Storage(#[from] aura_store::StorageError),
+
+    #[error("code: {0}")]
+    Code(#[from] crate::code::CodeError),
+}
+
 #[derive(Debug, Error)]
 pub enum PairingError {
     /// Any failure from the persistence layer. Carried as a string so

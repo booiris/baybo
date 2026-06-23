@@ -11,9 +11,11 @@
 //! See `docs/modules/pairing.md` for the full design.
 
 mod code;
+mod device_service;
 mod error;
 mod service;
 
 pub use code::{CODE_LEN, CodeError, generate_code};
-pub use error::PairingError;
+pub use device_service::DevicePairingService;
+pub use error::{DevicePairingError, PairingError};
 pub use service::{CheckOutcome, PairingService};

@@ -176,3 +176,168 @@ fn split_id(blob_id: &str) -> BlobResult<(&str, &str)> {
     let (hex, token) = hex_all.split_once('.').unwrap_or((hex_all, ""));
     Ok((hex, token))
 }
+
+// ---------------------------------------------------------------------------
+// Device registry + pairing-slot fakes (used by `aura-pairing` service tests)
+// ---------------------------------------------------------------------------
+
+use aura_store::device::{DeviceRow, DeviceStatus, DeviceStore, Result as DeviceResult};
+use aura_store::device_pairing::{
+    DevicePairingSlot, DevicePairingStore, Result as SlotResult,
+};
+
+/// In-memory [`DeviceStore`] keyed by `(user_id, device_id)`.
+#[derive(Default)]
+pub struct MemoryDeviceStore {
+    rows: Mutex<HashMap<(String, String), DeviceRow>>,
+}
+
+impl MemoryDeviceStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl DeviceStore for MemoryDeviceStore {
+    async fn create(&self, row: &DeviceRow) -> DeviceResult<()> {
+        let mut g = self.rows.lock();
+        let key = (row.user_id.clone(), row.device_id.clone());
+        if g.contains_key(&key) || g.values().any(|r| r.auth_token == row.auth_token) {
+            return Err(StorageError::Conflict("device or auth_token exists".into()));
+        }
+        g.insert(key, row.clone());
+        Ok(())
+    }
+
+    async fn get(&self, user_id: &str, device_id: &str) -> DeviceResult<Option<DeviceRow>> {
+        Ok(self
+            .rows
+            .lock()
+            .get(&(user_id.to_string(), device_id.to_string()))
+            .cloned())
+    }
+
+    async fn lookup_approved_by_auth_token(
+        &self,
+        auth_token: &str,
+    ) -> DeviceResult<Option<DeviceRow>> {
+        Ok(self
+            .rows
+            .lock()
+            .values()
+            .find(|r| r.auth_token == auth_token && r.status == DeviceStatus::Approved)
+            .cloned())
+    }
+
+    async fn list(&self, status: Option<DeviceStatus>) -> DeviceResult<Vec<DeviceRow>> {
+        Ok(sorted_desc(
+            self.rows
+                .lock()
+                .values()
+                .filter(|r| status.is_none_or(|s| r.status == s))
+                .cloned(),
+        ))
+    }
+
+    async fn list_for_user(
+        &self,
+        user_id: &str,
+        status: Option<DeviceStatus>,
+    ) -> DeviceResult<Vec<DeviceRow>> {
+        Ok(sorted_desc(
+            self.rows
+                .lock()
+                .values()
+                .filter(|r| r.user_id == user_id && status.is_none_or(|s| r.status == s))
+                .cloned(),
+        ))
+    }
+
+    async fn approve_by_code(&self, code: &str, now: i64) -> DeviceResult<Option<DeviceRow>> {
+        let mut g = self.rows.lock();
+        let Some(row) = g.values_mut().find(|r| {
+            r.pairing_code.as_deref() == Some(code) && r.status == DeviceStatus::Pending
+        }) else {
+            return Ok(None);
+        };
+        row.status = DeviceStatus::Approved;
+        row.approved_at = Some(now);
+        Ok(Some(row.clone()))
+    }
+
+    async fn revoke(&self, user_id: &str, device_id: &str) -> DeviceResult<bool> {
+        let mut g = self.rows.lock();
+        let Some(row) = g.get_mut(&(user_id.to_string(), device_id.to_string())) else {
+            return Ok(false);
+        };
+        if row.status == DeviceStatus::Revoked {
+            return Ok(false);
+        }
+        row.status = DeviceStatus::Revoked;
+        Ok(true)
+    }
+
+    async fn touch_last_seen(&self, user_id: &str, device_id: &str, now: i64) -> DeviceResult<()> {
+        if let Some(row) = self
+            .rows
+            .lock()
+            .get_mut(&(user_id.to_string(), device_id.to_string()))
+        {
+            row.last_seen_at = Some(now);
+        }
+        Ok(())
+    }
+}
+
+fn sorted_desc(rows: impl Iterator<Item = DeviceRow>) -> Vec<DeviceRow> {
+    let mut v: Vec<DeviceRow> = rows.collect();
+    v.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+    v
+}
+
+/// In-memory [`DevicePairingStore`] keyed by `code`.
+#[derive(Default)]
+pub struct MemoryDevicePairingStore {
+    slots: Mutex<HashMap<String, DevicePairingSlot>>,
+}
+
+impl MemoryDevicePairingStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl DevicePairingStore for MemoryDevicePairingStore {
+    async fn create_slot(&self, slot: &DevicePairingSlot) -> SlotResult<()> {
+        let mut g = self.slots.lock();
+        if g.contains_key(&slot.code) {
+            return Err(StorageError::Conflict(format!("code {} exists", slot.code)));
+        }
+        g.insert(slot.code.clone(), slot.clone());
+        Ok(())
+    }
+
+    async fn get_slot(&self, code: &str) -> SlotResult<Option<DevicePairingSlot>> {
+        Ok(self.slots.lock().get(code).cloned())
+    }
+
+    async fn delete_slot(&self, code: &str) -> SlotResult<()> {
+        self.slots.lock().remove(code);
+        Ok(())
+    }
+
+    async fn list_slots(&self) -> SlotResult<Vec<DevicePairingSlot>> {
+        let mut v: Vec<DevicePairingSlot> = self.slots.lock().values().cloned().collect();
+        v.sort_by_key(|s| std::cmp::Reverse(s.created_at));
+        Ok(v)
+    }
+
+    async fn purge_expired(&self, now: i64) -> SlotResult<u64> {
+        let mut g = self.slots.lock();
+        let before = g.len();
+        g.retain(|_, s| !s.is_expired(now));
+        Ok((before - g.len()) as u64)
+    }
+}

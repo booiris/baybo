@@ -11,9 +11,11 @@ aura-model = { workspace = true }
 aura-store = { workspace = true }
 
 chrono = { workspace = true }
+hex = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+aura-storage = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

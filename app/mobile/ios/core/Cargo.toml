@@ -1,0 +1,14 @@
+[package]
+name = "aura-mobile-core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+aura-wire = { workspace = true }
+aura-device-proto = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]

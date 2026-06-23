@@ -13,6 +13,8 @@ pub mod channel_pairing;
 pub mod channel_session;
 pub mod cost;
 pub mod cron;
+pub mod device;
+pub mod device_pairing;
 pub mod error;
 pub mod job;
 pub mod secret;
@@ -29,6 +31,8 @@ pub use channel_pairing::{ChannelPairingRow, ChannelPairingStore, PairingStatus}
 pub use channel_session::ChannelSessionStore;
 pub use cost::CostStore;
 pub use cron::CronStore;
+pub use device::{DeviceRow, DeviceStatus, DeviceStore};
+pub use device_pairing::{DevicePairingSlot, DevicePairingStore};
 pub use error::StorageError;
 pub use job::{JobRow, JobStore, JobTransitionRow};
 pub use secret::SecretStore;

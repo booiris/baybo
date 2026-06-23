@@ -317,7 +317,8 @@ fn build_admin_router(deps: GatewayDeps) -> Router {
     // through the bearer-protected admin surface above.
     let channel_v1 = build_channel_v1_subrouter(
         WsChannelState::from_deps(&deps),
-        channel_auth::ChannelAuthState::new(deps.channel_tokens.clone()),
+        channel_auth::ChannelAuthState::new(deps.channel_tokens.clone())
+            .with_device_store(deps.stores.device.clone()),
     );
 
     Router::new()
@@ -339,10 +340,16 @@ fn build_channel_v1_subrouter(
     // TraceLayer goes *inside* the auth middleware so it sees the
     // URI AFTER `require_channel_auth` has stripped `?token=…`.
     let inner: Router<()> = crate::channel::routes()
+        .with_state(state.clone())
+        .layer(TraceLayer::new_for_http());
+    let v1_authed = channel_auth::attach(inner, auth_state);
+    // The device-pairing handshake is **token-free** — pairing precedes any
+    // auth token, and the SPAKE2 code is the gate — so it is mounted OUTSIDE
+    // `channel_auth::attach`.
+    let pair: Router<()> = crate::channel::device_pair::routes()
         .with_state(state)
         .layer(TraceLayer::new_for_http());
-    let v1 = channel_auth::attach(inner, auth_state);
-    Router::new().nest("/v1", v1)
+    Router::new().nest("/v1", v1_authed.merge(pair))
 }
 
 /// Build the router served on the channel TCP listener. Called by
