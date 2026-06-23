@@ -28,3 +28,8 @@ tokio-tungstenite = { workspace = true }
 # The camera/barcode plugin only exists on mobile; on desktop the crate is empty.
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
 tauri-plugin-barcode-scanner = { workspace = true }
+
+# The App Group keychain write (push-key persistence for the NSE) is iOS-only.
+[target.'cfg(target_os = "ios")'.dependencies]
+core-foundation = { workspace = true }
+core-foundation-sys = { workspace = true }

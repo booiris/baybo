@@ -116,6 +116,8 @@ name = "aura-mobile-app"
 version = "0.1.0"
 dependencies = [
  "aura-mobile-core",
+ "core-foundation",
+ "core-foundation-sys",
  "device-proto",
  "futures-util",
  "hex",

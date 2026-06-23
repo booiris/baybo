@@ -57,7 +57,7 @@ pub async fn run_pairing(
 
     let req = PairingRequest {
         code: code.to_string(),
-        device_id,
+        device_id: device_id.clone(),
         label: label.to_string(),
         static_pubkey: keypair.public(),
         // TODO(apns): the real APNs token comes from the app's
@@ -82,8 +82,14 @@ pub async fn run_pairing(
         .on_welcome(&nonce, &ciphertext)
         .map_err(|e| e.to_string())?;
 
-    // TODO(persist): store `paired` (auth_token, gateway static key, relay/direct)
-    // and write `paired.push_key` to the shared App-Group keychain for the NSE.
+    // Persist the push key to the shared App Group keychain so the NSE can
+    // decrypt lock-screen previews (account `aura.push-key.<device_id>`, since
+    // the gateway stamps `bid = device_id` into every push payload).
+    crate::keychain::store_push_key(&device_id, &paired.push_key)
+        .map_err(|e| format!("persist push key: {e}"))?;
+
+    // TODO(persist): also store `paired` (auth_token, gateway static key,
+    // relay/direct candidates) + the Noise static secret for content sessions.
     Ok(PairedSummary::from(&paired))
 }
 
