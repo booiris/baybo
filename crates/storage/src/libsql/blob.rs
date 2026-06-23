@@ -2,7 +2,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use aura_model::BlobRef;
+use baybo_model::BlobRef;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
@@ -10,13 +10,13 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use super::LibsqlPool;
-use aura_store::StorageError;
-use aura_store::blob::{BlobMeta, BlobReader, BlobStore, ByteStream, Result, SHA256_PREFIX};
+use baybo_store::StorageError;
+use baybo_store::blob::{BlobMeta, BlobReader, BlobStore, ByteStream, Result, SHA256_PREFIX};
 
 // `DirBuilder::mode(0o700)` and `OpenOptions::mode(0o600)` lock down
 // every directory and file in the blob tree to the owning UID — the
 // channel-token boundary is the only gate on user-uploaded media, and
-// world-readable bytes on disk would bypass it. Aura is Unix-only (see
+// world-readable bytes on disk would bypass it. Baybo is Unix-only (see
 // `CLAUDE.md`) so neither needs a cfg gate.
 
 pub struct LibsqlBlobStore {
@@ -894,12 +894,12 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_mime_lands_without_extension() {
-        // Unrecognized mimes (e.g. `application/x-aura-foo`) must not
+        // Unrecognized mimes (e.g. `application/x-baybo-foo`) must not
         // synthesis a fake suffix — the disk filename falls back to
         // the bare hash. Both put and get round-trip.
         let (store, dir) = build().await;
         let blob = store
-            .put(b"opaque", "application/x-aura-foo", None)
+            .put(b"opaque", "application/x-baybo-foo", None)
             .await
             .unwrap();
         let hex_with_token = blob.blob_id.strip_prefix(SHA256_PREFIX).unwrap();

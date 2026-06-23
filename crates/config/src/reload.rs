@@ -1,6 +1,6 @@
-//! Hot-reload machinery for [`AuraConfig`].
+//! Hot-reload machinery for [`BayboConfig`].
 //!
-//! `aura-config` is a leaf crate, so it owns only the pure primitives:
+//! `baybo-config` is a leaf crate, so it owns only the pure primitives:
 //! a live handle to the applied config ([`ConfigHandle`]) and the
 //! whitelist gate ([`hot_reload_diff`]). The fallible derived-state
 //! rebuilds (LLM pool, cost limits) and the reload orchestration live
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::error::{ConfigError, Result};
-use crate::{AgentConfig, AuraConfig, CostConfig};
+use crate::{AgentConfig, BayboConfig, CostConfig};
 
 /// Live, swappable handle to the currently-applied config.
 ///
@@ -22,22 +22,22 @@ use crate::{AgentConfig, AuraConfig, CostConfig};
 /// in-flight reader drops it, which is what gives the contract's
 /// "in-flight requests finish on the old config" behaviour.
 #[derive(Clone)]
-pub struct ConfigHandle(Arc<RwLock<Arc<AuraConfig>>>);
+pub struct ConfigHandle(Arc<RwLock<Arc<BayboConfig>>>);
 
 impl ConfigHandle {
-    pub fn new(config: Arc<AuraConfig>) -> Self {
+    pub fn new(config: Arc<BayboConfig>) -> Self {
         Self(Arc::new(RwLock::new(config)))
     }
 
     /// Clone out the currently-applied config.
-    pub fn current(&self) -> Arc<AuraConfig> {
+    pub fn current(&self) -> Arc<BayboConfig> {
         self.0.read().clone()
     }
 
     /// Swap in a new applied config. Callers must have already passed
     /// [`hot_reload_diff`] + every consumer's prepare step; this is the
     /// infallible commit half.
-    pub fn store(&self, config: Arc<AuraConfig>) {
+    pub fn store(&self, config: Arc<BayboConfig>) {
         *self.0.write() = config;
     }
 }
@@ -51,11 +51,11 @@ impl ConfigHandle {
 /// rejected (atomic — no partial application), naming the first
 /// offending section so the operator knows a restart is required.
 ///
-/// `new` is destructured so that adding a field to `AuraConfig` (or
+/// `new` is destructured so that adding a field to `BayboConfig` (or
 /// `AgentConfig`) forces a hot/non-hot classification here rather than
 /// silently defaulting a fresh field to "hot, unchecked".
-pub fn hot_reload_diff(old: &AuraConfig, new: &AuraConfig) -> Result<()> {
-    let AuraConfig {
+pub fn hot_reload_diff(old: &BayboConfig, new: &BayboConfig) -> Result<()> {
+    let BayboConfig {
         // Hot — free to change.
         llm: _,
         default_llm: _,
@@ -145,10 +145,10 @@ fn not_hot(section: &str) -> ConfigError {
 mod tests {
     use super::*;
     use crate::LlmEntry;
-    use aura_model::{LlmEntryName, ModelTier};
+    use baybo_model::{LlmEntryName, ModelTier};
 
-    fn base() -> AuraConfig {
-        AuraConfig {
+    fn base() -> BayboConfig {
+        BayboConfig {
             llm: vec![LlmEntry {
                 name: LlmEntryName::from("primary"),
                 provider: "openai".into(),
@@ -192,7 +192,7 @@ mod tests {
         let old = base();
         let mut new = base();
         new.cost.rate_limit.max_requests += 1;
-        new.cost.spending_limits.daily_usd = Some(aura_model::MicroUsd::from_micros(5_000_000));
+        new.cost.spending_limits.daily_usd = Some(baybo_model::MicroUsd::from_micros(5_000_000));
         assert!(hot_reload_diff(&old, &new).is_ok());
     }
 

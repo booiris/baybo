@@ -56,7 +56,7 @@ export function defaultLogger(_channelType: string): Logger {
       if (droppedInWindow > 0) {
         writeNdjson(
           "warn",
-          `[aura-sdk] dropped ${droppedInWindow} log lines (rate cap ${MAX_LINES_PER_WINDOW}/${WINDOW_MS}ms)`,
+          `[baybo-sdk] dropped ${droppedInWindow} log lines (rate cap ${MAX_LINES_PER_WINDOW}/${WINDOW_MS}ms)`,
         );
         droppedInWindow = 0;
       }

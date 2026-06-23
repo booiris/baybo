@@ -4,18 +4,18 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aura_config::AuraConfig;
-use aura_security::{EncryptionKey, SecretVault};
-use aura_storage::Store;
-use aura_workspace::WorkspaceManager;
-use aura_workspace::WorkspacePaths;
-use aura_workspace::paths::ENV_CONFIG_PATH;
+use baybo_config::BayboConfig;
+use baybo_security::{EncryptionKey, SecretVault};
+use baybo_storage::Store;
+use baybo_workspace::WorkspaceManager;
+use baybo_workspace::WorkspacePaths;
+use baybo_workspace::paths::ENV_CONFIG_PATH;
 
 use crate::error::{Result, SetupError};
 
 pub struct SetupContext {
     pub config_path: PathBuf,
-    pub config: AuraConfig,
+    pub config: BayboConfig,
     pub vault: Arc<SecretVault>,
     pub stores: Store,
 }
@@ -42,11 +42,11 @@ pub async fn bootstrap_workspace_if_needed(workspace_root: PathBuf) -> Result<Se
 
     let config_path = resolve_config_path(&paths);
     let mut config = if config_path.exists() {
-        AuraConfig::load_from_file(&config_path)
+        BayboConfig::load_from_file(&config_path)
             .await
             .map_err(|e| SetupError::Config(format!("load {}: {e}", config_path.display())))?
     } else {
-        let mut cfg = AuraConfig::default();
+        let mut cfg = BayboConfig::default();
         cfg.security.encryption_key_file = Some(key_file.display().to_string());
         cfg
     };
@@ -59,7 +59,7 @@ pub async fn bootstrap_workspace_if_needed(workspace_root: PathBuf) -> Result<Se
 
     config
         .validate()
-        .map_err(|e| SetupError::Config(format!("validate aura.json: {e}")))?;
+        .map_err(|e| SetupError::Config(format!("validate baybo.json: {e}")))?;
 
     if !config_path.exists() {
         config.write_to_file(&config_path).await.map_err(|e| {
@@ -129,7 +129,7 @@ fn load_encryption_key(path: &Path) -> Result<EncryptionKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_workspace::IdentityKind;
+    use baybo_workspace::IdentityKind;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
@@ -184,7 +184,7 @@ mod tests {
     #[tokio::test]
     async fn re_running_setup_restores_deleted_identity_file() {
         // Plain gateway boots use `ensure_layout` directly and do NOT
-        // re-seed; only an explicit `aura setup` invocation does. So a
+        // re-seed; only an explicit `baybo setup` invocation does. So a
         // file deleted by the operator stays gone across reboots, but a
         // deliberate re-run of setup brings it back.
         let tmp = tempdir().unwrap();
@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(key_first, key_second, "key must not be re-minted");
         assert_eq!(
             cfg_mtime_first, cfg_mtime_second,
-            "aura.json must not be rewritten on a clean re-run"
+            "baybo.json must not be rewritten on a clean re-run"
         );
     }
 }

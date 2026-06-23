@@ -19,10 +19,10 @@
 //! keep working without a client-side allow-list.
 
 use async_trait::async_trait;
-use aura_channels::{
+use baybo_channels::{
     STOP_COMMAND, STOP_COMMAND_DESCRIPTION, SlashCommand, SlashHandler, SlashOutcome, ViewKind,
 };
-use aura_model::ContentBlock;
+use baybo_model::ContentBlock;
 
 /// Bundled slash handler used by the TUI.
 pub struct TuiSlashHandler;
@@ -104,7 +104,7 @@ fn help_text() -> String {
          Tool approvals are resolved from the modal (a / A / d).\n\
          \n\
          Admin commands (status, config, jobs, skills, tools,\n\
-         sessions, …) are reached via the `aura` CLI and are not\n\
+         sessions, …) are reached via the `baybo` CLI and are not\n\
          reachable from the TUI.\n",
     )
 }
@@ -141,7 +141,7 @@ mod tests {
         assert_eq!(dashboard_shortcut("skills"), Some(ViewKind::Skills));
         assert_eq!(dashboard_shortcut("jobs"), Some(ViewKind::Jobs));
         assert_eq!(dashboard_shortcut("sessions"), Some(ViewKind::Sessions));
-        // `memory` retired with the CLI `aura memory` family.
+        // `memory` retired with the CLI `baybo memory` family.
         assert_eq!(dashboard_shortcut("memory"), None);
         assert_eq!(dashboard_shortcut("status"), None);
     }

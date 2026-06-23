@@ -22,7 +22,7 @@ set -euo pipefail
 
 registry="ghcr.io/laude-institute/t-bench"
 bases=(ubuntu-24-04 python-3-13)
-label="aura.tb.augmented"
+label="baybo.tb.augmented"
 
 for base in "${bases[@]}"; do
   img="$registry/${base}:latest"

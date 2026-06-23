@@ -1,7 +1,7 @@
 //! Security-related identifiers used by trace `SpanEvent`s and the
 //! sanitization pipeline. The actual cryptographic + sanitization logic
-//! lives in `aura-security`; only the **types** that other crates need
-//! to reference (without depending on `aura-security`) are defined here.
+//! lives in `baybo-security`; only the **types** that other crates need
+//! to reference (without depending on `baybo-security`) are defined here.
 
 use std::fmt;
 
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// Opaque identifier for a minted placeholder string.
 ///
-/// `aura-security` mints placeholders of the form
+/// `baybo-security` mints placeholders of the form
 /// `[{REDACTED_SECRET_<hex>}]`; this newtype carries the canonical text
 /// form so that `SpanEvent::SanitizeHit` can reference the placeholder
 /// without copying the secret bytes themselves.

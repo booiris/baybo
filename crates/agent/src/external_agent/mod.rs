@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_llm::TokenUsage;
-use aura_model::{ChatMessage, ContentBlock, ExternalAgentKind};
+use baybo_llm::TokenUsage;
+use baybo_model::{ChatMessage, ContentBlock, ExternalAgentKind};
 use futures::Stream;
 use tokio_util::sync::CancellationToken;
 
@@ -46,7 +46,7 @@ pub enum ExternalAgentError {
 }
 
 /// Idle (inactivity) safety timeout for an external (claude/codex)
-/// subagent subprocess. Aura subagents are bounded by `max_iterations`,
+/// subagent subprocess. Baybo subagents are bounded by `max_iterations`,
 /// but an external CLI is an opaque subprocess that can wedge — so it is
 /// killed only after producing NO output for this long. The timer resets
 /// on every line the subprocess emits, so a long-but-active run is never
@@ -84,8 +84,8 @@ pub enum ExternalAgentEvent {
     /// the spawn router appends each one to `session_messages` so
     /// the child session's transcript mirrors the agent's own log
     /// (assistant thinking / tool_use, tool results, …). External
-    /// agents bypass aura's sandbox + approval gate, so these
-    /// records describe what the external agent did, not what aura
+    /// agents bypass baybo's sandbox + approval gate, so these
+    /// records describe what the external agent did, not what baybo
     /// authorised.
     Intermediate(ChatMessage),
     /// Terminal event — the agent has finished. Emitted exactly once,
@@ -132,14 +132,14 @@ impl ExternalAgentRegistry {
 /// `warn!` and continues (operator misconfiguration doesn't block
 /// boot). Adding a new `ExternalAgentKind` only requires extending
 /// the inner match here — boot paths just pass through their per-
-/// kind config (see `aura_config::ExternalAgentsConfig::boot_entries`).
+/// kind config (see `baybo_config::ExternalAgentsConfig::boot_entries`).
 ///
 /// Tuple form `(kind, enabled, binary_path)` is the lingua franca
-/// between this crate and `aura-config` since the two don't depend on
+/// between this crate and `baybo-config` since the two don't depend on
 /// each other.
 pub fn build_registry<'a, I>(
     entries: I,
-    proxy: Option<aura_security::http::ProxySettings>,
+    proxy: Option<baybo_security::http::ProxySettings>,
 ) -> ExternalAgentRegistry
 where
     I: IntoIterator<Item = (ExternalAgentKind, bool, Option<&'a str>)>,

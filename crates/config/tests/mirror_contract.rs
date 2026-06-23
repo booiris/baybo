@@ -1,4 +1,4 @@
-//! Contract tests for the mirror types in `aura-config`.
+//! Contract tests for the mirror types in `baybo-config`.
 //!
 //! These tests act as the drift detector between config-layer mirrors and the
 //! domain types they reflect. If a domain enum grows a new variant without the
@@ -11,34 +11,34 @@
 //! the shape of the error is pinned so future additions on either side have a
 //! defined failure mode.
 
-use aura_config::{ConfigError, TrustLevelConfig};
+use baybo_config::{ConfigError, TrustLevelConfig};
 
 // ---------------------------------------------------------------------------
 // TrustLevel ↔ TrustLevelConfig
 // ---------------------------------------------------------------------------
 
-fn trust_domain_to_mirror(d: &aura_model::TrustLevel) -> TrustLevelConfig {
+fn trust_domain_to_mirror(d: &baybo_model::TrustLevel) -> TrustLevelConfig {
     match d {
-        aura_model::TrustLevel::Trusted => TrustLevelConfig::Trusted,
-        aura_model::TrustLevel::Installed => TrustLevelConfig::Installed,
-        aura_model::TrustLevel::Untrusted => TrustLevelConfig::Untrusted,
+        baybo_model::TrustLevel::Trusted => TrustLevelConfig::Trusted,
+        baybo_model::TrustLevel::Installed => TrustLevelConfig::Installed,
+        baybo_model::TrustLevel::Untrusted => TrustLevelConfig::Untrusted,
     }
 }
 
-fn trust_mirror_to_domain(m: TrustLevelConfig) -> Result<aura_model::TrustLevel, ConfigError> {
+fn trust_mirror_to_domain(m: TrustLevelConfig) -> Result<baybo_model::TrustLevel, ConfigError> {
     Ok(match m {
-        TrustLevelConfig::Trusted => aura_model::TrustLevel::Trusted,
-        TrustLevelConfig::Installed => aura_model::TrustLevel::Installed,
-        TrustLevelConfig::Untrusted => aura_model::TrustLevel::Untrusted,
+        TrustLevelConfig::Trusted => baybo_model::TrustLevel::Trusted,
+        TrustLevelConfig::Installed => baybo_model::TrustLevel::Installed,
+        TrustLevelConfig::Untrusted => baybo_model::TrustLevel::Untrusted,
     })
 }
 
 #[test]
 fn trust_level_mirror_roundtrip() {
     let all = [
-        aura_model::TrustLevel::Trusted,
-        aura_model::TrustLevel::Installed,
-        aura_model::TrustLevel::Untrusted,
+        baybo_model::TrustLevel::Trusted,
+        baybo_model::TrustLevel::Installed,
+        baybo_model::TrustLevel::Untrusted,
     ];
     for d in all {
         let mirror = trust_domain_to_mirror(&d);

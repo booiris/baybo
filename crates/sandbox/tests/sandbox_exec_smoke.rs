@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_sandbox::sandbox_exec::SandboxExecRunner;
-use aura_sandbox::{
+use baybo_sandbox::sandbox_exec::SandboxExecRunner;
+use baybo_sandbox::{
     EnvPolicy, NetworkPolicy, ResourceLimits, SandboxRunner, SandboxSpec, StdinSource,
 };
 
@@ -40,7 +40,7 @@ async fn echo_through_sandbox_exec() {
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(5),
             resource_limits: ResourceLimits::default(),
-            filesystem_policy: aura_sandbox::FilesystemPolicy::default(),
+            filesystem_policy: baybo_sandbox::FilesystemPolicy::default(),
         })
         .await
         .expect("sandboxed run");
@@ -61,7 +61,7 @@ async fn host_tmp_writes_are_denied() {
     let runner: Arc<dyn SandboxRunner> =
         Arc::new(SandboxExecRunner::discover().expect("sandbox-exec runner"));
     let tmp = tempfile::tempdir().expect("tempdir");
-    let marker = format!("/tmp/aura-sandbox-host-escape-{}", std::process::id());
+    let marker = format!("/tmp/baybo-sandbox-host-escape-{}", std::process::id());
     let _ = std::fs::remove_file(&marker);
     let out = runner
         .run(SandboxSpec {
@@ -77,7 +77,7 @@ async fn host_tmp_writes_are_denied() {
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(5),
             resource_limits: ResourceLimits::default(),
-            filesystem_policy: aura_sandbox::FilesystemPolicy::default(),
+            filesystem_policy: baybo_sandbox::FilesystemPolicy::default(),
         })
         .await
         .expect("sandboxed run");

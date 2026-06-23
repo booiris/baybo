@@ -13,8 +13,8 @@
 
 use std::time::Duration;
 
-use aura_model::ContentBlock;
-use aura_tools::{ApprovalDecision, ResourceAccess};
+use baybo_model::ContentBlock;
+use baybo_tools::{ApprovalDecision, ResourceAccess};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -377,7 +377,7 @@ fn render_approval_block(frame: &mut Frame, area: Rect, entry: &ApprovalChatEntr
 // ---- Line-rendering helpers (used by lib.rs for terminal.insert_before) ----
 
 /// Pale dot marking an assistant answer's first line (replaces the old
-/// `aura> ` prefix). Continuation lines indent under it by [`ANSWER_INDENT`].
+/// `baybo> ` prefix). Continuation lines indent under it by [`ANSWER_INDENT`].
 const ANSWER_DOT: &str = "●";
 /// Continuation indent for assistant answers — the display width of `"● "`,
 /// so wrapped/continued lines align under the text rather than the dot.
@@ -672,7 +672,7 @@ pub(crate) fn render_banner_lines(
     let usable = (max_width as usize).saturating_sub(4).max(20);
     let edge = Style::default().fg(Color::DarkGray);
 
-    let header_full = format!("Aura TUI (v{version})");
+    let header_full = format!("Baybo TUI (v{version})");
     let session_text = clip_for_box(&format!("session: {session_id}"), usable);
     let session_w = session_text.width();
     // Width of the header is "> " + product+version; computed from the
@@ -896,7 +896,7 @@ pub(crate) fn wrapped_height(lines: &[Line<'_>], width: u16) -> u16 {
 /// TUI sessions are ephemeral — triggers fired while the gateway is down
 /// are lost, and a fresh TUI session will not replay them.
 const TUI_CRON_RECURRING_HINT: &str = "⚠ This cron is tied to the TUI channel. \
-    It only fires while `aura gateway` is running, and a new TUI session \
+    It only fires while `baybo gateway` is running, and a new TUI session \
     will not replay triggers missed while the gateway was down. For \
     long-lived recurring jobs, prefer a persistent channel \
     (telegram/discord/http).";
@@ -1150,8 +1150,8 @@ mod tests {
     fn completion_popup_height_counts_candidates_plus_border() {
         let mut app = AppState::new();
         app.set_commands(vec![
-            aura_channels::SlashCommand::new("/clear", "clear"),
-            aura_channels::SlashCommand::new("/quit", "quit"),
+            baybo_channels::SlashCommand::new("/clear", "clear"),
+            baybo_channels::SlashCommand::new("/quit", "quit"),
         ]);
         assert_eq!(completion_popup_height(&app), 0, "no popup on empty input");
         app.insert_char('/');
@@ -1171,8 +1171,8 @@ mod tests {
         use ratatui::backend::TestBackend;
         let mut app = AppState::new();
         app.set_commands(vec![
-            aura_channels::SlashCommand::new("/clear", "clear"),
-            aura_channels::SlashCommand::new("/quit", "quit"),
+            baybo_channels::SlashCommand::new("/clear", "clear"),
+            baybo_channels::SlashCommand::new("/quit", "quit"),
         ]);
         app.insert_char('/');
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
@@ -1243,7 +1243,7 @@ mod tests {
         let texts: Vec<String> = out.iter().map(line_text).collect();
         assert!(texts[0].starts_with('╭') && texts[0].ends_with('╮'));
         assert!(texts[5].contains("Ctrl-D"));
-        assert!(texts[1].contains(">_ Aura TUI (v0.1.0)"));
+        assert!(texts[1].contains(">_ Baybo TUI (v0.1.0)"));
         assert!(texts[3].contains("session:"));
         assert!(texts[3].contains("sess-abc-12345"));
         assert!(

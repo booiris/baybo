@@ -82,7 +82,7 @@ pub fn decrypt(data: &[u8], key: &EncryptionKey) -> crate::Result<Vec<u8>> {
 }
 
 impl EncryptionKey {
-    /// Mint a fresh 32-byte key from the OS RNG. Used by `aura setup`
+    /// Mint a fresh 32-byte key from the OS RNG. Used by `baybo setup`
     /// for first-run key generation; tests use it for fixtures.
     pub fn generate() -> Self {
         use rand::RngExt;

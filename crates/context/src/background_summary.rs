@@ -33,12 +33,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_llm::{ChatRequest, LlmResponse, ToolCallInfo, ToolDefinitionForLlm};
-use aura_model::{ChannelType, ChatMessage, ContentBlock, SessionId, User};
-use aura_session::SessionManager;
-use aura_tools::builtin::{EditTool, ReadTool};
-use aura_tools::{Tool, ToolContext, ToolError, ToolOutput};
-use aura_workspace::WorkspacePaths;
+use baybo_llm::{ChatRequest, LlmResponse, ToolCallInfo, ToolDefinitionForLlm};
+use baybo_model::{ChannelType, ChatMessage, ContentBlock, SessionId, User};
+use baybo_session::SessionManager;
+use baybo_tools::builtin::{EditTool, ReadTool};
+use baybo_tools::{Tool, ToolContext, ToolError, ToolOutput};
+use baybo_workspace::WorkspacePaths;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -46,7 +46,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::ContextError;
 use crate::tokenizer::Tokenizer;
-use aura_trace::LlmCallInputs;
+use baybo_trace::LlmCallInputs;
 
 /// Total file-size budget the summary is asked to fit within. When
 /// `summary.md` already exceeds this, the prompt appends a "CRITICAL"
@@ -291,7 +291,7 @@ async fn read_existing_summary(
 
 /// Atomic write — tempfile + rename. Creates the per-session
 /// directory if absent. Same crash-safety guarantee as
-/// `aura_workspace::identity::write_identity_file`: readers see
+/// `baybo_workspace::identity::write_identity_file`: readers see
 /// either the prior file or the new one, never a partial.
 async fn atomic_write_summary(
     paths: &WorkspacePaths,
@@ -352,8 +352,8 @@ fn tool_def_from(tool: &dyn Tool) -> ToolDefinitionForLlm {
 fn make_tool_context(workspace_paths: &WorkspacePaths, cancel: CancellationToken) -> ToolContext {
     ToolContext {
         session_id: "background-summary".into(),
-        job_id: aura_model::JobId::default(),
-        span_id: aura_model::SpanId::default(),
+        job_id: baybo_model::JobId::default(),
+        span_id: baybo_model::SpanId::default(),
         user: User {
             id: "background-summary".into(),
             name: None,
@@ -366,7 +366,7 @@ fn make_tool_context(workspace_paths: &WorkspacePaths, cancel: CancellationToken
         sandbox: None,
         approval: None,
         notifier: None,
-        events: aura_tools::noop_event_sink(),
+        events: baybo_tools::noop_event_sink(),
         llm: None,
         secrets: None,
         virtual_reads: None,
@@ -772,7 +772,7 @@ mod tests {
 
     fn test_ctx() -> ToolContext {
         make_tool_context(
-            &WorkspacePaths::new("/tmp/aura-test"),
+            &WorkspacePaths::new("/tmp/baybo-test"),
             CancellationToken::new(),
         )
     }

@@ -43,7 +43,7 @@ pub(crate) fn tool_sidecar_rel(trace_rel: &str) -> String {
 
 /// Count `tool_call` spans by `tool_name` in a parsed `trace.json`,
 /// highest first (ties broken by name). Walks the `jobs[].steps[].spans[]`
-/// shape `aura session export` emits. The precompute bin runs this once
+/// shape `baybo session export` emits. The precompute bin runs this once
 /// per trace and writes the result as the sidecar [`tool_counts`] reads.
 pub(crate) fn count_tools_in_trace(val: &Value) -> Vec<ToolCount> {
     let mut counts: BTreeMap<String, u32> = BTreeMap::new();

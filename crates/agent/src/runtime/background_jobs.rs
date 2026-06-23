@@ -13,8 +13,8 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use aura_model::{PendingBackgroundResult, SessionId, SubagentExitStatus};
-use aura_tools::{BackgroundJobControl, BackgroundJobInfo, BackgroundJobSink, DetachedCommand};
+use baybo_model::{PendingBackgroundResult, SessionId, SubagentExitStatus};
+use baybo_tools::{BackgroundJobControl, BackgroundJobInfo, BackgroundJobSink, DetachedCommand};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 

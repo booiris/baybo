@@ -3,12 +3,12 @@
 ## Problem
 
 Channel sidecars (Telegram today, future Discord / Slack / HTTP bots)
-forward every inbound user message to aura over the WS channel. The
+forward every inbound user message to baybo over the WS channel. The
 gateway used to run it straight through `ChannelSessionResolver →
 router → agent loop` — no per-user gate, anyone who could reach a
 provisioned bot could drive the agent.
 
-Aura (not the sidecar) now decides who may talk to a given bot. The
+Baybo (not the sidecar) now decides who may talk to a given bot. The
 operator approves pairings from the CLI; unknown users get a short
 code and must wait for approval.
 
@@ -27,7 +27,7 @@ Pairings are scoped to the **triple** `(channel_type, bot_id, user_id)`.
 
 The triple matters because one Telegram person might hit two of the
 operator's bots with different trust levels (approved on
-`@aura-staging-bot`, not yet on `@aura-prod-bot`). Keying on the pair
+`@baybo-staging-bot`, not yet on `@baybo-prod-bot`). Keying on the pair
 alone would force one decision across every bot.
 
 Same Telegram user under two different bots ⇒ two rows. Approving on
@@ -71,17 +71,17 @@ Revocation is a plain `DELETE` — there is no tombstone column.
 A pending row carries an `expires_at` stamp computed at insert time:
 `created_at + 15 minutes`. The TTL is a hardcoded constant
 (`PENDING_TTL_SECONDS` in `crates/pairing/src/service.rs`) — long
-enough for a human operator to notice a Telegram buzz and run `aura
+enough for a human operator to notice a Telegram buzz and run `baybo
 pair approve`, short enough that a one-time curious user's code
 doesn't linger in libsql for days.
 
 Expiry only applies to `pending` rows. On approval, `status` flips
 to `approved` and `expires_at` is cleared (`NULL`). Approved rows
 don't carry an `expires_at`, but they are **not** kept forever: the
-`aura-janitor` sweep also reaps approved rows whose `approved_at` is
+`baybo-janitor` sweep also reaps approved rows whose `approved_at` is
 older than `PAIRING_APPROVAL_TTL` (7 days) — an old approval is a
 record of a one-time grant, not a live capability (access is
-re-established at message-time via the channel route). `aura pair
+re-established at message-time via the channel route). `baybo pair
 revoke` still deletes an approved row on demand before the TTL fires.
 
 Behavior on an expired row:
@@ -90,21 +90,21 @@ Behavior on an expired row:
   pending row as if it weren't there and overwrites it with a fresh
   code + fresh `expires_at`. The user sees a new code in their
   Notice; the old one silently becomes invalid.
-- **`aura pair approve <old_code>`** → returns "not found", nothing
+- **`baybo pair approve <old_code>`** → returns "not found", nothing
   is mutated. The operator asks the user to message the bot again to
   mint a fresh code.
-- **`aura pair list`** → expired rows surface with `STATUS=EXPIRED`
+- **`baybo pair list`** → expired rows surface with `STATUS=EXPIRED`
   so the operator can see the queue honestly. They're not filtered
   out; the row still occupies the triple until the user retries (at
   which point it's overwritten).
 
-Stale rows are reaped by a background sweep. `aura-janitor` runs
+Stale rows are reaped by a background sweep. `baybo-janitor` runs
 `ChannelPairingStore::purge_expired` on an hourly cadence
 (`PAIRING_SWEEP_INTERVAL` = 1h, faster than the day-scoped log
 sweeps because pending codes expire on the order of minutes); it
 hard-deletes expired pending rows (`expires_at <= now`) and
 TTL-aged approved rows in one `DELETE`. The sweep is wired in
-production via `Janitor::with_pairing_store`. There is **no** `aura
+production via `Janitor::with_pairing_store`. There is **no** `baybo
 pair prune` CLI subcommand — the CLI surface is still only
 `list` / `approve` / `revoke`; retention is the janitor's job, not
 an operator command.
@@ -126,7 +126,7 @@ janitor sweep followed by a new inbound mints a fresh code.
 ### Gate flow
 
 ```
-            sidecar                         aura gateway
+            sidecar                         baybo gateway
               |                                   |
    user msg ─►│── Frame::Message ─────────────►   │
               │                                   │ look up (ct, bot, uid)
@@ -141,22 +141,22 @@ janitor sweep followed by a new inbound mints a fresh code.
               │                                     Frame::Notice:
               │                                     "pair required, code ABC123
               │                                      ask operator to run
-              │                                      `aura pair approve ABC123`"
+              │                                      `baybo pair approve ABC123`"
               │                                     drop message (no session)
               │                                           │
               │◄────────────────── Frame::Notice ─────────┘
 ```
 
-The refusal path does **not** create an aura session or a
+The refusal path does **not** create an baybo session or a
 `channel_sessions` row. Nothing lands in libsql for the user beyond
 the pending pairing itself.
 
 ### CLI
 
 ```
-aura pair list [--pending | --approved]
-aura pair approve <code>
-aura pair revoke <channel> <bot_id> <user_id>
+baybo pair list [--pending | --approved]
+baybo pair approve <code>
+baybo pair revoke <channel> <bot_id> <user_id>
 ```
 
 `list` default shows every live row, newest first. Output columns:
@@ -168,12 +168,12 @@ blank for approved rows.
 typable codes are the whole reason the code column exists. If no
 live pending row carries the code, returns `not found`.
 
-`revoke` is positional on the triple so `aura pair revoke telegram
+`revoke` is positional on the triple so `baybo pair revoke telegram
 prod-bot tg_…` is explicit about what it removes.
 
 Even the operator's own first use flows through the pending-request
 path: the operator messages the bot, reads the code out of the
-returned Notice, and runs `aura pair approve <code>`. Keeps one
+returned Notice, and runs `baybo pair approve <code>`. Keeps one
 code-path for everyone; no "trust me" escape hatch.
 
 All three run under `retry_on_busy` (CLI shares the libsql file
@@ -183,8 +183,8 @@ logged retry, not an operator-facing error).
 ### Crate layout
 
 Per the project convention documented in `docs/modules/storage.md`,
-store traits and row types live in the `aura-store` ports crate; the
-libsql adapter lives in `aura-storage` and business logic lives in a
+store traits and row types live in the `baybo-store` ports crate; the
+libsql adapter lives in `baybo-storage` and business logic lives in a
 dedicated crate. The split here is:
 
 ```
@@ -201,28 +201,28 @@ crates/store/src/channel_pairing.rs      // ChannelPairingStore trait
 crates/storage/src/libsql/channel_pairing.rs  // LibsqlChannelPairingStore
 ```
 
-Dependency direction: `aura-pairing → aura-store` for the trait +
-row types, matching how `aura-session` reaches `SessionStore`. The
-trait sits in `aura-store` next to every other store trait; the libsql
-impl lives in `aura-storage`, which the assembly layer wires in.
+Dependency direction: `baybo-pairing → baybo-store` for the trait +
+row types, matching how `baybo-session` reaches `SessionStore`. The
+trait sits in `baybo-store` next to every other store trait; the libsql
+impl lives in `baybo-storage`, which the assembly layer wires in.
 
 ```
-aura-store   ──► model                       (defines ChannelPairingStore + row + PairingStatus)
-aura-storage ──► store, model                (LibsqlChannelPairingStore; implements the trait)
-aura-pairing ──► model, store                (PairingService + code gen; consumes the trait + row types)
-aura-gateway ──► pairing, store, storage, …  (holds the Arc<dyn ChannelPairingStore>, wires the libsql impl)
-aura-cli     ──► store, storage              (CLI talks to the store directly)
+baybo-store   ──► model                       (defines ChannelPairingStore + row + PairingStatus)
+baybo-storage ──► store, model                (LibsqlChannelPairingStore; implements the trait)
+baybo-pairing ──► model, store                (PairingService + code gen; consumes the trait + row types)
+baybo-gateway ──► pairing, store, storage, …  (holds the Arc<dyn ChannelPairingStore>, wires the libsql impl)
+baybo-cli     ──► store, storage              (CLI talks to the store directly)
 ```
 
 The gateway consumes `PairingService` (service) and
-`ChannelPairingStore` (trait — imported from `aura-store`, to hold the
+`ChannelPairingStore` (trait — imported from `baybo-store`, to hold the
 `Arc`). The CLI consumes only the trait — `list/approve/revoke` are
 thin-wrapper store calls, so pulling in the full service would be
 dead weight.
 
 ### Test support
 
-`aura-pairing` ships no in-memory store fake: gateway tests
+`baybo-pairing` ships no in-memory store fake: gateway tests
 exercise the gate end-to-end through the real libsql adapter (via
 `build_test_deps`), and the adapter has its own per-method unit
 tests. A fake can be added later if service-level tests need one —
@@ -247,7 +247,7 @@ nothing does today.
 - `src/main.rs` / `src/gateway_cmd.rs` — plumb the store through
   from `Store::open` to the CLI context / `GatewayDeps`.
 - `crates/cli/src/cli.rs`, `dispatch.rs`, `commands/pair.rs` —
-  `aura pair` subcommand family.
+  `baybo pair` subcommand family.
 - `crates/channels/src/wire.rs` + `sdks/channel-ts/src/generated/`
   (regen) — `Frame::Message` carries optional `bot_id`.
 - `channel-src/telegram/src/channel.ts` — passes `botId` on the
@@ -274,7 +274,7 @@ doc's `PrincipalSource::Cli` branch.
 
 ## Constraints
 
-- Gate is aura-side only. Sidecars forward everything; the gate is
+- Gate is baybo-side only. Sidecars forward everything; the gate is
   the single choke point (matches the principle already in
   `docs/todo/slash-account-authorization.md`).
 - Fail closed: an unknown triple is pending, not approved. An empty

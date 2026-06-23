@@ -2,7 +2,7 @@
 #   runs/    — per-instance predictions.jsonl + the swebench harness report + logs/
 #   results/ — the shaped per-run results-claude-<run_id>.json report
 #   proxy/   — litellm proxy logs/pidfile
-#   trace/   — per-instance .messages.json transcripts (aura format)
+#   trace/   — per-instance .messages.json transcripts (baybo format)
 /runs/
 /results/
 /proxy/

@@ -3,7 +3,7 @@ use std::process::Command;
 
 use crate::installer::{InstallContext, InstallerError, Result, ServiceInstaller, ServiceStatus};
 
-const UNIT_NAME: &str = "aura-gateway.service";
+const UNIT_NAME: &str = "baybo-gateway.service";
 
 pub struct SystemdInstaller {
     user_mode: bool,
@@ -55,7 +55,7 @@ impl ServiceInstaller for SystemdInstaller {
     fn render_unit(&self, ctx: &InstallContext) -> String {
         let mut out = String::new();
         out.push_str("[Unit]\n");
-        out.push_str("Description=Aura HTTP gateway\n");
+        out.push_str("Description=Baybo HTTP gateway\n");
         out.push_str("After=network-online.target\n");
         out.push_str("Wants=network-online.target\n\n");
 
@@ -71,7 +71,7 @@ impl ServiceInstaller for SystemdInstaller {
         if let Some(cfg) = &ctx.config_path {
             out.push_str(&format!(
                 "Environment={}={}\n",
-                aura_workspace::paths::ENV_CONFIG_PATH,
+                baybo_workspace::paths::ENV_CONFIG_PATH,
                 cfg.display()
             ));
         }
@@ -148,9 +148,9 @@ mod tests {
 
     fn ctx() -> InstallContext {
         InstallContext {
-            exec_start: PathBuf::from("/usr/local/bin/aura"),
-            config_path: Some(PathBuf::from("/home/user/.aura/config/aura.json")),
-            log_dir: PathBuf::from("/home/user/.aura/logs"),
+            exec_start: PathBuf::from("/usr/local/bin/baybo"),
+            config_path: Some(PathBuf::from("/home/user/.baybo/config/baybo.json")),
+            log_dir: PathBuf::from("/home/user/.baybo/logs"),
             user_mode: true,
         }
     }
@@ -159,8 +159,8 @@ mod tests {
     fn render_unit_has_exec_start_and_config_env() {
         let inst = SystemdInstaller::new(true);
         let body = inst.render_unit(&ctx());
-        assert!(body.contains("ExecStart=/usr/local/bin/aura gateway start"));
-        assert!(body.contains("Environment=AURA_CONFIG_PATH=/home/user/.aura/config/aura.json"));
+        assert!(body.contains("ExecStart=/usr/local/bin/baybo gateway start"));
+        assert!(body.contains("Environment=BAYBO_CONFIG_PATH=/home/user/.baybo/config/baybo.json"));
         assert!(body.contains("Restart=on-failure"));
         assert!(body.contains("RestartSec=2"));
     }
@@ -171,6 +171,6 @@ mod tests {
         let mut c = ctx();
         c.config_path = None;
         let body = inst.render_unit(&c);
-        assert!(!body.contains("AURA_CONFIG_PATH"));
+        assert!(!body.contains("BAYBO_CONFIG_PATH"));
     }
 }

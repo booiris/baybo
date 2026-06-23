@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use aura_security::{
+use baybo_security::{
     AddOutcome, InjectionDetector, InjectionSeverity, InjectionWarning, LeakAction, LeakDetector,
     PlaceholderMinter, SecretVault, SecurityError, UserSecretManager,
 };
@@ -13,9 +13,9 @@ type Result<T> = std::result::Result<T, SecurityError>;
 // SecurityGateway
 // ---------------------------------------------------------------------------
 
-use aura_channels::{Message, OutgoingMessage};
-use aura_llm::LlmResponse;
-use aura_model::{ContentBlock, Session, ThinkingContent};
+use baybo_channels::{Message, OutgoingMessage};
+use baybo_llm::LlmResponse;
+use baybo_model::{ContentBlock, Session, ThinkingContent};
 
 const SESSION_SECRETS_KEY: &str = "__security_placeholder_map";
 
@@ -252,19 +252,19 @@ impl SecurityGateway {
     /// `ToolOutput::Error` (string leaves) and `ToolOutput::Json` (full
     /// recursive walk). Mints + vaults any new secrets and logs any
     /// prompt-injection markers observed.
-    pub async fn sanitize_tool_output(&self, output: &mut aura_tools::ToolOutput) -> Result<()> {
+    pub async fn sanitize_tool_output(&self, output: &mut baybo_tools::ToolOutput) -> Result<()> {
         let mut mints: Vec<Mint> = Vec::new();
         match output {
-            aura_tools::ToolOutput::Text(s) | aura_tools::ToolOutput::Error(s) => {
+            baybo_tools::ToolOutput::Text(s) | baybo_tools::ToolOutput::Error(s) => {
                 self.log_injection_warnings("tool_output", s);
                 sanitize_string(s, &self.leak_detector, &self.minter, &mut mints);
             }
-            aura_tools::ToolOutput::Json(v) => {
+            baybo_tools::ToolOutput::Json(v) => {
                 self.log_injection_warnings_in_value("tool_output", v);
                 sanitize_value(v, &self.leak_detector, &self.minter, &mut mints);
             }
-            aura_tools::ToolOutput::WithAttachments { text, .. }
-            | aura_tools::ToolOutput::MultiModalText { text, .. } => {
+            baybo_tools::ToolOutput::WithAttachments { text, .. }
+            | baybo_tools::ToolOutput::MultiModalText { text, .. } => {
                 self.log_injection_warnings("tool_output", text);
                 sanitize_string(text, &self.leak_detector, &self.minter, &mut mints);
             }
@@ -458,7 +458,7 @@ impl SecurityGateway {
     fn apply_matches_to_blocks(
         &self,
         blocks: &mut [ContentBlock],
-        matches: &[aura_security::LeakMatch],
+        matches: &[baybo_security::LeakMatch],
     ) -> Vec<Mint> {
         let mut mints: Vec<Mint> = Vec::new();
         let mut by_original: HashMap<&str, usize> = HashMap::new();
@@ -670,28 +670,28 @@ pub struct SecretVaultSummary {
 /// redaction and its `UserSecretManager` for add/list/check — guaranteeing the
 /// same mint/vault pipeline as input sanitization.
 #[async_trait::async_trait]
-impl aura_tools::SecretAccess for SecurityGateway {
-    async fn resolve_env(&self, names: &[String]) -> aura_tools::Result<Vec<(String, String)>> {
+impl baybo_tools::SecretAccess for SecurityGateway {
+    async fn resolve_env(&self, names: &[String]) -> baybo_tools::Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(names.len());
         for name in names {
             let value = self
                 .user_secrets
                 .get(name)
                 .await
-                .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?
+                .map_err(|e| baybo_tools::ToolError::Execution(e.to_string()))?
                 .ok_or_else(|| {
-                    aura_tools::ToolError::InvalidParams(format!("secret '{name}' not found"))
+                    baybo_tools::ToolError::InvalidParams(format!("secret '{name}' not found"))
                 })?;
             let plaintext = value
                 .as_str()
-                .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?
+                .map_err(|e| baybo_tools::ToolError::Execution(e.to_string()))?
                 .to_string();
             out.push((name.clone(), plaintext));
         }
         Ok(out)
     }
 
-    async fn redact(&self, text: &str, values: &[String]) -> aura_tools::Result<String> {
+    async fn redact(&self, text: &str, values: &[String]) -> baybo_tools::Result<String> {
         let mut out = text.to_string();
         for value in values {
             if value.len() < MIN_REDACT_LEN || !out.contains(value.as_str()) {
@@ -701,7 +701,7 @@ impl aura_tools::SecretAccess for SecurityGateway {
             self.secret_vault
                 .store_secret(&placeholder, value.as_bytes())
                 .await
-                .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))?;
+                .map_err(|e| baybo_tools::ToolError::Execution(e.to_string()))?;
             out = out.replace(value.as_str(), &placeholder);
         }
         Ok(out)
@@ -712,36 +712,36 @@ impl aura_tools::SecretAccess for SecurityGateway {
         name: &str,
         value: &[u8],
         overwrite: bool,
-    ) -> aura_tools::Result<AddOutcome> {
+    ) -> baybo_tools::Result<AddOutcome> {
         self.user_secrets
             .add(name, value, overwrite)
             .await
-            .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))
+            .map_err(|e| baybo_tools::ToolError::Execution(e.to_string()))
     }
 
-    async fn list_names(&self) -> aura_tools::Result<Vec<String>> {
+    async fn list_names(&self) -> baybo_tools::Result<Vec<String>> {
         self.user_secrets
             .list()
             .await
-            .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))
+            .map_err(|e| baybo_tools::ToolError::Execution(e.to_string()))
     }
 
-    async fn exists(&self, names: &[String]) -> aura_tools::Result<Vec<(String, bool)>> {
+    async fn exists(&self, names: &[String]) -> baybo_tools::Result<Vec<(String, bool)>> {
         self.user_secrets
             .exists_many(names)
             .await
-            .map_err(|e| aura_tools::ToolError::Execution(e.to_string()))
+            .map_err(|e| baybo_tools::ToolError::Execution(e.to_string()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_llm::{TokenUsage, ToolCallInfo};
-    use aura_model::ChannelType;
-    use aura_security::EncryptionKey;
-    use aura_security::leak_detector::{LeakAction, LeakDetectionRule};
-    use aura_security::test_support::MemorySecretStore;
+    use baybo_llm::{TokenUsage, ToolCallInfo};
+    use baybo_model::ChannelType;
+    use baybo_security::EncryptionKey;
+    use baybo_security::leak_detector::{LeakAction, LeakDetectionRule};
+    use baybo_security::test_support::MemorySecretStore;
     use chrono::Utc;
     use regex::Regex;
 
@@ -759,7 +759,7 @@ mod tests {
 
     #[tokio::test]
     async fn secret_access_impl_roundtrip() {
-        use aura_tools::SecretAccess;
+        use baybo_tools::SecretAccess;
         let (gateway, _store) = make_gateway();
 
         gateway
@@ -803,7 +803,7 @@ mod tests {
             id: "msg-1".into(),
             session_id: "sess-1".into(),
             channel: ChannelType::tui(),
-            sender: aura_model::User {
+            sender: baybo_model::User {
                 id: "user-1".into(),
                 name: Some("Test".into()),
                 channel: ChannelType::tui(),
@@ -816,10 +816,10 @@ mod tests {
     }
 
     fn make_session() -> Session {
-        let id = aura_model::SessionId::from("sess-1");
+        let id = baybo_model::SessionId::from("sess-1");
         Session {
             id: id.clone(),
-            user: aura_model::User {
+            user: baybo_model::User {
                 id: "user-1".into(),
                 name: Some("Test".into()),
                 channel: ChannelType::tui(),
@@ -829,7 +829,7 @@ mod tests {
             last_active: Utc::now(),
             state: Default::default(),
             root_session_id: id,
-            trigger: aura_model::TriggerSource::User,
+            trigger: baybo_model::TriggerSource::User,
             lineage: None,
             hidden: false,
             pinned: false,

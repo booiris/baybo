@@ -1,7 +1,7 @@
 import type { Bot } from "grammy";
 import { InputFile } from "grammy";
 
-import type { WireAttachment } from "@aura/channel-sdk";
+import type { WireAttachment } from "@baybo/channel-sdk";
 
 import { markdownToTelegram, TELEGRAM_PARSE_MODE } from "../markdown.js";
 import { threadOpts, type TelegramChat } from "../platform.js";

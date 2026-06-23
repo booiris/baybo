@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use aura_security::SecretVault;
+use baybo_security::SecretVault;
 
 use super::VAULT_KEY_TOKENS;
 use super::token_bundle::OAuthTokenBundle;
@@ -43,8 +43,8 @@ impl VaultTokenStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_security::EncryptionKey;
-    use aura_security::test_support::MemorySecretStore;
+    use baybo_security::EncryptionKey;
+    use baybo_security::test_support::MemorySecretStore;
     use std::sync::Arc;
 
     fn make_store() -> VaultTokenStore {

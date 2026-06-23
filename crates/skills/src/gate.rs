@@ -1,6 +1,6 @@
 //! Trait-based risk-check hook. Lives here rather than in
-//! `aura-skills-assessor` to dodge a circular dep — the assessor
-//! crate already depends on `aura-skills` for `SkillDefinition`.
+//! `baybo-skills-assessor` to dodge a circular dep — the assessor
+//! crate already depends on `baybo-skills` for `SkillDefinition`.
 
 use async_trait::async_trait;
 

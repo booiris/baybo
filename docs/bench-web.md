@@ -7,7 +7,7 @@ every request, normalizes each bench's heterogeneous `results-*.json`
 into one shared model, and serves both a small JSON API and an embedded
 React dashboard. No database, no auth — it reads files a developer
 already has locally. It is intentionally decoupled from the production
-`aura-gateway` daemon.
+`baybo-gateway` daemon.
 
 ## Run it
 
@@ -24,11 +24,11 @@ bench/bench-web/run.sh --release       # optimized backend
 Or directly:
 
 ```bash
-cargo run -p aura-bench-web -- --root bench --port 7000   # embedded UI
+cargo run -p baybo-bench-web -- --root bench --port 7000   # embedded UI
 ```
 
 Backend flags: `--root` (default `bench`), `--host` (default `127.0.0.1`),
-`--port` (default `7000`). Logging via `RUST_LOG=aura_bench_web=debug`.
+`--port` (default `7000`). Logging via `RUST_LOG=baybo_bench_web=debug`.
 
 ## Layout
 
@@ -44,7 +44,7 @@ bench/bench-web/
     trace.rs            trace reshape + raw-file endpoint + safe_join path guard
     webui.rs            serve the embedded bundle
     error.rs            ApiError → HTTP
-  web/                  fresh Vite+React+TS+Tailwind-v4 app (pnpm pkg aura-bench-web)
+  web/                  fresh Vite+React+TS+Tailwind-v4 app (pnpm pkg baybo-bench-web)
     src/generated/      ts-rs output (COMMITTED; gated by scripts/check-ts-bindings.sh)
     src/types/trace.ts, components/trace/{MessageList,SanitizeChip}.tsx  (ported from web/)
     components/trace/FlowRail.tsx  the item view's default: a dense step rail —
@@ -125,7 +125,7 @@ fields carry `#[ts(type = "number")]` so the TS side is JSON-safe
   `runs/<ts>/run_metadata.json`.
 - **Cache tokens**: every bench surfaces `cached_input_tokens` (the
   prompt-cache-hit share of input — often 88–99%). swe/memory read it
-  from `aura cost show`'s summary; TB sums it from the trace. The UI shows
+  from `baybo cost show`'s summary; TB sums it from the trace. The UI shows
   it inline (`in / out · N cached (RATE%)`) plus an `input cache rate`
   chip on the item page. Note `cost_micro_usd` already prices cache hits
   at the cheaper rate, so this is a visibility add, not a cost fix.

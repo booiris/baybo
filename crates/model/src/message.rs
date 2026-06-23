@@ -45,8 +45,8 @@ pub enum ContentBlock {
 
 /// Open-tag prefix of the `<tool_output name="...">` envelope the agent wraps
 /// untrusted tool results in before they enter the LLM transcript. Shared so
-/// the wrapper (`aura-context`) and the injection detector's forged-delimiter
-/// rule (`aura-security`) can never disagree on the literal they key off.
+/// the wrapper (`baybo-context`) and the injection detector's forged-delimiter
+/// rule (`baybo-security`) can never disagree on the literal they key off.
 pub const TOOL_OUTPUT_OPEN_PREFIX: &str = "<tool_output";
 
 /// Close-tag prefix (`</tool_output`, without the trailing `>`): the wrapper
@@ -93,7 +93,7 @@ pub enum MessageSource {
     /// a user bubble just like [`MessageSource::User`] (see
     /// [`ChatMessage::from_user`]), but is tracked distinctly so the wire layer
     /// can frame it with a `<user_interjection>` steering envelope
-    /// (`aura_context::prompts::interjection`). See
+    /// (`baybo_context::prompts::interjection`). See
     /// `docs/mid-turn-user-interjection.md`.
     UserInterjection,
     /// A cron job's fire-time framed prompt: synthesized by the agent, so
@@ -105,7 +105,7 @@ pub enum MessageSource {
     /// inform the current turn. Synthesized by the agent (so hidden from the
     /// chat transcript like [`MessageSource::Agent`]), but tracked distinctly
     /// so the wire layer frames it with a `<recalled_memory>` steering envelope
-    /// (`aura_context::prompts::recalled_memory`) and operator surfaces can tell
+    /// (`baybo_context::prompts::recalled_memory`) and operator surfaces can tell
     /// recalled context apart from a genuine turn. Always rides as a framed
     /// `Role::User` row — never `Role::System`, which would re-assert itself on
     /// every later turn (the failure mode that retired the prior memory
@@ -192,7 +192,7 @@ impl ChatMessage {
 
     /// A cron job's fire-time framed prompt — a `Role::User` turn the agent
     /// synthesized at fire time (see the agent crate's
-    /// `aura_context::prompts::cron::frame_cron_prompt`). Carries [`MessageSource::Cron`] so
+    /// `baybo_context::prompts::cron::frame_cron_prompt`). Carries [`MessageSource::Cron`] so
     /// the operator cron inbox can locate it by provenance instead of sniffing
     /// the `[cron:<id>]` framing tag, while the chat transcript still hides it.
     pub fn cron_fire(content: Vec<ContentBlock>) -> Self {
@@ -207,7 +207,7 @@ impl ChatMessage {
     /// `Role::User` row to inform the current turn — the **only** constructor
     /// that marks a row [`MessageSource::RecalledMemory`]. Never `Role::System`
     /// (which would pollute every later turn); the wire layer wraps it in a
-    /// `<recalled_memory>` envelope (`aura_context::prompts::recalled_memory`)
+    /// `<recalled_memory>` envelope (`baybo_context::prompts::recalled_memory`)
     /// re-derived per call. Carries [`MessageSource::RecalledMemory`] so it never
     /// surfaces as a user bubble.
     pub fn recalled_memory(content: Vec<ContentBlock>) -> Self {
@@ -411,7 +411,7 @@ mod tests {
 
         assert_eq!(
             rust_members, ts_members,
-            "MessageSource drift between aura_model and web/src/types/trace.ts — \
+            "MessageSource drift between baybo_model and web/src/types/trace.ts — \
              keep the TS union in sync with the Rust enum"
         );
     }

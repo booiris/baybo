@@ -2,7 +2,7 @@
 
 ## Overview
 
-`aura-gateway` is Aura's headless backend. It runs **two listeners** side
+`baybo-gateway` is Baybo's headless backend. It runs **two listeners** side
 by side against the same manager graph:
 
 1. **Admin listener** — TCP, bearer-token authenticated. Surfaces the
@@ -29,28 +29,28 @@ by side against the same manager graph:
    plugin speak this one protocol. `127.0.0.1` binding is hardcoded —
    config cannot loosen it to `0.0.0.0`.
 
-The per-type [`aura_channels::Channel`] is installed at gateway **boot**
+The per-type [`baybo_channels::Channel`] is installed at gateway **boot**
 from `ChannelsConfig` (`src/channel/boot.rs::install_channels`), not per
 connection. Each accepted WS upgrade builds a `src/channel/adapter.rs::
 Sidecar` that resolves the existing channel from the [`ChannelRegistry`]
 and calls `Channel::attach(Connection)` (a lazy-install fallback only
-covers out-of-tree sidecar types declared via `aura.json` or test
+covers out-of-tree sidecar types declared via `baybo.json` or test
 fixtures that skipped boot). The `Sidecar` owns an outbound frame mpsc
 and spawns two tasks: a translator that converts
-[`SessionEvent`](aura_channels::SessionEvent) → [`Frame`](aura_channels::wire::Frame),
+[`SessionEvent`](baybo_channels::SessionEvent) → [`Frame`](baybo_channels::wire::Frame),
 and a pump that drains the receiver onto the WS sink. Everything fans in
 to the same mpsc, so the pump is the single serialisation point onto the
 wire.
 
-The gateway is driven by the `aura gateway …` command tree. `start` runs
+The gateway is driven by the `baybo gateway …` command tree. `start` runs
 both listeners in the foreground; `install` / `enable` / `disable` /
 `uninstall` / `status` manage the platform service unit; `token
 {show|rotate}` manages the admin bearer token. The binary entrypoint
 intercepts `Commands::Gateway` in `src/main.rs` before the CLI dispatcher
 and routes it to `src/gateway_cmd.rs` — same pattern as `Commands::Tui`.
 
-Configuration lives in `aura_config::GatewayConfig` (a top-level
-section on `AuraConfig`). The gateway owns its own bind address /
+Configuration lives in `baybo_config::GatewayConfig` (a top-level
+section on `BayboConfig`). The gateway owns its own bind address /
 port; the `http` channel itself has no operator-facing knobs and is
 unconditionally installed at boot.
 
@@ -71,16 +71,16 @@ Both listeners share the same manager graph (`SessionManager`,
 `JobLifecycle`, …). The channel listener hosts `/v1/channel-ws` and
 `/v1/blobs`; the router sees a single `IncomingMessage` stream
 regardless of whether a frame came from the TUI, a sidecar, or a web
-chat tab. The per-type [`aura_channels::Channel`] each connection
+chat tab. The per-type [`baybo_channels::Channel`] each connection
 attaches to is installed at boot and dispatched by `ChannelType` — no
 parallel agent pipeline.
 
 ### Admin token, stored in `SecretVault`
 
-On `aura gateway enable`, `AdminToken::mint_if_absent` either reads
+On `baybo gateway enable`, `AdminToken::mint_if_absent` either reads
 the current token or generates a fresh 32-byte random value (hex-
 encoded) and writes it under the vault key `gateway.admin_token` — the
-same AES-256-GCM store the rest of Aura uses. `gateway.admin_token` is
+same AES-256-GCM store the rest of Baybo uses. `gateway.admin_token` is
 the only key the code reads or writes for the admin bearer. `token show`
 reads,
 `token rotate` overwrites. `uninstall` removes the service unit but
@@ -92,13 +92,13 @@ secret as every other credential in the project.
 ### Channel auth — vault-issued tokens (TUI, subprocess, tool, web)
 
 The channel listener enforces a single header on every request:
-`x-aura-channel-token: <hex>`, looked up against the in-memory
+`x-baybo-channel-token: <hex>`, looked up against the in-memory
 `ChannelTokenTable`. Each entry carries a `ClientIdentity { pid, label,
 bound_channel_type }`; the auth middleware maps the entry's `label` to
 one of four `auth::channel::AuthedClient` variants by reserved label /
 prefix:
 
-- **`Tui`** — label equals `aura_gateway::TUI_CLIENT_LABEL` ("tui").
+- **`Tui`** — label equals `baybo_gateway::TUI_CLIENT_LABEL` ("tui").
 - **`Tool`** — label starts with `TOOL_CLIENT_LABEL_PREFIX` ("tool/",
   e.g. `tool/browser`). The embedded tool sidecars (the browser MCP
   server today). Session-scoped like the TUI, so it **bypasses the
@@ -117,9 +117,9 @@ prefix:
 
 The flavours of token that end up in the table:
 
-- **TUI token.** Generated on every `aura gateway start`, written to
+- **TUI token.** Generated on every `baybo gateway start`, written to
   the secret vault under the key
-  `aura_gateway::TUI_TOKEN_VAULT_KEY` ("gateway.tui_token"), and
+  `baybo_gateway::TUI_TOKEN_VAULT_KEY` ("gateway.tui_token"), and
   registered with the gateway's own pid + the reserved TUI label. The
   gateway holds the returned `TokenHandle` for the entire lifetime of
   `start`, so the in-memory entry is revoked the moment shutdown
@@ -129,7 +129,7 @@ The flavours of token that end up in the table:
   value.
 - **Subprocess capability tokens.** Minted inside
   `ChannelSpawner::spawn` before `Command::spawn`, handed to the
-  child via the `AURA_CHANNEL_TOKEN` env var, and revoked when the
+  child via the `BAYBO_CHANNEL_TOKEN` env var, and revoked when the
   owning `ChildHandle` drops. The PID stored on the identity is the
   child PID and is retained for diagnostics (log lines,
   `/v1/status`) — it is *not* part of the auth check, since loopback
@@ -184,7 +184,7 @@ Token comparison differs by listener:
 
 - **Admin bearer** is compared in constant time:
   `auth::admin::require_admin_token` runs the presented token through
-  `aura_gateway::constant_time_eq` against the expected value
+  `baybo_gateway::constant_time_eq` against the expected value
   (`auth/admin.rs`).
 - **Channel token** is *not* a constant-time compare, by design.
   `ChannelTokenTable::lookup` is a plain `DashMap::get(token)`
@@ -195,7 +195,7 @@ Token comparison differs by listener:
   hash-probe timing side-channel on a high-entropy key is not a realistic
   recovery vector. Timing-safe equality is reserved for the admin bearer.
 
-`aura_gateway::constant_time_eq` is wired on the admin bearer path only,
+`baybo_gateway::constant_time_eq` is wired on the admin bearer path only,
 deliberately per the above. `/healthz` and `/readyz` skip auth on both
 listeners.
 
@@ -236,7 +236,7 @@ approval gate lives on the `Channel`, not the connection — the boot-time
 registry wiring installs a type-level gate into the shared
 `ApprovalGateMap`. A single pump task drains the receiver and writes each
 frame to the WS sink with
-[`rmp_serde::to_vec_named`](aura_channels::wire::encode) —
+[`rmp_serde::to_vec_named`](baybo_channels::wire::encode) —
 everything fans *in* to the mpsc, the pump is the only thing that
 touches the socket. On disconnect `Sidecar::into_pump()` detaches the
 connection from the channel and drops the last `frame_tx` clones, so the
@@ -282,8 +282,8 @@ module. The duplicated surface is small and the independence is worth
 more than the line count saved.
 
 `api/dto.rs` is also the **only** place in the workspace that depends
-on `utoipa`. Domain crates (`aura-model`, `aura-job`, `aura-cron`,
-`aura-tools`) stay HTTP-framework-agnostic — no `#[derive(ToSchema)]`,
+on `utoipa`. Domain crates (`baybo-model`, `baybo-job`, `baybo-cron`,
+`baybo-tools`) stay HTTP-framework-agnostic — no `#[derive(ToSchema)]`,
 no `#[schema(...)]` attributes leaking into them. The gateway defines
 a mirror type for every domain type that appears on the wire and
 provides `From<Domain>` conversions; handlers build DTOs at the seam
@@ -309,7 +309,7 @@ The document is checked in at `docs/openapi.json` and kept honest by
 `crates/gateway/tests/openapi_spec_sync.rs`: the test regenerates the
 spec from `v1_router_and_spec()` and compares byte-for-byte. On
 intentional surface changes, run with `UPDATE_OPENAPI=1 cargo test -p
-aura-gateway --test openapi_spec_sync` to rewrite the snapshot. A
+baybo-gateway --test openapi_spec_sync` to rewrite the snapshot. A
 drifted spec fails CI, which guarantees the frontend can regenerate
 types without hitting a stale file.
 
@@ -360,7 +360,7 @@ the relevant `web/` source inputs (`src/`, `index.html`,
 `package.json`, `tsconfig*.json`, `vite.config.ts`,
 `docs/openapi.json`, and the pnpm lock/workspace files). If those
 inputs changed since the last successful web build, it runs
-`pnpm --filter aura-web build`; otherwise it reuses the existing
+`pnpm --filter baybo-web build`; otherwise it reuses the existing
 `web/dist/`. It then zstd-compresses each emitted asset and writes
 `$OUT_DIR/webui_assets.rs` with a static asset table pairing the path,
 pre-computed MIME string, and compressed bytes (`html`, `js`, `css`,
@@ -397,12 +397,12 @@ Release flow:
 
 ```bash
 pnpm install
-pnpm --filter aura-web build
-cargo build --release -p aura-gateway
+pnpm --filter baybo-web build
+cargo build --release -p baybo-gateway
 ```
 
 If the tracked web inputs changed, `build.rs` attempts
-`pnpm --filter aura-web build` automatically during `cargo build`. If
+`pnpm --filter baybo-web build` automatically during `cargo build`. If
 that build fails or the frontend toolchain isn't available,
 `build.rs` falls back to the existing `web/dist/`; if no dist exists at
 all, it writes a one-line placeholder `index.html` so backend-only
@@ -426,7 +426,7 @@ window.location.origin` (the Vite origin), and bearer-token auth
 still works end-to-end because the proxy forwards the `Authorization`
 header. If you need to point the web bundle at a gateway on a
 different origin (e.g. running `npm run dev` against a remote gateway),
-add that origin to `gateway.cors_allowed_origins` in `aura.json` and
+add that origin to `gateway.cors_allowed_origins` in `baybo.json` and
 use the LoginScreen's **Advanced → Gateway base URL** field to
 override the stored `baseUrl`.
 
@@ -434,8 +434,8 @@ override the stored `baseUrl`.
 
 ```
 default      = ["linux", "macos"]
-linux        = []              # systemd installer — renders ~/.config/systemd/user/aura-gateway.service
-macos        = []              # launchd installer — renders ~/Library/LaunchAgents/com.aura.gateway.plist
+linux        = []              # systemd installer — renders ~/.config/systemd/user/baybo-gateway.service
+macos        = []              # launchd installer — renders ~/Library/LaunchAgents/com.baybo.gateway.plist
 test-support = ["dep:tempfile"] # cross-crate test helpers (CLAUDE.md gating rule)
 ```
 
@@ -465,14 +465,14 @@ snapshot the rendered output without writing to disk.
 ### `ExecStart` resolution is explicit, not implicit
 
 `installer::resolve_exec_start(explicit)` follows a strict precedence:
-`--exec-start` flag → `which aura` on `$PATH` → `std::env::current_exe()`.
+`--exec-start` flag → `which baybo` on `$PATH` → `std::env::current_exe()`.
 Under `cfg(debug_assertions)` with no flag the resolver **refuses** with
-a clear hint: `target/debug/aura` disappears after `cargo clean`, and
+a clear hint: `target/debug/baybo` disappears after `cargo clean`, and
 an installed service pointing at it would break silently. This is a
 real footgun from early versions and the refusal is intentional.
 
-`AURA_CONFIG_PATH` is captured at install time and embedded as
-`Environment=AURA_CONFIG_PATH=...` in the systemd unit (or as an entry
+`BAYBO_CONFIG_PATH` is captured at install time and embedded as
+`Environment=BAYBO_CONFIG_PATH=...` in the systemd unit (or as an entry
 under `EnvironmentVariables` in the launchd plist). systemd does not
 inherit the invoking shell's env, so the capture is load-bearing.
 
@@ -487,7 +487,7 @@ restart loop can thrash the lock. The systemd unit also sets
 
 ## CLI Surface
 
-All commands live under `aura gateway` and are also usable over slash
+All commands live under `baybo gateway` and are also usable over slash
 mode once a channel exposes them (not wired yet; the `Gateway` arm
 returns `UnknownCommand` from the normal dispatcher because
 `src/main.rs` intercepts it before dispatch).
@@ -521,7 +521,7 @@ listener-specific auth middleware.
 ```
 GET    /healthz                         liveness (no auth)
 GET    /readyz                          managers ready (no auth)
-GET    /v1/status                       aura status mirror
+GET    /v1/status                       baybo status mirror
 GET    /v1/config                       redacted config snapshot (read-only)
 PUT    /v1/config                       { path, value } → 200 { path, written_to, requires_restart }
 DELETE /v1/config                       { path } → 200 { path, written_to, requires_restart }
@@ -621,7 +621,7 @@ channel token does. (The repo's `admin_has_no_channels` test asserts
 and does not exercise the channel subrouter, so it does *not* establish
 that channel routes are absent from the admin listener.)
 
-The WS protocol is defined by [`aura_channels::wire::Frame`]
+The WS protocol is defined by [`baybo_channels::wire::Frame`]
 (tagged on `kind`, MessagePack-named). The client opens with a
 `Register { token, channel_type }` frame (no `protocol_version`); the
 server validates it via `channel::handshake::validate_register` against
@@ -699,14 +699,14 @@ For TUI clients only, the input-history ring rides two frames:
 be the next frame after the per-session subscribe, before any catch-up
 replay), and `HistoryAppend { session_id, entry }` is sent by the
 client after every accepted submission. The gateway owns the encrypted
-ring via `channel::TuiHistoryStore` (vault key `aura.tui.input_history`,
+ring via `channel::TuiHistoryStore` (vault key `baybo.tui.input_history`,
 500-entry cap, consecutive-duplicate dedup); concurrent appends from
 multiple TUIs on the same gateway serialise through a
 `tokio::sync::Mutex` on the store. TUI clients never open the vault
 themselves. See [`tui.md`](./tui.md) and [`security.md`](./security.md).
 
 Config mutation endpoints (`PUT /v1/config`, `DELETE /v1/config`, `PUT
-/v1/llm/...`) write through to the same on-disk `aura.json` that `aura
+/v1/llm/...`) write through to the same on-disk `baybo.json` that `baybo
 config set/unset` targets, then trigger an **in-process reload** via the
 shared `ConfigReloader` (`src/reload.rs`, re-exported from `lib.rs`).
 Hot-updatable fields take effect live; only a non-hot field forces a
@@ -732,7 +732,7 @@ lives in `src/runtime.rs` (the binary crate's `src/`, not under
 // src/runtime.rs
 pub struct ManagerGraph { /* all Arcs; llm_client + llm_pool; channels_registry; … */ }
 pub async fn build_managers(
-    config: Arc<AuraConfig>,
+    config: Arc<BayboConfig>,
     config_path: Option<PathBuf>,
     shutdown: ShutdownSignal,
     leak_detector: Arc<LeakDetector>,
@@ -741,7 +741,7 @@ pub async fn build_managers(
 pub struct RouterRunHandle { /* router, incoming_tx, incoming_rx, response_rx */ }
 pub async fn wire_router(graph: &mut ManagerGraph) -> RouterRunHandle;
 pub fn install_signal_handler(tracker: &mut TaskTracker, shutdown: ShutdownSignal);
-pub async fn build_secret_vault(config: &AuraConfig) -> anyhow::Result<Arc<SecretVault>>; // vault-only path, no manager graph
+pub async fn build_secret_vault(config: &BayboConfig) -> anyhow::Result<Arc<SecretVault>>; // vault-only path, no manager graph
 ```
 
 `gateway_cmd::start` is the boot-path caller of `build_managers` +
@@ -786,7 +786,7 @@ subcommands use it for the same reason.
   processes — see the threat-model note under "Channel auth" for the
   boundary.
 - **All gateway logs pass through `RedactingMakeWriter`** — the same
-  writer wrapper the TUI uses (`src/logging.rs`). `AURA_LOG_FORMAT=json`
+  writer wrapper the TUI uses (`src/logging.rs`). `BAYBO_LOG_FORMAT=json`
   is honoured. Request spans carry a `listener` field (`admin` /
   `channel`) so the origin of each request is obvious in logs.
 - **Every mutation goes through a manager.** Route handlers call
@@ -794,9 +794,9 @@ subcommands use it for the same reason.
   friends directly; there are no side-channel writes that bypass
   Trace/Job observability.
 - **Singleton lock applies only to the gateway.** `start` acquires
-  the per-workspace lock on `<workspace>/aura.lock`. `aura tui` is a
+  the per-workspace lock on `<workspace>/baybo.lock`. `baybo tui` is a
   `/v1/channel-ws` client (see [`tui.md`](./tui.md)) and **does not**
-  take the lock, so one long-lived `aura gateway` can serve many
+  take the lock, so one long-lived `baybo gateway` can serve many
   concurrent TUI sessions in the same workspace.
 
 ## Crate Layout
@@ -882,7 +882,7 @@ the `ChannelTokenTable` / `ClientIdentity` / `TokenHandle` types live
 inline in `crates/gateway/src/auth/token.rs` and are re-exported from
 both `crate::auth` and the crate root, so internal call sites can
 write `use crate::auth::ChannelTokenTable` and the bin's `gateway_cmd`
-/ `tui_cmd` boot paths reach them as `aura_gateway::ChannelTokenTable`.
+/ `tui_cmd` boot paths reach them as `baybo_gateway::ChannelTokenTable`.
 There is no compiled-in PSK any more — every credential is generated
 at runtime and stored in the per-workspace vault.
 
@@ -903,14 +903,14 @@ at runtime and stored in the per-workspace vault.
   reveal path. The admin token and the per-start TUI token are
   registered as `LeakDetector::Replace` rules at detector-construction
   time.
-- **config** — `AuraConfig::gateway` drives admin bind address, channel
+- **config** — `BayboConfig::gateway` drives admin bind address, channel
   socket path, CORS origins, and shutdown grace.
 - **storage** — `Store::open` for vault bootstrap in `gateway_cmd`; the
   `TraceStore` trait behind `/v1/traces/:session_id`.
 - **tui** — the TUI is a `/v1/channel-ws` client like any other
   sidecar. It reads the per-start token from `gateway.tui_token` in
   the secret vault, presents it via the shared
-  `x-aura-channel-token` header, registers as `channel_type = "tui"`,
+  `x-baybo-channel-token` header, registers as `channel_type = "tui"`,
   and client-generates session UUIDs. Admin endpoints are not
   reached from the TUI.
 - **cli** — `Commands::Gateway { cmd: GatewayCmd }` is defined in
@@ -921,4 +921,4 @@ at runtime and stored in the per-workspace vault.
   `gateway_cmd::run`; the long-running `start` path spins up both
   listeners against the same manager graph.
 
-[`aura_channels::Channel`]: ./channels.md
+[`baybo_channels::Channel`]: ./channels.md

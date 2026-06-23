@@ -1,4 +1,4 @@
-use aura_model::ContentBlock;
+use baybo_model::ContentBlock;
 
 /// Convert a ContentBlock to a textual representation.
 /// Text blocks return the text directly; non-text blocks produce a descriptive placeholder.
@@ -51,7 +51,7 @@ pub fn extract_text(blocks: &[ContentBlock]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::BlobRef;
+    use baybo_model::BlobRef;
 
     fn sample_blob() -> BlobRef {
         BlobRef {

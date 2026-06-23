@@ -3,8 +3,8 @@ mod scheduler;
 mod shutdown;
 pub mod tools;
 
-pub use aura_model::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
-pub use aura_store::CronStore;
+pub use baybo_model::{CronExecution, CronJob, CronSchedule, CronStatus, ExecutionStatus};
+pub use baybo_store::CronStore;
 pub use error::CronError;
 pub use scheduler::{CronScheduler, CronTriggerEvent};
 pub use shutdown::Shutdown;

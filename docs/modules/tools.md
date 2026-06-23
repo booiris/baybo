@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `tools` crate provides Aura's tool abstraction, registration, and runtime routing. It exposes a uniform `Tool` interface so Agent does not care how a particular tool is implemented.
+The `tools` crate provides Baybo's tool abstraction, registration, and runtime routing. It exposes a uniform `Tool` interface so Agent does not care how a particular tool is implemented.
 
 Core responsibilities:
 
@@ -20,18 +20,18 @@ permission rules.
 
 | Tool                                                                                                                                                                                                                                                                  | Status      | Notes                                                                                                       |
 | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------- |
-| `Read`, `Write`, `Edit`                                                                                                                                                                                                                                               | implemented | file I/O on absolute paths. `Edit` carries extra guards when `file_path` resolves under `<workspace>/profile/`: writes are restricted to the three identity files (`SOUL.md`, `USER.md`, `IDENTITY.md`), the existing file is capped at 1 MiB, and after a successful write the change is staged and committed to `profile/`'s standalone git repo with a fixed `Aura <aura@local>` author and `--no-verify` (audit history, not a hand-curated repo). Detached HEAD or commit failure leaves the file write in place and surfaces a `commit_warning` in the tool output. A profile edit does **not** change the running session's system prompt mid-turn; `ContextManager` re-resolves it on the next compaction (see [`agent.md`](agent.md)), so the edit takes effect from then on. |
-| `Bash`                                                                                                                                                                                                                                                                | implemented | `sh -c` inside the OS sandbox in **permissive filesystem** mode capped at `workspace_root + $HOME` (FHS roots RO; nothing outside that union is visible — no full host-root bind), with `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.docker`, `~/.kube`, `$AURA_HOME`, … masked by per-call tmpfs. Network enabled. Approval gate fires only on file-delete (`rm`/`rmdir`/`find -delete`) or destructive `git` (`reset --hard`, `push --force`, `branch -D`, …). No env/cwd persistence across calls. See `docs/modules/sandbox.md#filesystem-policy-workspace-vs-permissive`. |
+| `Read`, `Write`, `Edit`                                                                                                                                                                                                                                               | implemented | file I/O on absolute paths. `Edit` carries extra guards when `file_path` resolves under `<workspace>/profile/`: writes are restricted to the three identity files (`SOUL.md`, `USER.md`, `IDENTITY.md`), the existing file is capped at 1 MiB, and after a successful write the change is staged and committed to `profile/`'s standalone git repo with a fixed `Baybo <baybo@local>` author and `--no-verify` (audit history, not a hand-curated repo). Detached HEAD or commit failure leaves the file write in place and surfaces a `commit_warning` in the tool output. A profile edit does **not** change the running session's system prompt mid-turn; `ContextManager` re-resolves it on the next compaction (see [`agent.md`](agent.md)), so the edit takes effect from then on. |
+| `Bash`                                                                                                                                                                                                                                                                | implemented | `sh -c` inside the OS sandbox in **permissive filesystem** mode capped at `workspace_root + $HOME` (FHS roots RO; nothing outside that union is visible — no full host-root bind), with `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.docker`, `~/.kube`, `$BAYBO_HOME`, … masked by per-call tmpfs. Network enabled. Approval gate fires only on file-delete (`rm`/`rmdir`/`find -delete`) or destructive `git` (`reset --hard`, `push --force`, `branch -D`, …). No env/cwd persistence across calls. See `docs/modules/sandbox.md#filesystem-policy-workspace-vs-permissive`. |
 | `Glob`, `Grep`                                                                                                                                                                                                                                                        | implemented | basic walkdir + regex; will be upgraded if throughput becomes an issue                                      |
 | `WebFetch`                                                                                                                                                                                                                                                            | implemented | renders the response as Markdown; when `prompt` is supplied, the agent layer has bound a side LLM into `ToolContext::llm` (gateway/runtime path binds `Some`, argv-mode leaves `None`), AND the rendered content is at least `SUMMARY_MIN_CHARS` (2048 chars), runs a fixed-system extraction pass and returns the model's reply instead of the raw body. Shorter pages and LLM-less builds fall through to raw markdown — the prompt is silently ignored. |
 | `SendFile`                                                                                                                                                                                                                                                            | implemented | streams a local file into `BlobStore` and returns a channel attachment                                      |
 | `Now`                                                                                                                                                                                                                                                                 | implemented | returns the current UTC + host-local time so the LLM can anchor relative-time reasoning; no parameters, no capabilities |
 | `Echo`                                                                                                                                                                                                                                                                | debug-only  | returns params verbatim; registered only under `debug_assertions` for round-trip smoke-testing              |
-| `CronCreate`, `CronDelete`, `CronList`                                                                                                                                                                                                                                | implemented | live in `aura-cron::tools` (not `aura-tools::builtin`) because they hold `Arc<CronScheduler>`; registered from `src/runtime.rs` after the scheduler is constructed |
-| `Skill`                                                                                                                                                                                                                                                               | implemented | lives in `aura-skills::tools` (parallel to `aura-cron::tools`) because it holds `Arc<SkillRegistry>` + `Arc<dyn SkillRiskCheck>`; registered from `src/runtime.rs` after the assessor is constructed. Mode 1 (no `file_path`) returns the SKILL.md body plus a categorized inventory of helper files (`references/`, `templates/`, `scripts/`, `other`). Mode 2 (`file_path` set) returns a sub-file's contents with path-traversal protections. Risk assessor and `required_env` approval gate fire on every call. |
-| `SkillInstall`                                                                                                                                                                                                                                                        | implemented | lives in `aura-skills::tools` alongside `Skill`. Validates a source directory (must contain a parseable SKILL.md, must be outside the workspace skills dir, must not collide with an existing install), runs the risk assessor (`Dangerous` aborts with `ToolError::Denied`), copies the tree to `<workspace>/skills/<name>/` via a temp-dir-and-rename for atomicity, then triggers `SkillRegistry::reload()` so the new skill is available next turn. Declares `WriteFile` capability scoped to the skills dir. |
+| `CronCreate`, `CronDelete`, `CronList`                                                                                                                                                                                                                                | implemented | live in `baybo-cron::tools` (not `baybo-tools::builtin`) because they hold `Arc<CronScheduler>`; registered from `src/runtime.rs` after the scheduler is constructed |
+| `Skill`                                                                                                                                                                                                                                                               | implemented | lives in `baybo-skills::tools` (parallel to `baybo-cron::tools`) because it holds `Arc<SkillRegistry>` + `Arc<dyn SkillRiskCheck>`; registered from `src/runtime.rs` after the assessor is constructed. Mode 1 (no `file_path`) returns the SKILL.md body plus a categorized inventory of helper files (`references/`, `templates/`, `scripts/`, `other`). Mode 2 (`file_path` set) returns a sub-file's contents with path-traversal protections. Risk assessor and `required_env` approval gate fire on every call. |
+| `SkillInstall`                                                                                                                                                                                                                                                        | implemented | lives in `baybo-skills::tools` alongside `Skill`. Validates a source directory (must contain a parseable SKILL.md, must be outside the workspace skills dir, must not collide with an existing install), runs the risk assessor (`Dangerous` aborts with `ToolError::Denied`), copies the tree to `<workspace>/skills/<name>/` via a temp-dir-and-rename for atomicity, then triggers `SkillRegistry::reload()` so the new skill is available next turn. Declares `WriteFile` capability scoped to the skills dir. |
 | `SkillUninstall`                                                                                                                                                                                                                                                      | implemented | symmetric counterpart to `SkillInstall`. Looks up the skill by name, refuses if it has no on-disk source or its canonicalized `source_path` doesn't sit under the workspace skills dir (so registry-only or third-party-mounted skills aren't deletable), removes the directory recursively, then triggers `SkillRegistry::reload()`. Same `WriteFile` capability scoping. |
-| `TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate`                                                                                                                                                                                                                      | implemented | the session planning checklist — live in `aura-task::tools` (hold `Arc<dyn TaskStore>`); registered from `src/runtime.rs`. The agent loop re-injects the list every turn and emits it to the web checklist. See [`task.md`](task.md). |
+| `TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate`                                                                                                                                                                                                                      | implemented | the session planning checklist — live in `baybo-task::tools` (hold `Arc<dyn TaskStore>`); registered from `src/runtime.rs`. The agent loop re-injects the list every turn and emits it to the web checklist. See [`task.md`](task.md). |
 | `Agent`, `AskUserQuestion`, `SendMessage`, `EnterPlanMode`/`ExitPlanMode`, `EnterWorktree`/`ExitWorktree`, `LSP`, `Monitor`, `NotebookEdit`, `TaskStop`/`TaskOutput`, `ToolSearch`, `WebSearch`, `Team*`                                                               | TODO stub   | lives in `builtin::todo`; not auto-registered — each depends on a backing subsystem that has not yet landed (`TaskStop`/`TaskOutput` need the background-task runtime) |
 
 `ToolRegistry::with_defaults(blob_store, workspace_paths)` registers the
@@ -60,7 +60,7 @@ like `ToolContext::llm` (gateway/runtime binds `Some`, argv-mode leaves `None`;
 consumers fail closed). The concrete impl is `SecurityGateway`, so `resolve_env`
 and `redact` reuse the same deterministic mint + vault pipeline as input
 sanitization, while `add`/`list`/`exists` delegate to
-`aura_security::UserSecretManager` (the `user_env.<NAME>` namespace). Tools see
+`baybo_security::UserSecretManager` (the `user_env.<NAME>` namespace). Tools see
 only the trait.
 
 - **`SecretAdd` / `SecretList` / `SecretCheck`** (`builtin/secret.rs`) — add a
@@ -85,15 +85,15 @@ agent loop's `Tool` path. Per the workspace's "MCP scope is agent-loop only"
 rule, MCP tools never bridge to slash, mention, or elicitation surfaces.
 
 - **Configuration** lives in `<workspace>/.mcp.json` (loaded/written by
-  `aura_tools::mcp::McpFile`). Each entry carries a `name`, a transport
+  `baybo_tools::mcp::McpFile`). Each entry carries a `name`, a transport
   (`stdio { command, args }` or `http { url }`), a `trust_level`, an
   optional `capabilities` set, and an optional `oauth { client_id,
   callback_port }` block. **Nothing secret lives in this file** — env
   bags, header bags, OAuth client secrets, and OAuth refresh/access
   tokens all live in `SecretVault` under the `mcp.<name>.…` namespace
-  (`aura_tools::mcp::vault_keys`).
+  (`baybo_tools::mcp::vault_keys`).
 - **Tool wrapping** — every server-side tool descriptor becomes an
-  `aura_tools::mcp::McpTool` named `<server>/<tool>` so MCP names cannot
+  `baybo_tools::mcp::McpTool` named `<server>/<tool>` so MCP names cannot
   collide with builtins. Each `McpTool` carries an `Arc`-cloned
   `Peer<RoleClient>` that proxies `call_tool` over the connected
   rmcp transport.
@@ -103,9 +103,9 @@ rule, MCP tools never bridge to slash, mention, or elicitation surfaces.
   are torn down + re-established when the identity hash changes;
   `register_dynamic` / `unregister_for_source` keep the registry in
   sync. Cancelled via the shared shutdown signal.
-- **OAuth** — the `oauth` submodule (`aura_tools::mcp::oauth`) drives
+- **OAuth** — the `oauth` submodule (`baybo_tools::mcp::oauth`) drives
   OAuth 2.1 + PKCE + Dynamic Client Registration via rmcp's
-  `OAuthState`. The flow runs **inline inside `aura mcp add`** for HTTP
+  `OAuthState`. The flow runs **inline inside `baybo mcp add`** for HTTP
   transports when any OAuth flag (`--client-id`, `--client-secret`,
   `--callback-port`) is passed: discovery → DCR (if no client_id) →
   PKCE → browser launch via `open::that` → localhost callback listener
@@ -138,7 +138,7 @@ binary and never appear in or are editable via `.mcp.json`.
   crashed child surfaces as disconnect-and-reconnect.
 - An **embedded server with `capabilities=[]`** yields an empty
   per-server resource list, so its tools **skip per-call approval**
-  (`mcp/reconciler.rs`) — the contract being "Aura controls the spawn
+  (`mcp/reconciler.rs`) — the contract being "Baybo controls the spawn
   and trusts the vendor; don't gate on the transport command." Embedded
   servers that *do* declare capabilities still get the transport-derived
   approval like any stdio server.
@@ -150,8 +150,8 @@ trade-offs, and docker mode in depth rather than duplicating it here.
 ### Skill tool
 
 The `Skill` builtin is the LLM's entry point for declarative skills.
-Lives in `aura-skills::tools` so it can take `Arc<SkillRegistry>`
-without `aura-tools` gaining a dep edge into `aura-skills`.
+Lives in `baybo-skills::tools` so it can take `Arc<SkillRegistry>`
+without `baybo-tools` gaining a dep edge into `baybo-skills`.
 
 - **Visibility:** the per-turn system reminder in `AgentLoop` lists
   every `agent_invocable && trust_level != Untrusted` skill. The
@@ -171,7 +171,7 @@ without `aura-tools` gaining a dep edge into `aura-skills`.
   optional `args`, optional `risk_warning`, and a `usage_hint`. Mode 2
   (`file_path` set) collapses to `{name, file, content, file_type}`.
 - **Risk:** verdict from `Arc<dyn SkillRiskCheck>` (impl in
-  `aura-skills-assessor`). `Dangerous` → `ToolError::Denied`;
+  `baybo-skills-assessor`). `Dangerous` → `ToolError::Denied`;
   `Suspicious` → response carries `risk_warning` and a
   `SessionNotifier` warn (when wired); `Safe` runs silently.
 - **Env-var gate:** `SkillRequirements::required_env` is checked
@@ -208,7 +208,7 @@ Typical rules:
 
 Tools decide what `ResourceAccess` to declare from their parameters; the matching rules above only describe coverage *given* a declaration. Two builtins deliberately suppress declarations to skip prompts that wouldn't add safety:
 
-- **`Read`** declares `ReadFile`, but `ToolExecutor` unconditionally drops it from the uncovered set. The tool still runs through `aura_security::is_sensitive_path` for the actual access decision.
+- **`Read`** declares `ReadFile`, but `ToolExecutor` unconditionally drops it from the uncovered set. The tool still runs through `baybo_security::is_sensitive_path` for the actual access decision.
 - **`WebFetch`** is host-shape conditional (see below). `SafeResolver` + `is_blocked_ip` at DNS resolution time and `validate_url_with` at parse time are the load-bearing SSRF guards; the approval gate exists only for the *one* shape those checks cannot decide on.
 
 #### WebFetch host-shape policy
@@ -233,7 +233,7 @@ Cross-host redirects are still rejected inside the redirect policy (with a "re-i
 
 Separately, the **`bench-bash` Cargo feature** (off by default, compiled out of every prod build — see `bench/swe` + `bench/terminal-bench-1.0`) switches `BashTool` to a **bench profile**: raw exec with no OS sandbox, no uv shim, no work-dir jail, cwd inherited from the process, and a dedicated prompt — for running inside a disposable container where bwrap can't nest. It overrides `sandbox.mode` and disables the judge. `none` is the *config* counterpart that only drops the OS sandbox; the feature is the bench-only behavior hack.
 
-`auto` keeps every command sandboxed but adds an LLM risk judge at two points. The judge runs through `ctx.llm` (current-user attribution; once the LLM layer grows a shared "flash" slot it should prefer that cheaper model) and emits a single flat JSON verdict parsed by `aura_llm::extract_json_object` (shared with the skill assessor). It is **fail-closed**: a missing LLM, provider error, or unparseable reply is treated as "risky" (the opposite of the skill assessor's availability-first fail-open), so a failure never produces an unprompted escape.
+`auto` keeps every command sandboxed but adds an LLM risk judge at two points. The judge runs through `ctx.llm` (current-user attribution; once the LLM layer grows a shared "flash" slot it should prefer that cheaper model) and emits a single flat JSON verdict parsed by `baybo_llm::extract_json_object` (shared with the skill assessor). It is **fail-closed**: a missing LLM, provider error, or unparseable reply is treated as "risky" (the opposite of the skill assessor's availability-first fail-open), so a failure never produces an unprompted escape.
 
 - **Pre-execution** (`pre_exec_gate`): for a destructive-token command (the same `rm`/`git reset --hard`/… set the legacy gate keys on), the judge decides `safe` → run sandboxed unprompted, or `risky` → cached approval prompt (so "approve always" sticks). In auto mode `accessed_resources` returns `[]` for these so the executor's pre-execute gate doesn't double-fire — the judge owns the gate. The blunt token list survives only as the cheap "should I ask the judge?" filter.
 - **Post-failure** (`escalate_if_failed`): when a sandboxed command exits non-zero, one judge call returns `{sandbox_related, risk, rationale}` → `unrelated` ⇒ return the original failure unchanged; `related + safe` ⇒ re-run the command **outside** the sandbox automatically; `related + risky` ⇒ **uncached** approval prompt (an unsandboxed run is a different, elevated privilege than any prior sandboxed approval). In an unattended session (no approval handle: cron / nested subagent) a `risky` verdict has no human to ask, so it returns the original failure rather than escaping — but a `safe` verdict still self-heals anywhere. This runs on both the blocking path and a detached command that completes in-window; a command that overran and backgrounded is not retroactively escalated.
@@ -246,7 +246,7 @@ Every unsandboxed auto-run emits a `ctx.notifier` Warn notice (no-op in cron, bu
 
 ### Per-tool timeout ceiling
 
-Each `Tool` impl declares its own outer wall-clock cap via `fn max_timeout(&self) -> Duration` (default 30 s). `ToolExecutor` reads it per call, writes the result into `ToolContext::timeout`, and uses it to size the outer cancel deadline (`+ APPROVAL_HEADROOM`). There is no `aura.json` knob — the cap lives in code, where the tool author already knows the right ceiling for the workload they own.
+Each `Tool` impl declares its own outer wall-clock cap via `fn max_timeout(&self) -> Duration` (default 30 s). `ToolExecutor` reads it per call, writes the result into `ToolContext::timeout`, and uses it to size the outer cancel deadline (`+ APPROVAL_HEADROOM`). There is no `baybo.json` knob — the cap lives in code, where the tool author already knows the right ceiling for the workload they own.
 
 Current overrides:
 
@@ -265,7 +265,7 @@ The agent loop dispatches every tool call in one LLM response together. Each `To
 - **`ToolConcurrency::Exclusive`** (the default) — runs alone among pool calls. Every mutating builtin (`Write`, `Edit`, `Bash`, `SecretAdd`, `Cron{Create,Delete}`, `Skill{Install,Uninstall}`, `Task{Create,Update}`), every MCP/dynamic tool, and any tool the registry can't classify falls here. A tool with side effects must never overlap a reader (read-while-write race) or another writer.
 - **`ToolConcurrency::Independent`** — opts out of the pool: acquires no permit, so it neither waits for one nor blocks others (it can overlap even an `Exclusive` call) and is **not** counted against the cap. For tools that bound their own concurrency out-of-band. Today only `spawn_subagent`, capped per-root by its `SubagentDispatchLimiter` (default 8): a foreground spawn blocks on its child for the child's whole lifetime, so holding a shared permit would serialize the parent's fan-out — fan-out is meant to run in parallel, so it stays off the pool.
 
-The loop enforces this with a per-response `tokio::sync::Semaphore` sized to `MAX_CONCURRENT_TOOL_CALLS` (10, a code const like the timeout ceiling — no `aura.json` knob). It is used as a read/write lock: a `Concurrent` call acquires **one** permit (so at most 10 run at once), while an `Exclusive` call acquires **all** permits, so it waits for in-flight pool calls to drain and then runs alone, blocking every other pool call until it returns. An `Independent` call acquires **no** permit, so it runs immediately and overlaps anything — including an `Exclusive` call — leaving its own out-of-band limiter (the subagent fan-out cap) as the sole bound. The semaphore is fair (FIFO), so an exclusive call is never starved by a stream of reads. The limiter is scoped to a single response because that is the only place tool calls overlap — `ToolExecutor` is process-global and shared across sessions, so a limiter there would wrongly couple unrelated sessions. The post-execution pass that appends tool results stays sequential in `tool_calls` order regardless, keeping the next turn's context byte-stable.
+The loop enforces this with a per-response `tokio::sync::Semaphore` sized to `MAX_CONCURRENT_TOOL_CALLS` (10, a code const like the timeout ceiling — no `baybo.json` knob). It is used as a read/write lock: a `Concurrent` call acquires **one** permit (so at most 10 run at once), while an `Exclusive` call acquires **all** permits, so it waits for in-flight pool calls to drain and then runs alone, blocking every other pool call until it returns. An `Independent` call acquires **no** permit, so it runs immediately and overlaps anything — including an `Exclusive` call — leaving its own out-of-band limiter (the subagent fan-out cap) as the sole bound. The semaphore is fair (FIFO), so an exclusive call is never starved by a stream of reads. The limiter is scoped to a single response because that is the only place tool calls overlap — `ToolExecutor` is process-global and shared across sessions, so a limiter there would wrongly couple unrelated sessions. The post-execution pass that appends tool results stays sequential in `tool_calls` order regardless, keeping the next turn's context byte-stable.
 
 ### Output control
 
@@ -290,7 +290,7 @@ The agent's `ToolExecutor` builds a per-call `SpanEventRecorder` (`crates/agent/
 
 ## Constraints
 
-- Depends on `aura-llm`, `aura-model`, `aura-security`, `aura-storage`, `aura-workspace`, plus `rmcp` + `oauth2` + `axum` (callback listener) for the MCP client
+- Depends on `baybo-llm`, `baybo-model`, `baybo-security`, `baybo-storage`, `baybo-workspace`, plus `rmcp` + `oauth2` + `axum` (callback listener) for the MCP client
 - Does not install third-party artifacts
 - Defines the `ApprovalGate` trait but never implements the user-facing UX — the per-connection gate is built by the gateway's WS sidecar (`ChannelApprovalGate` backed by an `ApprovalQueue`), and the TUI renders the resulting prompts inline in its scrollback
 - `artifact_hash` must be recorded in `trace::ExecutionProvenance`

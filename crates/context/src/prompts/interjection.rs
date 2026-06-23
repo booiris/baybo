@@ -2,7 +2,7 @@
 //!
 //! A message the user sends *while the agent loop is still working* is drained
 //! at the next tool boundary and injected as a `Role::User` row stamped
-//! [`aura_model::MessageSource::UserInterjection`]. The raw text is persisted
+//! [`baybo_model::MessageSource::UserInterjection`]. The raw text is persisted
 //! faithfully (a clean user bubble); this envelope is applied **wire-only** by
 //! [`crate::ContextManager::messages_for_llm`] and re-derived from the source
 //! flag on every call, so it survives compaction/rebuild and is never stored.

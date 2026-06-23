@@ -1,8 +1,8 @@
-//! `/v1/config` — read and mutate the loaded `AuraConfig`.
+//! `/v1/config` — read and mutate the loaded `BayboConfig`.
 //!
 //! `GET` returns a snapshot of the on-disk config (with secret fields
-//! redacted by `aura_config`'s serde impls). `PUT` / `DELETE` write
-//! through to the same on-disk `aura.json` that `aura config set/unset`
+//! redacted by `baybo_config`'s serde impls). `PUT` / `DELETE` write
+//! through to the same on-disk `baybo.json` that `baybo config set/unset`
 //! targets, then trigger an in-process reload: a hot-updatable field
 //! takes effect live; a non-hot field is persisted but needs a restart,
 //! reported back via `requires_restart`.
@@ -30,7 +30,7 @@ pub fn routes() -> OpenApiRouter<AdminState> {
     responses(
         (
             status = 200,
-            description = "Current in-memory config. Secret fields are redacted by `AuraConfig`'s serde impl.",
+            description = "Current in-memory config. Secret fields are redacted by `BayboConfig`'s serde impl.",
             body = serde_json::Value,
             content_type = "application/json",
         ),
@@ -65,7 +65,7 @@ async fn set_config(
 ) -> Result<Json<MutateResponse>> {
     let target = state.config_path.as_ref().ok_or_else(|| {
         crate::GatewayError::BadRequest(
-            "gateway was started without a config file; set AURA_CONFIG_PATH or pass --config \
+            "gateway was started without a config file; set BAYBO_CONFIG_PATH or pass --config \
              <path> so the mutation has a destination"
                 .into(),
         )
@@ -116,7 +116,7 @@ async fn unset_config(
 ) -> Result<Json<MutateResponse>> {
     let target = state.config_path.as_ref().ok_or_else(|| {
         crate::GatewayError::BadRequest(
-            "gateway was started without a config file; set AURA_CONFIG_PATH or pass --config \
+            "gateway was started without a config file; set BAYBO_CONFIG_PATH or pass --config \
              <path> so the mutation has a destination"
                 .into(),
         )

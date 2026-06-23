@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_model::TrustLevel;
-use aura_tools::{
+use baybo_model::TrustLevel;
+use baybo_tools::{
     ApprovalDecision, NoticeLevel, ResourceAccess as ToolResourceAccess, Tool, ToolCapability,
     ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput,
 };
@@ -124,7 +124,7 @@ impl Tool for SkillTool {
         } else {
             format!("{skill} {args}")
         };
-        aura_tools::progress::preview_arg(&label)
+        baybo_tools::progress::preview_arg(&label)
     }
 
     fn max_timeout(&self) -> Duration {
@@ -135,7 +135,7 @@ impl Tool for SkillTool {
         Duration::from_secs(60)
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let mut p: SkillParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
@@ -241,7 +241,7 @@ async fn check_env_or_prompt(
     tool_name: &str,
     skill: &SkillDefinition,
     ctx: &ToolContext,
-) -> aura_tools::Result<()> {
+) -> baybo_tools::Result<()> {
     let required = &skill.requirements.required_env;
 
     let missing: Vec<String> = required
@@ -289,14 +289,14 @@ async fn check_env_or_prompt(
 }
 
 /// Token in a built-in SKILL.md body that gets substituted with the
-/// running session's id at render time. Only the aura-cli skill uses
+/// running session's id at render time. Only the baybo-cli skill uses
 /// it today; the substitution is a no-op for skill bodies that don't
 /// contain the token, so every skill goes through the same path.
 const SESSION_ID_TOKEN: &str = "{{session_id}}";
 
 /// Render a skill's prompt body for injection: substitute the running
 /// session's id into [`SESSION_ID_TOKEN`]. Shared by [`render_main`] (the
-/// `Skill` tool's output) and `aura-context`'s slash-command expansion, so the
+/// `Skill` tool's output) and `baybo-context`'s slash-command expansion, so the
 /// substitution rule lives in one place rather than being copied per caller.
 pub fn render_skill_body(skill: &SkillDefinition, session_id: &str) -> String {
     skill.prompt_template.replace(SESSION_ID_TOKEN, session_id)
@@ -318,7 +318,7 @@ The "{{skill_name}}" skill ships linked files. To read one, call the {{tool_name
 /// plus — when the skill ships linked sub-files — a text inventory + usage
 /// hint matching what [`render_main`] exposes to the LLM `Skill` tool, so the
 /// two invocation routes don't diverge. The sub-file fetch itself still goes
-/// through the gated `Skill` tool. Shared with `aura-context`'s slash
+/// through the gated `Skill` tool. Shared with `baybo-context`'s slash
 /// expansion.
 pub fn render_skill_for_slash(skill: &SkillDefinition, session_id: &str) -> String {
     let mut out = render_skill_body(skill, session_id);
@@ -351,7 +351,7 @@ fn render_main(
     skill: &SkillDefinition,
     args: Option<&str>,
     session_id: &str,
-) -> aura_tools::Result<ToolOutput> {
+) -> baybo_tools::Result<ToolOutput> {
     let dir = skill.source_path.as_deref();
     let path = dir.map(|d| d.join("SKILL.md"));
 
@@ -378,7 +378,7 @@ fn render_main(
 async fn render_subfile(
     skill: &SkillDefinition,
     file_path: &str,
-) -> aura_tools::Result<ToolOutput> {
+) -> baybo_tools::Result<ToolOutput> {
     let dir = skill.source_path.as_deref().ok_or_else(|| {
         ToolError::Execution(format!(
             "skill '{}' has no on-disk directory; cannot read sub-files",
@@ -533,7 +533,7 @@ impl Tool for SkillInstallTool {
         params
             .get("source_dir")
             .and_then(Value::as_str)
-            .map(|s| aura_tools::progress::preview_path(Path::new(s)))
+            .map(|s| baybo_tools::progress::preview_path(Path::new(s)))
     }
 
     fn max_timeout(&self) -> Duration {
@@ -544,7 +544,7 @@ impl Tool for SkillInstallTool {
         Duration::from_secs(120)
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let p: InstallParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
@@ -709,10 +709,10 @@ impl Tool for SkillUninstallTool {
         params
             .get("name")
             .and_then(Value::as_str)
-            .and_then(aura_tools::progress::preview_arg)
+            .and_then(baybo_tools::progress::preview_arg)
     }
 
-    async fn execute(&self, params: Value, _ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let p: UninstallParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
@@ -826,8 +826,8 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
 mod tests {
     use std::fs;
 
-    use aura_model::{ArtifactSource, ChannelType, TrustLevel, User};
-    use aura_tools::{ApprovalHandle, AutoDenyGate};
+    use baybo_model::{ArtifactSource, ChannelType, TrustLevel, User};
+    use baybo_tools::{ApprovalHandle, AutoDenyGate};
     use parking_lot::Mutex;
     use tempfile::tempdir;
 
@@ -856,8 +856,8 @@ mod tests {
     fn mk_ctx() -> ToolContext {
         ToolContext {
             session_id: "s".into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -866,14 +866,14 @@ mod tests {
             timeout: std::time::Duration::from_secs(10),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: Some(ApprovalHandle::new(
                 Arc::new(AutoDenyGate),
                 Arc::new(Mutex::new(Vec::new())),
             )),
             notifier: None,
-            events: aura_tools::noop_event_sink(),
+            events: baybo_tools::noop_event_sink(),
             llm: None,
             secrets: None,
             virtual_reads: None,
@@ -1127,7 +1127,7 @@ mod tests {
         fs::write(dir.path().join("SKILL.md"), "# Body\n").unwrap();
         let mut s = mk_skill(dir.path(), "demo");
         // Pick a name that would never be set in CI.
-        s.requirements.required_env = vec!["AURA_TEST_DEFINITELY_UNSET_VAR".into()];
+        s.requirements.required_env = vec!["BAYBO_TEST_DEFINITELY_UNSET_VAR".into()];
 
         let registry = Arc::new(SkillRegistry::new());
         registry.register(s);
@@ -1142,7 +1142,7 @@ mod tests {
             .unwrap_err();
         match err {
             ToolError::Execution(msg) => {
-                assert!(msg.contains("AURA_TEST_DEFINITELY_UNSET_VAR"));
+                assert!(msg.contains("BAYBO_TEST_DEFINITELY_UNSET_VAR"));
             }
             other => panic!("expected Execution, got {other:?}"),
         }

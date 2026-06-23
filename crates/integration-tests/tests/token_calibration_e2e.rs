@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use aura_integration_tests::AgentTestHarness;
-use aura_llm::{ModelPricing, StreamEvent, TokenUsage};
+use baybo_integration_tests::AgentTestHarness;
+use baybo_llm::{ModelPricing, StreamEvent, TokenUsage};
 
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 

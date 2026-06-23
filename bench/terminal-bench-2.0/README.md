@@ -1,8 +1,8 @@
-# aura ↔ Terminal-Bench 2.0 (Harbor) installed-agent adapter
+# baybo ↔ Terminal-Bench 2.0 (Harbor) installed-agent adapter
 
-Run the **real `aura` agent inside the official [Terminal-Bench 2.0](https://www.tbench.ai)
-tasks** for **leaderboard-comparable** scores. The adapter installs aura **into
-each task's Docker container**, runs one `aura prompt`, and lets the task's own
+Run the **real `baybo` agent inside the official [Terminal-Bench 2.0](https://www.tbench.ai)
+tasks** for **leaderboard-comparable** scores. The adapter installs baybo **into
+each task's Docker container**, runs one `baybo prompt`, and lets the task's own
 verifier (pytest) grade it — exactly how the leaderboard agents (Claude Code,
 Codex, …) are run.
 
@@ -14,23 +14,23 @@ TB 2.0 moved off the `terminal-bench` PyPI package onto the
 Harbor dataset **`terminal-bench/terminal-bench-2`** (89 tasks). The legacy `tb`
 adapter is the sibling [`../terminal-bench-1.0/`](../terminal-bench-1.0/).
 
-[`harbor_adapter/aura_agent.py`](harbor_adapter/aura_agent.py) is a thin subclass
+[`harbor_adapter/baybo_agent.py`](harbor_adapter/baybo_agent.py) is a thin subclass
 of Harbor's `harbor.agents.installed.base.BaseInstalledAgent`, modeled on the
 bundled `codex.py`. No fork of Harbor — it's used via `--agent-import-path`.
 
 ## Why a static **musl** binary + `--features bench-bash`
 
-Same rationale as 1.0. aura normally wraps every shell command in an OS sandbox
+Same rationale as 1.0. baybo normally wraps every shell command in an OS sandbox
 (bwrap/docker); inside a task container there is no bwrap and the container already
 *is* the isolation boundary, so the binary is built `--features bench-bash` (Bash
 runs raw — no OS sandbox, no work-dir jail, no uv shim) and the rendered
-`aura.json` sets `sandbox.mode = none`. A **static musl** build runs in any task
+`baybo.json` sets `sandbox.mode = none`. A **static musl** build runs in any task
 container regardless of glibc:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl     # one-time (+ musl-tools)
-cargo build --release --target x86_64-unknown-linux-musl --features bench-bash -p aura
-# -> target/x86_64-unknown-linux-musl/release/aura
+cargo build --release --target x86_64-unknown-linux-musl --features bench-bash -p baybo
+# -> target/x86_64-unknown-linux-musl/release/baybo
 ```
 
 ## Run
@@ -46,7 +46,7 @@ cp .env.example .env && $EDITOR .env       # set the API key (+ optional model/b
 ./run.sh                                    # all 89 tasks (deepseek/deepseek-v4-flash)
 ./run.sh -i terminal-bench/fix-git -l 1     # ONE task — see the task-name note below
 ./run.sh -n 4                               # 4 concurrent trials (RAM: ~2G/task)
-AURA_MODEL=openai/gpt-4o ./run.sh           # override model
+BAYBO_MODEL=openai/gpt-4o ./run.sh           # override model
 ```
 
 > ⚠️ **Single-task filtering uses the org-prefixed name with `-i`.** Harbor's
@@ -58,9 +58,9 @@ AURA_MODEL=openai/gpt-4o ./run.sh           # override model
 > word-split collapses into one filter that matches nothing.
 
 Config (all via env — see [`.env.example`](.env.example)): **API key** =
-`AURA_API_KEY` (provider-agnostic) or the provider's own var
+`BAYBO_API_KEY` (provider-agnostic) or the provider's own var
 (`DEEPSEEK_API_KEY`/`OPENAI_API_KEY`/…); **model** = `--model <provider>/<model>`
-or `AURA_MODEL`; **base URL** = `AURA_BASE_URL` (optional).
+or `BAYBO_MODEL`; **base URL** = `BAYBO_BASE_URL` (optional).
 
 Harbor writes each run to `runs/<ts>/<trial>/{agent/,verifier/}`; `run.sh` mirrors
 that into the bench-wide convention — `trace/<ts>/<task>/<trial>/agent-logs/` +
@@ -85,11 +85,11 @@ the denominator is the true attempted-task count, not just the graded ones.
 
 1. Harbor builds/starts the task's container (the `docker_image` in its
    `task.toml`).
-2. `AuraAgent.install()` `environment.upload_file`s the musl binary + a rendered
-   `aura.json` (`none` sandbox, self-contained state dir, the provider/model under
-   test), installs it to `/usr/local/bin/aura`, mints a vault key, and ensures
+2. `BayboAgent.install()` `environment.upload_file`s the musl binary + a rendered
+   `baybo.json` (`none` sandbox, self-contained state dir, the provider/model under
+   test), installs it to `/usr/local/bin/baybo`, mints a vault key, and ensures
    ca-certificates.
-3. `AuraAgent.run()` runs `aura prompt --json -y` to completion (a non-zero exit
+3. `BayboAgent.run()` runs `baybo prompt --json -y` to completion (a non-zero exit
    is logged, not raised, so the verifier still grades), then exports the
    transcript + call-tree to Harbor's per-trial `/logs/agent` dir.
 4. Harbor runs the task's verifier (pytest) and writes `verifier/reward.txt`.
@@ -143,4 +143,4 @@ this link isn't viable for them.
   generous TB 2.0 verifier timeout, so unlike 1.0 no base-image pre-bake is needed.
 - Pick a capable model — weak tool-callers tank scores independent of the plumbing.
 - The provider key is exported into the container's env for the run; it is never
-  written to `aura.json` (only the env-var *name* is).
+  written to `baybo.json` (only the env-var *name* is).

@@ -45,7 +45,7 @@ export interface SidecarOptions {
 
   /**
    * One-shot registration hook. When the bundle is spawned with
-   * `AURA_CHANNEL_MODE=register` the sidecar skips the normal
+   * `BAYBO_CHANNEL_MODE=register` the sidecar skips the normal
    * `build`/`runChannel` path and instead runs this function over a
    * stdin/stdout JSON protocol. Human-visible output (QR, progress)
    * should go to `process.stderr`; stdout is reserved for protocol
@@ -73,7 +73,7 @@ export interface SidecarOptions {
  *
  * ```ts
  * #!/usr/bin/env node
- * import { runSidecar } from "@aura/channel-sdk";
+ * import { runSidecar } from "@baybo/channel-sdk";
  * import { MyChannel } from "./channel.js";
  *
  * void runSidecar({
@@ -86,7 +86,7 @@ export interface SidecarOptions {
  * `process.exit`.
  */
 export async function runSidecar(opts: SidecarOptions): Promise<never> {
-  if (process.env["AURA_CHANNEL_MODE"] === "register") {
+  if (process.env["BAYBO_CHANNEL_MODE"] === "register") {
     if (!opts.register) {
       const line =
         JSON.stringify({

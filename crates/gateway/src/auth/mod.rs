@@ -5,7 +5,7 @@
 //! * [`admin`] — bearer-token middleware for the admin TCP listener
 //!   plus the [`AdminToken`] vault-backed lifecycle helper.
 //! * [`channel`] — channel-listener middleware that turns the
-//!   `x-aura-channel-token` header into an [`AuthedClient`] for
+//!   `x-baybo-channel-token` header into an [`AuthedClient`] for
 //!   downstream handlers, distinguishing the bundled TUI from
 //!   subprocess sidecars by the reserved [`token::TUI_CLIENT_LABEL`].
 //! * [`token`] — the in-memory [`ChannelTokenTable`] keyed on
@@ -18,7 +18,7 @@
 //! write `use crate::auth::{AdminToken, AuthedClient, ChannelTokenTable}`
 //! without remembering which sub-module owns each name. The crate root
 //! also re-exports the most-used items (see `lib.rs`) so external
-//! consumers stay on `aura_gateway::AdminToken` etc.
+//! consumers stay on `baybo_gateway::AdminToken` etc.
 
 pub mod admin;
 pub mod channel;

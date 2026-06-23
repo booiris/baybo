@@ -1,19 +1,19 @@
-//! End-to-end tests for `aura_memory::backends::openviking` against an axum mock server.
+//! End-to-end tests for `baybo_memory::backends::openviking` against an axum mock server.
 
 mod common;
 
 use std::sync::Arc;
 
-use aura_memory::Memory;
-use aura_memory::backends::openviking::{
-    OpenVikingConfig, OpenVikingMemory, TOOL_ARCHIVE_EXPAND, TOOL_FORGET, TOOL_RECALL, TOOL_STORE,
-};
-use aura_model::{ChatMessage, ContentBlock};
-use aura_trace::StepKind;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use baybo_memory::Memory;
+use baybo_memory::backends::openviking::{
+    OpenVikingConfig, OpenVikingMemory, TOOL_ARCHIVE_EXPAND, TOOL_FORGET, TOOL_RECALL, TOOL_STORE,
+};
+use baybo_model::{ChatMessage, ContentBlock};
+use baybo_trace::StepKind;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
@@ -40,7 +40,7 @@ fn build(server_url: &str) -> OpenVikingMemory {
     OpenVikingMemory::new(cfg(server_url), "test-key".into(), None).unwrap()
 }
 
-fn tool(m: &OpenVikingMemory, name: &str) -> Arc<dyn aura_tools::Tool> {
+fn tool(m: &OpenVikingMemory, name: &str) -> Arc<dyn baybo_tools::Tool> {
     m.tools()
         .into_iter()
         .find(|(t, _)| t.name() == name)
@@ -48,9 +48,9 @@ fn tool(m: &OpenVikingMemory, name: &str) -> Arc<dyn aura_tools::Tool> {
         .unwrap_or_else(|| panic!("tool {name} not found"))
 }
 
-fn expect_json(out: aura_tools::ToolOutput) -> Value {
+fn expect_json(out: baybo_tools::ToolOutput) -> Value {
     match out {
-        aura_tools::ToolOutput::Json(v) => v,
+        baybo_tools::ToolOutput::Json(v) => v,
         other => panic!("expected Json, got {other:?}"),
     }
 }
@@ -97,7 +97,7 @@ async fn recall_sends_query_and_returns_abstract_with_uri() {
     let headers = captured.headers.lock().last().cloned().unwrap();
     assert_eq!(headers.get("x-openviking-account").unwrap(), "acct");
     assert_eq!(headers.get("x-openviking-user").unwrap(), "alice");
-    assert_eq!(headers.get("x-openviking-agent").unwrap(), "aura");
+    assert_eq!(headers.get("x-openviking-agent").unwrap(), "baybo");
     let body = captured.bodies.lock().last().unwrap().clone();
     assert_eq!(body["query"], "rust");
     assert_eq!(body["top_k"], 5);
@@ -492,7 +492,7 @@ async fn tool_forget_refuses_non_memory_uri() {
         .await
         .unwrap();
     match out {
-        aura_tools::ToolOutput::Error(e) => assert!(e.contains("non-memory"), "got: {e}"),
+        baybo_tools::ToolOutput::Error(e) => assert!(e.contains("non-memory"), "got: {e}"),
         other => panic!("expected Error, got {other:?}"),
     }
 }
@@ -599,7 +599,7 @@ async fn tools_each_carry_a_matching_manifest() {
         assert!(
             manifest
                 .capabilities
-                .contains(&aura_tools::ToolCapability::Http),
+                .contains(&baybo_tools::ToolCapability::Http),
             "{} should declare Http",
             tool.name()
         );

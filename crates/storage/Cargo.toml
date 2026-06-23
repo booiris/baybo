@@ -1,5 +1,5 @@
 [package]
-name = "aura-storage"
+name = "baybo-storage"
 version.workspace = true
 edition.workspace = true
 
@@ -8,14 +8,14 @@ doctest = false
 
 [features]
 # Exposes the in-memory `MemoryBlobStore` fake to downstream crates'
-# tests (the session fakes live in aura-session). Pull in via:
-#   aura-storage = { workspace = true, features = ["test-support"] }
+# tests (the session fakes live in baybo-session). Pull in via:
+#   baybo-storage = { workspace = true, features = ["test-support"] }
 # inside the consumer's `[dev-dependencies]`.
 test-support = []
 
 [dependencies]
-aura-model = { workspace = true }
-aura-store = { workspace = true }
+baybo-model = { workspace = true }
+baybo-store = { workspace = true }
 
 async-trait = { workspace = true }
 bytes = { workspace = true }
@@ -35,8 +35,8 @@ tokio-util = { workspace = true, features = ["io"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-aura-trace = { workspace = true }
-aura-job = { workspace = true }
+baybo-trace = { workspace = true }
+baybo-job = { workspace = true }
 libc = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

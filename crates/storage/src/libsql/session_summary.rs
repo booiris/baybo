@@ -1,12 +1,12 @@
 //! libsql implementation of [`SessionSummaryStore`].
 
 use async_trait::async_trait;
-use aura_model::SessionId;
+use baybo_model::SessionId;
 use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
-use aura_store::StorageError;
-use aura_store::session_summary::{Result, SessionSummaryRow, SessionSummaryStore};
+use baybo_store::StorageError;
+use baybo_store::session_summary::{Result, SessionSummaryRow, SessionSummaryStore};
 
 pub struct LibsqlSessionSummaryStore {
     pool: LibsqlPool,
@@ -202,8 +202,8 @@ impl SessionSummaryStore for LibsqlSessionSummaryStore {
 mod tests {
     use super::*;
     use crate::libsql::session::LibsqlSessionStore;
-    use aura_model::{ChannelType, Session, SessionState, TriggerSource, User};
-    use aura_store::SessionStore;
+    use baybo_model::{ChannelType, Session, SessionState, TriggerSource, User};
+    use baybo_store::SessionStore;
 
     fn make_session(id: &str) -> Session {
         let user = User {

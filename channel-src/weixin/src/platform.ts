@@ -1,12 +1,12 @@
 import crypto from "node:crypto";
 
-import type { Logger, StartBotCommand, WireAttachment } from "@aura/channel-sdk";
-import { fetchBlob } from "@aura/channel-sdk";
+import type { Logger, StartBotCommand, WireAttachment } from "@baybo/channel-sdk";
+import { fetchBlob } from "@baybo/channel-sdk";
 import type {
   BotMediaPayload,
   BotPlatform,
   BotStartHooks,
-} from "@aura/channel-sdk/bot";
+} from "@baybo/channel-sdk/bot";
 
 import { DEFAULT_CDN_BASE_URL } from "./auth/login-qr.js";
 import {
@@ -27,7 +27,7 @@ function parseAuthBlob(raw: string): AuthBlob {
   const trimmed = raw.trimStart();
   if (!trimmed.startsWith("{")) {
     throw new Error(
-      "weixin: StartBot token is not a JSON AuthBlob — re-register via `aura channel add`",
+      "weixin: StartBot token is not a JSON AuthBlob — re-register via `baybo channel add`",
     );
   }
   let parsed: unknown;
@@ -99,7 +99,7 @@ export class WeixinPlatform implements BotPlatform<WeixinBotHandle, WeixinChat> 
       attach: hooks.attach,
       emit: (ev) => {
         if (approvals?.tryResolveInbound(botId, ev.chat, ev.content)) {
-          // Approval reply — swallow so aura never sees it as a chat.
+          // Approval reply — swallow so baybo never sees it as a chat.
           return;
         }
         hooks.emit(ev);
@@ -127,7 +127,7 @@ export class WeixinPlatform implements BotPlatform<WeixinBotHandle, WeixinChat> 
     // iLink uses `client_id` for server-side dedup. If omitted, sends
     // succeed at HTTP level but never reach the user — the server
     // treats them as duplicates of a sentinel "no id" slot.
-    const clientId = `aura-weixin:${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+    const clientId = `baybo-weixin:${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
     try {
       await sendMessage({
         baseUrl: handle.state.baseUrl,
@@ -194,7 +194,7 @@ export class WeixinPlatform implements BotPlatform<WeixinBotHandle, WeixinChat> 
       // Without a CDN endpoint we can't upload — surface a single
       // text-only message with the placeholder so the user sees
       // *something*. Operators on a private cloud need to set
-      // `AURA_WEIXIN_CDN_BASE_URL` for media to actually flow.
+      // `BAYBO_WEIXIN_CDN_BASE_URL` for media to actually flow.
       this.logger.warn(
         "weixin sendMedia: cdnBaseUrl unset; falling back to text",
       );

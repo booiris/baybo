@@ -4,7 +4,7 @@
 //! — messages, deltas, notices, and tool approvals all travel over a
 //! single [`WsClient`]. Admin-shaped resources (skills, jobs, memory,
 //! sessions CRUD) live on the admin TCP surface and are only reachable
-//! through the `aura` CLI.
+//! through the `baybo` CLI.
 //!
 //! This module holds the TUI-facing adapters:
 //!

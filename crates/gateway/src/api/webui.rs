@@ -6,7 +6,7 @@
 //! table into memory — no embedding crate needed at runtime. If the
 //! frontend hasn't been built, `build.rs` drops a placeholder
 //! `index.html` so `cargo build` still works; release builds run
-//! `pnpm install && pnpm --filter aura-web build` first to ship the
+//! `pnpm install && pnpm --filter baybo-web build` first to ship the
 //! real dashboard.
 //!
 //! Mounted as the admin router fallback, so `/`, `/assets/…`, and any

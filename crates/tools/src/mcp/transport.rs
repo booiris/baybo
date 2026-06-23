@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 
-use aura_security::SecretVault;
+use baybo_security::SecretVault;
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::ServiceExt;
 use rmcp::model::Tool as RmcpTool;
@@ -43,7 +43,7 @@ impl McpServerSession {
 pub async fn connect(
     entry: &McpServerEntry,
     vault: &Arc<SecretVault>,
-    proxy: Option<&aura_security::http::ProxySettings>,
+    proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> McpResult<McpServerSession> {
     connect_with_extra_env(entry, vault, &HashMap::new(), proxy).await
 }
@@ -51,15 +51,15 @@ pub async fn connect(
 /// Build a `reqwest::Client` for an HTTP MCP transport, honoring the optional
 /// egress proxy.
 fn proxied_http_client(
-    proxy: Option<&aura_security::http::ProxySettings>,
+    proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> McpResult<reqwest::Client> {
-    aura_security::http::client(proxy)
+    baybo_security::http::client(proxy)
         .map_err(|e| McpError::Transport(format!("build proxied http client: {e}")))
 }
 
 /// Like [`connect`] but merges `extra_env` onto the stdio child's env
 /// after the vault load. Used by the reconciler for embedded servers
-/// to inject boot-config env vars (`AURA_BROWSER_PROFILE_DIR`, …)
+/// to inject boot-config env vars (`BAYBO_BROWSER_PROFILE_DIR`, …)
 /// without polluting the user's secret vault. Vault entries retain
 /// precedence — `extra_env` is applied first, then vault entries, so
 /// an operator who really wants to override a boot value can stash
@@ -68,7 +68,7 @@ pub async fn connect_with_extra_env(
     entry: &McpServerEntry,
     vault: &Arc<SecretVault>,
     extra_env: &HashMap<String, String>,
-    proxy: Option<&aura_security::http::ProxySettings>,
+    proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> McpResult<McpServerSession> {
     let running = match &entry.transport {
         McpTransportConfig::Stdio { command, args } => {
@@ -92,7 +92,7 @@ async fn connect_stdio(
     args: &[String],
     vault: &Arc<SecretVault>,
     extra_env: &HashMap<String, String>,
-    proxy: Option<&aura_security::http::ProxySettings>,
+    proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> McpResult<RunningService<RoleClient, ()>> {
     let env = load_string_map(vault, &vault_keys::env_bag(server_name)).await?;
 
@@ -152,10 +152,10 @@ async fn connect_stdio(
 /// rmcp inherits the child's stderr by default; [`connect_stdio`] spawns
 /// it `piped` and hands the stream here. Each line becomes a `tracing`
 /// event tagged with `mcp_server`, so the gateway's file subscriber
-/// records server diagnostics in `aura.log` (and the admin LogBuffer)
+/// records server diagnostics in `baybo.log` (and the admin LogBuffer)
 /// rather than scrolling them past on the terminal. The task ends on EOF
 /// when the child exits. No per-line cap: MCP servers are operator-added
-/// (`aura mcp add`) and write line-oriented diagnostics, unlike the
+/// (`baybo mcp add`) and write line-oriented diagnostics, unlike the
 /// untrusted channel sidecars that justify the supervisor's pipe cap.
 fn drain_mcp_stderr(server_name: String, stderr: ChildStderr) {
     tokio::spawn(async move {
@@ -181,7 +181,7 @@ async fn connect_http(
     server_name: &str,
     url: &str,
     vault: &Arc<SecretVault>,
-    proxy: Option<&aura_security::http::ProxySettings>,
+    proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> McpResult<RunningService<RoleClient, ()>> {
     let headers = load_string_map(vault, &vault_keys::header_bag(server_name)).await?;
 
@@ -224,7 +224,7 @@ async fn connect_http(
         // client_id (StoredCredentials does not carry the secret). Re-attach
         // the secret from the vault so the refresh-token grant authenticates
         // — without this, the access token rotates fine until first expiry
-        // and then every request 401s until the operator re-runs `aura
+        // and then every request 401s until the operator re-runs `baybo
         // mcp add`.
         if let Some(secret) = vault
             .get_secret(&vault_keys::oauth_client_secret(server_name))

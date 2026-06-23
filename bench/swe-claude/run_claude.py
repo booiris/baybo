@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 """SWE-bench **claude arm**: the real Claude Code CLI (native standalone binary,
 no Node) run INSIDE each official eval image — the same in-container model as the
-aura arm. The binary is mounted into the container; `claude -p` runs headless in
+baybo arm. The binary is mounted into the container; `claude -p` runs headless in
 /testbed driving deepseek-v4-flash via a litellm `/v1/messages` proxy
 (ANTHROPIC_BASE_URL). Container uses --network=host so it can reach the host proxy.
 
 Per instance writes the model_patch (git diff HEAD, minus pre-existing dirty
 files), Claude Code's own token usage, and a transcript (raw stream-json + an
-aura-format .messages.json the existing export/compare tooling can render).
+baybo-format .messages.json the existing export/compare tooling can render).
 Writes <out>/preds.json; run.sh grades + shapes it.
 """
 import argparse, json, os, re, subprocess
@@ -84,8 +84,8 @@ def strip_dirty(diff, dirty):
     return "\n".join(out)
 
 
-# ── transcript: stream-json events -> aura .messages.json (for export/compare) ──
-def stream_to_aura(events, iid):
+# ── transcript: stream-json events -> baybo .messages.json (for export/compare) ──
+def stream_to_baybo(events, iid):
     msgs = []
     for ev in events:
         et = ev.get("type")
@@ -128,8 +128,8 @@ def write_transcript(trace_dir, iid, problem, repo, stream_lines, events):
     os.makedirs(d, exist_ok=True)
     # raw stream-json (ground truth)
     open(os.path.join(d, f"{iid}.stream.jsonl"), "w").write("\n".join(stream_lines))
-    # aura-format with the task prepended as the source==user message
-    doc = stream_to_aura(events, iid)
+    # baybo-format with the task prepended as the source==user message
+    doc = stream_to_baybo(events, iid)
     task = {"message": {"role": "user", "source": "user",
                         "content": [{"Text": problem}]},
             "ordinal": 0, "superseded_by": None}

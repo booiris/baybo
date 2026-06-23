@@ -7,12 +7,12 @@
 
 use std::sync::Arc;
 
-use aura_agent::SecurityGateway;
-use aura_channels::{Message, OutgoingMessage};
-use aura_integration_tests::{SessionBuilder, capture_tracing, gateway_with_memory_vault};
-use aura_model::{ChannelType, ContentBlock, MessageMetadata, User};
-use aura_security::test_support::MemorySecretStore;
-use aura_security::{
+use baybo_agent::SecurityGateway;
+use baybo_channels::{Message, OutgoingMessage};
+use baybo_integration_tests::{SessionBuilder, capture_tracing, gateway_with_memory_vault};
+use baybo_model::{ChannelType, ContentBlock, MessageMetadata, User};
+use baybo_security::test_support::MemorySecretStore;
+use baybo_security::{
     EncryptionKey, LeakAction, LeakDetectionRule, LeakDetector, PlaceholderMinter, SecretVault,
 };
 use chrono::Utc;
@@ -135,10 +135,10 @@ async fn s4_blocked_rule_returns_violation_and_redacts_message() {
         action: LeakAction::Block,
     });
     let store = Arc::new(MemorySecretStore::new());
-    let key = EncryptionKey::new(b"aura-it-master-key-32-bytes!!!!!".to_vec()).unwrap();
+    let key = EncryptionKey::new(b"baybo-it-master-key-32-bytes!!!!".to_vec()).unwrap();
     let vault = Arc::new(SecretVault::new(
         key,
-        store.clone() as Arc<dyn aura_store::SecretStore>,
+        store.clone() as Arc<dyn baybo_store::SecretStore>,
     ));
     let gw = SecurityGateway::new(Arc::new(detector), vault);
 

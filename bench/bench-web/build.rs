@@ -1,7 +1,7 @@
 //! Bake the bench viewer's React bundle into the `bench-web` binary.
 //!
 //! Mirrors `crates/gateway/build.rs` but only the WebUI half — this
-//! tool ships no sidecars. We run `pnpm --filter aura-bench-web build`
+//! tool ships no sidecars. We run `pnpm --filter baybo-bench-web build`
 //! to emit `web/dist/`, zstd-compress each asset, and write
 //! `$OUT_DIR/webui_assets.rs` with one `include_bytes!` arm per asset.
 //! `src/webui.rs` lazily decompresses the table on first request.
@@ -22,7 +22,7 @@ const ZSTD_LEVEL: i32 = 19;
 
 /// pnpm workspace package name of the bench viewer frontend (its
 /// `web/package.json` `name`).
-const WEB_PKG: &str = "aura-bench-web";
+const WEB_PKG: &str = "baybo-bench-web";
 
 fn main() {
     let manifest = PathBuf::from(
@@ -66,10 +66,10 @@ fn main() {
             &index,
             concat!(
                 "<!doctype html><html><head><meta charset=\"utf-8\">",
-                "<title>Aura Bench Viewer</title></head>",
+                "<title>Baybo Bench Viewer</title></head>",
                 "<body style=\"font-family:monospace;padding:2rem\">",
                 "<h1>bench-web frontend not built</h1>",
-                "<p>Run <code>pnpm install &amp;&amp; pnpm --filter aura-bench-web build</code>.</p>",
+                "<p>Run <code>pnpm install &amp;&amp; pnpm --filter baybo-bench-web build</code>.</p>",
                 "</body></html>",
             ),
         )

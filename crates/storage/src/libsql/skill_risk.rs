@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use super::LibsqlPool;
-use aura_store::StorageError;
-use aura_store::skill_risk::{
+use baybo_store::StorageError;
+use baybo_store::skill_risk::{
     AssessmentJob, AssessmentJobStatus, Result, RiskLevel, RiskVerdict, SkillRiskStore,
 };
 

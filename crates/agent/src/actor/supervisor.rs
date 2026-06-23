@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use aura_channels::{AgentEvent, AgentOutput};
-use aura_model::SessionId;
+use baybo_channels::{AgentEvent, AgentOutput};
+use baybo_model::SessionId;
 use chrono::Duration;
 use dashmap::DashMap;
 use tokio::sync::{broadcast, mpsc};
@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::actor::AgentMessage;
 use crate::actor::mailbox::{MailboxSender, TrySendError};
-use aura_session::SessionManager;
+use baybo_session::SessionManager;
 
 /// Handle to communicate with a running AgentActor.
 pub struct ActorHandle {
@@ -512,10 +512,10 @@ pub fn spawn_idle_reaper(
 /// Both edges are derived here from the one source of truth (the job
 /// store) rather than emitted by the actor: every job lifecycle
 /// transition publishes on
-/// [`aura_job::JobLifecycle::subscribe_lifecycle_events`] (the
+/// [`baybo_job::JobLifecycle::subscribe_lifecycle_events`] (the
 /// `Pending → InProgress` start edge and the three terminal edges), and on
 /// each one we recompute the session's
-/// [`aura_job::JobLifecycle::active_turn_started_at`] and broadcast the
+/// [`baybo_job::JobLifecycle::active_turn_started_at`] and broadcast the
 /// current value through the same `response_tx` → channel fan-out the
 /// actor's own output uses. The gateway's per-`Subscribe` snapshot reads
 /// the *same* `active_turn_started_at` — so the live start broadcast, the
@@ -530,7 +530,7 @@ pub fn spawn_idle_reaper(
 /// recomputes, and the Subscribe snapshot covers a client that joined
 /// during the gap.
 pub fn spawn_turn_state_projector(
-    job_lifecycle: Arc<aura_job::JobLifecycle>,
+    job_lifecycle: Arc<baybo_job::JobLifecycle>,
     sessions: Arc<SessionManager>,
     response_tx: mpsc::Sender<AgentOutput>,
     cancel_token: CancellationToken,
@@ -563,7 +563,7 @@ pub fn spawn_turn_state_projector(
 /// (`gateway::channel::route`) reads the same `active_turn_started_at`
 /// directly, so a freshly-joined tab and a live broadcast never disagree.
 async fn project_turn_state(
-    job_lifecycle: &aura_job::JobLifecycle,
+    job_lifecycle: &baybo_job::JobLifecycle,
     sessions: &SessionManager,
     response_tx: &mpsc::Sender<AgentOutput>,
     session_id: &SessionId,
@@ -580,7 +580,7 @@ async fn project_turn_state(
     // web subscribers (every other surface drops it regardless).
     let (channel, user_id) = match sessions.get(session_id).await {
         Ok(Some(s)) => (s.channel, s.user.id),
-        _ => (aura_model::ChannelType::http(), String::new()),
+        _ => (baybo_model::ChannelType::http(), String::new()),
     };
     let out = AgentOutput {
         session_id: session_id.clone(),
@@ -622,9 +622,9 @@ impl Drop for ActorRegistryGuard {
 mod tests {
     use super::*;
     use crate::actor::mailbox;
-    use aura_model::{ChannelType, SessionId, User};
-    use aura_session::SessionStore;
-    use aura_session::test_support::{
+    use baybo_model::{ChannelType, SessionId, User};
+    use baybo_session::SessionStore;
+    use baybo_session::test_support::{
         MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
     };
 

@@ -2,14 +2,14 @@
 
 A third agent arm for `bench/swe`, holding the **model constant** so it compares
 *scaffolds*: the real **Claude Code CLI** (native standalone binary, no Node) run
-**inside each official eval image** — the same in-container model as the aura arm
+**inside each official eval image** — the same in-container model as the baybo arm
 — driving **deepseek-v4-flash** via a litellm proxy, graded by the **same official
-`swebench` harness**. Directly comparable to the aura + mini-swe-agent arms.
+`swebench` harness**. Directly comparable to the baybo + mini-swe-agent arms.
 
 ```bash
 # validation (first 3 instances)
 bench/swe-claude/run.sh
-# full run + compare to an aura run
+# full run + compare to an baybo run
 LIMIT=500 AGENT_RESULTS=../swe/results/latest-agent.json bench/swe-claude/run.sh
 # a specific set, on Lite
 DATASET_NAME=princeton-nlp/SWE-bench_Lite INSTANCE_IDS="django__django-12983 ..." bench/swe-claude/run.sh
@@ -38,8 +38,8 @@ DATASET_NAME=princeton-nlp/SWE-bench_Lite INSTANCE_IDS="django__django-12983 ...
   setup.py/tox.ini contamination guard), graded by `swebench.harness.run_evaluation`.
 - **Captured per instance:** Claude Code's own token usage (input + cache_read +
   output) → preds → results; and a transcript — raw `trace/<run>/agent/<id>.stream.jsonl`
-  plus an aura-format `<id>.messages.json` the `export_aura_trajs.py` / `compare_arms.py`
-  tooling can render alongside aura/mini.
+  plus an baybo-format `<id>.messages.json` the `export_baybo_trajs.py` / `compare_arms.py`
+  tooling can render alongside baybo/mini.
 
 Knobs (env): `LIMIT` / `INSTANCE_IDS` / `SLICE`, `WORKERS`, `MAX_WORKERS` (grader),
 `MODEL`, `MAX_TURNS`, `PROMPT_TIMEOUT`, `PROXY_PORT`, `CLAUDE_BIN`, `AGENT_RESULTS`.

@@ -5,7 +5,7 @@
 //! real lock contention is hidden from logs and telemetry. We instead
 //! keep `busy_timeout` at its default (0) so anything serious surfaces
 //! immediately, and offer this helper for call-sites that are known
-//! to compete with another process (today just the CLI's `aura
+//! to compete with another process (today just the CLI's `baybo
 //! channels bot add/remove`, which writes the same libsql file a
 //! running gateway may read/write).
 //!
@@ -35,8 +35,8 @@ const INITIAL_BACKOFF_MS: u64 = 15;
 /// short-circuits.
 ///
 /// Generic over the error type so call-sites can share the helper
-/// across storage-level errors (`aura_storage::StorageError`) and the
-/// vault's security wrapper (`aura_security::SecurityError`) without
+/// across storage-level errors (`baybo_storage::StorageError`) and the
+/// vault's security wrapper (`baybo_security::SecurityError`) without
 /// either crate taking a dependency on the other.
 ///
 /// `op` names the call-site ("vault.store_secret",
@@ -84,7 +84,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use aura_store::StorageError;
+    use baybo_store::StorageError;
 
     fn busy_err() -> StorageError {
         StorageError::Internal(anyhow::anyhow!("libsql upsert: database is locked"))

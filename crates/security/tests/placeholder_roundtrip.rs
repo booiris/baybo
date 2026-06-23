@@ -10,15 +10,15 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use aura_security::test_support::MemorySecretStore;
-use aura_security::{EncryptionKey, LeakAction, LeakDetector, PlaceholderMinter, SecretVault};
+use baybo_security::test_support::MemorySecretStore;
+use baybo_security::{EncryptionKey, LeakAction, LeakDetector, PlaceholderMinter, SecretVault};
 
 fn make_vault() -> (Arc<SecretVault>, Arc<MemorySecretStore>) {
     let store = Arc::new(MemorySecretStore::new());
-    let key = EncryptionKey::new(b"aura-it-master-key-32-bytes!!!!!".to_vec()).unwrap();
+    let key = EncryptionKey::new(b"baybo-it-master-key-32-bytes!!!!".to_vec()).unwrap();
     let vault = Arc::new(SecretVault::new(
         key,
-        store.clone() as Arc<dyn aura_store::SecretStore>,
+        store.clone() as Arc<dyn baybo_store::SecretStore>,
     ));
     (vault, store)
 }

@@ -1,14 +1,14 @@
 #!/usr/bin/env python
-"""Build a single self-contained HTML page that puts the aura and mini-swe-agent
+"""Build a single self-contained HTML page that puts the baybo and mini-swe-agent
 trajectories side by side, for the cases where the two arms DIVERGE (one solved,
 the other didn't). Reuses the per-arm Markdown exports (same format), so it just
 md→HTML-renders both columns.
 
 Usage:
   python compare_arms.py \
-    --aura-export ../swe/trace/<RID>/_export \
+    --baybo-export ../swe/trace/<RID>/_export \
     --mini-export runs/<RID>/_export \
-    --aura-results ../swe/results/latest-agent.json \
+    --baybo-results ../swe/results/latest-agent.json \
     --mini-results results/latest-baseline.json \
     --out _compare/compare.html
 """
@@ -84,7 +84,7 @@ def first_lines(md, n=4):
 
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<title>aura vs mini-swe-agent — divergent cases</title>
+<title>baybo vs mini-swe-agent — divergent cases</title>
 <style>
 :root{color-scheme:light dark}
 *{box-sizing:border-box}
@@ -114,11 +114,11 @@ p{margin:4px 0;white-space:pre-wrap}
 .meta .r-y{color:#3fb950}.meta .r-n{color:#f85149}
 </style></head><body>
 <header>
-<h1>aura vs mini-swe-agent — divergent cases (one solved, other didn't)</h1>
+<h1>baybo vs mini-swe-agent — divergent cases (one solved, other didn't)</h1>
 <div class="filters">
   <button data-f="all" class="on">All (__N__)</button>
   <button data-f="mini">mini-only solves (__NB__)</button>
-  <button data-f="aura">aura-only solves (__NA__)</button>
+  <button data-f="baybo">baybo-only solves (__NA__)</button>
   <span style="margin:0 8px;color:#444">|</span>
   <button id="syncbtn" class="on">Sync scroll: ON</button>
 </div>
@@ -180,18 +180,18 @@ sb.onclick=()=>{syncOn=!syncOn;sb.classList.toggle('on',syncOn);sb.textContent='
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--aura-export", required=True)
+    ap.add_argument("--baybo-export", required=True)
     ap.add_argument("--mini-export", required=True)
-    ap.add_argument("--aura-results", required=True)
+    ap.add_argument("--baybo-results", required=True)
     ap.add_argument("--mini-results", required=True)
     ap.add_argument("--out", default="_compare/compare.html")
     a = ap.parse_args()
 
-    A = {r["instance_id"]: r for r in json.load(open(a.aura_results)).get("results", [])}
+    A = {r["instance_id"]: r for r in json.load(open(a.baybo_results)).get("results", [])}
     B = {r["instance_id"]: r for r in json.load(open(a.mini_results)).get("results", [])}
     shared = set(A) & set(B)
     mini_only = sorted(i for i in shared if B[i].get("resolved") and not A[i].get("resolved"))
-    aura_only = sorted(i for i in shared if A[i].get("resolved") and not B[i].get("resolved"))
+    baybo_only = sorted(i for i in shared if A[i].get("resolved") and not B[i].get("resolved"))
 
     def col(export_dir, iid, arm, resolved):
         p = os.path.join(export_dir, f"{iid}.md")
@@ -202,35 +202,35 @@ def main():
                 f'— <span class="meta {rcls}">{rtxt}</span></div>{body}</div>')
 
     sections, toc = [], []
-    order = [("mini", mini_only), ("aura", aura_only)]
+    order = [("mini", mini_only), ("baybo", baybo_only)]
     for cat, ids in order:
         for iid in ids:
             a_res, b_res = A[iid].get("resolved"), B[iid].get("resolved")
-            winner = "mini" if (b_res and not a_res) else "aura"
+            winner = "mini" if (b_res and not a_res) else "baybo"
             badge_a = "win" if a_res else "lose"
             badge_b = "win" if b_res else "lose"
             toc.append(f'<a href="#{iid}">{iid}</a>')
             sections.append(
                 f'<section id="{iid}" data-cat="{cat}">'
                 f'<div class="case-h"><span class="id">{iid}</span>'
-                f'<span class="badge {badge_a}">aura {"✓" if a_res else "✗"}</span>'
+                f'<span class="badge {badge_a}">baybo {"✓" if a_res else "✗"}</span>'
                 f'<span class="badge {badge_b}">mini {"✓" if b_res else "✗"}</span>'
                 f'<span class="meta">winner: {winner}</span></div>'
                 f'<div class="cols">'
-                + col(a.aura_export, iid, "AURA", a_res)
+                + col(a.baybo_export, iid, "BAYBO", a_res)
                 + col(a.mini_export, iid, "MINI (mini-swe-agent)", b_res)
                 + "</div></section>")
 
     page = (PAGE
-            .replace("__N__", str(len(mini_only) + len(aura_only)))
+            .replace("__N__", str(len(mini_only) + len(baybo_only)))
             .replace("__NB__", str(len(mini_only)))
-            .replace("__NA__", str(len(aura_only)))
+            .replace("__NA__", str(len(baybo_only)))
             .replace("__TOC__", " ".join(toc))
             .replace("__BODY__", "\n".join(sections)))
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     open(a.out, "w").write(page)
-    print(f"wrote {a.out}  ({len(mini_only)} mini-only + {len(aura_only)} aura-only "
-          f"= {len(mini_only) + len(aura_only)} cases)")
+    print(f"wrote {a.out}  ({len(mini_only)} mini-only + {len(baybo_only)} baybo-only "
+          f"= {len(mini_only) + len(baybo_only)} cases)")
 
 
 if __name__ == "__main__":

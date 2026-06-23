@@ -1,5 +1,5 @@
 //! Shared data layer for the memory benchmark: scope keys, the ingest↔run
-//! manifest, and the deterministic F1 metric. Holds **no Aura dependencies** so
+//! manifest, and the deterministic F1 metric. Holds **no Baybo dependencies** so
 //! it stays fast to compile and easy to unit-test.
 //!
 //! Dataset parsing lives behind the [`testset`] seam — each [`testset::TestSet`]
@@ -15,7 +15,7 @@ pub mod llm;
 pub mod report;
 pub mod testset;
 
-/// Env var holding the mem0 API key (mirrors `aura_memory::backends::mem0`).
+/// Env var holding the mem0 API key (mirrors `baybo_memory::backends::mem0`).
 pub const MEM0_API_KEY_ENV: &str = "MEM0_API_KEY";
 
 // ---------------------------------------------------------------------------

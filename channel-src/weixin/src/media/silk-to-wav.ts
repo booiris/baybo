@@ -11,7 +11,7 @@
  */
 import { decode as silkDecode, isSilk } from "silk-wasm";
 
-import type { Logger } from "@aura/channel-sdk";
+import type { Logger } from "@baybo/channel-sdk";
 
 const WECHAT_SILK_SAMPLE_RATE = 24_000;
 const WAV_HEADER_BYTES = 44;

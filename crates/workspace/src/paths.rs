@@ -1,6 +1,6 @@
 //! Centralised filesystem addresses.
 //!
-//! Every aura-managed path — workspace root, identity files, log dir,
+//! Every baybo-managed path — workspace root, identity files, log dir,
 //! libsql database, MCP config, sidecar cache — is resolved through one of
 //! the constants or helpers in this module. Keeping the strings in a single
 //! leaf-level crate prevents the same filename from drifting across
@@ -10,14 +10,14 @@
 //!
 //! ```text
 //! <root>/
-//!   config/            # standalone git repo: aura.json, .mcp.json
+//!   config/            # standalone git repo: baybo.json, .mcp.json
 //!   profile/           # standalone git repo: *.md identity files
 //!   skills/            # standalone git repo: user skill definitions
 //!   agents/            # standalone git repo: subagent profile definitions
 //!   .key/              # not version-controlled: encryption.key
-//!   state/             # not version-controlled: storage.db, aura.lock, channel.port, browser/profile
+//!   state/             # not version-controlled: storage.db, baybo.lock, channel.port, browser/profile
 //!   work/              # not version-controlled: sandbox FS scope; .uv/ (uv cache + downloaded pythons + tools), other scratch
-//!   logs/              # not version-controlled: aura.log.YYYY-MM-DD, channel/<type>.log (sessions/<id>.jsonl is virtual — never written)
+//!   logs/              # not version-controlled: baybo.log.YYYY-MM-DD, channel/<type>.log (sessions/<id>.jsonl is virtual — never written)
 //! ```
 //!
 //! `config/`, `profile/`, and `skills/` each get their own `.git` repo on
@@ -31,7 +31,7 @@ use crate::prompt::*;
 // Workspace top-level subdirectories
 // ---------------------------------------------------------------------------
 
-/// Standalone git repo at `<root>/config/`: aura.json + MCP registry.
+/// Standalone git repo at `<root>/config/`: baybo.json + MCP registry.
 /// Operator-edited, version-controlled.
 pub const CONFIG_DIR: &str = "config";
 
@@ -66,9 +66,9 @@ pub const LOGS_DIR: &str = "logs";
 // Files inside `config/` (standalone git repo)
 // ---------------------------------------------------------------------------
 
-/// Top-level config file (default name; `AURA_CONFIG_PATH` overrides).
-/// Stored at `<root>/config/aura.json`.
-pub const WORKSPACE_CONFIG_FILE: &str = "aura.json";
+/// Top-level config file (default name; `BAYBO_CONFIG_PATH` overrides).
+/// Stored at `<root>/config/baybo.json`.
+pub const WORKSPACE_CONFIG_FILE: &str = "baybo.json";
 
 /// MCP server registry file. Stored at `<root>/config/.mcp.json`.
 pub const MCP_CONFIG_FILE: &str = ".mcp.json";
@@ -97,13 +97,13 @@ pub const ENCRYPTION_KEY_FILE: &str = "encryption.key";
 pub const STORAGE_DB_FILE: &str = "storage.db";
 
 /// Per-workspace singleton lock (advisory `flock`).
-pub const SINGLETON_LOCK_FILE: &str = "aura.lock";
+pub const SINGLETON_LOCK_FILE: &str = "baybo.lock";
 
 /// Channel TCP listener publishes its ephemeral port here.
 pub const CHANNEL_PORT_FILE: &str = "channel.port";
 
 /// Browser sidecar Chrome user-data-dir lives at
-/// `<STATE_DIR>/<BROWSER_PROFILE_SUBDIR>`. Persistent across Aura
+/// `<STATE_DIR>/<BROWSER_PROFILE_SUBDIR>`. Persistent across Baybo
 /// restarts (cookies / localStorage retained); in docker mode this
 /// gets bind-mounted at `/data/profile` inside the container.
 pub const BROWSER_PROFILE_SUBDIR: &str = "browser/profile";
@@ -147,14 +147,14 @@ pub const BROWSER_FONTS_SUBDIR: &str = ".fonts";
 /// drops oversize tool results here as content-addressed `.txt` files
 /// so the LLM can `Read` the rest. Hidden (leading dot) to keep
 /// glob/grep noise down on the agent's working directory.
-pub const TOOL_SPILLS_SUBDIR: &str = ".aura-tool-spills";
+pub const TOOL_SPILLS_SUBDIR: &str = ".baybo-tool-spills";
 
 // ---------------------------------------------------------------------------
 // Files inside `logs/` (not version-controlled)
 // ---------------------------------------------------------------------------
 
-/// File-name prefix for the gateway's rolling log files (`aura.log.YYYY-MM-DD`).
-pub const LOG_FILE_PREFIX: &str = "aura.log";
+/// File-name prefix for the gateway's rolling log files (`baybo.log.YYYY-MM-DD`).
+pub const LOG_FILE_PREFIX: &str = "baybo.log";
 
 /// Subdirectory under [`LOGS_DIR`] holding per-channel sidecar log files
 /// (`<channel_type>.log.YYYY-MM-DD`).
@@ -174,24 +174,24 @@ pub const SESSION_LOG_EXTENSION: &str = "jsonl";
 // Cache (XDG-style, outside the workspace root)
 // ---------------------------------------------------------------------------
 
-/// Aura subdirectory under `$XDG_CACHE_HOME` (or `$HOME/.cache`).
-pub const CACHE_SUBDIR: &str = "aura";
+/// Baybo subdirectory under `$XDG_CACHE_HOME` (or `$HOME/.cache`).
+pub const CACHE_SUBDIR: &str = "baybo";
 
 // ---------------------------------------------------------------------------
 // Binary / env-var identifiers (single source of truth)
 // ---------------------------------------------------------------------------
 
 /// The cargo `[[bin]]` name in the workspace root `Cargo.toml`. Mirrored
-/// into the clap tree via `#[command(name = "aura", …)]` and matched
+/// into the clap tree via `#[command(name = "baybo", …)]` and matched
 /// against bash-tool command strings to decide whether to inject the
-/// agent-side env (see `aura_tools::builtin::bash::inject_aura_env`).
+/// agent-side env (see `baybo_tools::builtin::bash::inject_baybo_env`).
 ///
 /// If the bin is ever renamed, update this *and* the clap attribute in
-/// `aura_cli::cli` — they're not enforced equal by the compiler.
-pub const BIN_NAME: &str = "aura";
+/// `baybo_cli::cli` — they're not enforced equal by the compiler.
+pub const BIN_NAME: &str = "baybo";
 
 /// Override for the on-disk config file location.
-pub const ENV_CONFIG_PATH: &str = "AURA_CONFIG_PATH";
+pub const ENV_CONFIG_PATH: &str = "BAYBO_CONFIG_PATH";
 
 // ---------------------------------------------------------------------------
 // Default workspace root + default config file
@@ -204,13 +204,13 @@ pub const ENV_CONFIG_PATH: &str = "AURA_CONFIG_PATH";
 /// `ensure_layout`, or unit tests pointing at a freshly-named
 /// tempdir). `std::path::absolute` joins relative paths with cwd but
 /// does not normalise `.` components — strip them manually so the
-/// result doesn't show `<cwd>/./.aura/work`. `..` is left intact; the
+/// result doesn't show `<cwd>/./.baybo/work`. `..` is left intact; the
 /// OS resolves it correctly on access and proper normalisation
 /// requires a real filesystem walk.
 ///
 /// Callers that compare paths via [`Path::starts_with`] should route
 /// both sides through this helper so a relative workspace root (e.g.
-/// the debug-build default `./.aura`) does not turn the comparison
+/// the debug-build default `./.baybo`) does not turn the comparison
 /// into a silent miss.
 pub fn absolutise(p: &Path) -> PathBuf {
     if let Ok(canonical) = p.canonicalize() {
@@ -226,15 +226,15 @@ pub fn absolutise(p: &Path) -> PathBuf {
     cleaned
 }
 
-/// Default workspace root: `~/.aura` in release, `<cwd>/.aura` in
+/// Default workspace root: `~/.baybo` in release, `<cwd>/.baybo` in
 /// debug. The debug default keeps `cargo run` self-contained inside
 /// the project checkout rather than polluting the real user home;
 /// resolving against `current_dir` at call time keeps the result
 /// absolute so the path stays valid no matter which cwd a later
-/// subprocess inherits (see also [`AuraConfig::validate`], which
+/// subprocess inherits (see also [`BayboConfig::validate`], which
 /// rejects relative `workspace.path`).
 ///
-/// Falls back to `/.aura` in the (unreachable in practice) case
+/// Falls back to `/.baybo` in the (unreachable in practice) case
 /// where neither `current_dir()` nor `home_dir()` resolves — an
 /// absolute literal is still better than a relative one that
 /// validation would refuse.
@@ -242,26 +242,26 @@ pub fn default_workspace_root() -> PathBuf {
     if cfg!(debug_assertions)
         && let Ok(cwd) = std::env::current_dir()
     {
-        return cwd.join(".aura");
+        return cwd.join(".baybo");
     }
     match std::env::home_dir() {
-        Some(home) => home.join(".aura"),
-        None => PathBuf::from("/.aura"),
+        Some(home) => home.join(".baybo"),
+        None => PathBuf::from("/.baybo"),
     }
 }
 
-/// Default `aura.json` location: `<default_workspace_root>/config/aura.json`.
-/// Used as the fallback when `AURA_CONFIG_PATH` is not set.
+/// Default `baybo.json` location: `<default_workspace_root>/config/baybo.json`.
+/// Used as the fallback when `BAYBO_CONFIG_PATH` is not set.
 pub fn default_config_file() -> PathBuf {
     default_workspace_root()
         .join(CONFIG_DIR)
         .join(WORKSPACE_CONFIG_FILE)
 }
 
-/// System-level aura cache root: `$XDG_CACHE_HOME/aura`, falling back to
-/// `$HOME/.cache/aura`. `None` if neither env var is set — callers map
+/// System-level baybo cache root: `$XDG_CACHE_HOME/baybo`, falling back to
+/// `$HOME/.cache/baybo`. `None` if neither env var is set — callers map
 /// this to their own error type.
-pub fn aura_cache_root() -> Option<PathBuf> {
+pub fn baybo_cache_root() -> Option<PathBuf> {
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
@@ -470,7 +470,7 @@ impl WorkspacePaths {
     /// written here — the compaction summary embeds this path as a
     /// `read the full transcript at <path>` pointer, and a `Read` of it is
     /// served from the durable `session_messages` transcript (see the
-    /// session-transcript read intercept in `aura-agent`'s tool executor).
+    /// session-transcript read intercept in `baybo-agent`'s tool executor).
     pub fn session_log_file(&self, session_id: &str) -> PathBuf {
         self.sessions_log_dir().join(format!(
             "{}.{}",
@@ -540,75 +540,81 @@ mod tests {
 
     #[test]
     fn workspace_paths_compose_under_root() {
-        let p = WorkspacePaths::new("/var/aura");
-        assert_eq!(p.config_dir(), PathBuf::from("/var/aura/config"));
-        assert_eq!(p.config_file(), PathBuf::from("/var/aura/config/aura.json"));
-        assert_eq!(p.mcp_config(), PathBuf::from("/var/aura/config/.mcp.json"));
-        assert_eq!(p.profile_dir(), PathBuf::from("/var/aura/profile"));
+        let p = WorkspacePaths::new("/var/baybo");
+        assert_eq!(p.config_dir(), PathBuf::from("/var/baybo/config"));
+        assert_eq!(
+            p.config_file(),
+            PathBuf::from("/var/baybo/config/baybo.json")
+        );
+        assert_eq!(p.mcp_config(), PathBuf::from("/var/baybo/config/.mcp.json"));
+        assert_eq!(p.profile_dir(), PathBuf::from("/var/baybo/profile"));
         assert_eq!(
             p.identity_file(IdentityKind::Soul),
-            PathBuf::from("/var/aura/profile/SOUL.md"),
+            PathBuf::from("/var/baybo/profile/SOUL.md"),
         );
-        assert_eq!(p.key_dir(), PathBuf::from("/var/aura/.key"));
+        assert_eq!(p.key_dir(), PathBuf::from("/var/baybo/.key"));
         assert_eq!(
             p.encryption_key_file(),
-            PathBuf::from("/var/aura/.key/encryption.key"),
+            PathBuf::from("/var/baybo/.key/encryption.key"),
         );
-        assert_eq!(p.storage_db(), PathBuf::from("/var/aura/state/storage.db"),);
+        assert_eq!(p.storage_db(), PathBuf::from("/var/baybo/state/storage.db"),);
         assert_eq!(
             p.singleton_lock(),
-            PathBuf::from("/var/aura/state/aura.lock"),
+            PathBuf::from("/var/baybo/state/baybo.lock"),
         );
         assert_eq!(
             p.channel_port(),
-            PathBuf::from("/var/aura/state/channel.port"),
+            PathBuf::from("/var/baybo/state/channel.port"),
         );
-        assert_eq!(p.logs_dir(), PathBuf::from("/var/aura/logs"));
+        assert_eq!(p.logs_dir(), PathBuf::from("/var/baybo/logs"));
         assert_eq!(
             p.channel_logs_dir(),
-            PathBuf::from("/var/aura/logs/channel"),
+            PathBuf::from("/var/baybo/logs/channel"),
         );
         assert_eq!(
             p.sessions_log_dir(),
-            PathBuf::from("/var/aura/logs/sessions"),
+            PathBuf::from("/var/baybo/logs/sessions"),
         );
-        assert_eq!(p.skills_dir(), PathBuf::from("/var/aura/skills"));
-        assert_eq!(p.agents_dir(), PathBuf::from("/var/aura/agents"));
-        assert_eq!(p.uv_state_dir(), PathBuf::from("/var/aura/work/.uv"));
-        assert_eq!(p.uv_cache_dir(), PathBuf::from("/var/aura/work/.uv/cache"));
+        assert_eq!(p.skills_dir(), PathBuf::from("/var/baybo/skills"));
+        assert_eq!(p.agents_dir(), PathBuf::from("/var/baybo/agents"));
+        assert_eq!(p.uv_state_dir(), PathBuf::from("/var/baybo/work/.uv"));
+        assert_eq!(p.uv_cache_dir(), PathBuf::from("/var/baybo/work/.uv/cache"));
         assert_eq!(
             p.uv_python_dir(),
-            PathBuf::from("/var/aura/work/.uv/python"),
+            PathBuf::from("/var/baybo/work/.uv/python"),
         );
-        assert_eq!(p.uv_tool_dir(), PathBuf::from("/var/aura/work/.uv/tools"));
-        assert_eq!(p.uv_tool_bin_dir(), PathBuf::from("/var/aura/work/.uv/bin"));
+        assert_eq!(p.uv_tool_dir(), PathBuf::from("/var/baybo/work/.uv/tools"));
+        assert_eq!(
+            p.uv_tool_bin_dir(),
+            PathBuf::from("/var/baybo/work/.uv/bin")
+        );
         assert_eq!(
             p.browser_fonts_dir(),
-            PathBuf::from("/var/aura/work/.fonts"),
+            PathBuf::from("/var/baybo/work/.fonts"),
         );
         assert_eq!(
             p.browser_profile_dir(),
-            PathBuf::from("/var/aura/state/browser/profile"),
+            PathBuf::from("/var/baybo/state/browser/profile"),
         );
         assert_eq!(
             p.tool_spills_dir(),
-            PathBuf::from("/var/aura/work/.aura-tool-spills"),
+            PathBuf::from("/var/baybo/work/.baybo-tool-spills"),
         );
         assert_eq!(
             p.state_sessions_dir(),
-            PathBuf::from("/var/aura/state/sessions"),
+            PathBuf::from("/var/baybo/state/sessions"),
         );
         assert_eq!(
             p.session_state_dir("abc-123"),
-            PathBuf::from("/var/aura/state/sessions/abc-123"),
+            PathBuf::from("/var/baybo/state/sessions/abc-123"),
         );
         assert_eq!(
             p.session_summary_file("abc-123"),
-            PathBuf::from("/var/aura/state/sessions/abc-123/summary.md"),
+            PathBuf::from("/var/baybo/state/sessions/abc-123/summary.md"),
         );
         assert_eq!(
             p.session_summary_tmp_file("abc-123"),
-            PathBuf::from("/var/aura/state/sessions/abc-123/summary.md.tmp"),
+            PathBuf::from("/var/baybo/state/sessions/abc-123/summary.md.tmp"),
         );
     }
 
@@ -653,7 +659,7 @@ mod tests {
         // Don't mutate process env in unit tests; just verify both
         // branches by inspecting the constant composition that the
         // helper performs.
-        assert_eq!(CACHE_SUBDIR, "aura");
+        assert_eq!(CACHE_SUBDIR, "baybo");
     }
 
     #[test]

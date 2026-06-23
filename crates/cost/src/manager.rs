@@ -4,15 +4,15 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use tokio::sync::Notify;
 
-use aura_llm::ModelPricing;
-use aura_model::{JobId, MicroUsd, SessionId, SpanId};
+use baybo_llm::ModelPricing;
+use baybo_model::{JobId, MicroUsd, SessionId, SpanId};
 use chrono::{Datelike, NaiveDate, Utc};
 use parking_lot::RwLock;
 use thiserror::Error;
 use tracing::warn;
 
-use aura_model::{CallReason, CostRecord, TimeRange};
-use aura_store::CostStore;
+use baybo_model::{CallReason, CostRecord, TimeRange};
+use baybo_store::CostStore;
 
 #[derive(Debug, Error)]
 pub enum CostGuardError {
@@ -46,7 +46,7 @@ pub struct SpendingLimits {
 ///    Persist failures log a warning and tick
 ///    `metrics.persist_failures`; they never fail the call.
 ///
-/// `Router` (in `aura-agent`) also calls `check` at message ingress so
+/// `Router` (in `baybo-agent`) also calls `check` at message ingress so
 /// an over-cap user never even gets an actor spun up. [`Self::hydrate`]
 /// runs at boot to rebuild today's / this month's totals from disk so a
 /// restart doesn't silently widen the budget.
@@ -146,7 +146,7 @@ impl BudgetState {
 /// using `cached_input_per_1m_tokens` / `cache_write_per_1m_tokens`
 /// when present, falling back to `input_per_1m_tokens` when the
 /// model's pricing row hasn't yet exposed cache rates. The Anthropic
-/// adapter (`from_anthropic_*` in `aura-llm`) normalises its native
+/// adapter (`from_anthropic_*` in `baybo-llm`) normalises its native
 /// disjoint buckets to this convention so the formula is uniform
 /// across providers.
 fn compute_cost_usd(
@@ -179,7 +179,7 @@ fn compute_cost_usd(
 /// list-price cut.
 const PRICING_DRIFT_WARN: f64 = 0.25;
 
-fn drift_ratio(a: aura_model::MicroUsd, b: aura_model::MicroUsd) -> f64 {
+fn drift_ratio(a: baybo_model::MicroUsd, b: baybo_model::MicroUsd) -> f64 {
     let a = a.into_micros() as f64;
     let b = b.into_micros() as f64;
     if a <= 0.0 {
@@ -344,7 +344,7 @@ impl CostManager {
 
     /// Wait until every in-flight persist task has finished. The
     /// long-running gateway never needs this (it outlives all writes),
-    /// but a one-shot owner (`aura prompt` running in-process) must call
+    /// but a one-shot owner (`baybo prompt` running in-process) must call
     /// it before tearing the runtime down, or the detached persist tasks
     /// are aborted and the turn's spend never reaches `cost_records`.
     /// Cheap no-op when nothing is in flight.
@@ -511,33 +511,33 @@ impl CostManager {
 /// doesn't need to know about `LlmError` — callers in the agent layer
 /// can compose `CostManager::check` with `LlmError::GuardRejected`
 /// using [`cost_call_guard`].
-pub fn cost_call_guard(manager: &Arc<CostManager>) -> aura_llm::LlmCallGuard {
+pub fn cost_call_guard(manager: &Arc<CostManager>) -> baybo_llm::LlmCallGuard {
     let cm = Arc::clone(manager);
     Arc::new(move || {
         cm.check()
-            .map_err(|e| aura_llm::LlmError::GuardRejected(e.to_string()))
+            .map_err(|e| baybo_llm::LlmError::GuardRejected(e.to_string()))
     })
 }
 
 /// Bundle the admission guard and cost recorder for a `CostManager` into
-/// the [`CostHooks`](aura_llm::CostHooks) every `BillableLlm` is built
+/// the [`CostHooks`](baybo_llm::CostHooks) every `BillableLlm` is built
 /// with. This is the production wiring; argv one-shots and tests use
-/// [`CostHooks::passthrough`](aura_llm::CostHooks::passthrough).
-pub fn cost_hooks(manager: &Arc<CostManager>) -> aura_llm::CostHooks {
-    aura_llm::CostHooks {
+/// [`CostHooks::passthrough`](baybo_llm::CostHooks::passthrough).
+pub fn cost_hooks(manager: &Arc<CostManager>) -> baybo_llm::CostHooks {
+    baybo_llm::CostHooks {
         guard: cost_call_guard(manager),
         record: cost_record_closure(manager),
     }
 }
 
 /// Bridge `CostManager::record_call` to the
-/// [`LlmCostRecorder`](aura_llm::LlmCostRecorder) closure shape. Lives
-/// here, alongside [`cost_call_guard`], so `aura-llm` needn't know the
+/// [`LlmCostRecorder`](baybo_llm::LlmCostRecorder) closure shape. Lives
+/// here, alongside [`cost_call_guard`], so `baybo-llm` needn't know the
 /// manager's `record_call` signature.
-fn cost_record_closure(manager: &Arc<CostManager>) -> aura_llm::LlmCostRecorder {
+fn cost_record_closure(manager: &Arc<CostManager>) -> baybo_llm::LlmCostRecorder {
     let cm = Arc::clone(manager);
     Arc::new(
-        move |attr: &aura_llm::Attribution, model_id: &str, usage: &aura_llm::TokenUsage| {
+        move |attr: &baybo_llm::Attribution, model_id: &str, usage: &baybo_llm::TokenUsage| {
             cm.record_call(
                 &attr.user_id,
                 attr.session_id.clone(),
@@ -718,7 +718,7 @@ mod tests {
     /// is `Utc::now()` so the calendar-day / calendar-month windows in
     /// `check_quota` always include it.
     async fn record_spend(store: &Arc<dyn CostStore>, user_id: &str, cost: MicroUsd) {
-        use aura_model::{JobId, SessionId, SpanId};
+        use baybo_model::{JobId, SessionId, SpanId};
         store
             .record(&CostRecord {
                 user_id: user_id.into(),

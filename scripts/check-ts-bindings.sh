@@ -6,9 +6,9 @@
 # change always lands with the matching TS side.
 #
 # Surfaces:
-#   sdks/channel-ts/src/generated/    ← `aura-channels` (channel WS frames)
-#   tool-src/browser/src/generated/   ← `aura-tools::mcp` (MCP `_meta.aura.*`)
-#   bench/bench-web/web/src/generated/ ← `aura-bench-web` (bench spine model)
+#   sdks/channel-ts/src/generated/    ← `baybo-channels` (channel WS frames)
+#   tool-src/browser/src/generated/   ← `baybo-tools::mcp` (MCP `_meta.baybo.*`)
+#   bench/bench-web/web/src/generated/ ← `baybo-bench-web` (bench spine model)
 #
 # Usage: scripts/check-ts-bindings.sh
 set -euo pipefail
@@ -18,9 +18,9 @@ cd "$REPO_ROOT"
 
 # (binding-target-dir, regen-cargo-args)
 SURFACES=(
-    "sdks/channel-ts/src/generated|test -p aura-channels --features ts-export --lib wire"
-    "tool-src/browser/src/generated|test -p aura-tools  --features ts-export --lib mcp::access_rule"
-    "bench/bench-web/web/src/generated|test -p aura-bench-web --features ts-export --lib model"
+    "sdks/channel-ts/src/generated|test -p baybo-channels --features ts-export --lib wire"
+    "tool-src/browser/src/generated|test -p baybo-tools  --features ts-export --lib mcp::access_rule"
+    "bench/bench-web/web/src/generated|test -p baybo-bench-web --features ts-export --lib model"
 )
 
 failed=0

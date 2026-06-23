@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_store::BlobStore;
+use baybo_store::BlobStore;
 use rmcp::RoleClient;
 use rmcp::model::{CallToolRequestParams, Tool as RmcpTool};
 use rmcp::service::Peer;
@@ -12,7 +12,7 @@ use crate::approval::ResourceAccess;
 use crate::mcp::content_adapter::adapt_call_result;
 use crate::{Tool, ToolContext, ToolError, ToolOutput};
 
-/// Wrapper that exposes one rmcp-discovered tool to Aura's agent loop.
+/// Wrapper that exposes one rmcp-discovered tool to Baybo's agent loop.
 ///
 /// Names are namespaced as `<server>/<tool>` so an MCP server's tool list
 /// cannot collide with a builtin. The peer is `Arc`-cloned per tool;
@@ -131,7 +131,7 @@ pub(crate) fn build_manifest(
     namespaced_name: &str,
     description: String,
     parameters_schema: Value,
-    trust_level: aura_model::TrustLevel,
+    trust_level: baybo_model::TrustLevel,
     capabilities: Vec<crate::ToolCapability>,
 ) -> crate::ToolManifest {
     crate::ToolManifest {

@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_sandbox::bwrap::BwrapRunner;
-use aura_sandbox::{
+use baybo_sandbox::bwrap::BwrapRunner;
+use baybo_sandbox::{
     EnvPolicy, NetworkPolicy, ResourceLimits, SandboxRunner, SandboxSpec, StdinSource,
 };
 
@@ -41,7 +41,7 @@ async fn echo_through_bwrap() {
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(5),
             resource_limits: ResourceLimits::unlimited(),
-            filesystem_policy: aura_sandbox::FilesystemPolicy::default(),
+            filesystem_policy: baybo_sandbox::FilesystemPolicy::default(),
         })
         .await
         .expect("sandboxed run");

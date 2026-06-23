@@ -11,9 +11,9 @@
 //!   we slurp it.
 //! - **Audit commit**: after a successful write, the change is staged
 //!   and committed into `profile/`'s standalone git repo with a fixed
-//!   `Aura <aura@local>` author so the user can later see what the
+//!   `Baybo <baybo@local>` author so the user can later see what the
 //!   agent rewrote and revert with `git`. `--no-verify` is intentional:
-//!   `profile/` is Aura-managed audit history, not a hand-curated repo
+//!   `profile/` is Baybo-managed audit history, not a hand-curated repo
 //!   where pre-commit hooks would be authored. A commit failure
 //!   (detached HEAD, missing git, etc.) leaves the file write in place
 //!   and surfaces a warning in the tool output.
@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use aura_workspace::{IdentityKind, WorkspacePaths, absolutise};
+use baybo_workspace::{IdentityKind, WorkspacePaths, absolutise};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::process::Command;
@@ -35,8 +35,8 @@ use tokio::process::Command;
 use super::paths::require_absolute;
 use crate::{ResourceAccess, Tool, ToolContext, ToolError, ToolOutput};
 
-const GIT_AUTHOR_NAME: &str = "Aura";
-const GIT_AUTHOR_EMAIL: &str = "aura@local";
+const GIT_AUTHOR_NAME: &str = "Baybo";
+const GIT_AUTHOR_EMAIL: &str = "baybo@local";
 const MAX_PROFILE_BYTES: u64 = 1 << 20;
 
 pub struct EditTool {
@@ -49,7 +49,7 @@ impl EditTool {
     pub fn new(workspace_paths: WorkspacePaths) -> Self {
         // Bake absolutised dirs so `starts_with` comparisons work even
         // when the workspace root is relative — the debug-build default
-        // is `./.aura`, and a relative prefix never matches an absolute
+        // is `./.baybo`, and a relative prefix never matches an absolute
         // file path the LLM passes from the system prompt's
         // `<soul path="...">` wrapper.
         Self {
@@ -325,16 +325,16 @@ async fn run_git(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, User};
-    use aura_workspace::WorkspacePaths;
+    use baybo_model::{ChannelType, User};
+    use baybo_workspace::WorkspacePaths;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
     fn ctx() -> ToolContext {
         ToolContext {
             session_id: "t".into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -359,8 +359,8 @@ mod tests {
     fn ctx_with_paths(paths: WorkspacePaths) -> ToolContext {
         ToolContext {
             session_id: "sess-test".into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -525,7 +525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_edit_commits_with_aura_author() {
+    async fn profile_edit_commits_with_baybo_author() {
         let (_tmp, paths) = make_profile_workspace().await;
         let target = paths.identity_file(IdentityKind::Soul);
         tokio::fs::write(&target, "alpha bravo charlie\n")
@@ -579,7 +579,7 @@ mod tests {
             .await
             .unwrap();
         let log = String::from_utf8_lossy(&log.stdout);
-        assert!(log.contains("Aura <aura@local>"), "{log}");
+        assert!(log.contains("Baybo <baybo@local>"), "{log}");
         assert!(log.contains("Tool: Edit"), "{log}");
         assert!(log.contains("Session: sess-test"), "{log}");
     }
@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn accessed_resources_drops_writefile_for_profile_targets() {
-        let paths = WorkspacePaths::new("/var/aura");
+        let paths = WorkspacePaths::new("/var/baybo");
         let edit = EditTool::new(paths.clone());
 
         // Profile target → only ReadFile is declared; the WriteFile
@@ -695,7 +695,7 @@ mod tests {
 
     #[test]
     fn accessed_resources_drops_writefile_for_work_targets() {
-        let paths = WorkspacePaths::new("/var/aura");
+        let paths = WorkspacePaths::new("/var/baybo");
         let edit = EditTool::new(paths.clone());
 
         let in_work = paths.work_dir().join("scratch/notes.txt");
@@ -706,7 +706,7 @@ mod tests {
 
     #[test]
     fn accessed_resources_drops_writefile_for_skills_targets() {
-        let paths = WorkspacePaths::new("/var/aura");
+        let paths = WorkspacePaths::new("/var/baybo");
         let edit = EditTool::new(paths.clone());
 
         let in_skills = paths.skills_dir().join("my-skill/SKILL.md");
@@ -718,17 +718,17 @@ mod tests {
 
     #[test]
     fn accessed_resources_bypass_works_with_relative_workspace_root() {
-        // Regression: debug-build default is `./.aura` — a relative
+        // Regression: debug-build default is `./.baybo` — a relative
         // workspace root. profile_dir() returns the relative
-        // `./.aura/profile`, but the LLM passes file paths as absolute
+        // `./.baybo/profile`, but the LLM passes file paths as absolute
         // (the system prompt wraps each identity file with the
         // absolutised on-disk path). Without absolutising the cached
         // profile dir, `starts_with` never matched and the bypass
         // silently failed in dev. Lock that in.
         let cwd = std::env::current_dir().expect("cwd");
-        let edit = EditTool::new(WorkspacePaths::new("./.aura"));
+        let edit = EditTool::new(WorkspacePaths::new("./.baybo"));
 
-        let absolute_target = cwd.join(".aura/profile/SOUL.md");
+        let absolute_target = cwd.join(".baybo/profile/SOUL.md");
         let resources =
             edit.accessed_resources(&json!({ "file_path": absolute_target.to_string_lossy() }));
         assert_eq!(
@@ -744,7 +744,7 @@ mod tests {
         // Path looks like a profile edit (ends in /profile/SOUL.md) but
         // sits outside the actual workspace. Must NOT bypass approval —
         // otherwise the LLM could write anywhere matching that shape.
-        let paths = WorkspacePaths::new("/var/aura");
+        let paths = WorkspacePaths::new("/var/baybo");
         let edit = EditTool::new(paths);
         let resources = edit.accessed_resources(&json!({ "file_path": "/etc/profile/SOUL.md" }));
         assert_eq!(resources.len(), 2);

@@ -14,5 +14,5 @@ __pycache__/
 # The report, surfaced from the newest runs/<ts>/results.json by run.sh.
 /results/
 
-# Per-task aura transcripts + call-tree traces (mirrors the runs/ task path).
+# Per-task baybo transcripts + call-tree traces (mirrors the runs/ task path).
 /trace/

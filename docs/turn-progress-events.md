@@ -1,7 +1,7 @@
 # Turn Progress Events (Live Work Display)
 
 **Status:** ✅ Built on branch `turn-progress-events` (2026-05-26). The runtime
-mechanism lives in the code (`AgentEvent` / `Frame` in `aura-channels`, the
+mechanism lives in the code (`AgentEvent` / `Frame` in `baybo-channels`, the
 producers in `crates/agent/src/runtime/agent_loop.rs`) and is documented where
 it renders: [`docs/modules/tui.md`](modules/tui.md) (TUI),
 [`docs/modules/gateway.md`](modules/gateway.md) (wire), and
@@ -30,7 +30,7 @@ non-streaming channels drop it exactly as they drop `AnswerDelta`.
 Both interleave, in one linear transcript: streaming **reasoning/thinking**
 (dim, often collapsible), **tool invocations as they start** (`⏺ Read(path)`,
 `⏺ Bash(cmd)` — the tool + a human label), a **short result line** when each
-finishes (`⎿ Read 200 lines`, `⎿ exit 0`), and the final answer prose. Aura's
+finishes (`⎿ Read 200 lines`, `⎿ exit 0`), and the final answer prose. Baybo's
 twist: remote channels (Telegram/Discord/web) have no shared render surface, so
 progress is **opt-in per channel** — the TUI/web render it, sidecars ignore it.
 
@@ -44,7 +44,7 @@ progress is **opt-in per channel** — the TUI/web render it, sidecars ignore it
 | **Scope** | `Reasoning` (streamed thinking) + tool lifecycle (`ToolStarted` / `ToolCompleted`) + compaction status (`Status(Compacting/Compacted)`). Remaining `Status` phases (Thinking/Responding) deferred — see below. |
 | **Compaction status** | `compress_if_needed` reports `Status(Compacting)` before a pass and `Status(Compacted)` after, gated by a new `ContextManager::needs_compression` so the line shows **only when a pass actually runs** and the end always follows the start (emitted even on a compress error, so it never dangles). `maybe_compress` now calls `needs_compression` for its own threshold gate too (one source of truth). No token-delta summary — matches the plain `/compact` confirmation. Delivered with `await` (low-frequency; the end-clear is load-bearing). |
 | **Tool-lifecycle emission point** | The **agent loop** (`run_iteration`), not the executor: `ToolStarted` for every call before `join_all`, `ToolCompleted` per result after. For the common single-call iteration this is indistinguishable from per-tool timing; concurrent multi-tool batches "start together / finish together" — accepted. Per-tool real-time interleaving is a later upgrade that would move emission into `ToolExecutor::execute`. |
-| **Tool label** | A dedicated `Tool::progress_label(params)` (defaults to `call_label`, exposed to the loop via `ToolRegistry::progress_label`). Kept distinct from `call_label` because that one is an *approval warning* on some tools, not a preview (Bash's `call_label` only fires on destructive commands). Tools surface their most identifying argument through the shared `aura_tools::progress` helpers — `preview_path` (full path, left-truncated on a `/` boundary so the file name survives), `preview_arg` (whitespace-collapsed, capped at `PROGRESS_LABEL_MAX`), and `preview_search` (`<pattern> · in <path>`): Read/Write/Edit/SendFile → the path, Bash → the command, Grep/Glob → pattern + search root, WebFetch → the URL (inherited from `call_label`), spawn_subagent → `type: summary`, CronCreate → the prompt, CronDelete → the id, Skill(Install/Uninstall) → the skill name/dir. Tools with no identifying argument (Now, CronList, dynamic MCP tools) render a bare `● tool`. |
+| **Tool label** | A dedicated `Tool::progress_label(params)` (defaults to `call_label`, exposed to the loop via `ToolRegistry::progress_label`). Kept distinct from `call_label` because that one is an *approval warning* on some tools, not a preview (Bash's `call_label` only fires on destructive commands). Tools surface their most identifying argument through the shared `baybo_tools::progress` helpers — `preview_path` (full path, left-truncated on a `/` boundary so the file name survives), `preview_arg` (whitespace-collapsed, capped at `PROGRESS_LABEL_MAX`), and `preview_search` (`<pattern> · in <path>`): Read/Write/Edit/SendFile → the path, Bash → the command, Grep/Glob → pattern + search root, WebFetch → the URL (inherited from `call_label`), spawn_subagent → `type: summary`, CronCreate → the prompt, CronDelete → the id, Skill(Install/Uninstall) → the skill name/dir. Tools with no identifying argument (Now, CronList, dynamic MCP tools) render a bare `● tool`. |
 | **Tool result summary** | Content-**light** by design (line counts, attachment/image counts, `error`/`denied`), never raw output bytes — so a leak can't ride the summary. Derived generically from `ToolOutput`; a tool-authored `Tool::result_summary` is a later refinement. |
 | **Security** | `Reasoning`, `label`, and `summary` are model-/tool-derived text and pass the same sanitize + vault-reveal boundary as `AnswerDelta` (`stream_emit` / `sanitize_stream_fragment`). On a sanitize failure the summary is dropped (empty) rather than risk a leak. |
 | **Ordering / backpressure** | One ordered mpsc. Answer `AnswerDelta` and tool `ToolStarted/ToolCompleted` use `await` (load-bearing / display self-consistency); `Reasoning` uses `try_send` (ephemeral, droppable) — matching how `Notice` already drops on a full channel. The final `Message` is the reconciliation point that clears any in-flight progress UI. |

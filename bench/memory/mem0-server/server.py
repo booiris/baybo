@@ -1,7 +1,7 @@
 """Minimal self-hosted mem0 server for the benchmark.
 
 A thin FastAPI shim over the `mem0` library, exposing exactly the OSS REST
-surface the Aura mem0 backend speaks in `self_hosted` mode (`/memories`,
+surface the Baybo mem0 backend speaks in `self_hosted` mode (`/memories`,
 `/search`). Extraction runs synchronously inside `add` (an LLM call), so there
 is no event feed — the backend's settle is a no-op.
 
@@ -70,7 +70,7 @@ app = FastAPI(title="mem0-bench")
 
 def _wrap(res):
     """mem0 returns {"results": [...]} on recent versions, a bare list on older
-    ones. The Aura backend accepts either; normalize to the dict shape."""
+    ones. The Baybo backend accepts either; normalize to the dict shape."""
     return res if isinstance(res, dict) else {"results": res}
 
 

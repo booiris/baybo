@@ -1,4 +1,4 @@
-//! Inline OAuth 2.1 + PKCE + Dynamic Client Registration for `aura mcp add`.
+//! Inline OAuth 2.1 + PKCE + Dynamic Client Registration for `baybo mcp add`.
 //!
 //! The flow:
 //!  1. Discover authorization-server metadata from `<base_url>/.well-known/...`
@@ -13,17 +13,17 @@
 //!     them to the vault.
 //!
 //! The flow runs inside the CLI process for the duration of a single
-//! `aura mcp add` invocation and tears the listener down on exit.
+//! `baybo mcp add` invocation and tears the listener down on exit.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aura_security::SecretVault;
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::response::Html;
 use axum::routing::get;
+use baybo_security::SecretVault;
 use oauth2::TokenResponse;
 use rmcp::transport::auth::{
     AuthorizationManager, CredentialStore, OAuthClientConfig, OAuthState, OAuthTokenResponse,
@@ -38,7 +38,7 @@ use crate::mcp::error::{McpError, McpResult};
 
 const REDIRECT_PATH: &str = "/oauth/callback";
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
-const CLIENT_NAME: &str = "Aura MCP Client";
+const CLIENT_NAME: &str = "Baybo MCP Client";
 
 const CALLBACK_HTML: &str = "<!doctype html><html><body style=\"font-family:sans-serif;text-align:center;padding-top:6rem\"><h1>Authorization complete</h1><p>You can close this tab and return to the terminal.</p></body></html>";
 

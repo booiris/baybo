@@ -43,8 +43,8 @@ struct ListJobsParams {
     cursor: Option<String>,
 }
 
-fn parse_status(s: &str) -> Result<aura_job::JobStatusKind> {
-    use aura_job::JobStatusKind;
+fn parse_status(s: &str) -> Result<baybo_job::JobStatusKind> {
+    use baybo_job::JobStatusKind;
     match s {
         "pending" => Ok(JobStatusKind::Pending),
         "in_progress" => Ok(JobStatusKind::InProgress),
@@ -88,12 +88,12 @@ async fn list_jobs(
 
     let mut jobs = match params.session {
         Some(sid) => {
-            let sid = aura_model::SessionId::from(sid);
+            let sid = baybo_model::SessionId::from(sid);
             state.job_lifecycle.list_by_session(&sid, status).await
         }
         None => state.job_lifecycle.list(status).await,
     }
-    .map_err(|e: aura_job::JobError| GatewayError::Job(e.to_string()))?;
+    .map_err(|e: baybo_job::JobError| GatewayError::Job(e.to_string()))?;
 
     let total = jobs.len();
     if offset >= total {
@@ -149,14 +149,14 @@ async fn list_background_jobs(State(state): State<AdminState>) -> Json<Backgroun
     )
 )]
 async fn get_job(State(state): State<AdminState>, Path(id): Path<String>) -> Result<Json<Job>> {
-    let job_id: aura_model::JobId = id
+    let job_id: baybo_model::JobId = id
         .parse()
         .map_err(|e| GatewayError::BadRequest(format!("invalid job id: {e}")))?;
     let job = state
         .job_lifecycle
         .get(&job_id)
         .await
-        .map_err(|e: aura_job::JobError| GatewayError::Job(e.to_string()))?
+        .map_err(|e: baybo_job::JobError| GatewayError::Job(e.to_string()))?
         .ok_or_else(|| GatewayError::NotFound(format!("job {id}")))?;
     Ok(Json(Job::from(job)))
 }
@@ -177,21 +177,21 @@ async fn get_job(State(state): State<AdminState>, Path(id): Path<String>) -> Res
     )
 )]
 async fn cancel_job(State(state): State<AdminState>, Path(id): Path<String>) -> Result<Json<Job>> {
-    let job_id: aura_model::JobId = id
+    let job_id: baybo_model::JobId = id
         .parse()
         .map_err(|e| GatewayError::BadRequest(format!("invalid job id: {e}")))?;
     // Operator-initiated cancel; partial-artifact rollup belongs on the
     // recovery scan, not the admin endpoint.
     state
         .job_lifecycle
-        .cancel(&job_id, aura_job::CancelReason::OperatorCancel, vec![])
+        .cancel(&job_id, baybo_job::CancelReason::OperatorCancel, vec![])
         .await
-        .map_err(|e: aura_job::JobError| GatewayError::Job(e.to_string()))?;
+        .map_err(|e: baybo_job::JobError| GatewayError::Job(e.to_string()))?;
     let job = state
         .job_lifecycle
         .get(&job_id)
         .await
-        .map_err(|e: aura_job::JobError| GatewayError::Job(e.to_string()))?
+        .map_err(|e: baybo_job::JobError| GatewayError::Job(e.to_string()))?
         .ok_or_else(|| GatewayError::NotFound(format!("job {id}")))?;
     Ok(Json(Job::from(job)))
 }

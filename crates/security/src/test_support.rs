@@ -1,7 +1,7 @@
-//! In-memory `aura_store::SecretStore` for downstream tests.
+//! In-memory `baybo_store::SecretStore` for downstream tests.
 //!
 //! Gated behind the `test-support` cargo feature so it never ships in
-//! release builds. Lives in `aura-security` (next to `SecretVault`, the
+//! release builds. Lives in `baybo-security` (next to `SecretVault`, the
 //! consumer it backs) so a crate building a vault for its own tests gets
 //! the fake from the same crate as the vault.
 
@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
-use aura_store::secret::{Result, SecretStore};
+use baybo_store::secret::{Result, SecretStore};
 
 /// In-memory `SecretStore` for tests. Stores raw `(name, encrypted_value)`
 /// pairs in a `Mutex<HashMap>`. No encryption performed here — the bytes

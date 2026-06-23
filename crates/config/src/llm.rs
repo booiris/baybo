@@ -1,5 +1,5 @@
-use aura_model::LlmEntryName;
-pub use aura_model::LlmPricingOverride;
+use baybo_model::LlmEntryName;
+pub use baybo_model::LlmPricingOverride;
 use serde::{Deserialize, Serialize};
 
 /// One entry in the `llm` registry. Each entry is keyed by `name` and

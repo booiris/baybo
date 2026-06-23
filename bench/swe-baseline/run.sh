@@ -3,14 +3,14 @@
 # SWE-bench BASELINE: run the official minimal agent `mini-swe-agent` with the
 # same model as bench/swe (deepseek-v4-flash by default), grade with the SAME
 # official `swebench` harness, and emit a results JSON in bench/swe's schema so
-# the resolve-rate is directly comparable to the aura agent arm.
+# the resolve-rate is directly comparable to the baybo agent arm.
 #
 # Reuses the cached `swebench/sweb.eval.x86_64.*:latest` eval images (mini picks
 # them by the standard name) and bench/swe/.env for the model key.
 #
 # Quick start (first 5 instances, validation):
 #   bench/swe-baseline/run.sh
-# Full 300 + compare to an aura run:
+# Full 300 + compare to an baybo run:
 #   LIMIT=300 AGENT_RESULTS=../swe/results/latest-agent.json bench/swe-baseline/run.sh
 set -euo pipefail
 
@@ -29,17 +29,17 @@ SWE_DIR="$(cd "$BENCH_DIR/../swe" && pwd)"
 : "${INSTANCE_IDS:=}"                            # space-separated ids -> regex filter
 : "${WORKERS:=4}"                                # parallel agent instances
 : "${MAX_WORKERS:=4}"                            # grader harness workers
-: "${MODEL:=${AURA_MODEL:-deepseek/deepseek-v4-flash}}"
-: "${BASE_URL:=${AURA_BASE_URL:-}}"              # empty => litellm provider default
+: "${MODEL:=${BAYBO_MODEL:-deepseek/deepseek-v4-flash}}"
+: "${BASE_URL:=${BAYBO_BASE_URL:-}}"              # empty => litellm provider default
 : "${STEP_LIMIT:=250}"                           # mini's per-instance step budget
 : "${RUN_ID:=baseline-$(date +%Y-%m-%d__%H-%M-%S)}"
 : "${RUNS_DIR:=$BENCH_DIR/runs}"
 : "${RESULTS_DIR:=$BENCH_DIR/results}"
-: "${AGENT_RESULTS:=}"                           # aura results JSON to compare against
+: "${AGENT_RESULTS:=}"                           # baybo results JSON to compare against
 : "${DOCKER:=docker}"
 : "${DRY_RUN:=0}"
-API_KEY="${API_KEY:-${AURA_API_KEY:-}}"
-[ -n "$API_KEY" ] || { echo "need a model key — set AURA_API_KEY in bench/swe/.env (or API_KEY)" >&2; exit 1; }
+API_KEY="${API_KEY:-${BAYBO_API_KEY:-}}"
+[ -n "$API_KEY" ] || { echo "need a model key — set BAYBO_API_KEY in bench/swe/.env (or API_KEY)" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 
 # litellm reads a provider-specific key var; export our generic key under both

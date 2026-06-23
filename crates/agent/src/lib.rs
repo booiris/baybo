@@ -1,4 +1,4 @@
-//! `aura-agent` is the assembly layer for the Aura execution engine.
+//! `baybo-agent` is the assembly layer for the Baybo execution engine.
 //! The agent's two halves are organised into sibling subdirectories:
 //!
 //! - [`runtime`] holds per-turn execution (agent loop, tool executor,
@@ -19,8 +19,8 @@ pub mod runtime;
 pub mod security;
 pub mod service;
 
-// Stable external paths — consumers import `aura_agent::agent_loop::*`,
-// `aura_agent::supervisor::*`, etc. The submodules live under `runtime`
+// Stable external paths — consumers import `baybo_agent::agent_loop::*`,
+// `baybo_agent::supervisor::*`, etc. The submodules live under `runtime`
 // and `actor` after the PR6 reorg; these re-exports keep the wire shape.
 pub use actor::mailbox;
 pub use actor::router;
@@ -39,10 +39,10 @@ pub use runtime::tool_executor;
 pub use runtime::virtual_read;
 
 pub use agent_loop::AgentLoop;
-pub use aura_cron::{CronScheduler, CronTriggerEvent};
-pub use aura_security::SecretVault;
-pub use aura_session::SessionManager;
 pub use background_jobs::BackgroundJobManager;
+pub use baybo_cron::{CronScheduler, CronTriggerEvent};
+pub use baybo_security::SecretVault;
+pub use baybo_session::SessionManager;
 pub use llm_pool::{LlmClientPool, LlmPoolHandle};
 pub use router::{ActorSpawner, Router};
 pub use security::{LeakRuleSummary, SecretVaultSummary, SecurityAuditReport, SecurityGateway};

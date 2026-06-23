@@ -1,5 +1,5 @@
 [package]
-name = "aura-pairing"
+name = "baybo-pairing"
 version.workspace = true
 edition.workspace = true
 
@@ -7,8 +7,8 @@ edition.workspace = true
 doctest = false
 
 [dependencies]
-aura-model = { workspace = true }
-aura-store = { workspace = true }
+baybo-model = { workspace = true }
+baybo-store = { workspace = true }
 
 chrono = { workspace = true }
 rand = { workspace = true }

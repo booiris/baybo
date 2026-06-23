@@ -4,16 +4,16 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use aura_llm::{Attribution, BillableLlm, BilledChat};
-use aura_model::{JobId, ParallelGroup, SessionId, SpanId, TrustLevel, User};
+use baybo_llm::{Attribution, BillableLlm, BilledChat};
+use baybo_model::{JobId, ParallelGroup, SessionId, SpanId, TrustLevel, User};
 
-use aura_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
-use aura_tools::{
+use baybo_sandbox::{NetworkPolicy, SandboxRunner, default_sensitive_denylist};
+use baybo_tools::{
     ApprovalDecision, ApprovalGateMap, ApprovalHandle, ApprovalRequest, ApprovedResource,
     ExecSandbox, ResourceAccess, ToolCapability, ToolContext, ToolError, ToolManifest, ToolOutput,
     ToolRegistry, VirtualReadResolver, approval::preview_params,
 };
-use aura_trace::{
+use baybo_trace::{
     LifecycleOutcome, SpanEventKind, SpanFinalize, SpanKind, SpanRecorder, StepHandle,
     ToolCallBegin, ToolCallOrigin, ToolCallResult, ToolEventPayload,
 };
@@ -29,7 +29,7 @@ use crate::security::SecurityGateway;
 const APPROVAL_PARAMS_PREVIEW_LEN: usize = 512;
 
 /// Headroom added to the per-tool outer timeout so a slow user
-/// approval (handled mid-execution via [`aura_tools::ApprovalHandle`])
+/// approval (handled mid-execution via [`baybo_tools::ApprovalHandle`])
 /// cannot kill the tool while it is legitimately blocked on a modal.
 /// Tracks the channel gate's own `APPROVAL_TIMEOUT` in
 /// `crates/gateway/src/channel/adapter.rs`; if you change one, change
@@ -54,7 +54,7 @@ const FAILURE_REASON_MAX_BYTES: usize = 512;
 /// budget (each entry costs at least its `action` label length).
 const TOOL_EVENTS_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
-/// Buffer that implements [`aura_tools::ToolEventSink`] by stashing
+/// Buffer that implements [`baybo_tools::ToolEventSink`] by stashing
 /// `(action, payload)` entries for the executor to drain into
 /// [`SpanEventKind::ToolEvent`] events once the tool returns. Sync,
 /// fire-and-forget — the tool body sees a plain trait object.
@@ -102,7 +102,7 @@ fn payload_text_bytes(payload: &ToolEventPayload) -> usize {
     }
 }
 
-impl aura_tools::ToolEventSink for SpanEventRecorder {
+impl baybo_tools::ToolEventSink for SpanEventRecorder {
     fn emit(&self, action: &str, payload: ToolEventPayload) {
         let mut guard = self.entries.lock();
         let cost = action.len() + payload_text_bytes(&payload);
@@ -188,7 +188,7 @@ pub struct ToolExecutor {
     workspace_root: PathBuf,
     /// Layout addresses anchored at the actual workspace root.
     /// Forwarded to [`ToolContext::workspace_paths`].
-    workspace_paths: aura_workspace::WorkspacePaths,
+    workspace_paths: baybo_workspace::WorkspacePaths,
     sandbox_runner: Option<Arc<dyn SandboxRunner>>,
     /// Resolver for virtual reads (e.g. the session transcript), forwarded into
     /// every [`ToolContext`] this executor builds; `ReadTool` consults it before
@@ -198,10 +198,10 @@ pub struct ToolExecutor {
     /// [`ToolContext`] **only when the call is `background_eligible`** (a
     /// user-facing session) — see [`Self::execute`]. `None` ⇒ no manager
     /// wired (argv-mode boots, tests), so commands keep kill-on-timeout.
-    background_jobs: Option<Arc<dyn aura_tools::BackgroundJobSink>>,
+    background_jobs: Option<Arc<dyn baybo_tools::BackgroundJobSink>>,
     /// Control surface for the `JobList` / `JobStop` tools. Gated like
     /// [`Self::background_jobs`] (same runtime component implements both).
-    background_control: Option<Arc<dyn aura_tools::BackgroundJobControl>>,
+    background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>>,
 }
 
 impl ToolExecutor {
@@ -211,11 +211,11 @@ impl ToolExecutor {
         gate_map: Arc<ApprovalGateMap>,
         security_gateway: Arc<SecurityGateway>,
         workspace_root: PathBuf,
-        workspace_paths: aura_workspace::WorkspacePaths,
+        workspace_paths: baybo_workspace::WorkspacePaths,
         sandbox_runner: Option<Arc<dyn SandboxRunner>>,
         virtual_reads: Option<Arc<dyn VirtualReadResolver>>,
-        background_jobs: Option<Arc<dyn aura_tools::BackgroundJobSink>>,
-        background_control: Option<Arc<dyn aura_tools::BackgroundJobControl>>,
+        background_jobs: Option<Arc<dyn baybo_tools::BackgroundJobSink>>,
+        background_control: Option<Arc<dyn baybo_tools::BackgroundJobControl>>,
     ) -> Self {
         Self {
             tool_registry,
@@ -325,7 +325,7 @@ impl ToolExecutor {
         parallel_group: Option<ParallelGroup>,
         _parent_job_for_log: Option<JobId>,
         cancel_token: CancellationToken,
-        notifier: Option<Arc<dyn aura_tools::SessionNotifier>>,
+        notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
         // `None` ⇒ tool's `ctx.llm` is unset (argv-mode / older tests).
         bind_source: Option<&Arc<BillableLlm>>,
         // Whether this session may background work (user-facing session).
@@ -366,7 +366,7 @@ impl ToolExecutor {
                 result: None,
             },
             parallel_group,
-            Some((&cancel_for_close, aura_job::CancelReason::ParentCancelled)),
+            Some((&cancel_for_close, baybo_job::CancelReason::ParentCancelled)),
             |span_handle| async move {
                 let mut event_seq: u32 = 0;
 
@@ -457,13 +457,13 @@ impl ToolExecutor {
                 {
                     self.sandbox_runner.as_ref().map(|runner| {
                         let home = std::env::var_os("HOME").map(PathBuf::from);
-                        let aura_state = std::env::var_os("AURA_HOME")
+                        let baybo_state = std::env::var_os("BAYBO_HOME")
                             .map(PathBuf::from)
-                            .or_else(|| home.as_ref().map(|h| h.join(".aura")));
+                            .or_else(|| home.as_ref().map(|h| h.join(".baybo")));
                         let extra_root =
                             home.clone().unwrap_or_else(|| self.workspace_root.clone());
                         let denied =
-                            default_sensitive_denylist(home.as_deref(), aura_state.as_deref());
+                            default_sensitive_denylist(home.as_deref(), baybo_state.as_deref());
                         Arc::new(
                             SandboxAdapter::new(
                                 Arc::clone(runner),
@@ -502,7 +502,7 @@ impl ToolExecutor {
                         session_id: session_id.clone(),
                         job_id,
                         span_id: span_handle.span_id,
-                        reason: aura_llm::CallReason::Tool(tool_name_owned.clone()),
+                        reason: baybo_llm::CallReason::Tool(tool_name_owned.clone()),
                     });
                     Arc::new(crate::runtime::billed_chat::BilledChatRunner::new(
                         bound,
@@ -521,10 +521,10 @@ impl ToolExecutor {
                     sandbox,
                     approval: Some(approval),
                     notifier: notifier.clone(),
-                    events: Arc::clone(&event_sink) as Arc<dyn aura_tools::ToolEventSink>,
+                    events: Arc::clone(&event_sink) as Arc<dyn baybo_tools::ToolEventSink>,
                     llm,
                     secrets: Some(
-                        Arc::clone(&self.security_gateway) as Arc<dyn aura_tools::SecretAccess>
+                        Arc::clone(&self.security_gateway) as Arc<dyn baybo_tools::SecretAccess>
                     ),
                     // `ReadTool` consults this before the filesystem; today
                     // just the session transcript. Cheap clone (Arc bump).

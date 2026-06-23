@@ -1,5 +1,5 @@
 [package]
-name = "aura-setup"
+name = "baybo-setup"
 version.workspace = true
 edition.workspace = true
 
@@ -18,16 +18,16 @@ test = false
 bench = false
 
 [dependencies]
-aura-agent = { workspace = true }
-aura-channels = { workspace = true }
-aura-config = { workspace = true }
-aura-gateway = { workspace = true }
-aura-llm = { workspace = true }
-aura-model = { workspace = true }
-aura-security = { workspace = true }
-aura-storage = { workspace = true }
-aura-store = { workspace = true }
-aura-workspace = { workspace = true }
+baybo-agent = { workspace = true }
+baybo-channels = { workspace = true }
+baybo-config = { workspace = true }
+baybo-gateway = { workspace = true }
+baybo-llm = { workspace = true }
+baybo-model = { workspace = true }
+baybo-security = { workspace = true }
+baybo-storage = { workspace = true }
+baybo-store = { workspace = true }
+baybo-workspace = { workspace = true }
 
 anyhow = { workspace = true }
 crossterm = { workspace = true }
@@ -45,8 +45,8 @@ tracing = { workspace = true }
 test-support = []
 
 [dev-dependencies]
-aura-setup = { workspace = true, features = ["test-support"] }
-aura-storage = { workspace = true, features = ["test-support"] }
-aura-term-harness = { workspace = true }
+baybo-setup = { workspace = true, features = ["test-support"] }
+baybo-storage = { workspace = true, features = ["test-support"] }
+baybo-term-harness = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

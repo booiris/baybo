@@ -1,6 +1,6 @@
 //! Built-in subagent profiles compiled into the binary.
 //!
-//! The pattern mirrors `aura-skills::builtin`: each profile is a single
+//! The pattern mirrors `baybo-skills::builtin`: each profile is a single
 //! `<name>.md` file under `builtin/`, embedded via `include_str!` at
 //! build time, and surfaced through [`all`] for
 //! [`SubagentRegistry::register_builtins`].
@@ -12,7 +12,7 @@
 //!
 //! [`SubagentRegistry::register_builtins`]: crate::SubagentRegistry::register_builtins
 
-use aura_model::{ArtifactSource, TrustLevel};
+use baybo_model::{ArtifactSource, TrustLevel};
 
 use crate::SubagentProfile;
 use crate::loader::parse_profile_md;
@@ -69,7 +69,7 @@ fn parse_builtin(name: &str, content: &str) -> Option<SubagentProfile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::ModelTier;
+    use baybo_model::ModelTier;
 
     #[test]
     fn every_builtin_source_parses_cleanly() {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Shape a mini-swe-agent SWE-bench run + the official swebench grade into the
 same results JSON schema as `bench/swe` (so it's directly comparable and can
-feed bench-web), and print a baseline-vs-aura comparison.
+feed bench-web), and print a baseline-vs-baybo comparison.
 
 Inputs (under <runs-dir>/<run-id>/): `preds.json` (mini's predictions, dict
 keyed by instance_id), the harness report `<model_sanitized>.<run-id>.json`,
@@ -119,7 +119,7 @@ def main():
     ap.add_argument("--dataset-name", required=True)
     ap.add_argument("--split", required=True)
     ap.add_argument("--model", required=True)
-    ap.add_argument("--agent-results", default="")  # aura results JSON for comparison
+    ap.add_argument("--agent-results", default="")  # baybo results JSON for comparison
     a = ap.parse_args()
 
     sanitized = a.model.replace("/", "__")
@@ -189,13 +189,13 @@ def main():
         overlap = [r["instance_id"] for r in results if r["instance_id"] in ares]
         b_ok = sum(1 for i in overlap if next(r for r in results if r["instance_id"] == i)["resolved"])
         a_ok = sum(1 for i in overlap if ares[i].get("resolved"))
-        print(f"\n=== AURA vs BASELINE (on {len(overlap)} shared instances) ===")
-        print(f"  aura     : {a_ok}/{len(overlap)} = {100*a_ok/len(overlap):.1f}%")
+        print(f"\n=== BAYBO vs BASELINE (on {len(overlap)} shared instances) ===")
+        print(f"  baybo     : {a_ok}/{len(overlap)} = {100*a_ok/len(overlap):.1f}%")
         print(f"  baseline : {b_ok}/{len(overlap)} = {100*b_ok/len(overlap):.1f}%")
         # head-to-head
         only_a = [i for i in overlap if ares[i].get("resolved") and not next(r for r in results if r["instance_id"] == i)["resolved"]]
         only_b = [i for i in overlap if not ares[i].get("resolved") and next(r for r in results if r["instance_id"] == i)["resolved"]]
-        print(f"  aura-only solves: {len(only_a)}   baseline-only solves: {len(only_b)}")
+        print(f"  baybo-only solves: {len(only_a)}   baseline-only solves: {len(only_b)}")
 
     print(f"\nwrote {out}")
 

@@ -1,13 +1,13 @@
 //! [`DashboardProvider`] for the WS-backed TUI.
 //!
 //! The TUI's channel-surface no longer carries session CRUD (it's been
-//! folded back into the `aura` CLI), so every view here is rendered as
+//! folded back into the `baybo` CLI), so every view here is rendered as
 //! an "admin-only" snapshot with a footer pointing the operator at the
 //! CLI. The provider still exists so dashboard keybindings keep working
 //! and the user sees a clear message rather than an empty pane.
 
 use async_trait::async_trait;
-use aura_channels::{DashboardProvider, DashboardSnapshot, ViewKind};
+use baybo_channels::{DashboardProvider, DashboardSnapshot, ViewKind};
 
 /// [`DashboardProvider`] that renders the admin-only placeholder for
 /// every view. Kept as a type (rather than a bare function) to match
@@ -55,7 +55,7 @@ impl DashboardProvider for TuiDashboardProvider {
             columns,
             rows: Vec::new(),
             footer: Some(
-                "admin surface — use the `aura` CLI (not reachable over channel ws)".into(),
+                "admin surface — use the `baybo` CLI (not reachable over channel ws)".into(),
             ),
         }
     }

@@ -1,13 +1,13 @@
-//! Drive the REAL Aura agent as a black box — the analog of how upstream's
-//! benchmark drives OpenClaw: start `aura gateway` once per arm, then answer
-//! each question with a concurrent `aura prompt` routed over that gateway.
+//! Drive the REAL Baybo agent as a black box — the analog of how upstream's
+//! benchmark drives OpenClaw: start `baybo gateway` once per arm, then answer
+//! each question with a concurrent `baybo prompt` routed over that gateway.
 //! Recall + memory tools run inside the real agent loop; the bench only execs
-//! the `aura` binary (no agent-stack linkage).
+//! the `baybo` binary (no agent-stack linkage).
 //!
-//! **Per-conversation isolation** rides on the `USER` env each `aura prompt`
+//! **Per-conversation isolation** rides on the `USER` env each `baybo prompt`
 //! inherits: `cli_user()` reads `$USER`, that becomes the message sender →
 //! `session.user.id` → the recall scope OpenViking is queried under (verified
-//! in `aura_agent`'s router intake). So each question runs with
+//! in `baybo_agent`'s router intake). So each question runs with
 //! `USER=<conv-scope>`, matching what `ingest` populated.
 
 use std::io::Read;
@@ -20,8 +20,8 @@ use anyhow::{Context, Result, bail};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 
-/// Env var `aura` reads for its config path (mirrors `aura_workspace::paths`).
-const AURA_CONFIG_ENV: &str = "AURA_CONFIG_PATH";
+/// Env var `baybo` reads for its config path (mirrors `baybo_workspace::paths`).
+const BAYBO_CONFIG_ENV: &str = "BAYBO_CONFIG_PATH";
 /// Gateway readiness poll cadence + ceiling. The 1h ceiling matches the bench's
 /// other waits; a gateway that *crashes* is caught immediately via `try_wait`,
 /// so this only bounds a process that stays alive but never binds.
@@ -30,13 +30,13 @@ const READY_TIMEOUT: Duration = Duration::from_secs(3600);
 /// How much of a failed prompt's stderr to surface.
 const ERR_TAIL: usize = 400;
 /// Bounded poll for a question's cost row: the gateway persists `cost_records`
-/// on a detached task that races `aura prompt`'s return, so re-read until it
+/// on a detached task that races `baybo prompt`'s return, so re-read until it
 /// lands. Key on `calls`, not cost — a zero-priced model still writes a row.
 const COST_POLL_ATTEMPTS: usize = 8;
 const COST_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Effectively-unlimited per-user rate limit for the bench gateway. QA fires
 /// every question for a conversation under ONE user_id (the recall scope must
-/// match ingest), far above Aura's default 30 req/60s — without lifting it, a
+/// match ingest), far above Baybo's default 30 req/60s — without lifting it, a
 /// run stalls at question 30 (the rate limiter rejects the 31st in the window).
 const BENCH_RATE_LIMIT_MAX_REQUESTS: usize = 1_000_000;
 
@@ -50,15 +50,15 @@ pub fn prepare_arm_config(
     out_path: PathBuf,
 ) -> Result<(PathBuf, SocketAddr)> {
     let raw = std::fs::read_to_string(base_config)
-        .with_context(|| format!("read base aura config {}", base_config.display()))?;
+        .with_context(|| format!("read base baybo config {}", base_config.display()))?;
     let mut cfg: serde_json::Value =
-        serde_json::from_str(&raw).context("parse base aura config as JSON")?;
+        serde_json::from_str(&raw).context("parse base baybo config as JSON")?;
 
     // Overwrite the whole `memory` section with the bench's per-arm settings —
     // works whether or not the base config already has one. Everything else
     // (llm, workspace, gateway, keys) is the user's config untouched.
     cfg.as_object_mut()
-        .context("base aura config is not a JSON object")?
+        .context("base baybo config is not a JSON object")?
         .insert("memory".to_string(), memory);
 
     let gateway = cfg
@@ -84,7 +84,7 @@ pub fn prepare_arm_config(
     Ok((out_path, addr))
 }
 
-/// The configurable LLM the self-contained config has Aura answer with. A `None`
+/// The configurable LLM the self-contained config has Baybo answer with. A `None`
 /// `base_url` is omitted from the config so the provider uses its own default.
 pub struct AnswerModel {
     pub provider: String,
@@ -106,10 +106,10 @@ fn answer_llm_entry(answer: &AnswerModel) -> serde_json::Value {
     entry
 }
 
-/// Generate a fully self-contained aura config + a fresh workspace under
-/// `workspace_dir` — no dependency on `~/.aura`. The only thing `aura` can't
+/// Generate a fully self-contained baybo config + a fresh workspace under
+/// `workspace_dir` — no dependency on `~/.baybo`. The only thing `baybo` can't
 /// bootstrap itself is the 32-byte encryption key (the vault auto-creates and
-/// `aura gateway start` mints its own token), so we mint one here. The agent
+/// `baybo gateway start` mints its own token), so we mint one here. The agent
 /// answers with `answer` (provider/model/key-env from the CLI); `memory` is the
 /// arm's section. Returns the written config path + the gateway admin addr.
 pub fn generate_config(
@@ -150,7 +150,7 @@ pub fn generate_config(
         // user QA run doesn't stall at question 30. Bench gateway only.
         "cost": { "rate_limit": { "max_requests": BENCH_RATE_LIMIT_MAX_REQUESTS } },
     });
-    let out_path = workspace_dir.join("aura.json");
+    let out_path = workspace_dir.join("baybo.json");
     std::fs::write(&out_path, serde_json::to_string_pretty(&cfg)?)
         .with_context(|| format!("write config {}", out_path.display()))?;
     let addr: SocketAddr = format!("127.0.0.1:{gateway_port}")
@@ -159,31 +159,35 @@ pub fn generate_config(
     Ok((out_path, addr))
 }
 
-/// A running `aura gateway` subprocess, killed on drop. All `aura prompt`
+/// A running `baybo gateway` subprocess, killed on drop. All `baybo prompt`
 /// invocations against it share its config (same workspace → they find its
 /// admin addr + tui token).
 pub struct GatewayHandle {
     child: Child,
-    aura_bin: String,
+    baybo_bin: String,
     config_path: PathBuf,
 }
 
 impl GatewayHandle {
-    /// Spawn `aura gateway start` with `config_path`, then poll `admin_addr`
+    /// Spawn `baybo gateway start` with `config_path`, then poll `admin_addr`
     /// until it accepts (the listener is up + the workspace lock held, so
-    /// `aura prompt` will route over WS instead of going in-process).
-    pub async fn start(aura_bin: &str, config_path: &Path, admin_addr: SocketAddr) -> Result<Self> {
-        let child = Command::new(aura_bin)
+    /// `baybo prompt` will route over WS instead of going in-process).
+    pub async fn start(
+        baybo_bin: &str,
+        config_path: &Path,
+        admin_addr: SocketAddr,
+    ) -> Result<Self> {
+        let child = Command::new(baybo_bin)
             .args(["gateway", "start"])
-            .env(AURA_CONFIG_ENV, config_path)
+            .env(BAYBO_CONFIG_ENV, config_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
-            .with_context(|| format!("spawn `{aura_bin} gateway start`"))?;
+            .with_context(|| format!("spawn `{baybo_bin} gateway start`"))?;
         let mut handle = Self {
             child,
-            aura_bin: aura_bin.to_string(),
+            baybo_bin: baybo_bin.to_string(),
             config_path: config_path.to_path_buf(),
         };
         handle.await_ready(admin_addr).await?;
@@ -194,20 +198,20 @@ impl GatewayHandle {
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait().context("poll gateway")? {
-                bail!("aura gateway exited before becoming ready (status {status})");
+                bail!("baybo gateway exited before becoming ready (status {status})");
             }
             if TcpStream::connect(addr).await.is_ok() {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 let _ = self.child.start_kill();
-                bail!("aura gateway not ready on {addr} within {READY_TIMEOUT:?}");
+                bail!("baybo gateway not ready on {addr} within {READY_TIMEOUT:?}");
             }
             tokio::time::sleep(READY_POLL).await;
         }
     }
 
-    /// Answer one prompt through the gateway: `USER=scope_user aura prompt
+    /// Answer one prompt through the gateway: `USER=scope_user baybo prompt
     /// --json --session <id> --timeout <n> [-y] -- <prompt>`. Returns the
     /// assistant's text (the `response` field of the `--json` line).
     pub async fn run_prompt(
@@ -233,9 +237,9 @@ impl GatewayHandle {
         args.push("--".to_string());
         args.push(prompt.to_string());
 
-        let output = Command::new(&self.aura_bin)
+        let output = Command::new(&self.baybo_bin)
             .args(&args)
-            .env(AURA_CONFIG_ENV, &self.config_path)
+            .env(BAYBO_CONFIG_ENV, &self.config_path)
             // `cli_user()` reads $USER/$USERNAME → message sender → recall scope.
             .env("USER", scope_user)
             .env("USERNAME", scope_user)
@@ -244,10 +248,10 @@ impl GatewayHandle {
             .stderr(Stdio::piped())
             .output()
             .await
-            .context("run `aura prompt`")?;
+            .context("run `baybo prompt`")?;
         if !output.status.success() {
             bail!(
-                "aura prompt exited {}: {}",
+                "baybo prompt exited {}: {}",
                 output.status,
                 err_tail(&String::from_utf8_lossy(&output.stderr))
             );
@@ -256,14 +260,14 @@ impl GatewayHandle {
     }
 
     /// Read a question's whole-turn answer-side spend from the cost ledger via
-    /// `aura cost show --session <id> --json`. Returns `(input, output, micro_usd)`;
+    /// `baybo cost show --session <id> --json`. Returns `(input, output, micro_usd)`;
     /// an empty session degrades to zeros (see [`COST_POLL_ATTEMPTS`]).
     pub async fn session_cost(&self, session_id: &str) -> Result<(u64, u64, u64, i64)> {
         let mut last = (0u64, 0u64, 0u64, 0i64);
         for attempt in 0..COST_POLL_ATTEMPTS {
-            let output = Command::new(&self.aura_bin)
+            let output = Command::new(&self.baybo_bin)
                 .args(["cost", "show", "--session", session_id, "--json"])
-                .env(AURA_CONFIG_ENV, &self.config_path)
+                .env(BAYBO_CONFIG_ENV, &self.config_path)
                 // RUST_LOG=off so stdout is only the JSON — a log line with `{`
                 // would defeat `parse_cost_summary`.
                 .env("RUST_LOG", "off")
@@ -272,10 +276,10 @@ impl GatewayHandle {
                 .stderr(Stdio::piped())
                 .output()
                 .await
-                .context("run `aura cost show`")?;
+                .context("run `baybo cost show`")?;
             if !output.status.success() {
                 bail!(
-                    "aura cost show exited {}: {}",
+                    "baybo cost show exited {}: {}",
                     output.status,
                     err_tail(&String::from_utf8_lossy(&output.stderr))
                 );
@@ -319,11 +323,11 @@ impl GatewayHandle {
         .await;
     }
 
-    /// Run one `aura session …` subcommand (stdout = JSON) and write it to `out`.
+    /// Run one `baybo session …` subcommand (stdout = JSON) and write it to `out`.
     async fn write_session_dump(&self, args: &[&str], out: &Path) {
-        let output = Command::new(&self.aura_bin)
+        let output = Command::new(&self.baybo_bin)
             .args(args)
-            .env(AURA_CONFIG_ENV, &self.config_path)
+            .env(BAYBO_CONFIG_ENV, &self.config_path)
             // RUST_LOG=off so stdout is only the JSON (a log line would corrupt it).
             .env("RUST_LOG", "off")
             .stdin(Stdio::null())
@@ -362,7 +366,7 @@ impl Drop for GatewayHandle {
     }
 }
 
-/// Extract the assistant text from `aura prompt --json` stdout: the last line
+/// Extract the assistant text from `baybo prompt --json` stdout: the last line
 /// that parses as a JSON object with a `response` field. A turn the runtime
 /// rejected emits `{session_id, error}` instead — surfaced as an error.
 fn parse_response(stdout: &str) -> Result<String> {
@@ -378,27 +382,27 @@ fn parse_response(stdout: &str) -> Result<String> {
             return Ok(answer.to_string());
         }
         if let Some(err) = value.get("error").and_then(|v| v.as_str()) {
-            bail!("aura prompt turn error: {err}");
+            bail!("baybo prompt turn error: {err}");
         }
     }
     bail!(
-        "no `response` in aura prompt output: {}",
+        "no `response` in baybo prompt output: {}",
         stdout.trim().chars().take(ERR_TAIL).collect::<String>()
     );
 }
 
 /// Parse `(input_tokens, output_tokens, cost_micro_usd, calls)` from
-/// `aura cost show --json` — pretty-printed JSON maybe after log lines, so parse
+/// `baybo cost show --json` — pretty-printed JSON maybe after log lines, so parse
 /// from the first `{` to EOF; use integer `cost_micro_usd`, not the string.
 fn parse_cost_summary(stdout: &str) -> Result<(u64, u64, u64, i64, u64)> {
     let start = stdout
         .find('{')
-        .with_context(|| format!("no JSON object in aura cost output: {}", err_tail(stdout)))?;
+        .with_context(|| format!("no JSON object in baybo cost output: {}", err_tail(stdout)))?;
     let value: serde_json::Value = serde_json::from_str(stdout[start..].trim())
-        .with_context(|| format!("parse aura cost JSON: {}", err_tail(stdout)))?;
+        .with_context(|| format!("parse baybo cost JSON: {}", err_tail(stdout)))?;
     let summary = value
         .get("summary")
-        .with_context(|| format!("aura cost output has no `summary`: {}", err_tail(stdout)))?;
+        .with_context(|| format!("baybo cost output has no `summary`: {}", err_tail(stdout)))?;
     let field_u64 = |key: &str| summary.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
     let cost_micro_usd = summary
         .get("cost_micro_usd")
@@ -448,7 +452,7 @@ mod tests {
 
     #[test]
     fn parses_cost_summary_from_json() {
-        // Mirrors `aura cost show --session --json`'s pretty-printed shape.
+        // Mirrors `baybo cost show --session --json`'s pretty-printed shape.
         let out = r#"{
   "scope": { "session": "qa-1" },
   "summary": {

@@ -1,6 +1,6 @@
-# Aura Development Guide
+# Baybo Development Guide
 
-**Aura** is an intelligent assistant framework built on large language models, supporting multi-channel access, tool invocation, skill extensions, with comprehensive context management, compression, and error recovery mechanisms.
+**Baybo** is an intelligent assistant framework built on large language models, supporting multi-channel access, tool invocation, skill extensions, with comprehensive context management, compression, and error recovery mechanisms.
 
 ## Session data is core data — never delete
 
@@ -17,10 +17,10 @@ Session rows and their conversation transcripts are **user-facing core data**. T
 cargo fmt                                                       # format
 cargo clippy --all --benches --tests --examples --all-features  # lint (zero warnings)
 cargo test                                                      # unit tests
-RUST_LOG=aura=debug cargo run                                   # run with logging
+RUST_LOG=baybo=debug cargo run                                   # run with logging
 
 pnpm install                                                    # hydrate TS workspaces
-pnpm --filter @aura/channel-sdk test                            # SDK unit + e2e tests
+pnpm --filter @baybo/channel-sdk test                            # SDK unit + e2e tests
 scripts/check-ts-bindings.sh                                    # ts-rs regen CI gate
 ```
 
@@ -35,8 +35,8 @@ Test layout, `test-support` feature gating, and the shared fixture inventory are
 Verbose / scoped logging:
 
 ```bash
-RUST_LOG=aura=trace cargo run                # verbose
-RUST_LOG=aura::agent=debug cargo run         # agent module only
+RUST_LOG=baybo=trace cargo run                # verbose
+RUST_LOG=baybo::agent=debug cargo run         # agent module only
 ```
 
 ## Code Style
@@ -52,7 +52,7 @@ RUST_LOG=aura::agent=debug cargo run         # agent module only
 - Avoid exporting unnecessary item, prefer `pub(crate)`; use `pub` only when necessary
 - Test-only helpers (fakes, `NeverShutdown`-style stubs, dummy fixtures) MUST be gated so they don't ship in release builds:
   - Same-crate tests only → `#[cfg(test)]`.
-  - Consumed by another crate's tests → gate with `#[cfg(any(test, feature = "test-support"))]` and add a `test-support = []` feature in `Cargo.toml`. Downstream crates pull them in via `aura-<crate> = { workspace = true, features = ["test-support"] }` in `[dev-dependencies]`.
+  - Consumed by another crate's tests → gate with `#[cfg(any(test, feature = "test-support"))]` and add a `test-support = []` feature in `Cargo.toml`. Downstream crates pull them in via `baybo-<crate> = { workspace = true, features = ["test-support"] }` in `[dev-dependencies]`.
   - Never leave a test-only item plain `pub` — "it's named `Never...`" is not a gate.
 - Required dependencies belong in the constructor, NOT behind a `with_*` setter. If a struct ends up with many required fields, define a sibling `XxxConfig` struct with `pub` fields and a single `pub fn from_config(config: XxxConfig) -> Self` constructor — callers populate it via struct literal so every required field shows up at the call site by name. `with_*` is reserved for: (a) **genuine config knobs** with a real default that some callers rationally leave alone (`with_rate_limit`, `with_timeout`); (b) **incremental builders** that append to a collection (`with_tool`, `add_rule`); (c) **truly optional deps** where some real production paths legitimately leave them unset (not just tests).
 - Don't make a field `Option<T>` to accommodate tests. If every production caller passes `Some(...)` and the field is `Option` solely so a test fixture can skip wiring it, the field belongs as `T` (required). Tests that need a stripped-down loop should provide a real value or use a smaller dedicated fixture, not push `Option` onto the production type.
@@ -62,14 +62,14 @@ RUST_LOG=aura::agent=debug cargo run         # agent module only
 
 ## Platform Support
 
-Aura targets **Unix only** (Linux and macOS — see `default = ["linux", "macos"]` in `crates/gateway/Cargo.toml`). Don't write `#[cfg(unix)]` / `#[cfg(not(unix))]` branches or stub shims for Windows. Call `libc::getuid`, `std::os::unix::fs::PermissionsExt`, `nix::sys::signal`, etc. directly. A non-Unix build failing is intentional.
+Baybo targets **Unix only** (Linux and macOS — see `default = ["linux", "macos"]` in `crates/gateway/Cargo.toml`). Don't write `#[cfg(unix)]` / `#[cfg(not(unix))]` branches or stub shims for Windows. Call `libc::getuid`, `std::os::unix::fs::PermissionsExt`, `nix::sys::signal`, etc. directly. A non-Unix build failing is intentional.
 
 ## Dependency Management
 
 - All dependency versions are managed centrally in the root `Cargo.toml` under `[workspace.dependencies]`.
 - Crate `Cargo.toml` files MUST reference dependencies via `{ workspace = true }` — never hardcode a version in a crate.
 - Adding a new external dep: declare it in the root `[workspace.dependencies]` first, then pull it into the crate with `dep = { workspace = true }` (add per-crate `features = [...]` only when the crate needs extras beyond the workspace default).
-- Internal crates (`aura-*`) are also listed in `[workspace.dependencies]` with `path = "crates/<name>"` and consumed via `{ workspace = true }`.
+- Internal crates (`baybo-*`) are also listed in `[workspace.dependencies]` with `path = "crates/<name>"` and consumed via `{ workspace = true }`.
 - Applies to both `[dependencies]` and `[dev-dependencies]`.
 - Doctests are disabled workspace-wide via `[lib]\ndoctest = false` in every crate's `Cargo.toml` — empty doctest invocations were the dominant cost in `cargo test --workspace`. New crates MUST include this block. If you genuinely need a doctest in some crate, drop the line in just that crate.
 
@@ -81,7 +81,7 @@ Prefer generic/extensible architectures over hardcoding specific integrations. A
 
 - **Modular**: Each crate is an independent module; traits are defined within their own crate; crates interact via traits — high cohesion, low coupling
 - **Extensible**: Channels, Tools, and Skills all plug in via registries
-- **Domain crates own their tools**: a crate that owns a domain hosts its own `Tool` impls and depends on `aura-tools` for the trait; `aura-tools` carries only generic/core tools and never depends back on a domain crate (that would be a cycle)
+- **Domain crates own their tools**: a crate that owns a domain hosts its own `Tool` impls and depends on `baybo-tools` for the trait; `baybo-tools` carries only generic/core tools and never depends back on a domain crate (that would be a cycle)
 - **Secure**: Encrypted secret storage, input leak detection, least-privilege networking and credential injection
 - **Governable**: All Skill/Tool/extensions must carry source, version, hash, trust level, and capability declarations; selection and execution are auditable
 - **Observable**: Full call-chain tracing; Job system manages all async operation states; supports session replay, trace forking and rollback; logs/traces record only sanitized placeholders and summaries
@@ -106,6 +106,6 @@ For non-module-crate topics, read the relevant doc before touching that area:
 - [`docs/bench-web.md`](docs/bench-web.md) — standalone read-only viewer (`bench/bench-web`) for bench `results/` + agent `trace/` artifacts; spine model + per-bench adapters, ts-rs gate.
 - [`docs/sidecars.md`](docs/sidecars.md) — embedded JS sidecars (`channel-src/*`, `tool-src/*`), bundling/install pipeline, domain registration, and the browser sidecar (CDDM wrapper, security trade-offs, docker mode).
 - [`docs/modules/storage.md`](docs/modules/storage.md) — libsql storage; all deletable tables use plain `DELETE` (no soft-delete tombstones).
-- [`docs/fuzzing.md`](docs/fuzzing.md) — `aura-security` cargo-fuzz harness and targets.
+- [`docs/fuzzing.md`](docs/fuzzing.md) — `baybo-security` cargo-fuzz harness and targets.
 - [`docs/testing.md`](docs/testing.md) — test layout, `test-support` gating, shared fixtures.
-- [`docs/external-commands.md`](docs/external-commands.md) — external binaries aura shells out to (`git`/`sh`/`rg`/sandbox backends/`uv`/`bun`), required-vs-optional, and how the in-container benches provide or skip each.
+- [`docs/external-commands.md`](docs/external-commands.md) — external binaries baybo shells out to (`git`/`sh`/`rg`/sandbox backends/`uv`/`bun`), required-vs-optional, and how the in-container benches provide or skip each.

@@ -1,6 +1,6 @@
-//! Interactive first-run / reconfigure wizard (`aura setup`). Bootstraps
+//! Interactive first-run / reconfigure wizard (`baybo setup`). Bootstraps
 //! the workspace, mints the master encryption key, and walks step
-//! primitives that `aura llm add` / `aura channel add` also delegate to.
+//! primitives that `baybo llm add` / `baybo channel add` also delegate to.
 //! See `docs/modules/setup.md` for the design.
 
 #![deny(unsafe_code)]

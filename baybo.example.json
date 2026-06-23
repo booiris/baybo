@@ -13,7 +13,7 @@
     "message_buffer_size": 256
   },
   "security": {
-    "encryption_key_file": "/home/YOUR_USER/.aura/.key/encryption.key",
+    "encryption_key_file": "/home/YOUR_USER/.baybo/.key/encryption.key",
     "leak_detection_enabled": true
   },
   "skills": {
@@ -30,7 +30,7 @@
     }
   },
   "workspace": {
-    "path": "/home/YOUR_USER/.aura"
+    "path": "/home/YOUR_USER/.baybo"
   },
   "gateway": {
     "enabled": false,

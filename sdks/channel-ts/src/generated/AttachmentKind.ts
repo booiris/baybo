@@ -2,6 +2,6 @@
 
 /**
  * Discriminator on a [`WireAttachment`]. Maps 1:1 to the matching
- * [`aura_model::ContentBlock`] variant on either side of the bridge.
+ * [`baybo_model::ContentBlock`] variant on either side of the bridge.
  */
 export type AttachmentKind = "image" | "audio" | "file";

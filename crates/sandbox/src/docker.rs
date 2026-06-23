@@ -225,7 +225,7 @@ impl Drop for ContainerCleanupGuard {
         let binary = std::mem::take(&mut self.binary);
         let name = std::mem::take(&mut self.name);
         let _ = std::thread::Builder::new()
-            .name("aura-sandbox-docker-cleanup".into())
+            .name("baybo-sandbox-docker-cleanup".into())
             .spawn(move || {
                 let _ = std::process::Command::new(&binary)
                     .args(["rm", "-f", &name])
@@ -467,7 +467,7 @@ fn unique_container_name() -> String {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("aura-sandbox-{}-{nanos:x}-{seq:x}", std::process::id())
+    format!("baybo-sandbox-{}-{nanos:x}-{seq:x}", std::process::id())
 }
 
 #[cfg(test)]

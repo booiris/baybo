@@ -1,5 +1,5 @@
 [package]
-name = "aura-channels"
+name = "baybo-channels"
 version.workspace = true
 edition.workspace = true
 
@@ -10,14 +10,14 @@ doctest = false
 # Emits ts-rs-generated TypeScript definitions for `Message` / `Frame`
 # into `sdks/channel-ts/src/generated/`. Kept behind a feature so CI /
 # release builds don't depend on ts-rs. The embedded
-# `aura_model::ChannelType` is emitted as plain `string` via a
+# `baybo_model::ChannelType` is emitted as plain `string` via a
 # field-level `#[ts(type = "string")]` override so ts-rs doesn't
 # chase the domain crate.
-ts-export = ["dep:ts-rs", "aura-model/ts-export"]
+ts-export = ["dep:ts-rs", "baybo-model/ts-export"]
 
 [dependencies]
-aura-model = { workspace = true }
-aura-tools = { workspace = true }
+baybo-model = { workspace = true }
+baybo-tools = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }

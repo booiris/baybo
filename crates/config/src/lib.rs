@@ -1,15 +1,15 @@
-//! Aura configuration crate.
+//! Baybo configuration crate.
 //!
-//! Loads, validates, and exposes typed configuration for the Aura runtime.
-//! The top-level [`AuraConfig`] is deserialized from JSON and passed to the
-//! consumer (usually `main.rs` or `aura-agent`), which maps each section into
-//! the corresponding domain type (e.g., [`LlmConfig`] → `aura_llm::LlmProviderConfig`).
+//! Loads, validates, and exposes typed configuration for the Baybo runtime.
+//! The top-level [`BayboConfig`] is deserialized from JSON and passed to the
+//! consumer (usually `main.rs` or `baybo-agent`), which maps each section into
+//! the corresponding domain type (e.g., [`LlmConfig`] → `baybo_llm::LlmProviderConfig`).
 //!
 //! ```no_run
-//! use aura_config::AuraConfig;
+//! use baybo_config::BayboConfig;
 //!
-//! # async fn demo() -> Result<(), aura_config::ConfigError> {
-//! let config = AuraConfig::load_from_file(std::path::Path::new("aura.json")).await?;
+//! # async fn demo() -> Result<(), baybo_config::ConfigError> {
+//! let config = BayboConfig::load_from_file(std::path::Path::new("baybo.json")).await?;
 //! # Ok(()) }
 //! ```
 
@@ -53,15 +53,15 @@ pub use crate::security::SecurityConfig;
 pub use crate::skills::{RiskCheckConfig, SkillsConfig};
 pub use crate::tools::TrustLevelConfig;
 pub use crate::workspace::WorkspaceConfig;
-pub use aura_model::LlmEntryName;
+pub use baybo_model::LlmEntryName;
 
-/// Root configuration object for Aura.
+/// Root configuration object for Baybo.
 ///
 /// All sections have defaults, so deserializing an empty JSON object (`{}`)
 /// yields a fully valid config.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
-pub struct AuraConfig {
+pub struct BayboConfig {
     /// List of registered LLM entries. Multiple entries can target the
     /// same provider; each entry is keyed by its unique `name`.
     pub llm: Vec<LlmEntry>,
@@ -87,13 +87,13 @@ pub struct AuraConfig {
     /// How shell-out tools are isolated. `auto` (default) wraps every command in
     /// the OS sandbox and adds an LLM risk judge that can run a failed command
     /// unsandboxed when judged safe (else asks); `sandboxed` is the stricter,
-    /// judge-free mode; `none` disables OS isolation entirely (for running aura
+    /// judge-free mode; `none` disables OS isolation entirely (for running baybo
     /// inside an already-disposable environment). Hot-reloadable.
     #[serde(default)]
     pub sandbox: SandboxConfig,
 }
 
-impl AuraConfig {
+impl BayboConfig {
     /// Look up an LLM entry by name. Returns the first match or `None`.
     pub fn llm_entry(&self, name: &str) -> Option<&LlmEntry> {
         self.llm.iter().find(|e| e.name == name)
@@ -107,7 +107,7 @@ impl AuraConfig {
     }
 }
 
-impl AuraConfig {
+impl BayboConfig {
     /// Read, parse, and validate a config file.
     pub async fn load_from_file(path: &Path) -> Result<Self> {
         let contents =
@@ -122,14 +122,14 @@ impl AuraConfig {
 
     /// Parse and validate a config from a JSON string.
     pub fn load_from_str(json: &str) -> Result<Self> {
-        let config: AuraConfig =
+        let config: BayboConfig =
             serde_json::from_str(json).map_err(|e| ConfigError::Parse(e.to_string()))?;
         config.validate()?;
         Ok(config)
     }
 
     /// Serialize the config as pretty JSON and write it to `path` atomically-ish
-    /// (replace via a tmpfile + rename). Used by `aura config set/unset`.
+    /// (replace via a tmpfile + rename). Used by `baybo config set/unset`.
     pub async fn write_to_file(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self).map_err(|e| ConfigError::FileWrite {
             path: path.display().to_string(),
@@ -182,7 +182,7 @@ impl AuraConfig {
             })?;
         *slot = value;
 
-        let new_config: AuraConfig =
+        let new_config: BayboConfig =
             serde_json::from_value(root).map_err(|e| ConfigError::Parse(e.to_string()))?;
         new_config.validate()?;
         Ok(new_config)
@@ -216,7 +216,7 @@ impl AuraConfig {
             })?;
         obj.remove(leaf);
 
-        let new_config: AuraConfig =
+        let new_config: BayboConfig =
             serde_json::from_value(root).map_err(|e| ConfigError::Parse(e.to_string()))?;
         new_config.validate()?;
         Ok(new_config)

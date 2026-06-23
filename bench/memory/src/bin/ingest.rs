@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use aura_bench_memory::backend::{Backend, BackendOpts, SettleOpts, build_backend, settle_probe};
-use aura_bench_memory::testset::TestSetKind;
-use aura_bench_memory::{Manifest, scope_user_id};
+use baybo_bench_memory::backend::{Backend, BackendOpts, SettleOpts, build_backend, settle_probe};
+use baybo_bench_memory::testset::TestSetKind;
+use baybo_bench_memory::{Manifest, scope_user_id};
 use clap::{Parser, ValueEnum};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]

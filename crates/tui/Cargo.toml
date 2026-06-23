@@ -1,5 +1,5 @@
 [package]
-name = "aura-tui"
+name = "baybo-tui"
 version.workspace = true
 edition.workspace = true
 
@@ -23,9 +23,9 @@ test = false
 bench = false
 
 [dependencies]
-aura-model = { workspace = true }
-aura-tools = { workspace = true }
-aura-channels = { workspace = true }
+baybo-model = { workspace = true }
+baybo-tools = { workspace = true }
+baybo-channels = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
@@ -46,5 +46,5 @@ shell-words = { workspace = true }
 [dev-dependencies]
 # Self-reference enables `test-support` while building this crate's tests,
 # which is what makes the `chat_smoke` bin (and its CARGO_BIN_EXE) exist.
-aura-tui = { workspace = true, features = ["test-support"] }
-aura-term-harness = { workspace = true }
+baybo-tui = { workspace = true, features = ["test-support"] }
+baybo-term-harness = { workspace = true }

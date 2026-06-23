@@ -2,7 +2,7 @@ import type { WeixinConfigManager } from "./api/config-cache.js";
 import type { StreamingMarkdownFilter } from "./messaging/markdown-filter.js";
 
 /**
- * Schema: JSON value written by the CLI login flow into the Aura secret
+ * Schema: JSON value written by the CLI login flow into the Baybo secret
  * vault under `channel.weixin.bot.<bot_id>.token`. The sidecar reads it
  * verbatim from `StartBotCommand.token` and runs everything off the
  * fields here. The vault never persists a bare string, so the sidecar

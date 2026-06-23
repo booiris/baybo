@@ -1,13 +1,13 @@
 #!/bin/bash
-# Installed by AuraAgent. The `aura` binary and `aura.json` were already copied
+# Installed by BayboAgent. The `baybo` binary and `baybo.json` were already copied
 # into /installed-agent by the adapter's perform_task; this script puts the
-# binary on PATH and mints a per-container key for aura's secret vault.
+# binary on PATH and mints a per-container key for baybo's secret vault.
 set -e
-install -m 0755 /installed-agent/aura /usr/local/bin/aura
-mkdir -p /installed-agent/aura-home
+install -m 0755 /installed-agent/baybo /usr/local/bin/baybo
+mkdir -p /installed-agent/baybo-home
 od -An -tx1 -N32 /dev/urandom | tr -d ' \n' > /installed-agent/enc.key
 
-# aura needs TLS roots for the HTTPS call to the LLM. The base images ship
+# baybo needs TLS roots for the HTTPS call to the LLM. The base images ship
 # ca-certificates, so this is normally a no-op; only refresh+install when a task
 # image genuinely lacks them — a per-task `apt-get update` is slow on a weak
 # network and otherwise pointless. (`git` is no longer needed: a `bench-bash`

@@ -41,7 +41,7 @@ choice on the human (we evaluated and rejected the new-job route; see the
 - **Claude Code**: queued messages flush at the next LLM pause, auto-classified
   steering-vs-conversational.
 
-Aura's twist: remote channels (Telegram, Discord, web, gateway-TUI) have no
+Baybo's twist: remote channels (Telegram, Discord, web, gateway-TUI) have no
 Enter/Tab/Esc keystroke, so we pick **one** default policy — boundary-inject,
 below — and trust the model (via framing) to handle related-vs-unrelated. Unlike
 Codex we keep a hard `max_iterations` cap; like Codex we are snapshot-based, so a

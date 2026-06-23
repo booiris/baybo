@@ -36,7 +36,7 @@ pub(crate) fn parse_date_arg(raw: &str, flag: &str) -> crate::error::Result<chro
 pub(crate) const MAX_CHANNEL_NAME_LEN: usize = 64;
 
 /// Wired as a clap `value_parser` on `<channel>` positionals (notably
-/// `aura log channel <channel>`) so the validator runs before any
+/// `baybo log channel <channel>`) so the validator runs before any
 /// handler builds a path from the raw input.
 ///
 /// Restricts to `[a-z0-9_-]+` so the value can land in a filename

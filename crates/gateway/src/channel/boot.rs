@@ -1,7 +1,7 @@
 //! Eager channel installation at gateway boot.
 //!
 //! Walks the workspace [`ChannelsConfig`] and installs one
-//! [`aura_channels::Channel`] per enabled channel type into the shared
+//! [`baybo_channels::Channel`] per enabled channel type into the shared
 //! [`ChannelRegistry`]. Channels are pinned for the lifetime of the
 //! gateway process — connections come and go (browser tabs, TUI
 //! processes, telegram bot subprocesses) but the channel sits there
@@ -17,12 +17,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::{
+use baybo_channels::{
     ApprovalSurface, Channel, ChannelKind, ChannelRegistry, Result as ChannelResult,
 };
-use aura_config::ChannelsConfig;
-use aura_model::{ChannelType, SessionId};
-use aura_tools::{ApprovalGate, ApprovalQueue, ChannelApprovalGate};
+use baybo_config::ChannelsConfig;
+use baybo_model::{ChannelType, SessionId};
+use baybo_tools::{ApprovalGate, ApprovalQueue, ChannelApprovalGate};
 
 use super::session_pulse::SessionPulse;
 
@@ -40,7 +40,7 @@ fn kind_for(channel_type: &ChannelType) -> ChannelKind {
         ChannelType::TELEGRAM | ChannelType::DISCORD | ChannelType::WEIXIN => {
             ChannelKind::Multiplexed
         }
-        // Out-of-tree channels declared via `aura.json` default to
+        // Out-of-tree channels declared via `baybo.json` default to
         // `Multiplexed` — the common case is "one sidecar serves all
         // users". An operator who needs subscribed semantics for a
         // custom channel can wire it through this map.
@@ -50,7 +50,7 @@ fn kind_for(channel_type: &ChannelType) -> ChannelKind {
 
 /// Install all enabled channels from `config` into `registry`. Idempotent
 /// behaviour is *not* guaranteed: a duplicate install on an already-
-/// populated registry returns [`aura_channels::ChannelError::DuplicateChannel`].
+/// populated registry returns [`baybo_channels::ChannelError::DuplicateChannel`].
 /// Call exactly once at gateway boot.
 pub fn install_channels(
     registry: &Arc<ChannelRegistry>,
@@ -147,7 +147,7 @@ pub(crate) fn broadcast_approval_resolved(
     channel: &Channel,
     call_id: String,
     session_id: SessionId,
-    decision: aura_tools::ApprovalDecision,
+    decision: baybo_tools::ApprovalDecision,
 ) {
     channel.dispatch_approval_resolved(call_id, session_id, decision);
 }

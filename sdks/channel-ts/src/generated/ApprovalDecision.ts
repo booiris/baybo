@@ -3,9 +3,9 @@
 /**
  * Decision returned by an approval gate.
  *
- * Lives in `aura-model` so trace `SpanEvent`s can record approval
- * outcomes without `aura-trace` having to depend on `aura-tools`.
- * `aura-tools` re-exports this type so existing call sites keep
+ * Lives in `baybo-model` so trace `SpanEvent`s can record approval
+ * outcomes without `baybo-trace` having to depend on `baybo-tools`.
+ * `baybo-tools` re-exports this type so existing call sites keep
  * working unchanged.
  */
 export type ApprovalDecision = "approve" | "approve_always" | "deny";

@@ -1,6 +1,6 @@
 //! Tool-name encoding for the LLM wire boundary.
 //!
-//! Aura registers MCP tools as `<server>/<tool>`, but every supported
+//! Baybo registers MCP tools as `<server>/<tool>`, but every supported
 //! provider rejects `/` in `tools[].name`:
 //!
 //!   * OpenAI / Anthropic — `^[a-zA-Z0-9_-]{1,64}$`

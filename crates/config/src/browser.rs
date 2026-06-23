@@ -1,12 +1,12 @@
 //! Configuration for the embedded browser MCP server (`tool-src/browser`).
 //!
-//! The data lives here because `aura-config` is the canonical
-//! aggregator for `aura.json` shape; the *builder* that turns this
-//! into an [`aura_tools::mcp::EmbeddedMcpProfile`] lives in
-//! `aura_tools::mcp::profile::browser` (alongside the MCP machinery
+//! The data lives here because `baybo-config` is the canonical
+//! aggregator for `baybo.json` shape; the *builder* that turns this
+//! into an [`baybo_tools::mcp::EmbeddedMcpProfile`] lives in
+//! `baybo_tools::mcp::profile::browser` (alongside the MCP machinery
 //! that consumes it). The gateway boot path unpacks the config fields
-//! and hands them to `browser_mcp_profile` — keeping `aura-config`
-//! free of an `aura-tools` runtime dep.
+//! and hands them to `browser_mcp_profile` — keeping `baybo-config`
+//! free of an `baybo-tools` runtime dep.
 
 use std::path::PathBuf;
 
@@ -22,7 +22,7 @@ pub struct BrowserConfig {
     /// agent loop, and the bundle stays inert in the binary. Flip to
     /// `true` to opt the agent into web browsing — the sidecar will
     /// auto-download Google Chrome for Testing into
-    /// `$XDG_CACHE_HOME/aura/browser/chrome/` on first boot if it
+    /// `$XDG_CACHE_HOME/baybo/browser/chrome/` on first boot if it
     /// can't find a Chrome there.
     pub enable: bool,
 
@@ -30,7 +30,7 @@ pub struct BrowserConfig {
     ///
     /// Default: unset, in which case the sidecar auto-downloads Google
     /// Chrome for Testing 'stable' into
-    /// `$XDG_CACHE_HOME/aura/browser/chrome/<platform>/chrome-<buildId>/`
+    /// `$XDG_CACHE_HOME/baybo/browser/chrome/<platform>/chrome-<buildId>/`
     /// on first boot and uses that path. Set this only to pin to a
     /// specific Chrome (e.g. a system binary, a custom build, an
     /// air-gapped vendor distribution). Chrome for Testing is the
@@ -69,8 +69,8 @@ pub struct BrowserConfig {
     /// Override the per-sidecar Chrome profile directory.
     ///
     /// Default: `<workspace_root>/state/browser/profile` (computed by
-    /// `aura_gateway::collect_profiles` from `workspace.path`). The
-    /// profile is **persistent across Aura restarts** (cookies /
+    /// `baybo_gateway::collect_profiles` from `workspace.path`). The
+    /// profile is **persistent across Baybo restarts** (cookies /
     /// localStorage retained) and lives under the workspace so it
     /// follows the operator's `workspace.path`. In docker mode the
     /// same directory is bind-mounted at `/data/profile` inside the
@@ -78,7 +78,7 @@ pub struct BrowserConfig {
     /// docker modes (operator UID stays the owner).
     ///
     /// Note that chrome-devtools-mcp serialises browser access — only
-    /// one Aura process can drive a given profile dir at a time.
+    /// one Baybo process can drive a given profile dir at a time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_dir: Option<PathBuf>,
 
@@ -166,10 +166,10 @@ pub struct BrowserDockerConfig {
 
     /// Override the Docker image tag the sidecar runs. **Default: unset**,
     /// in which case the sidecar computes a deterministic tag of the form
-    /// `aura-browser:<sha256(Dockerfile + entrypoint.sh + chrome_version)[..12]>`
+    /// `baybo-browser:<sha256(Dockerfile + entrypoint.sh + chrome_version)[..12]>`
     /// and builds the image on first boot if it isn't already present
     /// locally. Subsequent boots find the cached image (no rebuild) and
-    /// new Aura versions land on a new tag (auto-rebuilds).
+    /// new Baybo versions land on a new tag (auto-rebuilds).
     ///
     /// Set this only to point at a hand-rolled image (e.g. an air-gapped
     /// registry mirror, a custom Chrome build). When set, the sidecar
@@ -221,7 +221,7 @@ mod tests {
             sandbox: true,
             width: 1280,
             height: 720,
-            profile_dir: Some(PathBuf::from("/tmp/aura-profile")),
+            profile_dir: Some(PathBuf::from("/tmp/baybo-profile")),
             docker: BrowserDockerConfig {
                 enable: true,
                 cdp_url: Some("http://127.0.0.1:9222".into()),

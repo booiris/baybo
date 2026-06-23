@@ -1,5 +1,5 @@
 [package]
-name = "aura-job"
+name = "baybo-job"
 version.workspace = true
 edition.workspace = true
 
@@ -10,8 +10,8 @@ doctest = false
 test-support = []
 
 [dependencies]
-aura-model = { workspace = true }
-aura-store = { workspace = true }
+baybo-model = { workspace = true }
+baybo-store = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

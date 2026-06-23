@@ -12,14 +12,14 @@
 //!   unsandboxed re-run is safe, yielding keep / unsandbox / prompt.
 //!
 //! The verdict is a single flat JSON object parsed with
-//! [`aura_llm::extract_json_object`] (shared with the skill assessor); only an
+//! [`baybo_llm::extract_json_object`] (shared with the skill assessor); only an
 //! explicit `"safe"` is treated as safe, so a garbled `risk` field defaults to
 //! risky.
 
 use std::path::Path;
 
-use aura_llm::{BilledChat, ChatRequest, extract_json_object};
-use aura_model::{ChatMessage, ContentBlock};
+use baybo_llm::{BilledChat, ChatRequest, extract_json_object};
+use baybo_model::{ChatMessage, ContentBlock};
 use serde::Deserialize;
 
 /// Max chars of stdout/stderr (tail) handed to the post-failure judge. The
@@ -158,7 +158,7 @@ async fn run_judge(llm: &dyn BilledChat, system: &str, user: &str) -> Option<Raw
     let reply = match llm.chat(&request).await {
         Ok(resp) => resp.response.content,
         Err(e) => {
-            tracing::warn!(target: "aura::tools::bash", error = %e, "bash risk judge call failed");
+            tracing::warn!(target: "baybo::tools::bash", error = %e, "bash risk judge call failed");
             return None;
         }
     };
@@ -187,7 +187,7 @@ Decide whether it is risky enough that a human should approve it before it runs:
 Respond with ONE JSON object and nothing else:
 {"risk": "safe"|"risky", "rationale": "one short sentence"}"#;
 
-const POST_FAIL_SYSTEM: &str = r#"You are a safety judge for an autonomous coding agent. A shell command just ran inside an OS sandbox and FAILED (non-zero exit). The sandbox gives read+write access to the project workspace and $HOME, EXCEPT these are hidden as empty directories: ~/.ssh, ~/.aws, ~/.gnupg, ~/.config/gh, ~/.config/gcloud, ~/.docker, ~/.kube, and aura's own state dir. Host devices and any path outside (workspace + $HOME) are also invisible. Network is enabled.
+const POST_FAIL_SYSTEM: &str = r#"You are a safety judge for an autonomous coding agent. A shell command just ran inside an OS sandbox and FAILED (non-zero exit). The sandbox gives read+write access to the project workspace and $HOME, EXCEPT these are hidden as empty directories: ~/.ssh, ~/.aws, ~/.gnupg, ~/.config/gh, ~/.config/gcloud, ~/.docker, ~/.kube, and baybo's own state dir. Host devices and any path outside (workspace + $HOME) are also invisible. Network is enabled.
 
 Decide two independent things:
 1. sandbox_related: Was the failure plausibly CAUSED by one of those sandbox restrictions — the command needed a hidden credential directory, a path or device outside the writable union, or otherwise-blocked access? Set this FALSE for ordinary failures that would fail the same way anywhere: compile errors, failing tests, bad flags, missing files inside the workspace, DNS/network errors, or an "expected" non-zero exit.

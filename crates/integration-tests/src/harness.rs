@@ -12,26 +12,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_agent::{
+use baybo_agent::{
     AgentLoop, SecurityGateway,
     actor::{AgentActor, AgentMessage, mailbox::MailboxSender},
     tool_executor::ToolExecutor,
 };
-use aura_channels::{AgentEvent, AgentOutput, IncomingMessage, Message};
-use aura_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer};
-use aura_cost::test_support::MemoryCostStore;
-use aura_cost::{CostManager, SpendingLimits, cost_hooks};
-use aura_job::JobLifecycle;
-use aura_job::test_support::MemoryJobStore;
-use aura_llm::test_support::StubLlm;
-use aura_llm::{LlmCompletion, ModelPricing};
-use aura_model::{ChannelType, ContentBlock, LlmEntryName, MessageMetadata, Session, User};
-use aura_security::test_support::MemorySecretStore;
-use aura_security::{LeakDetector, SecretVault};
-use aura_skills::SkillRegistry;
-use aura_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
-use aura_trace::test_support::MemoryTraceStore;
-use aura_trace::{SpanRecorder, TraceEventStream, TraceStore};
+use baybo_channels::{AgentEvent, AgentOutput, IncomingMessage, Message};
+use baybo_context::{ContextManager, ContextManagerConfig, TiktokenTokenizer};
+use baybo_cost::test_support::MemoryCostStore;
+use baybo_cost::{CostManager, SpendingLimits, cost_hooks};
+use baybo_job::JobLifecycle;
+use baybo_job::test_support::MemoryJobStore;
+use baybo_llm::test_support::StubLlm;
+use baybo_llm::{LlmCompletion, ModelPricing};
+use baybo_model::{ChannelType, ContentBlock, LlmEntryName, MessageMetadata, Session, User};
+use baybo_security::test_support::MemorySecretStore;
+use baybo_security::{LeakDetector, SecretVault};
+use baybo_skills::SkillRegistry;
+use baybo_tools::{ApprovalGateMap, Tool, ToolManifest, ToolRegistry};
+use baybo_trace::test_support::MemoryTraceStore;
+use baybo_trace::{SpanRecorder, TraceEventStream, TraceStore};
 use chrono::Utc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -44,7 +44,7 @@ use crate::fixtures::{SessionBuilder, master_key_for_tests};
 /// 1. Push canned `LlmResponse` / stream events onto `stub_llm` for the
 ///    upcoming turn.
 /// 2. Optionally register tools onto `tool_registry` (use `EchoTool` /
-///    `RecordingTool` from `aura_tools::test_support`).
+///    `RecordingTool` from `baybo_tools::test_support`).
 /// 3. Send user input via [`AgentTestHarness::send_text`] or
 ///    [`AgentTestHarness::send_message`].
 /// 4. Drain channel output via [`AgentTestHarness::drain_outputs`].
@@ -66,15 +66,15 @@ pub struct AgentTestHarness {
     pub tool_registry: Arc<ToolRegistry>,
     pub skill_registry: Arc<SkillRegistry>,
     pub cost_manager: Arc<CostManager>,
-    pub token_calibration: Arc<aura_context::TokenCalibration>,
+    pub token_calibration: Arc<baybo_context::TokenCalibration>,
     /// Session manager backing the wired `ContextManager`. Exposed so
     /// tests can pre-seed session messages or summary metadata before
     /// driving the agent loop (e.g. compressor fast-path e2e coverage).
-    pub session_manager: Arc<aura_agent::SessionManager>,
+    pub session_manager: Arc<baybo_agent::SessionManager>,
     /// Planning-checklist store shared by the registered `Task*` tools and the
     /// loop's per-turn reminder. Exposed so a task e2e can assert what the
     /// model's tool calls persisted.
-    pub task_store: Arc<dyn aura_store::TaskStore>,
+    pub task_store: Arc<dyn baybo_store::TaskStore>,
     pub mailbox: MailboxSender<AgentMessage>,
     outputs: mpsc::Receiver<AgentOutput>,
     actor_handle: Option<JoinHandle<()>>,
@@ -168,7 +168,7 @@ impl AgentTestHarness {
 /// Defaults: a `Session` with `id = "sess-it"` on `ChannelType::tui()`,
 /// the standard `LeakDetector::with_default_rules()` security stack
 /// pointed at an in-memory `SecretStore`, an empty `ToolRegistry` and
-/// `SkillRegistry`, the soul `"You are Aura, a test assistant."`, and
+/// `SkillRegistry`, the soul `"You are Baybo, a test assistant."`, and
 /// `max_iterations = 20`. Mailbox capacity defaults to 32.
 pub struct AgentTestHarnessBuilder {
     session: Option<Session>,
@@ -178,7 +178,7 @@ pub struct AgentTestHarnessBuilder {
     tools: Vec<(Arc<dyn Tool>, ToolManifest)>,
     spending_limits: SpendingLimits,
     pricing: HashMap<String, ModelPricing>,
-    workspace: Option<Arc<aura_workspace::WorkspacePaths>>,
+    workspace: Option<Arc<baybo_workspace::WorkspacePaths>>,
     keep_recent: Option<usize>,
     /// Override for the stub LLM's `context_window`, which becomes the
     /// `ContextManager`'s budget cap after `AgentLoop::from_config`
@@ -191,7 +191,7 @@ pub struct AgentTestHarnessBuilder {
     compression_threshold: Option<f64>,
     /// Pluggable memory wired into the loop. Defaults to `None` (inert); tests
     /// assert the recall / write hooks by wiring a `RecordingMemory`.
-    memory: Option<Arc<dyn aura_memory::Memory>>,
+    memory: Option<Arc<dyn baybo_memory::Memory>>,
     /// Override the LLM client wired into the pool. Defaults to `None` → the
     /// scriptable `StubLlm`. Set it to drive a custom `LlmCompletion` (e.g. a
     /// fixture whose call blocks until cancelled) when `StubLlm`'s
@@ -267,7 +267,7 @@ impl AgentTestHarnessBuilder {
     /// per-session paths through (`summary.md`, JSONL transcript).
     /// Default: a workspace rooted at a non-existent path so the
     /// fast-path always falls through.
-    pub fn with_workspace(mut self, workspace: Arc<aura_workspace::WorkspacePaths>) -> Self {
+    pub fn with_workspace(mut self, workspace: Arc<baybo_workspace::WorkspacePaths>) -> Self {
         self.workspace = Some(workspace);
         self
     }
@@ -295,9 +295,9 @@ impl AgentTestHarnessBuilder {
         self
     }
 
-    /// Wire a [`aura_memory::Memory`] impl into the loop so a test can assert
+    /// Wire a [`baybo_memory::Memory`] impl into the loop so a test can assert
     /// the recall / `on_job_complete` hooks fire. Defaults to `None` (inert).
-    pub fn with_memory(mut self, memory: Arc<dyn aura_memory::Memory>) -> Self {
+    pub fn with_memory(mut self, memory: Arc<dyn baybo_memory::Memory>) -> Self {
         self.memory = Some(memory);
         self
     }
@@ -324,7 +324,7 @@ impl AgentTestHarnessBuilder {
         let secret_store = Arc::new(MemorySecretStore::new());
         let vault = Arc::new(SecretVault::new(
             master_key_for_tests(),
-            secret_store.clone() as Arc<dyn aura_store::SecretStore>,
+            secret_store.clone() as Arc<dyn baybo_store::SecretStore>,
         ));
         let gateway = Arc::new(SecurityGateway::new(detector, vault.clone()));
 
@@ -368,7 +368,7 @@ impl AgentTestHarnessBuilder {
         // The client actually wired into the pool: the custom override when
         // set, else the scriptable stub. Its `model_info` drives the pool
         // entry name + tokenizer so they stay consistent either way.
-        let wired_llm: Arc<dyn aura_llm::LlmCompletion> = match self.llm {
+        let wired_llm: Arc<dyn baybo_llm::LlmCompletion> = match self.llm {
             Some(custom) => custom,
             None => stub_llm.clone(),
         };
@@ -379,42 +379,42 @@ impl AgentTestHarnessBuilder {
         // Wire the planning-checklist tools against a shared store the loop
         // also reads for its per-turn reminder — mirrors production so a task
         // e2e exercises the full tool→store→reminder→TaskList path.
-        let task_store: Arc<dyn aura_store::TaskStore> =
-            Arc::new(aura_task::test_support::MemoryTaskStore::new());
-        for (tool, manifest) in aura_task::tools::agent_tools(task_store.clone()) {
+        let task_store: Arc<dyn baybo_store::TaskStore> =
+            Arc::new(baybo_task::test_support::MemoryTaskStore::new());
+        for (tool, manifest) in baybo_task::tools::agent_tools(task_store.clone()) {
             tool_registry.register(tool, manifest);
         }
         let tool_registry = Arc::new(tool_registry);
         let skill_registry = Arc::new(SkillRegistry::new());
         let approval_gates = Arc::new(ApprovalGateMap::new());
-        let memory_session_store = Arc::new(aura_session::test_support::MemorySessionStore::new());
+        let memory_session_store = Arc::new(baybo_session::test_support::MemorySessionStore::new());
         // Mirror production's "session row exists before the actor spawns"
         // shape so cross-session lookups (`on_session_end` →
         // `SessionManager::history`, and the transcript-read intercept →
         // `SessionManager::full_transcript`) find the row instead of NotFound-ing.
         memory_session_store.seed_session(&session);
         let session_store =
-            Arc::clone(&memory_session_store) as Arc<dyn aura_session::SessionStore>;
-        let summary_store = Arc::new(aura_session::test_support::MemorySessionSummaryStore::new())
-            as Arc<dyn aura_session::SessionSummaryStore>;
-        let folder_store = Arc::new(aura_session::test_support::MemorySessionFolderStore::new())
-            as Arc<dyn aura_session::SessionFolderStore>;
-        let session_manager = Arc::new(aura_agent::SessionManager::new(
+            Arc::clone(&memory_session_store) as Arc<dyn baybo_session::SessionStore>;
+        let summary_store = Arc::new(baybo_session::test_support::MemorySessionSummaryStore::new())
+            as Arc<dyn baybo_session::SessionSummaryStore>;
+        let folder_store = Arc::new(baybo_session::test_support::MemorySessionFolderStore::new())
+            as Arc<dyn baybo_session::SessionFolderStore>;
+        let session_manager = Arc::new(baybo_agent::SessionManager::new(
             session_store,
             summary_store,
             folder_store,
         ));
-        let virtual_reads: Option<Arc<dyn aura_tools::VirtualReadResolver>> =
-            Some(Arc::new(aura_agent::SessionTranscriptReader::new(
-                Arc::clone(&session_manager) as Arc<dyn aura_agent::SessionTranscript>,
-                aura_workspace::WorkspacePaths::new(std::path::PathBuf::from("/tmp")),
+        let virtual_reads: Option<Arc<dyn baybo_tools::VirtualReadResolver>> =
+            Some(Arc::new(baybo_agent::SessionTranscriptReader::new(
+                Arc::clone(&session_manager) as Arc<dyn baybo_agent::SessionTranscript>,
+                baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/tmp")),
             )));
         let tool_executor = Arc::new(ToolExecutor::new(
             tool_registry.clone(),
             approval_gates,
             gateway.clone(),
             std::path::PathBuf::from("/tmp"),
-            aura_workspace::WorkspacePaths::new(std::path::PathBuf::from("/tmp")),
+            baybo_workspace::WorkspacePaths::new(std::path::PathBuf::from("/tmp")),
             None,
             virtual_reads,
             None,
@@ -428,29 +428,29 @@ impl AgentTestHarnessBuilder {
         // Non-existent root → fast-path read hits NotFound → falls
         // through. No tempdir to clean up.
         let workspace = self.workspace.unwrap_or_else(|| {
-            Arc::new(aura_workspace::WorkspacePaths::new(PathBuf::from(
-                "/nonexistent-aura-it-workspace",
+            Arc::new(baybo_workspace::WorkspacePaths::new(PathBuf::from(
+                "/nonexistent-baybo-it-workspace",
             )))
         });
         let keep_recent = self.keep_recent.unwrap_or(50);
         let compression_threshold = self.compression_threshold.unwrap_or(0.95);
-        let token_calibration = Arc::new(aura_context::TokenCalibration::new());
+        let token_calibration = Arc::new(baybo_context::TokenCalibration::new());
         let soul_text = self
             .soul_prompt
-            .unwrap_or_else(|| "You are Aura, a test assistant.".into());
+            .unwrap_or_else(|| "You are Baybo, a test assistant.".into());
         // Inject the fixed test prompt as a one-profile subagent registry: the
         // new design resolves a session's system prompt from either the
         // workspace soul or a subagent profile, and the harness workspace is a
         // stub (so the workspace path would just hit the fallback).
-        let subagent_registry = Arc::new(aura_subagent::SubagentRegistry::new());
-        subagent_registry.register(aura_subagent::SubagentProfile {
+        let subagent_registry = Arc::new(baybo_subagent::SubagentRegistry::new());
+        subagent_registry.register(baybo_subagent::SubagentProfile {
             name: "harness".into(),
             version: "1".into(),
             description: "harness test prompt".into(),
             system_prompt: soul_text,
             default_tier: None,
-            source: aura_model::ArtifactSource::Inline,
-            trust_level: aura_model::TrustLevel::Trusted,
+            source: baybo_model::ArtifactSource::Inline,
+            trust_level: baybo_model::TrustLevel::Trusted,
             source_path: None,
         });
         let context_manager = ContextManager::from_config(ContextManagerConfig {
@@ -466,7 +466,7 @@ impl AgentTestHarnessBuilder {
         });
 
         let guarded_llm =
-            aura_llm::BillableLlm::new(Arc::clone(&wired_llm), cost_hooks(&cost_manager));
+            baybo_llm::BillableLlm::new(Arc::clone(&wired_llm), cost_hooks(&cost_manager));
 
         // Single-entry pool keyed by the wired model's id; tests that
         // exercise mid-session swap can extend this by registering
@@ -474,15 +474,15 @@ impl AgentTestHarnessBuilder {
         let stub_entry_name = LlmEntryName::from(wired_llm.model_info().id.clone());
         let mut pool_clients = std::collections::HashMap::new();
         pool_clients.insert(stub_entry_name.clone(), guarded_llm);
-        let llm_pool: aura_agent::LlmPoolHandle = Arc::new(parking_lot::RwLock::new(Arc::new(
-            aura_agent::LlmClientPool::new(pool_clients, stub_entry_name.clone())
+        let llm_pool: baybo_agent::LlmPoolHandle = Arc::new(parking_lot::RwLock::new(Arc::new(
+            baybo_agent::LlmClientPool::new(pool_clients, stub_entry_name.clone())
                 .expect("stub pool default present"),
         )));
 
         let actor_parent_token = tokio_util::sync::CancellationToken::new();
         let actor_token = actor_parent_token.child_token();
 
-        let agent_loop = AgentLoop::from_config(aura_agent::agent_loop::AgentLoopConfig {
+        let agent_loop = AgentLoop::from_config(baybo_agent::agent_loop::AgentLoopConfig {
             llm_pool,
             initial_llm: None,
             tool_registry: tool_registry.clone(),
@@ -499,14 +499,14 @@ impl AgentTestHarnessBuilder {
             memory: self.memory,
             task_store: task_store.clone(),
         });
-        let (mailbox_tx, mailbox_rx) = aura_agent::mailbox::channel(self.mailbox_capacity);
+        let (mailbox_tx, mailbox_rx) = baybo_agent::mailbox::channel(self.mailbox_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.output_capacity);
 
         // Mirror production's turn-state projector so the turn-*ended*
         // `TurnState { active: false }` is derived from the job store
         // (the actor only emits the leading `true`). Without it the e2e
         // outputs would never carry the close edge.
-        aura_agent::supervisor::spawn_turn_state_projector(
+        baybo_agent::supervisor::spawn_turn_state_projector(
             Arc::clone(&job_lifecycle),
             Arc::clone(&session_manager),
             output_tx.clone(),
@@ -515,8 +515,8 @@ impl AgentTestHarnessBuilder {
 
         let job_lifecycle_for_harness = Arc::clone(&job_lifecycle);
         let actor = AgentActor::from_parts(
-            aura_agent::state::DurableActorState::new(session.clone()),
-            aura_agent::state::VolatileResources {
+            baybo_agent::state::DurableActorState::new(session.clone()),
+            baybo_agent::state::VolatileResources {
                 agent_loop,
                 response_tx: output_tx,
                 job_lifecycle,
@@ -558,11 +558,11 @@ impl AgentTestHarnessBuilder {
 // `Arc<dyn Trait>`, so the test handle and the manager-owned handle
 // point at the same instance and post-run assertions see real state.
 
-fn share_job_store(arc: &Arc<MemoryJobStore>) -> Arc<dyn aura_job::JobStore> {
+fn share_job_store(arc: &Arc<MemoryJobStore>) -> Arc<dyn baybo_job::JobStore> {
     arc.clone()
 }
 
-fn share_cost_store(arc: &Arc<MemoryCostStore>) -> Arc<dyn aura_cost::CostStore> {
+fn share_cost_store(arc: &Arc<MemoryCostStore>) -> Arc<dyn baybo_cost::CostStore> {
     arc.clone()
 }
 

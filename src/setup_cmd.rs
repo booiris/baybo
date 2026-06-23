@@ -1,9 +1,9 @@
-//! Binary entry for `aura setup`. Runs ahead of `boot::load_config`
+//! Binary entry for `baybo setup`. Runs ahead of `boot::load_config`
 //! because the wizard's job is to create the workspace + key +
-//! `aura.json` that the rest of the binary expects.
+//! `baybo.json` that the rest of the binary expects.
 
-use aura_setup::{SetupOutcome, TtyPrompter};
-use aura_workspace::paths::default_workspace_root;
+use baybo_setup::{SetupOutcome, TtyPrompter};
+use baybo_workspace::paths::default_workspace_root;
 
 use crate::tracing_init::{TracingMode, init_tracing};
 
@@ -11,25 +11,25 @@ pub async fn run() -> anyhow::Result<()> {
     let _tracing_guards = init_tracing(TracingMode::Stdout);
 
     let workspace_root = default_workspace_root();
-    eprintln!("Setting up Aura workspace at {}", workspace_root.display());
+    eprintln!("Setting up Baybo workspace at {}", workspace_root.display());
 
-    let mut ctx = aura_setup::bootstrap_workspace_if_needed(workspace_root)
+    let mut ctx = baybo_setup::bootstrap_workspace_if_needed(workspace_root)
         .await
         .map_err(|e| anyhow::anyhow!("workspace bootstrap failed: {e}"))?;
 
     let mut prompter =
         TtyPrompter::new().map_err(|e| anyhow::anyhow!("setup is interactive: {e}"))?;
 
-    let outcome = aura_setup::run(&mut prompter, &mut ctx)
+    let outcome = baybo_setup::run(&mut prompter, &mut ctx)
         .await
         .map_err(|e| anyhow::anyhow!("setup wizard failed: {e}"))?;
 
     print_summary(&outcome);
 
     // Setup never starts the gateway itself — it points the operator at
-    // the next command. `aura gateway start` then prints the dashboard
+    // the next command. `baybo gateway start` then prints the dashboard
     // URL and admin token.
-    aura_setup::print_exit_hint(&ctx.config_path);
+    baybo_setup::print_exit_hint(&ctx.config_path);
     Ok(())
 }
 

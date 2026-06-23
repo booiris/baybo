@@ -1,7 +1,7 @@
 //! `Step` — one iteration of the agent loop, or one logical
 //! work-unit (compression / memory / skill-selection / subagent).
 
-use aura_model::{JobId, StepId};
+use baybo_model::{JobId, StepId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +22,7 @@ use crate::outcome::{LifecycleOutcome, LifecycleState};
 /// the other. Recovery, storage rewrites, and replay all rely on this
 /// pairing.
 ///
-/// **Storage coupling:** the `steps` table in `aura-storage` derives its
+/// **Storage coupling:** the `steps` table in `baybo-storage` derives its
 /// indexed `job_id` / `started_at` columns from this struct's serialized
 /// JSON via `json_extract(data, '$.job_id')` (and `'$.started_at'`). Those
 /// field names are load-bearing — renaming them or adding a container

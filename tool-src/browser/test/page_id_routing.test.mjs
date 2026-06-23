@@ -37,17 +37,17 @@ function startSidecar() {
     // returns synchronously and skips the @puppeteer/browsers install
     // path entirely. We never actually launch this binary as Chrome —
     // tools/list in CDDM doesn't need a live browser.
-    const profileDir = mkdtempSync(join(tmpdir(), "aura-browser-test-"));
+    const profileDir = mkdtempSync(join(tmpdir(), "baybo-browser-test-"));
     const child = spawn(process.execPath, [bundlePath], {
         stdio: ["pipe", "pipe", "pipe"],
         env: {
             ...process.env,
-            AURA_BROWSER_CHROME_PATH: process.execPath,
-            AURA_BROWSER_PROFILE_DIR: profileDir,
+            BAYBO_BROWSER_CHROME_PATH: process.execPath,
+            BAYBO_BROWSER_PROFILE_DIR: profileDir,
             // Don't let the test inherit the operator's docker config;
             // the host-headless fast path is what we're exercising.
-            AURA_BROWSER_DOCKER_ENABLE: "",
-            AURA_BROWSER_DOCKER_CDP_URL: "",
+            BAYBO_BROWSER_DOCKER_ENABLE: "",
+            BAYBO_BROWSER_DOCKER_CDP_URL: "",
         },
     });
     child.stderr.on("data", () => {
@@ -109,7 +109,7 @@ test("experimentalPageIdRouting is on; pageId surfaces on the right tools", asyn
         params: {
             protocolVersion: "2024-11-05",
             capabilities: {},
-            clientInfo: { name: "aura-browser-test", version: "0.0.1" },
+            clientInfo: { name: "baybo-browser-test", version: "0.0.1" },
         },
     });
     const initResp = await nextResponse();

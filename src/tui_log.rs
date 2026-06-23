@@ -17,7 +17,7 @@
 use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
 
-use aura_tui::{LogLevel, LogRecord, TuiLogSink};
+use baybo_tui::{LogLevel, LogRecord, TuiLogSink};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::Layer;

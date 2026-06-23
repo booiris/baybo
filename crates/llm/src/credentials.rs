@@ -1,13 +1,13 @@
 //! API-key resolution for LLM entries — the single source of truth
 //! for both runtime boot (`src/boot.rs::build_llm_client`) and the
-//! `aura llm` CLI helpers. Taking primitive args (rather than an
-//! `LlmEntry`) avoids a circular dep on `aura-config`.
+//! `baybo llm` CLI helpers. Taking primitive args (rather than an
+//! `LlmEntry`) avoids a circular dep on `baybo-config`.
 
-use aura_security::SecretVault;
+use baybo_security::SecretVault;
 
-/// Vault key under which `aura llm add` stores an entry's literal API
+/// Vault key under which `baybo llm add` stores an entry's literal API
 /// key. Single function so the schema can never drift between the
-/// writer (`aura llm add`) and the readers (boot + CLI).
+/// writer (`baybo llm add`) and the readers (boot + CLI).
 pub fn vault_api_key_name(entry_name: &str) -> String {
     format!("llm.entry.{entry_name}.api_key")
 }
@@ -50,8 +50,8 @@ pub async fn resolve_api_key(
 mod tests {
     use std::sync::Arc;
 
-    use aura_security::EncryptionKey;
-    use aura_security::test_support::MemorySecretStore;
+    use baybo_security::EncryptionKey;
+    use baybo_security::test_support::MemorySecretStore;
 
     use super::*;
 
@@ -95,12 +95,12 @@ mod tests {
 
         // Explicit api_key_env wins over both.
         // SAFETY: see EnvCleanup::drop.
-        unsafe { std::env::set_var("AURA_TEST_LLM_KEY", "explicit-env-value") };
-        let _explicit_cleanup = EnvCleanup("AURA_TEST_LLM_KEY");
+        unsafe { std::env::set_var("BAYBO_TEST_LLM_KEY", "explicit-env-value") };
+        let _explicit_cleanup = EnvCleanup("BAYBO_TEST_LLM_KEY");
         let resolved = resolve_api_key(
             "alice",
             "openai",
-            Some("AURA_TEST_LLM_KEY"),
+            Some("BAYBO_TEST_LLM_KEY"),
             Some(v.as_ref()),
         )
         .await;
@@ -111,7 +111,7 @@ mod tests {
     /// by the next `resolve_api_key`. This is the property a config
     /// reload's pool rebuild depends on — the rebuild re-resolves from the
     /// vault every time and never caches, so `reload` (which always
-    /// rebuilds) and the `aura llm edit --api-key` → SIGHUP path both pick
+    /// rebuilds) and the `baybo llm edit --api-key` → SIGHUP path both pick
     /// up a rotated key on the next reload. The vault key beats the
     /// provider-default env var, so this holds regardless of ambient
     /// `OPENAI_API_KEY`.

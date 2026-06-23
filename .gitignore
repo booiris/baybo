@@ -4,9 +4,9 @@ temp
 index.scip
 .codex
 .env
-.aura
-aura.json
-aura_online.json
+.baybo
+baybo.json
+baybo_online.json
 **/node_modules/
 sdks/*/dist/
 channel-src/*/dist/

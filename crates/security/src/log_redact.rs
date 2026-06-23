@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn redacts_aws_access_key_in_log_line() {
         let mut w = redactor();
-        let line = b"2026-04-18T12:00:00Z INFO aura: key=AKIAIOSFODNN7EXAMPLE done\n";
+        let line = b"2026-04-18T12:00:00Z INFO baybo: key=AKIAIOSFODNN7EXAMPLE done\n";
         w.write_all(line).unwrap();
         let out = String::from_utf8(w.inner.0).unwrap();
         assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"));

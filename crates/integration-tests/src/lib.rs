@@ -1,4 +1,4 @@
-//! End-to-end test fixtures for the aura workspace.
+//! End-to-end test fixtures for the baybo workspace.
 //!
 //! This crate exposes builders and helpers that wire multiple
 //! `test-support`-feature crates together so individual `tests/*.rs`

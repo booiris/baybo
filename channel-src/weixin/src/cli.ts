@@ -1,4 +1,4 @@
-import type { RegistrationResult } from "@aura/channel-sdk";
+import type { RegistrationResult } from "@baybo/channel-sdk";
 import qrcode from "qrcode-terminal";
 
 import {
@@ -27,9 +27,9 @@ async function renderQr(qrcodeContent: string): Promise<void> {
 }
 
 export async function runLogin(): Promise<RegistrationResult> {
-  const timeoutMs = Number(process.env.AURA_WEIXIN_LOGIN_TIMEOUT_MS ?? 480_000);
-  const apiBaseUrl = process.env.AURA_WEIXIN_API_BASE_URL || FIXED_BASE_URL;
-  const botType = process.env.AURA_WEIXIN_BOT_TYPE || DEFAULT_ILINK_BOT_TYPE;
+  const timeoutMs = Number(process.env.BAYBO_WEIXIN_LOGIN_TIMEOUT_MS ?? 480_000);
+  const apiBaseUrl = process.env.BAYBO_WEIXIN_API_BASE_URL || FIXED_BASE_URL;
+  const botType = process.env.BAYBO_WEIXIN_BOT_TYPE || DEFAULT_ILINK_BOT_TYPE;
 
   out("正在启动微信扫码登录...\n");
   const start = await startWeixinLoginWithQr({
@@ -71,7 +71,7 @@ export async function runLogin(): Promise<RegistrationResult> {
     throw new Error("登录失败：服务器未返回 botToken。");
   }
 
-  const cdnBaseUrl = process.env.AURA_WEIXIN_CDN_BASE_URL || DEFAULT_CDN_BASE_URL;
+  const cdnBaseUrl = process.env.BAYBO_WEIXIN_CDN_BASE_URL || DEFAULT_CDN_BASE_URL;
   const blob: AuthBlob = {
     version: 1,
     botToken: result.botToken,

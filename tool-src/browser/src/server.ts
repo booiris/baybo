@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Aura's browser MCP sidecar is a thin wrapper around chrome-devtools-mcp:
+// Baybo's browser MCP sidecar is a thin wrapper around chrome-devtools-mcp:
 // we call its `createMcpServer` programmatically with hardened args
 // (telemetry off, isolation/persistence both via a dedicated userDataDir
 // + a dedicated Chrome binary) and connect a StdioServerTransport.
@@ -16,15 +16,15 @@
 //
 // We deliberately do not pass through `--isolated`: that flag creates
 // a temp userDataDir auto-deleted on close, which conflicts with the
-// "persistent across Aura restarts" property the operator gets by
+// "persistent across Baybo restarts" property the operator gets by
 // default. We achieve "isolated from the user's real Chrome profile"
-// via `userDataDir` pointed at an Aura-managed cache path + an
-// `executablePath` pointing at a Chrome under Aura's cache (not the
+// via `userDataDir` pointed at an Baybo-managed cache path + an
+// `executablePath` pointing at a Chrome under Baybo's cache (not the
 // user's system browser).
 //
 // Chrome auto-install + non-blocking ready: on first boot, if no
-// Chrome is found under Aura's cache, we kick off a download of
-// Chrome for Testing 'stable' into `$XDG_CACHE_HOME/aura/browser/chrome/`
+// Chrome is found under Baybo's cache, we kick off a download of
+// Chrome for Testing 'stable' into `$XDG_CACHE_HOME/baybo/browser/chrome/`
 // via @puppeteer/browsers in the background. The MCP server connects
 // immediately so the gateway sees the full tool list and the LLM can
 // reason about browser availability. Any `tools/call` arriving while
@@ -35,11 +35,11 @@
 // CDDM's `getContext()` (which re-reads `serverArgs.executablePath`
 // on every tool call) picks up the new path on the next attempt.
 //
-// Operator-facing knobs all live in `aura.json:browser.*`:
+// Operator-facing knobs all live in `baybo.json:browser.*`:
 // - `enable`, `chrome_path`, `sandbox`, `profile_dir` flow through
-//   `aura_tools::mcp::profile::browser_mcp_profile` into the child's
-//   env as internal IPC vars (`AURA_BROWSER_CHROME_PATH`,
-//   `AURA_BROWSER_NO_SANDBOX`, `AURA_BROWSER_PROFILE_DIR`).
+//   `baybo_tools::mcp::profile::browser_mcp_profile` into the child's
+//   env as internal IPC vars (`BAYBO_BROWSER_CHROME_PATH`,
+//   `BAYBO_BROWSER_NO_SANDBOX`, `BAYBO_BROWSER_PROFILE_DIR`).
 // - The env vars themselves are NOT a public interface; setting them
 //   directly works in development but isn't documented or supported.
 
@@ -115,7 +115,7 @@ interface InstallState {
 // fontconfig's FONTCONFIG_FILE. macOS Chrome uses Core Text and ignores
 // fontconfig — the override is a no-op there.
 function applyFontconfigOverride(): void {
-  const raw = process.env["AURA_BROWSER_EXTRA_FONT_DIRS"];
+  const raw = process.env["BAYBO_BROWSER_EXTRA_FONT_DIRS"];
   if (!raw) return;
   const dirs = raw.split(":").filter((d) => d.length > 0);
   if (dirs.length === 0) return;
@@ -142,7 +142,7 @@ function applyFontconfigOverride(): void {
     dirs.map((d) => `  <dir>${d}</dir>`).join("\n") +
     `\n</fontconfig>\n`;
 
-  const confPath = join(tmpdir(), `aura-browser-fonts-${process.pid}.conf`);
+  const confPath = join(tmpdir(), `baybo-browser-fonts-${process.pid}.conf`);
   writeFileSync(confPath, xml);
   process.env["FONTCONFIG_FILE"] = confPath;
   log(`fontconfig override: FONTCONFIG_FILE=${confPath} extra_dirs=${dirs.join(",")}`);
@@ -152,7 +152,7 @@ function parseViewport(raw: string | undefined): { width: number; height: number
   if (!raw) return undefined;
   const m = raw.match(/^(\d+)x(\d+)$/);
   if (!m) {
-    process.stderr.write(`[browser-mcp] AURA_BROWSER_VIEWPORT '${raw}' is not WxH; ignoring\n`);
+    process.stderr.write(`[browser-mcp] BAYBO_BROWSER_VIEWPORT '${raw}' is not WxH; ignoring\n`);
     return undefined;
   }
   return { width: Number(m[1]), height: Number(m[2]) };
@@ -164,18 +164,18 @@ function xdgCacheHome(): string {
 }
 
 function defaultProfileDir(): string {
-  return join(xdgCacheHome(), "aura", "browser", "profile");
+  return join(xdgCacheHome(), "baybo", "browser", "profile");
 }
 
 function defaultChromeCacheDir(): string {
   // The gateway's connect_stdio strips inherited env (env_clear), so an
-  // operator-set AURA_BROWSER_CACHE_DIR does NOT reach the runtime
+  // operator-set BAYBO_BROWSER_CACHE_DIR does NOT reach the runtime
   // sidecar — only the standalone `pnpm install-chrome` script (which
   // runs in the operator's shell, not via the gateway) honours it. Read
   // is intentionally absent here so the runtime path always uses the
-  // canonical `$XDG_CACHE_HOME/aura/browser/chrome/` and stays in sync
+  // canonical `$XDG_CACHE_HOME/baybo/browser/chrome/` and stays in sync
   // with the install script's default branch.
-  return join(xdgCacheHome(), "aura", "browser", "chrome");
+  return join(xdgCacheHome(), "baybo", "browser", "chrome");
 }
 
 const log = (msg: string): void => {
@@ -184,25 +184,25 @@ const log = (msg: string): void => {
 
 /**
  * Synchronous fast path: if a Chrome is already on disk (operator
- * pinned via `aura.json:browser.chrome_path`, plumbed to us as
- * `AURA_BROWSER_CHROME_PATH` by the Rust profile builder; or cached
+ * pinned via `baybo.json:browser.chrome_path`, plumbed to us as
+ * `BAYBO_BROWSER_CHROME_PATH` by the Rust profile builder; or cached
  * from a previous run), return its path. Returns `null` if nothing
  * is available — the caller then kicks off the background download
  * via {@link installChromeInBackground}.
  *
- * `AURA_BROWSER_CHROME_PATH` is an internal IPC channel between the
+ * `BAYBO_BROWSER_CHROME_PATH` is an internal IPC channel between the
  * gateway and the sidecar; operators configure the path through
- * `aura.json:browser.chrome_path` only.
+ * `baybo.json:browser.chrome_path` only.
  */
 async function findExistingChrome(): Promise<string | null> {
-  const pinned = process.env["AURA_BROWSER_CHROME_PATH"];
+  const pinned = process.env["BAYBO_BROWSER_CHROME_PATH"];
   if (pinned && pinned.length > 0) {
     if (existsSync(pinned)) {
       log(`using configured Chrome: ${pinned}`);
       return pinned;
     }
     log(
-      `aura.json:browser.chrome_path=${pinned} does not exist on disk; ` +
+      `baybo.json:browser.chrome_path=${pinned} does not exist on disk; ` +
         `falling through to cache lookup`,
     );
   }
@@ -214,7 +214,7 @@ async function findExistingChrome(): Promise<string | null> {
   if (!platform) {
     throw new Error(
       "@puppeteer/browsers detectBrowserPlatform returned null — unsupported OS/arch combo. " +
-        "Set aura.json:browser.chrome_path to a Chrome binary you have available.",
+        "Set baybo.json:browser.chrome_path to a Chrome binary you have available.",
     );
   }
 
@@ -230,7 +230,7 @@ async function findExistingChrome(): Promise<string | null> {
 
 /**
  * Long-running async path: download Google Chrome for Testing 'stable'
- * into Aura's cache and update `state` in place so the
+ * into Baybo's cache and update `state` in place so the
  * {@link GuardingTransport} can surface progress. Resolves to the
  * installed executable path on success; throws on failure.
  */
@@ -273,18 +273,18 @@ async function installChromeInBackground(state: InstallState): Promise<string> {
 }
 
 function buildArgs(executablePath: string | undefined): ServerArgs {
-  const userDataDir = process.env["AURA_BROWSER_PROFILE_DIR"] ?? defaultProfileDir();
+  const userDataDir = process.env["BAYBO_BROWSER_PROFILE_DIR"] ?? defaultProfileDir();
   mkdirSync(userDataDir, { recursive: true });
 
-  const viewport = parseViewport(process.env["AURA_BROWSER_VIEWPORT"]);
+  const viewport = parseViewport(process.env["BAYBO_BROWSER_VIEWPORT"]);
 
   // Chrome's renderer sandbox is on by default. The Rust profile
-  // builder sets AURA_BROWSER_NO_SANDBOX=1 when `aura.json:browser.sandbox`
+  // builder sets BAYBO_BROWSER_NO_SANDBOX=1 when `baybo.json:browser.sandbox`
   // is false (the default — most container/CI hosts can't satisfy
   // Chrome's user-namespace prerequisites). Append `--no-sandbox` to
   // chromeArg so it reaches Chrome at launch.
   const chromeArg: string[] = [];
-  if (process.env["AURA_BROWSER_NO_SANDBOX"] === "1") {
+  if (process.env["BAYBO_BROWSER_NO_SANDBOX"] === "1") {
     chromeArg.push("--no-sandbox");
   }
 
@@ -301,7 +301,7 @@ function buildArgs(executablePath: string | undefined): ServerArgs {
     categoryNavigationAutomation: true,
     categoryDebugging: true,
     // Drops `emulate` (CPU/network/device emulation) + `resize_page`.
-    // Viewport is fixed at sidecar boot via `AURA_BROWSER_VIEWPORT`, and
+    // Viewport is fixed at sidecar boot via `BAYBO_BROWSER_VIEWPORT`, and
     // the schema for `emulate` alone is ~1.2 KB of enum metadata that
     // the agent rarely needs.
     categoryEmulation: false,
@@ -316,7 +316,7 @@ function buildArgs(executablePath: string | undefined): ServerArgs {
     // Adds an optional `pageId` parameter to every page-scoped CDDM
     // tool. When the agent passes it, the call routes to that exact
     // page instead of CDDM's process-global "selected page" — which
-    // is the only thing that lets multiple Aura agents share one
+    // is the only thing that lets multiple Baybo agents share one
     // browser sidecar without their navigations / clicks / snapshots
     // tripping over each other (a select_page+act sequence is no
     // longer racy because CDDM's own toolMutex serialises every call,
@@ -445,9 +445,9 @@ class GuardingTransport {
       default:
         text =
           `Browser is unavailable: ${this.state.error ?? "unknown error"}. ` +
-          `Check the gateway logs (aura-browser-mcp lines), then either fix the underlying issue ` +
+          `Check the gateway logs (baybo-browser-mcp lines), then either fix the underlying issue ` +
           `(network for auto-install, docker daemon for docker mode) and restart the gateway, or ` +
-          `set aura.json:browser.chrome_path to an existing Chrome binary as a workaround.`;
+          `set baybo.json:browser.chrome_path to an existing Chrome binary as a workaround.`;
         break;
     }
     await this.real.send({
@@ -491,7 +491,7 @@ async function runHostFallback(state: InstallState): Promise<ServerArgs> {
   // (different hostname) or a crashed previous host Chrome (PID dead).
   // Live-PID-on-this-hostname locks are left alone so a real conflict
   // still surfaces.
-  const profileDir = process.env["AURA_BROWSER_PROFILE_DIR"] ?? defaultProfileDir();
+  const profileDir = process.env["BAYBO_BROWSER_PROFILE_DIR"] ?? defaultProfileDir();
   try {
     mkdirSync(profileDir, { recursive: true });
     clearStaleChromeLocks(profileDir);
@@ -544,7 +544,7 @@ async function runHostFallback(state: InstallState): Promise<ServerArgs> {
  * different hostname than the host, so each side leaves a lock the
  * other can't clear.
  *
- * Within an Aura process, host-headless and docker modes are mutually
+ * Within an Baybo process, host-headless and docker modes are mutually
  * exclusive — we never run both Chromes against this profile at the
  * same time. So a hostname mismatch is always stale. A *same-hostname*
  * lock with a live PID is the only case we leave alone (it'd be a real
@@ -614,8 +614,8 @@ function clearStaleChromeLocks(profileDir: string): void {
 }
 
 function dockerDirPath(): string {
-  // Bundle materialises to $XDG_CACHE_HOME/aura/sidecars/browser-<hash>/bundle.mjs;
-  // the `docker/` aux asset (declared in package.json:aura.auxAssets)
+  // Bundle materialises to $XDG_CACHE_HOME/baybo/sidecars/browser-<hash>/bundle.mjs;
+  // the `docker/` aux asset (declared in package.json:baybo.auxAssets)
   // lands as a sibling under the same hash dir.
   return resolve(dirname(fileURLToPath(import.meta.url)), "docker");
 }
@@ -652,7 +652,7 @@ async function trySpawnDocker(state: InstallState): Promise<DockerSpawnOutcome> 
   // the container's entrypoint hardcodes --no-sandbox because the slim
   // base ships no SUID chrome-sandbox helper. Warn loudly so the operator
   // doesn't think the sandbox is on when it isn't.
-  if (process.env["AURA_BROWSER_NO_SANDBOX"] !== "1") {
+  if (process.env["BAYBO_BROWSER_NO_SANDBOX"] !== "1") {
     log(
       "browser.sandbox=true ignored in docker mode — the container is the trust boundary " +
         "and Chrome runs with --no-sandbox inside (see CLAUDE.md 'Docker mode' subsection)",
@@ -662,13 +662,13 @@ async function trySpawnDocker(state: InstallState): Promise<DockerSpawnOutcome> 
 
   // Docker mode uses consumer Google Chrome installed inside the image
   // via apt (NOT @puppeteer/browsers / Chrome for Testing). Image is
-  // pinned by `aura-browser:<sha256(Dockerfile + entrypoint.sh)[..12]>`
+  // pinned by `baybo-browser:<sha256(Dockerfile + entrypoint.sh)[..12]>`
   // and gets whatever Chrome stable was current at build time. No host-
   // side Chrome version lookup needed — the only network call is the
   // initial `wget` inside the Dockerfile, which docker handles.
-  const operatorImageTag = process.env["AURA_BROWSER_DOCKER_IMAGE_TAG"] || undefined;
+  const operatorImageTag = process.env["BAYBO_BROWSER_DOCKER_IMAGE_TAG"] || undefined;
 
-  const profileDir = process.env["AURA_BROWSER_PROFILE_DIR"] ?? defaultProfileDir();
+  const profileDir = process.env["BAYBO_BROWSER_PROFILE_DIR"] ?? defaultProfileDir();
   // Belt-and-braces: the entrypoint inside the container also clears
   // stale locks, but doing it host-side first means the bind-mounted
   // /data/profile already looks clean to Chrome on first launch (avoids
@@ -685,12 +685,12 @@ async function trySpawnDocker(state: InstallState): Promise<DockerSpawnOutcome> 
     dockerDir: dockerDirPath(),
     imageTag: operatorImageTag,
     profileDir,
-    fontDir: pickFirstExistingDir(process.env["AURA_BROWSER_EXTRA_FONT_DIRS"]),
+    fontDir: pickFirstExistingDir(process.env["BAYBO_BROWSER_EXTRA_FONT_DIRS"]),
     webVncPort: parseVncPort(
-      process.env["AURA_BROWSER_DOCKER_WEB_VNC_PORT"],
+      process.env["BAYBO_BROWSER_DOCKER_WEB_VNC_PORT"],
       "WEB_VNC_PORT",
     ),
-    viewport: parseViewport(process.env["AURA_BROWSER_VIEWPORT"]) ?? { width: 1920, height: 1080 },
+    viewport: parseViewport(process.env["BAYBO_BROWSER_VIEWPORT"]) ?? { width: 1920, height: 1080 },
     onPhase: (p) => {
       state.phase = p;
     },
@@ -709,7 +709,7 @@ function parseVncPort(raw: string | undefined, label: string): number | undefine
   if (!raw) return undefined;
   const n = Number(raw);
   if (!Number.isInteger(n) || n < 1 || n > 65535) {
-    log(`AURA_BROWSER_DOCKER_${label} '${raw}' is not a valid TCP port; ignoring`);
+    log(`BAYBO_BROWSER_DOCKER_${label} '${raw}' is not a valid TCP port; ignoring`);
     return undefined;
   }
   return n;
@@ -717,8 +717,8 @@ function parseVncPort(raw: string | undefined, label: string): number | undefine
 
 async function main(): Promise<void> {
   const state: InstallState = { phase: "installing", percent: 0 };
-  const dockerCdpUrl = process.env["AURA_BROWSER_DOCKER_CDP_URL"];
-  const dockerEnable = process.env["AURA_BROWSER_DOCKER_ENABLE"] === "1";
+  const dockerCdpUrl = process.env["BAYBO_BROWSER_DOCKER_CDP_URL"];
+  const dockerEnable = process.env["BAYBO_BROWSER_DOCKER_ENABLE"] === "1";
   let dockerHandle: DockerHandle | null = null;
   let args: ServerArgs;
   let mode: "cdp_url" | "docker" | "host";
@@ -776,13 +776,13 @@ async function main(): Promise<void> {
   const [cddmInner, cddmOuter] = InMemoryTransport.createLinkedPair();
   await cddmServer.connect(cddmInner);
   const cddmClient = new Client(
-    { name: "aura-browser-proxy", version: "1.0.0" },
+    { name: "baybo-browser-proxy", version: "1.0.0" },
     { capabilities: {} },
   );
   await cddmClient.connect(cddmOuter);
 
   const proxy = new Server(
-    { name: "aura-browser", version: "1.0.0" },
+    { name: "baybo-browser", version: "1.0.0" },
     { capabilities: { tools: {} } },
   );
   proxy.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -805,7 +805,7 @@ async function main(): Promise<void> {
     }
     if (BLOCKED_TOOLS.has(req.params.name)) {
       return proxyToolError(
-        `Tool '${req.params.name}' is disabled in this Aura build. ` +
+        `Tool '${req.params.name}' is disabled in this Baybo build. ` +
           `It was hidden from tools/list — do not invoke it.`,
       );
     }

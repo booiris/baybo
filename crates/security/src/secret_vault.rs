@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::crypto::{self, EncryptionKey};
 use crate::secret_value::SecretValue;
 use crate::{Result, SecurityError};
-use aura_store::SecretStore;
+use baybo_store::SecretStore;
 
 pub struct SecretVault {
     master_key: EncryptionKey,

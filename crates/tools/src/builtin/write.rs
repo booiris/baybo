@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use aura_workspace::{WorkspacePaths, absolutise};
+use baybo_workspace::{WorkspacePaths, absolutise};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -103,15 +103,15 @@ impl Tool for WriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, User};
+    use baybo_model::{ChannelType, User};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
     fn ctx() -> ToolContext {
         ToolContext {
             session_id: "t".into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -120,7 +120,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: None,
             notifier: None,
@@ -134,7 +134,7 @@ mod tests {
     }
 
     fn tool() -> WriteTool {
-        WriteTool::new(aura_workspace::WorkspacePaths::new("/tmp"))
+        WriteTool::new(baybo_workspace::WorkspacePaths::new("/tmp"))
     }
 
     #[tokio::test]
@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn accessed_resources_skips_writefile_inside_work_dir() {
-        let paths = aura_workspace::WorkspacePaths::new("/var/aura");
+        let paths = baybo_workspace::WorkspacePaths::new("/var/baybo");
         let write = WriteTool::new(paths.clone());
         let in_work = paths.work_dir().join("scratch.txt");
         assert!(
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn accessed_resources_keeps_writefile_outside_work_dir() {
-        let paths = aura_workspace::WorkspacePaths::new("/var/aura");
+        let paths = baybo_workspace::WorkspacePaths::new("/var/baybo");
         let write = WriteTool::new(paths.clone());
 
         let in_profile = paths.profile_dir().join("SOUL.md");

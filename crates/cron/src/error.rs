@@ -16,12 +16,12 @@ pub enum CronError {
     Internal(#[from] anyhow::Error),
 }
 
-impl From<aura_store::StorageError> for CronError {
-    fn from(e: aura_store::StorageError) -> Self {
+impl From<baybo_store::StorageError> for CronError {
+    fn from(e: baybo_store::StorageError) -> Self {
         match e {
-            aura_store::StorageError::Conflict(s) => CronError::AlreadyDispatched(s),
-            aura_store::StorageError::NotFound(s) => CronError::NotFound(s),
-            aura_store::StorageError::Internal(e) => CronError::Internal(e),
+            baybo_store::StorageError::Conflict(s) => CronError::AlreadyDispatched(s),
+            baybo_store::StorageError::NotFound(s) => CronError::NotFound(s),
+            baybo_store::StorageError::Internal(e) => CronError::Internal(e),
             other => CronError::Storage(other.to_string()),
         }
     }

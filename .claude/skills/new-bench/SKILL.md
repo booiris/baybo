@@ -1,27 +1,27 @@
 ---
 name: new-bench
-description: Scaffold a new benchmark under bench/ for measuring the real Aura agent, following the shared conventions of bench/swe, bench/memory, bench/terminal-bench-1.0, and bench/terminal-bench-2.0. Use when the user wants to add a benchmark, eval, or leaderboard harness for aura.
+description: Scaffold a new benchmark under bench/ for measuring the real Baybo agent, following the shared conventions of bench/swe, bench/memory, bench/terminal-bench-1.0, and bench/terminal-bench-2.0. Use when the user wants to add a benchmark, eval, or leaderboard harness for baybo.
 argument-hint: "[what the bench measures, e.g. 'GAIA web-agent tasks']"
 ---
 
-# Add a new Aura benchmark
+# Add a new Baybo benchmark
 
-You are scaffolding a new benchmark under `bench/<name>/`. Aura already has four,
+You are scaffolding a new benchmark under `bench/<name>/`. Baybo already has four,
 and they share a deliberate skeleton — **reuse it; do not reinvent it.** This skill
 captures the cross-cutting decisions and invariants so a new bench is faithful,
 safe-to-merge, and consistent with the others on day one.
 
 **The three living templates — read the closest one before writing anything:**
 
-| bench | shape | how aura is driven | grader | isolation / build feature |
+| bench | shape | how baybo is driven | grader | isolation / build feature |
 | --- | --- | --- | --- | --- |
-| `bench/swe` | self-hosted Rust harness | **`docker run` per item**, `aura prompt` inside each official eval image | official `swebench` Python harness (shelled out) | `bench-bash` feature + `sandbox.mode=none` · static musl |
-| `bench/memory` | self-hosted Rust harness | **`aura gateway` once per arm**, concurrent `aura prompt` over it | LLM-as-judge (`deepseek`) + deterministic F1 | `bench-readonly-memory` (Cargo feature) |
-| `bench/terminal-bench-1.0` | **adapter into an external official harness** (legacy `tb` CLI; no Rust crate, no fork) | `aura prompt` inside the harness's task container, over tmux | the external harness's own pytest | `bench-bash` feature + `sandbox.mode=none` · static musl |
-| `bench/terminal-bench-2.0` | **adapter into an external official harness** (Harbor framework; no Rust crate, no fork) | `aura prompt` via a `BaseInstalledAgent` (`upload_file`s musl + `aura.json`) inside Harbor's task container | Harbor's own per-trial verifier (pytest → CTRF/`reward.txt`) | `bench-bash` feature + `sandbox.mode=none` · static musl |
+| `bench/swe` | self-hosted Rust harness | **`docker run` per item**, `baybo prompt` inside each official eval image | official `swebench` Python harness (shelled out) | `bench-bash` feature + `sandbox.mode=none` · static musl |
+| `bench/memory` | self-hosted Rust harness | **`baybo gateway` once per arm**, concurrent `baybo prompt` over it | LLM-as-judge (`deepseek`) + deterministic F1 | `bench-readonly-memory` (Cargo feature) |
+| `bench/terminal-bench-1.0` | **adapter into an external official harness** (legacy `tb` CLI; no Rust crate, no fork) | `baybo prompt` inside the harness's task container, over tmux | the external harness's own pytest | `bench-bash` feature + `sandbox.mode=none` · static musl |
+| `bench/terminal-bench-2.0` | **adapter into an external official harness** (Harbor framework; no Rust crate, no fork) | `baybo prompt` via a `BaseInstalledAgent` (`upload_file`s musl + `baybo.json`) inside Harbor's task container | Harbor's own per-trial verifier (pytest → CTRF/`reward.txt`) | `bench-bash` feature + `sandbox.mode=none` · static musl |
 
 `reference.md` (next to this file) holds the copy-paste boilerplate: the
-`run-bench.sh` skeleton, the self-contained `aura.json` shapes, the exact `aura`
+`run-bench.sh` skeleton, the self-contained `baybo.json` shapes, the exact `baybo`
 CLI contract for black-box driving, and the small tracked files
 (`.gitignore` / `.env.example` / `pyproject.toml` / `Cargo.toml` header).
 
@@ -45,14 +45,14 @@ valid framings, or there's a cost/scope tradeoff only the user can weigh.
 3. **Isolation + build feature** — runs **inside a disposable container** (bwrap
    can't nest)? → build `--features bench-bash` (the off-by-default bench profile:
    raw Bash, no uv, no work-dir jail, inherited cwd) and set `sandbox.mode = none`
-   in the bench's `aura.json` (+ static musl). The agent's own loop **writes state
+   in the bench's `baybo.json` (+ static musl). The agent's own loop **writes state
    that contaminates the measurement** (e.g. memory)? → a fail-closed
    `bench-readonly-*` Cargo feature. (Both are fail-closed features per Invariant
    2. `sandbox.mode = none` on its own — drop the OS sandbox but keep uv + the
    work jail — is a plain config mode, used by neither alone.) Neither otherwise.
-4. **Driving shape** — **default one-shot** (`aura prompt` per item; `swe` /
+4. **Driving shape** — **default one-shot** (`baybo prompt` per item; `swe` /
    `terminal`). Use **gateway-once then prompt-per-item** (`memory`) only when many
-   items share one long-lived aura process/workspace.
+   items share one long-lived baybo process/workspace.
 5. **Grader** — **default: shell out to the official grader** if one exists (most
    faithful). Else **LLM-as-judge** for open-ended NL answers (clone
    `memory/judge.rs` + `llm.rs`); else a **deterministic** check. Oracle must hit
@@ -65,7 +65,7 @@ valid framings, or there's a cost/scope tradeoff only the user can weigh.
 These hold across all four benches. A new bench that drops one is wrong.
 
 1. **Arms = `noop` (floor) + `oracle` (ceiling) + the real arm(s).** `noop` and
-   `oracle` need **no aura build and no API key**, so they validate the entire
+   `oracle` need **no baybo build and no API key**, so they validate the entire
    Docker/grader/judge pipeline **offline and unpriced** before the real arm
    spends a cent. Run them first; if `oracle` isn't ≈100% your grader is
    misconfigured — fix that before trusting any real number. `noop` ≈ floor
@@ -87,26 +87,26 @@ These hold across all four benches. A new bench that drops one is wrong.
    you need, use the config too, not another feature.** Dropping just the OS
    sandbox is `sandbox.mode = none` (`crates/config/src/sandbox.rs`) — a
    first-class, hot-reloadable mode real deployments may also pick — so a
-   container bench sets `none` in its `aura.json` **and** builds `--features
+   container bench sets `none` in its `baybo.json` **and** builds `--features
    bench-bash` (the feature lifts uv + the work jail on top).
 
-3. **Drive aura as a black box.** Exec the `aura` *binary* (`prompt` / `gateway` /
-   `cost`); do **not** link aura's agent/context/session/tool stack. The single
+3. **Drive baybo as a black box.** Exec the `baybo` *binary* (`prompt` / `gateway` /
+   `cost`); do **not** link baybo's agent/context/session/tool stack. The single
    permitted exception is one concrete backend crate when the bench must populate
-   state directly (`bench/memory` depends on `aura-memory` solely for its `ingest`
+   state directly (`bench/memory` depends on `baybo-memory` solely for its `ingest`
    bin). Everything else is the CLI contract in `reference.md`.
 
 4. **Self-contained config + minted key + lifted rate limit.** The bench writes
-   its own `aura.json` into a fresh isolated workspace and mints a 32-byte
-   `/dev/urandom` encryption key — so nothing of the user's `~/.aura` is touched
+   its own `baybo.json` into a fresh isolated workspace and mints a 32-byte
+   `/dev/urandom` encryption key — so nothing of the user's `~/.baybo` is touched
    and reruns never collide. Always set `cost.rate_limit.max_requests` to
-   `1_000_000`: the bench fires every item under **one** `user_id` and aura's
+   `1_000_000`: the bench fires every item under **one** `user_id` and baybo's
    default 30 req/60s would wedge the run at item 30. (Optionally also support a
-   `--aura-config` derive-from-yours mode that overwrites only the one section
+   `--baybo-config` derive-from-yours mode that overwrites only the one section
    under test — see `bench/memory/src/agent.rs::prepare_arm_config`.)
 
 5. **Money is integer micro-USD (`i64`).** Never `f32/f64` for cost. Read it from
-   aura's ledger via `aura cost show --session <id> --json` (with `RUST_LOG=off`
+   baybo's ledger via `baybo cost show --session <id> --json` (with `RUST_LOG=off`
    so stdout is pure JSON); poll briefly for the row (it's written on a detached
    task that races the answer), and key "row landed" on `summary.calls > 0`, not
    on cost (a zero-priced model still writes a row). Render to dollars only at
@@ -116,7 +116,7 @@ These hold across all four benches. A new bench that drops one is wrong.
    `{bench}-{run_id}-{arm}-conv{N}` so reruns, arms, and co-tenant benches never
    silently contaminate each other.
 
-7. **Secret hygiene.** Pass the API key **by name** — `aura.json` carries only
+7. **Secret hygiene.** Pass the API key **by name** — `baybo.json` carries only
    `api_key_env`; the value rides in the process/container env (`docker run -e
    NAME`, the adapter's `_env`), never in argv (`ps`) and never written to disk.
 
@@ -124,7 +124,7 @@ These hold across all four benches. A new bench that drops one is wrong.
    `run` bin spends money / needs Docker / hits external servers → run by hand,
    and say so in the `Cargo.toml` header comment. The **pure** half (the instance
    IR, prompt framing, prediction/line shaping, scope keys, F1, report
-   aggregation, all parsers) has **no aura/Docker/Python dep** and carries real
+   aggregation, all parsers) has **no baybo/Docker/Python dep** and carries real
    `#[cfg(test)]` unit tests. Keep that split: heavy I/O in `agent.rs`/`grader.rs`,
    pure logic in `lib.rs`/`report.rs`.
 
@@ -134,7 +134,7 @@ These hold across all four benches. A new bench that drops one is wrong.
    `pyproject.toml` + `.python-version`, commit `uv.lock`, gitignore `.venv/` —
    never `pip install` into the system interpreter). **Output dirs — all
    gitignored, one job each:** `results/` = the final report JSON *only*; `runs/` =
-   the run environment + working byproducts (the aura workspaces, the grader's
+   the run environment + working byproducts (the baybo workspaces, the grader's
    intermediates + harness logs); `bench-out/` = prepared inputs (dataset /
    manifests); `trace/` = transcripts. Follow the repo's `CLAUDE.md` style
    throughout (raw strings for prompts/JSON-ish text, named `const`s not magic
@@ -145,9 +145,9 @@ These hold across all four benches. A new bench that drops one is wrong.
     fact. Per item, after the turn — and for an **in-container** bench *before*
     teardown (the session DB dies with the container) — dump both artifacts to
     `bench/<name>/trace/<run_id>/<arm>/<item>.{messages,trace}.json` (gitignored,
-    mirrors `results/`): the verbatim conversation via `aura session history <id>
+    mirrors `results/`): the verbatim conversation via `baybo session history <id>
     --include-superseded --json` (incl. compaction-dropped rows) and the
-    jobs/steps/spans call tree via `aura session export <id> --json`. Capture
+    jobs/steps/spans call tree via `baybo session export <id> --json`. Capture
     stdout with `RUST_LOG=off`; **best-effort** — a trace failure warns and is
     dropped, never failing the graded item. See `reference.md` §"Trace export".
 
@@ -193,13 +193,13 @@ bench/<name>/
   Cargo.toml          # publish=false, [lib] doctest=false, workspace deps; header: "NOT a CI target"
   README.md           # measures-what + faithfulness; arms table; the build feature + why; usage; caveats
   run-bench.sh        # one-command driver: .env autoload → config block → preflight → dry-run → build → arms loop → jq table
-  .env.example        # the API key (AURA_API_KEY) + optional AURA_MODEL/AURA_BASE_URL overrides
+  .env.example        # the API key (BAYBO_API_KEY) + optional BAYBO_MODEL/BAYBO_BASE_URL overrides
   .gitignore          # /bench-out/ /results/ /runs/ /trace/ /.env  (+ __pycache__/, /.venv/)
   results/ runs/ bench-out/ trace/   # generated (gitignored): report · run env+artifacts · inputs · transcripts
   src/
     lib.rs            # PURE IR + helpers + unit tests, no heavy deps:
                       #   the per-item struct, frame_instruction(), scope keys, run-id, parse_model(), metric
-    agent.rs          # drive aura as a black box: render config, mint key, run prompt, parse response + cost + trace export
+    agent.rs          # drive baybo as a black box: render config, mint key, run prompt, parse response + cost + trace export
     report.rs         # InstanceResult + aggregate() → RunReport (overall + per-bucket + means) + print_table() + JSON
     grader.rs         # (if official grader) shell out + parse its report   — OR —
     judge.rs + llm.rs # (if LLM-judge) judge prompt + a minimal OpenAI-compatible ChatClient
@@ -211,7 +211,7 @@ bench/<name>/
 
 **Adapter shape (clone `terminal`)** — no Rust crate, not a workspace member:
 `tb_adapter/<agent>.py` (subclass the harness's installed-agent base, copy in the
-musl binary + a rendered `aura.json`, run `aura prompt --json -y`),
+musl binary + a rendered `baybo.json`, run `baybo prompt --json -y`),
 `<setup>.sh.j2` (install binary, mint key, ensure `git`+`ca-certificates`),
 `run.sh` (build the musl binary if missing, load `.env`, run the harness's
 `run --agent-import-path …`, then surface its `results.json` from `runs/<ts>/`
@@ -226,7 +226,7 @@ into `results/` so the report sits where the other benches' does), `pyproject.to
 1. **Scaffold the dir** + add `bench/<name>` to root `Cargo.toml` `[workspace]
    members` and (self-hosted) `[workspace.dependencies]`.
 2. **`lib.rs` first** — the pure IR, framing, scope keys, metric, *with unit
-   tests*. `cargo test -p aura-bench-<name>` must pass with zero heavy deps.
+   tests*. `cargo test -p baybo-bench-<name>` must pass with zero heavy deps.
 3. **The build feature** (for a behavior hack, per Invariant 2 — e.g. the Bash
    bench profile rides the existing `bench-bash`) — root `[features]` → forward to
    owning crate → `cfg!(feature = "…")` / `#[cfg(feature)]` gate, off by default.
@@ -240,7 +240,7 @@ into `results/` so the report sits where the other benches' does), `pyproject.to
 6. **`report.rs`** — clone; rename the per-bucket axis (per-repo / per-category)
    and the metric column. Keep micro-USD + the latency/token/cost columns.
 7. **`bin/run.rs`** — clap `Arm` enum (`Noop`/`Oracle`/`<Real>`), `--dry-run` that
-   prints the plan with no spend, the noop/oracle branches that skip aura
+   prints the plan with no spend, the noop/oracle branches that skip baybo
    entirely, bounded-concurrency real arm (`futures::stream::buffer_unordered`).
 8. **`run-bench.sh` + `.env.example` + `.gitignore` + `README.md`** — clone the
    skeleton from `reference.md`; wire the arms list and the build command.
@@ -254,10 +254,10 @@ into `results/` so the report sits where the other benches' does), `pyproject.to
 
 - [ ] `noop` + `oracle` + real arm; oracle ≈100% offline, no key needed for either floor/ceiling.
 - [ ] Bench-only *behavior hack* (if any) is a fail-closed, off-by-default Cargo feature (the Bash bench profile = `bench-bash`). Dropping just the OS sandbox is `sandbox.mode = none` config; a container bench uses both.
-- [ ] aura driven only via its binary (+ at most one concrete backend crate); no agent-stack linkage.
-- [ ] Self-contained `aura.json` + minted key + `rate_limit.max_requests = 1_000_000`.
+- [ ] baybo driven only via its binary (+ at most one concrete backend crate); no agent-stack linkage.
+- [ ] Self-contained `baybo.json` + minted key + `rate_limit.max_requests = 1_000_000`.
 - [ ] Cost = `i64` micro-USD from the ledger (`RUST_LOG=off`, poll on `calls`); latency/tokens/cost surfaced per item.
-- [ ] Trace export on by default (`NO_TRACE=1` opts out): per item → `trace/<run_id>/<arm>/<item>.{messages,trace}.json` via `aura session history/export`; in-container benches export before teardown.
+- [ ] Trace export on by default (`NO_TRACE=1` opts out): per item → `trace/<run_id>/<arm>/<item>.{messages,trace}.json` via `baybo session history/export`; in-container benches export before teardown.
 - [ ] `RUN_ID=$(date +%Y-%m-%d__%H-%M-%S)`; refresh `latest` pointers (`trace/latest` up front, `results/latest-<arm>.json`, `runs/latest`); co-locate each item's outcome as `<item>.result.json` next to its trace.
 - [ ] Cross-run consolidation: a `consolidate` step (auto-run at the end of the driver, best-effort) folds all runs into `results/merged.json` (best-per-item + provenance, never-graded infra items recovered) + a hardlinked `trace/merged/`. Template: `bench/terminal-bench-2.0/consolidate.sh`.
 - [ ] Scope keys are `{bench}-{run_id}-{arm}-conv{N}`.

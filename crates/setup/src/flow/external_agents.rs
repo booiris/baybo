@@ -4,11 +4,11 @@
 //! ends up enabled, prompts for the default. Records each enabled
 //! agent's discovered binary path.
 
-use aura_agent::external_agent::claude_cli::ClaudeCliAgent;
-use aura_agent::external_agent::codex_cli::CodexCliAgent;
-use aura_agent::external_agent::gemini_cli::GeminiCliAgent;
-use aura_config::AuraConfig;
-use aura_model::ExternalAgentKind;
+use baybo_agent::external_agent::claude_cli::ClaudeCliAgent;
+use baybo_agent::external_agent::codex_cli::CodexCliAgent;
+use baybo_agent::external_agent::gemini_cli::GeminiCliAgent;
+use baybo_config::BayboConfig;
+use baybo_model::ExternalAgentKind;
 
 use crate::error::Result;
 use crate::prompt::Prompter;
@@ -21,7 +21,7 @@ pub struct ExternalAgentsStepOutcome {
 
 pub async fn configure_external_agents_step<P: Prompter>(
     prompter: &mut P,
-    config: &mut AuraConfig,
+    config: &mut BayboConfig,
 ) -> Result<ExternalAgentsStepOutcome> {
     select_and_apply(prompter, config, detect_on_path())
 }
@@ -31,7 +31,7 @@ pub async fn configure_external_agents_step<P: Prompter>(
 /// itself walks the real `PATH` and can't be scripted.
 fn select_and_apply<P: Prompter>(
     prompter: &mut P,
-    config: &mut AuraConfig,
+    config: &mut BayboConfig,
     detected: Vec<Detected>,
 ) -> Result<ExternalAgentsStepOutcome> {
     if detected.is_empty() {
@@ -82,7 +82,7 @@ fn select_and_apply<P: Prompter>(
 /// and an explicit pick when more than one competes.
 fn pick_default<P: Prompter>(
     prompter: &mut P,
-    config: &mut AuraConfig,
+    config: &mut BayboConfig,
 ) -> Result<Option<ExternalAgentKind>> {
     let enabled = config.external_agents.enabled_kinds();
     let chosen = match enabled.as_slice() {
@@ -130,7 +130,7 @@ fn probe(kind: ExternalAgentKind) -> Option<String> {
     }
 }
 
-fn is_enabled(config: &AuraConfig, kind: ExternalAgentKind) -> bool {
+fn is_enabled(config: &BayboConfig, kind: ExternalAgentKind) -> bool {
     match kind {
         ExternalAgentKind::Claude => config.external_agents.claude.enabled,
         ExternalAgentKind::Codex => config.external_agents.codex.enabled,
@@ -138,7 +138,7 @@ fn is_enabled(config: &AuraConfig, kind: ExternalAgentKind) -> bool {
     }
 }
 
-fn apply_enable(config: &mut AuraConfig, d: &Detected, on: bool) {
+fn apply_enable(config: &mut BayboConfig, d: &Detected, on: bool) {
     let (enabled, binary_path) = match d.kind {
         ExternalAgentKind::Claude => (
             &mut config.external_agents.claude.enabled,
@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn enables_only_the_selected_subset() {
-        let mut config = AuraConfig::default();
+        let mut config = BayboConfig::default();
         // Two detected, check only index 1 (codex).
         let mut prompter = MockPrompter::new().push_multi_select(vec![1]);
         let outcome = select_and_apply(
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn multiple_enabled_prompts_for_default() {
-        let mut config = AuraConfig::default();
+        let mut config = BayboConfig::default();
         // Check both (0,1), then pick default = index 1 (codex).
         let mut prompter = MockPrompter::new()
             .push_multi_select(vec![0, 1])
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn deselecting_all_disables_and_clears_default() {
-        let mut config = AuraConfig::default();
+        let mut config = BayboConfig::default();
         config.external_agents.claude.enabled = true;
         config.external_agents.default_external_agent = Some(ExternalAgentKind::Claude);
 
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn empty_detection_is_a_noop() {
-        let mut config = AuraConfig::default();
+        let mut config = BayboConfig::default();
         let mut prompter = MockPrompter::new();
         let outcome = select_and_apply(&mut prompter, &mut config, Vec::new()).unwrap();
         assert_eq!(outcome, ExternalAgentsStepOutcome::default());

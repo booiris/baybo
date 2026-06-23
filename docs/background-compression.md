@@ -2,7 +2,7 @@
 
 A cross-cutting feature that runs the existing compression operation in a second, **background** mode in addition to the original **inline** one. The inline path (`ContextManager::maybe_compress`'s 3-stage compressor — summary.md fast-path → live LLM summary → truncate fallback) blocks the user's turn for one synchronous LLM round-trip whenever the budget threshold trips and stage 1 misses. The background path is a **detached task the session's own `AgentLoop` spawns** between LLM iterations / at end-of-job: it precomputes the summary asynchronously and persists it per-session; at compression time the inline compressor's stage-1 fast-path swaps it into the output deterministically, so the inline LLM call is skipped whenever the precomputed summary is available. Both paths share `compression::CompressionRunner` for the actual LLM dispatch; the background pass bills + traces against the session.
 
-Affected crates: `aura-model`, `aura-storage`, `aura-session`, `aura-context`, `aura-agent`, `aura-workspace`.
+Affected crates: `baybo-model`, `baybo-storage`, `baybo-session`, `baybo-context`, `baybo-agent`, `baybo-workspace`.
 
 See also: [`docs/modules/context.md`](modules/context.md), [`docs/modules/session.md`](modules/session.md), [`docs/modules/agent.md`](modules/agent.md).
 
@@ -26,7 +26,7 @@ Session (TriggerKind::User|Cron)
     │          tokio::spawn(detached, fresh CancellationToken::new()):
     │            mint JobInput::System job (attributed to PARENT session,
     │            parent_job_id = triggering turn's job)
-    │              → BackgroundCompressionRunner::run → aura_context::run_background_summary:
+    │              → BackgroundCompressionRunner::run → baybo_context::run_background_summary:
     │                  1. load the session's session_messages (active, ordinal ≤ up_to_ordinal)
     │                  2. read summary.md (if exists)
     │                  3. one tool-free LLM call (same model as the session)
@@ -162,9 +162,9 @@ Key properties:
 - **`parent_job_id = Some(current_job_id)`** parents the minted maintenance job under the triggering turn's job, so the trace nests correctly.
 - **Cancel token** is a fresh `CancellationToken::new()` that is never cancelled. It is **not** derived from the actor's token — see *Cancellation* below.
 
-### `BackgroundCompressionRunner::run` → `aura_context::run_background_summary`
+### `BackgroundCompressionRunner::run` → `baybo_context::run_background_summary`
 
-`BackgroundCompressionRunner` (in `crates/agent/src/runtime/compression.rs`) is the agent-side adapter: it bundles the agent-layer deps (`BillableLlm`, `SpanRecorder`, `SecurityGateway`, `SessionManager`, `WorkspacePaths`, tokenizer, model info, the session identity, the minted `job_id`, and the cancel token), wraps a fresh `CompressionRunner` per LLM iteration into the context-crate callback shape, and delegates the actual flow to `aura_context::run_background_summary`. That flow:
+`BackgroundCompressionRunner` (in `crates/agent/src/runtime/compression.rs`) is the agent-side adapter: it bundles the agent-layer deps (`BillableLlm`, `SpanRecorder`, `SecurityGateway`, `SessionManager`, `WorkspacePaths`, tokenizer, model info, the session identity, the minted `job_id`, and the cancel token), wraps a fresh `CompressionRunner` per LLM iteration into the context-crate callback shape, and delegates the actual flow to `baybo_context::run_background_summary`. That flow:
 
 1. Load the session's active messages up to `up_to_ordinal` (`load_active_session_messages_up_to`).
 2. Load `summary.md` from `<workspace>/state/sessions/<session_id>/summary.md` (None if absent).
@@ -305,19 +305,19 @@ SELECT cost_micros FROM session_summaries WHERE session_id = ?;
 
 (or sum the individual `cost_records` rows whose `span_id` matches the pass's `Compression` spans for that session).
 
-## Configuration (constants for now; potential `aura.json` knobs later)
+## Configuration (constants for now; potential `baybo.json` knobs later)
 
 | Constant | Value | Where |
 |---|---|---|
-| `SUMMARY_TRIGGER_TOKEN_THRESHOLD` | `0.5 × max_tokens` | `aura-context` |
-| `SUMMARY_DIFF_TOKEN_THRESHOLD` | `5_000` | `aura-context` |
-| `SUMMARY_TRIGGER_TOOL_CALL_THRESHOLD` | `3` | `aura-context` |
-| `RECENT_SLICE_MIN_TOKENS` | `10_000` | `aura-context` |
-| `RECENT_SLICE_MIN_TEXT_BLOCK_MSGS` | `5` | `aura-context` |
-| `RECENT_SLICE_MAX_TOKENS` | `40_000` | `aura-context` |
-| `FAST_PATH_FALLTHROUGH_THRESHOLD` | `0.6 × max_tokens` | `aura-context` |
-| `STATE_SESSIONS_DIR` | `"state/sessions"` | `aura-workspace` |
-| `SUMMARY_FILE_NAME` | `"summary.md"` | `aura-workspace` |
+| `SUMMARY_TRIGGER_TOKEN_THRESHOLD` | `0.5 × max_tokens` | `baybo-context` |
+| `SUMMARY_DIFF_TOKEN_THRESHOLD` | `5_000` | `baybo-context` |
+| `SUMMARY_TRIGGER_TOOL_CALL_THRESHOLD` | `3` | `baybo-context` |
+| `RECENT_SLICE_MIN_TOKENS` | `10_000` | `baybo-context` |
+| `RECENT_SLICE_MIN_TEXT_BLOCK_MSGS` | `5` | `baybo-context` |
+| `RECENT_SLICE_MAX_TOKENS` | `40_000` | `baybo-context` |
+| `FAST_PATH_FALLTHROUGH_THRESHOLD` | `0.6 × max_tokens` | `baybo-context` |
+| `STATE_SESSIONS_DIR` | `"state/sessions"` | `baybo-workspace` |
+| `SUMMARY_FILE_NAME` | `"summary.md"` | `baybo-workspace` |
 
 ## Known Limitations
 

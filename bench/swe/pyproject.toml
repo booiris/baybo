@@ -4,9 +4,9 @@
 # `python3` the host ships — never `pip install` into the system interpreter.
 # This is a deps-only env (`package = false`), not an installable package.
 [project]
-name = "aura-bench-swe-pytools"
+name = "baybo-bench-swe-pytools"
 version = "0.0.0"
-description = "Python tooling for the aura SWE-bench harness: dataset export + the swebench grader/image builder."
+description = "Python tooling for the baybo SWE-bench harness: dataset export + the swebench grader/image builder."
 # swebench's stack (datasets/pyarrow/...) lags the newest CPython; pin a known-good line.
 requires-python = ">=3.11,<3.13"
 dependencies = [

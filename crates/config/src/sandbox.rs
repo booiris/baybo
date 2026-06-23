@@ -25,7 +25,7 @@ pub enum SandboxMode {
     Auto,
     /// No OS sandbox at all — run shell commands directly via `sh -c`, with no
     /// work-dir path jail and cwd inherited from the process. **Dangerous:** the
-    /// agent has the full reach of the host user. Only meaningful when aura
+    /// agent has the full reach of the host user. Only meaningful when baybo
     /// itself already runs inside a disposable, isolated environment (a
     /// benchmark task container, a throwaway VM) where the OS sandbox is both
     /// unavailable — bwrap can't nest — and redundant. Pick it deliberately;

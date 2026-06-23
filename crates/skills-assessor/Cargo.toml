@@ -1,5 +1,5 @@
 [package]
-name = "aura-skills-assessor"
+name = "baybo-skills-assessor"
 version.workspace = true
 edition.workspace = true
 
@@ -7,10 +7,10 @@ edition.workspace = true
 doctest = false
 
 [dependencies]
-aura-skills = { workspace = true }
-aura-store = { workspace = true }
-aura-llm = { workspace = true }
-aura-model = { workspace = true }
+baybo-skills = { workspace = true }
+baybo-store = { workspace = true }
+baybo-llm = { workspace = true }
+baybo-model = { workspace = true }
 
 async-trait = { workspace = true }
 chrono = { workspace = true }

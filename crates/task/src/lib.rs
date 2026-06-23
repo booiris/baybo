@@ -1,9 +1,9 @@
 //! The session planning-checklist tools (`Task*`).
 //!
-//! Mirrors `aura-cron` / `aura-skills` / `aura-subagent`: a domain crate that
-//! owns its own `Tool` impls and depends on `aura-tools` for the trait, never
+//! Mirrors `baybo-cron` / `baybo-skills` / `baybo-subagent`: a domain crate that
+//! owns its own `Tool` impls and depends on `baybo-tools` for the trait, never
 //! the reverse. The tools are thin, store-scoped CRUD over the per-session
-//! checklist behind `aura_store::TaskStore` — no actor round-trip, because the
+//! checklist behind `baybo_store::TaskStore` — no actor round-trip, because the
 //! `session_tasks` table is shared state (per-row writes are atomic), not the
 //! actor-owned `SessionState` blob.
 //!

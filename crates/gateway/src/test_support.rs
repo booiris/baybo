@@ -13,16 +13,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::auth::ChannelTokenTable;
-use aura_agent::service::ShutdownSignal;
-use aura_agent::{CronScheduler, SessionManager};
-use aura_channels::{ChannelRegistry, RouterInbound};
-use aura_config::AuraConfig;
-use aura_job::JobLifecycle;
-use aura_llm::{LlmProviderConfig, LlmProviderRegistry};
-use aura_security::{EncryptionKey, SecretVault};
-use aura_skills::SkillRegistry;
-use aura_storage::Store;
-use aura_tools::ToolRegistry;
+use baybo_agent::service::ShutdownSignal;
+use baybo_agent::{CronScheduler, SessionManager};
+use baybo_channels::{ChannelRegistry, RouterInbound};
+use baybo_config::BayboConfig;
+use baybo_job::JobLifecycle;
+use baybo_llm::{LlmProviderConfig, LlmProviderRegistry};
+use baybo_security::{EncryptionKey, SecretVault};
+use baybo_skills::SkillRegistry;
+use baybo_storage::Store;
+use baybo_tools::ToolRegistry;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
@@ -56,7 +56,7 @@ impl crate::reload::ConfigReloader for StubConfigReloader {
 
     async fn dry_run(
         &self,
-        _candidate: &aura_config::AuraConfig,
+        _candidate: &baybo_config::BayboConfig,
     ) -> std::result::Result<(), crate::reload::ReloadError> {
         Ok(())
     }
@@ -77,7 +77,7 @@ impl crate::reload::ConfigReloader for RejectingDryRunReloader {
 
     async fn dry_run(
         &self,
-        _candidate: &aura_config::AuraConfig,
+        _candidate: &baybo_config::BayboConfig,
     ) -> std::result::Result<(), crate::reload::ReloadError> {
         Err(crate::reload::ReloadError::LlmRebuild(
             "test: default entry unbuildable".into(),
@@ -103,7 +103,7 @@ impl crate::reload::ConfigReloader for NonHotPendingReloader {
 
     async fn dry_run(
         &self,
-        _candidate: &aura_config::AuraConfig,
+        _candidate: &baybo_config::BayboConfig,
     ) -> std::result::Result<(), crate::reload::ReloadError> {
         Ok(())
     }
@@ -142,7 +142,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
         .await
         .expect("open tempdir-backed test store");
 
-    let config = Arc::new(AuraConfig::default());
+    let config = Arc::new(BayboConfig::default());
     let session_manager = Arc::new(SessionManager::new(
         stores.session.clone(),
         stores.session_summary.clone(),
@@ -161,7 +161,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     let cron_scheduler = Arc::new(CronScheduler::new(
         stores.cron.clone(),
         cron_tx,
-        Arc::new(shutdown.clone()) as Arc<dyn aura_cron::Shutdown>,
+        Arc::new(shutdown.clone()) as Arc<dyn baybo_cron::Shutdown>,
     ));
 
     let skill_registry = Arc::new(SkillRegistry::new());
@@ -190,18 +190,18 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
                 proxy: None,
             },
             None,
-            aura_llm::CostHooks::passthrough(),
+            baybo_llm::CostHooks::passthrough(),
         )
         .expect("stub LLM client");
 
     // Wrap the stub client in a single-entry pool handle so GatewayDeps
     // hands the gateway a hot-swappable pool (matches production).
-    let llm_pool: aura_agent::LlmPoolHandle = {
-        let name = aura_model::LlmEntryName::from(llm_client.model_info().id.clone());
+    let llm_pool: baybo_agent::LlmPoolHandle = {
+        let name = baybo_model::LlmEntryName::from(llm_client.model_info().id.clone());
         let mut clients = std::collections::HashMap::new();
         clients.insert(name.clone(), llm_client);
         Arc::new(parking_lot::RwLock::new(Arc::new(
-            aura_agent::LlmClientPool::new(clients, name).expect("stub pool default present"),
+            baybo_agent::LlmClientPool::new(clients, name).expect("stub pool default present"),
         )))
     };
 
@@ -222,7 +222,7 @@ pub async fn build_test_deps(admin_bind: SocketAddr) -> TestGateway {
     // takes its persist-directly branch) and the response channel is
     // never driven. A throwaway sender satisfies the constructor.
     let (agent_output_tx, _agent_output_rx) = mpsc::channel(1);
-    let supervisor = aura_agent::supervisor::AgentSupervisor::new(agent_output_tx);
+    let supervisor = baybo_agent::supervisor::AgentSupervisor::new(agent_output_tx);
 
     let deps = GatewayDeps {
         config,

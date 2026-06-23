@@ -8,11 +8,11 @@
 
 use std::sync::Arc;
 
-use aura_agent::SessionManager;
-use aura_channels::{ChannelRegistry, RouterInbound};
-use aura_pairing::PairingService;
-use aura_security::SecretVault;
-use aura_store::{BlobStore, ChannelBotStore, TaskStore};
+use baybo_agent::SessionManager;
+use baybo_channels::{ChannelRegistry, RouterInbound};
+use baybo_pairing::PairingService;
+use baybo_security::SecretVault;
+use baybo_store::{BlobStore, ChannelBotStore, TaskStore};
 
 use tokio::sync::mpsc;
 
@@ -44,7 +44,7 @@ pub struct WsChannelState {
     pub session_manager: Arc<SessionManager>,
     /// Vault-backed TUI input-history store. Shared across every
     /// concurrent TUI client on this gateway — the server is the single
-    /// writer of the `aura.tui.input_history` vault key, so an
+    /// writer of the `baybo.tui.input_history` vault key, so an
     /// in-process `tokio::sync::Mutex` inside the store is enough to
     /// serialise concurrent appends.
     pub tui_history: Arc<TuiHistoryStore>,
@@ -54,7 +54,7 @@ pub struct WsChannelState {
     /// here so the admin `/v1/logs` view surfaces sidecar output
     /// alongside gateway-internal tracing.
     pub log_buffer: Arc<LogBuffer>,
-    /// Resolves `(channel_type, user_id)` → aura `session_id` for
+    /// Resolves `(channel_type, user_id)` → baybo `session_id` for
     /// sidecars that send `Frame::Message` with an empty `session_id`.
     /// The TUI (which picks its own UUID) bypasses this path entirely.
     pub session_resolver: Arc<ChannelSessionResolver>,
@@ -76,7 +76,7 @@ pub struct WsChannelState {
     pub bot_reconciler: Arc<ChannelBotReconciler>,
     /// Gate that decides whether an inbound sidecar message can reach
     /// the agent loop. Unpaired `(channel_type, bot_id, user_id)`
-    /// triples get a short code back via [`aura_channels::wire::Frame::Notice`]
+    /// triples get a short code back via [`baybo_channels::wire::Frame::Notice`]
     /// and their message is dropped. See `docs/modules/pairing.md`.
     pub pairing: Arc<PairingService>,
     /// Backing store for non-text media. Sidecars upload via
@@ -93,7 +93,7 @@ pub struct WsChannelState {
     /// `Frame::TurnState` snapshot (is a turn in flight, since when) —
     /// the live `TurnState` broadcasts cover connected clients; this
     /// covers the late joiner who missed them.
-    pub job_lifecycle: Arc<aura_job::JobLifecycle>,
+    pub job_lifecycle: Arc<baybo_job::JobLifecycle>,
     /// Recent-window dedup for sidecar-supplied
     /// `(channel_type, bot_id, platform_msg_id)` triples. Sidecars that
     /// replay their long-poll buffer after a restart hit this and the

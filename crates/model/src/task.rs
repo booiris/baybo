@@ -2,9 +2,9 @@
 //! `Task*` tool family.
 //!
 //! Pure data, shared one-way (mirrors [`crate::spawn_protocol::PendingBackgroundResult`]):
-//! `aura-task` (the tool boundary) and `aura-context` (the per-turn
+//! `baybo-task` (the tool boundary) and `baybo-context` (the per-turn
 //! re-injection renderer) both reach for these. Persistence lives in the
-//! dedicated `session_tasks` table behind `aura_store::TaskStore`.
+//! dedicated `session_tasks` table behind `baybo_store::TaskStore`.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ use crate::TaskId;
 
 /// Tool names for the `Task*` family. Defined here (next to the value types) so
 /// the agent loop can recognize a checklist mutation without depending on the
-/// `aura-task` crate — mirroring `SPAWN_SUBAGENT_TOOL_NAME`.
+/// `baybo-task` crate — mirroring `SPAWN_SUBAGENT_TOOL_NAME`.
 pub const TASK_CREATE_TOOL_NAME: &str = "TaskCreate";
 pub const TASK_GET_TOOL_NAME: &str = "TaskGet";
 pub const TASK_LIST_TOOL_NAME: &str = "TaskList";

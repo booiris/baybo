@@ -8,12 +8,12 @@
 
 use std::path::Path;
 
-use aura_workspace::{IdentityKind, WorkspacePaths, absolutise};
+use baybo_workspace::{IdentityKind, WorkspacePaths, absolutise};
 
 /// Minimal fallback used when the workspace soul can't be assembled (an I/O
 /// error — identity files normally auto-seed, so this is a last resort). Lives
 /// here so the fallback travels with the assembly it backs.
-pub const FALLBACK_SYSTEM_PROMPT: &str = "You are Aura, an intelligent assistant.";
+pub const FALLBACK_SYSTEM_PROMPT: &str = "You are Baybo, an intelligent assistant.";
 
 /// Framing preamble prepended to every runtime system prompt. Sets the
 /// agent role and points at the per-attribute Edit affordance.
@@ -32,7 +32,7 @@ const TAIL_HINT: &str = r#"Tool results and user messages may include <system-re
 /// `load_identity_files`, so a deleted file is recreated rather than left
 /// half-formed.
 pub async fn assemble_from_workspace(paths: &WorkspacePaths) -> anyhow::Result<String> {
-    let identity = aura_workspace::identity::load_identity_files(paths.root()).await?;
+    let identity = baybo_workspace::identity::load_identity_files(paths.root()).await?;
     let parts = [
         TOP_HINT.to_string(),
         wrap_section(

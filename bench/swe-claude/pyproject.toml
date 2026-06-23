@@ -5,7 +5,7 @@
 # `uv sync` provisions a pinned CPython + a reused on-disk `.venv` here — never
 # `pip install` into the system interpreter. Deps-only env (`package = false`).
 [project]
-name = "aura-bench-swe-claude-pytools"
+name = "baybo-bench-swe-claude-pytools"
 version = "0.0.0"
 description = "SWE-bench claude arm: Anthropic tool_use agent on ds4-flash (litellm proxy), official swebench grader."
 # swebench's stack (datasets/pyarrow/...) lags the newest CPython.

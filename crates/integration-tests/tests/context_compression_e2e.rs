@@ -21,11 +21,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::{AgentEvent, AgentOutput, TurnStatus};
-use aura_integration_tests::AgentTestHarness;
-use aura_llm::{LlmResponse, ModelPricing, StreamEvent, TokenUsage};
-use aura_model::MicroUsd;
-use aura_trace::{SpanKind, StepKind, TraceStore};
+use baybo_channels::{AgentEvent, AgentOutput, TurnStatus};
+use baybo_integration_tests::AgentTestHarness;
+use baybo_llm::{LlmResponse, ModelPricing, StreamEvent, TokenUsage};
+use baybo_model::MicroUsd;
+use baybo_trace::{SpanKind, StepKind, TraceStore};
 
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 
@@ -111,12 +111,12 @@ async fn compression_call_records_cost_with_matching_span_id() {
     let job_ids: std::collections::BTreeSet<_> = records.iter().map(|r| r.job_id).collect();
     let mut compression_steps = Vec::new();
     for job_id in &job_ids {
-        let steps: Vec<aura_trace::Step> = trace_store
+        let steps: Vec<baybo_trace::Step> = trace_store
             .list_steps_by_job(job_id)
             .await
             .unwrap()
             .into_iter()
-            .map(|r| aura_trace::Step::from_row(r).unwrap())
+            .map(|r| baybo_trace::Step::from_row(r).unwrap())
             .collect();
         compression_steps.extend(
             steps
@@ -131,12 +131,12 @@ async fn compression_call_records_cost_with_matching_span_id() {
     );
     let compression_step = &compression_steps[0];
 
-    let spans: Vec<aura_trace::Span> = trace_store
+    let spans: Vec<baybo_trace::Span> = trace_store
         .list_spans_by_step(&compression_step.id)
         .await
         .unwrap()
         .into_iter()
-        .map(|r| aura_trace::Span::from_row(r).unwrap())
+        .map(|r| baybo_trace::Span::from_row(r).unwrap())
         .collect();
     let compression_span = spans
         .iter()
@@ -173,7 +173,7 @@ async fn compression_call_records_cost_with_matching_span_id() {
     // transcript itself is recovered from the log at replay time.
     if let SpanKind::LlmCall { begin, .. } = &compression_span.kind {
         match &begin.input_messages {
-            aura_trace::LlmCallInputs::Persisted {
+            baybo_trace::LlmCallInputs::Persisted {
                 last_ordinal,
                 prefix_len,
                 suffix,

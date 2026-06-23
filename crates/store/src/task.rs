@@ -10,7 +10,7 @@
 //! `ON DELETE CASCADE` from `sessions`; the runtime never sweeps them.
 
 use async_trait::async_trait;
-use aura_model::{SessionId, Task, TaskId, TaskStatus};
+use baybo_model::{SessionId, Task, TaskId, TaskStatus};
 
 use crate::StorageError;
 

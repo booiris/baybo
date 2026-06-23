@@ -1,7 +1,7 @@
-// `composeAuraUserId` is the single source of truth for the canonical
-// aura user identity — `BotChannel.ingest` uses it for the inbound
+// `composeBayboUserId` is the single source of truth for the canonical
+// baybo user identity — `BotChannel.ingest` uses it for the inbound
 // `Frame::Message.user_id`, and platform code (telegram / weixin /
-// future channels) must use it for the `x-aura-user-id` header on
+// future channels) must use it for the `x-baybo-user-id` header on
 // blob uploads, otherwise the gateway pairing gate sees two different
 // identities for the same physical user and the upload lands in
 // `pending` even when the chat is already approved.
@@ -9,7 +9,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { BotChannel, composeAuraUserId, defaultChatKey } from "../dist/bot.js";
+import { BotChannel, composeBayboUserId, defaultChatKey } from "../dist/bot.js";
 
 function stubLogger() {
   return { debug() {}, info() {}, warn() {}, error() {} };
@@ -17,14 +17,14 @@ function stubLogger() {
 
 test("primitive ChatId: <channel>_<bot>_<chat>_<user>", () => {
   assert.equal(
-    composeAuraUserId("telegram", "b1", 42, "u1"),
+    composeBayboUserId("telegram", "b1", 42, "u1"),
     "telegram_b1_42_u1",
   );
 });
 
 test("string ChatId passes through verbatim", () => {
   assert.equal(
-    composeAuraUserId("weixin", "acct", "wxuser", "wxuser"),
+    composeBayboUserId("weixin", "acct", "wxuser", "wxuser"),
     "weixin_acct_wxuser_wxuser",
   );
 });
@@ -35,15 +35,15 @@ test("structured ChatId: keys serialize sorted, key=value joined by &", () => {
   // session-isolated. Order-independent: same input shape always
   // produces the same id regardless of property declaration order.
   assert.equal(
-    composeAuraUserId("test", "b1", { chatId: 42, threadId: 1 }, "u"),
+    composeBayboUserId("test", "b1", { chatId: 42, threadId: 1 }, "u"),
     "test_b1_chatId=42&threadId=1_u",
   );
   assert.equal(
-    composeAuraUserId("test", "b1", { threadId: 1, chatId: 42 }, "u"),
+    composeBayboUserId("test", "b1", { threadId: 1, chatId: 42 }, "u"),
     "test_b1_chatId=42&threadId=1_u",
   );
   assert.equal(
-    composeAuraUserId("test", "b1", { chatId: 42 }, "u"),
+    composeBayboUserId("test", "b1", { chatId: 42 }, "u"),
     "test_b1_chatId=42_u",
   );
 });
@@ -51,9 +51,9 @@ test("structured ChatId: keys serialize sorted, key=value joined by &", () => {
 test("custom chatKey override is applied (mirrors weixin's `chat.toUserId`)", () => {
   // Weixin's chatKey is just `chat.toUserId`, not the default
   // `toUserId=<id>` form. Platforms that override `BotPlatform.chatKey`
-  // must thread that override through `composeAuraUserId` so the
+  // must thread that override through `composeBayboUserId` so the
   // upload identity matches the inbound text-frame identity.
-  const id = composeAuraUserId(
+  const id = composeBayboUserId(
     "weixin",
     "acct1",
     { toUserId: "wxuser" },
@@ -66,7 +66,7 @@ test("custom chatKey override is applied (mirrors weixin's `chat.toUserId`)", ()
 test("matches BotChannel.ingest (single source of truth)", async () => {
   // Round-trip proof: emit through the channel, capture the `userId`
   // that lands on the inbound queue, and verify it byte-equals what
-  // `composeAuraUserId` produces for the same inputs. If these ever
+  // `composeBayboUserId` produces for the same inputs. If these ever
   // drift, sidecar uploads will silently miss the existing pairing.
   let lastEmit = null;
   const platform = {
@@ -93,11 +93,11 @@ test("matches BotChannel.ingest (single source of truth)", async () => {
   });
   const { value } = await it.next();
   assert.equal(value.userId, "telegram_8405546650_chatId=8758857303_8758857303");
-  // `composeAuraUserId` MUST produce the exact same value for the
+  // `composeBayboUserId` MUST produce the exact same value for the
   // same inputs — that's the contract a sidecar's blob upload relies
   // on to land in the right pairing identity.
   assert.equal(
-    composeAuraUserId(
+    composeBayboUserId(
       "telegram",
       "8405546650",
       { chatId: 8758857303 },

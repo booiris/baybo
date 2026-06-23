@@ -1,5 +1,5 @@
 [package]
-name = "aura-integration-tests"
+name = "baybo-integration-tests"
 version.workspace = true
 edition.workspace = true
 publish = false
@@ -24,24 +24,24 @@ path = "tests/all.rs"
 # graph entirely.
 
 [dependencies]
-aura-agent = { workspace = true }
-aura-channels = { workspace = true }
-aura-context = { workspace = true }
-aura-cost = { workspace = true, features = ["test-support"] }
-aura-job = { workspace = true, features = ["test-support"] }
-aura-llm = { workspace = true, features = ["test-support"] }
-aura-memory = { workspace = true, features = ["test-support"] }
-aura-model = { workspace = true }
-aura-security = { workspace = true, features = ["test-support"] }
-aura-session = { workspace = true, features = ["test-support"] }
-aura-skills = { workspace = true }
-aura-storage = { workspace = true, features = ["test-support"] }
-aura-store = { workspace = true }
-aura-subagent = { workspace = true }
-aura-task = { workspace = true, features = ["test-support"] }
-aura-tools = { workspace = true, features = ["test-support"] }
-aura-trace = { workspace = true, features = ["test-support"] }
-aura-workspace = { workspace = true }
+baybo-agent = { workspace = true }
+baybo-channels = { workspace = true }
+baybo-context = { workspace = true }
+baybo-cost = { workspace = true, features = ["test-support"] }
+baybo-job = { workspace = true, features = ["test-support"] }
+baybo-llm = { workspace = true, features = ["test-support"] }
+baybo-memory = { workspace = true, features = ["test-support"] }
+baybo-model = { workspace = true }
+baybo-security = { workspace = true, features = ["test-support"] }
+baybo-session = { workspace = true, features = ["test-support"] }
+baybo-skills = { workspace = true }
+baybo-storage = { workspace = true, features = ["test-support"] }
+baybo-store = { workspace = true }
+baybo-subagent = { workspace = true }
+baybo-task = { workspace = true, features = ["test-support"] }
+baybo-tools = { workspace = true, features = ["test-support"] }
+baybo-trace = { workspace = true, features = ["test-support"] }
+baybo-workspace = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
@@ -53,9 +53,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-aura-cli = { workspace = true, features = ["test-support"] }
-aura-gateway = { workspace = true }
-aura-setup = { workspace = true }
+baybo-cli = { workspace = true, features = ["test-support"] }
+baybo-gateway = { workspace = true }
+baybo-setup = { workspace = true }
 futures = { workspace = true }
 regex = { workspace = true }
 tempfile = { workspace = true }

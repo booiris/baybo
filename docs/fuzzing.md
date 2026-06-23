@@ -1,6 +1,6 @@
-# Fuzzing (aura-security)
+# Fuzzing (baybo-security)
 
-The `aura-security` crate ships a cargo-fuzz harness at `crates/security/fuzz/`
+The `baybo-security` crate ships a cargo-fuzz harness at `crates/security/fuzz/`
 with targets for the injection detector, leak detector, sensitive-path check,
 AES-GCM crypto roundtrip, and placeholder minter. The fuzz crate is excluded
 from the workspace; run from inside `crates/security/`:

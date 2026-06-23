@@ -3,11 +3,11 @@
 # SWE-bench CLAUDE arm: a Claude-style agent (Anthropic Messages API + tool_use,
 # via the `anthropic` SDK) driving deepseek-v4-flash through a litellm
 # `/v1/messages` -> deepseek proxy, graded by the SAME official `swebench`
-# harness as the aura + mini arms. Apples-to-apples third scaffold (same model,
+# harness as the baybo + mini arms. Apples-to-apples third scaffold (same model,
 # same eval images, same grader).
 #
 # Quick start (first 3 instances):           bench/swe-claude/run.sh
-# Full 300 + compare to an aura run:
+# Full 300 + compare to an baybo run:
 #   LIMIT=300 AGENT_RESULTS=../swe/results/latest-agent.json bench/swe-claude/run.sh
 set -euo pipefail
 
@@ -26,7 +26,7 @@ SWE_DIR="$(cd "$BENCH_DIR/../swe" && pwd)"
 : "${SLICE:=}"                                    # start:end
 : "${WORKERS:=4}"                                 # parallel agent instances
 : "${MAX_WORKERS:=4}"                             # grader harness workers
-: "${MODEL:=${AURA_MODEL:-deepseek/deepseek-v4-flash}}"
+: "${MODEL:=${BAYBO_MODEL:-deepseek/deepseek-v4-flash}}"
 : "${MAX_TURNS:=120}"                            # Claude Code agent turn budget per instance
 : "${CLAUDE_BIN:=$(readlink -f "$HOME/.local/bin/claude" 2>/dev/null)}"  # native claude binary
 : "${PROMPT_TIMEOUT:=1800}"                       # per-instance wall ceiling (s)
@@ -35,10 +35,10 @@ SWE_DIR="$(cd "$BENCH_DIR/../swe" && pwd)"
 : "${RUNS_DIR:=$BENCH_DIR/runs}"
 : "${RESULTS_DIR:=$BENCH_DIR/results}"
 : "${TRACE_DIR:=$BENCH_DIR/trace}"               # per-instance .messages.json transcripts
-: "${AGENT_RESULTS:=}"                            # aura results JSON to compare against
+: "${AGENT_RESULTS:=}"                            # baybo results JSON to compare against
 : "${DOCKER:=docker}"
-API_KEY="${API_KEY:-${AURA_API_KEY:-}}"
-[ -n "$API_KEY" ] || { echo "need the model key in AURA_API_KEY (bench/swe/.env) or API_KEY" >&2; exit 1; }
+API_KEY="${API_KEY:-${BAYBO_API_KEY:-}}"
+[ -n "$API_KEY" ] || { echo "need the model key in BAYBO_API_KEY (bench/swe/.env) or API_KEY" >&2; exit 1; }
 export DEEPSEEK_API_KEY="$API_KEY" OPENAI_API_KEY="$API_KEY"
 [ -x "$CLAUDE_BIN" ] || { echo "native claude binary not found/executable at '$CLAUDE_BIN' — install Claude Code (curl -fsSL https://claude.ai/install.sh | bash) or set CLAUDE_BIN" >&2; exit 1; }
 # ---------------------------------------------------------------------------

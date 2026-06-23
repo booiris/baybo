@@ -1,14 +1,14 @@
 use async_trait::async_trait;
-use aura_model::{CronExecution, CronJob, ExecutionStatus};
+use baybo_model::{CronExecution, CronJob, ExecutionStatus};
 
 use crate::StorageError;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Persistence interface for cron jobs and executions. Implemented by
-/// `aura_storage::libsql::LibsqlCronStore`. The trait talks in the domain
+/// `baybo_storage::libsql::LibsqlCronStore`. The trait talks in the domain
 /// types (`CronJob`, `CronExecution`, `ExecutionStatus`) from
-/// `aura-model`; the libsql impl handles JSON round-tripping internally.
+/// `baybo-model`; the libsql impl handles JSON round-tripping internally.
 #[async_trait]
 pub trait CronStore: Send + Sync {
     // ── Job CRUD ──

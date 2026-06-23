@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aura_security::SecretVault;
-use aura_tools::mcp::config::McpFile;
+use baybo_security::SecretVault;
+use baybo_tools::mcp::config::McpFile;
 
 use crate::cli::McpCmd;
 use crate::context::CommandContext;
@@ -15,7 +15,7 @@ mod list;
 mod probe;
 mod remove;
 
-pub(crate) use aura_tools::mcp::vault_keys;
+pub(crate) use baybo_tools::mcp::vault_keys;
 
 pub async fn handle(ctx: &CommandContext, cmd: McpCmd) -> Result<CommandOutput> {
     match cmd {
@@ -64,7 +64,7 @@ pub(super) fn workspace_root(ctx: &CommandContext) -> PathBuf {
 pub(super) fn require_vault(ctx: &CommandContext) -> Result<&Arc<SecretVault>> {
     ctx.secret_vault.as_ref().ok_or_else(|| {
         CliError::Config(
-            "secret vault unavailable — run from the workspace root with a valid aura.json".into(),
+            "secret vault unavailable — run from the workspace root with a valid baybo.json".into(),
         )
     })
 }

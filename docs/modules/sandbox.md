@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `sandbox` crate (`aura-sandbox`) provides per-invocation OS-native
+The `sandbox` crate (`baybo-sandbox`) provides per-invocation OS-native
 isolation for tools that shell out. Today every tool runs in-process inside
 the gateway; without the sandbox, `BashTool` (the only `ExecCommand`-capable
 builtin) would spawn `sh -c <user-supplied>` with the gateway's full
@@ -20,14 +20,14 @@ What the crate provides:
   and the permissive "host RW + denylist" model used by `BashTool`.
 - `cfg`-free `args.rs` that renders the bwrap argv and the SBPL profile,
   so spec → invocation is unit-testable on any developer host.
-- An `aura_sandbox::probe()` entry point so callers (the gateway) can detect
+- An `baybo_sandbox::probe()` entry point so callers (the gateway) can detect
   a missing backend at startup and react cleanly. The `bootstrap` module
   exports the `SandboxAvailability` struct that `probe()` returns; the
   function itself sits at the crate root.
 
 What gets wrapped:
 
-- Tools whose manifest declares `aura_tools::ToolCapability::ExecCommand`.
+- Tools whose manifest declares `baybo_tools::ToolCapability::ExecCommand`.
   The `ToolExecutor` builds a `SandboxAdapter` per call and injects it into
   `ToolContext.sandbox`; the tool then routes its child through
   `ExecSandbox::spawn_command(program, args, SpawnOpts { cwd, stdin, extra_env, timeout })`.
@@ -50,7 +50,7 @@ running unsandboxed would defeat the whole point.
 `#[cfg(target_os = "linux")]` selects `BwrapRunner`; `#[cfg(target_os =
 "macos")]` selects `SandboxExecRunner`. Both are gated behind matching
 Cargo features (`linux`, `macos`), mirroring the gateway's installer
-pattern. Aura is Unix-only and Windows is out of scope.
+pattern. Baybo is Unix-only and Windows is out of scope.
 
 `current_platform_runner()` tries the native backend first; if its
 binary is missing on `$PATH`, it falls back to `DockerRunner` (gated
@@ -114,7 +114,7 @@ There is no shared "policy" type beyond `SandboxSpec` itself.
   via `ResourceLimits::unlimited()` — drops the corresponding flag,
   in which case the container inherits the daemon's defaults.
 - **Container lifecycle**: every `docker run` is started with a
-  unique `--name aura-sandbox-<pid>-<nanos>-<seq>`. On timeout or
+  unique `--name baybo-sandbox-<pid>-<nanos>-<seq>`. On timeout or
   io-error the runner issues `docker rm -f <name>` before returning,
   because `kill_on_drop` only reaps the local docker CLI client and
   the daemon-managed container would otherwise keep running with
@@ -152,13 +152,13 @@ Per-runner enforcement (queryable through
   runner's default is `unlimited()`. If a caller explicitly passes
   non-`unlimited()` limits, `BwrapRunner::run` returns
   `SandboxError::Unenforceable` rather than silently downgrading.
-  Operators who need caps in daemonised setups should run aura
+  Operators who need caps in daemonised setups should run baybo
   under a systemd user unit or use the Docker fallback.
 - **macOS (sandbox-exec)**: SBPL has no cgroup equivalent. Default
   is `unlimited()`. Non-`unlimited()` specs return
   `SandboxError::Unenforceable`. Operators who need a hard memory
   ceiling on macOS should layer a separate launchd
-  `MemoryHighWaterMark` outside aura.
+  `MemoryHighWaterMark` outside baybo.
 
 `SandboxAdapter::new` reads `runner.default_resource_limits()` so the
 agent's per-call default is automatically tuned to whatever the
@@ -277,7 +277,7 @@ build time so bwrap never sees a `--tmpfs <missing>` line.
 `SandboxAdapter::with_readable_paths(paths)` adds **read-only** re-binds
 on top of that policy (filtered to existing paths at build time). The
 agent layer passes `<workspace>/skills` here: the denylist masks all of
-`~/.aura`, but installed skill scripts must still be executable in
+`~/.baybo`, but installed skill scripts must still be executable in
 place, so `skills/` is re-bound RO *after* the masking tmpfs — the same
 last-wins ordering that re-establishes the `work/` dir, except RO. On
 bwrap that's `--ro-bind-try <skills> <skills>` emitted after the
@@ -289,12 +289,12 @@ mirrors this: a command-argument path under `skills/` is accepted even
 though it sits outside `work/`, while `cwd` stays pinned to `work/`.
 
 Default Bash denylist (built by
-`aura_sandbox::default_sensitive_denylist`):
+`baybo_sandbox::default_sensitive_denylist`):
 
 - `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.gpg` — credentials and keys
 - `~/.config/gh`, `~/.config/gcloud` — cloud CLI tokens
 - `~/.docker`, `~/.kube` — registry / cluster auth
-- `$AURA_HOME` (or `~/.aura` if unset) — Aura's own state, secrets,
+- `$BAYBO_HOME` (or `~/.baybo` if unset) — Baybo's own state, secrets,
   identity files. The whole tree is masked, then `skills/` alone is
   re-exposed read-only via `with_readable_paths` (above) so skill
   scripts run in place; `config/`, `state/`, `profile/`, `.key/`, etc.
@@ -307,28 +307,28 @@ Trade-offs:
   vaults". `/etc/sudoers`, `/var/log`, `/srv`, `/data` (when not the
   workspace), … stay invisible. Pair with the per-command approval
   gate (which already fires on `rm`/destructive `git`) and the
-  `aura_security` content filters for defence in depth.
+  `baybo_security` content filters for defence in depth.
 - On non-FHS distros (NixOS, GoboLinux) the FHS-RO bind list still
   leaves `/nix/store` uncovered; if the agent needs binaries from
-  there, prefer launching aura with the workspace inside `$HOME` so
+  there, prefer launching baybo with the workspace inside `$HOME` so
   the home bind covers it, or extend `BWRAP_RO_ROOTS`.
 - Docker ignores the permissive *denylist / extra_root* policy and
   binds only `workspace_root` (plus `readable_paths` RO, so `skills/`
   still works) — reaching `$HOME` from inside a container would need an
   explicit bind that defeats the container model.
 
-### Sandbox FS root vs. Aura state directory
+### Sandbox FS root vs. Baybo state directory
 
 These are **different paths**, on purpose:
 
-- `aura_workspace::WorkspaceManager.root` is `config.workspace.path`
-  (defaults to `~/.aura`). It's where Aura keeps its libsql storage,
+- `baybo_workspace::WorkspaceManager.root` is `config.workspace.path`
+  (defaults to `~/.baybo`). It's where Baybo keeps its libsql storage,
   identity files, lock file, and skill bundles. The agent reads from
   here in-process, not via subprocesses.
 - The sandbox FS root passed to `ToolExecutor::new` is the *project
   workspace*: where the user expects shell commands to run. The
   gateway resolves this from `std::env::current_dir().canonicalize()`
-  at startup — the directory aura was launched from. If
+  at startup — the directory baybo was launched from. If
   `current_dir()` fails, the gateway falls back to the state
   directory and logs a warning.
 - `SandboxAdapter` rejects any `cwd` that isn't a subpath of the
@@ -349,7 +349,7 @@ but what `/tmp` actually points at depends on the filesystem policy:
   per-call scratch — `--tmpfs /tmp` on bwrap, `tempdir_in(workspace_root)`
   on macOS with `TMPDIR` pointed at it. The macOS scratch dir is removed
   when the call returns (best-effort — `kill -9` of the gateway
-  leaves it behind, recognizable by the `.aura-sandbox-` prefix). The
+  leaves it behind, recognizable by the `.baybo-sandbox-` prefix). The
   SBPL profile still denies writes to host `/tmp` / `/private/tmp`,
   so a script that ignores `$TMPDIR` and hardcodes `/tmp` gets `EPERM`
   from the kernel on macOS; on Linux it writes into the per-call tmpfs
@@ -388,7 +388,7 @@ some setups make it a dangling symlink.
 
 ### Bootstrap probe at startup, not per-call
 
-`aura_sandbox::current_platform_runner()` is called once during gateway
+`baybo_sandbox::current_platform_runner()` is called once during gateway
 boot. The result is stored on `ToolExecutor`; per-call cost is just an
 `Arc::clone`. A missing backend at startup becomes a single error log
 plus `sandbox_runner: None`, which `ToolExecutor` checks per-tool: if the
@@ -397,14 +397,14 @@ an actionable error. This keeps the rest of the gateway running normally.
 
 ### Runner injected via `ToolContext`, not interposed by the executor
 
-The `ExecSandbox` trait lives in `aura-tools`. `aura-agent` defines a
+The `ExecSandbox` trait lives in `baybo-tools`. `baybo-agent` defines a
 `SandboxAdapter` that implements `ExecSandbox` and wraps a
-`Arc<dyn aura_sandbox::SandboxRunner>`. The executor builds one adapter per
+`Arc<dyn baybo_sandbox::SandboxRunner>`. The executor builds one adapter per
 call (when needed) and attaches it to `ToolContext.sandbox`. The tool then
 opts in by calling `ctx.sandbox.spawn_command(...)`.
 
-This keeps the `Tool` trait shape unchanged and avoids `aura-tools`
-depending on `aura-sandbox`. Future ExecCommand-capable tools get the
+This keeps the `Tool` trait shape unchanged and avoids `baybo-tools`
+depending on `baybo-sandbox`. Future ExecCommand-capable tools get the
 runner for free without further executor changes.
 
 ### `cfg`-free argv/profile rendering
@@ -434,7 +434,7 @@ backend binary is absent.
   pick limits the backend can actually deliver.
 - ExecCommand tools refuse to run when the backend binary is missing —
   no fallback to unsandboxed execution.
-- MCP stdio servers (`aura-tools::mcp::McpReconciler`) currently spawn
+- MCP stdio servers (`baybo-tools::mcp::McpReconciler`) currently spawn
   outside the sandbox. Wrapping them is on the deferred list.
 
 ## Collaboration

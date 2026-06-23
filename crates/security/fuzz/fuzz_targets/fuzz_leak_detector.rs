@@ -2,7 +2,7 @@
 
 use std::sync::OnceLock;
 
-use aura_security::LeakDetector;
+use baybo_security::LeakDetector;
 use libfuzzer_sys::fuzz_target;
 
 static DETECTOR: OnceLock<LeakDetector> = OnceLock::new();

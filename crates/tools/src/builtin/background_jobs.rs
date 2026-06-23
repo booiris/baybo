@@ -94,7 +94,7 @@ impl Tool for JobStopTool {
 mod tests {
     use super::*;
     use crate::{BackgroundJobControl, BackgroundJobInfo};
-    use aura_model::{ChannelType, SessionId, User};
+    use baybo_model::{ChannelType, SessionId, User};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
@@ -118,8 +118,8 @@ mod tests {
     fn ctx(control: Option<Arc<dyn BackgroundJobControl>>) -> ToolContext {
         ToolContext {
             session_id: "t".into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -128,7 +128,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: None,
             notifier: None,

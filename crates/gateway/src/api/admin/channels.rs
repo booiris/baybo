@@ -10,7 +10,7 @@ use axum::extract::State;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use aura_channels::ChannelRegistry;
+use baybo_channels::ChannelRegistry;
 
 use crate::Result;
 use crate::api::dto::{ChannelEntry, ErrorBody, ListResponse};
