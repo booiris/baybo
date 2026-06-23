@@ -15,13 +15,17 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+use std::time::Duration;
+
 use aura_device_proto::aead;
 use aura_job::{JobInputKind, JobLifecycle, JobLifecycleEvent, JobPhase, JobShape};
-use aura_model::{ContentBlock, Role, SessionId};
+use aura_model::{ContentBlock, JobId, Role, SessionId};
 use aura_security::SecretVault;
 use aura_session::SessionManager;
 use aura_store::{DeviceStatus, DeviceStore, SessionStore};
 use base64::Engine;
+use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -35,6 +39,11 @@ const PUSH_KEY_LEN: usize = 32;
 /// `kid` epoch — always 0 in phase 1 (the field exists so rotation needs no
 /// payload change).
 const PHASE1_KID: u32 = 0;
+/// Read-after-write: how many times to re-check for a fresh assistant row
+/// before falling back to the generic placeholder.
+const PREVIEW_READ_RETRIES: u32 = 5;
+/// Backoff between read-after-write re-checks.
+const PREVIEW_READ_BACKOFF: Duration = Duration::from_millis(100);
 
 /// The blind `/notify` body A POSTs to C. `enc`/`n` are base64 of the
 /// per-device AEAD output; C copies them verbatim into the APNs payload.
@@ -97,6 +106,10 @@ pub struct PushDispatcher {
     secret_vault: Arc<SecretVault>,
     sink: Arc<dyn NotifySink>,
     instance_key: String,
+    /// `job_id → session ordinal at turn start`, captured on the `Started`
+    /// edge so the completed-turn preview can wait for a row newer than this
+    /// (the read-after-write gate). Dropped on any terminal edge.
+    start_cursors: Mutex<HashMap<JobId, i64>>,
 }
 
 impl PushDispatcher {
@@ -115,11 +128,13 @@ impl PushDispatcher {
             secret_vault,
             sink,
             instance_key: instance_key.into(),
+            start_cursors: Mutex::new(HashMap::new()),
         }
     }
 
-    /// True iff this event should buzz a phone: a successfully-completed real
-    /// user turn. The `shape == Turn` gate is what excludes `/compact`.
+    /// True iff this terminal event should buzz a phone: a successfully-
+    /// completed real user turn. The `shape == Turn` gate is what excludes
+    /// `/compact`.
     pub fn should_dispatch(ev: &JobLifecycleEvent) -> bool {
         ev.phase == JobPhase::Completed
             && ev.shape == JobShape::Turn
@@ -127,10 +142,35 @@ impl PushDispatcher {
     }
 
     /// Process one lifecycle event; returns how many devices were notified.
+    /// Tracks the turn's start cursor (for read-after-write) and dispatches on
+    /// the completed edge.
     pub async fn handle_event(&self, ev: &JobLifecycleEvent) -> usize {
-        if !Self::should_dispatch(ev) {
+        // Only real user turns are relevant at all.
+        if ev.shape != JobShape::Turn || ev.kind != JobInputKind::UserChat {
             return 0;
         }
+        match ev.phase {
+            JobPhase::Started => {
+                let cursor = self
+                    .session_store
+                    .latest_session_ordinal(&ev.session_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                self.start_cursors.lock().insert(ev.job_id, cursor);
+                0
+            }
+            JobPhase::Completed => self.dispatch_completed(ev).await,
+            JobPhase::Failed | JobPhase::Cancelled => {
+                self.start_cursors.lock().remove(&ev.job_id);
+                0
+            }
+        }
+    }
+
+    async fn dispatch_completed(&self, ev: &JobLifecycleEvent) -> usize {
+        let start_cursor = self.start_cursors.lock().remove(&ev.job_id);
         let Some(session) = self.session_manager.get(&ev.session_id).await.ok().flatten() else {
             return 0;
         };
@@ -142,7 +182,7 @@ impl PushDispatcher {
         if devices.is_empty() {
             return 0;
         }
-        let preview = self.build_preview(&ev.session_id).await;
+        let preview = self.build_preview(&ev.session_id, start_cursor).await;
         let mut sent = 0;
         for d in devices {
             match self.dispatch_to_device(&d.device_id, &ev.session_id, &preview).await {
@@ -178,31 +218,67 @@ impl PushDispatcher {
             .map_err(|_| "push key wrong length".to_string())
     }
 
-    /// Build the preview JSON from the session's last assistant message — title
-    /// + first ~200 chars, with a generic fallback for non-text / empty.
-    ///
-    /// NOTE (read-after-write): a fuller implementation gates this on the
-    /// message ordinal vs. the turn's start to avoid encrypting the *previous*
-    /// turn's reply; here we take the latest assistant text and fall back to a
-    /// generic placeholder when none is present.
-    async fn build_preview(&self, session_id: &SessionId) -> String {
+    /// Build the preview JSON from the session's last assistant message, gated
+    /// on **read-after-write**: the `Completed` lifecycle event can fire before
+    /// the assistant message row is durable, so a naive read could encrypt the
+    /// *previous* turn's reply. We re-check (bounded) until a session row newer
+    /// than the turn's start cursor has landed, then take the last assistant
+    /// text; on expiry we send the generic placeholder, **never** stale text.
+    async fn build_preview(&self, session_id: &SessionId, start_cursor: Option<i64>) -> String {
+        for attempt in 0..PREVIEW_READ_RETRIES {
+            let latest = self
+                .session_store
+                .latest_session_ordinal(session_id)
+                .await
+                .ok()
+                .flatten();
+            if landed(latest, start_cursor)
+                && let Some(text) = self.last_assistant_text(session_id).await
+            {
+                return preview_json(Some(&text));
+            }
+            if attempt + 1 < PREVIEW_READ_RETRIES {
+                tokio::time::sleep(PREVIEW_READ_BACKOFF).await;
+            }
+        }
+        preview_json(None)
+    }
+
+    async fn last_assistant_text(&self, session_id: &SessionId) -> Option<String> {
         let messages = self
             .session_store
             .load_active_session_messages(session_id)
             .await
-            .unwrap_or_default();
-        let text = messages.iter().rev().find(|m| m.role == Role::Assistant).and_then(|m| {
+            .ok()?;
+        messages.iter().rev().find(|m| m.role == Role::Assistant).and_then(|m| {
             m.content.iter().find_map(|cb| match cb {
                 ContentBlock::Text(t) => Some(t.clone()),
                 _ => None,
             })
-        });
-        let body = match text {
-            Some(t) => t.chars().take(PREVIEW_MAX_CHARS).collect::<String>(),
-            None => "New message".to_string(),
-        };
-        json!({ "title": "Aura", "body": body }).to_string()
+        })
     }
+}
+
+/// Read-after-write decision: has a session row newer than the turn's start
+/// cursor landed? With no start cursor (the dispatcher missed the `Started`
+/// edge — e.g. it booted mid-turn) we accept best-effort.
+fn landed(latest: Option<i64>, start_cursor: Option<i64>) -> bool {
+    match (latest, start_cursor) {
+        (Some(l), Some(s)) => l > s,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// The preview JSON the NSE rewrites into `title`/`body`. `None` text yields the
+/// generic placeholder (used when the read-after-write gate never sees a fresh
+/// reply), so a stale previous-turn reply is never encrypted.
+fn preview_json(text: Option<&str>) -> String {
+    let body = match text {
+        Some(t) => t.chars().take(PREVIEW_MAX_CHARS).collect::<String>(),
+        None => "New message".to_string(),
+    };
+    json!({ "title": "Aura", "body": body }).to_string()
 }
 
 /// Pure: AEAD-seal `preview` under `key`, base64 the output, and frame the
@@ -335,6 +411,26 @@ mod tests {
         let ct = b64.decode(&body.enc).unwrap();
         let plaintext = aead::open(&key, &nonce, &ct).unwrap();
         assert_eq!(plaintext, preview.as_bytes());
+    }
+
+    #[test]
+    fn read_after_write_gate_waits_for_a_newer_row() {
+        assert!(landed(Some(5), Some(4)), "a newer row landed → go");
+        assert!(!landed(Some(4), Some(4)), "no new row since turn start → wait");
+        assert!(!landed(Some(3), Some(4)), "stale latest → wait");
+        assert!(landed(Some(9), None), "no start cursor → best-effort accept");
+        assert!(!landed(None, Some(4)), "empty session → wait");
+    }
+
+    #[test]
+    fn preview_json_truncates_and_falls_back_to_placeholder() {
+        let long = "x".repeat(500);
+        let v: serde_json::Value = serde_json::from_str(&preview_json(Some(&long))).unwrap();
+        assert_eq!(v["title"], "Aura");
+        assert_eq!(v["body"].as_str().unwrap().chars().count(), PREVIEW_MAX_CHARS);
+        // None → generic placeholder (never a stale previous-turn reply).
+        let g: serde_json::Value = serde_json::from_str(&preview_json(None)).unwrap();
+        assert_eq!(g["body"], "New message");
     }
 
     #[test]
