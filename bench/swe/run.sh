@@ -34,7 +34,7 @@ if [ -f "$BENCH_DIR/.env" ]; then set -a; . "$BENCH_DIR/.env"; set +a; fi
 
 # ---- config (override via env) --------------------------------------------
 : "${ARMS:=noop oracle}"                       # space-separated: noop oracle agent
-: "${DATASET_NAME:=princeton-nlp/SWE-bench_Lite}"
+: "${DATASET_NAME:=princeton-nlp/SWE-bench_Verified}"
 : "${SPLIT:=test}"
 : "${NAMESPACE:=swebench}"                      # swebench => pull prebuilt Hub images; none => local build
 : "${INSTANCE_IDS:=}"                           # space-separated; empty => first $LIMIT

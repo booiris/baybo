@@ -22,8 +22,8 @@ SWE_DIR="$(cd "$BENCH_DIR/../swe" && pwd)"
 [ -f "$BENCH_DIR/.env" ] && { set -a; . "$BENCH_DIR/.env"; set +a; }  # local overrides win
 
 # ---- config (override via env) --------------------------------------------
-: "${DATASET_NAME:=princeton-nlp/SWE-bench_Lite}"
-: "${SUBSET:=lite}"
+: "${DATASET_NAME:=princeton-nlp/SWE-bench_Verified}"
+: "${SUBSET:=verified}"
 : "${SPLIT:=test}"
 : "${LIMIT:=5}"                                  # first N; INSTANCE_IDS overrides
 : "${INSTANCE_IDS:=}"                            # space-separated ids -> regex filter
