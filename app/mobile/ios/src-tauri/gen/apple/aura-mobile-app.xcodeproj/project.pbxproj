@@ -8,11 +8,15 @@
 
 /* Begin PBXBuildFile section */
 		0D3AD49CCA367CC67D6E0557 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D339D6A75B58B6275046EDB9 /* UIKit.framework */; };
+		1ECE42825986E419CA1CC022 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 039D4C6C6B830971655C7710 /* NotificationService.swift */; };
+		22A5F69577E27EF5AD5653DF /* NotificationExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = A923395F639621376F025147 /* NotificationExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		28B088F76D7E5E970A264B5E /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 846D5BA935DBF9A89ACF451E /* CoreGraphics.framework */; };
 		37B8BD77ABA7EDAD112F3B08 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 51DD5B88E0F6E536499E782C /* MetalKit.framework */; };
 		5009FD20E05F6F83CC48FFE5 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8DD72E66BFFAFA1F63D95492 /* QuartzCore.framework */; };
 		543309D6AA672D3EA16456C3 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7D31773A9F2FA8563D612506 /* Security.framework */; };
+		733DF8F723F7FD27963E63BE /* UserNotifications.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 74BFE8CD51BCD791D244A4F5 /* UserNotifications.framework */; };
 		840046DFC71CB27E178E0AA7 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6BAE6D7BB19539EEA16E752B /* Metal.framework */; };
+		8AF0085E3D5A283B8992F330 /* PushKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24D6B9A1FFC260CA2CD48ACD /* PushKeyStore.swift */; };
 		A8859348D8E489EE240F298E /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A9819CAB8C48A596941727E2 /* WebKit.framework */; };
 		AEBE3AFEFC2E0D826E23052A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 9C8647F16B24993699BB4FF7 /* Assets.xcassets */; };
 		BC9DF064B1D6B820F047A199 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = B16D406D68A43998D58C687E /* LaunchScreen.storyboard */; };
@@ -21,20 +25,48 @@
 		FFCA1507FAC694DDD557C218 /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 357D479F2BC9333842CBAF8B /* main.mm */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		A8CEC2ECE812F837D7EB3A94 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 56DE8C74B22BA3D35CAE6B00 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = CBAD422527CDE2F4C71301C4;
+			remoteInfo = NotificationExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		B00CE20478420F9A7B2B4FE5 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				22A5F69577E27EF5AD5653DF /* NotificationExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		039D4C6C6B830971655C7710 /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 		1AE43D04608E41D37A3BCF3B /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		2322C3A78ED2CD69E4188124 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
+		24D6B9A1FFC260CA2CD48ACD /* PushKeyStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushKeyStore.swift; sourceTree = "<group>"; };
 		356F0462A32111C607556356 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
 		357D479F2BC9333842CBAF8B /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
 		51DD5B88E0F6E536499E782C /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
 		6BAE6D7BB19539EEA16E752B /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		6CCF646970650614A9D8C004 /* aura-mobile-app_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "aura-mobile-app_iOS.entitlements"; sourceTree = "<group>"; };
+		74BFE8CD51BCD791D244A4F5 /* UserNotifications.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UserNotifications.framework; path = System/Library/Frameworks/UserNotifications.framework; sourceTree = SDKROOT; };
 		7D31773A9F2FA8563D612506 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		846D5BA935DBF9A89ACF451E /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		89B2CA59921274737CB0302F /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
 		8DD72E66BFFAFA1F63D95492 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		9C8647F16B24993699BB4FF7 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A1E97A7BA63E74FAA77E8026 /* aura-mobile-app_iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "aura-mobile-app_iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		A923395F639621376F025147 /* NotificationExtension.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = NotificationExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		A9819CAB8C48A596941727E2 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		AA39E28A40E9E4C65D823FE2 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
 		B16D406D68A43998D58C687E /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
@@ -44,6 +76,14 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		95F89C88E2A85B6F93527807 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				733DF8F723F7FD27963E63BE /* UserNotifications.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		B5C5F8E98344D636C36DF600 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -94,6 +134,7 @@
 				B16D406D68A43998D58C687E /* LaunchScreen.storyboard */,
 				951271C6B8B4ADD940655A19 /* aura-mobile-app_iOS */,
 				50DAC9AAA979B922FD4FF12B /* Externals */,
+				D07C5D271F26475D4D51728F /* NotificationExtension */,
 				54F45107A2E6D143EE039815 /* Sources */,
 				F5EA7949786D594F73C5A760 /* src */,
 				59476A5974ED01A8BE57A668 /* Frameworks */,
@@ -111,6 +152,7 @@
 				8DD72E66BFFAFA1F63D95492 /* QuartzCore.framework */,
 				7D31773A9F2FA8563D612506 /* Security.framework */,
 				D339D6A75B58B6275046EDB9 /* UIKit.framework */,
+				74BFE8CD51BCD791D244A4F5 /* UserNotifications.framework */,
 				A9819CAB8C48A596941727E2 /* WebKit.framework */,
 			);
 			name = Frameworks;
@@ -128,6 +170,7 @@
 			isa = PBXGroup;
 			children = (
 				A1E97A7BA63E74FAA77E8026 /* aura-mobile-app_iOS.app */,
+				A923395F639621376F025147 /* NotificationExtension.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -141,6 +184,16 @@
 			path = "aura-mobile-app_iOS";
 			sourceTree = "<group>";
 		};
+		D07C5D271F26475D4D51728F /* NotificationExtension */ = {
+			isa = PBXGroup;
+			children = (
+				039D4C6C6B830971655C7710 /* NotificationService.swift */,
+				24D6B9A1FFC260CA2CD48ACD /* PushKeyStore.swift */,
+			);
+			name = NotificationExtension;
+			path = ../../../apple/NotificationExtension;
+			sourceTree = "<group>";
+		};
 		F5EA7949786D594F73C5A760 /* src */ = {
 			isa = PBXGroup;
 			children = (
@@ -152,9 +205,41 @@
 			path = ../../src;
 			sourceTree = "<group>";
 		};
+		"TEMP_AC12039F-DF90-42F2-B503-8FFE64F08C94" /* arm64 */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = arm64;
+			sourceTree = "<group>";
+		};
+		"TEMP_ACC90B54-00E9-4FD5-8F10-196C1B7E454C" /* x86_64 */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = x86_64;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		CBAD422527CDE2F4C71301C4 /* NotificationExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A932228D759332050CCCE228 /* Build configuration list for PBXNativeTarget "NotificationExtension" */;
+			buildPhases = (
+				458A97668E23CD4377B63931 /* Sources */,
+				95F89C88E2A85B6F93527807 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = NotificationExtension;
+			packageProductDependencies = (
+			);
+			productName = NotificationExtension;
+			productReference = A923395F639621376F025147 /* NotificationExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		DE57CE9BF2A0DE8879F60390 /* aura-mobile-app_iOS */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = E619380E72A3BB224E1682DF /* Build configuration list for PBXNativeTarget "aura-mobile-app_iOS" */;
@@ -163,10 +248,12 @@
 				2D5BAB6AEF30B74A6B513156 /* Sources */,
 				70C95D7439C8B5F4D8B4AC2F /* Resources */,
 				B5C5F8E98344D636C36DF600 /* Frameworks */,
+				B00CE20478420F9A7B2B4FE5 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				B645924DC6597FDBA3F43201 /* PBXTargetDependency */,
 			);
 			name = "aura-mobile-app_iOS";
 			packageProductDependencies = (
@@ -198,6 +285,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
+				CBAD422527CDE2F4C71301C4 /* NotificationExtension */,
 				DE57CE9BF2A0DE8879F60390 /* aura-mobile-app_iOS */,
 			);
 		};
@@ -249,9 +337,51 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		458A97668E23CD4377B63931 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1ECE42825986E419CA1CC022 /* NotificationService.swift in Sources */,
+				8AF0085E3D5A283B8992F330 /* PushKeyStore.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		B645924DC6597FDBA3F43201 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = CBAD422527CDE2F4C71301C4 /* NotificationExtension */;
+			targetProxy = A8CEC2ECE812F837D7EB3A94 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		07304863B00E6A1D28933B70 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = NO;
+				ARCHS = (
+					arm64,
+				);
+				CODE_SIGN_ENTITLEMENTS = NotificationExtension/NotificationExtension.entitlements;
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				INFOPLIST_FILE = NotificationExtension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.aura.app.NotificationExtension;
+				PRODUCT_NAME = NotificationExtension;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = debug;
+		};
 		6232441CEDF26716C5D2467F /* release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -332,7 +462,7 @@
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				PRODUCT_BUNDLE_IDENTIFIER = com.aura.app;
-				PRODUCT_NAME = "Aura";
+				PRODUCT_NAME = Aura;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALID_ARCHS = arm64;
@@ -402,6 +532,31 @@
 			};
 			name = debug;
 		};
+		DCF83F0BA6EE17F3B8203F0C /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = NO;
+				ARCHS = (
+					arm64,
+				);
+				CODE_SIGN_ENTITLEMENTS = NotificationExtension/NotificationExtension.entitlements;
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				INFOPLIST_FILE = NotificationExtension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.aura.app.NotificationExtension;
+				PRODUCT_NAME = NotificationExtension;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = release;
+		};
 		E398299ED33EC176A887A40B /* release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -426,7 +581,7 @@
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				PRODUCT_BUNDLE_IDENTIFIER = com.aura.app;
-				PRODUCT_NAME = "Aura";
+				PRODUCT_NAME = Aura;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALID_ARCHS = arm64;
@@ -436,6 +591,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		A932228D759332050CCCE228 /* Build configuration list for PBXNativeTarget "NotificationExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				07304863B00E6A1D28933B70 /* debug */,
+				DCF83F0BA6EE17F3B8203F0C /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
 		E619380E72A3BB224E1682DF /* Build configuration list for PBXNativeTarget "aura-mobile-app_iOS" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (

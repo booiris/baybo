@@ -53,8 +53,15 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         CFBundleShortVersionString: 0.1.0
         CFBundleVersion: "0.1.0"
+        NSCameraUsageDescription: Aura uses the camera to scan the pairing QR code shown by your gateway.
     entitlements:
       path: aura-mobile-app_iOS/aura-mobile-app_iOS.entitlements
+      properties:
+        aps-environment: development
+        com.apple.security.application-groups:
+          - group.com.aura.app
+        keychain-access-groups:
+          - group.com.aura.app
     scheme:
       environmentVariables:
         RUST_BACKTRACE: full
@@ -70,6 +77,9 @@ targets:
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
       groups: [app]
     dependencies:
+      # The push Notification Service Extension, embedded into the app's PlugIns.
+      - target: NotificationExtension
+        embed: true
       - framework: libapp.a
         embed: false
       - sdk: CoreGraphics.framework
@@ -86,3 +96,43 @@ targets:
         outputFiles:
           - $(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a
           - $(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a
+
+  # Push Notification Service Extension. Wakes on `mutable-content` APNs pushes,
+  # reads the per-binding push key from the App Group keychain, and decrypts the
+  # lock-screen preview locally (CryptoKit ChaChaPoly, matching aura_device_proto
+  # ::aead). Hand-written Swift lives in ../../../apple; its Info.plist and
+  # entitlements are generated here from project.yml so a regen reproduces them.
+  NotificationExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ../../../apple/NotificationExtension/NotificationService.swift
+      - path: ../../../apple/NotificationExtension/PushKeyStore.swift
+    info:
+      path: NotificationExtension/Info.plist
+      properties:
+        CFBundleDisplayName: Aura
+        CFBundleShortVersionString: 0.1.0
+        CFBundleVersion: "0.1.0"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+    entitlements:
+      path: NotificationExtension/NotificationExtension.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.aura.app
+        keychain-access-groups:
+          - group.com.aura.app
+    settings:
+      base:
+        PRODUCT_NAME: NotificationExtension
+        PRODUCT_BUNDLE_IDENTIFIER: com.aura.app.NotificationExtension
+        ENABLE_BITCODE: false
+        ARCHS: [arm64]
+        VALID_ARCHS: arm64
+        EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
+        SKIP_INSTALL: true
+        ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: false
+    dependencies:
+      - sdk: UserNotifications.framework
