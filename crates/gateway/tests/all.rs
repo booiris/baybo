@@ -6,6 +6,8 @@ mod admin_has_no_channels;
 mod auth;
 #[path = "channel_ws.rs"]
 mod channel_ws;
+#[path = "device_channel_ws.rs"]
+mod device_channel_ws;
 #[path = "chat_api.rs"]
 mod chat_api;
 #[path = "jobs_pagination.rs"]
