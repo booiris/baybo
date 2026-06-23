@@ -6,7 +6,12 @@ edition.workspace = true
 [lib]
 doctest = false
 
+[[bin]]
+name = "aura-remote-host-push"
+path = "src/main.rs"
+
 [dependencies]
+tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -15,6 +20,8 @@ jsonwebtoken = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 axum = { workspace = true }
+# Real APNs egress: reqwest negotiates HTTP/2 over TLS (ALPN), as APNs requires.
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

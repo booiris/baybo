@@ -12,13 +12,17 @@
 //! `device_id → { token, env }` store follow.
 
 pub mod apns;
+pub mod apns_http;
 pub mod error;
 pub mod http;
 pub mod jwt;
 pub mod notify;
+pub mod serve;
 pub mod store;
 
 pub use apns::{ApnsEnv, ApnsOutcome, ApnsRequest, ApnsSender};
+pub use apns_http::HttpApnsSender;
+pub use serve::{PushConfig, build_router};
 pub use error::PushError;
 pub use http::{PushState, router};
 pub use jwt::ApnsProviderToken;

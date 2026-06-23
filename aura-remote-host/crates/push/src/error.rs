@@ -11,4 +11,8 @@ pub enum PushError {
     /// ES256 signing of the provider token failed.
     #[error("jwt sign: {0}")]
     Jwt(String),
+
+    /// Runtime configuration was missing or unreadable (env var / `.p8` file).
+    #[error("config: {0}")]
+    Config(String),
 }
