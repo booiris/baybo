@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_channels::{DashboardProvider, DashboardSnapshot, ViewKind};
+use baybo_channels::{DashboardProvider, DashboardSnapshot, ViewKind};
 
 use crate::context::CommandContext;
 
@@ -40,7 +40,7 @@ impl DashboardProvider for CliDashboardProvider {
 fn skills_snapshot(ctx: &CommandContext) -> DashboardSnapshot {
     // Refreshing the Skills view also hot-reloads from disk so operators
     // can edit `<workspace>/skills/<name>/SKILL.md` and see the change
-    // without restarting Aura. Other dashboards don't pair with a
+    // without restarting Baybo. Other dashboards don't pair with a
     // filesystem source, so they skip this step.
     let total = ctx.skills.reload();
     let mut names = ctx.skills.list();

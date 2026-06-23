@@ -5,7 +5,7 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use aura_security::{LeakDetector, RedactingMakeWriter};
+use baybo_security::{LeakDetector, RedactingMakeWriter};
 use parking_lot::Mutex;
 use tracing::{info, warn};
 use tracing_subscriber::fmt::MakeWriter;
@@ -58,7 +58,7 @@ fn aws_key_in_info_event_is_redacted() {
     let buf = SharedBuf::new();
     let _guard = install_redacting_subscriber(buf.clone());
 
-    info!(target: "aura.test", key = "AKIAIOSFODNN7EXAMPLE", "auth attempt");
+    info!(target: "baybo.test", key = "AKIAIOSFODNN7EXAMPLE", "auth attempt");
     drop(_guard);
 
     let out = buf.contents();
@@ -79,7 +79,7 @@ fn anthropic_key_inside_message_string_is_redacted() {
     let _guard = install_redacting_subscriber(buf.clone());
 
     let secret = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-ABC";
-    warn!(target: "aura.test", "got secret {secret}");
+    warn!(target: "baybo.test", "got secret {secret}");
     drop(_guard);
 
     let out = buf.contents();
@@ -95,7 +95,7 @@ fn benign_log_passes_through_unchanged() {
     let buf = SharedBuf::new();
     let _guard = install_redacting_subscriber(buf.clone());
 
-    info!(target: "aura.test", action = "boot", "starting up");
+    info!(target: "baybo.test", action = "boot", "starting up");
     drop(_guard);
 
     let out = buf.contents();
@@ -110,7 +110,7 @@ fn multiple_secrets_in_one_event_all_redacted() {
     let _guard = install_redacting_subscriber(buf.clone());
 
     info!(
-        target: "aura.test",
+        target: "baybo.test",
         aws = "AKIAIOSFODNN7EXAMPLE",
         gh = "ghp_1234567890abcdefghijklmnopqrstuvwxyz",
         "two leaks"

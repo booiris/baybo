@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use aura_gateway::SidecarRuntime;
+use baybo_gateway::SidecarRuntime;
 
 use crate::bootstrap::SetupContext;
 use crate::error::{Result, SetupError};
@@ -149,7 +149,7 @@ async fn commit_config(ctx: &mut SetupContext) -> Result<()> {
         .write_to_file(&ctx.config_path)
         .await
         .map_err(|e| SetupError::Config(format!("write {}: {e}", ctx.config_path.display())))?;
-    tracing::info!(path = %ctx.config_path.display(), "wrote final aura.json");
+    tracing::info!(path = %ctx.config_path.display(), "wrote final baybo.json");
     Ok(())
 }
 
@@ -158,7 +158,7 @@ pub fn print_exit_hint(config_path: &Path) {
     println!("Setup complete. Wrote {}.", config_path.display());
     println!();
     println!("Next steps:");
-    println!("  aura gateway start    # start the daemon (dashboard at the printed URL)");
-    println!("  aura tui              # interactive terminal UI (needs gateway running)");
+    println!("  baybo gateway start    # start the daemon (dashboard at the printed URL)");
+    println!("  baybo tui              # interactive terminal UI (needs gateway running)");
     println!();
 }

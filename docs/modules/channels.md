@@ -44,7 +44,7 @@ Core responsibilities:
   [`ViewKind`]), plus the shared command constants (`COMPACT_COMMAND`
   / `COMPACT_COMMAND_NAME`, `STOP_COMMAND` / `STOP_COMMAND_NAME` /
   `STOP_COMMAND_DESCRIPTION`). The trait impls live outside the crate
-  (e.g. `aura-cli`) so channel adapters stay independent of the
+  (e.g. `baybo-cli`) so channel adapters stay independent of the
   command layer while every adapter hooks into the same dispatcher.
 
 ## Channel and Connection
@@ -281,8 +281,8 @@ logger, console.log) falls back to a plain text record at info
 (stdout) or warn (stderr). Attribution uses
 `sidecar::<channel_type>[::<target>]`.
 
-The channel WebSocket URL + token are read from `AURA_CHANNEL_URL` /
-`AURA_CHANNEL_TOKEN` env vars. `ChannelSpawner`
+The channel WebSocket URL + token are read from `BAYBO_CHANNEL_URL` /
+`BAYBO_CHANNEL_TOKEN` env vars. `ChannelSpawner`
 (`crates/gateway/src/spawn.rs`) is the primitive that mints a fresh
 token per spawn and injects both env vars; the URL the supervisor
 builds is `ws://127.0.0.1:<port>/v1/channel-ws` where `<port>` comes
@@ -290,12 +290,12 @@ from [`ChannelServer::port`] after it binds on `127.0.0.1:0`.
 [`SidecarSupervisor`] (`crates/gateway/src/sidecar/supervisor.rs`)
 drives it: at gateway boot, [`SidecarRuntime::install`] materialises
 each sidecar's JS bundle to
-`$XDG_CACHE_HOME/aura/sidecars/<channel>-<hash>/bundle.mjs` (plus any
+`$XDG_CACHE_HOME/baybo/sidecars/<channel>-<hash>/bundle.mjs` (plus any
 declared aux assets next to it), then one supervised task per embedded
 channel type runs `Command::new("bun").arg(bundle).spawn()` through
 `ChannelSpawner` and restarts on exit with exponential backoff
 (500ms → 30s, reset after ≥60s of stable uptime). The `bun` executable
-is resolved from `PATH`; set `AURA_BUN_BIN` to point at a specific
+is resolved from `PATH`; set `BAYBO_BUN_BIN` to point at a specific
 install. Shutdown fans out via the shared `ShutdownSignal` — children
 are SIGKILLed and awaited. Bringing up a custom sidecar out-of-tree is
 still possible: export the two env vars yourself (or pass `wsUrl` /
@@ -328,7 +328,7 @@ connects to `/v1/logs`'s admin endpoint. There is no SDK-level shortcut.
 `pnpm --filter <pkg> bundle` for each `channel-src/*` package; the
 `bundle` script in each `package.json` invokes
 `bun build --target=bun --minify` to emit a single self-contained
-`dist/bundle.mjs`. The output, plus any `aura.auxAssets` declared in
+`dist/bundle.mjs`. The output, plus any `baybo.auxAssets` declared in
 the package (e.g. weixin's `silk.wasm`), is zstd-compressed into
 `target/sidecar-cache/<fingerprint>/` and embedded via
 `include_bytes!`. Sidecar packaging is keyed by the relevant sidecar
@@ -345,7 +345,7 @@ landmines in node-fetch@2 / whatwg-url@5 / dual-package CJS deps.
 Failures (missing `node_modules`, bun bundle error, missing `pnpm`)
 degrade to `cargo:warning=…` + empty assets — `cargo build` still
 succeeds, the supervisor just logs "embedded sidecar runtime
-unavailable" and skips the spawn loop. Set `AURA_REQUIRE_SIDECARS=1`
+unavailable" and skips the spawn loop. Set `BAYBO_REQUIRE_SIDECARS=1`
 to flip those degrades into hard build failures for release CI.
 
 Raw wire types are re-exported under the `./wire` subpath for advanced
@@ -353,7 +353,7 @@ callers. There is no Rust SDK — the TUI has its own private WS client,
 and the server is authoritative on the wire format.
 
 The first in-tree sidecar built on the SDK is the Telegram channel at
-`channel-src/telegram/` (package `@aura/channel-telegram`). It uses
+`channel-src/telegram/` (package `@baybo/channel-telegram`). It uses
 `grammy` for long-polling, maps Telegram `chat_id`s to stable UUIDv5
 `session_id`s, and surfaces `Frame::ApprovalRequested` as an inline-
 keyboard prompt in the originating chat. It's also the working example
@@ -363,9 +363,9 @@ cleanup.
 
 ## Bot Registration
 
-`aura channel add` is a separate, one-shot mode of the same bundle
+`baybo channel add` is a separate, one-shot mode of the same bundle
 that runs the channel at runtime. The CLI spawns
-`bun <bundle>` with `AURA_CHANNEL_MODE=register` set; the SDK's
+`bun <bundle>` with `BAYBO_CHANNEL_MODE=register` set; the SDK's
 [`runSidecar`] notices the env var and dispatches into the channel's
 optional `register(ctx)` hook instead of the normal `runChannel` path.
 There is no WebSocket and no capability token in this mode — the
@@ -405,8 +405,8 @@ register: async (ctx) => {
 **CLI driver**: `crates/setup/src/flow/channel/register_driver.rs`
 (`run_registration`) enforces the contract from the host side. It runs the bundle with
 `Command::env_clear()` + a small allowlist (`PATH`, `HOME`, `TERM`,
-`LANG`, `LC_*`, `TZ`, `TMPDIR`, plus `AURA_CHANNEL_MODE=register`) so
-no `AURA_*` value (capability tokens, vault endpoints, gateway URL)
+`LANG`, `LC_*`, `TZ`, `TMPDIR`, plus `BAYBO_CHANNEL_MODE=register`) so
+no `BAYBO_*` value (capability tokens, vault endpoints, gateway URL)
 leaks in. The driver enforces a 10-minute overall timeout, a 5-second
 post-result exit grace, and `kill_on_drop(true)` so any error path
 terminates the subprocess. On success it persists exactly one vault
@@ -450,7 +450,7 @@ carrier didn't set one (older bundles, TUI, fixtures).
 ## Constraints
 
 - `channels` stays independent of `agent`, `llm`, and other business
-  crates (depends only on `aura-model` and `aura-tools`; `aura-tools`
+  crates (depends only on `baybo-model` and `baybo-tools`; `baybo-tools`
   is pulled in only for the `ApprovalGate` + `ApprovalGateMap` types).
 - Transports own framing and encoding. This crate only defines the
   neutral `wire::{Frame, Message}` shapes (MessagePack-named) and the

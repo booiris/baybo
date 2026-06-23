@@ -11,8 +11,8 @@
 
 use std::sync::Arc;
 
-use aura_model::ChannelType;
-use aura_tools::ApprovalGateMap;
+use baybo_model::ChannelType;
+use baybo_tools::ApprovalGateMap;
 use dashmap::DashMap;
 
 use crate::{Channel, ChannelError, Result};
@@ -88,7 +88,7 @@ mod tests {
     use crate::kind::ChannelKind;
     use crate::types::SessionEvent;
     use crate::wire::Frame;
-    use aura_model::SessionId;
+    use baybo_model::SessionId;
 
     struct DiscardSink;
     impl ConnectionSink for DiscardSink {

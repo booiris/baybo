@@ -46,7 +46,7 @@ export function LoginScreen() {
         <div className="flex items-center gap-3 mb-6">
           <RiKey2Line className="text-3xl" />
           <div>
-            <h1 className="text-2xl font-bold uppercase -tracking-[0.05em]">AURA</h1>
+            <h1 className="text-2xl font-bold uppercase -tracking-[0.05em]">BAYBO</h1>
             <p className="text-ink-soft text-sm">Admin access</p>
           </div>
         </div>
@@ -59,7 +59,7 @@ export function LoginScreen() {
           autoFocus
           value={token}
           onChange={(e) => setToken(e.target.value)}
-          placeholder="Paste the token from `aura gateway token show`"
+          placeholder="Paste the token from `baybo gateway token show`"
           className="w-full px-4 py-3 border-[3px] border-black rounded-md font-mono text-sm focus:outline-none focus:shadow-brutal-sm"
         />
 
@@ -96,7 +96,7 @@ export function LoginScreen() {
 
         <p className="mt-6 text-xs text-ink-soft">
           The token is stored in this browser&apos;s localStorage. Rotate with{' '}
-          <code className="font-mono">aura gateway token rotate</code>.
+          <code className="font-mono">baybo gateway token rotate</code>.
         </p>
 
         {error && (

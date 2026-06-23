@@ -1,7 +1,7 @@
 //! Embedded MCP-server profiles.
 //!
 //! A profile describes one always-on MCP server that ships inside the
-//! Aura binary: the stdio command + args to spawn, the MCP-side server
+//! Baybo binary: the stdio command + args to spawn, the MCP-side server
 //! name (the `<server>/<tool>` namespace the LLM sees), the capability
 //! ceiling, and any boot-config env vars to merge into the child.
 //!
@@ -14,7 +14,7 @@
 //! [`embedded_servers`], which materialises each one into the
 //! [`EmbeddedMcpServer`] entry the reconciler consumes.
 //!
-//! Why this lives in `aura-tools` and not in `aura-gateway`: the
+//! Why this lives in `baybo-tools` and not in `baybo-gateway`: the
 //! profile is policy (how to translate config knobs into env vars,
 //! which capabilities a family declares, which server name the LLM
 //! sees). The gateway's role is purely OS plumbing — locating the
@@ -48,7 +48,7 @@ pub struct EmbeddedMcpProfile {
     pub args: Vec<String>,
     /// Capability ceiling for the synthesised manifest, surfaced as
     /// the per-server resource list every tool from this server
-    /// inherits. An empty list means "Aura controls the spawn and
+    /// inherits. An empty list means "Baybo controls the spawn and
     /// trusts the vendor; do not gate per-call approval on the
     /// transport command" (browser today).
     pub capabilities: Vec<ToolCapability>,

@@ -1,4 +1,4 @@
-# Aura Testing Conventions
+# Baybo Testing Conventions
 
 This guide defines the test layout and reusable framework for the
 workspace. Read this before adding new tests, especially when the work
@@ -38,7 +38,7 @@ pub mod test_support;
 ```toml
 # Consumer crate's Cargo.toml
 [dev-dependencies]
-aura-foo = { workspace = true, features = ["test-support"] }
+baybo-foo = { workspace = true, features = ["test-support"] }
 ```
 
 Helpers used only by the same crate's tests stay `#[cfg(test)]`.
@@ -47,20 +47,20 @@ Helpers used only by the same crate's tests stay `#[cfg(test)]`.
 
 | Crate              | Helper                                                                  | Purpose                                                                                       |
 | ------------------ | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `aura-security`    | `MemorySecretStore`                                                     | In-memory `SecretStore` impl with `len()` / `is_empty()` for vault-state assertions.          |
-| domain crates      | `MemoryJobStore` (`aura-job`), `MemoryTraceStore` (`aura-trace`), `MemoryCostStore` (`aura-cost`), `RecordingMemory` (`aura-memory` — records `recall` / `on_job_complete` / `on_session_end` calls), `MemorySessionStore` + `MemorySessionSummaryStore` (`aura-session`) | In-memory backends for the `*Store` traits (the trait contracts live in `aura-store`; each fake sits in its domain crate's `test_support.rs`). Each exposes a typed `Arc` handle so e2e tests can assert on what the agent persisted. `MemorySessionStore` stubs out lineage / maintenance lookups (returning empty); tests that need that surface should use the real libsql store via `Store::open` against a tempfile. `MemorySessionSummaryStore` mirrors the libsql backend's per-row semantics (`upsert_success` resets `error_count`, `bump_error_count` inserts a zero row when missing) so unit tests assert against the same invariants production exercises. |
-| `aura-tools`       | `EchoTool`, `RecordingTool`                                             | `Tool` impls — `EchoTool` echoes params; `RecordingTool` captures invocation params.          |
-| `aura-llm`         | `StubLlm`                                                               | Scriptable `LlmCompletion` impl. `with_text_chunk_size(n)` forces sub-chunked stream events. |
+| `baybo-security`    | `MemorySecretStore`                                                     | In-memory `SecretStore` impl with `len()` / `is_empty()` for vault-state assertions.          |
+| domain crates      | `MemoryJobStore` (`baybo-job`), `MemoryTraceStore` (`baybo-trace`), `MemoryCostStore` (`baybo-cost`), `RecordingMemory` (`baybo-memory` — records `recall` / `on_job_complete` / `on_session_end` calls), `MemorySessionStore` + `MemorySessionSummaryStore` (`baybo-session`) | In-memory backends for the `*Store` traits (the trait contracts live in `baybo-store`; each fake sits in its domain crate's `test_support.rs`). Each exposes a typed `Arc` handle so e2e tests can assert on what the agent persisted. `MemorySessionStore` stubs out lineage / maintenance lookups (returning empty); tests that need that surface should use the real libsql store via `Store::open` against a tempfile. `MemorySessionSummaryStore` mirrors the libsql backend's per-row semantics (`upsert_success` resets `error_count`, `bump_error_count` inserts a zero row when missing) so unit tests assert against the same invariants production exercises. |
+| `baybo-tools`       | `EchoTool`, `RecordingTool`                                             | `Tool` impls — `EchoTool` echoes params; `RecordingTool` captures invocation params.          |
+| `baybo-llm`         | `StubLlm`                                                               | Scriptable `LlmCompletion` impl. `with_text_chunk_size(n)` forces sub-chunked stream events. |
 
 The integration-tests crate composes these into higher-level builders:
 
 | Helper                          | Where                                              | Purpose                                                  |
 | ------------------------------- | -------------------------------------------------- | -------------------------------------------------------- |
-| `gateway_with_memory_vault()`   | `aura_integration_tests::fixtures`                 | Returns `(Arc<SecurityGateway>, Arc<MemorySecretStore>, Arc<SecretVault>)` — the full security pipeline wired against an in-memory vault. |
-| `SessionBuilder`                | `aura_integration_tests::fixtures`                 | Fluent builder for `Session` so tests don't repeat field lists. |
-| `master_key_for_tests()`        | `aura_integration_tests::fixtures`                 | Stable 32-byte `EncryptionKey` so placeholder hex stays reproducible across runs. |
-| `capture_tracing()`             | `aura_integration_tests::tracing_capture`          | Per-test thread-local `tracing` subscriber. Returns `TracingCapture` (RAII) with `events()`, `at_level(Level)`, `any_contains(&str)`. |
-| `AgentTestHarnessBuilder` / `AgentTestHarness` | `aura_integration_tests::harness`   | Spawns a real `AgentActor` wired to the in-memory stores, the `StubLlm`, and the gateway. Tests push canned LLM responses, send user input via `harness.send_text(...)` (which runs `SecurityGateway::sanitize_input` first, just like the real `Router`), then drain `AgentOutput` from the channel side. `with_tool(Arc<dyn Tool>, ToolManifest)` registers tools before the actor spawns. |
+| `gateway_with_memory_vault()`   | `baybo_integration_tests::fixtures`                 | Returns `(Arc<SecurityGateway>, Arc<MemorySecretStore>, Arc<SecretVault>)` — the full security pipeline wired against an in-memory vault. |
+| `SessionBuilder`                | `baybo_integration_tests::fixtures`                 | Fluent builder for `Session` so tests don't repeat field lists. |
+| `master_key_for_tests()`        | `baybo_integration_tests::fixtures`                 | Stable 32-byte `EncryptionKey` so placeholder hex stays reproducible across runs. |
+| `capture_tracing()`             | `baybo_integration_tests::tracing_capture`          | Per-test thread-local `tracing` subscriber. Returns `TracingCapture` (RAII) with `events()`, `at_level(Level)`, `any_contains(&str)`. |
+| `AgentTestHarnessBuilder` / `AgentTestHarness` | `baybo_integration_tests::harness`   | Spawns a real `AgentActor` wired to the in-memory stores, the `StubLlm`, and the gateway. Tests push canned LLM responses, send user input via `harness.send_text(...)` (which runs `SecurityGateway::sanitize_input` first, just like the real `Router`), then drain `AgentOutput` from the channel side. `with_tool(Arc<dyn Tool>, ToolManifest)` registers tools before the actor spawns. |
 
 ## Six conventions
 
@@ -71,7 +71,7 @@ The integration-tests crate composes these into higher-level builders:
 2. **Builder pattern for domain types.** Tests construct `Session`,
    `Message`, `OutgoingMessage` etc. via builders so a future field
    addition doesn't fan out across every test file. `SessionBuilder`
-   in `aura-integration-tests` is the reference pattern.
+   in `baybo-integration-tests` is the reference pattern.
 
 3. **Spy over mock.** Prefer recording fakes (e.g. `RecordingTool`)
    that capture all interactions and let the test assert on the actual
@@ -110,7 +110,7 @@ Current drift tests:
 
 | Test                                            | Snapshot                | Regenerate with                                                            |
 | ----------------------------------------------- | ----------------------- | -------------------------------------------------------------------------- |
-| `crates/gateway/tests/openapi_spec_sync.rs`     | `docs/openapi.json`     | `UPDATE_OPENAPI=1 cargo test -p aura-gateway --test openapi_spec_sync`     |
+| `crates/gateway/tests/openapi_spec_sync.rs`     | `docs/openapi.json`     | `UPDATE_OPENAPI=1 cargo test -p baybo-gateway --test openapi_spec_sync`     |
 
 The OpenAPI snapshot is the contract that `web/`'s
 `openapi-typescript` codegen reads to produce `web/src/api/schema.d.ts`;
@@ -143,7 +143,7 @@ the pattern: name the file after the contract, group scenarios as
 Terminal rendering — raw crossterm escape sequences, the alternate
 screen, inline-viewport anchoring, and the SIGWINCH/resize reflow path —
 can't be checked by unit tests over the layout math. The
-`aura-term-harness` crate drives the **actual binary** inside a detached
+`baybo-term-harness` crate drives the **actual binary** inside a detached
 tmux pane at a forced size and reads back the rendered screen with
 `capture-pane`. tmux interprets escape sequences exactly like a real
 terminal, so the capture is ground truth (a raw PTY would hand the bytes
@@ -165,7 +165,7 @@ The probe pattern (used by both suites below):
   `required-features = ["test-support"]` so it never builds or ships in a
   release build. The crate enables that feature during its own tests via
   the dev-dependency self-reference
-  (`aura-foo = { workspace = true, features = ["test-support"] }`), which
+  (`baybo-foo = { workspace = true, features = ["test-support"] }`), which
   is what makes cargo build the bin and expose its path to the test as
   `env!("CARGO_BIN_EXE_<probe>")`. Locating the binary this way avoids a
   nested `cargo build` at test time (which contends on cargo's target
@@ -185,14 +185,14 @@ Current real-terminal suites:
   resize re-windowing.
 - `crates/tui/tests/chat_render.rs` (probe `chat_smoke`) — the
   inline-viewport chat UI driven against an in-process stub gateway that
-  speaks `aura_channels::wire`. The stub dispatches on the typed message
-  (`aura_tui::smoke_contract`) so one probe covers many scenarios:
+  speaks `baybo_channels::wire`. The stub dispatches on the typed message
+  (`baybo_tui::smoke_contract`) so one probe covers many scenarios:
   - **Golden snapshots** for the clean, stable frames — the initial
     banner and a plain reply — stored under `tests/snapshots/*.snap` and
     compared after `normalize()` masks the version string (`vX.Y.Z`) and
     drops the volatile working-indicator timer line. Regenerate after an
     intentional UI change with `UPDATE_CHAT_SNAPSHOT=1 cargo test -p
-    aura-tui --test chat_render`. These catch *unanticipated* visual
+    baybo-tui --test chat_render`. These catch *unanticipated* visual
     drift the structural asserts would miss.
   - **Structural assertions** for the dynamic scenarios: a tool-call line
     (`Read(src/lib.rs)` + `⎿` result), a subagent surfacing as a `Task`
@@ -217,11 +217,11 @@ Current real-terminal suites:
 
 ```bash
 cargo test                                              # full workspace
-cargo test -p aura-security                             # one crate
-cargo test -p aura-integration-tests --test security_pipeline   # one file
-cargo test -p aura-integration-tests --test tool_boundary -- --nocapture
-cargo test -p aura-setup --test picker_render           # real-terminal (needs tmux)
-cargo test -p aura-tui   --test chat_render             # real-terminal (needs tmux)
+cargo test -p baybo-security                             # one crate
+cargo test -p baybo-integration-tests --test security_pipeline   # one file
+cargo test -p baybo-integration-tests --test tool_boundary -- --nocapture
+cargo test -p baybo-setup --test picker_render           # real-terminal (needs tmux)
+cargo test -p baybo-tui   --test chat_render             # real-terminal (needs tmux)
 ```
 
 The real-terminal suites need `tmux` on `PATH`; without it they self-skip

@@ -45,38 +45,38 @@ license = "MIT"
 
 [workspace.dependencies]
 # Internal crates
-aura-model = { path = "crates/model" }
-aura-channels = { path = "crates/channels" }
-aura-llm = { path = "crates/llm" }
-aura-tools = { path = "crates/tools" }
-aura-workspace = { path = "crates/workspace", default-features = false }
-aura-context = { path = "crates/context" }
-aura-session = { path = "crates/session" }
-aura-job = { path = "crates/job" }
-aura-memory = { path = "crates/memory" }
-aura-cost = { path = "crates/cost" }
-aura-query = { path = "crates/query" }
-aura-trace = { path = "crates/trace" }
-aura-security = { path = "crates/security" }
-aura-sandbox = { path = "crates/sandbox" }
-aura-agent = { path = "crates/agent" }
-aura-store = { path = "crates/store" }
-aura-storage = { path = "crates/storage" }
-aura-skills = { path = "crates/skills" }
-aura-skills-assessor = { path = "crates/skills-assessor" }
-aura-subagent = { path = "crates/subagent" }
-aura-task = { path = "crates/task" }
-aura-cron = { path = "crates/cron" }
-aura-config = { path = "crates/config" }
-aura-cli = { path = "crates/cli" }
-aura-gateway = { path = "crates/gateway" }
-aura-tui = { path = "crates/tui" }
-aura-pairing = { path = "crates/pairing" }
-aura-integration-tests = { path = "crates/integration-tests" }
-aura-janitor = { path = "crates/janitor" }
-aura-setup = { path = "crates/setup" }
-aura-term-harness = { path = "crates/term-harness" }
-aura-bench-web = { path = "bench/bench-web" }
+baybo-model = { path = "crates/model" }
+baybo-channels = { path = "crates/channels" }
+baybo-llm = { path = "crates/llm" }
+baybo-tools = { path = "crates/tools" }
+baybo-workspace = { path = "crates/workspace", default-features = false }
+baybo-context = { path = "crates/context" }
+baybo-session = { path = "crates/session" }
+baybo-job = { path = "crates/job" }
+baybo-memory = { path = "crates/memory" }
+baybo-cost = { path = "crates/cost" }
+baybo-query = { path = "crates/query" }
+baybo-trace = { path = "crates/trace" }
+baybo-security = { path = "crates/security" }
+baybo-sandbox = { path = "crates/sandbox" }
+baybo-agent = { path = "crates/agent" }
+baybo-store = { path = "crates/store" }
+baybo-storage = { path = "crates/storage" }
+baybo-skills = { path = "crates/skills" }
+baybo-skills-assessor = { path = "crates/skills-assessor" }
+baybo-subagent = { path = "crates/subagent" }
+baybo-task = { path = "crates/task" }
+baybo-cron = { path = "crates/cron" }
+baybo-config = { path = "crates/config" }
+baybo-cli = { path = "crates/cli" }
+baybo-gateway = { path = "crates/gateway" }
+baybo-tui = { path = "crates/tui" }
+baybo-pairing = { path = "crates/pairing" }
+baybo-integration-tests = { path = "crates/integration-tests" }
+baybo-janitor = { path = "crates/janitor" }
+baybo-setup = { path = "crates/setup" }
+baybo-term-harness = { path = "crates/term-harness" }
+baybo-bench-web = { path = "bench/bench-web" }
 # External dependencies
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -161,7 +161,7 @@ ts-rs = { version = "11", features = ["serde-compat", "no-serde-warnings"] }
 zstd = "0.13"
 # MCP client: rmcp for the protocol + transports, oauth2 for the
 # authorization-code-with-PKCE flow, `open` to launch the user's browser
-# during `aura mcp add` against an OAuth-protected HTTP server, base64 for
+# during `baybo mcp add` against an OAuth-protected HTTP server, base64 for
 # PKCE challenge encoding.
 rmcp = { version = "1.5", default-features = false, features = [
     "client",
@@ -175,53 +175,53 @@ open = "5"
 base64 = "0.22"
 
 [package]
-name = "aura"
+name = "baybo"
 version.workspace = true
 edition.workspace = true
 
 [features]
-# Build a benchmark-only `aura` that recalls memory but never writes it, so the
+# Build a benchmark-only `baybo` that recalls memory but never writes it, so the
 # LOCOMO bench (`bench/memory`) can drive the real agent end-to-end without QA
 # turns polluting the recall scope. Wraps the backend in
-# `aura_memory::ReadOnlyMemory` (see `src/runtime.rs`). NOT for production.
-bench-readonly-memory = ["aura-memory/bench-readonly-memory"]
+# `baybo_memory::ReadOnlyMemory` (see `src/runtime.rs`). NOT for production.
+bench-readonly-memory = ["baybo-memory/bench-readonly-memory"]
 
 # Compile the Bash tool's bench profile: run shell commands raw inside an
 # already-disposable container — no uv shims, no work-dir jail, cwd inherited
 # from the process, and a dedicated prompt. Also skips the workspace
-# identity-repo `git init` (aura-workspace) so a bench container needs no `git`
+# identity-repo `git init` (baybo-workspace) so a bench container needs no `git`
 # on PATH. Distinct from the `sandbox.mode = none` config (which only drops the
 # OS sandbox but keeps uv + the work/ jail). Off by default; absent in every
 # prod build. For bench/swe + bench/terminal-bench-1.0.
-bench-bash = ["aura-tools/bench-bash", "aura-workspace/bench-bash"]
+bench-bash = ["baybo-tools/bench-bash", "baybo-workspace/bench-bash"]
 
 [dependencies]
-aura-model = { workspace = true }
-aura-channels = { workspace = true }
-aura-llm = { workspace = true }
-aura-tools = { workspace = true }
-aura-workspace = { workspace = true, features = ["io"] }
-aura-context = { workspace = true }
-aura-job = { workspace = true }
-aura-memory = { workspace = true }
-aura-cost = { workspace = true }
-aura-trace = { workspace = true }
-aura-security = { workspace = true }
-aura-sandbox = { workspace = true }
-aura-agent = { workspace = true }
-aura-cron = { workspace = true }
-aura-janitor = { workspace = true }
-aura-storage = { workspace = true }
-aura-store = { workspace = true }
-aura-skills = { workspace = true }
-aura-skills-assessor = { workspace = true }
-aura-subagent = { workspace = true }
-aura-task = { workspace = true }
-aura-config = { workspace = true }
-aura-cli = { workspace = true }
-aura-gateway = { workspace = true }
-aura-setup = { workspace = true }
-aura-tui = { workspace = true }
+baybo-model = { workspace = true }
+baybo-channels = { workspace = true }
+baybo-llm = { workspace = true }
+baybo-tools = { workspace = true }
+baybo-workspace = { workspace = true, features = ["io"] }
+baybo-context = { workspace = true }
+baybo-job = { workspace = true }
+baybo-memory = { workspace = true }
+baybo-cost = { workspace = true }
+baybo-trace = { workspace = true }
+baybo-security = { workspace = true }
+baybo-sandbox = { workspace = true }
+baybo-agent = { workspace = true }
+baybo-cron = { workspace = true }
+baybo-janitor = { workspace = true }
+baybo-storage = { workspace = true }
+baybo-store = { workspace = true }
+baybo-skills = { workspace = true }
+baybo-skills-assessor = { workspace = true }
+baybo-subagent = { workspace = true }
+baybo-task = { workspace = true }
+baybo-config = { workspace = true }
+baybo-cli = { workspace = true }
+baybo-gateway = { workspace = true }
+baybo-setup = { workspace = true }
+baybo-tui = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

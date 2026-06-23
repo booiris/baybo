@@ -14,10 +14,10 @@ import type { Folder } from './types';
 // `GET /v1/chat/folders` and replaced wholesale on every
 // `Frame::FoldersChanged` snapshot (folders are few, so no patch-merge).
 // Only the per-folder collapsed/expanded state is client-local, persisted
-// under a single `aura.folders.collapsed` localStorage key and synced
+// under a single `baybo.folders.collapsed` localStorage key and synced
 // across tabs via the storage event.
 
-const COLLAPSED_KEY = 'aura.folders.collapsed';
+const COLLAPSED_KEY = 'baybo.folders.collapsed';
 
 function readCollapsed(): Set<string> {
   try {

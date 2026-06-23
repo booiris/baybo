@@ -4,8 +4,8 @@
 //! browser tool sidecar).
 //!
 //! Sidecars are spawned at runtime with the host's `bun` / `node`
-//! binary resolved from `PATH` (overridable via `AURA_BUN_BIN` /
-//! `AURA_NODE_BIN`) — no JS runtime is shipped inside the gateway
+//! binary resolved from `PATH` (overridable via `BAYBO_BUN_BIN` /
+//! `BAYBO_NODE_BIN`) — no JS runtime is shipped inside the gateway
 //! binary.
 
 use std::collections::HashSet;
@@ -13,7 +13,7 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use aura_workspace::paths::aura_cache_root;
+use baybo_workspace::paths::baybo_cache_root;
 use thiserror::Error;
 
 mod generated {
@@ -27,7 +27,7 @@ mod generated {
 use generated::{SIDECARS, SidecarAsset, SidecarAuxAsset};
 
 /// Well-known domain identifiers. New domains are added by appending
-/// here AND by setting `"aura": { "domain": "<name>" }` in the new
+/// here AND by setting `"baybo": { "domain": "<name>" }` in the new
 /// sidecar's `package.json`. The runtime is otherwise agnostic — a
 /// build-time domain string that doesn't appear here is still
 /// accepted, callers just won't have a constant to refer to it by.
@@ -76,7 +76,7 @@ struct SidecarEntry {
 ///
 /// Each sidecar is tagged with its **domain** — the business family
 /// it participates in (`channel`, `tool`, …) — declared in the
-/// sidecar's own `package.json` (`aura.domain`). Callers iterate
+/// sidecar's own `package.json` (`baybo.domain`). Callers iterate
 /// per domain so the channel list, the embedded-MCP profiles, and
 /// any future family stay decoupled. New domains add by appending to
 /// the sidecar's package.json + (optionally) adding a constant in
@@ -152,7 +152,7 @@ impl SidecarRuntime {
     }
 
     /// Cache root that holds every materialised `<name>-<hash>/` dir
-    /// (`$XDG_CACHE_HOME/aura/sidecars/`). Returned only when the
+    /// (`$XDG_CACHE_HOME/baybo/sidecars/`). Returned only when the
     /// runtime contains at least one sidecar — an empty runtime has no
     /// path to point at. Consumed by the janitor's sidecar-cache sweep
     /// to know which root directory to walk.
@@ -166,7 +166,7 @@ impl SidecarRuntime {
     /// sidecar in this build. Consumed by the janitor's sidecar-cache
     /// sweep as the "do not delete" allowlist — anything else under
     /// `sidecars_cache_root()` whose mtime is older than the TTL is
-    /// stale cruft from a prior Aura version.
+    /// stale cruft from a prior Baybo version.
     pub fn live_dir_names(&self) -> HashSet<String> {
         self.sidecars
             .iter()
@@ -182,7 +182,7 @@ impl SidecarRuntime {
 }
 
 fn cache_root() -> Result<PathBuf, SidecarError> {
-    aura_cache_root().ok_or(SidecarError::NoCacheDir)
+    baybo_cache_root().ok_or(SidecarError::NoCacheDir)
 }
 
 fn install_sidecar(cache_root: &Path, asset: &SidecarAsset) -> Result<PathBuf, SidecarError> {
@@ -240,7 +240,7 @@ fn safe_relative_path(raw: &str) -> Result<&Path, SidecarError> {
 
 fn decompress_to(zst: &[u8], dest: &Path, what: &'static str) -> Result<(), SidecarError> {
     // Per-process tempfile under the same dir as `dest`, atomically
-    // persisted. `$XDG_CACHE_HOME/aura/` is user-level shared across
+    // persisted. `$XDG_CACHE_HOME/baybo/` is user-level shared across
     // every workspace the same UID runs, so two gateways
     // first-installing concurrently would otherwise race on a fixed
     // `<dest>.part`. NamedTempFile gives each a unique `.tmp<rand>`

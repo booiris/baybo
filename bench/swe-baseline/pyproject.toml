@@ -4,7 +4,7 @@
 # reused on-disk `.venv` here — never `pip install` into the system interpreter.
 # Deps-only env (`package = false`), not an installable package.
 [project]
-name = "aura-bench-swe-baseline-pytools"
+name = "baybo-bench-swe-baseline-pytools"
 version = "0.0.0"
 description = "SWE-bench baseline: run mini-swe-agent + ds4-flash, grade with the official swebench harness."
 # swebench's stack (datasets/pyarrow/...) lags the newest CPython; mini needs >=3.10.

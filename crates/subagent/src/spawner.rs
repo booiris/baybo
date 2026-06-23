@@ -2,13 +2,13 @@
 //!
 //! Like [`crate::SubagentDispatchLimiter`], this trait lives in the leaf
 //! crate so the tool can depend on the capability without a cycle: the
-//! tool holds an `Arc<dyn SubagentSpawner>`, and `aura-agent` provides the
+//! tool holds an `Arc<dyn SubagentSpawner>`, and `baybo-agent` provides the
 //! actor-backed impl (which builds a real `AgentActor` for the child).
-//! `aura-subagent` depends on neither the runtime nor `aura-tools`, so
+//! `baybo-subagent` depends on neither the runtime nor `baybo-tools`, so
 //! neither direction closes a loop.
 
 use async_trait::async_trait;
-use aura_model::{SubagentParentContext, SubagentResult, SubagentSpawnRequest};
+use baybo_model::{SubagentParentContext, SubagentResult, SubagentSpawnRequest};
 
 /// Launches a child subagent and returns the result the tool renders.
 ///

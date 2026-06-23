@@ -12,10 +12,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_context::SUMMARIZE_INSTRUCTION;
-use aura_integration_tests::AgentTestHarness;
-use aura_llm::{StreamEvent, TokenUsage};
-use aura_model::ContentBlock;
+use baybo_context::SUMMARIZE_INSTRUCTION;
+use baybo_integration_tests::AgentTestHarness;
+use baybo_llm::{StreamEvent, TokenUsage};
+use baybo_model::ContentBlock;
 use chrono::Utc;
 use tempfile::TempDir;
 
@@ -26,7 +26,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 /// fingerprint of the inner `Summarize` strategy's chat callback
 /// firing. Fast-path success means none of the captured requests
 /// match; fall-through means at least one does.
-fn any_request_invoked_summarizer(requests: &[aura_llm::ChatRequest]) -> bool {
+fn any_request_invoked_summarizer(requests: &[baybo_llm::ChatRequest]) -> bool {
     requests.iter().any(|req| {
         req.messages.last().is_some_and(|m| {
             m.content
@@ -49,7 +49,7 @@ async fn fast_path_skips_chat_callback_when_summary_md_present() {
     // `<root>/state/sessions/<session_id>/summary.md` from it on the
     // second turn. Held until the test ends.
     let workspace_root = TempDir::new().expect("tempdir");
-    let workspace = Arc::new(aura_workspace::WorkspacePaths::new(
+    let workspace = Arc::new(baybo_workspace::WorkspacePaths::new(
         workspace_root.path().to_path_buf(),
     ));
 

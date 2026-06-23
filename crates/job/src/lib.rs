@@ -17,11 +17,11 @@ mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-use aura_model::{JobId, SessionId, SpanId, TriggerKind};
+use baybo_model::{JobId, SessionId, SpanId, TriggerKind};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub use aura_store::{JobRow, JobStore, JobTransitionRow};
+pub use baybo_store::{JobRow, JobStore, JobTransitionRow};
 pub use cancel::CancelReason;
 pub use cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
 pub use error::JobError;
@@ -162,7 +162,7 @@ fn default_shape() -> JobShape {
 }
 
 /// One externally-triggered unit of work. Lives within a `Session` and
-/// owns a chain of `Step`s (in `aura-trace`).
+/// owns a chain of `Step`s (in `baybo-trace`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: JobId,
@@ -423,7 +423,7 @@ pub struct JobTransition {
 #[allow(unused_must_use)] // tests assert on `j.status` directly; the JobTransition audit record isn't relevant here
 mod tests {
     use super::*;
-    use aura_model::ContentBlock;
+    use baybo_model::ContentBlock;
 
     fn user_chat_input() -> JobInput {
         JobInput::UserChat {

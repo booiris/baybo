@@ -32,7 +32,7 @@ pub(crate) const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Resolve the binary path: explicit override when set, otherwise
 /// PATH-walk for `binary_name`. Explicit overrides MUST be absolute —
 /// relative paths resolve against whichever cwd happens to be in
-/// effect (different for `aura external-agent setup` vs the gateway
+/// effect (different for `baybo external-agent setup` vs the gateway
 /// service), which would let probe succeed under one and fail under
 /// the other.
 pub(crate) fn resolve_binary(

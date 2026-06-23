@@ -2,7 +2,7 @@
 
 use std::sync::OnceLock;
 
-use aura_security::{InjectionDetector, InjectionSeverity};
+use baybo_security::{InjectionDetector, InjectionSeverity};
 use libfuzzer_sys::fuzz_target;
 
 static DETECTOR: OnceLock<InjectionDetector> = OnceLock::new();

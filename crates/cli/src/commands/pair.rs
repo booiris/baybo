@@ -1,13 +1,13 @@
-//! `aura pair` subcommand family.
+//! `baybo pair` subcommand family.
 //!
 //! Surfaces the per-user pairing gate to operators. See
 //! `docs/modules/pairing.md` for the gate's semantics.
 
 use std::sync::Arc;
 
-use aura_model::ChannelType;
-use aura_storage::retry::retry_on_busy;
-use aura_store::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
+use baybo_model::ChannelType;
+use baybo_storage::retry::retry_on_busy;
+use baybo_store::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
 use chrono::Utc;
 use serde_json::json;
 
@@ -32,7 +32,8 @@ pub async fn handle(ctx: &CommandContext, cmd: PairCmd) -> Result<CommandOutput>
 fn require_store(ctx: &CommandContext) -> Result<&Arc<dyn ChannelPairingStore>> {
     ctx.channel_pairing_store.as_ref().ok_or_else(|| {
         CliError::Config(
-            "pairing store unavailable — run from the workspace root with a valid aura.json".into(),
+            "pairing store unavailable — run from the workspace root with a valid baybo.json"
+                .into(),
         )
     })
 }

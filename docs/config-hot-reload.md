@@ -5,14 +5,14 @@ This is the approved design for config hot-reload. It folds together what were o
 
 ## Goal
 
-Apply a subset of `aura.json` changes to a running gateway without a restart, honoring the contract in [`docs/modules/config.md`](modules/config.md) §"Reload semantics": an explicit hot-updatable whitelist, an atomic swap, validation rollback, and in-flight isolation.
+Apply a subset of `baybo.json` changes to a running gateway without a restart, honoring the contract in [`docs/modules/config.md`](modules/config.md) §"Reload semantics": an explicit hot-updatable whitelist, an atomic swap, validation rollback, and in-flight isolation.
 
 The headline win is **LLM identity** (`provider`, `model`, `base_url`, `api_key`, `pricing`, `context_window`, `default-llm`, `model_tiers`) — today a restart, full stop — plus **cost limits** (`cost.rate_limit`, `cost.spending_limits`).
 
 ## Non-goals
 
 - Hot-reloading anything outside the whitelist (ports, bind address, workspace path, encryption key file, channels, session, the rest of `agent`). These **hard-reject** on reload.
-- HTTP add/remove model endpoints — the `aura llm` CLI already does full CRUD, and reload rebuilds the whole pool from `config.llm` regardless of which surface triggered it.
+- HTTP add/remove model endpoints — the `baybo llm` CLI already does full CRUD, and reload rebuilds the whole pool from `config.llm` regardless of which surface triggered it.
 - TUI inline reload (the TUI boot path has no admin HTTP server; SIGHUP only, if wired).
 - Making `skill_assessor` *follow* a hot-reload model swap — it's now on the billed path (a system-attributed `BoundBilledLlm`) but stays pinned to the boot-time default; see the TODO below.
 
@@ -21,7 +21,7 @@ The headline win is **LLM identity** (`provider`, `model`, `base_url`, `api_key`
 Restated from `config.md` §"Reload semantics", made concrete for this work:
 
 - **Hot-updatable whitelist:** `llm`, `default_llm`, `agent.model_tiers`, `cost.rate_limit`, `cost.spending_limits`. Any diff touching a field outside this set rejects the **entire** reload (atomic — nothing swaps) with an error naming the offending section. An operator who edits a model *and* a port in one shot gets the model change rejected too and must restart; this is deliberate and predictable.
-- **Atomic swap:** a successful reload swaps a single `Arc<AuraConfig>` holding all whitelisted changes together. Partial application is forbidden. *(Implementation note: commit publishes in three sub-swaps — pool, then cost limits + rate atomics, then the config handle — not one compare-and-swap. Each value is individually valid, so there's no torn read, but a turn starting in the ~ns gap can observe new-pool + old-limits. Practically fine; not a literal single publish.)*
+- **Atomic swap:** a successful reload swaps a single `Arc<BayboConfig>` holding all whitelisted changes together. Partial application is forbidden. *(Implementation note: commit publishes in three sub-swaps — pool, then cost limits + rate atomics, then the config handle — not one compare-and-swap. Each value is individually valid, so there's no torn read, but a turn starting in the ~ns gap can observe new-pool + old-limits. Practically fine; not a literal single publish.)*
 - **Validation rollback:** a reload that fails `validate()` leaves the running config untouched and returns `ConfigError`; no observable partial state.
 - **In-flight behavior:** an LLM turn already running finishes on the client it resolved at turn start; only the next turn sees the new pool.
 
@@ -29,15 +29,15 @@ Restated from `config.md` §"Reload semantics", made concrete for this work:
 
 ### Layering
 
-`aura-config` is a leaf crate (no `aura-*` deps), so it owns only the pure machinery:
+`baybo-config` is a leaf crate (no `baybo-*` deps), so it owns only the pure machinery:
 
-- `ConfigHandle` — newtype over `Arc<parking_lot::RwLock<Arc<AuraConfig>>>` (parking_lot is already the workspace-wide lock primitive; the swap is read per-turn / per-request, not per-token, so lock-free `ArcSwap` buys nothing and would add a new dep to ~5 crates). `current()` clones out the live `Arc`; `store()` swaps under the write lock. Holds the **current applied** config; the orchestrator diffs against it and stores the new one on a successful commit.
-- The orchestrator re-reads through the existing `AuraConfig::load_from_file` (already a load+validate wrapper); no separate `reload_from_file` is needed.
-- `hot_reload_diff(old: &AuraConfig, new: &AuraConfig) -> Result<(), ConfigError>` — pure; returns `Err` naming the first non-whitelisted section that changed. No I/O, matching the crate's "validation must be pure" constraint.
+- `ConfigHandle` — newtype over `Arc<parking_lot::RwLock<Arc<BayboConfig>>>` (parking_lot is already the workspace-wide lock primitive; the swap is read per-turn / per-request, not per-token, so lock-free `ArcSwap` buys nothing and would add a new dep to ~5 crates). `current()` clones out the live `Arc`; `store()` swaps under the write lock. Holds the **current applied** config; the orchestrator diffs against it and stores the new one on a successful commit.
+- The orchestrator re-reads through the existing `BayboConfig::load_from_file` (already a load+validate wrapper); no separate `reload_from_file` is needed.
+- `hot_reload_diff(old: &BayboConfig, new: &BayboConfig) -> Result<(), ConfigError>` — pure; returns `Err` naming the first non-whitelisted section that changed. No I/O, matching the crate's "validation must be pure" constraint.
 
-The heavy lifting can't live in `aura-config` (it would need `aura-agent`/`aura-cost`/`aura-llm`). It lives behind a trait:
+The heavy lifting can't live in `baybo-config` (it would need `baybo-agent`/`baybo-cost`/`baybo-llm`). It lives behind a trait:
 
-- **`trait ConfigReloader`** (defined in `aura-gateway`, so `AdminState`/`GatewayDeps` can name it): `async fn reload(&self) -> Result<ReloadOutcome, ReloadError>`.
+- **`trait ConfigReloader`** (defined in `baybo-gateway`, so `AdminState`/`GatewayDeps` can name it): `async fn reload(&self) -> Result<ReloadOutcome, ReloadError>`.
 - **Concrete impl in the bin crate** (`src/`), because it calls `boot::build_llm_client_for_entry`. It owns the `ConfigHandle`, a concrete `LlmReloader`, a concrete `CostReloader`, and a **reload `Mutex`** so concurrent triggers (endpoint + SIGHUP racing) serialize. Handed to `GatewayDeps` as `Arc<dyn ConfigReloader>`; the SIGHUP handler holds the same `Arc`.
 
 `ReloadOutcome` summarizes what changed (new active model, entries added / removed / dropped-on-build-failure) for the HTTP response + logs.
@@ -46,7 +46,7 @@ The heavy lifting can't live in `aura-config` (it would need `aura-agent`/`aura-
 
 Driven under the reload `Mutex`:
 
-1. `new = AuraConfig::load_from_file(path)?` — load + validate. Fail ⇒ return, nothing swaps.
+1. `new = BayboConfig::load_from_file(path)?` — load + validate. Fail ⇒ return, nothing swaps.
 2. `old = handle.load()`.
 3. `hot_reload_diff(&old, &new)?` — non-whitelisted change ⇒ reject, nothing swaps.
 4. **Prepare** (fallible):
@@ -82,7 +82,7 @@ Subagent pinning needs no special handling: `resolve(Some(removed_entry))` alrea
 
 ### Admin read-through (no stale snapshots)
 
-`AdminState` holds the pool handle instead of a captured `Arc<BillableLlm>`; `get_llm` resolves the current default per request, so it's always truthful after a reload. (`aura-gateway` already depends on `aura-agent`, so it can name the pool type directly — no trait indirection.)
+`AdminState` holds the pool handle instead of a captured `Arc<BillableLlm>`; `get_llm` resolves the current default per request, so it's always truthful after a reload. (`baybo-gateway` already depends on `baybo-agent`, so it can name the pool type directly — no trait indirection.)
 
 The generic config endpoints (`GET`/`PUT`/`DELETE /v1/config`) read the **current on-disk** config via `read_config_for_dashboard`, not the boot `state.config` snapshot. Otherwise `GET` would lie after a reload, and `PUT`/`DELETE` would build from the stale snapshot and write it back — clobbering changes a prior hot-reload already applied. (The LLM admin endpoints already used `read_config_for_dashboard`.) The path `read_config_for_dashboard` reads and the path the reloader applies are the **same** value (`resolve_config_path()`, or the default file when none existed at boot) — otherwise a first-run create + reload would apply the file to the live pool yet leave `GET /v1/config` still reporting the empty boot snapshot.
 
@@ -96,9 +96,9 @@ The OpenRouter live-pricing loop (`src/runtime.rs`, currently a detached `tokio:
 
 ### Credential rotation
 
-An API key lives in the **vault**, keyed by entry name — never in `aura.json`. So rotating a key produces an empty `config.llm` diff. This is exactly why `reload` rebuilds the pool **unconditionally** (above) rather than gating on the diff: a diff-gated rebuild would leave the running pool bound to the *old* credential while reporting success (a revoked key would stay live). One extra piece is needed at the write side:
+An API key lives in the **vault**, keyed by entry name — never in `baybo.json`. So rotating a key produces an empty `config.llm` diff. This is exactly why `reload` rebuilds the pool **unconditionally** (above) rather than gating on the diff: a diff-gated rebuild would leave the running pool bound to the *old* credential while reporting success (a revoked key would stay live). One extra piece is needed at the write side:
 
-- **Stage before build.** `update_model` writes the new secret to the vault **before** `dry_run`, because every provider requires the key at `create_client` construction; otherwise the pre-flight (and an entry gaining its first key) would build against the absent/old value and could wrongly reject a valid edit. Once staged, the subsequent `reload` rebuilds against the new key; the CLI's `aura llm edit --api-key` path gets the same effect because its post-write SIGHUP also runs `reload` (which always rebuilds).
+- **Stage before build.** `update_model` writes the new secret to the vault **before** `dry_run`, because every provider requires the key at `create_client` construction; otherwise the pre-flight (and an entry gaining its first key) would build against the absent/old value and could wrongly reject a valid edit. Once staged, the subsequent `reload` rebuilds against the new key; the CLI's `baybo llm edit --api-key` path gets the same effect because its post-write SIGHUP also runs `reload` (which always rebuilds).
 
 ## Cost consumer
 
@@ -111,7 +111,7 @@ Both are infallible to prepare.
 
 - **Admin endpoints:** `update_model`, `set_default`, the generic `PUT`/`DELETE /v1/config`, plus a new `POST /v1/config/reload`. Each validates and **dry-runs the rebuild before** writing config to disk — so an edit whose default model can't be built is rejected (400) without dirtying the file, which would otherwise be re-read and silently dropped by a later SIGHUP — then calls `reloader.reload()` **inline**; the HTTP response carries the `ReloadOutcome` (new active model) or the validation/prepare error. `MutateResponse.requires_restart` is `false` on a hot change. The generic `PUT`/`DELETE` can target a non-hot field: that persists to disk and reports `requires_restart: true` (via the expected `NotHotReloadable`, not an error) rather than applying live. `update_model` additionally stages a rotated `api_key` into the vault **before** the dry-run (every provider needs the key at client construction, so the build must resolve the new value) — see "Credential rotation" above.
 - **SIGHUP:** a new arm in `install_signal_handler` (alongside SIGINT/SIGTERM → shutdown) re-reads the on-disk file and runs the same orchestrator. Covers hand-edits and is the mechanism the CLI uses; since `reload` always rebuilds the pool, a CLI key rotation (vault-only, invisible in the diff) takes effect through this path too.
-- **`aura llm` CLI** (`Add`, `Edit`, `Remove`, `Default` — the four mutating subcommands; `Status`/`Probe`/`LiveModel` are read-only): write config (+ vault — an `Edit` can touch *only* the vault, e.g. a key rotation), then `SIGHUP` the gateway PID from `<workspace>/state/aura.lock` (the singleton records it) — but **only when the lock is held** by another process. A free lock means no gateway is running, so the recorded PID is stale; the CLI clears it under the lock before releasing, so a racing sibling CLI that observes the brief hold as `WouldBlock` can't read a stale PID and `SIGHUP` an unrelated, PID-reused process. Best-effort: if no live gateway holds the lock, print "config written; takes effect on next start". The CLI is a separate process and gets no synchronous reload result — that's why the signal path exists. The reloader's config path falls back to the default config file when none existed at boot, so a first-run `aura llm add` that creates the file and signals us still reloads instead of no-op'ing with `NoConfigPath`.
+- **`baybo llm` CLI** (`Add`, `Edit`, `Remove`, `Default` — the four mutating subcommands; `Status`/`Probe`/`LiveModel` are read-only): write config (+ vault — an `Edit` can touch *only* the vault, e.g. a key rotation), then `SIGHUP` the gateway PID from `<workspace>/state/baybo.lock` (the singleton records it) — but **only when the lock is held** by another process. A free lock means no gateway is running, so the recorded PID is stale; the CLI clears it under the lock before releasing, so a racing sibling CLI that observes the brief hold as `WouldBlock` can't read a stale PID and `SIGHUP` an unrelated, PID-reused process. Best-effort: if no live gateway holds the lock, print "config written; takes effect on next start". The CLI is a separate process and gets no synchronous reload result — that's why the signal path exists. The reloader's config path falls back to the default config file when none existed at boot, so a first-run `baybo llm add` that creates the file and signals us still reloads instead of no-op'ing with `NoConfigPath`.
 
 ## Failure semantics
 
@@ -141,12 +141,12 @@ Both are infallible to prepare.
 
 Implemented:
 
-- `hot_reload_diff` (`aura-config`): accepts whitelisted-only diffs; rejects each non-whitelisted section (table-driven), including mixed hot+non-hot ⇒ reject.
-- Cost (`aura-cost`): `CostManager::set_limits` is observed by the next `check`.
-- Rate limit (`aura-agent`): the live `LiveRateLimit` knobs take effect on the next request without rebuilding the limiter.
-- Gateway (`aura-gateway`): the LLM admin endpoints round-trip with inline reload wired in (`update_model` returns `requires_restart: false` via the test stub reloader); the OpenAPI drift check covers the new `POST /v1/config/reload`.
-- Gateway (`aura-gateway`): a `dry_run` that rejects the candidate leaves the on-disk config **byte-identical** — the guarantee that an unbuildable edit never dirties the file (`rejected_dry_run_leaves_config_file_untouched`).
-- Credentials (`aura-llm`): `resolve_api_key` reflects a rotated vault key — the property the always-rebuild reload leans on, so an `aura llm edit --api-key` / admin key rotation takes effect on the next reload (`resolve_reflects_a_rotated_vault_key`).
+- `hot_reload_diff` (`baybo-config`): accepts whitelisted-only diffs; rejects each non-whitelisted section (table-driven), including mixed hot+non-hot ⇒ reject.
+- Cost (`baybo-cost`): `CostManager::set_limits` is observed by the next `check`.
+- Rate limit (`baybo-agent`): the live `LiveRateLimit` knobs take effect on the next request without rebuilding the limiter.
+- Gateway (`baybo-gateway`): the LLM admin endpoints round-trip with inline reload wired in (`update_model` returns `requires_restart: false` via the test stub reloader); the OpenAPI drift check covers the new `POST /v1/config/reload`.
+- Gateway (`baybo-gateway`): a `dry_run` that rejects the candidate leaves the on-disk config **byte-identical** — the guarantee that an unbuildable edit never dirties the file (`rejected_dry_run_leaves_config_file_untouched`).
+- Credentials (`baybo-llm`): `resolve_api_key` reflects a rotated vault key — the property the always-rebuild reload leans on, so an `baybo llm edit --api-key` / admin key rotation takes effect on the next reload (`resolve_reflects_a_rotated_vault_key`).
 
 Deferred (the orchestrator is bin-only, so these need bin-crate or end-to-end fixtures):
 

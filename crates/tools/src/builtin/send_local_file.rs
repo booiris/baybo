@@ -5,8 +5,8 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_model::{ContentBlock, TrustLevel};
-use aura_store::BlobStore;
+use baybo_model::{ContentBlock, TrustLevel};
+use baybo_store::BlobStore;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -117,7 +117,7 @@ impl Tool for SendFileTool {
 
         require_absolute(&p.path, "SendFile", "path")?;
 
-        if aura_security::is_sensitive_path(&p.path) {
+        if baybo_security::is_sensitive_path(&p.path) {
             tracing::warn!(path = %p.path.display(), "SendFile refused sensitive path");
             return Err(ToolError::Execution(format!(
                 "refused to send sensitive path {} — credential-bearing files are blocked by security policy",
@@ -235,16 +235,16 @@ fn guess_mime(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, User};
-    use aura_storage::test_support::MemoryBlobStore;
+    use baybo_model::{ChannelType, User};
+    use baybo_storage::test_support::MemoryBlobStore;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
     fn ctx() -> ToolContext {
         ToolContext {
             session_id: "test".into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -253,7 +253,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancellation_token: CancellationToken::new(),
             workspace_root: PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: None,
             notifier: None,

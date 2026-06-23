@@ -23,9 +23,9 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
-use aura_llm::{ChatRequest, LlmResponse};
-use aura_model::{ChatMessage, ContentBlock};
-use aura_trace::LlmCallInputs;
+use baybo_llm::{ChatRequest, LlmResponse};
+use baybo_model::{ChatMessage, ContentBlock};
+use baybo_trace::LlmCallInputs;
 use tracing::{debug, warn};
 
 use crate::error::ContextError;
@@ -124,7 +124,7 @@ pub(crate) fn partition_system(messages: &[ChatMessage]) -> (Vec<ChatMessage>, V
     let mut system = Vec::new();
     let mut rest = Vec::new();
     for msg in messages {
-        if msg.role == aura_model::Role::System {
+        if msg.role == baybo_model::Role::System {
             system.push(msg.clone());
         } else {
             rest.push(msg.clone());
@@ -545,7 +545,7 @@ fn build_summary_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::Role;
+    use baybo_model::Role;
 
     fn tool_use(id: &str) -> ChatMessage {
         ChatMessage::assistant(vec![ContentBlock::ToolUse {

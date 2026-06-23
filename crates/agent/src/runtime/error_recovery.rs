@@ -34,7 +34,7 @@ impl ErrorHandler {
     }
 
     /// Type-driven retry decision:
-    /// - `LlmError`: defers to [`aura_llm::LlmError::is_retriable`].
+    /// - `LlmError`: defers to [`baybo_llm::LlmError::is_retriable`].
     /// - `std::io::Error`: always retried — transport flake.
     /// - Anything else: do not retry. An unrecognised error shape is
     ///   safer to surface than to silently re-issue.
@@ -42,7 +42,7 @@ impl ErrorHandler {
         if attempt >= self.max_retries {
             return false;
         }
-        if let Some(llm_err) = error.downcast_ref::<aura_llm::LlmError>() {
+        if let Some(llm_err) = error.downcast_ref::<baybo_llm::LlmError>() {
             return llm_err.is_retriable();
         }
         if error.downcast_ref::<std::io::Error>().is_some() {
@@ -56,7 +56,7 @@ impl ErrorHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_llm::LlmError;
+    use baybo_llm::LlmError;
 
     fn handler() -> ErrorHandler {
         ErrorHandler::default()

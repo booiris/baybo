@@ -7,8 +7,8 @@ use std::sync::Arc;
 use crate::JobStatus;
 use crate::cancellation_registry::{JobCancellationGuard, JobCancellationRegistry};
 use crate::{CancelReason, Job, JobError, JobInput, JobShape, JobStatusKind, JobTransition};
-use aura_model::{JobId, SessionId, SpanId, TriggerKind};
-use aura_store::JobStore;
+use baybo_model::{JobId, SessionId, SpanId, TriggerKind};
+use baybo_store::JobStore;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -123,7 +123,7 @@ impl JobLifecycle {
     /// Create a new job in `Pending`.
     ///
     /// `origin` is the root trigger kind of the owning session — stored
-    /// on the job as-is (see `aura_job::kind`), independent of `input`.
+    /// on the job as-is (see `baybo_job::kind`), independent of `input`.
     /// `shape` is declared by the caller (the running code path), not
     /// inferred from `input`.
     ///
@@ -280,7 +280,7 @@ impl JobLifecycle {
     /// index instead of scanning the full table. Newest first.
     pub async fn list_by_session(
         &self,
-        session_id: &aura_model::SessionId,
+        session_id: &baybo_model::SessionId,
         status: Option<JobStatusKind>,
     ) -> Result<Vec<Job>> {
         let mut jobs = self
@@ -303,7 +303,7 @@ impl JobLifecycle {
     /// session.
     pub async fn list_active_by_session(
         &self,
-        session_id: &aura_model::SessionId,
+        session_id: &baybo_model::SessionId,
     ) -> Result<Vec<Job>> {
         self.store
             .list_active_by_session(session_id)
@@ -321,7 +321,7 @@ impl JobLifecycle {
     /// though its input is a `UserChat` payload.
     pub async fn list_active_turns_by_session(
         &self,
-        session_id: &aura_model::SessionId,
+        session_id: &baybo_model::SessionId,
     ) -> Result<Vec<Job>> {
         Ok(self
             .list_active_by_session(session_id)
@@ -339,7 +339,7 @@ impl JobLifecycle {
     /// flight from the user's point of view).
     pub async fn active_turn_started_at(
         &self,
-        session_id: &aura_model::SessionId,
+        session_id: &baybo_model::SessionId,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
         let jobs = self.list_active_turns_by_session(session_id).await?;
         Ok(jobs
@@ -427,7 +427,7 @@ impl JobLifecycle {
 mod tests {
     use super::*;
     use crate::test_support::MemoryJobStore;
-    use aura_model::{BackgroundCompressionPayload, ContentBlock};
+    use baybo_model::{BackgroundCompressionPayload, ContentBlock};
 
     fn user_chat_input() -> JobInput {
         JobInput::UserChat {

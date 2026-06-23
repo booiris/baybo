@@ -1,13 +1,13 @@
 //! Conversions between the rich trace domain types (`Step` / `Span` /
-//! `SpanEvent`) and their persistence rows in `aura-store`.
+//! `SpanEvent`) and their persistence rows in `baybo-store`.
 //!
-//! The `TraceStore` trait lives in `aura-store` and trades in rows, so
+//! The `TraceStore` trait lives in `baybo-store` and trades in rows, so
 //! the lifecycle recorder's logic stays in this crate while the store
 //! contract sits alongside every other one. Callers convert at the
 //! boundary via these helpers.
 
 use crate::{Result, Span, SpanEvent, Step, TraceError};
-use aura_store::{SpanEventRow, SpanRow, StepRow};
+use baybo_store::{SpanEventRow, SpanRow, StepRow};
 
 impl Step {
     pub fn to_row(&self) -> Result<StepRow> {
@@ -55,11 +55,11 @@ impl SpanEvent {
     }
 }
 
-impl From<aura_store::StorageError> for TraceError {
-    fn from(e: aura_store::StorageError) -> Self {
+impl From<baybo_store::StorageError> for TraceError {
+    fn from(e: baybo_store::StorageError) -> Self {
         match e {
-            aura_store::StorageError::NotFound(s) => TraceError::NotFound(s),
-            aura_store::StorageError::Internal(e) => TraceError::Internal(e),
+            baybo_store::StorageError::NotFound(s) => TraceError::NotFound(s),
+            baybo_store::StorageError::Internal(e) => TraceError::Internal(e),
             other => TraceError::Storage(other.to_string()),
         }
     }

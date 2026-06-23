@@ -1,5 +1,5 @@
-use aura_channels::{AgentEvent, AgentOutput, OutgoingMessage};
-use aura_model::SessionId;
+use baybo_channels::{AgentEvent, AgentOutput, OutgoingMessage};
+use baybo_model::SessionId;
 use tracing::{debug, error, warn};
 
 use super::Router;

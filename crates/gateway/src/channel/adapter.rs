@@ -13,23 +13,23 @@
 //!   ([`SessionEvent`] → [`Frame`]) and an outbound pump
 //!   ([`Frame`] → WebSocket bytes).
 //!
-//! All wire-format knowledge stays here; `aura-channels` never sees
+//! All wire-format knowledge stays here; `baybo-channels` never sees
 //! `Frame`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::wire::{
+use axum::extract::ws::{Message as AxumWsMessage, WebSocket};
+use baybo_channels::wire::{
     self, AttachmentKind, Frame, Message as WireMessage, TaskView, WireAttachment,
 };
-use aura_channels::{
+use baybo_channels::{
     AgentEvent, AgentOutput, Channel, ChannelError, ChannelRegistry, Connection, ConnectionId,
     ConnectionSink, MessageRole, NoticeLevel, SendOutcome, SessionEvent, ToolStatus, TurnStatus,
 };
-use aura_model::{ChannelType, ContentBlock};
-use aura_store::BlobStore;
-use aura_tools::ApprovalDecision;
-use axum::extract::ws::{Message as AxumWsMessage, WebSocket};
+use baybo_model::{ChannelType, ContentBlock};
+use baybo_store::BlobStore;
+use baybo_tools::ApprovalDecision;
 use futures::SinkExt;
 use futures::stream::SplitSink;
 use tokio::sync::mpsc;
@@ -55,7 +55,7 @@ pub(crate) struct Sidecar {
 /// Resolve the channel for `channel_type` from the registry, falling
 /// back to a lazy install for out-of-tree sidecar channels that the
 /// boot-time installer didn't know about (custom platforms declared
-/// via `aura.json`).
+/// via `baybo.json`).
 ///
 /// Split out from [`Sidecar::build`] so the route handler can run
 /// this *before* committing the sink to the build path. On `Err`,
@@ -550,10 +550,10 @@ async fn stat_attachment(
 #[cfg(test)]
 mod tests {
     use super::resolve_or_install_channel;
-    use aura_channels::wire::Frame;
-    use aura_channels::{AgentEvent, AgentOutput, ChannelRegistry, NoticeLevel};
-    use aura_model::ChannelType;
-    use aura_storage::test_support::MemoryBlobStore;
+    use baybo_channels::wire::Frame;
+    use baybo_channels::{AgentEvent, AgentOutput, ChannelRegistry, NoticeLevel};
+    use baybo_model::ChannelType;
+    use baybo_storage::test_support::MemoryBlobStore;
     use std::sync::Arc;
 
     /// An installed channel is returned directly without invoking the
@@ -575,7 +575,7 @@ mod tests {
     }
 
     /// An unknown channel type triggers the lazy install fallback so
-    /// out-of-tree sidecars declared via `aura.json` (not in the
+    /// out-of-tree sidecars declared via `baybo.json` (not in the
     /// built-in `install_channels` map) still get a registry slot
     /// when their first connection lands.
     #[test]

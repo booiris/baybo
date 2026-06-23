@@ -55,7 +55,7 @@ impl WorkspaceManager {
     /// default template. Existing files are left untouched, so an
     /// operator who deletes a file (or replaces its contents) is never
     /// silently overridden. Intended to run once at setup time —
-    /// `aura-setup::bootstrap` invokes it after `ensure_layout` — rather
+    /// `baybo-setup::bootstrap` invokes it after `ensure_layout` — rather
     /// than on every boot, so a deliberately-deleted identity file
     /// stays deleted.
     ///

@@ -7,7 +7,7 @@ use sha2::Sha256;
 
 use crate::crypto::EncryptionKey;
 
-const HKDF_INFO: &[u8] = b"aura-placeholder-v1";
+const HKDF_INFO: &[u8] = b"baybo-placeholder-v1";
 const PLACEHOLDER_HEX_LEN: usize = 24;
 
 /// Opening / closing markers use the asymmetric ASCII pairs `[{` and `}]`.

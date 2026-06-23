@@ -1,7 +1,7 @@
-import type { Logger, WireAttachment } from "@aura/channel-sdk";
-import { uploadBlob } from "@aura/channel-sdk";
-import type { BotInboundEvent, BotStartHooks } from "@aura/channel-sdk/bot";
-import { composeAuraUserId } from "@aura/channel-sdk/bot";
+import type { Logger, WireAttachment } from "@baybo/channel-sdk";
+import { uploadBlob } from "@baybo/channel-sdk";
+import type { BotInboundEvent, BotStartHooks } from "@baybo/channel-sdk/bot";
+import { composeBayboUserId } from "@baybo/channel-sdk/bot";
 
 import {
   SESSION_EXPIRED_ERRCODE,
@@ -197,11 +197,11 @@ async function downloadAndUpload(
 
   try {
     const fromUserId = msg.from_user_id ?? "";
-    // Match `BotChannel.ingest`'s composite aura user id so the
+    // Match `BotChannel.ingest`'s composite baybo user id so the
     // gateway's pairing gate sees the same identity for the upload
     // as for the text frame the user has already approved. Weixin
     // overrides `chatKey` to `chat.toUserId`, so pass that through.
-    const auraUserId = composeAuraUserId(
+    const bayboUserId = composeBayboUserId(
       "weixin",
       state.accountId,
       { toUserId: fromUserId },
@@ -210,7 +210,7 @@ async function downloadAndUpload(
     );
     const { blobId } = await uploadBlob(media.bytes, media.mimeType, {
       botId: state.accountId,
-      userId: auraUserId,
+      userId: bayboUserId,
     });
     return {
       kind: media.kind === "video" ? "file" : media.kind, // wire side only knows image/audio/file

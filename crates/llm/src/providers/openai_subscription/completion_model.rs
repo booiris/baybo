@@ -136,7 +136,7 @@ impl OpenAiSubscriptionCompletionModel {
         let stream = self.stream(request).await?;
         let mut text_buf = String::new();
         let mut reasoning_buf = String::new();
-        let mut thinking_blocks: Vec<aura_model::ContentBlock> = Vec::new();
+        let mut thinking_blocks: Vec<baybo_model::ContentBlock> = Vec::new();
         let mut tool_calls: Vec<ToolCallInfo> = Vec::new();
         let mut usage = TokenUsage::default();
         let mut stream = stream;
@@ -229,7 +229,7 @@ impl OpenAiSubscriptionCompletionModel {
                 .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
             if retried.status() == reqwest::StatusCode::UNAUTHORIZED {
                 return Err(CompletionError::ProviderError(
-                    "openai-subscription: unauthorized after refresh — run `aura llm edit` \
+                    "openai-subscription: unauthorized after refresh — run `baybo llm edit` \
                      and pick `OAuth login (re-authenticate)` for this entry"
                         .into(),
                 ));
@@ -268,8 +268,8 @@ impl OpenAiSubscriptionCompletionModel {
                 }
                 return Err(LlmError::Config(
                     "openai-subscription: not signed in — add an entry via \
-                     `aura llm add` (pick the openai-subscription provider) or \
-                     re-authenticate an existing entry via `aura llm edit`"
+                     `baybo llm add` (pick the openai-subscription provider) or \
+                     re-authenticate an existing entry via `baybo llm edit`"
                         .into(),
                 ));
             }
@@ -433,7 +433,7 @@ pub(crate) fn build_responses_body(
 
     // The Codex Responses API rejects requests without `instructions`
     // ("400: Instructions are required") even when the caller hasn't
-    // set a system message — `aura llm probe` is the canonical example.
+    // set a system message — `baybo llm probe` is the canonical example.
     // Always supply at least a minimal placeholder.
     let instructions = request
         .preamble
@@ -493,7 +493,7 @@ async fn parse_models_response(
 
 /// Project Codex's `{ "models": [...] }` into `Vec<LiveModelInfo>`. Each
 /// raw entry is stashed verbatim into `extras` so operators with --json
-/// can see fields aura doesn't surface.
+/// can see fields baybo doesn't surface.
 fn project_models_body(mut body: Value) -> crate::Result<Vec<crate::LiveModelInfo>> {
     let raw = match body.get_mut("models").map(Value::take) {
         Some(Value::Array(arr)) => arr,
@@ -665,7 +665,7 @@ fn convert_message(message: &Message) -> Result<Vec<Value>, String> {
 /// when there's nothing to surface.
 fn build_reasoning_block(
     reasoning_buf: String,
-    thinking_blocks: Vec<aura_model::ContentBlock>,
+    thinking_blocks: Vec<baybo_model::ContentBlock>,
 ) -> Option<Reasoning> {
     let mut content: Vec<ReasoningContent> = Vec::new();
     if !reasoning_buf.is_empty() {
@@ -673,16 +673,16 @@ fn build_reasoning_block(
         content.push(ReasoningContent::Summary(reasoning_buf));
     }
     for block in thinking_blocks {
-        if let aura_model::ContentBlock::Thinking { content: tc, .. } = block {
+        if let baybo_model::ContentBlock::Thinking { content: tc, .. } = block {
             for piece in tc {
                 content.push(match piece {
-                    aura_model::ThinkingContent::Text { text, signature } => {
+                    baybo_model::ThinkingContent::Text { text, signature } => {
                         ReasoningContent::Text { text, signature }
                     }
-                    aura_model::ThinkingContent::Summary { text } => {
+                    baybo_model::ThinkingContent::Summary { text } => {
                         ReasoningContent::Summary(text)
                     }
-                    aura_model::ThinkingContent::Redacted { data } => {
+                    baybo_model::ThinkingContent::Redacted { data } => {
                         ReasoningContent::Redacted { data }
                     }
                 });
@@ -904,14 +904,14 @@ fn translate_event(
                         // server treats it as opaque on the next turn,
                         // so we just round-trip the bytes.
                         let data = serde_json::to_string(item).unwrap_or_default();
-                        let mut content = Vec::<aura_model::ThinkingContent>::with_capacity(2);
+                        let mut content = Vec::<baybo_model::ThinkingContent>::with_capacity(2);
                         if !summary_text.is_empty() {
                             content
-                                .push(aura_model::ThinkingContent::Summary { text: summary_text });
+                                .push(baybo_model::ThinkingContent::Summary { text: summary_text });
                         }
-                        content.push(aura_model::ThinkingContent::Redacted { data });
+                        content.push(baybo_model::ThinkingContent::Redacted { data });
                         out.push(Ok(StreamEvent::ThinkingBlock(
-                            aura_model::ContentBlock::Thinking { id, content },
+                            baybo_model::ContentBlock::Thinking { id, content },
                         )));
                     }
                 }
@@ -1328,7 +1328,7 @@ mod tests {
     }
 
     /// Regression: the Codex Responses API rejects requests without
-    /// `instructions` (400 "Instructions are required"). `aura llm
+    /// `instructions` (400 "Instructions are required"). `baybo llm
     /// probe` builds a request with no preamble, so the body builder
     /// must inject a placeholder when the caller didn't provide one.
     #[test]
@@ -1345,7 +1345,7 @@ mod tests {
     /// Regression: Codex Responses returns 400 "Unsupported parameter:
     /// temperature" when the field is forwarded. The reasoning models
     /// pin sampling server-side; we drop the field even when the
-    /// caller (e.g. `aura llm probe`) sets one.
+    /// caller (e.g. `baybo llm probe`) sets one.
     #[test]
     fn body_drops_temperature_for_codex_responses() {
         let mut req = empty_request();
@@ -1381,7 +1381,7 @@ mod tests {
     }
 
     /// Regression: Codex Responses requires `tools[].name` to match
-    /// `^[a-zA-Z0-9_-]+$`. Aura's MCP-prefixed names (`browser/foo`)
+    /// `^[a-zA-Z0-9_-]+$`. Baybo's MCP-prefixed names (`browser/foo`)
     /// must be encoded on the way out and decoded on the way back.
     #[test]
     fn tool_name_round_trips_through_sanitization() {
@@ -1615,23 +1615,23 @@ mod tests {
     /// SecretStore adapter that fails the first N stores, then succeeds.
     /// Drives the "vault is broken right now" branch of the durable-save path.
     struct FailingStoreNTimes {
-        inner: aura_security::test_support::MemorySecretStore,
+        inner: baybo_security::test_support::MemorySecretStore,
         fails_remaining: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
-    impl aura_store::SecretStore for FailingStoreNTimes {
+    impl baybo_store::SecretStore for FailingStoreNTimes {
         async fn store(
             &self,
             name: &str,
             encrypted_value: &[u8],
-        ) -> std::result::Result<(), aura_store::StorageError> {
+        ) -> std::result::Result<(), baybo_store::StorageError> {
             if self
                 .fails_remaining
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
                 > 0
             {
-                return Err(aura_store::StorageError::Storage(
+                return Err(baybo_store::StorageError::Storage(
                     "simulated vault failure".into(),
                 ));
             }
@@ -1640,13 +1640,13 @@ mod tests {
         async fn retrieve(
             &self,
             name: &str,
-        ) -> std::result::Result<Option<Vec<u8>>, aura_store::StorageError> {
+        ) -> std::result::Result<Option<Vec<u8>>, baybo_store::StorageError> {
             self.inner.retrieve(name).await
         }
-        async fn delete(&self, name: &str) -> std::result::Result<(), aura_store::StorageError> {
+        async fn delete(&self, name: &str) -> std::result::Result<(), baybo_store::StorageError> {
             self.inner.delete(name).await
         }
-        async fn list(&self) -> std::result::Result<Vec<String>, aura_store::StorageError> {
+        async fn list(&self) -> std::result::Result<Vec<String>, baybo_store::StorageError> {
             self.inner.list().await
         }
     }
@@ -1654,10 +1654,10 @@ mod tests {
     fn vault_with_failing_store(
         initial_fails: usize,
     ) -> (VaultTokenStore, std::sync::Arc<FailingStoreNTimes>) {
-        use aura_security::{EncryptionKey, SecretVault};
+        use baybo_security::{EncryptionKey, SecretVault};
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
         let store = std::sync::Arc::new(FailingStoreNTimes {
-            inner: aura_security::test_support::MemorySecretStore::new(),
+            inner: baybo_security::test_support::MemorySecretStore::new(),
             fails_remaining: std::sync::atomic::AtomicUsize::new(initial_fails),
         });
         let vault = std::sync::Arc::new(SecretVault::new(key, store.clone()));
@@ -1728,11 +1728,11 @@ mod tests {
 
     /// Cache-hit path revalidates the vault every CACHE_VAULT_REVALIDATE_INTERVAL_SECS.
     /// Past the window, a missing vault entry invalidates the cached bundle
-    /// so a cross-process `aura llm remove` (which clears the vault entry) is honoured.
+    /// so a cross-process `baybo llm remove` (which clears the vault entry) is honoured.
     #[tokio::test]
     async fn ensure_fresh_bundle_invalidates_cache_when_vault_is_emptied() {
-        use aura_security::test_support::MemorySecretStore;
-        use aura_security::{EncryptionKey, SecretVault};
+        use baybo_security::test_support::MemorySecretStore;
+        use baybo_security::{EncryptionKey, SecretVault};
 
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
         let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));
@@ -1779,8 +1779,8 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_fresh_bundle_skips_vault_within_revalidate_interval() {
-        use aura_security::test_support::MemorySecretStore;
-        use aura_security::{EncryptionKey, SecretVault};
+        use baybo_security::test_support::MemorySecretStore;
+        use baybo_security::{EncryptionKey, SecretVault};
 
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
         let vault = Arc::new(SecretVault::new(key, Arc::new(MemorySecretStore::new())));
@@ -1852,8 +1852,8 @@ mod tests {
     /// — the re-check fires before any network call.
     #[tokio::test]
     async fn single_flight_refresh_dedups_after_concurrent_rotation() {
-        use aura_security::test_support::MemorySecretStore;
-        use aura_security::{EncryptionKey, SecretVault};
+        use baybo_security::test_support::MemorySecretStore;
+        use baybo_security::{EncryptionKey, SecretVault};
 
         let now = chrono::Utc::now().timestamp();
         let key = EncryptionKey::new(b"test-master-key-32-bytes-long!!!".to_vec()).unwrap();
@@ -1919,14 +1919,14 @@ mod tests {
         // Reasoning deltas + structured thinking block -> Summary + the
         // block's pieces appended in order. Verifies neither path drops
         // content (the bug this regression test guards against).
-        let block = aura_model::ContentBlock::Thinking {
+        let block = baybo_model::ContentBlock::Thinking {
             id: Some("t1".into()),
             content: vec![
-                aura_model::ThinkingContent::Text {
+                baybo_model::ThinkingContent::Text {
                     text: "signed thought".into(),
                     signature: Some("sig".into()),
                 },
-                aura_model::ThinkingContent::Redacted {
+                baybo_model::ThinkingContent::Redacted {
                     data: "secret".into(),
                 },
             ],

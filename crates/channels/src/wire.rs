@@ -13,8 +13,8 @@
 //! types below verbatim, both encode/decode via MessagePack with named
 //! fields.
 
-use aura_model::{ChannelType, ResourceAccess, SessionId};
-use aura_tools::ApprovalDecision;
+use baybo_model::{ChannelType, ResourceAccess, SessionId};
+use baybo_tools::ApprovalDecision;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -32,7 +32,7 @@ pub enum WireError {
 }
 
 /// Discriminator on a [`WireAttachment`]. Maps 1:1 to the matching
-/// [`aura_model::ContentBlock`] variant on either side of the bridge.
+/// [`baybo_model::ContentBlock`] variant on either side of the bridge.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
@@ -228,8 +228,8 @@ pub struct TaskView {
     pub depends_on: Vec<String>,
 }
 
-impl From<aura_model::Task> for TaskView {
-    fn from(task: aura_model::Task) -> Self {
+impl From<baybo_model::Task> for TaskView {
+    fn from(task: baybo_model::Task) -> Self {
         Self {
             id: task.id.to_string(),
             subject: task.subject,
@@ -253,7 +253,7 @@ impl From<aura_model::Task> for TaskView {
 pub enum Frame {
     /// First frame after the WebSocket handshake. Names the channel
     /// this connection serves. `token` is the connection's capability
-    /// token (injected via `AURA_CHANNEL_TOKEN`); for the built-in TUI
+    /// token (injected via `BAYBO_CHANNEL_TOKEN`); for the built-in TUI
     /// the field is left empty because the channel-auth middleware
     /// already validated a vault-issued token on the upgrade request.
     ///
@@ -514,7 +514,7 @@ pub enum Frame {
     /// Client → server: persist one submitted input line to the
     /// server-side history store. Used by the built-in TUI to get
     /// zsh-style history without the client holding any encryption key
-    /// itself — the gateway's [`aura_security::SecretVault`] is the
+    /// itself — the gateway's [`baybo_security::SecretVault`] is the
     /// single writer. Fire-and-forget; the server does not ack
     /// per-append.
     HistoryAppend {
@@ -542,7 +542,7 @@ pub enum Frame {
     StopBot { bot_id: String },
     /// Client → server: ack for a `StartBot` / `StopBot` command.
     /// `ok: true` means the command ran; `ok: false` carries a
-    /// human-readable reason so aura can surface it (e.g. bad token).
+    /// human-readable reason so baybo can surface it (e.g. bad token).
     BotStatus {
         bot_id: String,
         ok: bool,

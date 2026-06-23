@@ -75,7 +75,7 @@ export interface BotMediaPayload {
 }
 
 /**
- * Routing tuple reconstructed from an aura user id. The SDK hands
+ * Routing tuple reconstructed from an baybo user id. The SDK hands
  * these to the approvals hook so approval UI code never has to touch
  * the routing tables itself.
  */
@@ -132,7 +132,7 @@ export interface BotStartHooks<BotHandle, ChatId> {
 export interface BotPlatform<BotHandle, ChatId> {
   /**
    * Optional override for how the channel stringifies a chat address
-   * into the composite aura user id. The SDK composes the final
+   * into the composite baybo user id. The SDK composes the final
    * `userId` as `<channelType>_<botId>_<chatKey>_<platformUserId>`
    * (surfaced as `UserInbound.userId` / `ApprovalRequest.userId`).
    *
@@ -156,7 +156,7 @@ export interface BotPlatform<BotHandle, ChatId> {
    * received, so a late exit from a prior generation can't purge a
    * freshly-spawned replacement for the same `botId`.
    *
-   * Throw to surface `ok: false + message` on aura's admin dashboard.
+   * Throw to surface `ok: false + message` on baybo's admin dashboard.
    */
   startBot(
     cmd: StartBotCommand,
@@ -210,7 +210,7 @@ export interface BotPlatform<BotHandle, ChatId> {
 
   /**
    * Optional "working on it" ping fired by the channel once per
-   * accepted inbound, before the event is queued for aura. Best-effort:
+   * accepted inbound, before the event is queued for baybo. Best-effort:
    * the channel fire-and-forgets the returned promise, so a rate-limit
    * or network blip is a debug log, not a pumped error. Implement when
    * your platform has a typing / presence primitive (Telegram
@@ -315,7 +315,7 @@ export interface PlatformApprovals<
   ChatId,
 > {
   /**
-   * Aura is asking for an approval. `route` is `null` if the user is
+   * Baybo is asking for an approval. `route` is `null` if the user is
    * unknown or the bot has been detached — fail closed with `"deny"`
    * in that case.
    */
@@ -325,7 +325,7 @@ export interface PlatformApprovals<
   ): Promise<ApprovalDecision>;
 
   /**
-   * Aura has resolved an approval it originally requested. Use this
+   * Baybo has resolved an approval it originally requested. Use this
    * to update the platform-side UI (e.g. edit the prompt message to
    * show the final decision).
    */
@@ -400,7 +400,7 @@ export interface BotChannelOptions<
    *
    * The list is the channel's static manifest, not a per-bot one:
    * registering the same set on every bot is the intended behaviour
-   * since aura's gateway-side dispatcher is bot-agnostic.
+   * since baybo's gateway-side dispatcher is bot-agnostic.
    */
   slashCommands?: ReadonlyArray<SlashCommandSpec>;
 }
@@ -416,7 +416,7 @@ interface TypingSession {
   // outbound (onMessage/onNotice). The session only really ends when
   // this reaches zero, so a quick double-send doesn't lose the
   // indicator when the first turn replies while the second is still
-  // queued behind aura's per-session serialization.
+  // queued behind baybo's per-session serialization.
   pending: number;
   ping: () => void;
   // FIFO queue of working-reaction targets currently live on the user's
@@ -438,7 +438,7 @@ interface TypingSession {
  * sessions.
  *
  * Exported so platform code can compute the same chat key the
- * `BotChannel` does — e.g. when constructing the aura user id for an
+ * `BotChannel` does — e.g. when constructing the baybo user id for an
  * out-of-band action (blob upload) before `hooks.emit` has fired.
  */
 export function defaultChatKey(chat: unknown): string {
@@ -479,10 +479,10 @@ function formatAttachments(atts: ReadonlyArray<WireAttachment>): string {
 }
 
 /**
- * Compose the canonical aura user id `<channelType>_<botId>_<chatKey>_<platformUserId>`.
+ * Compose the canonical baybo user id `<channelType>_<botId>_<chatKey>_<platformUserId>`.
  *
  * This is the identity the gateway pairs against — both the
- * `Frame::Message.user_id` it stores and the `x-aura-user-id` header
+ * `Frame::Message.user_id` it stores and the `x-baybo-user-id` header
  * the blob `POST /v1/blobs` endpoint expects. `BotChannel.ingest`
  * uses this when emitting inbound events; platform code that needs
  * to act on the user before the event reaches the channel (chiefly
@@ -495,7 +495,7 @@ function formatAttachments(atts: ReadonlyArray<WireAttachment>): string {
  * {@link BotPlatform.chatKey}; the same default we apply in
  * `ingest` is used otherwise.
  */
-export function composeAuraUserId<ChatId>(
+export function composeBayboUserId<ChatId>(
   channelType: string,
   botId: string,
   chat: ChatId,
@@ -1031,7 +1031,7 @@ export class BotChannel<BotHandle, ChatId>
   }
 
   private ingest(botId: string, ev: BotInboundEvent<ChatId>): void {
-    const userId = composeAuraUserId(
+    const userId = composeBayboUserId(
       this.channelType,
       botId,
       ev.chat,
@@ -1057,8 +1057,8 @@ export class BotChannel<BotHandle, ChatId>
 
   /** Render a chat using the platform's `chatKey` if defined,
    * otherwise fall through to {@link defaultChatKey}. Same identity
-   * `composeAuraUserId` keys on, so a log line's `chat=` token matches
-   * the chat-portion of the `user=` (Aura user id) it appears with. */
+   * `composeBayboUserId` keys on, so a log line's `chat=` token matches
+   * the chat-portion of the `user=` (Baybo user id) it appears with. */
   private renderChat(chat: ChatId): string {
     return this.platform.chatKey
       ? this.platform.chatKey.call(this.platform, chat)
@@ -1172,7 +1172,7 @@ export class BotChannel<BotHandle, ChatId>
     const session = this.typingSessions.get(userId);
     if (session === undefined) return;
     session.pending -= 1;
-    // This turn produced output → drop its working-reaction. aura
+    // This turn produced output → drop its working-reaction. baybo
     // serializes turns per session in FIFO order, so the oldest live
     // reaction is the one whose turn just finished. (When pending hits
     // zero `cancelTyping` clears any stragglers too.)

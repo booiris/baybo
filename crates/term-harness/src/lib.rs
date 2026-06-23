@@ -186,7 +186,7 @@ impl TmuxSession {
     /// still be captured.
     pub fn launch(spec: LaunchSpec) -> Result<Self> {
         let name = format!(
-            "auraterm_{}_{}",
+            "bayboterm_{}_{}",
             std::process::id(),
             SESSION_SEQ.fetch_add(1, Ordering::Relaxed)
         );

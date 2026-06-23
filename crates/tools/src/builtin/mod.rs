@@ -4,7 +4,7 @@
 //! operator uses in permission rules (see `docs/modules/tools.md`).
 //!
 //! The Claude Code reference also defines tools that depend on larger
-//! subsystems not yet landed in Aura (agent teams, worktrees, LSP, background
+//! subsystems not yet landed in Baybo (agent teams, worktrees, LSP, background
 //! monitors, MCP client, etc.). Stubs for those live in [`todo`] and are not
 //! registered by [`default_tools`] — a follow-up will wire them in as each
 //! backing subsystem arrives.
@@ -23,9 +23,9 @@
 
 use std::sync::Arc;
 
-use aura_model::TrustLevel;
-use aura_store::BlobStore;
-use aura_workspace::WorkspacePaths;
+use baybo_model::TrustLevel;
+use baybo_store::BlobStore;
+use baybo_workspace::WorkspacePaths;
 
 use crate::{Tool, ToolCapability, ToolManifest};
 

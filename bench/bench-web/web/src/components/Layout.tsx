@@ -12,7 +12,7 @@ export function Layout() {
     <div className="h-full flex flex-col">
       <header className="border-b-[3px] border-black bg-white flex items-center gap-4 px-5 py-3 shrink-0">
         <Link to="/" className="font-bold text-lg tracking-tight">
-          AURA<span className="text-brand">·BENCH</span>
+          BAYBO<span className="text-brand">·BENCH</span>
         </Link>
         <div className="ml-auto flex items-center gap-3">
           <ToolIoToggle />

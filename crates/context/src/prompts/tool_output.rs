@@ -1,17 +1,17 @@
 //! Framing for untrusted tool output entering the LLM transcript.
 //!
 //! Detection (`InjectionDetector::scan`) and secret sanitization stay in
-//! `aura-security`; this module owns only the *format* side — the
+//! `baybo-security`; this module owns only the *format* side — the
 //! `<tool_output>` envelope, breakout-escaping, the byte-budget cap, and the
 //! content-addressed spill. Injection-marker rule names arrive as plain
-//! strings (`warning_rules`) so this crate needs no `aura-security`
+//! strings (`warning_rules`) so this crate needs no `baybo-security`
 //! dependency, and the `</tool_output>` delimiter is shared through
-//! `aura-model` so the wrapper's escape and the detector's forged-delimiter
+//! `baybo-model` so the wrapper's escape and the detector's forged-delimiter
 //! rule can never disagree on the literal.
 
 use std::path::{Path, PathBuf};
 
-use aura_model::{TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX};
+use baybo_model::{TOOL_OUTPUT_CLOSE_PREFIX, TOOL_OUTPUT_OPEN_PREFIX};
 
 /// Maximum bytes of tool output carried into LLM context before the cap
 /// truncates with a notice. Covers the post-sanitization text.
@@ -23,10 +23,10 @@ pub const MAX_TOOL_OUTPUT_BYTES: usize = 32 * 1024;
 /// zero-width space.
 ///
 /// `warning_rules` are the injection-marker rule names the caller already
-/// pulled from `aura-security`'s `InjectionDetector::scan` (sorted/deduped
+/// pulled from `baybo-security`'s `InjectionDetector::scan` (sorted/deduped
 /// here); when non-empty a security banner precedes the body. Passing rule
 /// names rather than the detector's `InjectionWarning` keeps this crate free
-/// of an `aura-security` dependency.
+/// of an `baybo-security` dependency.
 pub fn wrap_tool_output(tool_name: &str, content: &str, warning_rules: &[&str]) -> String {
     let escaped_name = escape_xml_attr(tool_name);
     let escaped_body = escape_close_tool_output(content);

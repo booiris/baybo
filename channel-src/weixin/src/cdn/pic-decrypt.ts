@@ -4,7 +4,7 @@
  * that don't carry an `aes_key`). The decrypt path also has to deal
  * with two on-the-wire encodings of the AES key — see [`parseAesKey`].
  */
-import type { Logger } from "@aura/channel-sdk";
+import type { Logger } from "@baybo/channel-sdk";
 
 import { decryptAesEcb } from "./aes-ecb.js";
 import { ENABLE_CDN_URL_FALLBACK, buildCdnDownloadUrl } from "./cdn-url.js";

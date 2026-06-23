@@ -1,4 +1,4 @@
-//! Resolves `(channel_type, user_id)` → aura `session_id` for sidecars
+//! Resolves `(channel_type, user_id)` → baybo `session_id` for sidecars
 //! that don't carry their own session ids on the wire.
 //!
 //! The TUI is session-scoped — it picks its own UUID and mints it into
@@ -9,16 +9,16 @@
 //! and let the gateway resolve / allocate on their behalf. The mapping
 //! is persisted in the `channel_sessions` libsql table so:
 //!
-//! * Same Telegram user → same aura session across sidecar restarts.
-//! * Same Telegram user → same aura session across gateway restarts
+//! * Same Telegram user → same baybo session across sidecar restarts.
+//! * Same Telegram user → same baybo session across gateway restarts
 //!   (libsql is the source of truth, not in-memory state).
 //! * Different users on the same bot always land on distinct sessions.
 
 use std::sync::Arc;
 
-use aura_agent::SessionManager;
-use aura_model::{ChannelType, SessionId, User};
-use aura_store::ChannelSessionStore;
+use baybo_agent::SessionManager;
+use baybo_model::{ChannelType, SessionId, User};
+use baybo_store::ChannelSessionStore;
 
 /// Errors surfaced from [`ChannelSessionResolver::resolve_or_create`].
 /// Kept narrow on purpose — the caller just needs to decide whether to
@@ -42,7 +42,7 @@ impl ChannelSessionResolver {
         Self { sessions, store }
     }
 
-    /// Return the aura `session_id` for this `(channel_type, user_id)`
+    /// Return the baybo `session_id` for this `(channel_type, user_id)`
     /// pair, creating (and persisting) a fresh one via
     /// [`SessionManager::create_session`] on a cache miss.
     pub async fn resolve_or_create(
@@ -91,7 +91,7 @@ impl ChannelSessionResolver {
     }
 
     /// Drop the existing `(channel_type, user_id)` mapping (if any) and
-    /// allocate a brand-new aura session for the same user. Returns the
+    /// allocate a brand-new baybo session for the same user. Returns the
     /// new `session_id`. Only the channel mapping is repointed — the
     /// underlying `sessions` row is independent.
     ///
@@ -135,17 +135,17 @@ impl ChannelSessionResolver {
 
 #[cfg(test)]
 mod tests {
-    use aura_storage::libsql::{LibsqlChannelSessionStore, LibsqlPool, LibsqlSessionStore};
+    use baybo_storage::libsql::{LibsqlChannelSessionStore, LibsqlPool, LibsqlSessionStore};
 
     use super::*;
 
     async fn build() -> ChannelSessionResolver {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let session_store = Arc::new(LibsqlSessionStore::new(pool.clone()));
-        let summary_store = Arc::new(aura_storage::libsql::LibsqlSessionSummaryStore::new(
+        let summary_store = Arc::new(baybo_storage::libsql::LibsqlSessionSummaryStore::new(
             pool.clone(),
         ));
-        let folder_store = Arc::new(aura_storage::libsql::LibsqlSessionFolderStore::new(
+        let folder_store = Arc::new(baybo_storage::libsql::LibsqlSessionFolderStore::new(
             pool.clone(),
         ));
         let session_mgr = Arc::new(SessionManager::new(

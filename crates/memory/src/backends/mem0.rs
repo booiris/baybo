@@ -29,7 +29,7 @@
 //! every call — never overridable by a tool param, so one user's tools cannot
 //! read, write, or delete another user's memories. An optional `scope:
 //! "session"` narrows reads to the current session via Mem0's `run_id` (sourced
-//! from `ToolContext::session_id`). `agent_id` defaults to `"aura"` (deployment
+//! from `ToolContext::session_id`). `agent_id` defaults to `"baybo"` (deployment
 //! identity) on writes and is the one identity a tool call may still set.
 //!
 //! Failures are routed through a 5-failure / 120 s circuit breaker that pauses
@@ -59,13 +59,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use aura_model::{ContentBlock, TrustLevel};
-use aura_security::http::ProxySettings;
-use aura_security::{SecretVault, USER_SECRET_PREFIX};
-use aura_tools::{
+use baybo_model::{ContentBlock, TrustLevel};
+use baybo_security::http::ProxySettings;
+use baybo_security::{SecretVault, USER_SECRET_PREFIX};
+use baybo_tools::{
     Tool, ToolCapability, ToolContext, ToolError, ToolEventSink, ToolManifest, ToolOutput,
 };
-use aura_trace::ToolEventPayload;
+use baybo_trace::ToolEventPayload;
 use parking_lot::Mutex;
 use reqwest::{Method, header};
 use serde::{Deserialize, Serialize};
@@ -75,7 +75,7 @@ use tracing::{debug, info, warn};
 use crate::{Memory, MemoryContext, MemoryError, RecalledMemory, Result};
 
 const DEFAULT_BASE_URL: &str = "https://api.mem0.ai";
-const DEFAULT_AGENT_ID: &str = "aura";
+const DEFAULT_AGENT_ID: &str = "baybo";
 const DEFAULT_TOP_K: usize = 5;
 /// Default minimum similarity for `mem0_search` / search-and-delete. Mirrors
 /// the openclaw plugin's `searchThreshold` default.
@@ -96,7 +96,7 @@ const RECALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// root, so the user never waits; Mem0's server-side fact-extraction is
 /// LLM-backed and can be slow under load, so give it a generous ceiling.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(600);
-/// Default user-secret name (managed via `aura secret add`) holding the
+/// Default user-secret name (managed via `baybo secret add`) holding the
 /// Mem0 API key. Doubles as the process-env var name when the secret
 /// vault is empty.
 const DEFAULT_API_KEY_NAME: &str = "MEM0_API_KEY";
@@ -134,7 +134,7 @@ const DELETE_AUTO_SCORE: f64 = 0.9;
 pub struct Mem0Config {
     /// Name of the user secret holding the Mem0 API key. Resolution at
     /// startup: vault entry `user_env.<api_key_name>` (managed via
-    /// `aura secret add <name>`), then process-env `<api_key_name>`.
+    /// `baybo secret add <name>`), then process-env `<api_key_name>`.
     /// `None` defaults the name to `"MEM0_API_KEY"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_name: Option<String>,
@@ -175,13 +175,13 @@ impl Mem0Config {
 
 /// Resolve the Mem0 API key. Order:
 ///   1. User secret vault entry `user_env.<name>` (managed via
-///      `aura secret add <name>`).
+///      `baybo secret add <name>`).
 ///   2. Process env var of the same name.
 ///
 /// `<name>` is `cfg.api_key_name` or [`DEFAULT_API_KEY_NAME`] when unset.
 /// The dedicated `memory.mem0.api_key` vault path has been retired —
 /// secrets now live alongside other user-managed credentials under the
-/// `user_env.` namespace, manageable via the existing `aura secret`
+/// `user_env.` namespace, manageable via the existing `baybo secret`
 /// command.
 pub async fn resolve_api_key(cfg: &Mem0Config, vault: Option<&SecretVault>) -> Option<String> {
     let name = cfg.api_key_name.as_deref().unwrap_or(DEFAULT_API_KEY_NAME);
@@ -441,22 +441,22 @@ pub struct Mem0Memory {
 
 impl Mem0Memory {
     /// Build the backend from typed config + resolved API key. The
-    /// `extra` blob from [`aura_config::MemoryConfig`] is parsed into a
+    /// `extra` blob from [`baybo_config::MemoryConfig`] is parsed into a
     /// [`Mem0Config`] by the caller (see [`Mem0Config`] / `serde_json::from_value`).
     /// `proxy` threads the deployment-configured egress proxy through
-    /// [`aura_security::http::client_builder`] — the crate-wide outbound
+    /// [`baybo_security::http::client_builder`] — the crate-wide outbound
     /// chokepoint.
     pub fn new(cfg: Mem0Config, api_key: String, proxy: Option<&ProxySettings>) -> Result<Self> {
         let self_hosted = cfg.self_hosted();
         // A self-hosted OSS server needs no key; the Platform API does.
         if api_key.is_empty() && !self_hosted {
             return Err(MemoryError::Backend(
-                "mem0 API key missing — run `aura secret add MEM0_API_KEY` \
+                "mem0 API key missing — run `baybo secret add MEM0_API_KEY` \
                  (or set the MEM0_API_KEY env var)"
                     .into(),
             ));
         }
-        let client = aura_security::http::client_builder(proxy)
+        let client = baybo_security::http::client_builder(proxy)
             .map_err(|e| MemoryError::Backend(format!("mem0 client build failed: {e}")))?
             .timeout(HTTP_TIMEOUT)
             .build()
@@ -479,7 +479,7 @@ impl Mem0Memory {
     /// — the breaker handles persistent outages later.
     pub async fn probe(&self) {
         let body = json!({
-            "filters": {"AND": [{"user_id": "__aura_probe__"}]},
+            "filters": {"AND": [{"user_id": "__baybo_probe__"}]},
             "page": 1,
             "page_size": 1,
         });
@@ -717,7 +717,7 @@ impl Memory for Mem0Memory {
     async fn on_session_end(
         &self,
         _ctx: &MemoryContext,
-        _transcript: &[aura_model::ChatMessage],
+        _transcript: &[baybo_model::ChatMessage],
     ) -> Result<()> {
         Ok(())
     }
@@ -817,7 +817,7 @@ impl Tool for Mem0SearchTool {
         })
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         if self.inner.breaker_open() {
             return Ok(breaker_unavailable());
         }
@@ -927,13 +927,13 @@ impl Tool for Mem0AddTool {
                 "importance": {"type": "number", "description": "Importance 0.0–1.0 (stored as metadata)."},
                 "metadata": {"type": "object", "description": "Additional metadata to attach."},
                 "longTerm": {"type": "boolean", "description": "Long-term (default true). false → session-scoped."},
-                "agentId": {"type": "string", "description": "Agent namespace (default: aura)."}
+                "agentId": {"type": "string", "description": "Agent namespace (default: baybo)."}
             },
             "required": []
         })
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         if self.inner.breaker_open() {
             return Ok(breaker_unavailable());
         }
@@ -1043,7 +1043,7 @@ impl Tool for Mem0GetTool {
         })
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         if self.inner.breaker_open() {
             return Ok(breaker_unavailable());
         }
@@ -1106,7 +1106,7 @@ impl Tool for Mem0ListTool {
         })
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         if self.inner.breaker_open() {
             return Ok(breaker_unavailable());
         }
@@ -1200,7 +1200,7 @@ impl Tool for Mem0UpdateTool {
         })
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         if self.inner.breaker_open() {
             return Ok(breaker_unavailable());
         }
@@ -1300,7 +1300,7 @@ impl Tool for Mem0DeleteTool {
         })
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         if self.inner.breaker_open() {
             return Ok(breaker_unavailable());
         }
@@ -1439,7 +1439,7 @@ impl Tool for Mem0EventListTool {
         json!({"type": "object", "properties": {}, "required": []})
     }
 
-    async fn execute(&self, _params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, _params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         if self.inner.breaker_open() {
             return Ok(breaker_unavailable());
         }
@@ -1509,7 +1509,7 @@ impl Tool for Mem0EventStatusTool {
         })
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         if self.inner.breaker_open() {
             return Ok(breaker_unavailable());
         }
@@ -1673,7 +1673,7 @@ mod tests {
 
     #[test]
     fn concat_text_skips_non_text() {
-        use aura_model::BlobRef;
+        use baybo_model::BlobRef;
         let blocks = vec![
             ContentBlock::Text("hello".into()),
             ContentBlock::Image {

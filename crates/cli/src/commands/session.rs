@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use aura_model::SessionId;
-use aura_query::QueryApi;
-use aura_session::StoredMessage;
+use baybo_model::SessionId;
+use baybo_query::QueryApi;
+use baybo_session::StoredMessage;
 use serde_json::{Value, json};
 use tokio::fs;
 
@@ -24,7 +24,7 @@ pub async fn handle(ctx: &CommandContext, cmd: SessionCmd) -> Result<CommandOutp
     }
 }
 
-fn sessions(ctx: &CommandContext) -> Result<&aura_agent::SessionManager> {
+fn sessions(ctx: &CommandContext) -> Result<&baybo_agent::SessionManager> {
     ctx.session.as_deref().ok_or_else(|| {
         CliError::Manager("session manager is not available in this invocation".into())
     })
@@ -113,7 +113,7 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         "created_at": session.created_at.to_rfc3339(),
         "last_active": session.last_active.to_rfc3339(),
         "messages": messages.len(),
-        "called_skills": aura_context::scan_skill_calls(&messages),
+        "called_skills": baybo_context::scan_skill_calls(&messages),
         "compression_count": session.state.compression_count,
     });
     if let Some((jobs, steps, spans)) = trace_counts
@@ -125,7 +125,7 @@ async fn show(ctx: &CommandContext, id: &str) -> Result<CommandOutput> {
         );
     }
 
-    let called_skills = aura_context::scan_skill_calls(&messages);
+    let called_skills = baybo_context::scan_skill_calls(&messages);
     let called_skills_human = if called_skills.is_empty() {
         "(none)".to_string()
     } else {
@@ -171,7 +171,7 @@ async fn history(
 }
 
 async fn active_history(
-    mgr: &aura_agent::SessionManager,
+    mgr: &baybo_agent::SessionManager,
     id: &str,
     typed: &SessionId,
 ) -> Result<CommandOutput> {
@@ -208,7 +208,7 @@ async fn active_history(
 /// Each row carries `superseded_by` — `None` means active, `Some(n)`
 /// means a later compaction at ordinal `n` replaced this row.
 async fn full_history(
-    mgr: &aura_agent::SessionManager,
+    mgr: &baybo_agent::SessionManager,
     id: &str,
     typed: &SessionId,
     superseded_only: bool,

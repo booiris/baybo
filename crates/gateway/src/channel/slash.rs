@@ -7,7 +7,7 @@
 //! so the gateway intercepts them right after the pairing gate and
 //! before [`ChannelSessionResolver::resolve_or_create`].
 //!
-//! `/new` is wired here — it forces a fresh aura session for the
+//! `/new` is wired here — it forces a fresh baybo session for the
 //! calling user and replies with a confirmation. `/compact` and `/stop`
 //! are published in the manifest so sidecars register them natively (e.g.
 //! Telegram's `setMyCommands`) but are **not** intercepted: the
@@ -22,15 +22,15 @@
 
 use std::sync::LazyLock;
 
-use aura_channels::wire::{Message as WireMessage, SlashCommandSpec};
-use aura_channels::{COMPACT_COMMAND_NAME, STOP_COMMAND_DESCRIPTION, STOP_COMMAND_NAME};
-use aura_model::{ChannelType, SessionId};
+use baybo_channels::wire::{Message as WireMessage, SlashCommandSpec};
+use baybo_channels::{COMPACT_COMMAND_NAME, STOP_COMMAND_DESCRIPTION, STOP_COMMAND_NAME};
+use baybo_model::{ChannelType, SessionId};
 
 use super::session_resolver::ChannelSessionResolver;
 
 /// Authoritative manifest of slash commands the gateway dispatcher
 /// recognises for sidecar channels. Pushed to every freshly-registered
-/// sidecar via [`aura_channels::wire::Frame::SlashManifest`] so each
+/// sidecar via [`baybo_channels::wire::Frame::SlashManifest`] so each
 /// platform's native command surface (Telegram `setMyCommands`,
 /// Discord application commands, …) stays in sync without sidecars
 /// keeping their own hardcoded copy. Adding a new command here is the
@@ -155,7 +155,7 @@ fn reply(
         bot_id: String::new(),
         attachments: Vec::new(),
         platform_msg_id: String::new(),
-        role: aura_channels::MessageRole::Assistant,
+        role: baybo_channels::MessageRole::Assistant,
         ordinal: None,
     }
 }
@@ -164,18 +164,18 @@ fn reply(
 mod tests {
     use std::sync::Arc;
 
-    use aura_agent::SessionManager;
-    use aura_storage::libsql::{LibsqlChannelSessionStore, LibsqlPool, LibsqlSessionStore};
+    use baybo_agent::SessionManager;
+    use baybo_storage::libsql::{LibsqlChannelSessionStore, LibsqlPool, LibsqlSessionStore};
 
     use super::*;
 
     async fn build() -> ChannelSessionResolver {
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let session_store = Arc::new(LibsqlSessionStore::new(pool.clone()));
-        let summary_store = Arc::new(aura_storage::libsql::LibsqlSessionSummaryStore::new(
+        let summary_store = Arc::new(baybo_storage::libsql::LibsqlSessionSummaryStore::new(
             pool.clone(),
         ));
-        let folder_store = Arc::new(aura_storage::libsql::LibsqlSessionFolderStore::new(
+        let folder_store = Arc::new(baybo_storage::libsql::LibsqlSessionFolderStore::new(
             pool.clone(),
         ));
         let session_mgr = Arc::new(SessionManager::new(

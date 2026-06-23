@@ -8,13 +8,13 @@ compression flow. Persistence is wired in directly — every
 `ContextManager` takes a bound `SessionId` + `Arc<SessionManager>` at
 construction; `append` and the compression apply mirror to
 `session_messages` through the `SessionManager` wrapper in
-[`aura-session`](session.md). Tests construct an in-memory store via
-`aura_session::test_support::MemorySessionStore` and pass it through
+[`baybo-session`](session.md). Tests construct an in-memory store via
+`baybo_session::test_support::MemorySessionStore` and pass it through
 the same constructor — no separate "in-memory mode" exists.
 
 Core responsibilities:
 
-- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `aura-model`) carries only metadata (id, user, channel, lineage, soul binding, …). Every `append` calls `persist_appended` (→ `SessionManager::append_session_message`) and every successful compression calls `persist_compaction` (→ `SessionManager::apply_session_compaction`). Cold-start hydration via `restore_from_store` seeds the manager so an actor restart preserves the conversation.
+- **Sole owner of the transcript**: `ContextManager` holds `Vec<ChatMessage>` directly. `Session` (in `baybo-model`) carries only metadata (id, user, channel, lineage, soul binding, …). Every `append` calls `persist_appended` (→ `SessionManager::append_session_message`) and every successful compression calls `persist_compaction` (→ `SessionManager::apply_session_compaction`). Cold-start hydration via `restore_from_store` seeds the manager so an actor restart preserves the conversation.
 - **Caller-driven compression**: `append()` is pure (push + budget update); the agent loop calls `maybe_compress()` at well-defined points so compression LLM cost can be recorded against the cost ledger
 - **Token budget tracking**: track current token usage and remaining capacity via `TokenBudget`, anchored to the provider's authoritative `usage.input_tokens` between calls
 - **Hardcoded compression flow**: a single `Compressor` impl block on `ContextManager` runs three stages in sequence — summary.md fast-path → live LLM summary → truncate fallback. No trait, no dispatch — every production session takes the same path.
@@ -33,7 +33,7 @@ ContextManager (struct)
 │                       fed back from `AgentLoop::call_llm`
 ├── current_model     — Option<String>; written by maybe_compress, used as
 │                       calibration key + baseline-invalidation trigger
-├── workspace         — Arc<aura_workspace::WorkspacePaths>; resolves
+├── workspace         — Arc<baybo_workspace::WorkspacePaths>; resolves
 │                       summary.md (fast-path), the transcript-recovery pointer,
 │                       the identity files (soul assembly), and the
 │                       tool-spills dir (oversize tool output)
@@ -62,9 +62,9 @@ the LLM transcript. The pure builders are unit-testable on their own; both
 `ContextManager` (`resolve_system_prompt` via `ensure_seeded`,
 `cap_tool_output`, `reseed_system_row`) and the agent-loop seam
 (`append_cron_fire`, `append_subagent_notification`) call into them. The
-injection *detection* for tool output stays in `aura-security`; only the
+injection *detection* for tool output stays in `baybo-security`; only the
 `<tool_output>` envelope formatting lives here (the shared delimiter is
-`aura_model::TOOL_OUTPUT_{OPEN,CLOSE}_PREFIX`).
+`baybo_model::TOOL_OUTPUT_{OPEN,CLOSE}_PREFIX`).
 
 **Key design choice**: `ContextManager` is a **concrete struct** with a **concrete compression flow**. Both the management logic (append, budget check) and the compression algorithm are invariant — no swappable strategy, no extension trait. Per-session paths flow through one shared `WorkspacePaths` handle.
 
@@ -123,10 +123,10 @@ The context sent to the LLM is organized in descending priority:
 
 ### Dependency boundaries
 
-- Depends on `aura-llm` for the `ChatRequest` / `LlmResponse` shape used in the `ChatCallback` signature. The compressor does not construct an LLM client itself; the callback is supplied by the caller. Tokenization stays algorithm-only: `TiktokenTokenizer` depends on `tiktoken-rs` (pure BPE), not on any provider SDK.
-- Depends on `aura-workspace` for `WorkspacePaths` so per-session paths (`summary.md`, transcript-recovery pointer) resolve through the same source of truth the rest of the runtime uses.
+- Depends on `baybo-llm` for the `ChatRequest` / `LlmResponse` shape used in the `ChatCallback` signature. The compressor does not construct an LLM client itself; the callback is supplied by the caller. Tokenization stays algorithm-only: `TiktokenTokenizer` depends on `tiktoken-rs` (pure BPE), not on any provider SDK.
+- Depends on `baybo-workspace` for `WorkspacePaths` so per-session paths (`summary.md`, transcript-recovery pointer) resolve through the same source of truth the rest of the runtime uses.
 - Does **not** depend on `memory` (the agent loop has no automatic memory injection; the `memory` crate only powers the admin REST surface).
-- Does **not** depend on `trace` or `storage` directly — the chat callback is what opens the trace span and records cost; `context` only sees its `Result<LlmResponse, ContextError>`. Persistence of the transcript is brokered through the `Arc<SessionManager>` (from `aura-session`) supplied at construction.
+- Does **not** depend on `trace` or `storage` directly — the chat callback is what opens the trace span and records cost; `context` only sees its `Result<LlmResponse, ContextError>`. Persistence of the transcript is brokered through the `Arc<SessionManager>` (from `baybo-session`) supplied at construction.
 
 ## Constraints
 

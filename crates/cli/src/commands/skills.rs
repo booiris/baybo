@@ -1,5 +1,5 @@
-use aura_skills::{SkillDefinition, SkillIssueKind, SkillValidation};
-use aura_skills_assessor::{AssessError, AssessedSkill, RiskLevel, SkillAssessor};
+use baybo_skills::{SkillDefinition, SkillIssueKind, SkillValidation};
+use baybo_skills_assessor::{AssessError, AssessedSkill, RiskLevel, SkillAssessor};
 use serde_json::{Value, json};
 
 use crate::cli::SkillsCmd;

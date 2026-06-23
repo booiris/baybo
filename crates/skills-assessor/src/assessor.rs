@@ -3,9 +3,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use aura_llm::{BoundBilledLlm, ChatRequest};
-use aura_skills::SkillDefinition;
-use aura_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
+use baybo_llm::{BoundBilledLlm, ChatRequest};
+use baybo_skills::SkillDefinition;
+use baybo_store::{AssessmentJob, AssessmentJobStatus, RiskLevel, RiskVerdict, SkillRiskStore};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -21,7 +21,7 @@ pub enum AssessError {
     #[error("hashing skill dir failed: {0}")]
     Hash(#[from] std::io::Error),
     #[error("risk store: {0}")]
-    Store(#[from] aura_store::StorageError),
+    Store(#[from] baybo_store::StorageError),
     #[error("LLM call failed: {0}")]
     Llm(String),
     #[error("LLM reply did not parse as a verdict: {preview}")]
@@ -52,7 +52,7 @@ impl AssessmentScope {
 }
 
 /// How `SkillAssessor::check` judges a skill. Mirrors
-/// `aura_config::RiskCheckConfig`; bootstrap maps between them.
+/// `baybo_config::RiskCheckConfig`; bootstrap maps between them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AssessmentMode {
     /// Skip the LLM classifier. Every skill comes back `Safe`.
@@ -84,7 +84,7 @@ pub struct AssessedSkill {
 /// `Primary` reads only `SKILL.md`, `Full` reads the whole tree.
 pub struct SkillAssessor {
     /// Billed handle bound once at startup to a `system:skill-assessor`
-    /// [`Attribution`](aura_llm::Attribution): every `chat` records its
+    /// [`Attribution`](baybo_llm::Attribution): every `chat` records its
     /// spend to that bucket. Assessment is platform safety overhead, not
     /// user-attributable work, and verdicts are cached by content hash
     /// (not model), so the boot-time client is pinned for the assessor's

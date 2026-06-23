@@ -2,12 +2,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::LibsqlPool;
-use aura_model::{
+use baybo_model::{
     ChatMessage, ControlEvent, ControlEventKind, FolderId, LineageKind, LlmEntryName, Session,
     SessionId,
 };
-use aura_store::StorageError;
-use aura_store::session::{Result, SessionStore, StoredMessage};
+use baybo_store::StorageError;
+use baybo_store::session::{Result, SessionStore, StoredMessage};
 
 pub struct LibsqlSessionStore {
     pool: LibsqlPool,
@@ -40,10 +40,10 @@ fn lineage_kind_str(s: &Session) -> Option<&'static str> {
 /// wins; an `Agent` source dispatches on the role.
 fn rehydrate_message(
     role: &str,
-    content: Vec<aura_model::ContentBlock>,
+    content: Vec<baybo_model::ContentBlock>,
     source: &str,
 ) -> Result<ChatMessage> {
-    use aura_model::{MessageSource, Role};
+    use baybo_model::{MessageSource, Role};
     let role = role.parse::<Role>().map_err(StorageError::Storage)?;
     let source = source
         .parse::<MessageSource>()
@@ -117,10 +117,10 @@ impl SessionStore for LibsqlSessionStore {
         let data = serde_json::to_string(session)
             .map_err(|e| StorageError::Storage(format!("serialize session: {e}")))?;
         let trigger_kind = match session.trigger.kind() {
-            aura_model::TriggerKind::User => "user",
-            aura_model::TriggerKind::Cron => "cron",
-            aura_model::TriggerKind::System => "system",
-            aura_model::TriggerKind::Spawned => "spawned",
+            baybo_model::TriggerKind::User => "user",
+            baybo_model::TriggerKind::Cron => "cron",
+            baybo_model::TriggerKind::System => "system",
+            baybo_model::TriggerKind::Spawned => "spawned",
         };
         let parent_session = session
             .lineage
@@ -387,7 +387,7 @@ impl SessionStore for LibsqlSessionStore {
         Ok(sessions)
     }
 
-    async fn list_by_channel(&self, channel: &aura_model::ChannelType) -> Result<Vec<Session>> {
+    async fn list_by_channel(&self, channel: &baybo_model::ChannelType) -> Result<Vec<Session>> {
         // Push the channel filter into SQL via `json_extract` — the
         // sessions table doesn't carry `channel` as a flat column
         // (it rides inside the JSON `data` blob), so a real index
@@ -903,7 +903,7 @@ impl SessionStore for LibsqlSessionStore {
         session_id: &SessionId,
         before_ordinal: Option<i64>,
         limit: usize,
-    ) -> Result<Vec<(i64, DateTime<Utc>, aura_model::ChatMessage)>> {
+    ) -> Result<Vec<(i64, DateTime<Utc>, baybo_model::ChatMessage)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -930,7 +930,7 @@ impl SessionStore for LibsqlSessionStore {
                 StorageError::Internal(anyhow::anyhow!("libsql query active tail: {e}"))
             })?;
 
-        let mut out: Vec<(i64, DateTime<Utc>, aura_model::ChatMessage)> = Vec::new();
+        let mut out: Vec<(i64, DateTime<Utc>, baybo_model::ChatMessage)> = Vec::new();
         while let Some(row) = rows
             .next()
             .await
@@ -976,7 +976,7 @@ impl SessionStore for LibsqlSessionStore {
         session_id: &SessionId,
         after_ordinal: i64,
         limit: usize,
-    ) -> Result<Vec<(i64, aura_model::ChatMessage)>> {
+    ) -> Result<Vec<(i64, baybo_model::ChatMessage)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1001,7 +1001,7 @@ impl SessionStore for LibsqlSessionStore {
                 StorageError::Internal(anyhow::anyhow!("libsql query active since: {e}"))
             })?;
 
-        let mut out: Vec<(i64, aura_model::ChatMessage)> = Vec::new();
+        let mut out: Vec<(i64, baybo_model::ChatMessage)> = Vec::new();
         while let Some(row) = rows
             .next()
             .await
@@ -1029,7 +1029,7 @@ impl SessionStore for LibsqlSessionStore {
     async fn load_last_user_message(
         &self,
         session_id: &SessionId,
-    ) -> Result<Option<(DateTime<Utc>, aura_model::ChatMessage)>> {
+    ) -> Result<Option<(DateTime<Utc>, baybo_model::ChatMessage)>> {
         let conn = self.pool.conn();
         // Newest human-authored row (source `user` / `user_interjection`,
         // i.e. `from_user`). The partial active index makes `ORDER BY
@@ -1142,7 +1142,7 @@ impl SessionStore for LibsqlSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, SessionState, TriggerSource, User};
+    use baybo_model::{ChannelType, SessionState, TriggerSource, User};
 
     fn make_root_session(id: &str) -> Session {
         let id = SessionId::from(id);
@@ -1183,7 +1183,7 @@ mod tests {
 
     #[tokio::test]
     async fn control_events_round_trip_seq_kind_and_micros() {
-        use aura_model::ControlEventKind;
+        use baybo_model::ControlEventKind;
 
         let pool = LibsqlPool::open_in_memory().await.unwrap();
         let store = LibsqlSessionStore::new(pool);
@@ -1406,7 +1406,7 @@ mod tests {
         store.save(&s).await.unwrap(); // blob carries last_llm=None
         assert!(
             store
-                .set_last_llm(&s.id, Some(&aura_model::LlmEntryName::from("claude-opus")))
+                .set_last_llm(&s.id, Some(&baybo_model::LlmEntryName::from("claude-opus")))
                 .await
                 .unwrap()
         );
@@ -1418,7 +1418,7 @@ mod tests {
         let loaded = store.get(&s.id).await.unwrap().expect("row present");
         assert_eq!(
             loaded.state.last_llm,
-            Some(aura_model::LlmEntryName::from("claude-opus")),
+            Some(baybo_model::LlmEntryName::from("claude-opus")),
             "save must preserve the last_llm column owned by set_last_llm"
         );
 
@@ -1533,7 +1533,7 @@ mod tests {
         store.save(&s).await.unwrap();
         assert!(
             store
-                .set_last_llm(&s.id, Some(&aura_model::LlmEntryName::from("gpt-4o")))
+                .set_last_llm(&s.id, Some(&baybo_model::LlmEntryName::from("gpt-4o")))
                 .await
                 .unwrap()
         );
@@ -1542,7 +1542,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(
             listed[0].state.last_llm,
-            Some(aura_model::LlmEntryName::from("gpt-4o")),
+            Some(baybo_model::LlmEntryName::from("gpt-4o")),
             "last_llm must reflect the column in list projections"
         );
     }
@@ -1554,7 +1554,7 @@ mod tests {
         let s = make_root_session("fld-1");
         store.save(&s).await.unwrap();
 
-        let fid = aura_model::FolderId::from("folder-x");
+        let fid = baybo_model::FolderId::from("folder-x");
         assert!(store.set_folder(&s.id, Some(&fid)).await.unwrap());
         assert_eq!(
             store.get(&s.id).await.unwrap().unwrap().folder_id,
@@ -1585,7 +1585,7 @@ mod tests {
 
         let s = make_root_session("fld-then-save");
         store.save(&s).await.unwrap();
-        let fid = aura_model::FolderId::from("keepme");
+        let fid = baybo_model::FolderId::from("keepme");
         assert!(store.set_folder(&s.id, Some(&fid)).await.unwrap());
 
         // Re-save the stale in-memory copy (still folder_id = None).
@@ -1606,7 +1606,7 @@ mod tests {
         let mut s = make_root_session("fld-list");
         s.channel = ChannelType::http();
         store.save(&s).await.unwrap();
-        let fid = aura_model::FolderId::from("folder-list");
+        let fid = baybo_model::FolderId::from("folder-list");
         assert!(store.set_folder(&s.id, Some(&fid)).await.unwrap());
 
         let listed = store.list_by_channel(&ChannelType::http()).await.unwrap();
@@ -1668,7 +1668,7 @@ mod tests {
             loaded.folder_id, None,
             "migrated legacy row defaults to uncategorized"
         );
-        let fid = aura_model::FolderId::from("now-filed");
+        let fid = baybo_model::FolderId::from("now-filed");
         assert!(store.set_folder(&id, Some(&fid)).await.unwrap());
         assert_eq!(store.get(&id).await.unwrap().unwrap().folder_id, Some(fid));
     }
@@ -1684,9 +1684,9 @@ mod tests {
         let session = make_root_session("paginate-me");
         store.save(&session).await.unwrap();
         for i in 0..7 {
-            let msg = aura_model::ChatMessage::user(vec![aura_model::ContentBlock::Text(format!(
-                "msg-{i}"
-            ))]);
+            let msg = baybo_model::ChatMessage::user(vec![baybo_model::ContentBlock::Text(
+                format!("msg-{i}"),
+            )]);
             store
                 .append_session_message(&session.id, &msg)
                 .await
@@ -1733,7 +1733,7 @@ mod tests {
         let store = LibsqlSessionStore::new(pool);
         let session = make_root_session("preview-me");
         store.save(&session).await.unwrap();
-        let text = |s: &str| vec![aura_model::ContentBlock::Text(s.to_owned())];
+        let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
 
         // No user turn yet -> None.
         assert!(
@@ -1747,21 +1747,21 @@ mod tests {
         store
             .append_session_message(
                 &session.id,
-                &aura_model::ChatMessage::user(text("first prompt")),
+                &baybo_model::ChatMessage::user(text("first prompt")),
             )
             .await
             .unwrap();
         store
             .append_session_message(
                 &session.id,
-                &aura_model::ChatMessage::assistant(text("first reply")),
+                &baybo_model::ChatMessage::assistant(text("first reply")),
             )
             .await
             .unwrap();
         store
             .append_session_message(
                 &session.id,
-                &aura_model::ChatMessage::user(text("the freshest prompt")),
+                &baybo_model::ChatMessage::user(text("the freshest prompt")),
             )
             .await
             .unwrap();
@@ -1771,7 +1771,7 @@ mod tests {
             store
                 .append_session_message(
                     &session.id,
-                    &aura_model::ChatMessage::assistant(text(&format!("tool churn {i}"))),
+                    &baybo_model::ChatMessage::assistant(text(&format!("tool churn {i}"))),
                 )
                 .await
                 .unwrap();
@@ -1796,16 +1796,19 @@ mod tests {
         let store = LibsqlSessionStore::new(pool);
         let session = make_root_session("interjection-me");
         store.save(&session).await.unwrap();
-        let text = |s: &str| vec![aura_model::ContentBlock::Text(s.to_owned())];
+        let text = |s: &str| vec![baybo_model::ContentBlock::Text(s.to_owned())];
 
         store
-            .append_session_message(&session.id, &aura_model::ChatMessage::user(text("genuine")))
+            .append_session_message(
+                &session.id,
+                &baybo_model::ChatMessage::user(text("genuine")),
+            )
             .await
             .unwrap();
         store
             .append_session_message(
                 &session.id,
-                &aura_model::ChatMessage::user_interjection(text("interjected")),
+                &baybo_model::ChatMessage::user_interjection(text("interjected")),
             )
             .await
             .unwrap();
@@ -1813,7 +1816,7 @@ mod tests {
         store
             .append_session_message(
                 &session.id,
-                &aura_model::ChatMessage::agent_context(text("injected reminder")),
+                &baybo_model::ChatMessage::agent_context(text("injected reminder")),
             )
             .await
             .unwrap();
@@ -1840,9 +1843,9 @@ mod tests {
         let session = make_root_session("catch-up-me");
         store.save(&session).await.unwrap();
         for i in 0..7 {
-            let msg = aura_model::ChatMessage::user(vec![aura_model::ContentBlock::Text(format!(
-                "msg-{i}"
-            ))]);
+            let msg = baybo_model::ChatMessage::user(vec![baybo_model::ContentBlock::Text(
+                format!("msg-{i}"),
+            )]);
             store
                 .append_session_message(&session.id, &msg)
                 .await

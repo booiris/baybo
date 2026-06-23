@@ -19,7 +19,7 @@ pub struct OAuthTokenBundle {
     /// response carries.
     pub refresh_token: String,
     /// JWT carrying the user's identity claims (email, plan_type,
-    /// chatgpt_account_id). Re-parsed only for `aura llm status` display;
+    /// chatgpt_account_id). Re-parsed only for `baybo llm status` display;
     /// the flat `account_id` field below is the hot-path copy.
     pub id_token: String,
     /// `chatgpt_account_id` claim from `id_token`, sent as the
@@ -84,7 +84,7 @@ impl OAuthTokenBundle {
         now >= self.expires_at.saturating_sub(skew_secs)
     }
 
-    /// Email claim from `id_token`, for `aura llm status` display only.
+    /// Email claim from `id_token`, for `baybo llm status` display only.
     pub fn email(&self) -> Option<String> {
         let claims = parse_jwt_payload(&self.id_token).ok()?;
         let direct = claims.get("email").and_then(|v| v.as_str());

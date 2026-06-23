@@ -10,13 +10,13 @@ use crate::{AnyCompletionModel, LlmClient, LlmError, ModelInfo, ModelPricing};
 /// Hosts where the ChatGPT subscription bearer is allowed to land. Match
 /// is suffix-based (`chatgpt.com` covers `api.chatgpt.com` etc.). A
 /// non-default `base_url` outside the list is rejected at factory time
-/// so a malicious aura.json can't exfiltrate the OAuth bearer to an
+/// so a malicious baybo.json can't exfiltrate the OAuth bearer to an
 /// attacker host on the next chat call.
 const ALLOWED_HOST_SUFFIXES: &[&str] = &["chatgpt.com", "auth.openai.com"];
 
-/// Env-var escape hatch for non-OpenAI hosts. Env rather than aura.json
+/// Env-var escape hatch for non-OpenAI hosts. Env rather than baybo.json
 /// so flipping a credential-leak guard requires an explicit shell action.
-pub const UNSAFE_BASE_URL_ENV_VAR: &str = "AURA_OPENAI_SUBSCRIPTION_UNSAFE_BASE_URL";
+pub const UNSAFE_BASE_URL_ENV_VAR: &str = "BAYBO_OPENAI_SUBSCRIPTION_UNSAFE_BASE_URL";
 
 fn validate_base_url(base_url: Option<&str>) -> crate::Result<()> {
     let Some(url_str) = base_url else {
@@ -117,7 +117,7 @@ fn build_model(
     let vault = config.vault.as_ref().ok_or_else(|| {
         LlmError::Config(
             "openai-subscription: SecretVault not provided. Boot wires it for normal runs; \
-             argv-mode probes (e.g. `aura llm models`) cannot use this provider."
+             argv-mode probes (e.g. `baybo llm models`) cannot use this provider."
                 .into(),
         )
     })?;
@@ -137,9 +137,9 @@ fn build_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::MicroUsd;
-    use aura_security::test_support::MemorySecretStore;
-    use aura_security::{EncryptionKey, SecretVault};
+    use baybo_model::MicroUsd;
+    use baybo_security::test_support::MemorySecretStore;
+    use baybo_security::{EncryptionKey, SecretVault};
     use std::sync::Arc;
 
     fn vault() -> Arc<SecretVault> {

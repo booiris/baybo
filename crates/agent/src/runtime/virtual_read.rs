@@ -2,10 +2,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_model::{ChatMessage, ContentBlock, MessageSource, Role, SessionId, ThinkingContent};
-use aura_tools::{VirtualReadAccess, VirtualReadResolver};
-use aura_workspace::WorkspacePaths;
-use aura_workspace::paths::SESSION_LOG_EXTENSION;
+use baybo_model::{ChatMessage, ContentBlock, MessageSource, Role, SessionId, ThinkingContent};
+use baybo_tools::{VirtualReadAccess, VirtualReadResolver};
+use baybo_workspace::WorkspacePaths;
+use baybo_workspace::paths::SESSION_LOG_EXTENSION;
 use tracing::warn;
 
 /// Data source for [`SessionTranscriptReader`]: the full durable transcript in
@@ -178,7 +178,7 @@ fn render_transcript(messages: &[ChatMessage]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, User};
+    use baybo_model::{ChannelType, User};
 
     struct FakeTranscript(Vec<ChatMessage>);
     struct FailingTranscript;
@@ -198,7 +198,7 @@ mod tests {
     }
 
     fn paths() -> WorkspacePaths {
-        WorkspacePaths::new(std::path::PathBuf::from("/tmp/aura-vread-test"))
+        WorkspacePaths::new(std::path::PathBuf::from("/tmp/baybo-vread-test"))
     }
 
     fn user() -> User {
@@ -316,7 +316,7 @@ mod tests {
             session_id: &sid,
             user: &u,
         };
-        let elsewhere = std::path::Path::new("/tmp/aura-vread-test/work/foo.txt");
+        let elsewhere = std::path::Path::new("/tmp/baybo-vread-test/work/foo.txt");
         assert!(reader.resolve(elsewhere, &access).await.is_none());
     }
 
@@ -340,22 +340,22 @@ mod tests {
     // pre-compaction content for the owning session.
     #[tokio::test]
     async fn recovers_compacted_away_content_via_real_manager() {
-        use aura_session::test_support::{
+        use baybo_session::test_support::{
             MemorySessionFolderStore, MemorySessionStore, MemorySessionSummaryStore,
         };
-        use aura_session::{SessionFolderStore, SessionStore, SessionSummaryStore};
+        use baybo_session::{SessionFolderStore, SessionStore, SessionSummaryStore};
 
         let now = chrono::Utc::now();
         let sid = SessionId::from("recover-sess");
-        let session = aura_model::Session {
+        let session = baybo_model::Session {
             id: sid.clone(),
             user: user(),
             channel: ChannelType::tui(),
             created_at: now,
             last_active: now,
-            state: aura_model::SessionState::default(),
+            state: baybo_model::SessionState::default(),
             root_session_id: sid.clone(),
-            trigger: aura_model::TriggerSource::User,
+            trigger: baybo_model::TriggerSource::User,
             lineage: None,
             hidden: false,
             pinned: false,

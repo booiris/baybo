@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use aura_channels::register_wire::{MAX_FRAME_BYTES, PromptKind, RegisterIn, RegisterOut};
-use aura_channels::registration::{Prompter as ChannelPrompter, RegistrationResult};
-use aura_gateway::{BUN_BINARY_ENV, SIDECAR_ENV_ALLOWLIST, SidecarRuntime};
-use aura_model::ChannelType;
+use baybo_channels::register_wire::{MAX_FRAME_BYTES, PromptKind, RegisterIn, RegisterOut};
+use baybo_channels::registration::{Prompter as ChannelPrompter, RegistrationResult};
+use baybo_gateway::{BUN_BINARY_ENV, SIDECAR_ENV_ALLOWLIST, SidecarRuntime};
+use baybo_model::ChannelType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 
@@ -197,7 +197,7 @@ fn scrubbed_env(cmd: &mut Command) {
             cmd.env(key, v);
         }
     }
-    cmd.env("AURA_CHANNEL_MODE", "register");
+    cmd.env("BAYBO_CHANNEL_MODE", "register");
 }
 
 #[cfg(test)]

@@ -1,12 +1,12 @@
 //! Shared data layer for the SWE-bench benchmark: the normalized instance IR,
 //! the prompt the agent is handed, the `predictions.jsonl` line shape the
-//! `swebench` harness consumes, and the per-arm model label. Holds **no Aura,
+//! `swebench` harness consumes, and the per-arm model label. Holds **no Baybo,
 //! Docker, or Python dependency** so it stays fast to compile and unit-testable.
 //!
 //! The flow the bins implement around these types:
 //! 1. `swe_export.py` writes `instances.json` (dataset rows + the canonical
 //!    Docker `image_key`), which [`load_instances`] parses into [`SweInstance`]s.
-//! 2. The `agent` arm runs aura inside each instance's image and captures a
+//! 2. The `agent` arm runs baybo inside each instance's image and captures a
 //!    `git diff`; that becomes a [`prediction_line`] in `predictions.jsonl`.
 //! 3. The `swebench` harness grades the predictions (or `gold`); the report is
 //!    parsed back in `grader.rs`.
@@ -18,16 +18,16 @@ pub mod grader;
 pub mod report;
 
 /// Canonical env var the agent arm reads the model's API key from. The bench
-/// generates the in-container `aura.json`, so the env-var name is fixed here
+/// generates the in-container `baybo.json`, so the env-var name is fixed here
 /// (written into `api_key_env` and injected via `docker run -e`) rather than a
-/// user knob — matching the `new-bench` skill's canonical `AURA_API_KEY`.
-pub const AURA_API_KEY_ENV: &str = "AURA_API_KEY";
+/// user knob — matching the `new-bench` skill's canonical `BAYBO_API_KEY`.
+pub const BAYBO_API_KEY_ENV: &str = "BAYBO_API_KEY";
 
 /// One normalized SWE-bench task instance, as exported by `swe_export.py`.
 ///
 /// `image_key` is the Docker image the **official** harness uses for this
 /// instance (from `swebench`'s `make_test_spec(...).instance_image_key`), so the
-/// agent arm runs aura inside the *exact* environment grading will use.
+/// agent arm runs baybo inside the *exact* environment grading will use.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SweInstance {
     pub instance_id: String,
@@ -60,12 +60,12 @@ pub fn load_instances(path: &std::path::Path) -> anyhow::Result<Vec<SweInstance>
 pub fn arm_model_name(arm: &str) -> &'static str {
     match arm {
         "oracle" => "gold",
-        "noop" => "aura-noop",
-        _ => "aura",
+        "noop" => "baybo-noop",
+        _ => "baybo",
     }
 }
 
-/// The instruction handed to `aura prompt` for one instance. The repo is already
+/// The instruction handed to `baybo prompt` for one instance. The repo is already
 /// checked out at `base_commit` in the image at `/testbed` (the agent's cwd), so
 /// the agent just edits in place; we capture the diff afterwards. Tests are
 /// withheld (the harness applies them at grade time), so the agent is told not
@@ -164,8 +164,8 @@ mod tests {
     #[test]
     fn arm_model_names_are_distinct_and_gold_for_oracle() {
         assert_eq!(arm_model_name("oracle"), "gold");
-        assert_eq!(arm_model_name("noop"), "aura-noop");
-        assert_eq!(arm_model_name("agent"), "aura");
+        assert_eq!(arm_model_name("noop"), "baybo-noop");
+        assert_eq!(arm_model_name("agent"), "baybo");
         // Distinct so concurrent arms' report files never clobber each other.
         assert_ne!(arm_model_name("noop"), arm_model_name("agent"));
     }
@@ -182,17 +182,17 @@ mod tests {
 
     #[test]
     fn prediction_line_has_the_three_harness_keys() {
-        let line = prediction_line("django__django-12345", "aura", "diff --git a/x b/x");
+        let line = prediction_line("django__django-12345", "baybo", "diff --git a/x b/x");
         assert_eq!(line["instance_id"], "django__django-12345");
-        assert_eq!(line["model_name_or_path"], "aura");
+        assert_eq!(line["model_name_or_path"], "baybo");
         assert_eq!(line["model_patch"], "diff --git a/x b/x");
     }
 
     #[test]
     fn predictions_jsonl_is_one_object_per_line() {
         let lines = vec![
-            prediction_line("a", "aura", "pa"),
-            prediction_line("b", "aura", "pb"),
+            prediction_line("a", "baybo", "pa"),
+            prediction_line("b", "baybo", "pb"),
         ];
         let text = predictions_jsonl(&lines);
         let parsed: Vec<&str> = text.lines().collect();

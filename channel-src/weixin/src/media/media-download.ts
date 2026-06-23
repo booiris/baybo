@@ -2,7 +2,7 @@
  * Inbound media decode for Weixin. Picks the first downloadable media
  * item out of a `WeixinMessage`, downloads + AES-128-ECB decrypts it,
  * and returns the plaintext buffer ready for `uploadBlob` against the
- * Aura gateway.
+ * Baybo gateway.
  *
  * Quoted media (`ref_msg`) is handled separately — the caller should
  * fall back to that only when the main item list has no media of its
@@ -10,7 +10,7 @@
  * monitor loop so a multi-item message with both an image and a
  * voice-note returns the image first.
  */
-import type { Logger } from "@aura/channel-sdk";
+import type { Logger } from "@baybo/channel-sdk";
 
 import { downloadAndDecryptBuffer, downloadPlainCdnBuffer } from "../cdn/pic-decrypt.js";
 import { MessageItemType, type MessageItem, type WeixinMessage } from "../api/types.js";

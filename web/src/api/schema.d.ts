@@ -700,7 +700,7 @@ export interface components {
             jobs: components["schemas"]["BackgroundJob"][];
         };
         /**
-         * @description Admin-surface mirror of [`aura_model::ChannelType`]. Transparent
+         * @description Admin-surface mirror of [`baybo_model::ChannelType`]. Transparent
          *     wrapper around a snake_case string so the OpenAPI surface stays
          *     stable while the core type is open-ended (runtime-registered
          *     sidecars like `"slack"` pass through unchanged).
@@ -736,7 +736,7 @@ export interface components {
             /**
              * @description The user-facing prompt for this fire. Truncated to
              *     [`PREVIEW_MAX_CHARS`]. The persisted user row carries the cron
-             *     dispatcher's fire-time framing; `aura_context::prompts::cron::original_cron_prompt`
+             *     dispatcher's fire-time framing; `baybo_context::prompts::cron::original_cron_prompt`
              *     recovers the instruction as configured so the panel shows that,
              *     not the framing boilerplate.
              */
@@ -794,7 +794,7 @@ export interface components {
             /** Format: date-time */
             last_active: string;
             /**
-             * @description Per-session LLM pin (`session.state.last_llm`): the `aura.json`
+             * @description Per-session LLM pin (`session.state.last_llm`): the `baybo.json`
              *     entry name this session's turns resolve against, or `null` to
              *     follow `default-llm`. Drives the chat header model picker's
              *     initial selection. Set via `PUT /v1/chat/sessions/{id}/model`.
@@ -971,7 +971,7 @@ export interface components {
         };
         /**
          * @description `POST /v1/cron` body. Schedule format is the standard 5-field cron
-         *     string accepted by [`aura_cron`].
+         *     string accepted by [`baybo_cron`].
          */
         CreateCronRequest: {
             channel?: null | components["schemas"]["ChannelType"];
@@ -992,7 +992,7 @@ export interface components {
             /** @description Parent folder id (`null`/absent = top-level). */
             parent_id?: string | null;
         };
-        /** @description Mirror of [`aura_cron::CronJob`]. */
+        /** @description Mirror of [`baybo_cron::CronJob`]. */
         CronJob: {
             channel: components["schemas"]["ChannelType"];
             /** Format: date-time */
@@ -1011,7 +1011,7 @@ export interface components {
             updated_at: string;
             user_id: string;
         };
-        /** @description Mirror of [`aura_cron::CronSchedule`]. */
+        /** @description Mirror of [`baybo_cron::CronSchedule`]. */
         CronSchedule: {
             expr: string;
             /** @enum {string} */
@@ -1023,7 +1023,7 @@ export interface components {
             time: string;
         };
         /**
-         * @description Mirror of [`aura_cron::CronStatus`].
+         * @description Mirror of [`baybo_cron::CronStatus`].
          * @enum {string}
          */
         CronStatus: "enabled" | "disabled" | "executed";
@@ -1051,7 +1051,7 @@ export interface components {
             items: components["schemas"]["FolderDto"][];
         };
         /**
-         * @description Wire mirror of [`aura_job::Job`]. Inner shape reflects the new
+         * @description Wire mirror of [`baybo_job::Job`]. Inner shape reflects the new
          *     state machine (Q6) — `final_result` replaces `output`/`error`,
          *     `emitted_span_ids` replaces `trace_span_id`.
          */
@@ -1076,23 +1076,23 @@ export interface components {
             status: components["schemas"]["JobStatus"];
         };
         /**
-         * @description Wire mirror of [`aura_job::JobInputKind`] — what payload fed the job.
+         * @description Wire mirror of [`baybo_job::JobInputKind`] — what payload fed the job.
          * @enum {string}
          */
         JobInputKind: "user_chat" | "cron" | "system" | "spawned" | "subagent_notification";
         /**
          * @description Wire mirror of a job's origin (the owning session's root trigger,
-         *     [`aura_model::TriggerKind`]).
+         *     [`baybo_model::TriggerKind`]).
          * @enum {string}
          */
         JobOrigin: "user" | "cron" | "system" | "spawned";
         /**
-         * @description Wire mirror of [`aura_job::JobShape`] — turn vs maintenance.
+         * @description Wire mirror of [`baybo_job::JobShape`] — turn vs maintenance.
          * @enum {string}
          */
         JobShape: "turn" | "maintenance";
         /**
-         * @description Wire mirror of [`aura_job::JobStatus`]. Carries the same payload
+         * @description Wire mirror of [`baybo_job::JobStatus`]. Carries the same payload
          *     the domain enum carries (cancel reason, partial-artifact span IDs);
          *     the wire shape collapses inner-variant content into `Option`-typed
          *     fields so HTTP clients can decode without needing the full Rust
@@ -1222,10 +1222,10 @@ export interface components {
         };
         /**
          * @description Per-entry pricing override fields. Wire shape mirrors
-         *     [`aura_model::LlmPricingOverride`]; each field is integer micro-USD
+         *     [`baybo_model::LlmPricingOverride`]; each field is integer micro-USD
          *     per 1M tokens (1 USD = 1_000_000). The DTO exists separately from
          *     the canonical struct only so we can derive `ToSchema` for utoipa
-         *     without leaking that derive into `aura-model`.
+         *     without leaking that derive into `baybo-model`.
          */
         LlmPricingOverrideDto: {
             /** Format: int64 */
@@ -1263,7 +1263,7 @@ export interface components {
             message: string;
             /**
              * @description Tracing target that emitted the record (e.g.
-             *     `aura_gateway::server`). Rendered as "source" in the UI.
+             *     `baybo_gateway::server`). Rendered as "source" in the UI.
              */
             target: string;
             /** Format: date-time */
@@ -1331,7 +1331,7 @@ export interface components {
             parent_id?: string | null;
         };
         /**
-         * @description Wire mirror of [`aura_query::SessionKind`]. Coarse trigger/lineage
+         * @description Wire mirror of [`baybo_query::SessionKind`]. Coarse trigger/lineage
          *     label for the trace browser list view.
          * @enum {string}
          */
@@ -1339,7 +1339,7 @@ export interface components {
         /** @description `PUT /v1/config` body. */
         SetConfigRequest: {
             path: string;
-            /** @description JSON value written at `path`. Shape validated by `AuraConfig`. */
+            /** @description JSON value written at `path`. Shape validated by `BayboConfig`. */
             value: Record<string, never>;
         };
         /** @description `PUT /v1/llm/default` body. */
@@ -1354,7 +1354,7 @@ export interface components {
         /** @description Request body for `PUT /v1/chat/sessions/{session_id}/model`. */
         SetSessionModelRequest: {
             /**
-             * @description `aura.json` LLM entry name to pin this session to, or `null`
+             * @description `baybo.json` LLM entry name to pin this session to, or `null`
              *     (absent) to clear the pin and follow `default-llm`. Must match a
              *     configured entry — see `GET /v1/llm/models` → `items[].name`.
              */
@@ -1381,9 +1381,9 @@ export interface components {
         };
         /**
          * @description Wire DTO for slash command entries. Mirror of
-         *     [`aura_channels::wire::SlashCommandSpec`] so the OpenAPI surface
+         *     [`baybo_channels::wire::SlashCommandSpec`] so the OpenAPI surface
          *     stays inside this crate's DTOs (the wire type lives in
-         *     `aura-channels` for sidecar reuse).
+         *     `baybo-channels` for sidecar reuse).
          */
         SlashCommandEntry: {
             command: string;
@@ -1398,7 +1398,7 @@ export interface components {
         };
         /**
          * @description One row of the trace browser list view. Mirrors
-         *     [`aura_query::SessionSummary`] for the wire.
+         *     [`baybo_query::SessionSummary`] for the wire.
          */
         TraceSessionSummary: {
             cache_creation_input_tokens: number;
@@ -2296,7 +2296,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Current in-memory config. Secret fields are redacted by `AuraConfig`'s serde impl. */
+            /** @description Current in-memory config. Secret fields are redacted by `BayboConfig`'s serde impl. */
             200: {
                 headers: {
                     [name: string]: unknown;

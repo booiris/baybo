@@ -50,8 +50,8 @@ pub use crate::registry::{
     LiveModelInfo, LlmPricingOverride, LlmProviderConfig, LlmProviderRegistry,
 };
 /// Re-exported next to [`Attribution`] (which carries it) so call sites
-/// binding an attribution don't need a separate `aura_model` import.
-pub use aura_model::CallReason;
+/// binding an attribution don't need a separate `baybo_model` import.
+pub use baybo_model::CallReason;
 
 /// Process-wide handle to the default provider registry. Lazily
 /// constructed on first lookup, shared by the metadata-helper fns
@@ -180,19 +180,19 @@ pub struct ModelInfo {
 /// vs. the input rate: 0.1× cached read, 1.25× cache write.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ModelPricing {
-    pub input_per_1m_tokens: aura_model::MicroUsd,
-    pub output_per_1m_tokens: aura_model::MicroUsd,
+    pub input_per_1m_tokens: baybo_model::MicroUsd,
+    pub output_per_1m_tokens: baybo_model::MicroUsd,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cached_input_per_1m_tokens: Option<aura_model::MicroUsd>,
+    pub cached_input_per_1m_tokens: Option<baybo_model::MicroUsd>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_write_per_1m_tokens: Option<aura_model::MicroUsd>,
+    pub cache_write_per_1m_tokens: Option<baybo_model::MicroUsd>,
 }
 
 /// Unified response structure returned by `LlmClient::chat()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
     pub content: String,
-    pub content_blocks: Vec<aura_model::ContentBlock>,
+    pub content_blocks: Vec<baybo_model::ContentBlock>,
     pub tool_calls: Vec<ToolCallInfo>,
     pub usage: TokenUsage,
     pub thinking: Option<String>,
@@ -229,7 +229,7 @@ pub struct TokenUsage {
 /// A chat request to be sent to an LLM provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
-    pub messages: Vec<aura_model::ChatMessage>,
+    pub messages: Vec<baybo_model::ChatMessage>,
     pub temperature: Option<f32>,
     pub tools: Vec<ToolDefinitionForLlm>,
 }
@@ -254,7 +254,7 @@ pub enum StreamEvent {
     /// A complete, structured reasoning block. Must be preserved for
     /// providers that require thinking to be echoed back (Anthropic,
     /// Gemini).
-    ThinkingBlock(aura_model::ContentBlock),
+    ThinkingBlock(baybo_model::ContentBlock),
     /// Token usage statistics (emitted at stream end).
     Usage(TokenUsage),
 }
@@ -613,7 +613,7 @@ impl AnyCompletionModel {
 /// other consumer that doesn't need the concrete `LlmClient` (e.g. probe).
 ///
 /// Implemented by `LlmClient` for production and by test stubs in
-/// `aura-llm`'s `test-support` feature for deterministic integration tests.
+/// `baybo-llm`'s `test-support` feature for deterministic integration tests.
 #[async_trait::async_trait]
 pub trait LlmCompletion: Send + Sync {
     async fn chat(&self, request: &ChatRequest) -> crate::Result<LlmResponse>;
@@ -635,7 +635,7 @@ impl LlmCompletion for LlmClient {
 }
 
 /// Capability the LLM client uses to materialise blob bytes for
-/// multimodal user content. Decoupled from `aura-storage::BlobStore`
+/// multimodal user content. Decoupled from `baybo-storage::BlobStore`
 /// so the LLM crate stays storage-agnostic — the agent runtime wraps
 /// its `BlobStore` in an adapter that implements this trait.
 #[async_trait::async_trait]
@@ -736,10 +736,10 @@ impl LlmClient {
 
         for msg in &request.messages {
             match msg.role {
-                aura_model::Role::System => {
+                baybo_model::Role::System => {
                     system_parts.push(multimodal::extract_text(&msg.content));
                 }
-                aura_model::Role::User => {
+                baybo_model::Role::User => {
                     let mut parts: Vec<UserContent> = Vec::with_capacity(msg.content.len());
                     for block in &msg.content {
                         parts.push(self.user_content_for_block(block).await);
@@ -753,14 +753,14 @@ impl LlmClient {
                         chat_messages.push(Message::User { content });
                     }
                 }
-                aura_model::Role::Assistant => {
+                baybo_model::Role::Assistant => {
                     let mut parts: Vec<AssistantContent> = Vec::new();
                     for block in &msg.content {
                         match block {
-                            aura_model::ContentBlock::Text(t) if !t.is_empty() => {
+                            baybo_model::ContentBlock::Text(t) if !t.is_empty() => {
                                 parts.push(AssistantContent::Text(Text { text: t.clone() }));
                             }
-                            aura_model::ContentBlock::ToolUse {
+                            baybo_model::ContentBlock::ToolUse {
                                 id,
                                 name,
                                 input,
@@ -779,7 +779,7 @@ impl LlmClient {
                                     },
                                 ));
                             }
-                            aura_model::ContentBlock::Thinking { id, content } => {
+                            baybo_model::ContentBlock::Thinking { id, content } => {
                                 parts.push(convert_thinking_to_reasoning(id, content));
                             }
                             _ => {}
@@ -794,11 +794,11 @@ impl LlmClient {
                         chat_messages.push(Message::Assistant { id: None, content });
                     }
                 }
-                aura_model::Role::Tool => {
+                baybo_model::Role::Tool => {
                     let mut parts: Vec<UserContent> = Vec::new();
                     for block in &msg.content {
                         match block {
-                            aura_model::ContentBlock::ToolResult {
+                            baybo_model::ContentBlock::ToolResult {
                                 tool_use_id,
                                 content,
                             } => {
@@ -814,7 +814,7 @@ impl LlmClient {
                                     },
                                 ));
                             }
-                            aura_model::ContentBlock::Text(text) => {
+                            baybo_model::ContentBlock::Text(text) => {
                                 // Legacy fallback for plain-text tool results.
                                 parts.push(UserContent::Text(Text { text: text.clone() }));
                             }
@@ -885,10 +885,10 @@ impl LlmClient {
     /// fetch fails — the block degrades to a `[image: …]`-style text
     /// stub so the conversation can keep going even if the bytes
     /// aren't deliverable.
-    async fn user_content_for_block(&self, block: &aura_model::ContentBlock) -> UserContent {
+    async fn user_content_for_block(&self, block: &baybo_model::ContentBlock) -> UserContent {
         match block {
-            aura_model::ContentBlock::Text(t) => UserContent::Text(Text { text: t.clone() }),
-            aura_model::ContentBlock::Image { blob, mime_type }
+            baybo_model::ContentBlock::Text(t) => UserContent::Text(Text { text: t.clone() }),
+            baybo_model::ContentBlock::Image { blob, mime_type }
                 if self.model_info.supports_vision =>
             {
                 if let (Some(fetcher), Some(media_type)) = (
@@ -926,7 +926,7 @@ impl LlmClient {
                     })
                 }
             }
-            aura_model::ContentBlock::Audio { blob, mime_type }
+            baybo_model::ContentBlock::Audio { blob, mime_type }
                 if self.model_info.supports_vision =>
             {
                 if let (Some(fetcher), Some(media_type)) = (
@@ -956,7 +956,7 @@ impl LlmClient {
                     })
                 }
             }
-            aura_model::ContentBlock::File {
+            baybo_model::ContentBlock::File {
                 blob, mime_type, ..
             } if self.model_info.supports_vision => {
                 if let (Some(fetcher), Some(media_type)) = (
@@ -1007,7 +1007,7 @@ impl LlmClient {
                             content.push('\n');
                         }
                         content.push_str(&text.text);
-                        content_blocks.push(aura_model::ContentBlock::Text(text.text));
+                        content_blocks.push(baybo_model::ContentBlock::Text(text.text));
                     }
                 }
                 AssistantContent::ToolCall(tc) => {
@@ -1070,12 +1070,12 @@ impl LlmClient {
 
     /// Issue a minimal chat request to verify provider connectivity and auth.
     ///
-    /// Used by `aura llm probe` and `aura doctor`. The request is deliberately
+    /// Used by `baybo llm probe` and `baybo doctor`. The request is deliberately
     /// tiny (one-token prompt, no tools) so it is cheap to run repeatedly.
     pub async fn probe(&self) -> crate::Result<ProbeReport> {
         let req = ChatRequest {
-            messages: vec![aura_model::ChatMessage::agent_context(vec![
-                aura_model::ContentBlock::Text("ping".to_string()),
+            messages: vec![baybo_model::ChatMessage::agent_context(vec![
+                baybo_model::ContentBlock::Text("ping".to_string()),
             ])],
             temperature: Some(0.0),
             tools: vec![],
@@ -1106,7 +1106,7 @@ pub struct ProbeReport {
     /// Number of UTF-8 characters of reasoning summary the provider
     /// returned. `None` when the model didn't emit any reasoning —
     /// either because reasoning is disabled or because the provider
-    /// doesn't support it. Useful for `aura llm probe` to confirm
+    /// doesn't support it. Useful for `baybo llm probe` to confirm
     /// reasoning is actually flowing end-to-end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_chars: Option<usize>,
@@ -1124,8 +1124,8 @@ pub struct ProbeReport {
 /// `ContentBlock::Thinking` representation.
 fn convert_reasoning_to_block(
     reasoning: &completion::message::Reasoning,
-) -> aura_model::ContentBlock {
-    use aura_model::ThinkingContent;
+) -> baybo_model::ContentBlock {
+    use baybo_model::ThinkingContent;
     let content = reasoning
         .content
         .iter()
@@ -1148,7 +1148,7 @@ fn convert_reasoning_to_block(
             },
         })
         .collect();
-    aura_model::ContentBlock::Thinking {
+    baybo_model::ContentBlock::Thinking {
         id: reasoning.id.clone(),
         content,
     }
@@ -1158,20 +1158,20 @@ fn convert_reasoning_to_block(
 /// `AssistantContent::Reasoning` for the completion request.
 fn convert_thinking_to_reasoning(
     id: &Option<String>,
-    content: &[aura_model::ThinkingContent],
+    content: &[baybo_model::ThinkingContent],
 ) -> AssistantContent {
     use rig::completion::message::{Reasoning, ReasoningContent};
     let blocks = content
         .iter()
         .map(|tc| match tc {
-            aura_model::ThinkingContent::Text { text, signature } => ReasoningContent::Text {
+            baybo_model::ThinkingContent::Text { text, signature } => ReasoningContent::Text {
                 text: text.clone(),
                 signature: signature.clone(),
             },
-            aura_model::ThinkingContent::Summary { text } => {
+            baybo_model::ThinkingContent::Summary { text } => {
                 ReasoningContent::Summary(text.clone())
             }
-            aura_model::ThinkingContent::Redacted { data } => {
+            baybo_model::ThinkingContent::Redacted { data } => {
                 ReasoningContent::Redacted { data: data.clone() }
             }
         })
@@ -1192,7 +1192,7 @@ mod multimodal_dispatch_tests {
 
     use std::sync::Arc;
 
-    use aura_model::{BlobRef, ContentBlock};
+    use baybo_model::{BlobRef, ContentBlock};
     use rig::completion::message::{DocumentSourceKind, ImageMediaType};
     use rig::message::UserContent;
 

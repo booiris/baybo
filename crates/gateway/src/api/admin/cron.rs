@@ -6,8 +6,8 @@ use axum::http::StatusCode;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use aura_cron::CronSchedule;
-use aura_model::ChannelType as ChannelTypeModel;
+use baybo_cron::CronSchedule;
+use baybo_model::ChannelType as ChannelTypeModel;
 
 use crate::api::dto::{CreateCronRequest, CronJob, ErrorBody, ListResponse};
 use crate::server::AdminState;

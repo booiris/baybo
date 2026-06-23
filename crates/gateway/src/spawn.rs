@@ -6,7 +6,7 @@
 //! one-shot token bound to its process. At spawn time the gateway:
 //!
 //! 1. Generates a fresh capability token.
-//! 2. Sets `AURA_CHANNEL_URL` and `AURA_CHANNEL_TOKEN` in the child's
+//! 2. Sets `BAYBO_CHANNEL_URL` and `BAYBO_CHANNEL_TOKEN` in the child's
 //!    environment so the child knows where to connect and how to
 //!    authenticate.
 //! 3. Spawns the child, captures its PID, and registers the token
@@ -31,24 +31,24 @@ use crate::{GatewayError, Result};
 /// Env var: WebSocket URL of the gateway's channel listener, e.g.
 /// `ws://127.0.0.1:42111/v1/channel-ws`. The child dials this
 /// directly with a standard WebSocket client — no custom scheme.
-pub const ENV_CHANNEL_URL: &str = "AURA_CHANNEL_URL";
+pub const ENV_CHANNEL_URL: &str = "BAYBO_CHANNEL_URL";
 /// Env var: hex-encoded capability token the child presents as
 /// [`CHANNEL_TOKEN_HEADER`].
-pub const ENV_CHANNEL_TOKEN: &str = "AURA_CHANNEL_TOKEN";
+pub const ENV_CHANNEL_TOKEN: &str = "BAYBO_CHANNEL_TOKEN";
 
 /// Env vars a supervised channel sidecar is allowed to inherit from
-/// the gateway. Anything else (`OPENAI_API_KEY`, every `AURA_*` from
+/// the gateway. Anything else (`OPENAI_API_KEY`, every `BAYBO_*` from
 /// the operator's shell, cloud / proxy creds, …) is scrubbed before
 /// `execve` so a compromised JS bundle can't read the gateway's
 /// secret env. The one exception is the operator-configured egress
-/// proxy (`aura.json`'s `proxy`): `ChannelSpawner::spawn` re-injects
+/// proxy (`baybo.json`'s `proxy`): `ChannelSpawner::spawn` re-injects
 /// the standard `*_PROXY` vars from it after the scrub, since shell-
 /// inherited proxy env is wiped but sidecars still need to reach the
 /// network through the configured proxy. Mirrors the registration-mode
 /// allowlist in
 /// `cli::commands::channel::register::scrubbed_env`. Tool-domain
 /// sidecars (the embedded browser MCP server today) flow through
-/// `aura_tools::mcp::transport::connect_with_extra_env`, which
+/// `baybo_tools::mcp::transport::connect_with_extra_env`, which
 /// applies its own scrubbing list — keep these two in mind together
 /// when adding a new env var that needs to reach a child.
 pub const SIDECAR_ENV_ALLOWLIST: &[&str] = &[
@@ -67,7 +67,7 @@ pub const SIDECAR_ENV_ALLOWLIST: &[&str] = &[
     "TZ",
     "TMPDIR",
     // Browser tool sidecar resolves its profile dir under
-    // `$XDG_CACHE_HOME/aura/browser/...`. Channel sidecars don't
+    // `$XDG_CACHE_HOME/baybo/browser/...`. Channel sidecars don't
     // need it but inheriting it costs nothing.
     "XDG_CACHE_HOME",
 ];
@@ -81,14 +81,14 @@ pub struct ChannelSpawner {
     /// Egress proxy injected into each sidecar's env. `env_clear` below
     /// wipes any inherited `*_PROXY`, so we re-add the standard vars
     /// explicitly when configured. `None` = sidecars run direct.
-    proxy: Option<aura_security::http::ProxySettings>,
+    proxy: Option<baybo_security::http::ProxySettings>,
 }
 
 impl ChannelSpawner {
     pub fn new(
         url: String,
         tokens: ChannelTokenTable,
-        proxy: Option<aura_security::http::ProxySettings>,
+        proxy: Option<baybo_security::http::ProxySettings>,
     ) -> Self {
         Self { url, tokens, proxy }
     }
@@ -111,7 +111,7 @@ impl ChannelSpawner {
     ///
     /// The child's environment is scrubbed to [`SIDECAR_ENV_ALLOWLIST`]
     /// plus the two channel env vars before exec, so the operator's
-    /// `OPENAI_API_KEY`, `AURA_*`, cloud creds, etc. never reach the JS bundle.
+    /// `OPENAI_API_KEY`, `BAYBO_*`, cloud creds, etc. never reach the JS bundle.
     pub fn spawn(
         &self,
         mut cmd: Command,
@@ -216,8 +216,8 @@ mod tests {
     fn env_var_names_stable() {
         // Children rely on these; changing them is a protocol break
         // so pin them in a test.
-        assert_eq!(ENV_CHANNEL_URL, "AURA_CHANNEL_URL");
-        assert_eq!(ENV_CHANNEL_TOKEN, "AURA_CHANNEL_TOKEN");
+        assert_eq!(ENV_CHANNEL_URL, "BAYBO_CHANNEL_URL");
+        assert_eq!(ENV_CHANNEL_TOKEN, "BAYBO_CHANNEL_TOKEN");
     }
 
     /// End-to-end check that the spawned child does NOT inherit
@@ -236,7 +236,7 @@ mod tests {
             }
         }
 
-        let secret_var = "AURA_TEST_SECRET_THAT_MUST_NOT_LEAK";
+        let secret_var = "BAYBO_TEST_SECRET_THAT_MUST_NOT_LEAK";
         // SAFETY: see EnvCleanup::drop.
         unsafe { std::env::set_var(secret_var, "hunter2") };
         let _cleanup = EnvCleanup(secret_var);

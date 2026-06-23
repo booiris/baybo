@@ -1,4 +1,4 @@
-//! Operator-facing command layer for Aura.
+//! Operator-facing command layer for Baybo.
 //!
 //! See `docs/modules/cli.md` for the high-level design. This crate owns
 //! the clap tree, the shared `CommandContext`, the dispatcher, and a
@@ -6,7 +6,7 @@
 //! `/`-prefixed input through the same code path as the shell CLI.
 //!
 //! ```no_run
-//! use aura_cli::Cli;
+//! use baybo_cli::Cli;
 //! use clap::Parser;
 //!
 //! let cli = Cli::parse();

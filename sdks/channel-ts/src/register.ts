@@ -19,7 +19,7 @@ const MAX_FRAME_BYTES = 64 * 1024;
 
 /**
  * Entry point for a sidecar's registration flow. Invoked by
- * {@link runSidecar} when `AURA_CHANNEL_MODE === "register"`. Drives a
+ * {@link runSidecar} when `BAYBO_CHANNEL_MODE === "register"`. Drives a
  * line-delimited JSON exchange over stdin/stdout; writes one terminal
  * frame (`result` on success, `error` on throw) before exiting.
  *

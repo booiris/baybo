@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::{CronSchedule, CronScheduler};
 use async_trait::async_trait;
-use aura_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput};
+use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput};
 use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::Deserialize;
@@ -60,7 +60,7 @@ fn with_manifest(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
     let manifest = ToolManifest {
         name: tool.name().to_string(),
         description: tool.description(),
-        trust_level: aura_model::TrustLevel::Trusted,
+        trust_level: baybo_model::TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![],
     };
@@ -131,10 +131,10 @@ impl Tool for CronCreateTool {
         params
             .get("prompt")
             .and_then(Value::as_str)
-            .and_then(aura_tools::progress::preview_arg)
+            .and_then(baybo_tools::progress::preview_arg)
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let p: CreateParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
@@ -223,10 +223,10 @@ impl Tool for CronDeleteTool {
         params
             .get("id")
             .and_then(Value::as_str)
-            .and_then(aura_tools::progress::preview_arg)
+            .and_then(baybo_tools::progress::preview_arg)
     }
 
-    async fn execute(&self, params: Value, _ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let p: DeleteParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
 
@@ -274,7 +274,7 @@ impl Tool for CronListTool {
         json!({ "type": "object", "properties": {} })
     }
 
-    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, _params: Value, _ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let mut jobs = self
             .scheduler
             .list_all_jobs()

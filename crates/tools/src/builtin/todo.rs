@@ -1,5 +1,5 @@
 //! Stub implementations for Claude Code tools whose backing subsystems are
-//! not yet available in Aura.
+//! not yet available in Baybo.
 //!
 //! Each stub implements the [`Tool`] trait and returns
 //! [`ToolError::NotImplemented`] when called. They exist so that:
@@ -71,7 +71,7 @@ todo_tool!(
     SendMessageTool,
     name = "SendMessage",
     desc = "Send a message to an agent-team teammate or resume a subagent.",
-    reason = "agent teams are experimental and not yet modeled in Aura"
+    reason = "agent teams are experimental and not yet modeled in Baybo"
 );
 
 // -- Plan / worktree ---------------------------------------------------------
@@ -122,7 +122,7 @@ todo_tool!(
 
 // -- Background task management ----------------------------------------------
 // The planning-checklist tools (TaskCreate/Get/List/Update) are implemented in
-// `aura-task` and registered from the runtime. These two operate on
+// `baybo-task` and registered from the runtime. These two operate on
 // already-running background work, which has no model yet.
 todo_tool!(
     TaskStopTool,
@@ -158,19 +158,19 @@ todo_tool!(
     TeamCreateTool,
     name = "TeamCreate",
     desc = "Create an agent team.",
-    reason = "agent teams are experimental and not yet modeled in Aura"
+    reason = "agent teams are experimental and not yet modeled in Baybo"
 );
 todo_tool!(
     TeamDeleteTool,
     name = "TeamDelete",
     desc = "Disband an agent team.",
-    reason = "agent teams are experimental and not yet modeled in Aura"
+    reason = "agent teams are experimental and not yet modeled in Baybo"
 );
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, User};
+    use baybo_model::{ChannelType, User};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
@@ -178,8 +178,8 @@ mod tests {
     async fn stub_returns_not_implemented() {
         let ctx = ToolContext {
             session_id: "t".into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u".into(),
                 name: None,
@@ -188,7 +188,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             cancellation_token: CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: None,
             notifier: None,

@@ -7,10 +7,10 @@
 
 use std::sync::Arc;
 
-use aura_channels::{AgentEvent, AgentOutput, NoticeLevel};
-use aura_job::JobLifecycle;
-use aura_model::{ChannelType, SessionId};
-use aura_trace::TraceStore;
+use baybo_channels::{AgentEvent, AgentOutput, NoticeLevel};
+use baybo_job::JobLifecycle;
+use baybo_model::{ChannelType, SessionId};
+use baybo_trace::TraceStore;
 use chrono::Utc;
 use tokio::sync::mpsc;
 use tracing::warn;

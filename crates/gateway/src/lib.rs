@@ -1,4 +1,4 @@
-//! Aura HTTP gateway.
+//! Baybo HTTP gateway.
 //!
 //! Exposes two listeners:
 //!
@@ -10,9 +10,9 @@
 //!   vault-issued channel-token authenticated. Hosts a single
 //!   WebSocket endpoint (`/v1/channel-ws`) over which the bundled
 //!   TUI and sidecar channel plugins exchange
-//!   [`aura_channels::wire::Frame`]s (MessagePack).
+//!   [`baybo_channels::wire::Frame`]s (MessagePack).
 //!
-//! The gateway is driven by the CLI command tree `aura gateway ...`:
+//! The gateway is driven by the CLI command tree `baybo gateway ...`:
 //! `start` runs both listeners in the foreground; `install` writes a
 //! platform service unit; `enable` mints the admin token (if absent) and
 //! marks the service to autostart at boot.

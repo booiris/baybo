@@ -4,7 +4,7 @@
 
 The `trace` crate is the home for the four-tier observability model: domain types (`Step`, `StepKind`, `Span`, `SpanKind`, `SpanEvent`, `SpanEventKind`, `ToolEventPayload`, `LlmToolCallRecord`, `ToolCallOrigin`), the row conversions that persist them, and the `SpanRecorder` lifecycle facade (with its `TraceEvent` / `TraceEventStream` broadcast bus).
 
-The `TraceStore` trait itself lives in the `aura-store` ports crate and trades in row DTOs — `StepRow` / `SpanRow` / `SpanEventRow`, each a queryable key plus the serialized entity in a `data` field. This crate owns the `Step::to_row` / `Step::from_row` (and `Span` / `SpanEvent`) conversions and converts at the recorder boundary, so the rich types and the recorder logic stay here while the trait sits in a leaf crate every store consumer can reach. `aura-storage` provides the libsql implementation, shuttling rows without depending on `aura-trace` (it converts in its tests only). `impl From<aura_store::StorageError> for TraceError` bridges errors at the call sites.
+The `TraceStore` trait itself lives in the `baybo-store` ports crate and trades in row DTOs — `StepRow` / `SpanRow` / `SpanEventRow`, each a queryable key plus the serialized entity in a `data` field. This crate owns the `Step::to_row` / `Step::from_row` (and `Span` / `SpanEvent`) conversions and converts at the recorder boundary, so the rich types and the recorder logic stay here while the trait sits in a leaf crate every store consumer can reach. `baybo-storage` provides the libsql implementation, shuttling rows without depending on `baybo-trace` (it converts in its tests only). `impl From<baybo_store::StorageError> for TraceError` bridges errors at the call sites.
 
 Trace answers **"what exactly did this operation do"** by recording sanitized inputs, results, latency, and execution provenance. Its difference from `job` is: **Job manages state, Trace manages content.**
 
@@ -82,7 +82,7 @@ pub enum ToolEventPayload {
 
 ### Single-table persistence
 
-Step and Span lifecycle writes go to the canonical tables (`steps`, `spans`, `span_events`). Each row stores the entity as a single JSON `data` blob; queryable fields (`job_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns that SQLite keeps in lockstep with `data` automatically. There is no two-side write contract — adding a new field is a serde change in `aura-trace`, no schema migration. New indexed lookups need a new generated column; that is the only schema change vector.
+Step and Span lifecycle writes go to the canonical tables (`steps`, `spans`, `span_events`). Each row stores the entity as a single JSON `data` blob; queryable fields (`job_id`, `step_id`, `started_at`, `ended_at`) surface as `GENERATED ALWAYS AS (json_extract(...)) VIRTUAL` columns that SQLite keeps in lockstep with `data` automatically. There is no two-side write contract — adding a new field is a serde change in `baybo-trace`, no schema migration. New indexed lookups need a new generated column; that is the only schema change vector.
 
 The earlier two-layer WAL (`trace_events` table mirroring every begin/end) was removed once it became clear no reader consumed it: recovery scans `spans` directly, and there is no replay / OTel-export path yet that would benefit from the append-only log. If one lands later, the WAL can come back together with its consumer.
 
@@ -136,7 +136,7 @@ Writes are asynchronous, with **synchronous fences** before any LLM or tool call
 
 ### Recovery
 
-`aura_agent::recovery` closes half-open trace rows left by dropped execution.
+`baybo_agent::recovery` closes half-open trace rows left by dropped execution.
 At boot, `recover_orphaned_traces_and_jobs` walks non-terminal jobs from the
 prior process, closes pending spans/steps at the last observed child activity,
 and cancels the job as `SystemCrash`. While the process is still alive,
@@ -145,12 +145,12 @@ session's active turn jobs, using the actor task's crash time as the close time.
 
 ## Constraints
 
-- Depends on `aura-job` (for `JobId`, `CancelReason`) and `aura-model` (for `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.). No dependency on `aura-storage`.
+- Depends on `baybo-job` (for `JobId`, `CancelReason`) and `baybo-model` (for `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, etc.). No dependency on `baybo-storage`.
 - IDs use ULID newtypes (`StepId`, `SpanId`); `SpanEvent` uses a `(span_id, seq)` compound key
 - Storage uses columnar schema: `steps` / `spans` / `span_events` (one row per entity); the `Job > Step > Span` parent chain is encoded by foreign keys, not by embedded child lists
 - All deletes are hard `DELETE FROM` — no `deleted_at` tombstone column (see [storage.md](./storage.md#hard-delete))
 - `SpanRecorder` holds locks only for short critical sections, never across `await`
-- `test_support::MemoryTraceStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `aura-trace = { workspace = true, features = ["test-support"] }`.
+- `test_support::MemoryTraceStore` is gated behind the `test-support` feature so it never ships in release builds. Downstream test crates pull it in via `baybo-trace = { workspace = true, features = ["test-support"] }`.
 
 ## Collaboration
 
@@ -159,5 +159,5 @@ session's active turn jobs, using the actor task's crash time as the close time.
 | `job`     | Job manages state, Trace manages content; linked via `JobId`; `partial_artifacts: Vec<SpanId>` references trace spans         |
 | `agent`   | Constructs and shares one `SpanRecorder` per session; uses `JobLifecycle` and `SpanRecorder` together as sibling facades       |
 | `store`   | Owns the `TraceStore` trait + its `StepRow` / `SpanRow` / `SpanEventRow` DTOs and `StorageError`; this crate converts rich types ↔ rows |
-| `storage` | Provides the libsql implementation of `TraceStore` (from `aura-store`), shuttling rows; depends on `aura-trace` only as a dev-dependency |
+| `storage` | Provides the libsql implementation of `TraceStore` (from `baybo-store`), shuttling rows; depends on `baybo-trace` only as a dev-dependency |
 | `model`   | Provides `SessionId`, `ChatMessage`, `ContentBlock`, `SecretKind`, `PlaceholderId`, `ApprovalDecision`, `ResourceAccess`       |

@@ -6,10 +6,10 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Async trait for encrypted secret persistence.
 ///
-/// Implemented by `aura_storage::libsql::LibsqlSecretStore` (production)
-/// and `aura_security::test_support::MemorySecretStore` (tests). The bytes
+/// Implemented by `baybo_storage::libsql::LibsqlSecretStore` (production)
+/// and `baybo_security::test_support::MemorySecretStore` (tests). The bytes
 /// handed in are already AES-256-GCM ciphertext minted by
-/// `aura_security::SecretVault` — this layer only persists opaque blobs
+/// `baybo_security::SecretVault` — this layer only persists opaque blobs
 /// keyed by name and never sees plaintext.
 #[async_trait]
 pub trait SecretStore: Send + Sync {

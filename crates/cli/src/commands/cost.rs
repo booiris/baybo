@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
-use aura_cost::{CostSummary, TimeRange};
-use aura_model::{JobId, SessionId};
-use aura_query::{CostScope, QueryApi};
+use baybo_cost::{CostSummary, TimeRange};
+use baybo_model::{JobId, SessionId};
+use baybo_query::{CostScope, QueryApi};
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 

@@ -5,14 +5,14 @@
 //! event on a given span. Cross-span queries join by `event_kind` when
 //! needed.
 
-use aura_model::{ApprovalDecision, PlaceholderId, ResourceAccess, SecretKind, SpanId};
+use baybo_model::{ApprovalDecision, PlaceholderId, ResourceAccess, SecretKind, SpanId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Discrete observation tied to a specific `Span`. Audit-only — writing
 /// a `SpanEvent` does not trigger any side effects beyond persistence.
 ///
-/// **Storage coupling:** the `span_events` table in `aura-storage` derives
+/// **Storage coupling:** the `span_events` table in `baybo-storage` derives
 /// its `kind` / `tool_event_kind` columns via `json_extract(data,
 /// '$.kind.kind')` and `'$.kind.payload.type'`, so the `#[serde(tag = …)]`
 /// discriminants on [`SpanEventKind`] / [`ToolEventPayload`] are load-bearing

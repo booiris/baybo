@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /*!
- * Aura weixin channel sidecar.
+ * Baybo weixin channel sidecar.
  *
  * Derived from openclaw-weixin (https://github.com/Tencent/openclaw-weixin),
  * Copyright (C) 2026 Tencent, licensed under the MIT License. The iLink
  * protocol layer (login QR flow, polling cadence, markdown filter, message
  * encoding) is ported from that project; the surrounding sidecar runtime,
- * approvals, and integration with the Aura gateway are original.
+ * approvals, and integration with the Baybo gateway are original.
  */
-import { runSidecar } from "@aura/channel-sdk";
-import { BotChannel } from "@aura/channel-sdk/bot";
+import { runSidecar } from "@baybo/channel-sdk";
+import { BotChannel } from "@baybo/channel-sdk/bot";
 
 import { WeixinApprovals } from "./approvals.js";
 import { runLogin } from "./cli.js";

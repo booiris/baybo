@@ -2,18 +2,18 @@
 
 ## Overview
 
-The `subagent` crate (`aura-subagent`) owns the typed-subagent domain end to end: the `SubagentProfile` definition, the process-wide `SubagentRegistry`, the per-root fan-out `SubagentDispatchLimiter`, and the `spawn_subagent` `Tool` itself. It mirrors `aura-skills` and `aura-cron` — a domain crate hosts its own `Tool` impl and depends on `aura-tools` for the trait, and `aura-tools` never depends back (that would be a cycle).
+The `subagent` crate (`baybo-subagent`) owns the typed-subagent domain end to end: the `SubagentProfile` definition, the process-wide `SubagentRegistry`, the per-root fan-out `SubagentDispatchLimiter`, and the `spawn_subagent` `Tool` itself. It mirrors `baybo-skills` and `baybo-cron` — a domain crate hosts its own `Tool` impl and depends on `baybo-tools` for the trait, and `baybo-tools` never depends back (that would be a cycle).
 
 A `SubagentProfile` declares the `system_prompt` + default model tier for a single `subagent_type` value the parent LLM can emit when calling `spawn_subagent`. The profile's `system_prompt` **fully replaces the parent's Soul** for the spawned child actor — the profile author owns the child's identity, security, and output contracts; base Soul is not threaded through.
 
-The spawn protocol types (`SubagentSpawnRequest`, `SubagentResult`, `SubagentBackend`, `SubagentParentContext`, `SPAWN_SUBAGENT_TOOL_NAME`) live in `aura-model`; this crate consumes them. The `SubagentSpawner` capability trait lives here in `aura-subagent` (leaf crate, no cycle); its actor-backed impl is in `aura-agent`. Profiles are loaded from a single `<workspace>/agents/<name>.md` markdown file (frontmatter + system-prompt body).
+The spawn protocol types (`SubagentSpawnRequest`, `SubagentResult`, `SubagentBackend`, `SubagentParentContext`, `SPAWN_SUBAGENT_TOOL_NAME`) live in `baybo-model`; this crate consumes them. The `SubagentSpawner` capability trait lives here in `baybo-subagent` (leaf crate, no cycle); its actor-backed impl is in `baybo-agent`. Profiles are loaded from a single `<workspace>/agents/<name>.md` markdown file (frontmatter + system-prompt body).
 
 ### Public surface
 
 - **`SubagentProfile`** — `name`, `version`, `description`, `system_prompt`, `default_tier: Option<ModelTier>`, `source: ArtifactSource`, `trust_level: TrustLevel`, `source_path: Option<PathBuf>`.
 - **`SubagentProfileSummary`** — hot-path projection (`name` + `description` + `default_tier`) used by the `spawn_subagent` description renderer that runs every LLM turn; skips cloning the `system_prompt` body.
 - **`SubagentRegistry`** — process-wide profile lookup (interior mutability via `DashMap`, an `AtomicU64` `version()` for cache invalidation).
-- **`tool::SpawnSubagentTool`** + **`tool::SpawnSubagentToolConfig`** + **`tool::make()`** — the `spawn_subagent` `Tool` (tool name = `aura_model::SPAWN_SUBAGENT_TOOL_NAME`). In the public `tool` module, not re-exported at the crate root.
+- **`tool::SpawnSubagentTool`** + **`tool::SpawnSubagentToolConfig`** + **`tool::make()`** — the `spawn_subagent` `Tool` (tool name = `baybo_model::SPAWN_SUBAGENT_TOOL_NAME`). In the public `tool` module, not re-exported at the crate root.
 - **`SubagentDispatchLimiter`** trait + **`FanOutLimiter`** (production) + **`UnboundedDispatchLimiter`** + **`unbounded_limiter()`** (test/non-production stub).
 - **`load_profile_from_file`** / **`parse_profile_md`** (loader) and **`validate_profile_name`** / **`validate_profile_version`** / **`normalize_line_endings`** (validation).
 
@@ -25,7 +25,7 @@ A child actor boots with an empty context, the profile's `system_prompt` as its 
 
 ### Registry mirrors SkillRegistry
 
-`SubagentRegistry` follows the same pattern as `aura-skills::SkillRegistry`:
+`SubagentRegistry` follows the same pattern as `baybo-skills::SkillRegistry`:
 
 - `register` overwrites by name; `register_builtins` populates the bundled profiles so a fresh workspace boots with at least the catch-all `general-purpose` target.
 - `load_dir` remembers the directory so `reload` can replay disk state. `reload` is **authoritative-disk**: it clears the map and re-scans every remembered directory, so profiles deleted from disk drop out and programmatic `register` calls without a backing file are cleared. Built-ins are *not* auto-re-registered on `reload` — the caller drives `register_builtins` ↔ `reload` ordering explicitly.
@@ -41,24 +41,24 @@ A child actor boots with an empty context, the profile's `system_prompt` as its 
 3. Reserves a fan-out slot under the root via the dispatch limiter **before** shipping. Over cap → `ToolError::SubagentFanoutExceeded`.
 4. Hands the `SubagentSpawnRequest` (plus a `SubagentParentContext` carrying the parent's session/job/span ids + cancel token) to the actor-backed `SubagentSpawner` — reached via a late-set slot, since the tool is built before the spawner exists — and returns the `SubagentResult`: the child's terminal for a foreground spawn, or the dispatch ack for a background one.
 
-The tool is registered by the runtime wiring code (`src/runtime.rs`), **not** by `aura_tools::builtin::default_tools`, because it needs the runtime-owned spawner slot and the live `SubagentRegistry` for its per-turn description. Its manifest carries `TrustLevel::Trusted` and an empty capability set.
+The tool is registered by the runtime wiring code (`src/runtime.rs`), **not** by `baybo_tools::builtin::default_tools`, because it needs the runtime-owned spawner slot and the live `SubagentRegistry` for its per-turn description. Its manifest carries `TrustLevel::Trusted` and an empty capability set.
 
-**Caps** (constructor-overridable defaults): `DEFAULT_MAX_SUBAGENT_DEPTH = 3` bounds the lineage chain; `DEFAULT_MAX_SUBAGENTS_PER_ROOT = 8` bounds concurrent breadth under one root. The tool requires a `max_timeout`, so it uses a 30-day `TOOL_WAIT_BACKSTOP` that never fires in practice — subagent execution is no longer wall-clock-bounded (aura subagents stop at `max_iterations`, external ones at their own internal safety timeout).
+**Caps** (constructor-overridable defaults): `DEFAULT_MAX_SUBAGENT_DEPTH = 3` bounds the lineage chain; `DEFAULT_MAX_SUBAGENTS_PER_ROOT = 8` bounds concurrent breadth under one root. The tool requires a `max_timeout`, so it uses a 30-day `TOOL_WAIT_BACKSTOP` that never fires in practice — subagent execution is no longer wall-clock-bounded (baybo subagents stop at `max_iterations`, external ones at their own internal safety timeout).
 
 **Tool parameters** (`subagent_type`, `description`, `prompt` required):
 
-- `backend` — `"aura"` (default, full in-process aura agent) or `"claude"` / `"codex"` / `"gemini"` (one-shot external CLI backends; see [`../external-agents.md`](../external-agents.md)). Parsed via `SubagentBackend` / `ExternalAgentKind`.
-- `model_tier` — `fast` / `balanced` / `deep`; precedence is explicit > profile `default_tier` > pool default. Only applies to `backend="aura"`.
+- `backend` — `"baybo"` (default, full in-process baybo agent) or `"claude"` / `"codex"` / `"gemini"` (one-shot external CLI backends; see [`../external-agents.md`](../external-agents.md)). Parsed via `SubagentBackend` / `ExternalAgentKind`.
+- `model_tier` — `fast` / `balanced` / `deep`; precedence is explicit > profile `default_tier` > pool default. Only applies to `backend="baybo"`.
 - `background` — when `true`, returns a dispatch ack immediately and surfaces the child's final result as an out-of-band notification on the parent's next turn.
 - `resume_session_id` — continue a prior child's conversation (foreground results carry a `[subagent_session_id: …]` tail the parent can pass back).
 
 ### Fan-out limiter is a per-root capacity gate
 
-The fan-out cap is enforced **outside** the depth check: depth bounds chain length, fan-out bounds concurrent breadth under one root session. The `SubagentDispatchLimiter` trait (`try_reserve(root, cap) -> Result<(), current_count>`, `release(root)`, `in_flight(root)`, `snapshot()`) lives in this leaf crate so both consumers share one definition without a cycle: the `spawn_subagent` tool reserves a slot, and `aura-agent`'s router releases it on the child's terminal event. `FanOutLimiter` backs this with a sharded `DashMap<SessionId, u32>` whose entry API gives an atomic-within-shard check-and-increment (two parallel spawns under the same root cannot both observe `cap - 1`). `release` decrements-or-removes while holding the shard guard so it can't race a re-increment. The lifecycle contract is: one successful `try_reserve` ⇒ exactly one eventual `release` (converging on the supervisor across the envelope-send-failure, router-setup-failure, and terminal-hook paths).
+The fan-out cap is enforced **outside** the depth check: depth bounds chain length, fan-out bounds concurrent breadth under one root session. The `SubagentDispatchLimiter` trait (`try_reserve(root, cap) -> Result<(), current_count>`, `release(root)`, `in_flight(root)`, `snapshot()`) lives in this leaf crate so both consumers share one definition without a cycle: the `spawn_subagent` tool reserves a slot, and `baybo-agent`'s router releases it on the child's terminal event. `FanOutLimiter` backs this with a sharded `DashMap<SessionId, u32>` whose entry API gives an atomic-within-shard check-and-increment (two parallel spawns under the same root cannot both observe `cap - 1`). `release` decrements-or-removes while holding the shard guard so it can't race a re-increment. The lifecycle contract is: one successful `try_reserve` ⇒ exactly one eventual `release` (converging on the supervisor across the envelope-send-failure, router-setup-failure, and terminal-hook paths).
 
 ### Profile format: a single `<name>.md`
 
-One file per profile under `<workspace>/agents/` — no directory-per-profile ceremony like skills, because a profile has no linked-files concern (the prompt body *is* the whole thing). The loader accepts the same YAML subset as `aura-skills::loader` (flow scalars, optionally quoted; `|` literal blocks for multi-paragraph descriptions) and **rejects** anything more exotic — inline/block lists, bools, nested maps, anchors — so misreads can't slip through. `name` defaults to the filename stem; `description` is required (it's shown to the parent LLM when picking a type); `version` defaults to `0.0.0`; `default_tier` is optional. The body after the frontmatter becomes `system_prompt` (leading/trailing blank lines trimmed) and cannot be empty.
+One file per profile under `<workspace>/agents/` — no directory-per-profile ceremony like skills, because a profile has no linked-files concern (the prompt body *is* the whole thing). The loader accepts the same YAML subset as `baybo-skills::loader` (flow scalars, optionally quoted; `|` literal blocks for multi-paragraph descriptions) and **rejects** anything more exotic — inline/block lists, bools, nested maps, anchors — so misreads can't slip through. `name` defaults to the filename stem; `description` is required (it's shown to the parent LLM when picking a type); `version` defaults to `0.0.0`; `default_tier` is optional. The body after the frontmatter becomes `system_prompt` (leading/trailing blank lines trimmed) and cannot be empty.
 
 `validate_profile_name` (`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`) and `validate_profile_version` (`^[a-zA-Z0-9._\-+~]{1,32}$`) reject whitespace, quotes, and angle brackets at load time — frontmatter is untrusted input that could otherwise try to forge a trust level by breaking out of the XML/JSON envelope the runtime renders profiles into.
 
@@ -68,8 +68,8 @@ Four profiles are compiled into the binary via `include_str!` (`builtin/*.md`) a
 
 ## Constraints
 
-- Internal deps: `aura-model` (spawn protocol + domain types), `aura-session` (lineage walk for the depth check), `aura-tools` (the `Tool` trait). **No** dependency on `aura-agent` or `aura-context` — those depend on this crate, never the reverse.
-- Mirrors `aura-skills` / `aura-cron`: a domain crate owning its own `Tool` is only acyclic because `aura-tools`'s dependency graph never reaches back here.
+- Internal deps: `baybo-model` (spawn protocol + domain types), `baybo-session` (lineage walk for the depth check), `baybo-tools` (the `Tool` trait). **No** dependency on `baybo-agent` or `baybo-context` — those depend on this crate, never the reverse.
+- Mirrors `baybo-skills` / `baybo-cron`: a domain crate owning its own `Tool` is only acyclic because `baybo-tools`'s dependency graph never reaches back here.
 - The crate is pure domain + tool logic; it persists nothing itself. Profile discovery is filesystem-only (`<workspace>/agents/`); there is no `SubagentStore`.
 
 ## Collaboration

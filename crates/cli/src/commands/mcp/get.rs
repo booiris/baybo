@@ -58,7 +58,7 @@ pub async fn run(ctx: &CommandContext, name: String, do_probe: bool) -> Result<C
     human.push_str(&format!("name: {}\n", entry.name));
     human.push_str(&format!("transport: {}\n", entry.transport.kind_name()));
     match &entry.transport {
-        aura_tools::mcp::McpTransportConfig::Stdio { command, args } => {
+        baybo_tools::mcp::McpTransportConfig::Stdio { command, args } => {
             human.push_str(&format!("  command: {command}\n"));
             if !args.is_empty() {
                 human.push_str(&format!("  args: {}\n", args.join(" ")));
@@ -72,7 +72,7 @@ pub async fn run(ctx: &CommandContext, name: String, do_probe: bool) -> Result<C
                 }
             ));
         }
-        aura_tools::mcp::McpTransportConfig::Http { url } => {
+        baybo_tools::mcp::McpTransportConfig::Http { url } => {
             human.push_str(&format!("  url: {url}\n"));
             human.push_str(&format!(
                 "  headers: {}\n",
@@ -105,7 +105,7 @@ pub async fn run(ctx: &CommandContext, name: String, do_probe: bool) -> Result<C
             if credentials_present {
                 "******** (encrypted; auto-refreshed on use)"
             } else {
-                "(missing — re-run `aura mcp add` to authorize)"
+                "(missing — re-run `baybo mcp add` to authorize)"
             }
         ));
     }

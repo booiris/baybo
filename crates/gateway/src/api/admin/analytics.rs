@@ -3,7 +3,7 @@
 //!
 //! Defaults to the last 30 UTC days when no range is supplied. Caller
 //! supplies `since` / `until` for any other window. Results are
-//! computed via [`aura_query::QueryApi::compute_analytics`], which
+//! computed via [`baybo_query::QueryApi::compute_analytics`], which
 //! single-passes `cost_records` plus a session list.
 
 use axum::Json;
@@ -12,7 +12,7 @@ use chrono::{Duration, Utc};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use aura_cost::TimeRange;
+use baybo_cost::TimeRange;
 
 use crate::api::dto::{AnalyticsQuery, AnalyticsResponse, ErrorBody};
 use crate::server::AdminState;

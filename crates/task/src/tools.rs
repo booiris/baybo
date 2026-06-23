@@ -7,12 +7,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_model::{
+use baybo_model::{
     TASK_CREATE_TOOL_NAME, TASK_GET_TOOL_NAME, TASK_LIST_TOOL_NAME, TASK_UPDATE_TOOL_NAME, Task,
     TaskId, TaskStatus,
 };
-use aura_store::task::{TaskPatch, TaskStore};
-use aura_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput};
+use baybo_store::task::{TaskPatch, TaskStore};
+use baybo_tools::{Tool, ToolConcurrency, ToolContext, ToolError, ToolManifest, ToolOutput};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -35,7 +35,7 @@ fn with_manifest(tool: Arc<dyn Tool>) -> (Arc<dyn Tool>, ToolManifest) {
     let manifest = ToolManifest {
         name: tool.name().to_string(),
         description: tool.description(),
-        trust_level: aura_model::TrustLevel::Trusted,
+        trust_level: baybo_model::TrustLevel::Trusted,
         parameters_schema: tool.parameters_schema(),
         capabilities: vec![],
     };
@@ -195,10 +195,10 @@ impl Tool for TaskCreateTool {
             .and_then(|t| t.first())
             .and_then(|t| t.get("subject"))
             .and_then(Value::as_str)
-            .and_then(aura_tools::progress::preview_arg)
+            .and_then(baybo_tools::progress::preview_arg)
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let p: TaskCreateParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         if p.tasks.is_empty() {
@@ -311,7 +311,7 @@ impl Tool for TaskListTool {
         })
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let p: TaskListParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         let mut tasks = self.store.list(&ctx.session_id).await.map_err(exec_err)?;
@@ -366,7 +366,7 @@ impl Tool for TaskGetTool {
         })
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let p: IdParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         let id = parse_task_id(&p.id, "id")?;
@@ -446,10 +446,10 @@ impl Tool for TaskUpdateTool {
         params
             .get("id")
             .and_then(Value::as_str)
-            .and_then(aura_tools::progress::preview_arg)
+            .and_then(baybo_tools::progress::preview_arg)
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> aura_tools::Result<ToolOutput> {
+    async fn execute(&self, params: Value, ctx: &ToolContext) -> baybo_tools::Result<ToolOutput> {
         let p: TaskUpdateParams =
             serde_json::from_value(params).map_err(|e| ToolError::InvalidParams(e.to_string()))?;
         let id = parse_task_id(&p.id, "id")?;
@@ -548,14 +548,14 @@ impl Tool for TaskUpdateTool {
 mod tests {
     use super::*;
     use crate::test_support::MemoryTaskStore;
-    use aura_model::{ChannelType, User};
+    use baybo_model::{ChannelType, User};
     use std::time::Duration;
 
     fn ctx(session: &str) -> ToolContext {
         ToolContext {
             session_id: session.into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u1".into(),
                 name: None,
@@ -564,11 +564,11 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             workspace_root: std::path::PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: None,
             notifier: None,
-            events: aura_tools::noop_event_sink(),
+            events: baybo_tools::noop_event_sink(),
             llm: None,
             secrets: None,
             virtual_reads: None,

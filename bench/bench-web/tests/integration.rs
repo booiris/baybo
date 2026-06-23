@@ -8,13 +8,13 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use aura_bench_web::adapters;
-use aura_bench_web::model::BenchExtra;
+use baybo_bench_web::adapters;
+use baybo_bench_web::model::BenchExtra;
 
 // ── Fixtures ─────────────────────────────────────────────────────────
 
 const SWE_AGENT_RUN: &str = r#"{
-  "run_id": "2026-01-01__00-00-00", "dataset": "SWE-bench_Lite", "arm": "agent", "model": "aura",
+  "run_id": "2026-01-01__00-00-00", "dataset": "SWE-bench_Lite", "arm": "agent", "model": "baybo",
   "mean_latency_ms": 100, "input_tokens": 50, "output_tokens": 10, "total_cost_micro_usd": 4840,
   "results": [{"instance_id": "repo__pkg-1", "repo": "repo/pkg", "resolved": true,
     "empty_patch": false, "errored": false, "patch_bytes": 120, "latency_ms": 100,
@@ -40,7 +40,7 @@ const SWE_ORACLE_RUN: &str = r#"{
   "results": [{"instance_id": "repo__pkg-1", "repo": "repo/pkg", "resolved": true}]
 }"#;
 const SWE_NOOP_RUN: &str = r#"{
-  "run_id": "2026-01-01__00-00-00", "arm": "noop", "model": "aura-noop", "mean_latency_ms": 0,
+  "run_id": "2026-01-01__00-00-00", "arm": "noop", "model": "baybo-noop", "mean_latency_ms": 0,
   "results": [{"instance_id": "repo__pkg-1", "repo": "repo/pkg", "resolved": false, "empty_patch": true}]
 }"#;
 
@@ -66,7 +66,7 @@ const MESSAGES_JSON: &str = r#"{"session": "s1", "messages": [{"ordinal": 0, "su
   "created_at": "2026-01-01T00:00:00Z",
   "message": {"role": "user", "source": "user", "content": [{"Text": "hi"}]}}]}"#;
 
-const PREDICTIONS: &str = "{\"instance_id\": \"repo__pkg-1\", \"model_name_or_path\": \"aura\", \"model_patch\": \"diff --git a/x b/x\\n+hi\\n\"}\n";
+const PREDICTIONS: &str = "{\"instance_id\": \"repo__pkg-1\", \"model_name_or_path\": \"baybo\", \"model_patch\": \"diff --git a/x b/x\\n+hi\\n\"}\n";
 
 fn write(path: PathBuf, contents: &str) {
     fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir");
@@ -309,7 +309,7 @@ mod api {
     use tower::ServiceExt;
 
     async fn get(root: &Path, uri: &str) -> (StatusCode, Vec<u8>) {
-        let app = aura_bench_web::api::router(root.to_path_buf());
+        let app = baybo_bench_web::api::router(root.to_path_buf());
         let resp = app
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await

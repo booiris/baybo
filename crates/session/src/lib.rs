@@ -1,11 +1,11 @@
 //! Session orchestration + persistence interface.
 //!
 //! Domain types (`Session`, `User`, `ChannelType`, `SessionState`,
-//! `Lineage`, `TriggerSource`) live in `aura-model`; the `SessionStore`
+//! `Lineage`, `TriggerSource`) live in `baybo-model`; the `SessionStore`
 //! / `SessionSummaryStore` traits and their per-row `StoredMessage` /
-//! `SessionSummaryRow` value types live in `aura-store` (the ports
+//! `SessionSummaryRow` value types live in `baybo-store` (the ports
 //! crate). This crate owns the `SessionManager` business-logic facade;
-//! `aura-storage` provides the libsql implementations of both stores.
+//! `baybo-storage` provides the libsql implementations of both stores.
 
 mod error;
 mod manager;
@@ -13,7 +13,7 @@ mod manager;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub use aura_store::{
+pub use baybo_store::{
     SessionFolderRow, SessionFolderStore, SessionStore, SessionSummaryRow, SessionSummaryStore,
     StoredMessage,
 };

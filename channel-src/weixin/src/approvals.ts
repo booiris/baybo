@@ -5,18 +5,18 @@ import type {
   ApprovalRequest,
   Logger,
   ResourceAccess,
-} from "@aura/channel-sdk";
+} from "@baybo/channel-sdk";
 import type {
   BotRoute,
   PlatformApprovals,
-} from "@aura/channel-sdk/bot";
+} from "@baybo/channel-sdk/bot";
 
 import { sendMessage } from "./api/endpoints.js";
 import { MessageItemType, MessageState, MessageType } from "./api/types.js";
 import type { WeixinBotHandle, WeixinChat } from "./types.js";
 
 /**
- * How long we keep a pending approval before auto-denying. Aura has
+ * How long we keep a pending approval before auto-denying. Baybo has
  * its own approval timeout higher up, but we still clean up here so a
  * never-answered prompt doesn't hold a chat slot forever if the
  * upstream timer drifts.
@@ -57,8 +57,8 @@ export function matchDecision(raw: string): ApprovalDecision | null {
 }
 
 /**
- * Aura ships `paramsPreview` as a compact JSON blob (see
- * `aura_tools::approval::preview_params`), truncated mid-string with a
+ * Baybo ships `paramsPreview` as a compact JSON blob (see
+ * `baybo_tools::approval::preview_params`), truncated mid-string with a
  * trailing `…` when it would otherwise overflow. We try to pretty-
  * print; if truncation broke parsing or the preview isn't JSON at all,
  * fall back to the raw string. Returns the string ready to paste into
@@ -98,7 +98,7 @@ function formatAccess(acc: ResourceAccess): string {
  * iLink has no inline-button UI like Telegram, so we send a plain-text
  * prompt listing the acceptable reply keywords, then rely on the
  * platform's poll loop calling {@link tryResolveInbound} before
- * forwarding the next message to Aura. A non-matching reply falls
+ * forwarding the next message to Baybo. A non-matching reply falls
  * through to the agent unchanged — we intentionally don't swallow it,
  * so the user can redirect the conversation mid-approval if they want
  * to abandon the tool call.
@@ -123,7 +123,7 @@ export class WeixinApprovals
     const key = chatKey(route.botId, route.chat);
     // One outstanding approval per (bot, user). If a second request
     // arrives before the first is answered, drop the old one rather
-    // than queueing — aura serializes tool calls per session, so this
+    // than queueing — baybo serializes tool calls per session, so this
     // path should be rare, and a silent queue would just strand the
     // user on a stale prompt.
     const prev = this.pending.get(key);
@@ -174,7 +174,7 @@ export class WeixinApprovals
   ): Promise<void> {
     // Find the entry by callId (we key by user, not callId). If it's
     // still pending at this point the user never replied in time;
-    // resolve it with the decision aura handed us.
+    // resolve it with the decision baybo handed us.
     let matched: { key: string; entry: PendingEntry } | null = null;
     for (const [key, entry] of this.pending) {
       if (entry.callId === callId) {
@@ -263,7 +263,7 @@ export class WeixinApprovals
     }
     lines.push("", "Reply: yes / always / no");
     const text = lines.join("\n");
-    const clientId = `aura-weixin-approval:${Date.now()}-${crypto
+    const clientId = `baybo-weixin-approval:${Date.now()}-${crypto
       .randomBytes(4)
       .toString("hex")}`;
     const contextToken = handle.state.contextTokens.get(chat.toUserId);
@@ -294,7 +294,7 @@ export class WeixinApprovals
         : decision === "approve_always"
           ? "✅ Approved (always)"
           : "🚫 Denied";
-    const clientId = `aura-weixin-approval-echo:${Date.now()}-${crypto
+    const clientId = `baybo-weixin-approval-echo:${Date.now()}-${crypto
       .randomBytes(4)
       .toString("hex")}`;
     const contextToken = entry.handle.state.contextTokens.get(entry.chat.toUserId);

@@ -1,5 +1,5 @@
 [package]
-name = "aura-session"
+name = "baybo-session"
 version.workspace = true
 edition.workspace = true
 
@@ -9,13 +9,13 @@ doctest = false
 [features]
 # Exposes the in-memory `MemorySessionStore` / `MemorySessionSummaryStore`
 # fakes to downstream crates' tests. Pull in via:
-#   aura-session = { workspace = true, features = ["test-support"] }
+#   baybo-session = { workspace = true, features = ["test-support"] }
 # inside the consumer's `[dev-dependencies]`.
 test-support = []
 
 [dependencies]
-aura-model = { workspace = true }
-aura-store = { workspace = true }
+baybo-model = { workspace = true }
+baybo-store = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }

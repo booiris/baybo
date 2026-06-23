@@ -1,6 +1,6 @@
-use aura_tools::ToolCapability;
-use aura_tools::mcp::oauth::run_authorization_flow;
-use aura_tools::mcp::{McpServerEntry, McpTransportConfig, OAuthConfig, TrustLevelConfig};
+use baybo_tools::ToolCapability;
+use baybo_tools::mcp::oauth::run_authorization_flow;
+use baybo_tools::mcp::{McpServerEntry, McpTransportConfig, OAuthConfig, TrustLevelConfig};
 use serde_json::json;
 
 use crate::cli::{McpTransportArg, TrustLevelArg};
@@ -76,7 +76,7 @@ pub async fn run(ctx: &CommandContext, args: AddArgs) -> Result<CommandOutput> {
         // the auto-OAuth path. Connection errors, timeouts, and other
         // inconclusive results fall through — the operator either gets a
         // working tokenless entry, a working entry once the server comes
-        // back online, or a clear status message from `aura mcp list`.
+        // back online, or a clear status message from `baybo mcp list`.
         eprintln!("Server requires authorization (HEAD {url} → 401). Running OAuth flow.");
         oauth_intent = true;
         auto_detected_realm = Some(realm);
@@ -149,7 +149,7 @@ pub async fn run(ctx: &CommandContext, args: AddArgs) -> Result<CommandOutput> {
         } else {
             // Auto-detected OAuth — populate the OAuth config so the
             // reconciler knows the entry is OAuth-managed.
-            entry.oauth = Some(aura_tools::mcp::OAuthConfig {
+            entry.oauth = Some(baybo_tools::mcp::OAuthConfig {
                 client_id: bundle.client_id.clone(),
                 callback_port: args.callback_port,
             });
@@ -209,7 +209,7 @@ pub async fn run(ctx: &CommandContext, args: AddArgs) -> Result<CommandOutput> {
     );
     if matches!(&entry.transport, McpTransportConfig::Http { .. }) && entry.oauth.is_some() {
         human.push_str(
-            "\nNote: OAuth authorization flow runs at first connect; if no refresh token is present, the reconciler will surface an error until you re-run `aura mcp add` interactively.",
+            "\nNote: OAuth authorization flow runs at first connect; if no refresh token is present, the reconciler will surface an error until you re-run `baybo mcp add` interactively.",
         );
     }
 
@@ -227,7 +227,7 @@ pub async fn run(ctx: &CommandContext, args: AddArgs) -> Result<CommandOutput> {
 
 async fn entry_has_headers(
     _entry: &McpServerEntry,
-    vault: &aura_security::SecretVault,
+    vault: &baybo_security::SecretVault,
     name: &str,
 ) -> bool {
     vault

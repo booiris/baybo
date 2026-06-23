@@ -2,7 +2,7 @@
 //!
 //! When the memory subsystem surfaces relevant memories for a turn, each is
 //! persisted as a `Role::User` row stamped
-//! [`aura_model::MessageSource::RecalledMemory`]. This envelope is applied
+//! [`baybo_model::MessageSource::RecalledMemory`]. This envelope is applied
 //! **wire-only** by [`crate::ContextManager::messages_for_llm`] and re-derived
 //! from the source flag on every call, so it survives compaction/rebuild and is
 //! never stored.

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { runSidecar } from "@aura/channel-sdk";
-import { BotChannel } from "@aura/channel-sdk/bot";
+import { runSidecar } from "@baybo/channel-sdk";
+import { BotChannel } from "@baybo/channel-sdk/bot";
 import type { Bot } from "grammy";
 
 import { TelegramApprovals } from "./approvals.js";

@@ -68,17 +68,17 @@ mod tests {
 
     #[test]
     fn preview_path_keeps_short_path_intact() {
-        let p = Path::new("/data/aura/crates/tools/src/builtin/read.rs");
+        let p = Path::new("/data/baybo/crates/tools/src/builtin/read.rs");
         assert_eq!(
             preview_path(p),
-            "/data/aura/crates/tools/src/builtin/read.rs"
+            "/data/baybo/crates/tools/src/builtin/read.rs"
         );
     }
 
     #[test]
     fn preview_path_left_truncates_long_path_on_separator() {
         let p = Path::new(
-            "/data/aura/some/really/deeply/nested/workspace/crates/agent/src/runtime/agent_loop.rs",
+            "/data/baybo/some/really/deeply/nested/workspace/crates/agent/src/runtime/agent_loop.rs",
         );
         let out = preview_path(p);
         assert!(out.starts_with('…'), "leads with ellipsis: {out}");
@@ -122,8 +122,8 @@ mod tests {
 
     #[test]
     fn preview_search_appends_path_when_present() {
-        let out = preview_search("TODO", Some("/data/aura/crates/tui")).unwrap();
-        assert_eq!(out, "TODO · in /data/aura/crates/tui");
+        let out = preview_search("TODO", Some("/data/baybo/crates/tui")).unwrap();
+        assert_eq!(out, "TODO · in /data/baybo/crates/tui");
     }
 
     #[test]

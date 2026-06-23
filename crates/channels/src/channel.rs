@@ -10,8 +10,8 @@
 
 use std::sync::Arc;
 
-use aura_model::{ChannelType, ResourceAccess, SessionId};
-use aura_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ApprovalRequest};
+use baybo_model::{ChannelType, ResourceAccess, SessionId};
+use baybo_tools::{ApprovalDecision, ApprovalGate, ApprovalQueue, ApprovalRequest};
 use chrono::{DateTime, Utc};
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
@@ -572,7 +572,7 @@ mod tests {
     use super::*;
     use crate::connection::SendOutcome;
     use crate::types::{IncomingMessage, Message as AgentMessage};
-    use aura_model::{ChannelType, MessageMetadata, User};
+    use baybo_model::{ChannelType, MessageMetadata, User};
     use chrono::Utc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -1,7 +1,7 @@
 //! Per-step interactive primitives shared between the setup wizard
-//! and `aura llm add` / `aura channel add`. Each primitive runs its
+//! and `baybo llm add` / `baybo channel add`. Each primitive runs its
 //! own side effects (vault writes, libsql rows, sidecar registrations)
-//! and mutates `AuraConfig` in memory; `aura.json` is committed once
+//! and mutates `BayboConfig` in memory; `baybo.json` is committed once
 //! at the end (β2).
 
 mod browser;
@@ -22,8 +22,8 @@ use crate::prompt::Prompter;
 
 /// Common Add / Skip picker used by the LLM and channel steps. With
 /// `allow_skip = false` the picker is suppressed and the step runs
-/// unconditionally — that's the contract `aura llm add` /
-/// `aura channel add` rely on.
+/// unconditionally — that's the contract `baybo llm add` /
+/// `baybo channel add` rely on.
 pub(crate) fn pick_add_or_skip<P: Prompter>(
     prompter: &mut P,
     label: &str,

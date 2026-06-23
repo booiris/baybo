@@ -22,9 +22,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use aura_channels::{AgentOutput, ChannelRegistry, RouterInbound};
-use aura_cron::CronTriggerEvent;
-use aura_model::{LlmEntryName, Session};
+use baybo_channels::{AgentOutput, ChannelRegistry, RouterInbound};
+use baybo_cron::CronTriggerEvent;
+use baybo_model::{LlmEntryName, Session};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -33,9 +33,9 @@ use crate::actor::AgentMessage;
 use crate::actor::mailbox::MailboxSender;
 use crate::actor::supervisor::AgentSupervisor;
 use crate::security::SecurityGateway;
-use aura_cost::CostManager;
-use aura_job::JobLifecycle;
-use aura_session::SessionManager;
+use baybo_cost::CostManager;
+use baybo_job::JobLifecycle;
+use baybo_session::SessionManager;
 
 /// Live, atomically-updatable rate-limit knobs, shared between the
 /// `Router`'s [`RateLimiter`] (reader) and the config-reload

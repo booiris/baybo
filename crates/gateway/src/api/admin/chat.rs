@@ -32,19 +32,19 @@
 
 use std::collections::HashMap;
 
-use aura_agent::actor::AgentMessage;
-use aura_channels::wire::{FolderChange, FolderView, SessionPatch, SlashCommandSpec};
-use aura_channels::{
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use baybo_agent::actor::AgentMessage;
+use baybo_channels::wire::{FolderChange, FolderView, SessionPatch, SlashCommandSpec};
+use baybo_channels::{
     AgentEvent, STOP_CANCELLED_REPLY_LINE, STOP_COMMAND_NAME, SessionEvent, ToolStatus,
 };
-use aura_model::{
+use baybo_model::{
     ChannelType, ChatMessage, ContentBlock, ControlEvent, ControlEventKind, FolderId,
     FolderSummary, LlmEntryName, MessageSource, Role, Session, SessionId, ThinkingContent,
     TriggerSource, User,
 };
-use aura_session::SessionError;
-use axum::Json;
-use axum::extract::{Path, Query, State};
+use baybo_session::SessionError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -340,7 +340,7 @@ pub struct ChatSessionDetail {
     pub oldest_ordinal: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newest_ordinal: Option<i64>,
-    /// Per-session LLM pin (`session.state.last_llm`): the `aura.json`
+    /// Per-session LLM pin (`session.state.last_llm`): the `baybo.json`
     /// entry name this session's turns resolve against, or `null` to
     /// follow `default-llm`. Drives the chat header model picker's
     /// initial selection. Set via `PUT /v1/chat/sessions/{id}/model`.
@@ -409,7 +409,7 @@ pub struct ChatCronMessage {
     pub last_active: DateTime<Utc>,
     /// The user-facing prompt for this fire. Truncated to
     /// [`PREVIEW_MAX_CHARS`]. The persisted user row carries the cron
-    /// dispatcher's fire-time framing; `aura_context::prompts::cron::original_cron_prompt`
+    /// dispatcher's fire-time framing; `baybo_context::prompts::cron::original_cron_prompt`
     /// recovers the instruction as configured so the panel shows that,
     /// not the framing boilerplate.
     pub prompt: String,
@@ -436,9 +436,9 @@ pub struct ListCronMessagesQuery {
 }
 
 /// Wire DTO for slash command entries. Mirror of
-/// [`aura_channels::wire::SlashCommandSpec`] so the OpenAPI surface
+/// [`baybo_channels::wire::SlashCommandSpec`] so the OpenAPI surface
 /// stays inside this crate's DTOs (the wire type lives in
-/// `aura-channels` for sidecar reuse).
+/// `baybo-channels` for sidecar reuse).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SlashCommandEntry {
     pub command: String,
@@ -687,7 +687,7 @@ async fn get_session(
 /// Request body for `PUT /v1/chat/sessions/{session_id}/model`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetSessionModelRequest {
-    /// `aura.json` LLM entry name to pin this session to, or `null`
+    /// `baybo.json` LLM entry name to pin this session to, or `null`
     /// (absent) to clear the pin and follow `default-llm`. Must match a
     /// configured entry — see `GET /v1/llm/models` → `items[].name`.
     #[serde(default)]
@@ -1441,7 +1441,7 @@ fn is_cron_triggered(session: &Session) -> bool {
 /// at all surfaces empty strings so the panel still pins the
 /// timestamp instead of silently dropping the row.
 async fn cron_message_from_session(
-    manager: &aura_session::SessionManager,
+    manager: &baybo_session::SessionManager,
     session: Session,
 ) -> Option<ChatCronMessage> {
     let cron_job_id = match &session.trigger {
@@ -1465,7 +1465,7 @@ async fn cron_message_from_session(
         // `Role::User` turn, indistinguishable by role from a skill reminder.
         if matches!(msg.source(), MessageSource::Cron) {
             let text = extract_text(&msg.content);
-            prompt = Some(aura_context::prompts::cron::original_cron_prompt(&text).to_owned());
+            prompt = Some(baybo_context::prompts::cron::original_cron_prompt(&text).to_owned());
             break;
         }
     }
@@ -1506,10 +1506,10 @@ fn extract_text(content: &[ContentBlock]) -> String {
 /// the session has no user turn, when that turn is media-only, or when the
 /// lookup fails — the sidebar treats all three as "no preview" rather than
 /// surfacing an error, so a single bad row never breaks the whole list.
-/// One indexed lookup ([`aura_session::SessionManager::last_user_message`]),
+/// One indexed lookup ([`baybo_session::SessionManager::last_user_message`]),
 /// so a prompt buried under a long tool loop is still found.
 async fn last_user_preview(
-    manager: &aura_session::SessionManager,
+    manager: &baybo_session::SessionManager,
     session_id: &SessionId,
 ) -> Option<String> {
     // One indexed lookup for the freshest human-authored turn — no
@@ -1841,8 +1841,9 @@ fn reconstruct_transcript(
                     if cancelled {
                         // Drop the model-facing cancelled-turn marker so the
                         // salvaged reply renders as clean partial output.
-                        item.text = aura_context::prompts::cancelled_turn::strip_marker(&item.text)
-                            .to_string();
+                        item.text =
+                            baybo_context::prompts::cancelled_turn::strip_marker(&item.text)
+                                .to_string();
                     }
                     // A marker-only salvage (thinking-only cancelled turn)
                     // leaves nothing to show once stripped — no empty bubble.
@@ -2104,7 +2105,7 @@ mod tests {
     fn ctl(
         seq: i64,
         after: i64,
-        kind: aura_model::ControlEventKind,
+        kind: baybo_model::ControlEventKind,
         body: &str,
         secs: i64,
     ) -> ControlEvent {
@@ -2181,7 +2182,7 @@ mod tests {
 
     #[test]
     fn reconstruct_interleaves_control_events_by_anchor() {
-        use aura_model::ControlEventKind::{Command, NoticeInfo, NoticeWarn};
+        use baybo_model::ControlEventKind::{Command, NoticeInfo, NoticeWarn};
         // A /stop'd tool turn: user (ord 2) → tool-using assistant (ord 3) →
         // tool result (ord 4), with no final answer. Control events: a warn
         // notice anchored before any row (after_ordinal -1), and the /stop echo
@@ -2205,7 +2206,7 @@ mod tests {
         ];
         // The acknowledgement carries the real cancellation line so reconstruct
         // recognises this `/stop` as one that actually cancelled the turn.
-        let stop_notice = format!("Stopped.\n{}", aura_channels::STOP_CANCELLED_REPLY_LINE);
+        let stop_notice = format!("Stopped.\n{}", baybo_channels::STOP_CANCELLED_REPLY_LINE);
         // Deliberately out of sorted order to prove reconstruct sorts them.
         let events = vec![
             ctl(2, 4, NoticeInfo, &stop_notice, 5),
@@ -2262,7 +2263,7 @@ mod tests {
 
     #[test]
     fn reconstruct_stopped_partial_turn_salvages_reply_as_bubble_below_cancelled_block() {
-        use aura_model::ControlEventKind::{Command, NoticeInfo};
+        use baybo_model::ControlEventKind::{Command, NoticeInfo};
         // A turn cancelled mid-LLM-call: the loop persisted a partial assistant
         // row (reasoning + partial answer text, no tool calls) before aborting,
         // then the `/stop` echo + notice anchored right after it (the ordering
@@ -2270,7 +2271,7 @@ mod tests {
         // the model-facing cancelled-turn marker, which display must strip.
         let partial = format!(
             "a b-tree is{}",
-            aura_context::prompts::cancelled_turn::SUFFIX
+            baybo_context::prompts::cancelled_turn::SUFFIX
         );
         let tail = vec![
             (2, ts(2), ChatMessage::user(vec![text("explain b-trees")])),
@@ -2280,7 +2281,7 @@ mod tests {
                 ChatMessage::assistant(vec![thinking("weighing the options"), text(&partial)]),
             ),
         ];
-        let stop_notice = format!("Stopped.\n{}", aura_channels::STOP_CANCELLED_REPLY_LINE);
+        let stop_notice = format!("Stopped.\n{}", baybo_channels::STOP_CANCELLED_REPLY_LINE);
         let events = vec![
             ctl(1, 3, Command, "/stop", 5),
             ctl(2, 3, NoticeInfo, &stop_notice, 5),
@@ -2319,7 +2320,7 @@ mod tests {
 
     #[test]
     fn reconstruct_stopped_thinking_only_turn_has_no_reply_bubble() {
-        use aura_model::ControlEventKind::{Command, NoticeInfo};
+        use baybo_model::ControlEventKind::{Command, NoticeInfo};
         // Cancelled before any answer text streamed — only reasoning was
         // salvaged (so the persisted partial is a marker-only block). The
         // cancelled work block carries the reasoning; there is no reply bubble.
@@ -2330,11 +2331,11 @@ mod tests {
                 ts(3),
                 ChatMessage::assistant(vec![
                     thinking("weighing the options"),
-                    text(&aura_context::prompts::cancelled_turn::marker_block_text()),
+                    text(&baybo_context::prompts::cancelled_turn::marker_block_text()),
                 ]),
             ),
         ];
-        let stop_notice = format!("Stopped.\n{}", aura_channels::STOP_CANCELLED_REPLY_LINE);
+        let stop_notice = format!("Stopped.\n{}", baybo_channels::STOP_CANCELLED_REPLY_LINE);
         let events = vec![
             ctl(1, 3, Command, "/stop", 5),
             ctl(2, 3, NoticeInfo, &stop_notice, 5),
@@ -2357,7 +2358,7 @@ mod tests {
 
     #[test]
     fn reconstruct_completed_answer_then_noop_stop_keeps_the_answer() {
-        use aura_model::ControlEventKind::{Command, NoticeInfo};
+        use baybo_model::ControlEventKind::{Command, NoticeInfo};
         // A turn that FINISHED (full answer), then the user typed `/stop` — a
         // no-op (its notice says "Nothing in progress to stop."). The completed
         // answer must render as its bubble, NOT get folded into a "Cancelled"
@@ -2477,7 +2478,7 @@ mod tests {
 
     #[test]
     fn reconstruct_control_event_mid_block_splits_the_work() {
-        use aura_model::ControlEventKind::NoticeInfo;
+        use baybo_model::ControlEventKind::NoticeInfo;
         // A control event anchored at a row *inside* a tool turn (after_ordinal
         // 3, the intermediate assistant row) flushes the work accumulated so far
         // before the final answer.
@@ -2543,7 +2544,7 @@ mod tests {
 
     #[test]
     fn reconstruct_no_user_row_turn_after_stop_does_not_inherit_start() {
-        use aura_model::ControlEventKind::{Command, NoticeInfo};
+        use baybo_model::ControlEventKind::{Command, NoticeInfo};
         // A /stop'd turn ends at its control events; the next turn on the
         // page has no user row (a subagent-notification fire). Its work
         // block must time from its own first row, not the stopped turn's

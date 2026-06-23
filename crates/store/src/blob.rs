@@ -1,7 +1,7 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use aura_model::BlobRef;
+use baybo_model::BlobRef;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use tokio::io::AsyncRead;

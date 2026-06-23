@@ -1,9 +1,9 @@
 //! Phase 2 of the memory benchmark: answer each question by driving the REAL
-//! Aura agent — one `aura gateway` per arm, then a concurrent `aura prompt`
+//! Baybo agent — one `baybo gateway` per arm, then a concurrent `baybo prompt`
 //! per question routed over it (recall + memory tools run inside the real
 //! loop). Each answer is judged by a standalone DeepSeek client, then reported.
 //!
-//! Per-conversation isolation: each `aura prompt` runs with `USER=<conv-scope>`
+//! Per-conversation isolation: each `baybo prompt` runs with `USER=<conv-scope>`
 //! (→ message sender → session user → recall scope), matching what `ingest`
 //! populated. One arm per invocation; run once per arm and compare the JSONs.
 
@@ -12,12 +12,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use aura_bench_memory::agent::{AnswerModel, GatewayHandle, generate_config, prepare_arm_config};
-use aura_bench_memory::judge::judge;
-use aura_bench_memory::llm::ChatClient;
-use aura_bench_memory::report::{QuestionResult, ReportMeta, aggregate, print_table};
-use aura_bench_memory::testset::{BenchSample, TestSetKind};
-use aura_bench_memory::{Manifest, scope_user_id, token_f1};
+use baybo_bench_memory::agent::{AnswerModel, GatewayHandle, generate_config, prepare_arm_config};
+use baybo_bench_memory::judge::judge;
+use baybo_bench_memory::llm::ChatClient;
+use baybo_bench_memory::report::{QuestionResult, ReportMeta, aggregate, print_table};
+use baybo_bench_memory::testset::{BenchSample, TestSetKind};
+use baybo_bench_memory::{Manifest, scope_user_id, token_f1};
 use clap::{Parser, ValueEnum};
 use futures::{StreamExt, stream};
 
@@ -25,9 +25,9 @@ use futures::{StreamExt, stream};
 /// regardless of the configured soul. Mirrors upstream's "answer directly".
 const ANSWER_INSTRUCTION: &str = "Answer the question directly and concisely with just the specific fact requested. If the information is not available to you, say you do not have it rather than guessing.";
 
-/// Report label for the answer model under `--aura-config` (we don't introspect
+/// Report label for the answer model under `--baybo-config` (we don't introspect
 /// that config's `default-llm`); self-contained runs report `provider/model`.
-const ANSWER_LABEL: &str = "aura-prompt (gateway)";
+const ANSWER_LABEL: &str = "baybo-prompt (gateway)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Arm {
@@ -66,7 +66,7 @@ impl Arm {
 }
 
 #[derive(Parser, Debug)]
-#[command(about = "memory benchmark — drive the real Aura agent for one arm and score it")]
+#[command(about = "memory benchmark — drive the real Baybo agent for one arm and score it")]
 struct Args {
     /// Which arm to evaluate.
     #[arg(long, value_enum)]
@@ -85,21 +85,21 @@ struct Args {
     #[arg(long)]
     manifest: Option<PathBuf>,
 
-    /// Optional: derive the gateway config from your aura.json (overwriting only
+    /// Optional: derive the gateway config from your baybo.json (overwriting only
     /// its memory section), reusing its workspace/keys/llm. Omit to generate a
     /// self-contained config (fresh workspace + minted key + DeepSeek answerer).
     #[arg(long)]
-    aura_config: Option<PathBuf>,
+    baybo_config: Option<PathBuf>,
 
     /// Directory to hold generated gateway configs + self-contained workspaces
-    /// (one `aura-bench-ws-<run_id>-<arm>` each). Defaults to the system temp
+    /// (one `baybo-bench-ws-<run_id>-<arm>` each). Defaults to the system temp
     /// dir; `run.sh` points it under the (gitignored) bench dir.
     #[arg(long)]
     workspace_root: Option<PathBuf>,
 
-    /// The `aura` binary to drive (gateway + prompt).
-    #[arg(long, default_value = "aura")]
-    aura_bin: String,
+    /// The `baybo` binary to drive (gateway + prompt).
+    #[arg(long, default_value = "baybo")]
+    baybo_bin: String,
 
     /// OpenViking endpoint the agent's memory backend connects to (host side of
     /// the Docker port-map). Written into the generated config's memory.extra.
@@ -116,11 +116,11 @@ struct Args {
     top_k: usize,
 
     /// Answer model for the self-contained config — the `llm` entry the real
-    /// agent answers with. Ignored when `--aura-config` is given (yours wins).
+    /// agent answers with. Ignored when `--baybo-config` is given (yours wins).
     #[arg(long, default_value = "deepseek-chat")]
     answer_model: String,
 
-    /// Provider for the self-contained answer model — any Aura-supported
+    /// Provider for the self-contained answer model — any Baybo-supported
     /// provider (`deepseek`, `openai`, `anthropic`, …). Self-contained only.
     #[arg(long, default_value = "deepseek")]
     answer_provider: String,
@@ -157,7 +157,7 @@ struct Args {
     #[arg(long)]
     deepseek_base_url: Option<String>,
 
-    /// Per-question ceiling for `aura prompt` (seconds). 10 min: ample for a real
+    /// Per-question ceiling for `baybo prompt` (seconds). 10 min: ample for a real
     /// agent turn (recall + tool calls + answer), short enough that a wedged turn
     /// fails fast instead of hanging the whole run for an hour.
     #[arg(long, default_value_t = 600)]
@@ -177,7 +177,7 @@ struct Args {
     #[arg(long)]
     dry_run: bool,
 
-    /// Max questions answered concurrently (concurrent `aura prompt`s over the
+    /// Max questions answered concurrently (concurrent `baybo prompt`s over the
     /// one gateway).
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
@@ -276,7 +276,7 @@ async fn main() -> Result<()> {
     let judge_llm = ChatClient::new(&args.judge_model, args.deepseek_base_url.as_deref())?;
 
     // Config for this arm's gateway. Default: generate a self-contained one
-    // (fresh workspace + minted key + DeepSeek answerer). With `--aura-config`:
+    // (fresh workspace + minted key + DeepSeek answerer). With `--baybo-config`:
     // derive from yours, overwriting only the memory section.
     let memory = arm_memory(
         args.arm,
@@ -290,13 +290,13 @@ async fn main() -> Result<()> {
         .unwrap_or_else(std::env::temp_dir);
     std::fs::create_dir_all(&ws_root)
         .with_context(|| format!("create workspace root {}", ws_root.display()))?;
-    let (config_path, admin_addr) = match args.aura_config.as_deref() {
+    let (config_path, admin_addr) = match args.baybo_config.as_deref() {
         Some(base) => {
-            let out = ws_root.join(format!("aura-bench-{run_id}-{}.json", args.arm.as_str()));
+            let out = ws_root.join(format!("baybo-bench-{run_id}-{}.json", args.arm.as_str()));
             prepare_arm_config(base, memory, out)?
         }
         None => {
-            let ws = ws_root.join(format!("aura-bench-ws-{run_id}-{}", args.arm.as_str()));
+            let ws = ws_root.join(format!("baybo-bench-ws-{run_id}-{}", args.arm.as_str()));
             // 0 → grab a free ephemeral port so repeated/concurrent runs (and the
             // user's own gateway) never collide on a fixed port.
             let gateway_port = match args.gateway_port {
@@ -312,8 +312,8 @@ async fn main() -> Result<()> {
             generate_config(&ws, memory, &answer, gateway_port)?
         }
     };
-    tracing::info!(arm = args.arm.as_str(), %admin_addr, "starting aura gateway");
-    let gateway = GatewayHandle::start(&args.aura_bin, &config_path, admin_addr).await?;
+    tracing::info!(arm = args.arm.as_str(), %admin_addr, "starting baybo gateway");
+    let gateway = GatewayHandle::start(&args.baybo_bin, &config_path, admin_addr).await?;
     tracing::info!(arm = args.arm.as_str(), %run_id, conversations = n_conv, concurrency = args.concurrency, "QA start");
 
     // Flatten to independent per-question tasks; the oracle convo is shared
@@ -367,7 +367,7 @@ async fn main() -> Result<()> {
                             answer: format!("<prompt error: {e}>"),
                             correct: false,
                             f1: 0.0,
-                            judge_reason: "aura prompt failed; not judged".to_string(),
+                            judge_reason: "baybo prompt failed; not judged".to_string(),
                             latency_ms,
                             session_id: task.session_id.clone(),
                             input_tokens: 0,
@@ -433,11 +433,11 @@ async fn main() -> Result<()> {
     ordered.sort_by_key(|(seq, _)| *seq);
     let results: Vec<QuestionResult> = ordered.into_iter().map(|(_, r)| r).collect();
 
-    let answer_model = if args.aura_config.is_some() {
+    let answer_model = if args.baybo_config.is_some() {
         ANSWER_LABEL.to_string()
     } else {
         format!(
-            "{}/{} (aura gateway)",
+            "{}/{} (baybo gateway)",
             args.answer_provider, args.answer_model
         )
     };
@@ -465,7 +465,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// The prompt sent to `aura prompt`: the answer instruction + question, with
+/// The prompt sent to `baybo prompt`: the answer instruction + question, with
 /// the whole conversation prepended for the oracle arm.
 fn build_prompt(question: &str, convo: Option<&str>) -> String {
     match convo {
@@ -551,7 +551,7 @@ fn print_plan(arm: Arm, testset: &str, samples: &[BenchSample], n_q: usize, conc
     println!("conversations: {}", samples.len());
     println!("questions: {questions}");
     println!(
-        "calls: {questions} aura-prompt (real agent) + {questions} judge + {questions} cost-show"
+        "calls: {questions} baybo-prompt (real agent) + {questions} judge + {questions} cost-show"
     );
     println!("concurrency: {}", concurrency.max(1));
     println!("(no gateway started, no API calls made)");
@@ -601,7 +601,7 @@ fn default_run_id() -> String {
 }
 
 /// Grab a currently-free ephemeral port by binding `127.0.0.1:0` and reading the
-/// port the OS assigned. The listener drops immediately so the `aura gateway`
+/// port the OS assigned. The listener drops immediately so the `baybo gateway`
 /// child can bind it — a tiny TOCTOU window that's fine for a local bench.
 fn pick_free_port() -> Result<u16> {
     let listener =

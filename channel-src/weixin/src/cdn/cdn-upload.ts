@@ -5,7 +5,7 @@
  * key and bounce up to `UPLOAD_MAX_RETRIES` times on transient
  * server errors.
  */
-import type { Logger } from "@aura/channel-sdk";
+import type { Logger } from "@baybo/channel-sdk";
 
 import { encryptAesEcb } from "./aes-ecb.js";
 import { buildCdnUploadUrl } from "./cdn-url.js";

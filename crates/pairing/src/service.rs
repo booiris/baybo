@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use aura_model::ChannelType;
-use aura_store::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
+use baybo_model::ChannelType;
+use baybo_store::{ChannelPairingRow, ChannelPairingStore, PairingStatus};
 use chrono::Utc;
 
 use crate::code::{GenerateUniqueError, generate_unique};
@@ -17,7 +17,7 @@ const CODE_MINT_RETRIES: u32 = 8;
 /// How long a freshly-minted pending pairing code stays valid before
 /// the service overwrites it with a new one on the next inbound.
 /// 15 minutes — long enough for a human operator to notice a Telegram
-/// buzz and run `aura pair approve`, short enough that a curious
+/// buzz and run `baybo pair approve`, short enough that a curious
 /// one-time user's code doesn't linger in libsql for days.
 const PENDING_TTL_SECONDS: i64 = 900;
 

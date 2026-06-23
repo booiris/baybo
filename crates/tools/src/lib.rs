@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use aura_model::{JobId, SessionId, SpanId, User};
-use aura_trace::ToolEventPayload;
-use aura_workspace::WorkspacePaths;
+use baybo_model::{JobId, SessionId, SpanId, User};
+use baybo_trace::ToolEventPayload;
+use baybo_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -189,7 +189,7 @@ pub struct ToolContext {
     /// when no LLM is wired (argv-mode boots, tests that don't
     /// exercise the side LLM); tools must fail-closed by ignoring
     /// their LLM-dependent code path.
-    pub llm: Option<Arc<dyn aura_llm::BilledChat>>,
+    pub llm: Option<Arc<dyn baybo_llm::BilledChat>>,
     /// Tool-side access to user-managed secrets, bound by the agent layer
     /// (mirrors [`Self::llm`]). `BashTool` uses it to resolve `secret_env`
     /// names to plaintext for child-process injection and to redact those
@@ -215,7 +215,7 @@ pub struct ToolContext {
 }
 
 /// Severity of a [`SessionNotifier`] event. Matches
-/// `aura_channels::NoticeLevel` exactly — the agent-loop bridge does
+/// `baybo_channels::NoticeLevel` exactly — the agent-loop bridge does
 /// a one-to-one variant mapping when it forwards onto
 /// `AgentEvent::Notice`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,7 +236,7 @@ pub trait SessionNotifier: Send + Sync {
     /// are media only (`Image` / `Audio` / `File`). Default no-op for
     /// notifiers with no live channel (cron, tests); the live notifier
     /// routes it to the channel. Sync, fire-and-forget.
-    fn emit_attachment(&self, blocks: &[aura_model::ContentBlock]) {
+    fn emit_attachment(&self, blocks: &[baybo_model::ContentBlock]) {
         let _ = blocks;
     }
 }
@@ -333,7 +333,7 @@ pub fn noop_event_sink() -> Arc<dyn ToolEventSink> {
 ///
 /// - Read: before forwarding to the gate, request filters out
 ///   accesses that the cache already covers (matches the pre-execute
-///   gate in `aura-agent`'s `ToolExecutor`). When *all* accesses are
+///   gate in `baybo-agent`'s `ToolExecutor`). When *all* accesses are
 ///   covered the call short-circuits to `Approve` without prompting.
 /// - Write: on `ApproveAlways` the granted accesses are appended to
 ///   the cache so a follow-up call inside the same session does not
@@ -455,9 +455,9 @@ pub struct SpawnOpts {
 }
 
 /// OS-level sandbox runner exposed to tools that need to spawn an
-/// external process. The `aura-agent` crate adapts a real
-/// `aura_sandbox::SandboxRunner` into this trait so `aura-tools` does
-/// not gain a transitive dependency on `aura-sandbox`.
+/// external process. The `baybo-agent` crate adapts a real
+/// `baybo_sandbox::SandboxRunner` into this trait so `baybo-tools` does
+/// not gain a transitive dependency on `baybo-sandbox`.
 #[async_trait]
 pub trait ExecSandbox: Send + Sync {
     async fn spawn_command(
@@ -564,7 +564,7 @@ pub struct DetachedCommand {
 /// Runtime hook that takes ownership of a [`DetachedCommand`], streams it
 /// to completion off the tool call, and routes a background-job completion
 /// notification to the parent session. Implemented by the agent layer
-/// (`aura-agent`) and injected via [`ToolContext::background_jobs`], which
+/// (`baybo-agent`) and injected via [`ToolContext::background_jobs`], which
 /// the runtime populates **only for user-facing sessions** — so the
 /// presence of the sink is itself the "is this conversation eligible to
 /// background work" gate.
@@ -600,7 +600,7 @@ pub trait BackgroundJobControl: Send + Sync {
 
 /// Tool-side access to user-managed secrets, injected by the agent layer
 /// through [`ToolContext::secrets`]. The concrete impl wraps the security
-/// gateway + `UserSecretManager`; `aura-tools` sees only this trait, so the
+/// gateway + `UserSecretManager`; `baybo-tools` sees only this trait, so the
 /// reveal/mint pipeline and storage details stay in the agent layer (the
 /// trait is implemented "from above" — see `docs/secret-management.md`).
 #[async_trait]
@@ -622,7 +622,7 @@ pub trait SecretAccess: Send + Sync {
         name: &str,
         value: &[u8],
         overwrite: bool,
-    ) -> crate::Result<aura_security::AddOutcome>;
+    ) -> crate::Result<baybo_security::AddOutcome>;
 
     /// All user-secret names (no values).
     async fn list_names(&self) -> crate::Result<Vec<String>>;
@@ -644,7 +644,7 @@ pub enum ToolOutput {
     /// loop and the channel sidecar then sends them out-of-band.
     WithAttachments {
         text: String,
-        attachments: Vec<aura_model::ContentBlock>,
+        attachments: Vec<baybo_model::ContentBlock>,
     },
     /// Tool result that includes images the *LLM itself* should see on
     /// the next turn (e.g. `browser_screenshot`). The agent loop
@@ -659,7 +659,7 @@ pub enum ToolOutput {
     /// silently dropped at construction.
     MultiModalText {
         text: String,
-        llm_images: Vec<aura_model::ContentBlock>,
+        llm_images: Vec<baybo_model::ContentBlock>,
     },
 }
 
@@ -669,10 +669,10 @@ impl ToolOutput {
     /// variants are silently dropped — the variant is documented as
     /// images-only and accidental misuse from a tool author should
     /// not surprise the agent loop.
-    pub fn multi_modal_text(text: String, llm_images: Vec<aura_model::ContentBlock>) -> Self {
+    pub fn multi_modal_text(text: String, llm_images: Vec<baybo_model::ContentBlock>) -> Self {
         let llm_images = llm_images
             .into_iter()
-            .filter(|b| matches!(b, aura_model::ContentBlock::Image { .. }))
+            .filter(|b| matches!(b, baybo_model::ContentBlock::Image { .. }))
             .collect();
         Self::MultiModalText { text, llm_images }
     }
@@ -691,7 +691,7 @@ pub struct ToolDefinition {
 pub struct ToolManifest {
     pub name: String,
     pub description: String,
-    pub trust_level: aura_model::TrustLevel,
+    pub trust_level: baybo_model::TrustLevel,
     pub parameters_schema: Value,
     pub capabilities: Vec<ToolCapability>,
 }
@@ -725,7 +725,7 @@ pub use registry::ToolRegistry;
 #[cfg(test)]
 mod multi_modal_text_tests {
     use super::ToolOutput;
-    use aura_model::{BlobRef, ContentBlock};
+    use baybo_model::{BlobRef, ContentBlock};
 
     fn img() -> ContentBlock {
         ContentBlock::Image {

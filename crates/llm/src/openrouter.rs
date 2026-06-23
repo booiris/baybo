@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use aura_model::MicroUsd;
+use baybo_model::MicroUsd;
 use serde::Deserialize;
 
 use crate::ModelPricing;
@@ -205,14 +205,14 @@ pub fn pricing_for(provider: &str, model_id: &str) -> Option<ModelPricing> {
     snapshot_pricing(&slug_for(provider, model_id)?)
 }
 
-/// Snapshot capabilities for an Aura `(provider, model_id)` pair.
+/// Snapshot capabilities for an Baybo `(provider, model_id)` pair.
 /// `None` when the slug isn't OpenRouter-routable or isn't in the
 /// bundled snapshot — caller keeps its hardcoded default.
 pub fn capabilities_for(provider: &str, model_id: &str) -> Option<ModelCapabilities> {
     snapshot_capabilities(&slug_for(provider, model_id)?)
 }
 
-/// Enumerate every snapshot model id for an Aura provider, stripped of
+/// Enumerate every snapshot model id for an Baybo provider, stripped of
 /// the `<or_provider>/` slug prefix. Returns the catalog ids OpenRouter
 /// publishes for that vendor — useful as a fallback model list when the
 /// vendor's own `/v1/models` endpoint is empty or unimplemented.
@@ -233,7 +233,7 @@ pub fn snapshot_model_ids_for(provider: &str) -> Vec<String> {
         .collect()
 }
 
-/// Map an Aura `(provider, model_id)` pair to its OpenRouter catalog
+/// Map an Baybo `(provider, model_id)` pair to its OpenRouter catalog
 /// slug. Returns `None` for providers that don't ship through
 /// OpenRouter (`openai-subscription` bills against a flat OAuth
 /// subscription, not per-token).
@@ -248,7 +248,7 @@ pub fn snapshot_model_ids_for(provider: &str) -> Vec<String> {
 ///    `claude-haiku-4-5`).
 /// 4. A `-` is rewritten to `.` only when both adjacent characters
 ///    are ASCII digits **and** each digit run is exactly one
-///    character long (covers Aura's dash-separated version style
+///    character long (covers Baybo's dash-separated version style
 ///    like `claude-opus-4-6` → `claude-opus-4.6`, while leaving
 ///    OpenRouter's date-stamped slugs intact —
 ///    `gpt-4o-2024-11-20` stays as `gpt-4o-2024-11-20` because the
@@ -378,7 +378,7 @@ impl ApiEntry {
 /// providers) are silently skipped.
 pub async fn fetch_overlay_for(
     entries: &[(&str, &str)],
-    proxy: Option<&aura_security::http::ProxySettings>,
+    proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> HashMap<String, (ModelPricing, ModelCapabilities)> {
     let mut wanted: Vec<(String, String)> = Vec::new();
     for (provider, model) in entries {
@@ -418,7 +418,7 @@ pub async fn fetch_overlay_for(
 /// extend boot. Failures are caller-tolerant; the overlay paths
 /// swallow them and keep the bundled snapshot.
 async fn fetch_catalog(
-    proxy: Option<&aura_security::http::ProxySettings>,
+    proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> crate::Result<HashMap<String, SnapshotEntry>> {
     let body = fetch_models_response(proxy).await?;
     Ok(body
@@ -439,9 +439,9 @@ async fn fetch_catalog(
 }
 
 async fn fetch_models_response(
-    proxy: Option<&aura_security::http::ProxySettings>,
+    proxy: Option<&baybo_security::http::ProxySettings>,
 ) -> crate::Result<ApiResponse> {
-    let client = aura_security::http::client_builder(proxy)
+    let client = baybo_security::http::client_builder(proxy)
         .and_then(|b| b.timeout(LIVE_FETCH_TIMEOUT).build())
         .map_err(|e| crate::LlmError::Config(format!("openrouter http client: {e}")))?;
 
@@ -481,8 +481,8 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_carries_known_aura_targets() {
-        // Pin the four canonical slugs Aura's default factories map
+    fn snapshot_carries_known_baybo_targets() {
+        // Pin the four canonical slugs Baybo's default factories map
         // to, so a regen that accidentally filters them out is caught.
         for slug in [
             "openai/gpt-5",
@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn snapshot_model_ids_for_gemini_uses_google_prefix() {
-        // Aura's `gemini` provider maps to OpenRouter's `google/` prefix —
+        // Baybo's `gemini` provider maps to OpenRouter's `google/` prefix —
         // the enumerate path must use the same mapping as `slug_for`,
         // otherwise gemini fallbacks return zero entries.
         let ids = snapshot_model_ids_for("gemini");
@@ -759,7 +759,7 @@ mod tests {
 
     #[test]
     fn capabilities_for_resolves_context_window_and_vision() {
-        // Pin: Aura's canonical Anthropic flagship resolves to the
+        // Pin: Baybo's canonical Anthropic flagship resolves to the
         // 1M-context vision-capable profile via the snapshot. If this
         // regresses after a refresh, the factory's hardcoded fallback
         // still works but operators lose per-model context tracking.

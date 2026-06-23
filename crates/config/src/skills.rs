@@ -15,7 +15,7 @@ pub struct SkillsConfig {
 /// How aggressively the skill risk assessor should classify a skill
 /// before it is made available to the agent.
 ///
-/// Mirrored into `aura_skills_assessor::AssessmentMode` at bootstrap.
+/// Mirrored into `baybo_skills_assessor::AssessmentMode` at bootstrap.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskCheckConfig {

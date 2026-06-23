@@ -1,4 +1,4 @@
-use aura_model::{ChatMessage, ContentBlock};
+use baybo_model::{ChatMessage, ContentBlock};
 use tiktoken_rs::CoreBPE;
 
 /// Trait for counting tokens in text and multimodal content.
@@ -96,8 +96,8 @@ impl Tokenizer for TiktokenTokenizer {
                     let text: String = content
                         .iter()
                         .filter_map(|c| match c {
-                            aura_model::ThinkingContent::Text { text, .. } => Some(text.as_str()),
-                            aura_model::ThinkingContent::Summary { text } => Some(text.as_str()),
+                            baybo_model::ThinkingContent::Text { text, .. } => Some(text.as_str()),
+                            baybo_model::ThinkingContent::Summary { text } => Some(text.as_str()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()

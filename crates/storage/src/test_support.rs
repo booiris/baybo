@@ -9,13 +9,13 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use async_trait::async_trait;
-use aura_model::BlobRef;
+use baybo_model::BlobRef;
 use futures::StreamExt;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
-use aura_store::StorageError;
-use aura_store::blob::{
+use baybo_store::StorageError;
+use baybo_store::blob::{
     BlobMeta, BlobReader, BlobStore, ByteStream, Result as BlobResult, SHA256_PREFIX,
 };
 

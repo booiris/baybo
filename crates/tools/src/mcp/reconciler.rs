@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aura_security::SecretVault;
-use aura_store::BlobStore;
+use baybo_security::SecretVault;
+use baybo_store::BlobStore;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -60,7 +60,7 @@ pub struct McpReconciler {
     embedded: Vec<EmbeddedMcpServer>,
     /// Egress proxy applied to HTTP MCP transports and injected into stdio
     /// MCP children's env. `None` = direct.
-    proxy: Option<aura_security::http::ProxySettings>,
+    proxy: Option<baybo_security::http::ProxySettings>,
     cancel: CancellationToken,
     notify: Arc<Notify>,
     state: Mutex<HashMap<String, Connected>>,
@@ -75,7 +75,7 @@ impl McpReconciler {
         blob_store: Option<Arc<dyn BlobStore>>,
         embedded: Vec<EmbeddedMcpServer>,
         cancel: CancellationToken,
-        proxy: Option<aura_security::http::ProxySettings>,
+        proxy: Option<baybo_security::http::ProxySettings>,
     ) -> Arc<Self> {
         Arc::new(Self {
             workspace_root,
@@ -92,7 +92,7 @@ impl McpReconciler {
     }
 
     /// Wake the reconciler immediately. CLI commands call this after a
-    /// successful `aura mcp add/remove` so the gateway picks up changes
+    /// successful `baybo mcp add/remove` so the gateway picks up changes
     /// without waiting for the next tick. Best-effort: missing the
     /// notify just means the next periodic tick will absorb the change.
     pub fn poke(&self) {
@@ -175,7 +175,7 @@ impl McpReconciler {
         // Probe embedded entries for liveness so a crashed child
         // surfaces as disconnect-and-reconnect rather than silently
         // staying in the state map. User-configured stdio servers keep
-        // today's "no probe" semantics (a manual `aura mcp add` re-edit
+        // today's "no probe" semantics (a manual `baybo mcp add` re-edit
         // triggers reconciliation).
         let probe_targets: Vec<String> = {
             let state = self.state.lock();
@@ -321,14 +321,14 @@ impl McpReconciler {
         is_embedded: bool,
     ) -> crate::mcp::McpResult<()> {
         // Defense-in-depth trust gate: never spawn / connect an entry
-        // that wouldn't have been accepted by `aura mcp add`. A
+        // that wouldn't have been accepted by `baybo mcp add`. A
         // hand-edited `.mcp.json` could otherwise smuggle in an
         // `installed`-trust stdio command and run it at boot.
         entry.validate()?;
         let session =
             connect_with_extra_env(entry, &self.vault, extra_env, self.proxy.as_ref()).await?;
         let resources = resource_access_for(entry, is_embedded);
-        let trust_level: aura_model::TrustLevel = entry.trust_level.into();
+        let trust_level: baybo_model::TrustLevel = entry.trust_level.into();
 
         for descriptor in session.tools().to_vec() {
             let tool = crate::mcp::tool::McpTool::new(
@@ -410,13 +410,13 @@ fn identity_hash(entry: &McpServerEntry, extra_env: &HashMap<String, String>) ->
 /// every HTTP tool as `Http{host}`. The agent loop's pre-execute approval
 /// gate prompts on these uniformly.
 ///
-/// For **embedded** Aura-owned servers (browser today, future code_exec /
+/// For **embedded** Baybo-owned servers (browser today, future code_exec /
 /// db_query) the embedded profile builder declares the capability
 /// ceiling explicitly via `EmbeddedMcpProfile::capabilities`. An *empty*
-/// `capabilities` is the embedded profile's way of saying "Aura controls
+/// `capabilities` is the embedded profile's way of saying "Baybo controls
 /// the spawn and trusts the vendor; do not gate per-call approval on the
 /// transport command" — the user already authorised the spawn by setting
-/// `enable=true` in aura.json. The browser sidecar relies on this:
+/// `enable=true` in baybo.json. The browser sidecar relies on this:
 /// chrome-devtools-mcp's tool surface is too broad and too high-frequency
 /// for a per-call "will run: node" prompt to make sense.
 ///
@@ -485,7 +485,7 @@ mod tests {
         assert!(!should_disconnect("github-mcp", false, &embedded));
     }
 
-    /// Regression: `aura.json:browser` declares `capabilities: []` to
+    /// Regression: `baybo.json:browser` declares `capabilities: []` to
     /// opt the embedded browser sidecar out of per-call approval (the
     /// operator's `enable=true` is the gate). Before the fix, the
     /// reconciler derived approval resources from the **transport**

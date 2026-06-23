@@ -1,4 +1,4 @@
-# Aura browser-sidecar image: consumer Google Chrome inside an Xvfb display
+# Baybo browser-sidecar image: consumer Google Chrome inside an Xvfb display
 # so the agent gets a non-headless Chrome (better simulates a real user,
 # dodges `HeadlessChrome` fingerprint checks). The TS sidecar stays on
 # the host and connects via CDP — `args.browserUrl =
@@ -13,11 +13,11 @@
 # automated infrastructure.
 #
 # Build context is `tool-src/browser/docker/`. Tag is computed by the TS
-# wrapper as `aura-browser:<sha256(Dockerfile + entrypoint.sh)[..12]>` —
-# any Aura update that changes either file triggers a rebuild and pulls
+# wrapper as `baybo-browser:<sha256(Dockerfile + entrypoint.sh)[..12]>` —
+# any Baybo update that changes either file triggers a rebuild and pulls
 # whatever Chrome stable was current at build time. To force a refresh
 # of an unchanged image (e.g. to pick up a Chrome security update),
-# operators run `docker rmi aura-browser:<tag>` and restart Aura.
+# operators run `docker rmi baybo-browser:<tag>` and restart Baybo.
 
 FROM debian:bookworm-slim
 
@@ -50,9 +50,9 @@ RUN apt-get update \
 # Install consumer Google Chrome from Google's official .deb. We pull
 # `_current` (whatever's stable at build time) because pinning a specific
 # version doesn't gain much: the image tag is hashed from Dockerfile +
-# entrypoint, so an Aura update that changes either auto-rebuilds and
-# pulls fresh Chrome. For deliberate refreshes between Aura updates,
-# operators `docker rmi aura-browser:<tag>` and restart.
+# entrypoint, so an Baybo update that changes either auto-rebuilds and
+# pulls fresh Chrome. For deliberate refreshes between Baybo updates,
+# operators `docker rmi baybo-browser:<tag>` and restart.
 #
 # Trust path: HTTPS to dl.google.com (cert-pinned by the system CA
 # bundle). `apt install /tmp/chrome.deb` resolves dependencies through
@@ -72,20 +72,20 @@ RUN wget -q -O /tmp/chrome.deb \
 # COPY + chmod is what makes the entrypoint executable/readable. The
 # host-side file's mode bit is lost via `decompress_to`'s umask handling
 # (crates/gateway/src/sidecar/assets.rs), so set the full mode explicitly.
-COPY entrypoint.sh /usr/local/bin/aura-browser-entrypoint.sh
-RUN chmod 755 /usr/local/bin/aura-browser-entrypoint.sh
+COPY entrypoint.sh /usr/local/bin/baybo-browser-entrypoint.sh
+RUN chmod 755 /usr/local/bin/baybo-browser-entrypoint.sh
 
 # Operator UID is overridden at `docker run` time via `--user $(id -u):$(id -g)`
 # so files written into `/data/profile` are owned by the host operator
 # (lets the same profile dir round-trip between host-headless and docker
-# modes cleanly). The `aura` user just guarantees a writeable HOME for
+# modes cleanly). The `baybo` user just guarantees a writeable HOME for
 # the rare case the operator skips `--user`.
-RUN groupadd --system --gid 1000 aura \
- && useradd --system --gid aura --uid 1000 --create-home --home-dir /home/aura aura \
+RUN groupadd --system --gid 1000 baybo \
+ && useradd --system --gid baybo --uid 1000 --create-home --home-dir /home/baybo baybo \
  && mkdir -p /data/profile /data/fonts \
- && chown -R aura:aura /data /home/aura
-USER aura
-WORKDIR /home/aura
+ && chown -R baybo:baybo /data /home/baybo
+USER baybo
+WORKDIR /home/baybo
 
 # 9223 is the socat relay (entrypoint.sh) — Chrome 134+ silently ignores
 # `--remote-debugging-address=0.0.0.0` so we bind Chrome to loopback 9222
@@ -93,4 +93,4 @@ WORKDIR /home/aura
 # port-mapped.
 EXPOSE 9223
 
-ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/aura-browser-entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/baybo-browser-entrypoint.sh"]

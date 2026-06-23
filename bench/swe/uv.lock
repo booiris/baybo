@@ -115,7 +115,7 @@ wheels = [
 ]
 
 [[package]]
-name = "aura-bench-swe-pytools"
+name = "baybo-bench-swe-pytools"
 version = "0.0.0"
 source = { virtual = "." }
 dependencies = [

@@ -1,9 +1,9 @@
 //! [`SubagentRegistry`] — process-wide lookup of typed subagent profiles.
 //!
-//! Pattern mirrors `aura-skills::SkillRegistry`: interior mutability,
+//! Pattern mirrors `baybo-skills::SkillRegistry`: interior mutability,
 //! `Arc<SubagentRegistry>` shared across the agent loop, the
 //! `spawn_subagent` builtin (for dynamic description rendering), and
-//! the CLI (for `aura agents list`). `register` overwrites by name,
+//! the CLI (for `baybo agents list`). `register` overwrites by name,
 //! `load_dir` remembers the path so `reload` can replay disk state, and
 //! `register_builtins` populates the catch-all `general-purpose` entry
 //! so a fresh workspace boots with a usable spawn target.
@@ -224,7 +224,7 @@ impl SubagentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ArtifactSource, ModelTier, TrustLevel};
+    use baybo_model::{ArtifactSource, ModelTier, TrustLevel};
 
     fn mk(name: &str) -> SubagentProfile {
         SubagentProfile {
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn load_dir_missing_directory_returns_zero() {
         let reg = SubagentRegistry::new();
-        let loaded = reg.load_dir(Path::new("/definitely/does/not/exist/aura-agents"));
+        let loaded = reg.load_dir(Path::new("/definitely/does/not/exist/baybo-agents"));
         assert_eq!(loaded, 0);
     }
 

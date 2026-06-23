@@ -2,7 +2,7 @@ const MAX_BOT_ID_LEN = 64;
 
 /**
  * Normalize an iLink bot id (e.g. `b0f5860fdecb@im.bot`) into a string
- * that passes Aura's CLI validation (alphanumerics, `-`, `_`; ≤64
+ * that passes Baybo's CLI validation (alphanumerics, `-`, `_`; ≤64
  * chars). `@` and `.` become `-`; anything outside the allowed charset
  * is dropped. Empty output throws — prefer failing loudly over silently
  * producing an empty key.

@@ -1,15 +1,15 @@
 use std::path::{Path, PathBuf};
 
-use aura_model::TrustLevel;
-use aura_workspace::WorkspacePaths;
+use baybo_model::TrustLevel;
+use baybo_workspace::WorkspacePaths;
 use serde::{Deserialize, Serialize};
 
 use crate::ToolCapability;
 use crate::mcp::error::{McpError, McpResult};
 
-/// Mirror of [`aura_model::TrustLevel`] for the on-disk representation.
+/// Mirror of [`baybo_model::TrustLevel`] for the on-disk representation.
 /// Kept separate from the runtime enum so the serde format is stable
-/// even if `aura-model` reshapes its variants. Convert via `From`.
+/// even if `baybo-model` reshapes its variants. Convert via `From`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustLevelConfig {
@@ -221,7 +221,7 @@ impl McpFile {
     }
 
     /// Write `.mcp.json` atomically (tmp + rename, matching
-    /// `AuraConfig::write_to_file`).
+    /// `BayboConfig::write_to_file`).
     pub async fn write(&self, workspace_root: &Path) -> McpResult<()> {
         for entry in &self.servers {
             entry.validate()?;

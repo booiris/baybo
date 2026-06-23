@@ -3,12 +3,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_channels::registration::{Prompter as ChannelPrompter, RegistrationResult};
-use aura_gateway::SidecarRuntime;
-use aura_model::ChannelType;
-use aura_security::SecretVault;
-use aura_storage::retry::retry_on_busy;
-use aura_store::ChannelBotStore;
+use baybo_channels::registration::{Prompter as ChannelPrompter, RegistrationResult};
+use baybo_gateway::SidecarRuntime;
+use baybo_model::ChannelType;
+use baybo_security::SecretVault;
+use baybo_storage::retry::retry_on_busy;
+use baybo_store::ChannelBotStore;
 
 use crate::error::{Result, SetupError};
 use crate::prompt::Prompter;
@@ -60,7 +60,7 @@ pub async fn configure_channel_step<P: Prompter>(
         prompter,
         label,
         add_label,
-        "Skip — configure later with `aura channel add`",
+        "Skip — configure later with `baybo channel add`",
         allow_skip,
     )? {
         return Ok(ChannelStepOutcome::Skipped);
@@ -83,7 +83,7 @@ pub async fn configure_channel_step<P: Prompter>(
 
 fn offered_channels(runtime: &SidecarRuntime) -> Vec<ChannelType> {
     let mut channels: Vec<ChannelType> = runtime
-        .names_in_domain(aura_gateway::sidecar::domains::CHANNEL)
+        .names_in_domain(baybo_gateway::sidecar::domains::CHANNEL)
         .map(ChannelType::from)
         .collect();
     channels.sort_by(|a, b| a.as_str().cmp(b.as_str()));
@@ -93,8 +93,8 @@ fn offered_channels(runtime: &SidecarRuntime) -> Vec<ChannelType> {
 async fn collect_existing(
     store: &Arc<dyn ChannelBotStore>,
     channels: &[ChannelType],
-) -> Result<Vec<(ChannelType, aura_store::ChannelBotRow)>> {
-    let mut out: Vec<(ChannelType, aura_store::ChannelBotRow)> = Vec::new();
+) -> Result<Vec<(ChannelType, baybo_store::ChannelBotRow)>> {
+    let mut out: Vec<(ChannelType, baybo_store::ChannelBotRow)> = Vec::new();
     for ct in channels {
         let rows = store
             .list_live(ct)

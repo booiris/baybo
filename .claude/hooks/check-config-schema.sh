@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PostToolUse hook: when a file under crates/config/src/ is edited,
-emit additionalContext reminding Claude to sync aura.example.json.
+emit additionalContext reminding Claude to sync baybo.example.json.
 """
 import json
 import re
@@ -18,7 +18,7 @@ if re.search(r"crates/config/src/.*\.rs$", path):
             "hookEventName": "PostToolUse",
             "additionalContext": (
                 f"The config schema in crates/config/src/ was just modified "
-                f"(edited: {path}). Check whether /data/aura/aura.example.json "
+                f"(edited: {path}). Check whether /data/baybo/baybo.example.json "
                 "needs to be updated to reflect the new schema (new fields, "
                 "renamed fields, changed defaults, removed fields)."
             ),

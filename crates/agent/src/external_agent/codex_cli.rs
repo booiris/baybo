@@ -17,7 +17,7 @@
 //!
 //! Security: `--dangerously-bypass-approvals-and-sandbox` is hardcoded
 //! — codex's interactive permission prompts can't reach a non-TTY
-//! subprocess. aura's sandbox / sensitive_paths / approval gate do
+//! subprocess. baybo's sandbox / sensitive_paths / approval gate do
 //! NOT apply to codex's internal tool calls. `--cd <workspace_dir>`
 //! pins codex's root but does not constrain its absolute-path reach.
 
@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_llm::TokenUsage;
-use aura_model::{ChatMessage, ContentBlock, ExternalAgentKind, ThinkingContent};
+use baybo_llm::TokenUsage;
+use baybo_model::{ChatMessage, ContentBlock, ExternalAgentKind, ThinkingContent};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -48,9 +48,9 @@ const INSTALL_HINT: &str =
     "Install codex (npm install -g @openai/codex) or configure an explicit binary path.";
 
 /// Synthetic tool names attached to codex's `command_execution` /
-/// `file_change` items when projected into aura's `ContentBlock::ToolUse`.
+/// `file_change` items when projected into baybo's `ContentBlock::ToolUse`.
 /// Prefixed so a session reader can tell at a glance these are
-/// codex-internal calls and were NOT routed through aura's tool
+/// codex-internal calls and were NOT routed through baybo's tool
 /// registry / approval gate.
 const CODEX_TOOL_SHELL: &str = "codex_shell";
 const CODEX_TOOL_FILE_CHANGE: &str = "codex_file_change";
@@ -63,7 +63,7 @@ pub struct CodexCliAgent {
     model: String,
     /// Egress proxy injected into the child's env so the external CLI's
     /// own LLM calls route through it. `None` = inherit the parent env.
-    proxy: Option<aura_security::http::ProxySettings>,
+    proxy: Option<baybo_security::http::ProxySettings>,
 }
 
 impl CodexCliAgent {
@@ -71,7 +71,7 @@ impl CodexCliAgent {
     /// shape as claude_cli.
     pub fn probe_and_build(
         binary_path: Option<&str>,
-        proxy: Option<aura_security::http::ProxySettings>,
+        proxy: Option<baybo_security::http::ProxySettings>,
     ) -> Result<Arc<Self>> {
         let resolved = resolve_binary(
             binary_path,
@@ -255,10 +255,10 @@ fn spawn_stream_parser(
                                 },
                         } => {
                             // Pair (Assistant tool_use) + (Tool
-                            // tool_result) just like aura's own agent
+                            // tool_result) just like baybo's own agent
                             // loop. `name` is deliberately codex-
                             // qualified so a transcript reader can't
-                            // confuse it with an aura-audited tool
+                            // confuse it with an baybo-audited tool
                             // invocation.
                             let tool_use_id = format!("codex-{id}");
                             yield Ok(ExternalAgentEvent::Intermediate(ChatMessage::assistant(
@@ -397,7 +397,7 @@ enum ThreadEvent {
 }
 
 /// `item.completed` payloads codex emits. We surface the four kinds
-/// that map onto aura's `ContentBlock` set (text / thinking /
+/// that map onto baybo's `ContentBlock` set (text / thinking /
 /// tool_use+tool_result for shell + file edits). Newer codex item
 /// kinds fall through `Other`.
 ///

@@ -368,7 +368,7 @@ test("stale exit rejected even when the platform returns a stable handle value a
 test("structured ChatId keeps same-user cross-topic sessions separate and routes outbound back", async () => {
   // ChatId is `{ chatId, threadId? }` — Telegram supergroup-topic
   // analog. The same (bot, chat, user) with different threadIds must
-  // compose to distinct aura userIds so sessions stay isolated, and
+  // compose to distinct baybo userIds so sessions stay isolated, and
   // each outbound must land back on the structured address it came
   // from. Uses the SDK default `chatKey` (no platform override) to
   // prove the default handles composite addresses correctly.

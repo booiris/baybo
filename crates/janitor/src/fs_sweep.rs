@@ -79,7 +79,7 @@ where
 
 pub(crate) fn is_log_file(name: &str) -> bool {
     // Daily-rolling tracing files plus channel sidecar variants.
-    // Examples: `aura.log.2026-04-27`, `telegram.log.2026-04-27`.
+    // Examples: `baybo.log.2026-04-27`, `telegram.log.2026-04-27`.
     let bytes = name.as_bytes();
     if bytes.len() < 5 {
         return false;
@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn name_predicates_match_expected_shapes() {
-        assert!(is_log_file("aura.log.2026-04-27"));
+        assert!(is_log_file("baybo.log.2026-04-27"));
         assert!(is_log_file("telegram.log.2026-04-27"));
         assert!(is_log_file("plain.log"));
         assert!(!is_log_file("README.md"));

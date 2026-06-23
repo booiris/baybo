@@ -8,7 +8,7 @@ use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::PathBuf;
 
-use aura_security::is_sensitive_path;
+use baybo_security::is_sensitive_path;
 use tempfile::TempDir;
 
 fn write(path: &std::path::Path, contents: &str) {

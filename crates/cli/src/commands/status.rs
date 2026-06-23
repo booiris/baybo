@@ -1,6 +1,6 @@
-use aura_cost::TimeRange;
-use aura_job::JobStatusKind;
-use aura_query::CostScope;
+use baybo_cost::TimeRange;
+use baybo_job::JobStatusKind;
+use baybo_query::CostScope;
 use chrono::{Duration, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -69,7 +69,7 @@ struct LiveSnapshot {
 struct LiveCostSummary {
     /// `MicroUsd::as_usd_decimal` formatted to four places. Kept as a
     /// string so JSON consumers don't accidentally re-introduce float
-    /// drift across `aura status --live --json` aggregations.
+    /// drift across `baybo status --live --json` aggregations.
     cost_usd: String,
     calls: usize,
     input_tokens: usize,

@@ -1,12 +1,12 @@
 //! Persistence contract for the per-user pairing gate.
 //!
 //! Business logic (code minting, TTL semantics, refusal shape) lives
-//! in `aura-pairing`. This module keeps only the trait + row shape so
-//! aura-storage stays the single owner of every libsql adapter. See
+//! in `baybo-pairing`. This module keeps only the trait + row shape so
+//! baybo-storage stays the single owner of every libsql adapter. See
 //! `docs/modules/pairing.md` for the end-to-end picture.
 
 use async_trait::async_trait;
-use aura_model::ChannelType;
+use baybo_model::ChannelType;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -40,7 +40,7 @@ impl PairingStatus {
 
 /// One pairing row. The natural key is the triple
 /// `(channel_type, bot_id, user_id)`; `code` is unique across live
-/// rows and is the handle the operator hands to `aura pair approve`.
+/// rows and is the handle the operator hands to `baybo pair approve`.
 #[derive(Debug, Clone)]
 pub struct ChannelPairingRow {
     pub channel_type: ChannelType,

@@ -20,7 +20,7 @@ One directory per skill, a `SKILL.md` entrypoint with YAML frontmatter plus a Ma
 
 At startup the registry first calls `SkillRegistry::register_builtins()` to register every skill compiled into the cargo `[[bin]]` (`crates/skills/src/builtin/<name>/SKILL.md`, embedded via `include_str!`), then scans `<workspace.path>/skills/<skill-name>/SKILL.md` and overlays any workspace skill of the same name on top. Built-ins are `ArtifactSource::Inline` + `TrustLevel::Trusted`; an operator can patch shipped behaviour by dropping a same-named directory under the workspace.
 
-The first built-in is `aura-cli` — a non-user-invocable skill that tells the agent to introspect the running Aura instance through the `aura` CLI (the BashTool auto-injects `AURA_HELP_AGENT` and `AURA_CONFIG_PATH`, so the agent sees the full inventory and the right config without needing flags).
+The first built-in is `baybo-cli` — a non-user-invocable skill that tells the agent to introspect the running Baybo instance through the `baybo` CLI (the BashTool auto-injects `BAYBO_HELP_AGENT` and `BAYBO_CONFIG_PATH`, so the agent sees the full inventory and the right config without needing flags).
 
 ```
 <workspace>/skills/
@@ -78,7 +78,7 @@ Every skill exposes two independent entry points; both default on:
 
 A `/deploy` skill that's too dangerous to auto-trigger sets `disable-model-invocation: true`; a `legacy-system-context` reference that isn't actionable as a command sets `user-invocable: false`. A regex-based pattern trigger is **not** modelled — use `description` plus model decision instead.
 
-The `/<name>` entry point is surfaced on channel adapters by `aura-cli`'s `CliSlashHandler`: `commands()` lists every skill with `command.is_some()` so TUI autocomplete shows them alongside built-ins, and `handle()` returns `PassThrough` for `/<skill>` so the raw line reaches the agent and `select()` narrows on the exact match. See [`cli.md`](./cli.md#skill-shortcut) and [`tui.md`](./tui.md#skill-shortcuts) for the full wiring.
+The `/<name>` entry point is surfaced on channel adapters by `baybo-cli`'s `CliSlashHandler`: `commands()` lists every skill with `command.is_some()` so TUI autocomplete shows them alongside built-ins, and `handle()` returns `PassThrough` for `/<skill>` so the raw line reaches the agent and `select()` narrows on the exact match. See [`cli.md`](./cli.md#skill-shortcut) and [`tui.md`](./tui.md#skill-shortcuts) for the full wiring.
 
 ### Three-tier trust model
 
@@ -110,7 +110,7 @@ the first LLM call. The tool runs through `ToolExecutor::execute`
 exactly like an LLM-invoked call, so risk assessment, env-var
 approval, and trace provenance all flow through one path.
 
-`SkillRegistry::select` is retained for `aura skills check` /
+`SkillRegistry::select` is retained for `baybo skills check` /
 operator inspection and still has the same two cases (slash narrows
 to one; anything else returns the full set), but it is no longer
 consulted by `AgentLoop` to decide what gets injected — only to
@@ -122,12 +122,12 @@ Downstream gating happens lazily, on call:
 
 - The `Skill` tool runs the assessor (via `Arc<dyn SkillRiskCheck>`) before returning the body. `Dangerous` aborts with `ToolError::Denied`; `Suspicious` continues but adds a `risk_warning` field to the response and emits a notice (when a `SessionNotifier` is wired).
 - The tool also enforces `SkillRequirements::required_env`: missing host env vars short-circuit the call with `ToolError::Execution` *before* prompting the user. If every required var is present, an approval gate fires (`ResourceAccess::Env { vars }`); the env *values* are never templated into the response.
-- `SkillRegistry::validate_all` still reports unmet `required_bins` / `required_env`; callers that care (e.g. `aura skills check`) act on that report.
+- `SkillRegistry::validate_all` still reports unmet `required_bins` / `required_env`; callers that care (e.g. `baybo skills check`) act on that report.
 - Trust-level attenuation of the tool ceiling is a design stage not yet wired in.
 
 ### Risk assessment
 
-Static governance (trust levels, allow-lists, validator checks) catches structural problems but can't judge *semantic* intent: a skill with clean YAML can still instruct the model to exfiltrate secrets or run destructive commands. The `aura-skills-assessor` crate adds an LLM-backed second opinion, kept in its own crate so `aura-skills` stays LLM-free (selection must remain deterministic and offline-capable).
+Static governance (trust levels, allow-lists, validator checks) catches structural problems but can't judge *semantic* intent: a skill with clean YAML can still instruct the model to exfiltrate secrets or run destructive commands. The `baybo-skills-assessor` crate adds an LLM-backed second opinion, kept in its own crate so `baybo-skills` stays LLM-free (selection must remain deterministic and offline-capable).
 
 **Mode** (`config.skills.risk_check` → `AssessmentMode`):
 
@@ -145,7 +145,7 @@ check(skill)
         └─ miss → LLM classifier → put → return verdict
 ```
 
-The hash is a **metadata fingerprint**, not a content hash — see [skills-assessor.md](skills-assessor.md) for the full rationale and tradeoff. It covers every entry in the hashed scope (`SKILL.md` alone under `primary`, or `SKILL.md` plus all helper files under `full`), so a normal edit bumps mtime and re-triggers the check without us reading file bodies on the hot path. Length-prefixing the rel-path and symlink-target fields closes aliasing hazards across adjacent variable-length fields. Two scope discriminators (`aura.skill.full:v1` and `aura.skill.primary:v1`) are mixed into the hasher state so a one-file skill's primary hash and full hash never collide — both scopes can share the `(skill_name, content_hash)` primary key without ambiguity. A 500-file / 100 MiB hard cap rejects pathological trees outright before any hashing work runs.
+The hash is a **metadata fingerprint**, not a content hash — see [skills-assessor.md](skills-assessor.md) for the full rationale and tradeoff. It covers every entry in the hashed scope (`SKILL.md` alone under `primary`, or `SKILL.md` plus all helper files under `full`), so a normal edit bumps mtime and re-triggers the check without us reading file bodies on the hot path. Length-prefixing the rel-path and symlink-target fields closes aliasing hazards across adjacent variable-length fields. Two scope discriminators (`baybo.skill.full:v1` and `baybo.skill.primary:v1`) are mixed into the hasher state so a one-file skill's primary hash and full hash never collide — both scopes can share the `(skill_name, content_hash)` primary key without ambiguity. A 500-file / 100 MiB hard cap rejects pathological trees outright before any hashing work runs.
 
 **Return type** (`AssessedSkill`):
 
@@ -168,11 +168,11 @@ The hash is a **metadata fingerprint**, not a content hash — see [skills-asses
 | `model`        | Which LLM produced the verdict. |
 | `assessed_at`  | Unix microseconds. |
 
-**Non-blocking error policy**: only `Dangerous` blocks execution. Assessor errors (LLM unreachable, unparseable reply, I/O failure), skills without an on-disk `source_path` (e.g. test fixtures), and the `Suspicious` tier all pass through with a `warn!` log. Availability is preferred over false-positive blocks; the verdict is still surfaced in `aura skills check` output so a human can review.
+**Non-blocking error policy**: only `Dangerous` blocks execution. Assessor errors (LLM unreachable, unparseable reply, I/O failure), skills without an on-disk `source_path` (e.g. test fixtures), and the `Suspicious` tier all pass through with a `warn!` log. Availability is preferred over false-positive blocks; the verdict is still surfaced in `baybo skills check` output so a human can review.
 
 **Integration points** (both lazy — no work until the skill is actually invoked):
 
-- **CLI `aura skills check` / `/skills check`** — runs the validator, then invokes the assessor per skill. Output includes `risk: {status, scope, background_pending, level, rationale, model, content_hash, assessed_at}`.
+- **CLI `baybo skills check` / `/skills check`** — runs the validator, then invokes the assessor per skill. Output includes `risk: {status, scope, background_pending, level, rationale, model, content_hash, assessed_at}`.
 - **`Skill` tool** — `SkillRiskCheck::assess` returns a `SkillGate` (`Pass` / `PassWithWarning { rationale }` / `Block { rationale }`). `Block` aborts the call with `ToolError::Denied`; `PassWithWarning` returns the body with the rationale embedded as a `risk_warning` JSON field (and emits `Notice { level: Warn }` if a `SessionNotifier` is wired); `Pass` returns silently. Risk is checked once per call, not once per turn — the LLM only pays for assessment of the skill it actually invoked.
 
 The assessor is wired in `src/runtime.rs` alongside the other shared services using `with_background_worker(llm, store, mode)` where `mode` is read from `config.skills.risk_check`; `recover_pending_jobs` runs once after the skill registry is populated and drains persisted rows regardless of mode — `Off` only suppresses new enqueues. Argv-mode commands that don't open the chat loop leave the assessor `None`, which the CLI surfaces as `status: "not_configured"`.
@@ -195,7 +195,7 @@ The crate ships two governance-gated lifecycle tools (built by `build_install_to
 passed to `load_dir` and rebuilds the skill set from disk. The TUI
 Skills dashboard wires this into its refresh action (`r` key), so an
 operator editing `<workspace>/skills/<name>/SKILL.md` can press refresh
-to pick up the change without restarting Aura. Individual broken
+to pick up the change without restarting Baybo. Individual broken
 `SKILL.md` files are logged and skipped, matching startup behaviour.
 Filesystem watching is not wired yet — reload is on-demand only.
 
@@ -205,7 +205,7 @@ Skills declare `allowed-tools`, but this is only one input to the upper bound. B
 
 ## Constraints
 
-- Depends on `aura-model`, `aura-tools`, and `aura-workspace` (the last for `aura_workspace::paths::BIN_NAME`), plus `regex`, `dashmap`, `walkdir`, and `uuid`
+- Depends on `baybo-model`, `baybo-tools`, and `baybo-workspace` (the last for `baybo_workspace::paths::BIN_NAME`), plus `regex`, `dashmap`, `walkdir`, and `uuid`
 - Does not call `llm` or execute tools directly
 - The crate's own `SkillInstall` / `SkillUninstall` tools (see below) are the supported way to add or remove a workspace skill at runtime; nothing else here mutates the installed set
 - Every skill execution must record `skill_name`, `skill_version`, `source`, `trust_level` in Trace
@@ -215,10 +215,10 @@ Skills declare `allowed-tools`, but this is only one input to the upper bound. B
 | Module | Role |
 |--------|------|
 | `agent` | `AgentLoop` calls `SkillRegistry.select()` and executes skills |
-| `tools` | Skills declare allowed tool sets but don't execute tools directly. The `Skill` builtin (registered from `aura-skills::tools`, parallel to `aura-cron::tools`) is the LLM's single entry point for invoking them. |
+| `tools` | Skills declare allowed tool sets but don't execute tools directly. The `Skill` builtin (registered from `baybo-skills::tools`, parallel to `baybo-cron::tools`) is the LLM's single entry point for invoking them. |
 | `trace` | Records skill version, source, and execution results |
 | `workspace` | Provides trusted local skill directories for hot reload |
 
 ## References
 
-- [nearai/ironclaw `ironclaw_skills`](https://github.com/nearai/ironclaw/tree/staging/crates/ironclaw_skills/src) — prior art for the validator (hostile-manifest hardening). Aura's `validation.rs` is adapted from this design.
+- [nearai/ironclaw `ironclaw_skills`](https://github.com/nearai/ironclaw/tree/staging/crates/ironclaw_skills/src) — prior art for the validator (hostile-manifest hardening). Baybo's `validation.rs` is adapted from this design.

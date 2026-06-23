@@ -1,8 +1,8 @@
-//! Storage for channel-native-id → aura-session-id mappings.
+//! Storage for channel-native-id → baybo-session-id mappings.
 //!
 //! When a channel sidecar (e.g. Telegram) forwards a user's message, it
 //! identifies the user by the platform-native id (Telegram user id,
-//! prefixed as `tg_<id>`). The gateway keys aura's session UUID on the
+//! prefixed as `tg_<id>`). The gateway keys baybo's session UUID on the
 //! pair `(channel_type, user_id)` so the same user always lands on the
 //! same session — across sidecar restarts, across gateway restarts,
 //! and without the sidecar needing to generate UUIDs itself.
@@ -12,7 +12,7 @@
 //! `session_id`.
 
 use async_trait::async_trait;
-use aura_model::{ChannelType, SessionId};
+use baybo_model::{ChannelType, SessionId};
 
 use crate::StorageError;
 
@@ -20,7 +20,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 
 #[async_trait]
 pub trait ChannelSessionStore: Send + Sync {
-    /// Look up the aura `session_id` for `(channel_type, user_id)`.
+    /// Look up the baybo `session_id` for `(channel_type, user_id)`.
     /// Returns `Ok(None)` when no mapping exists.
     async fn get(&self, channel_type: &ChannelType, user_id: &str) -> Result<Option<SessionId>>;
 

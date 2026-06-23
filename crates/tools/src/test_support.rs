@@ -12,42 +12,42 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aura_model::TrustLevel;
+use baybo_model::TrustLevel;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use aura_llm::{BilledChat, BilledChatResponse};
+use baybo_llm::{BilledChat, BilledChatResponse};
 
 use crate::{
     ApprovalDecision, ApprovalGate, ApprovalRequest, ExecSandbox, RunningChild, SandboxedOutput,
     SpawnOpts, TokioRunningChild, Tool, ToolContext, ToolManifest, ToolOutput,
 };
 
-/// Binds a [`aura_llm::BillableLlm`] to a throwaway system
-/// [`Attribution`](aura_llm::Attribution) and exposes it as a
+/// Binds a [`baybo_llm::BillableLlm`] to a throwaway system
+/// [`Attribution`](baybo_llm::Attribution) and exposes it as a
 /// [`BilledChat`] — bridges tests that drive `LlmCompletion` stubs into
 /// the per-call `ctx.llm` slot WebFetch (and any future tool) reads
-/// from. Pass a [`BillableLlm::passthrough`](aura_llm::BillableLlm::passthrough)
+/// from. Pass a [`BillableLlm::passthrough`](baybo_llm::BillableLlm::passthrough)
 /// client so its no-op recorder reports `cost_micros: MicroUsd::ZERO`;
 /// budget assertions belong in agent-crate tests.
-pub fn unbilled_chat(inner: Arc<aura_llm::BillableLlm>) -> Arc<dyn BilledChat> {
+pub fn unbilled_chat(inner: Arc<baybo_llm::BillableLlm>) -> Arc<dyn BilledChat> {
     struct UnbilledChat {
-        inner: aura_llm::BoundBilledLlm,
+        inner: baybo_llm::BoundBilledLlm,
     }
     #[async_trait]
     impl BilledChat for UnbilledChat {
-        fn model_info(&self) -> &aura_llm::ModelInfo {
+        fn model_info(&self) -> &baybo_llm::ModelInfo {
             self.inner.model_info()
         }
         async fn chat(
             &self,
-            request: &aura_llm::ChatRequest,
+            request: &baybo_llm::ChatRequest,
         ) -> std::result::Result<BilledChatResponse, String> {
             self.inner.chat(request).await.map_err(|e| e.to_string())
         }
     }
     Arc::new(UnbilledChat {
-        inner: inner.bind(aura_llm::Attribution::system("tool-test")),
+        inner: inner.bind(baybo_llm::Attribution::system("tool-test")),
     })
 }
 
@@ -101,7 +101,7 @@ pub struct RecordingTool {
     name: String,
     invocations: Arc<Mutex<Vec<Value>>>,
     response: Arc<Mutex<ToolOutput>>,
-    last_job_id: Arc<Mutex<Option<aura_model::JobId>>>,
+    last_job_id: Arc<Mutex<Option<baybo_model::JobId>>>,
 }
 
 impl RecordingTool {
@@ -128,7 +128,7 @@ impl RecordingTool {
     /// The `job_id` of the most recent `execute()` call — lets a test
     /// reconstruct the per-turn cohort key (`GroupState::cohort_key`) that a
     /// grouped `spawn_subagent` running in that turn would have produced.
-    pub fn last_job_id(&self) -> Option<aura_model::JobId> {
+    pub fn last_job_id(&self) -> Option<baybo_model::JobId> {
         *self.last_job_id.lock()
     }
 
@@ -285,13 +285,13 @@ impl ApprovalGate for FakeApprovalGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_model::{ChannelType, User};
+    use baybo_model::{ChannelType, User};
 
     fn ctx() -> ToolContext {
         ToolContext {
             session_id: "s1".into(),
-            job_id: aura_model::JobId::default(),
-            span_id: aura_model::SpanId::default(),
+            job_id: baybo_model::JobId::default(),
+            span_id: baybo_model::SpanId::default(),
             user: User {
                 id: "u1".into(),
                 name: Some("tester".into()),
@@ -300,7 +300,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             workspace_root: PathBuf::from("/tmp"),
-            workspace_paths: aura_workspace::WorkspacePaths::new("/tmp"),
+            workspace_paths: baybo_workspace::WorkspacePaths::new("/tmp"),
             sandbox: None,
             approval: None,
             notifier: None,

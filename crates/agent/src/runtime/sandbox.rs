@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aura_sandbox::{
+use baybo_sandbox::{
     EnvPolicy, FilesystemPolicy, NetworkPolicy, ResourceLimits, SandboxRunner, SandboxSpec,
     StdinSource,
 };
-use aura_tools::{ExecSandbox, RunningChild, SandboxedOutput, SpawnOpts, ToolError};
+use baybo_tools::{ExecSandbox, RunningChild, SandboxedOutput, SpawnOpts, ToolError};
 
 pub struct SandboxAdapter {
     runner: Arc<dyn SandboxRunner>,
@@ -87,8 +87,8 @@ impl SandboxAdapter {
     /// at the same path. Used to surface `<workspace>/skills` so an
     /// installed skill's bundled script runs in place: under
     /// `Permissive`, the RO bind is layered on top of the denylist's
-    /// masking tmpfs (the agent's denylist masks all of `~/.aura`), so
-    /// the script stays readable while the rest of the aura state stays
+    /// masking tmpfs (the agent's denylist masks all of `~/.baybo`), so
+    /// the script stays readable while the rest of the baybo state stays
     /// hidden. Non-existent paths are dropped — bwrap's `--ro-bind-try`
     /// tolerates them, but Docker's `-v …:ro` would fail and an SBPL
     /// allow on a missing path is dead weight.
@@ -178,7 +178,7 @@ impl ExecSandbox for SandboxAdapter {
                 stderr: out.stderr,
                 timed_out: out.timed_out,
             }),
-            Err(aura_sandbox::SandboxError::Timeout(_)) => Ok(SandboxedOutput {
+            Err(baybo_sandbox::SandboxError::Timeout(_)) => Ok(SandboxedOutput {
                 exit_code: -1,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
@@ -202,10 +202,10 @@ impl ExecSandbox for SandboxAdapter {
     }
 }
 
-/// Bridges a backend's [`aura_sandbox::DetachedChild`] to the tool layer's
+/// Bridges a backend's [`baybo_sandbox::DetachedChild`] to the tool layer's
 /// [`RunningChild`] (identical shape; the two traits live in different crates
-/// to keep `aura-sandbox` free of an `aura-tools` dependency).
-struct DetachedChildAdapter(Box<dyn aura_sandbox::DetachedChild>);
+/// to keep `baybo-sandbox` free of an `baybo-tools` dependency).
+struct DetachedChildAdapter(Box<dyn baybo_sandbox::DetachedChild>);
 
 #[async_trait]
 impl RunningChild for DetachedChildAdapter {
@@ -226,7 +226,7 @@ impl RunningChild for DetachedChildAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_sandbox::{Backend, SandboxError, SandboxOutput};
+    use baybo_sandbox::{Backend, SandboxError, SandboxOutput};
     use parking_lot::Mutex;
     use std::time::Duration;
 

@@ -1,11 +1,11 @@
 //! Interactive single/multi-select pickers for CLI commands. Thin
-//! delegations to `aura_setup::TtyPrompter` — the one raw-mode picker
+//! delegations to `baybo_setup::TtyPrompter` — the one raw-mode picker
 //! implementation in the workspace — so the crossterm rendering lives in
 //! exactly one place. `?` / `map_err(Into::into)` map `SetupError` →
 //! `CliError` (see `crate::error`); `Cancelled` / `NotATerminal` land on
 //! `CliError::Config`, matching what callers already expect.
 
-use aura_setup::{Prompter, TtyPrompter};
+use baybo_setup::{Prompter, TtyPrompter};
 
 use crate::error::Result;
 

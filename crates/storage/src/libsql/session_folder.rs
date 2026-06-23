@@ -1,11 +1,11 @@
 //! libsql implementation of [`SessionFolderStore`].
 
 use async_trait::async_trait;
-use aura_model::{FolderId, SessionId};
+use baybo_model::{FolderId, SessionId};
 
 use super::LibsqlPool;
-use aura_store::StorageError;
-use aura_store::session_folder::{Result, SessionFolderRow, SessionFolderStore};
+use baybo_store::StorageError;
+use baybo_store::session_folder::{Result, SessionFolderRow, SessionFolderStore};
 
 pub struct LibsqlSessionFolderStore {
     pool: LibsqlPool,
@@ -261,8 +261,8 @@ impl SessionFolderStore for LibsqlSessionFolderStore {
 mod tests {
     use super::*;
     use crate::libsql::LibsqlSessionStore;
-    use aura_model::{ChannelType, Session, SessionState, TriggerSource, User};
-    use aura_store::SessionStore;
+    use baybo_model::{ChannelType, Session, SessionState, TriggerSource, User};
+    use baybo_store::SessionStore;
 
     fn folder_row(id: &str, parent: Option<&str>, name: &str, pos: i64) -> SessionFolderRow {
         SessionFolderRow {

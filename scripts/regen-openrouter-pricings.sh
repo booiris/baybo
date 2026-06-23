@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Refresh the OpenRouter pricing snapshot bundled into `aura-llm`.
+# Refresh the OpenRouter pricing snapshot bundled into `baybo-llm`.
 #
 # Why a snapshot at all: `CostManager` seeds `compute_cost_usd` from
 # `LlmProviderRegistry::all_known_pricings()` at boot. The runtime
@@ -14,7 +14,7 @@
 #
 # Filtering rules:
 #   * Store the FULL OpenRouter catalog (every provider), not just the
-#     ones Aura ships factories for. Pricing lookups are gated by
+#     ones Baybo ships factories for. Pricing lookups are gated by
 #     `openrouter::openrouter_provider_prefix` — an unmapped provider's
 #     rows are simply never queried — so bundling them is harmless and
 #     means adding a new provider factory needs no edit here. (The

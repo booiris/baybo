@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Errors produced while loading, parsing, or validating Aura configuration.
+/// Errors produced while loading, parsing, or validating Baybo configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file '{path}': {reason}")]

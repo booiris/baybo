@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura_sandbox::docker::{DEFAULT_IMAGE, DockerRunner};
-use aura_sandbox::{
+use baybo_sandbox::docker::{DEFAULT_IMAGE, DockerRunner};
+use baybo_sandbox::{
     EnvPolicy, NetworkPolicy, ResourceLimits, SandboxRunner, SandboxSpec, StdinSource,
 };
 
@@ -58,7 +58,7 @@ async fn echo_through_docker() {
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(120),
             resource_limits: ResourceLimits::default(),
-            filesystem_policy: aura_sandbox::FilesystemPolicy::default(),
+            filesystem_policy: baybo_sandbox::FilesystemPolicy::default(),
         })
         .await
         .expect("sandboxed run");
@@ -110,11 +110,11 @@ async fn timeout_force_removes_container() {
             stdin: StdinSource::Null,
             timeout: Duration::from_millis(800),
             resource_limits: ResourceLimits::default(),
-            filesystem_policy: aura_sandbox::FilesystemPolicy::default(),
+            filesystem_policy: baybo_sandbox::FilesystemPolicy::default(),
         })
         .await;
     assert!(
-        matches!(res, Err(aura_sandbox::SandboxError::Timeout(_))),
+        matches!(res, Err(baybo_sandbox::SandboxError::Timeout(_))),
         "expected Timeout, got: {res:?}",
     );
 
@@ -168,7 +168,7 @@ async fn external_future_drop_force_removes_container() {
         // timeout branch ever runs.
         timeout: Duration::from_secs(60),
         resource_limits: ResourceLimits::default(),
-        filesystem_policy: aura_sandbox::FilesystemPolicy::default(),
+        filesystem_policy: baybo_sandbox::FilesystemPolicy::default(),
     };
 
     let res = tokio::time::timeout(Duration::from_millis(800), runner.run(spec)).await;
@@ -215,7 +215,7 @@ async fn network_none_blocks_dns() {
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(120),
             resource_limits: ResourceLimits::default(),
-            filesystem_policy: aura_sandbox::FilesystemPolicy::default(),
+            filesystem_policy: baybo_sandbox::FilesystemPolicy::default(),
         })
         .await
         .expect("sandboxed run");
@@ -259,7 +259,7 @@ async fn detached_start_kill_then_wait_removes_container() {
             stdin: StdinSource::Null,
             timeout: Duration::from_secs(60), // ignored by the detached path
             resource_limits: ResourceLimits::default(),
-            filesystem_policy: aura_sandbox::FilesystemPolicy::default(),
+            filesystem_policy: baybo_sandbox::FilesystemPolicy::default(),
         })
         .await
         .expect("spawn_detached");

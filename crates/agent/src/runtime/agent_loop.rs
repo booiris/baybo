@@ -1,24 +1,24 @@
 use std::sync::Arc;
 
-use aura_channels::{
+use baybo_channels::{
     AgentEvent, AgentOutput, COMPACT_COMMAND, OutgoingMessage, ToolStatus, TurnStatus,
 };
-use aura_context::ContextManager;
-use aura_job::{JobInput, JobLifecycle, JobOutput, JobShape};
-use aura_llm::{
+use baybo_context::ContextManager;
+use baybo_job::{JobInput, JobLifecycle, JobOutput, JobShape};
+use baybo_llm::{
     Attribution, BillableLlm, BoundBilledLlm, ChatRequest, LlmResponse, StreamEvent, TokenUsage,
     ToolDefinitionForLlm,
 };
-use aura_memory::{Memory, MemoryContext};
-use aura_model::{
+use baybo_memory::{Memory, MemoryContext};
+use baybo_model::{
     ChatMessage, ContentBlock, JobId, LlmEntryName, MessageSource, Role, SessionId, ThinkingContent,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use aura_model::{LineageKind, Session, TriggerSource};
-use aura_tools::{ToolConcurrency, ToolOutput, ToolRegistry};
-use aura_trace::{
+use baybo_model::{LineageKind, Session, TriggerSource};
+use baybo_tools::{ToolConcurrency, ToolOutput, ToolRegistry};
+use baybo_trace::{
     LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
 };
 use tracing::{debug, error, info, warn};
@@ -54,7 +54,7 @@ const TOOL_SUMMARY_MAX: usize = 80;
 /// returns. A [`ToolConcurrency::Independent`] call (`spawn_subagent`)
 /// acquires no permit and self-bounds out-of-band, so the pool never
 /// throttles subagent fan-out. Like the per-tool timeout ceiling, the
-/// cap lives in code rather than `aura.json`.
+/// cap lives in code rather than `baybo.json`.
 const MAX_CONCURRENT_TOOL_CALLS: usize = 10;
 
 /// Trim and length-cap a single-line summary string. Char-based so a
@@ -103,8 +103,8 @@ fn tool_completion_summary(result: &anyhow::Result<ToolOutput>) -> (ToolStatus, 
         }
         Ok(ToolOutput::Error(msg)) => (ToolStatus::Error, truncate_summary(msg)),
         Err(e) => {
-            if let Some(aura_tools::ToolError::Denied { .. }) =
-                e.downcast_ref::<aura_tools::ToolError>()
+            if let Some(baybo_tools::ToolError::Denied { .. }) =
+                e.downcast_ref::<baybo_tools::ToolError>()
             {
                 (ToolStatus::Denied, "denied".to_string())
             } else {
@@ -187,7 +187,7 @@ fn empty_llm_response() -> LlmResponse {
 
 /// Blocks safe to persist from an assistant turn cancelled mid-stream:
 /// rendered text and completed thinking, with the cancelled-turn marker
-/// ([`aura_context::prompts::cancelled_turn`]) appended so the model knows the
+/// ([`baybo_context::prompts::cancelled_turn`]) appended so the model knows the
 /// turn was cut short. The marker is model-facing framing; display surfaces
 /// strip it before rendering the partial reply. A streamed-but-undispatched
 /// `ToolUse` is dropped — persisting a `tool_use` with no matching
@@ -209,9 +209,9 @@ fn salvage_partial_blocks(resp: &LlmResponse) -> Vec<ContentBlock> {
     // Fold the marker into the trailing text rather than emitting a second
     // adjacent text block; a thinking-only salvage gets its own marker block.
     match blocks.last_mut() {
-        Some(ContentBlock::Text(t)) => t.push_str(aura_context::prompts::cancelled_turn::SUFFIX),
+        Some(ContentBlock::Text(t)) => t.push_str(baybo_context::prompts::cancelled_turn::SUFFIX),
         _ => blocks.push(ContentBlock::Text(
-            aura_context::prompts::cancelled_turn::marker_block_text(),
+            baybo_context::prompts::cancelled_turn::marker_block_text(),
         )),
     }
     blocks
@@ -242,17 +242,17 @@ impl std::error::Error for CancelledTurn {}
 /// than losing the line.
 struct DeltaTxNotifier {
     tx: tokio::sync::mpsc::Sender<AgentOutput>,
-    session_id: aura_model::SessionId,
+    session_id: baybo_model::SessionId,
     user_id: String,
-    channel: aura_model::ChannelType,
+    channel: baybo_model::ChannelType,
 }
 
-impl aura_tools::SessionNotifier for DeltaTxNotifier {
-    fn emit(&self, level: aura_tools::NoticeLevel, summary: &str, detail: &str) {
+impl baybo_tools::SessionNotifier for DeltaTxNotifier {
+    fn emit(&self, level: baybo_tools::NoticeLevel, summary: &str, detail: &str) {
         let level = match level {
-            aura_tools::NoticeLevel::Info => aura_channels::NoticeLevel::Info,
-            aura_tools::NoticeLevel::Warn => aura_channels::NoticeLevel::Warn,
-            aura_tools::NoticeLevel::Error => aura_channels::NoticeLevel::Error,
+            baybo_tools::NoticeLevel::Info => baybo_channels::NoticeLevel::Info,
+            baybo_tools::NoticeLevel::Warn => baybo_channels::NoticeLevel::Warn,
+            baybo_tools::NoticeLevel::Error => baybo_channels::NoticeLevel::Error,
         };
         let text = if detail.is_empty() {
             summary.to_string()
@@ -348,7 +348,7 @@ fn memory_recall_query(input: &JobInput) -> Option<Vec<ContentBlock>> {
 
 /// Best-effort extraction of a cron fire's prompt text for the recall query.
 /// The cron router writes `action_payload` as `{cron_job_id, prompt}` (an
-/// opaque trace blob — see `aura_job::JobInput::Cron`); a missing or non-string
+/// opaque trace blob — see `baybo_job::JobInput::Cron`); a missing or non-string
 /// `prompt` yields an empty query, so recall degrades to a no-op rather than
 /// coupling hard to that shape.
 fn cron_prompt_blocks(action_payload: &serde_json::Value) -> Vec<ContentBlock> {
@@ -397,7 +397,7 @@ pub struct AgentLoop {
     /// pass reads it (to write `summary.md`); other future system
     /// work may want it too. `None` in tests that don't exercise such
     /// passes.
-    workspace_paths: Option<Arc<aura_workspace::WorkspacePaths>>,
+    workspace_paths: Option<Arc<baybo_workspace::WorkspacePaths>>,
     /// Cross-session manager — used by passes that operate across
     /// sessions (today: background summary, for transcript loads and
     /// summary metadata writes). Distinct from the `SessionManager`
@@ -412,7 +412,7 @@ pub struct AgentLoop {
     /// loads it each turn — and after any checklist-mutating tool call — to
     /// refresh the transient reminder the model sees via `ContextManager`.
     /// Always present in production (sourced from the `Store` bundle).
-    task_store: Arc<dyn aura_store::TaskStore>,
+    task_store: Arc<dyn baybo_store::TaskStore>,
     /// Monotonic per-turn counter (one tick per `run_inner`) backing the task
     /// reminder throttle below. In-memory: a rehydrated actor restarts at 0,
     /// which just re-grants the start-of-session grace window.
@@ -452,7 +452,7 @@ pub struct AgentLoopConfig {
     pub security_gateway: Arc<SecurityGateway>,
     /// Workspace paths. Used by the background-summary pass to write
     /// on-disk `summary.md`.
-    pub workspace_paths: Option<Arc<aura_workspace::WorkspacePaths>>,
+    pub workspace_paths: Option<Arc<baybo_workspace::WorkspacePaths>>,
     /// Cross-session manager. Used by the background-summary pass for
     /// transcript loads + summary metadata writes.
     pub sessions: Option<Arc<crate::SessionManager>>,
@@ -461,7 +461,7 @@ pub struct AgentLoopConfig {
     pub memory: Option<Arc<dyn Memory>>,
     /// Durable per-session planning-checklist store backing the `Task*` tools
     /// and the per-turn reminder.
-    pub task_store: Arc<dyn aura_store::TaskStore>,
+    pub task_store: Arc<dyn baybo_store::TaskStore>,
 }
 
 /// Task-reminder throttle (mirrors Claude Code's `TODO_REMINDER_CONFIG`): the
@@ -642,7 +642,7 @@ impl AgentLoop {
         self.context_manager.set_active_model_context_window(window);
     }
 
-    /// Re-pin which `aura.json` entry this loop resolves against and
+    /// Re-pin which `baybo.json` entry this loop resolves against and
     /// apply it now (swaps the client + context window via
     /// [`Self::refresh_active_llm`]) so the next turn runs on the new
     /// model. `None` reverts to the pool default. Drives the chat
@@ -751,13 +751,13 @@ impl AgentLoop {
         // are a distinct output variant from the LLM's streamed `AnswerDelta`
         // and must reach the channel on every iteration, independent of
         // any per-iteration streaming decision.
-        let notifier: Option<Arc<dyn aura_tools::SessionNotifier>> = delta_tx.as_ref().map(|tx| {
+        let notifier: Option<Arc<dyn baybo_tools::SessionNotifier>> = delta_tx.as_ref().map(|tx| {
             Arc::new(DeltaTxNotifier {
                 tx: tx.clone(),
                 session_id: session.id.clone(),
                 user_id: session.user.id.clone(),
                 channel: session.channel.clone(),
-            }) as Arc<dyn aura_tools::SessionNotifier>
+            }) as Arc<dyn baybo_tools::SessionNotifier>
         });
 
         // Expand an explicit `/command` skill invocation before the loop:
@@ -899,7 +899,7 @@ impl AgentLoop {
                 span_recorder.as_ref(),
                 job_id,
                 StepKind::LlmIteration,
-                Some((&cancel_token, aura_job::CancelReason::ParentCancelled)),
+                Some((&cancel_token, baybo_job::CancelReason::ParentCancelled)),
                 |step| {
                     let fut = self.run_iteration(
                         session,
@@ -1005,7 +1005,7 @@ impl AgentLoop {
         job_id: JobId,
         iterations: usize,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
-        notifier: Option<Arc<dyn aura_tools::SessionNotifier>>,
+        notifier: Option<Arc<dyn baybo_tools::SessionNotifier>>,
         cancel_token: &CancellationToken,
     ) -> anyhow::Result<IterationOutcome> {
         let (response, llm_span_id) = match self
@@ -1041,7 +1041,7 @@ impl AgentLoop {
                 response.content_blocks.clone()
             };
 
-            let final_text = aura_llm::multimodal::extract_text(&response_blocks);
+            let final_text = baybo_llm::multimodal::extract_text(&response_blocks);
 
             info!(
                 iterations,
@@ -1216,9 +1216,9 @@ impl AgentLoop {
             // timeout. A real dispatch returns the ack with its `bg-…` handle.
             let dispatched = matches!(
                 &tool_result,
-                Ok(ToolOutput::Text(t)) if t.starts_with(aura_model::BACKGROUND_DISPATCH_ACK_PREFIX)
+                Ok(ToolOutput::Text(t)) if t.starts_with(baybo_model::BACKGROUND_DISPATCH_ACK_PREFIX)
             );
-            if tool_call.name == aura_model::SPAWN_SUBAGENT_TOOL_NAME
+            if tool_call.name == baybo_model::SPAWN_SUBAGENT_TOOL_NAME
                 && dispatched
                 && let Some(group) = tool_call
                     .arguments
@@ -1235,7 +1235,7 @@ impl AgentLoop {
                 session
                     .state
                     .background_groups
-                    .entry(aura_model::GroupState::cohort_key(job_id, group))
+                    .entry(baybo_model::GroupState::cohort_key(job_id, group))
                     .or_default()
                     .expected += 1;
             }
@@ -1252,8 +1252,8 @@ impl AgentLoop {
                 | Ok(ToolOutput::MultiModalText { text, .. }) => text.clone(),
                 Ok(ToolOutput::Error(msg)) => format!("Error: {msg}"),
                 Err(e) => {
-                    if let Some(denied) = e.downcast_ref::<aura_tools::ToolError>()
-                        && matches!(denied, aura_tools::ToolError::Denied { .. })
+                    if let Some(denied) = e.downcast_ref::<baybo_tools::ToolError>()
+                        && matches!(denied, baybo_tools::ToolError::Denied { .. })
                     {
                         format!(
                             "The user explicitly denied permission for tool '{}'. \
@@ -1269,13 +1269,13 @@ impl AgentLoop {
 
             // Cap size before wrapping so the truncation notice lands inside
             // the `<tool_output>` envelope. The scan/format split keeps the
-            // injection detector in `aura-security` while the cap + spill +
-            // envelope framing live in `aura-context`; the loop bridges the
+            // injection detector in `baybo-security` while the cap + spill +
+            // envelope framing live in `baybo-context`; the loop bridges the
             // two by feeding the scan's rule names into the wrapper.
             let capped = self.context_manager.cap_tool_output(raw_result_text).await;
             let warnings = self.security_gateway.detect_injection(&capped);
             let warning_rules: Vec<&str> = warnings.iter().map(|w| w.rule_name.as_str()).collect();
-            let wrapped = aura_context::prompts::tool_output::wrap_tool_output(
+            let wrapped = baybo_context::prompts::tool_output::wrap_tool_output(
                 &tool_call.name,
                 &capped,
                 &warning_rules,
@@ -1293,7 +1293,7 @@ impl AgentLoop {
         let task_mutated = response
             .tool_calls
             .iter()
-            .any(|tc| aura_model::TASK_MUTATING_TOOL_NAMES.contains(&tc.name.as_str()));
+            .any(|tc| baybo_model::TASK_MUTATING_TOOL_NAMES.contains(&tc.name.as_str()));
         Ok(IterationOutcome::Continue { task_mutated })
     }
 
@@ -1308,7 +1308,7 @@ impl AgentLoop {
         step: &StepHandle,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         cancel_token: &CancellationToken,
-    ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
+    ) -> anyhow::Result<(LlmResponse, baybo_model::SpanId)> {
         let mut attempt = 0u32;
         loop {
             match self
@@ -1356,7 +1356,7 @@ impl AgentLoop {
         step: &StepHandle,
         delta_tx: Option<&mpsc::Sender<AgentOutput>>,
         cancel_token: &CancellationToken,
-    ) -> anyhow::Result<(LlmResponse, aura_model::SpanId)> {
+    ) -> anyhow::Result<(LlmResponse, baybo_model::SpanId)> {
         let model_info = self.llm_client.model_info();
 
         let tool_defs: Vec<ToolDefinitionForLlm> = self
@@ -1400,7 +1400,7 @@ impl AgentLoop {
                 input_messages,
                 temperature: None,
             },
-            Some((cancel_token, aura_job::CancelReason::ParentCancelled)),
+            Some((cancel_token, baybo_job::CancelReason::ParentCancelled)),
             |span| async move {
                 // Bind this call to its `LlmCall` span so the spend lands
                 // on the right span. `BoundBilledLlm` does gate → call →
@@ -1410,7 +1410,7 @@ impl AgentLoop {
                     session_id: session.id.clone(),
                     job_id: step.job_id,
                     span_id: span.span_id,
-                    reason: aura_llm::CallReason::Chat,
+                    reason: baybo_llm::CallReason::Chat,
                 });
                 // Run the provider call. The streaming path is cancel-aware
                 // internally — it stops consuming and returns whatever it
@@ -1418,7 +1418,7 @@ impl AgentLoop {
                 // against the token so a `/stop` (or the idle reaper) aborts
                 // the in-flight request by dropping it (a streaming
                 // `RecordingStream` still bills its partial usage on drop).
-                let (partial_usage, llm_result): (TokenUsage, aura_llm::Result<LlmResponse>) =
+                let (partial_usage, llm_result): (TokenUsage, baybo_llm::Result<LlmResponse>) =
                     match delta_tx {
                         Some(tx) => self.chat_streaming(&bound, &request, session, tx, &cancel).await,
                         None => tokio::select! {
@@ -1454,7 +1454,7 @@ impl AgentLoop {
                             let trace_tool_calls = resp
                                 .tool_calls
                                 .iter()
-                                .map(|tc| aura_trace::LlmToolCallRecord {
+                                .map(|tc| baybo_trace::LlmToolCallRecord {
                                     id: tc.id.clone(),
                                     name: tc.name.clone(),
                                     arguments: tc.arguments.clone(),
@@ -1495,10 +1495,10 @@ impl AgentLoop {
                         // whitespace is left intact so markdown paragraphs,
                         // code blocks, and lists are unaffected.
                         trim_response_text_edges(&mut response);
-                        let trace_tool_calls: Vec<aura_trace::LlmToolCallRecord> = response
+                        let trace_tool_calls: Vec<baybo_trace::LlmToolCallRecord> = response
                             .tool_calls
                             .iter()
-                            .map(|tc| aura_trace::LlmToolCallRecord {
+                            .map(|tc| baybo_trace::LlmToolCallRecord {
                                 id: tc.id.clone(),
                                 name: tc.name.clone(),
                                 arguments: tc.arguments.clone(),
@@ -1585,7 +1585,7 @@ impl AgentLoop {
     }
 
     /// Recall memories relevant to `query` and inject each as a framed
-    /// [`aura_model::MessageSource::RecalledMemory`] row before the next LLM
+    /// [`baybo_model::MessageSource::RecalledMemory`] row before the next LLM
     /// call. No-op when no memory is wired. Recall failure is logged and
     /// swallowed — it must never fail the turn. The impl bills its own
     /// embedding/LLM work against the minted [`Attribution`]; a `MemoryRecall`
@@ -1620,7 +1620,7 @@ impl AgentLoop {
             span_recorder.as_ref(),
             job_id,
             StepKind::MemoryRecall,
-            Some((cancel_token, aura_job::CancelReason::ParentCancelled)),
+            Some((cancel_token, baybo_job::CancelReason::ParentCancelled)),
             move |step| async move {
                 let ctx = MemoryContext::new(user_id, session_id, job_id, recorder, step);
                 match memory.recall(&ctx, &query).await {
@@ -1823,14 +1823,14 @@ impl AgentLoop {
     }
 
     /// Append a cron fire's framed prompt as a persisted `Cron`-source row
-    /// ahead of the turn. The framing ([`aura_context::prompts::cron`]) makes
+    /// ahead of the turn. The framing ([`baybo_context::prompts::cron`]) makes
     /// the model treat the fire as a task to perform now rather than a live
     /// user message; `MessageSource::Cron` lets the operator inbox find the
     /// row. Seeds the system prompt first so a fresh cron session never lands
     /// the fire ahead of `messages[0]`.
     pub async fn append_cron_fire(&mut self, job_id: &str, prompt: &str) -> anyhow::Result<()> {
         self.context_manager.ensure_seeded().await;
-        let framed = aura_context::prompts::cron::frame_cron_prompt(job_id, prompt);
+        let framed = baybo_context::prompts::cron::frame_cron_prompt(job_id, prompt);
         let msg = ChatMessage::cron_fire(vec![ContentBlock::Text(framed)]);
         self.context_manager.append(&msg).await;
         Ok(())
@@ -1854,7 +1854,7 @@ impl AgentLoop {
     /// rows under the infinite-backoff retry. The caller seeds the system
     /// prompt and snapshots the transcript *before* this so a failed turn can
     /// roll the row back; `content` is built via
-    /// [`aura_context::prompts::subagent::build_notification_content`].
+    /// [`baybo_context::prompts::subagent::build_notification_content`].
     pub fn append_subagent_notification(&mut self, content: Vec<ContentBlock>) {
         // Unlike the other append_* helpers this does NOT seed the system
         // prompt: the caller must have seeded (and snapshotted) *before* this,
@@ -1914,7 +1914,7 @@ impl AgentLoop {
         session: &Session,
         delta_tx: &mpsc::Sender<AgentOutput>,
         cancel: &CancellationToken,
-    ) -> (TokenUsage, aura_llm::Result<LlmResponse>) {
+    ) -> (TokenUsage, baybo_llm::Result<LlmResponse>) {
         let mut stream = match tokio::select! {
             biased;
             _ = cancel.cancelled() => return (TokenUsage::default(), Ok(empty_llm_response())),
@@ -2318,7 +2318,7 @@ impl AgentLoop {
         if cancel_token.is_cancelled()
             || !should_fire_observer(
                 delta_tx.is_some(),
-                session.trigger.kind() == aura_model::TriggerKind::User,
+                session.trigger.kind() == baybo_model::TriggerKind::User,
                 channel_wants_progress(&session.channel),
                 iterations,
                 turn_started,
@@ -2461,16 +2461,16 @@ impl AgentLoop {
                     })
                     .await?;
                 let text = match outcome {
-                    aura_context::CompressionOutcome::Compressed => {
+                    baybo_context::CompressionOutcome::Compressed => {
                         "Context compressed.".to_string()
                     }
-                    aura_context::CompressionOutcome::BelowThreshold => {
+                    baybo_context::CompressionOutcome::BelowThreshold => {
                         "Context already under the compression threshold; skipped.".to_string()
                     }
-                    aura_context::CompressionOutcome::StrategyDeclined => {
+                    baybo_context::CompressionOutcome::StrategyDeclined => {
                         "Compression strategy declined: nothing to summarize (conversation too short).".to_string()
                     }
-                    aura_context::CompressionOutcome::NoSavings => {
+                    baybo_context::CompressionOutcome::NoSavings => {
                         "Compression ran but produced no savings; kept the original.".to_string()
                     }
                 };
@@ -2574,7 +2574,7 @@ impl AgentLoop {
                 origin,
                 // A compression pass, not an agent-loop turn.
                 shape: JobShape::Maintenance,
-                input: aura_job::JobInput::System {
+                input: baybo_job::JobInput::System {
                     payload: payload.clone(),
                 },
                 // Parent the maintenance job under the triggering turn's job.
@@ -2600,7 +2600,7 @@ impl AgentLoop {
                     };
                     let outcome = runner.run(payload).await?;
                     let value = serde_json::to_value(&outcome)?;
-                    let output = aura_job::JobOutput::Structured { value };
+                    let output = baybo_job::JobOutput::Structured { value };
                     Ok((output, outcome))
                 },
             )
@@ -2704,8 +2704,8 @@ mod task_reminder_throttle_tests {
 #[cfg(test)]
 mod notifier_bridge_tests {
     use super::*;
-    use aura_channels::{AgentEvent, AgentOutput};
-    use aura_tools::{NoticeLevel as ToolsNoticeLevel, SessionNotifier};
+    use baybo_channels::{AgentEvent, AgentOutput};
+    use baybo_tools::{NoticeLevel as ToolsNoticeLevel, SessionNotifier};
 
     fn mk_notifier() -> (DeltaTxNotifier, tokio::sync::mpsc::Receiver<AgentOutput>) {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
@@ -2713,7 +2713,7 @@ mod notifier_bridge_tests {
             tx,
             session_id: "s".into(),
             user_id: "u".into(),
-            channel: aura_model::ChannelType::tui(),
+            channel: baybo_model::ChannelType::tui(),
         };
         (n, rx)
     }
@@ -2730,7 +2730,7 @@ mod notifier_bridge_tests {
                 user_id,
                 ..
             } => {
-                assert_eq!(level, aura_channels::NoticeLevel::Warn);
+                assert_eq!(level, baybo_channels::NoticeLevel::Warn);
                 assert_eq!(text, "summary: detail");
                 assert_eq!(session_id, "s");
                 assert_eq!(user_id, "u");
@@ -2748,7 +2748,7 @@ mod notifier_bridge_tests {
                 event: AgentEvent::Notice { level, text },
                 ..
             } => {
-                assert_eq!(level, aura_channels::NoticeLevel::Error);
+                assert_eq!(level, baybo_channels::NoticeLevel::Error);
                 assert_eq!(text, "blocked: rationale");
             }
             _ => panic!(),
@@ -2775,7 +2775,7 @@ mod notifier_bridge_tests {
             tx,
             session_id: "s".into(),
             user_id: "u".into(),
-            channel: aura_model::ChannelType::tui(),
+            channel: baybo_model::ChannelType::tui(),
         };
         n.emit(ToolsNoticeLevel::Warn, "first", "");
         // Second emit should not block or panic — try_send drops it.
@@ -2883,8 +2883,8 @@ mod skip_leading_whitespace_tests {
 #[cfg(test)]
 mod trim_response_text_edges_tests {
     use super::trim_response_text_edges;
-    use aura_llm::{LlmResponse, TokenUsage};
-    use aura_model::ContentBlock;
+    use baybo_llm::{LlmResponse, TokenUsage};
+    use baybo_model::ContentBlock;
 
     fn resp(content: &str, blocks: Vec<ContentBlock>) -> LlmResponse {
         LlmResponse {
@@ -2978,7 +2978,7 @@ mod session_end_gate_tests {
     //! but their teardown is not a user-session ending — firing the hook
     //! for them would write garbage memory.
     use super::should_fire_session_end;
-    use aura_model::{
+    use baybo_model::{
         ChannelType, JobId, Lineage, LineageKind, Session, SessionId, SessionState, TriggerSource,
         User,
     };

@@ -1,4 +1,4 @@
-use aura_model::{MicroUsd, usd_decimal_option};
+use baybo_model::{MicroUsd, usd_decimal_option};
 use serde::{Deserialize, Serialize};
 
 /// Cost and rate limit configuration.

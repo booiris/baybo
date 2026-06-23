@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 
 use super::LibsqlPool;
-use aura_model::{JobId, SessionId};
-use aura_store::job::Result;
-use aura_store::{JobRow, JobStore, JobTransitionRow, StorageError};
+use baybo_model::{JobId, SessionId};
+use baybo_store::job::Result;
+use baybo_store::{JobRow, JobStore, JobTransitionRow, StorageError};
 
 pub struct LibsqlJobStore {
     pool: LibsqlPool,
@@ -219,8 +219,8 @@ impl LibsqlJobStore {
 #[allow(unused_must_use)] // tests build state machines via direct calls; the JobTransition audit record isn't the assertion target
 mod tests {
     use super::*;
-    use aura_job::{Job, JobInput, JobShape, JobStatus};
-    use aura_model::{ContentBlock, TriggerKind};
+    use baybo_job::{Job, JobInput, JobShape, JobStatus};
+    use baybo_model::{ContentBlock, TriggerKind};
 
     fn test_job() -> Job {
         Job::new(
@@ -308,7 +308,7 @@ mod tests {
         let mut completed = test_job();
         completed.start().unwrap();
         completed
-            .complete(aura_job::JobOutput::Message {
+            .complete(baybo_job::JobOutput::Message {
                 content: vec![ContentBlock::Text("ok".into())],
             })
             .unwrap();
@@ -347,7 +347,7 @@ mod tests {
         let mut a_done = mk(&sess_a);
         a_done.start().unwrap();
         a_done
-            .complete(aura_job::JobOutput::Message {
+            .complete(baybo_job::JobOutput::Message {
                 content: vec![ContentBlock::Text("ok".into())],
             })
             .unwrap();
@@ -375,7 +375,7 @@ mod tests {
         store.record_transition(&t.to_row().unwrap()).await.unwrap();
         let ts = store.get_transitions(&j.id).await.unwrap();
         assert_eq!(ts.len(), 1);
-        let t0 = aura_job::JobTransition::from_row(ts.into_iter().next().unwrap()).unwrap();
+        let t0 = baybo_job::JobTransition::from_row(ts.into_iter().next().unwrap()).unwrap();
         assert!(matches!(t0.to, JobStatus::InProgress));
     }
 }

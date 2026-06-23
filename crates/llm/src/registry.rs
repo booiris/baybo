@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aura_security::SecretVault;
+use baybo_security::SecretVault;
 use serde::{Deserialize, Serialize};
 
 use crate::providers::{
@@ -29,7 +29,7 @@ pub struct LlmProviderConfig {
     pub model: String,
     /// Operator override for the factory's default `supports_vision`.
     /// `None` keeps the factory default; `Some` forces the flag.
-    /// Surfaces the corresponding field on `aura_config::LlmConfig`.
+    /// Surfaces the corresponding field on `baybo_config::LlmConfig`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
     /// Operator override for `ModelInfo.context_window`. `None` keeps
@@ -56,10 +56,10 @@ pub struct LlmProviderConfig {
     /// runtime state derived from the global `proxy` config, not part of
     /// the serialized config shape.
     #[serde(skip)]
-    pub proxy: Option<aura_security::http::ProxySettings>,
+    pub proxy: Option<baybo_security::http::ProxySettings>,
 }
 
-pub use aura_model::LlmPricingOverride;
+pub use baybo_model::LlmPricingOverride;
 
 impl std::fmt::Debug for LlmProviderConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -181,7 +181,7 @@ pub struct LiveModelInfo {
     pub supports_tools: Option<bool>,
     /// Catch-all for provider-specific metadata that doesn't fit the
     /// common shape (Codex returns ~25 fields per model — most are
-    /// uninteresting to aura but kept here for operators who care).
+    /// uninteresting to baybo but kept here for operators who care).
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub extras: serde_json::Value,
 }
@@ -309,7 +309,7 @@ impl LlmProviderRegistry {
     /// `blob_fetcher` is optional; passing `None` is correct for
     /// text-only deployments and one-shot probes. `billing` carries the
     /// pre-call guard and post-call cost recorder — production wires
-    /// `aura_cost::cost_hooks`, while CLI / test fixtures pass
+    /// `baybo_cost::cost_hooks`, while CLI / test fixtures pass
     /// [`CostHooks::passthrough`].
     pub fn create_client(
         &self,

@@ -155,9 +155,9 @@ mod tests {
     fn volatile_resources_fields_are_marker_clean() {
         use crate::actor::supervisor::AgentSupervisor;
         use crate::runtime::agent_loop::AgentLoop;
-        use aura_channels::AgentOutput;
-        use aura_job::JobLifecycle;
-        use aura_trace::SpanRecorder;
+        use baybo_channels::AgentOutput;
+        use baybo_job::JobLifecycle;
+        use baybo_trace::SpanRecorder;
 
         assert_volatile::<AgentLoop>();
         assert_volatile::<mpsc::Sender<AgentOutput>>();
@@ -196,7 +196,7 @@ mod tests {
     /// "`Volatile` is not implemented for `String`":
     ///
     /// ```compile_fail
-    /// use aura_agent::state::marker::Volatile;
+    /// use baybo_agent::state::marker::Volatile;
     /// fn assert_volatile<T: Volatile>() {}
     /// fn check() { assert_volatile::<String>(); }
     /// ```

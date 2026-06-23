@@ -1,4 +1,4 @@
-//! End-to-end tests for `aura_memory::backends::mem0` against an axum mock server.
+//! End-to-end tests for `baybo_memory::backends::mem0` against an axum mock server.
 //!
 //! Each test spins up a tiny `axum::Router` that asserts the inbound request
 //! shape (path, auth header, body) and returns a canned JSON response, then
@@ -8,17 +8,17 @@ mod common;
 
 use std::sync::Arc;
 
-use aura_memory::backends::mem0::{
-    Mem0Config, Mem0Memory, TOOL_ADD, TOOL_DELETE, TOOL_EVENT_LIST, TOOL_EVENT_STATUS, TOOL_GET,
-    TOOL_LIST, TOOL_SEARCH, TOOL_UPDATE,
-};
-use aura_memory::{Memory, RecalledMemory};
-use aura_model::ContentBlock;
-use aura_trace::StepKind;
 use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use baybo_memory::backends::mem0::{
+    Mem0Config, Mem0Memory, TOOL_ADD, TOOL_DELETE, TOOL_EVENT_LIST, TOOL_EVENT_STATUS, TOOL_GET,
+    TOOL_LIST, TOOL_SEARCH, TOOL_UPDATE,
+};
+use baybo_memory::{Memory, RecalledMemory};
+use baybo_model::ContentBlock;
+use baybo_trace::StepKind;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
@@ -46,7 +46,7 @@ fn build(server_url: &str) -> Mem0Memory {
 }
 
 /// Find a tool by name in the backend's contributed tool set.
-fn tool_by_name(m: &Mem0Memory, name: &str) -> Arc<dyn aura_tools::Tool> {
+fn tool_by_name(m: &Mem0Memory, name: &str) -> Arc<dyn baybo_tools::Tool> {
     m.tools()
         .into_iter()
         .find(|(t, _)| t.name() == name)
@@ -54,9 +54,9 @@ fn tool_by_name(m: &Mem0Memory, name: &str) -> Arc<dyn aura_tools::Tool> {
         .unwrap_or_else(|| panic!("tool {name} not found"))
 }
 
-fn expect_json(out: aura_tools::ToolOutput) -> Value {
+fn expect_json(out: baybo_tools::ToolOutput) -> Value {
     match out {
-        aura_tools::ToolOutput::Json(v) => v,
+        baybo_tools::ToolOutput::Json(v) => v,
         other => panic!("expected Json, got {other:?}"),
     }
 }
@@ -182,7 +182,7 @@ async fn on_job_complete_posts_messages_with_user_and_agent_ids() {
 
     let body = captured.bodies.lock().last().unwrap().clone();
     assert_eq!(body["user_id"], "u-2");
-    assert_eq!(body["agent_id"], "aura");
+    assert_eq!(body["agent_id"], "baybo");
     let messages = body["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0]["role"], "user");
@@ -343,7 +343,7 @@ async fn tool_add_stores_facts_verbatim_with_metadata_and_session_scope() {
     let body = captured.bodies.lock().last().unwrap().clone();
     assert_eq!(body["infer"], false);
     assert_eq!(body["user_id"], "u-6");
-    assert_eq!(body["agent_id"], "aura");
+    assert_eq!(body["agent_id"], "baybo");
     assert_eq!(body["run_id"], "test-session");
     assert_eq!(body["categories"][0], "preference");
     assert_eq!(body["metadata"]["importance"], 0.8);
@@ -515,7 +515,7 @@ async fn tool_delete_all_requires_confirm() {
     let ctx = tool_context("u-10");
     let out = tool.execute(json!({"all": true}), &ctx).await.unwrap();
     match out {
-        aura_tools::ToolOutput::Error(e) => assert!(e.contains("confirm"), "got: {e}"),
+        baybo_tools::ToolOutput::Error(e) => assert!(e.contains("confirm"), "got: {e}"),
         other => panic!("expected Error, got {other:?}"),
     }
 }
@@ -754,7 +754,7 @@ async fn tools_each_carry_a_matching_manifest() {
         assert!(!manifest.description.is_empty());
         assert!(matches!(
             manifest.capabilities.first(),
-            Some(aura_tools::ToolCapability::Http)
+            Some(baybo_tools::ToolCapability::Http)
         ));
     }
 }

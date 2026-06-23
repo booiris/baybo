@@ -2,10 +2,10 @@ use async_trait::async_trait;
 
 use super::LibsqlPool;
 use super::time;
-use aura_model::{CallReason, CostRecord, CostSummary, TimeRange};
-use aura_model::{JobId, MicroUsd, SessionId, SpanId};
-use aura_store::StorageError;
-use aura_store::cost::{CostStore, Result as CostResult};
+use baybo_model::{CallReason, CostRecord, CostSummary, TimeRange};
+use baybo_model::{JobId, MicroUsd, SessionId, SpanId};
+use baybo_store::StorageError;
+use baybo_store::cost::{CostStore, Result as CostResult};
 
 pub struct LibsqlCostStore {
     pool: LibsqlPool,

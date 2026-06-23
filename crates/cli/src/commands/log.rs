@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::time::Duration;
 
-use aura_workspace::WorkspacePaths;
-use aura_workspace::paths::LOG_FILE_PREFIX;
+use baybo_workspace::WorkspacePaths;
+use baybo_workspace::paths::LOG_FILE_PREFIX;
 use chrono::{NaiveDate, Utc};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};

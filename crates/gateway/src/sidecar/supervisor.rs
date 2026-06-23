@@ -27,8 +27,8 @@
 //! for the live admin dashboard and (b) appended to a per-channel
 //! daily-rolling file at `<channel_log_dir>/<channel_type>.log.<date>`
 //! through [`RedactingMakeWriter`]. Sidecar output is deliberately
-//! **not** echoed to the gateway's own stdout/stderr — `aura gateway
-//! start` stays quiet on the terminal — and never enters `aura.log`;
+//! **not** echoed to the gateway's own stdout/stderr — `baybo gateway
+//! start` stays quiet on the terminal — and never enters `baybo.log`;
 //! read it live from the dashboard or `tail` the per-channel file.
 //!
 //! The SDK's default logger emits one NDJSON record per call
@@ -45,10 +45,10 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aura_agent::service::ShutdownSignal;
-use aura_model::ChannelType;
-use aura_security::{LeakDetector, RedactingMakeWriter};
-use aura_store::ChannelBotStore;
+use baybo_agent::service::ShutdownSignal;
+use baybo_model::ChannelType;
+use baybo_security::{LeakDetector, RedactingMakeWriter};
+use baybo_store::ChannelBotStore;
 use tokio::io::{AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::time::sleep;
@@ -66,7 +66,7 @@ const SIDECAR_PIPE_LINE_MAX_BYTES: usize = 1024;
 /// Override for the `bun` binary used to run sidecars. Resolved
 /// lazily at spawn time so a bun install elsewhere on disk can be
 /// pointed at without rebuilding. Defaults to `bun` from `PATH`.
-pub const BUN_BINARY_ENV: &str = "AURA_BUN_BIN";
+pub const BUN_BINARY_ENV: &str = "BAYBO_BUN_BIN";
 
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -76,13 +76,13 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const UPTIME_RESET_THRESHOLD: Duration = Duration::from_secs(60);
 /// How often the supervisor polls the bot store for embedded channel
 /// types that have gained their first registered bot. Matches the
-/// reconciler tick so an `aura channel add` propagates uniformly.
+/// reconciler tick so an `baybo channel add` propagates uniformly.
 const BOT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 
 type ChannelLogWriter = Arc<RedactingMakeWriter<NonBlocking>>;
 
 /// Resolve the `bun` executable path used to run sidecars. Honours
-/// the `AURA_BUN_BIN` override; otherwise relies on `PATH` resolution
+/// the `BAYBO_BUN_BIN` override; otherwise relies on `PATH` resolution
 /// inside `Command::new`.
 pub(crate) fn bun_binary() -> PathBuf {
     std::env::var_os(BUN_BINARY_ENV)
@@ -363,7 +363,7 @@ async fn drain_pipe<R>(
             Ok(LineOutcome::Eof) => break,
             Ok(o) => o,
             Err(e) => {
-                let msg = format!("[aura] sidecar pipe read error: {e}");
+                let msg = format!("[baybo] sidecar pipe read error: {e}");
                 if let Some(mw) = file_writer.as_ref() {
                     write_line_to_file(mw, LogLevel::Warn, &msg);
                 }

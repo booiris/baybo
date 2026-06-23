@@ -1,26 +1,26 @@
 //! `GET /v1/channel-ws` route — upgrades a channel-auth'd request into
 //! a WebSocket, runs the Register handshake, attaches the resulting
-//! [`Connection`](aura_channels::Connection) to the registry-owned
-//! [`Channel`](aura_channels::Channel) for the requested channel
+//! [`Connection`](baybo_channels::Connection) to the registry-owned
+//! [`Channel`](baybo_channels::Channel) for the requested channel
 //! type, and drives the per-connection inbound loop until either side
 //! closes.
 
 use std::time::Duration;
 
-use aura_channels::wire::{
-    self, AttachmentKind, Frame, Message as WireMessage, TaskView, WireAttachment,
-};
-use aura_channels::{
-    ChannelKind, IncomingMessage, Message as AgentMessage, MessageRole, RouterInbound,
-};
-use aura_model::{
-    BlobRef, ChannelType, ChatMessage, ContentBlock, MessageMetadata, Role, SessionId, User,
-};
 use axum::Router;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, State};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use baybo_channels::wire::{
+    self, AttachmentKind, Frame, Message as WireMessage, TaskView, WireAttachment,
+};
+use baybo_channels::{
+    ChannelKind, IncomingMessage, Message as AgentMessage, MessageRole, RouterInbound,
+};
+use baybo_model::{
+    BlobRef, ChannelType, ChatMessage, ContentBlock, MessageMetadata, Role, SessionId, User,
+};
 use chrono::Utc;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
@@ -232,7 +232,7 @@ async fn send_ack_and_close(
 /// Stream `StartBot` for every live bot in the `channel_bots` table
 /// to the freshly-connected sidecar. A failure fetching the token from
 /// the vault skips just that bot. The sidecar replies to each with a
-/// `BotStatus`; the WS inbound loop pushes those into `aura-tracing`.
+/// `BotStatus`; the WS inbound loop pushes those into `baybo-tracing`.
 async fn push_live_bots(
     state: &WsChannelState,
     channel_type: &ChannelType,
@@ -729,7 +729,7 @@ async fn chat_to_visible_wire_message(
     session_id: &SessionId,
     ordinal: i64,
     msg: ChatMessage,
-    blob_store: &dyn aura_store::BlobStore,
+    blob_store: &dyn baybo_store::BlobStore,
 ) -> Option<WireMessage> {
     let role = match msg.role {
         Role::User if msg.from_user() => MessageRole::User,
@@ -785,7 +785,7 @@ async fn build_inbound_message(
     sidecar: &Sidecar,
     channel_type: &ChannelType,
     kind: ChannelKind,
-    wire_msg: aura_channels::wire::Message,
+    wire_msg: baybo_channels::wire::Message,
 ) -> Option<IncomingMessage> {
     let session_id = resolve_inbound_session(state, sidecar, channel_type, kind, &wire_msg).await?;
     let sender = User {
@@ -819,7 +819,7 @@ async fn resolve_inbound_session(
     sidecar: &Sidecar,
     channel_type: &ChannelType,
     kind: ChannelKind,
-    wire_msg: &aura_channels::wire::Message,
+    wire_msg: &baybo_channels::wire::Message,
 ) -> Option<SessionId> {
     match kind {
         ChannelKind::Subscribed => {
@@ -949,7 +949,7 @@ async fn enforce_pairing(
     bot_id: &str,
     user_id: &str,
 ) -> bool {
-    use aura_pairing::CheckOutcome;
+    use baybo_pairing::CheckOutcome;
 
     match state.pairing.check(channel_type, bot_id, user_id).await {
         Ok(CheckOutcome::Approved) => true,
@@ -962,8 +962,8 @@ async fn enforce_pairing(
             );
             let text = format!(
                 "🔐 Pairing required. Run:\n\
-                 `aura pair approve {code}`\n\
-                 Messages won't reach aura until this pairing is approved."
+                 `baybo pair approve {code}`\n\
+                 Messages won't reach baybo until this pairing is approved."
             );
             let notice = Frame::Notice {
                 session_id: SessionId::from(""),
@@ -1025,7 +1025,7 @@ fn wire_to_content_blocks(content: String, attachments: Vec<WireAttachment>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_channels::wire::AttachmentKind;
+    use baybo_channels::wire::AttachmentKind;
 
     fn att(kind: AttachmentKind, mime: &str, filename: Option<&str>) -> WireAttachment {
         WireAttachment {
