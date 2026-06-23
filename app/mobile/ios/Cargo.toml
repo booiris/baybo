@@ -10,7 +10,7 @@
 # docs/todo/mobile/phase1.md.
 [workspace]
 resolver = "2"
-members = ["core"]
+members = ["core", "src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,13 +18,21 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+aura-mobile-core = { path = "core" }
 aura-wire = { path = "../../../crates/aura-wire" }
 aura-device-proto = { path = "../../../crates/aura-device-proto" }
 aura-model = { path = "../../../crates/model" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
+hex = "0.4"
 # Same major as aura-device-proto's snow so the handshake/transport types
 # unify across the two crates.
 snow = "0.9"
-# Test-only: drive the async connection-policy tests.
 tokio = { version = "1", features = ["rt", "macros"] }
+# The Tauri shell dials the gateway's /v1/device/pair WS (ws:// or wss://).
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+tauri = { version = "2", features = [] }
+tauri-build = { version = "2", features = [] }
+tauri-plugin-barcode-scanner = "2"

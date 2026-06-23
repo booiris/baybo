@@ -1,0 +1,30 @@
+[package]
+name = "aura-mobile-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Aura iOS companion (Tauri shell)"
+
+# The library Tauri's mobile entry point links against. `staticlib`/`cdylib` are
+# required by the iOS/Android build; `rlib` keeps it usable from the desktop bin.
+[lib]
+name = "aura_mobile_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+tauri = { workspace = true }
+aura-mobile-core = { workspace = true }
+aura-device-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "macros"] }
+tokio-tungstenite = { workspace = true }
+
+# The camera/barcode plugin only exists on mobile; on desktop the crate is empty.
+[target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
+tauri-plugin-barcode-scanner = { workspace = true }
