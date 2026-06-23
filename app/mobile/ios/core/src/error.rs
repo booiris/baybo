@@ -9,6 +9,14 @@ pub enum MobileError {
     #[error("proto: {0}")]
     Proto(#[from] ProtoError),
 
+    /// A Noise handshake / transport failure on the content session.
+    #[error("noise: {0}")]
+    Noise(#[from] snow::Error),
+
+    /// A `Frame` encode/decode failure on the content session.
+    #[error("wire: {0}")]
+    Wire(#[from] aura_wire::WireError),
+
     /// The handshake was driven out of order (a programming error in the shell).
     #[error("protocol state: {0}")]
     State(&'static str),

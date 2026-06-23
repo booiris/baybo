@@ -20,5 +20,9 @@ license = "MIT"
 [workspace.dependencies]
 aura-wire = { path = "../../../crates/aura-wire" }
 aura-device-proto = { path = "../../../crates/aura-device-proto" }
+aura-model = { path = "../../../crates/model" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# Same major as aura-device-proto's snow so the handshake/transport types
+# unify across the two crates.
+snow = "0.9"

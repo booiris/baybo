@@ -9,6 +9,8 @@ doctest = false
 [dependencies]
 aura-wire = { workspace = true }
 aura-device-proto = { workspace = true }
+aura-model = { workspace = true }
 thiserror = { workspace = true }
+snow = { workspace = true }
 
 [dev-dependencies]

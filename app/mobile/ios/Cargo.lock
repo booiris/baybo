@@ -66,7 +66,9 @@ name = "aura-mobile-core"
 version = "0.1.0"
 dependencies = [
  "aura-device-proto",
+ "aura-model",
  "aura-wire",
+ "snow",
  "thiserror",
 ]
 
