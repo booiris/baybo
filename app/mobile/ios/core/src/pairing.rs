@@ -3,7 +3,7 @@
 //! A transport-agnostic state machine: the Tauri shell pumps
 //! [`PairFrame`]s over the `/v1/device/pair` WebSocket (direct or via C's
 //! rendezvous) and feeds them through these methods. The crypto is entirely
-//! [`aura_device_proto`], so the app and the gateway agree by construction.
+//! [`device_proto`], so the app and the gateway agree by construction.
 //!
 //! Flow: [`PairingClient::start`] → send `Hello` → [`on_pake_reply`] → send the
 //! sealed `DeviceHello` → [`on_welcome`] → [`PairedGateway`].
@@ -11,10 +11,10 @@
 //! [`on_pake_reply`]: PairingClient::on_pake_reply
 //! [`on_welcome`]: PairingClient::on_welcome
 
-use aura_device_proto::aead::KEY_LEN;
-use aura_device_proto::kdf::{PairKeys, derive_pair_keys};
-use aura_device_proto::pairing::{self, ApnsEnv, DeviceHello, GatewayWelcome, PairFrame};
-use aura_device_proto::pake::Pake;
+use device_proto::aead::KEY_LEN;
+use device_proto::kdf::{PairKeys, derive_pair_keys};
+use device_proto::pairing::{self, ApnsEnv, DeviceHello, GatewayWelcome, PairFrame};
+use device_proto::pake::Pake;
 
 use crate::error::MobileError;
 
@@ -127,7 +127,7 @@ mod tests {
     use super::*;
 
     /// Drive the full 4-message handshake in-process: the client against an
-    /// in-process gateway side built from the same `aura-device-proto`. Proves
+    /// in-process gateway side built from the same `device-proto`. Proves
     /// the app derives the same push key and recovers the welcome — the same
     /// interop the real gateway's e2e test exercises, from the app's side.
     #[test]

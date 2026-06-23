@@ -4,7 +4,7 @@
 //! channel-token middleware — it is gated by the SPAKE2 code itself (a balanced
 //! PAKE allows one online guess per run; the operator's `aura device approve`
 //! is the second gate). The 4-message handshake (see
-//! [`aura_device_proto::pairing::PairFrame`]):
+//! [`device_proto::pairing::PairFrame`]):
 //!
 //! 1. P → A `Hello { code, pake }`   — A claims the slot and runs SPAKE2.
 //! 2. A → P `PakeReply { pake }`     — both ends derive the master secret K.
@@ -17,9 +17,9 @@
 
 use std::time::Duration;
 
-use aura_device_proto::kdf::derive_pair_keys;
-use aura_device_proto::pairing::{self, DeviceHello, GatewayWelcome, PairFrame};
-use aura_device_proto::pake::Pake;
+use device_proto::kdf::derive_pair_keys;
+use device_proto::pairing::{self, DeviceHello, GatewayWelcome, PairFrame};
+use device_proto::pake::Pake;
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
@@ -160,9 +160,9 @@ async fn send(socket: &mut WebSocket, frame: &PairFrame) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::test_support::build_test_deps;
-    use aura_device_proto::kdf::derive_pair_keys;
-    use aura_device_proto::noise::StaticKeypair;
-    use aura_device_proto::pairing::ApnsEnv;
+    use device_proto::kdf::derive_pair_keys;
+    use device_proto::noise::StaticKeypair;
+    use device_proto::pairing::ApnsEnv;
     use aura_store::DeviceStatus;
     use futures::{SinkExt, StreamExt};
     use tokio::net::TcpStream;

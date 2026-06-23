@@ -78,7 +78,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura_device_proto::aead::KEY_LEN;
+    use device_proto::aead::KEY_LEN;
 
     fn paired(direct: &[&str], relay: &str) -> PairedGateway {
         PairedGateway {

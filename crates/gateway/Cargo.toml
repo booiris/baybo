@@ -36,7 +36,7 @@ aura-context = { workspace = true }
 aura-config = { workspace = true }
 aura-cron = { workspace = true }
 aura-cost = { workspace = true }
-aura-device-proto = { workspace = true }
+device-proto = { workspace = true }
 aura-job = { workspace = true }
 aura-llm = { workspace = true }
 aura-model = { workspace = true }

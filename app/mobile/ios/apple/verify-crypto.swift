@@ -2,13 +2,13 @@
 //
 // Runs the NSE's crypto-critical decrypt (the same CryptoKit ChaChaPoly path as
 // NotificationService.open) against the vector pinned in
-// `aura_device_proto::fixtures`, with NO Xcode / iOS SDK — just CryptoKit, which
+// `device_proto::fixtures`, with NO Xcode / iOS SDK — just CryptoKit, which
 // ships with macOS. Proves the Swift consumer agrees with the Rust producer
 // byte-for-byte.
 //
 //   $ swift app/mobile/ios/apple/verify-crypto.swift
 //
-// Pairs with the Rust test `aura_device_proto::fixtures::pinned_vector_is_reproduced`.
+// Pairs with the Rust test `device_proto::fixtures::pinned_vector_is_reproduced`.
 // If the AEAD output ever drifts, update CIPHERTEXT_HEX in BOTH places together.
 
 import CryptoKit
@@ -40,7 +40,7 @@ extension Data {
     }
 }
 
-// aura_device_proto::fixtures — KEY (0x00..=0x1f), NONCE (0xa0..=0xab), CIPHERTEXT_HEX.
+// device_proto::fixtures — KEY (0x00..=0x1f), NONCE (0xa0..=0xab), CIPHERTEXT_HEX.
 let key = Data((0x00 ... 0x1f).map { UInt8($0) })
 let nonce = Data((0xa0 ... 0xab).map { UInt8($0) })
 let ciphertextHex =

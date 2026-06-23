@@ -1,5 +1,5 @@
 [package]
-name = "aura-remote-host-push"
+name = "remote-host-push"
 version.workspace = true
 edition.workspace = true
 
@@ -7,7 +7,7 @@ edition.workspace = true
 doctest = false
 
 [[bin]]
-name = "aura-remote-host-push"
+name = "remote-host-push"
 path = "src/main.rs"
 
 [dependencies]

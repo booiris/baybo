@@ -13,7 +13,7 @@ pub mod registration;
 /// crate so the iOS companion can speak the protocol without `aura-channels`'
 /// server-only dependency chain. Re-exported here as `wire` so existing
 /// `aura_channels::wire::*` consumers are unchanged.
-pub use aura_wire as wire;
+pub use wire as wire;
 
 pub use channel::{ApprovalSurface, Channel, DispatchObserver, SubscribedView};
 pub use connection::{Connection, ConnectionId, ConnectionSink, SendOutcome};
@@ -30,8 +30,8 @@ pub use types::{
     AgentEvent, AgentOutput, IncomingMessage, Message, NoticeLevel, OutgoingMessage,
     RouterInbound, SessionEvent, ToolStatus, TurnStatus,
 };
-// `MessageRole` now lives in `aura-wire`; keep it at the crate root so
+// `MessageRole` now lives in `wire`; keep it at the crate root so
 // `aura_channels::MessageRole` consumers are unchanged.
-pub use aura_wire::MessageRole;
+pub use wire::MessageRole;
 
 pub type Result<T> = std::result::Result<T, ChannelError>;

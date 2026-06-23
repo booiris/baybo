@@ -5,17 +5,17 @@
 //! open it runs a Noise **IK** handshake as the initiator (it already knows A's
 //! static key, so it's near-0-RTT), then exchanges `Frame`s inside the
 //! authenticated, forward-secret transport: it sends a
-//! [`Frame::Subscribe`](aura_wire::Frame::Subscribe) and decodes the replayed
-//! [`Frame::Message`](aura_wire::Frame::Message) rows. C (the relay) sees only
+//! [`Frame::Subscribe`](wire::Frame::Subscribe) and decodes the replayed
+//! [`Frame::Message`](wire::Frame::Message) rows. C (the relay) sees only
 //! Noise ciphertext.
 //!
 //! Transport-agnostic and host-testable: the Tauri shell pumps the opaque bytes
 //! over the direct or relayed WebSocket; the crypto is entirely
-//! [`aura_device_proto`] + the `Frame` codec is [`aura_wire`], so interop with
+//! [`device_proto`] + the `Frame` codec is [`wire`], so interop with
 //! the gateway is guaranteed by construction.
 
-use aura_device_proto::noise::StaticKeypair;
-use aura_wire::{Frame, decode, encode};
+use device_proto::noise::StaticKeypair;
+use wire::{Frame, decode, encode};
 use snow::{HandshakeState, TransportState};
 
 use crate::error::MobileError;
@@ -82,10 +82,10 @@ impl ContentSession {
 mod tests {
     use super::*;
     use aura_model::{ChannelType, SessionId};
-    use aura_wire::{Message, MessageRole};
+    use wire::{Message, MessageRole};
 
     /// The app's content session round-trips a self-pull against an in-process
-    /// gateway (IK responder built from the same `aura-device-proto`): the app
+    /// gateway (IK responder built from the same `device-proto`): the app
     /// subscribes, the gateway replays a `Frame::Message`, the app decodes it.
     #[test]
     fn self_pull_round_trips_over_noise() {

@@ -6,7 +6,7 @@
 //! byte-for-byte:
 //!
 //! - [`pake`] — SPAKE2 over the untrusted rendezvous (the operator-run
-//!   `aura-remote-host`, **C**, only relays opaque blobs and never learns the
+//!   `remote-host`, **C**, only relays opaque blobs and never learns the
 //!   short code or the derived key).
 //! - [`kdf`] — HKDF expansion of the SPAKE2 master secret into the labeled
 //!   subkeys both ends derive identically at pairing (the K-channel key and the

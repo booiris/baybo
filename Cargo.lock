@@ -334,7 +334,6 @@ dependencies = [
  "async-trait",
  "aura-model",
  "aura-tools",
- "aura-wire",
  "chrono",
  "dashmap",
  "parking_lot",
@@ -346,6 +345,7 @@ dependencies = [
  "tracing",
  "ts-rs",
  "uuid",
+ "wire",
 ]
 
 [[package]]
@@ -479,21 +479,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aura-device-proto"
-version = "0.1.0"
-dependencies = [
- "chacha20poly1305",
- "hex",
- "hkdf",
- "rmp-serde",
- "serde",
- "sha2",
- "snow",
- "spake2",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "aura-gateway"
 version = "0.1.0"
 dependencies = [
@@ -506,7 +491,6 @@ dependencies = [
  "aura-context",
  "aura-cost",
  "aura-cron",
- "aura-device-proto",
  "aura-gateway",
  "aura-job",
  "aura-llm",
@@ -526,6 +510,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dashmap",
+ "device-proto",
  "futures",
  "hex",
  "http-body-util",
@@ -1046,18 +1031,6 @@ dependencies = [
  "tracing",
  "unicode-width",
  "uuid",
-]
-
-[[package]]
-name = "aura-wire"
-version = "0.1.0"
-dependencies = [
- "aura-model",
- "chrono",
- "rmp-serde",
- "serde",
- "thiserror 2.0.18",
- "ts-rs",
 ]
 
 [[package]]
@@ -1813,6 +1786,21 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "device-proto"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "hex",
+ "hkdf",
+ "rmp-serde",
+ "serde",
+ "sha2",
+ "snow",
+ "spake2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -6065,6 +6053,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "wire"
+version = "0.1.0"
+dependencies = [
+ "aura-model",
+ "chrono",
+ "rmp-serde",
+ "serde",
+ "thiserror 2.0.18",
+ "ts-rs",
 ]
 
 [[package]]

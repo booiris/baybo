@@ -5,8 +5,8 @@
 //! the WebSocket pump (msgpack `PairFrame`s as binary frames) + the bits the
 //! shell owns: generating the device's Noise keypair and a device id.
 
-use aura_device_proto::noise::StaticKeypair;
-use aura_device_proto::pairing::{self, ApnsEnv, PairFrame};
+use device_proto::noise::StaticKeypair;
+use device_proto::pairing::{self, ApnsEnv, PairFrame};
 use aura_mobile_core::{PairedGateway, PairingClient, PairingRequest};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;

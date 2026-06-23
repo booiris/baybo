@@ -1,5 +1,5 @@
 [package]
-name = "aura-remote-host-dashboard"
+name = "remote-host-dashboard"
 version.workspace = true
 edition.workspace = true
 

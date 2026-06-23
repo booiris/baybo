@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-/// Everything that can go wrong inside `aura-device-proto`. Crypto failures
+/// Everything that can go wrong inside `device-proto`. Crypto failures
 /// are deliberately coarse — an attacker learns nothing from a more precise
 /// reason, and the only correct response to any of them is to abort the
 /// pairing / drop the message.

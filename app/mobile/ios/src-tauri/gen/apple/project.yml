@@ -99,7 +99,7 @@ targets:
 
   # Push Notification Service Extension. Wakes on `mutable-content` APNs pushes,
   # reads the per-binding push key from the App Group keychain, and decrypts the
-  # lock-screen preview locally (CryptoKit ChaChaPoly, matching aura_device_proto
+  # lock-screen preview locally (CryptoKit ChaChaPoly, matching device_proto
   # ::aead). Hand-written Swift lives in ../../../apple; its Info.plist and
   # entitlements are generated here from project.yml so a regen reproduces them.
   NotificationExtension:

@@ -3,8 +3,8 @@
 //!
 //! It runs in the Tauri shell's `src-tauri` (reached from the webview via Tauri
 //! commands) and speaks the exact same protocol as the gateway by depending on
-//! the same crates — [`aura_wire`] for the `Frame` wire types and
-//! [`aura_device_proto`] for SPAKE2 / Noise / the AEAD framing. No FFI, no
+//! the same crates — [`wire`] for the `Frame` wire types and
+//! [`device_proto`] for SPAKE2 / Noise / the AEAD framing. No FFI, no
 //! Tauri, no platform APIs here, so it is fully host-unit-testable and
 //! cross-compiles to `aarch64-apple-ios` unchanged.
 //!
@@ -23,4 +23,4 @@ pub use pairing::{PairedGateway, PairingClient, PairingRequest};
 
 // Re-export the wire `Frame` so the shell renders threads against the same type
 // the gateway emits.
-pub use aura_wire::Frame;
+pub use wire::Frame;

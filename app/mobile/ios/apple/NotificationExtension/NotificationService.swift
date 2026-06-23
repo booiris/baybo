@@ -6,10 +6,10 @@
 // the visible title/body. It never touches the network and holds no remote-host
 // (C) credential — C relayed the ciphertext blind.
 //
-// The crypto MUST match `aura_device_proto::aead` byte-for-byte:
+// The crypto MUST match `device_proto::aead` byte-for-byte:
 //   ChaCha20-Poly1305, 32-byte push key, 12-byte nonce carried as `n`,
 //   ciphertext = `ciphertext || 16-byte tag`, empty AAD.
-// The interop vector is pinned in `aura_device_proto::fixtures` and asserted by
+// The interop vector is pinned in `device_proto::fixtures` and asserted by
 // `NotificationServiceTests` here — a drift on either side fails a test.
 
 import CryptoKit
@@ -68,7 +68,7 @@ final class NotificationService: UNNotificationServiceExtension {
         return open(key: key, nonce: nonce, ciphertextAndTag: enc)
     }
 
-    /// CryptoKit ChaChaPoly open matching `aura_device_proto::aead::open`.
+    /// CryptoKit ChaChaPoly open matching `device_proto::aead::open`.
     /// `combined = nonce(12) || ciphertext || tag(16)`, empty AAD. Static + pure
     /// so `NotificationServiceTests` drives it with the pinned fixture.
     static func open(key: SymmetricKey, nonce: Data, ciphertextAndTag: Data) -> Preview? {

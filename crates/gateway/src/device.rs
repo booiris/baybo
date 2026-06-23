@@ -7,7 +7,7 @@
 //! half is advertised inside the SPAKE2 K-channel at pairing; the secret half
 //! never leaves the vault.
 
-use aura_device_proto::noise::StaticKeypair;
+use device_proto::noise::StaticKeypair;
 use aura_security::SecretVault;
 
 /// `SecretVault` key holding A's static Noise keypair as `public ‖ secret`.

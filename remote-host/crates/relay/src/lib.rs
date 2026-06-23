@@ -1,4 +1,4 @@
-//! **relay** — the blind byte-pipe + SPAKE2 rendezvous for `aura-remote-host`.
+//! **relay** — the blind byte-pipe + SPAKE2 rendezvous for `remote-host`.
 //!
 //! Solves "the phone can't reach the NAT'd gateway" and hosts pairing. Both the
 //! pairing rendezvous (keyed by the SPAKE2 code) and the content relay (keyed by

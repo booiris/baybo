@@ -1,5 +1,5 @@
 [package]
-name = "aura-device-proto"
+name = "device-proto"
 version.workspace = true
 edition.workspace = true
 

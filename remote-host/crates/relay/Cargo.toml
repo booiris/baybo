@@ -1,5 +1,5 @@
 [package]
-name = "aura-remote-host-relay"
+name = "remote-host-relay"
 version.workspace = true
 edition.workspace = true
 

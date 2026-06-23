@@ -1,6 +1,6 @@
 //! SPAKE2 over the untrusted rendezvous.
 //!
-//! Pairing crosses the operator-run `aura-remote-host` (C), which only relays
+//! Pairing crosses the operator-run `remote-host` (C), which only relays
 //! opaque PAKE blobs: it never learns the short code or the derived master
 //! secret, and a balanced PAKE allows at most one online guess of the code per
 //! run (no offline dictionary attack). The app drives the [`Pake::start_app`]

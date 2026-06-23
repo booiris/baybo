@@ -1,5 +1,5 @@
 //! **dashboard** — the operator's **metadata-only** status surface for
-//! `aura-remote-host`.
+//! `remote-host`.
 //!
 //! Blind by construction: it reports counts only — admitted instances, bound
 //! device tokens, connected gateways, pending relay legs — and **never any

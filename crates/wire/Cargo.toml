@@ -1,5 +1,5 @@
 [package]
-name = "aura-wire"
+name = "wire"
 version.workspace = true
 edition.workspace = true
 

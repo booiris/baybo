@@ -19,7 +19,7 @@ compiled or run on a Linux/macOS CI host without Xcode + the iOS SDK, so it is
 kept here as reviewed, drop-in source rather than wired into `cargo test`.
 
 **Correctness is verified, not hand-waved.** The NSE crypto is validated against
-the exact cross-language vector in `aura_device_proto::fixtures`
+the exact cross-language vector in `device_proto::fixtures`
 (`KEY`/`NONCE`/`CIPHERTEXT_HEX`/`PLAINTEXT`). The Rust test
 `fixtures::pinned_vector_is_reproduced` guards the producer side; the bundled
 `NotificationServiceTests.testDecryptsThePinnedFixture` guards this consumer
@@ -50,7 +50,7 @@ entitlements) still needs Xcode.
 ## The wire contract (already implemented on the server side)
 
 The gateway (A) encrypts the preview and the push role (C) sends APNs this body
-(`crates/gateway/src/push` + `aura-remote-host/crates/push`):
+(`crates/gateway/src/push` + `remote-host/crates/push`):
 
 ```json
 {

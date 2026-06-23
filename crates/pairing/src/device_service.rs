@@ -5,7 +5,7 @@
 //! owns the lifecycle around the two device stores — minting a one-time slot,
 //! finalizing a completed SPAKE2 handshake into a durable (pending) device row,
 //! and approve / revoke / list. The SPAKE2 + Noise + AEAD math lives in
-//! `aura-device-proto`; the WS transport lives in the gateway. This layer knows
+//! `device-proto`; the WS transport lives in the gateway. This layer knows
 //! about TTLs, code minting, and the slot → device-row transition.
 
 use std::sync::Arc;

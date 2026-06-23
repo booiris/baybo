@@ -112,26 +112,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
-name = "aura-device-proto"
-version = "0.1.0"
-dependencies = [
- "chacha20poly1305",
- "hex",
- "hkdf",
- "rmp-serde",
- "serde",
- "sha2",
- "snow",
- "spake2",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "aura-mobile-app"
 version = "0.1.0"
 dependencies = [
- "aura-device-proto",
  "aura-mobile-core",
+ "device-proto",
  "futures-util",
  "hex",
  "serde",
@@ -147,12 +132,12 @@ dependencies = [
 name = "aura-mobile-core"
 version = "0.1.0"
 dependencies = [
- "aura-device-proto",
  "aura-model",
- "aura-wire",
+ "device-proto",
  "snow",
  "thiserror 2.0.18",
  "tokio",
+ "wire",
 ]
 
 [[package]]
@@ -169,17 +154,6 @@ dependencies = [
  "tracing",
  "ulid",
  "uuid",
-]
-
-[[package]]
-name = "aura-wire"
-version = "0.1.0"
-dependencies = [
- "aura-model",
- "chrono",
- "rmp-serde",
- "serde",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -741,6 +715,21 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "device-proto"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "hex",
+ "hkdf",
+ "rmp-serde",
+ "serde",
+ "sha2",
+ "snow",
+ "spake2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4878,6 +4867,17 @@ checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
 dependencies = [
  "cfg-if",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "wire"
+version = "0.1.0"
+dependencies = [
+ "aura-model",
+ "chrono",
+ "rmp-serde",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -6,7 +6,7 @@
 # change always lands with the matching TS side.
 #
 # Surfaces:
-#   sdks/channel-ts/src/generated/    ← `aura-wire` (channel WS frames) +
+#   sdks/channel-ts/src/generated/    ← `wire` (channel WS frames) +
 #                                        `aura-channels` (registration wire)
 #   tool-src/browser/src/generated/   ← `aura-tools::mcp` (MCP `_meta.aura.*`)
 #   bench/bench-web/web/src/generated/ ← `aura-bench-web` (bench spine model)
@@ -21,10 +21,10 @@ cd "$REPO_ROOT"
 #
 # The channel-ts surface is split: the `Frame` / `Message` wire types (and
 # the transitively-referenced `ApprovalDecision` / `ResourceAccess`) come
-# from `aura-wire`; the registration-wire types (`PromptKind` /
+# from `wire`; the registration-wire types (`PromptKind` /
 # `RegisterIn` / `RegisterOut`) stay in `aura-channels`.
 SURFACES=(
-    "sdks/channel-ts/src/generated|test -p aura-wire --features ts-export --lib"
+    "sdks/channel-ts/src/generated|test -p wire --features ts-export --lib"
     "sdks/channel-ts/src/generated|test -p aura-channels --features ts-export --lib register_wire"
     "tool-src/browser/src/generated|test -p aura-tools  --features ts-export --lib mcp::access_rule"
     "bench/bench-web/web/src/generated|test -p aura-bench-web --features ts-export --lib model"

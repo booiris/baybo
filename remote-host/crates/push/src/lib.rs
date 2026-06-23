@@ -1,4 +1,4 @@
-//! **push** — the only `aura-remote-host` component that holds the APNs `.p8`.
+//! **push** — the only `remote-host` component that holds the APNs `.p8`.
 //!
 //! It relays operator-encrypted lock-screen-preview blobs to APNs for any Aura
 //! gateway, staying **blind**: the gateway (A) encrypts the preview with the

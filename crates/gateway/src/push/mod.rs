@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use aura_device_proto::aead;
+use device_proto::aead;
 use aura_job::{JobInputKind, JobLifecycle, JobLifecycleEvent, JobPhase, JobShape};
 use aura_model::{ContentBlock, JobId, Role, SessionId};
 use aura_security::SecretVault;
@@ -106,7 +106,7 @@ struct RegisterBody {
     instance_key: String,
     device_id: String,
     apns_token: String,
-    env: aura_device_proto::pairing::ApnsEnv,
+    env: device_proto::pairing::ApnsEnv,
 }
 
 /// Seam over the POST to C's `/register`. The device-pair route calls it
@@ -118,7 +118,7 @@ pub trait ApnsRegistrar: Send + Sync {
         &self,
         device_id: &str,
         apns_token: &str,
-        env: aura_device_proto::pairing::ApnsEnv,
+        env: device_proto::pairing::ApnsEnv,
     ) -> Result<(), String>;
 }
 
@@ -145,7 +145,7 @@ impl ApnsRegistrar for HttpApnsRegistrar {
         &self,
         device_id: &str,
         apns_token: &str,
-        env: aura_device_proto::pairing::ApnsEnv,
+        env: device_proto::pairing::ApnsEnv,
     ) -> Result<(), String> {
         let body = RegisterBody {
             instance_key: self.instance_key.clone(),
@@ -519,7 +519,7 @@ mod tests {
             instance_key: "inst-A".into(),
             device_id: "dev-1".into(),
             apns_token: "tok".into(),
-            env: aura_device_proto::pairing::ApnsEnv::Sandbox,
+            env: device_proto::pairing::ApnsEnv::Sandbox,
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["instance_key"], "inst-A");
