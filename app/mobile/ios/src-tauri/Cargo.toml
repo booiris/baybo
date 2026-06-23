@@ -29,7 +29,13 @@ tokio-tungstenite = { workspace = true }
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
 tauri-plugin-barcode-scanner = { workspace = true }
 
-# The App Group keychain write (push-key persistence for the NSE) is iOS-only.
+# The App Group keychain write (push-key persistence for the NSE) is iOS-only,
+# as is push registration (notification auth + remote-notification token).
 [target.'cfg(target_os = "ios")'.dependencies]
 core-foundation = { workspace = true }
 core-foundation-sys = { workspace = true }
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-ui-kit = { workspace = true }
+objc2-user-notifications = { workspace = true }
+block2 = { workspace = true }

@@ -8,6 +8,7 @@
 
 mod keychain;
 mod pairing;
+mod push_register;
 
 use pairing::PairedSummary;
 
@@ -65,6 +66,13 @@ pub fn run() {
     #[cfg(mobile)]
     let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
     let result = builder
+        .setup(|_app| {
+            // Request provisional notification auth + remote-notification
+            // registration once the app is up (main thread).
+            #[cfg(target_os = "ios")]
+            push_register::register();
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![pair])
         .run(tauri::generate_context!());
     if let Err(e) = result {
