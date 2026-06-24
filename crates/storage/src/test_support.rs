@@ -228,6 +228,18 @@ impl DeviceStore for MemoryDeviceStore {
             .cloned())
     }
 
+    async fn lookup_approved_by_pubkey(
+        &self,
+        device_pubkey: &[u8],
+    ) -> DeviceResult<Option<DeviceRow>> {
+        Ok(self
+            .rows
+            .lock()
+            .values()
+            .find(|r| r.device_pubkey == device_pubkey && r.status == DeviceStatus::Approved)
+            .cloned())
+    }
+
     async fn list(&self, status: Option<DeviceStatus>) -> DeviceResult<Vec<DeviceRow>> {
         Ok(sorted_desc(
             self.rows

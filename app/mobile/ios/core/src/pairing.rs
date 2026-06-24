@@ -52,6 +52,10 @@ pub struct PairedGateway {
     /// shared Keychain for the NSE.
     pub push_key: [u8; KEY_LEN],
     pub relay_node_id: String,
+    /// Base WS URL of the blind relay (C); the app dials
+    /// `{relay_url}/content/join/{relay_node_id}` to reach a NAT'd gateway when
+    /// every direct candidate fails. Empty when relay is off.
+    pub relay_url: String,
     pub direct_candidates: Vec<String>,
     /// The code this device paired under (retained for audit).
     pub pairing_code: String,
@@ -123,7 +127,8 @@ impl PairingClient {
             .keys
             .as_ref()
             .ok_or(MobileError::State("keys not derived yet"))?;
-        let (nonce, ciphertext) = pairing::seal_msg(&keys.channel_key, &DeviceConfirm { accepted })?;
+        let (nonce, ciphertext) =
+            pairing::seal_msg(&keys.channel_key, &DeviceConfirm { accepted })?;
         Ok(PairFrame::Sealed { nonce, ciphertext })
     }
 
@@ -144,6 +149,7 @@ impl PairingClient {
             gateway_static_pubkey: welcome.static_pubkey,
             push_key: keys.push_key,
             relay_node_id: welcome.relay_node_id,
+            relay_url: welcome.relay_url,
             direct_candidates: welcome.direct_candidates,
             pairing_code: welcome.pairing_code,
         })
@@ -171,7 +177,11 @@ mod tests {
         let (mut client, hello) = PairingClient::start(req);
 
         // --- gateway side (mirrors the /v1/device/pair route) ---
-        let PairFrame::Hello { code, pake: app_pake } = hello else {
+        let PairFrame::Hello {
+            code,
+            pake: app_pake,
+        } = hello
+        else {
             panic!("expected Hello");
         };
         assert_eq!(code, "WORMHOLE-7-foo");
@@ -181,8 +191,7 @@ mod tests {
         let gw_confirm = derive_confirm_code(&gw_k).unwrap();
 
         // client processes PakeReply → sealed DeviceHello
-        let PairFrame::Sealed { nonce, ciphertext } =
-            client.on_pake_reply(&gw_pake).unwrap()
+        let PairFrame::Sealed { nonce, ciphertext } = client.on_pake_reply(&gw_pake).unwrap()
         else {
             panic!("expected sealed DeviceHello");
         };
@@ -195,7 +204,11 @@ mod tests {
         assert_eq!(client.confirm_code(), Some(gw_confirm.as_str()));
 
         // user accepts → client seals DeviceConfirm; gateway opens it
-        let PairFrame::Sealed { nonce: cn, ciphertext: cc } = client.confirm(true).unwrap() else {
+        let PairFrame::Sealed {
+            nonce: cn,
+            ciphertext: cc,
+        } = client.confirm(true).unwrap()
+        else {
             panic!("expected sealed DeviceConfirm");
         };
         let device_confirm: DeviceConfirm =
@@ -206,6 +219,7 @@ mod tests {
         let welcome = GatewayWelcome {
             static_pubkey: [9u8; KEY_LEN],
             relay_node_id: "node-1".into(),
+            relay_url: "wss://proxy.baybo.space:7777".into(),
             direct_candidates: vec!["wss://baybo.lan:8889".into()],
             user_id: "user-1".into(),
             pairing_code: code.clone(),
@@ -219,7 +233,10 @@ mod tests {
         assert_eq!(paired.auth_token, "issued-token");
         assert_eq!(paired.gateway_static_pubkey, [9u8; KEY_LEN]);
         assert_eq!(paired.relay_node_id, "node-1");
-        assert_eq!(paired.direct_candidates, vec!["wss://baybo.lan:8889".to_string()]);
+        assert_eq!(
+            paired.direct_candidates,
+            vec!["wss://baybo.lan:8889".to_string()]
+        );
         // Both ends derived the same push key from the SPAKE2 secret.
         assert_eq!(paired.push_key, gw_keys.push_key);
     }

@@ -258,6 +258,15 @@ impl GatewayServer {
             crate::channel::relay_pair::spawn(
                 WsChannelState::from_deps(&deps),
                 crate::channel::relay_pair::RelayPairConfig {
+                    relay_url: relay.url.clone(),
+                    instance_key: relay.instance_key.clone(),
+                },
+            );
+            // Content control connection: hold an outbound A->C link so a phone
+            // can reach this (possibly NAT'd) gateway for chat via the relay.
+            crate::channel::relay_content::spawn(
+                WsChannelState::from_deps(&deps),
+                crate::channel::relay_content::RelayContentConfig {
                     relay_url: relay.url,
                     instance_key: relay.instance_key,
                 },

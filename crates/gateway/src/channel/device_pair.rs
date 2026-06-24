@@ -80,10 +80,13 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     let keys = derive_pair_keys(&k).map_err(|e| format!("kdf: {e}"))?;
 
     // 3. Hand the app our SPAKE2 message; it derives the same K.
-    transport.send_frame(&PairFrame::PakeReply { pake: gw_pake }).await?;
+    transport
+        .send_frame(&PairFrame::PakeReply { pake: gw_pake })
+        .await?;
 
     // 4. Sealed DeviceHello — app static key + push registration.
-    let PairFrame::Sealed { nonce, ciphertext } = transport.recv_frame(PAIR_STEP_TIMEOUT).await? else {
+    let PairFrame::Sealed { nonce, ciphertext } = transport.recv_frame(PAIR_STEP_TIMEOUT).await?
+    else {
         return Err("expected sealed DeviceHello".into());
     };
     let hello: DeviceHello = pairing::open_msg(&keys.channel_key, &nonce, &ciphertext)
@@ -107,7 +110,8 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         .map_err(|e| format!("publish confirm: {e}"))?;
 
     // 5a. The phone user's decision, sealed under the channel key.
-    let PairFrame::Sealed { nonce, ciphertext } = transport.recv_frame(CONFIRM_TIMEOUT).await? else {
+    let PairFrame::Sealed { nonce, ciphertext } = transport.recv_frame(CONFIRM_TIMEOUT).await?
+    else {
         return Err("expected sealed DeviceConfirm".into());
     };
     let confirm: DeviceConfirm = pairing::open_msg(&keys.channel_key, &nonce, &ciphertext)
@@ -177,13 +181,22 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
         .await
         .map_err(|e| format!("static key: {e}"))?;
 
-    // 8. Sealed GatewayWelcome — A's static key, routing (empty until the
-    //    relay/direct config lands), and the issued (inert) auth_token.
+    // 8. Sealed GatewayWelcome — A's static key + the routing the app reaches it
+    //    by: direct candidates from config, and (when a relay is configured) the
+    //    gateway's stable relay_node_id + the relay's base URL so the app can
+    //    fall back to the blind relay when every direct candidate fails.
+    let (relay_node_id, relay_url) = if state.relay_url.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let node_id = crate::relay::load_or_create_relay_node_id(&state.secret_vault)
+            .await
+            .map_err(|e| format!("relay node id: {e}"))?;
+        (node_id, state.relay_url.clone())
+    };
     let welcome = GatewayWelcome {
         static_pubkey: static_key.public(),
-        // relay_node_id is C-assigned (phase 2, when A holds its control
-        // connection to the remote host); direct candidates come from config.
-        relay_node_id: String::new(),
+        relay_node_id,
+        relay_url,
         direct_candidates: state.device_direct_candidates.clone(),
         user_id: slot.user_id.clone(),
         pairing_code: slot.code.clone(),
@@ -191,7 +204,9 @@ pub(crate) async fn drive<T: PairTransport + ?Sized>(
     };
     let (nonce, ciphertext) =
         pairing::seal_msg(&keys.channel_key, &welcome).map_err(|e| format!("seal welcome: {e}"))?;
-    transport.send_frame(&PairFrame::Sealed { nonce, ciphertext }).await?;
+    transport
+        .send_frame(&PairFrame::Sealed { nonce, ciphertext })
+        .await?;
 
     tracing::info!(
         device = %super::short_hash(&hello.device_id),
@@ -315,7 +330,10 @@ mod tests {
         let code = device_pairing.mint("user-1", "").await.unwrap();
         // Operator confirms in their live session (their CLI writes this). Set
         // up front so the gateway's poll finds it without a timing race.
-        device_pairing.set_operator_decision(&code, true).await.unwrap();
+        device_pairing
+            .set_operator_decision(&code, true)
+            .await
+            .unwrap();
 
         // Serve just the token-free pairing route on an ephemeral port.
         let app = Router::new().nest("/v1", routes().with_state(state));

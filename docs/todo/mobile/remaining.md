@@ -35,22 +35,24 @@ chat UI. See `crates/gateway/src/channel/device_content.rs`,
 `app/mobile/ios/src-tauri/src/content.rs`, `app/mobile/ios/src/App.tsx`. (Known
 limit: one frame ≤ the Noise ~64 KiB ceiling; chunking is a follow-up.)
 
-### 2. Content relay — content traffic for a NAT'd gateway (phase 2)
+### 2. Content relay — content traffic for a NAT'd gateway ✅ done
 
-Relay **pairing** works; relay **content** does not. Today `relay_node_id` is
-`String::new()` (`crates/gateway/src/channel/device_pair.rs`), the relay only
-serves the pairing routes, and the A↔C control connection
-(`crates/gateway/src/relay/mod.rs`, `remote-host/crates/relay/src/control.rs`)
-isn't wired into boot. To let content ride the relay:
-
-- gateway opens + maintains its A↔C control connection at boot; C assigns a
-  `relay_node_id`; the gateway puts it in `GatewayWelcome`.
-- `remote-host-relay` serves a content-leg route keyed by `relay_node_id`
-  (reuse `RelayBroker` + the `pump_ws` adapter, like the pairing routes).
-- the app's content session falls back to the relay leg when no direct candidate
-  connects (`connect_first` already plans `Endpoint::Relay`).
-
-Depends on #1 (the content session must exist first).
+A NAT'd gateway now serves content through the blind relay. The gateway holds a
+persistent A→C control connection at boot (`channel/relay_content.rs` +
+`relay/mod.rs` `connect_control`/`pump_control`), presenting a persisted
+`relay_node_id` (`load_or_create_relay_node_id`) it also advertises in
+`GatewayWelcome` (+ `relay_url`). C mounts `/control`, `/content/join/{node}`
+(phone parks, C signals the gateway), `/content/host/{key}` (gateway data leg);
+the existing `RelayBroker`/`pump_ws` splice the two legs blind
+(`remote-host/crates/relay/src/serve.rs`). The gateway's content responder is
+transport-generic (`device_content.rs` `BinarySink`/`BinarySource`), so it runs
+the Noise IK responder over the outbound relay leg too — authenticating the
+device by looking its static key up among approved rows
+(`DeviceStore::lookup_approved_by_pubkey`, since the relay leg carries no token).
+The app falls back via `connect_first` → `dial_relay`
+(`{relay_url}/content/join/{node}`). Tested end-to-end on C
+(`content_relay_splices_phone_and_gateway`) and on A
+(`relay_path_resolves_device_by_pubkey_and_round_trips`).
 
 ### 3. Real APNs device token
 
@@ -71,8 +73,13 @@ pairing request (or a later `/register`).
 
 ### 5. Hardening / smaller follow-ups
 
-- **Relay**: TTL sweep for stale parked host legs (a crashed gateway leaves a
-  parked leg until the WS closes); basic rate-limiting on `/pair/join`.
+- **Relay**: TTL sweep for stale parked broker legs — both the pairing
+  `/pair/host` legs **and** the content `/content/join` / `/content/host` legs
+  leak a parked entry if the partner never arrives or the WS upgrade fails after
+  the synchronous `broker.join` (a crashed/slow gateway, a client that drops
+  mid-handshake). A periodic sweep keyed on park-time is the systematic fix.
+  Also basic rate-limiting on `/pair/join` and `/content/join` (both park a leg
+  for an unauthenticated caller that knows only a code / `relay_node_id`).
 - **relay-pair host manager**: no shutdown signal — it dies with the process;
   give it a `ShutdownSignal` if graceful drain matters.
 - **No automated cross-workspace e2e** for relay pairing (relay and gateway are

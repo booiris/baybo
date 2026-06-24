@@ -13,13 +13,26 @@
 use std::collections::HashMap;
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 /// Bounded backlog of control signals toward one gateway.
 const CONTROL_CHANNEL_CAP: usize = 32;
 
-/// A control-plane signal C sends to a registered gateway.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// First frame the gateway (A) sends on the control WS: its `relay_node_id`
+/// (routing key) + its admission `instance_key`. Mirrors the gateway-side
+/// `ControlClientHello`; decoded from the binary JSON A sends.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ControlHello {
+    pub relay_node_id: String,
+    pub instance_key: String,
+}
+
+/// A control-plane signal C sends to a registered gateway. Serialized to the
+/// exact JSON the gateway's `ControlServerMsg` decodes (`{"t":"open_data_leg",
+/// "relay_key":"…"}`), so the two halves agree byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
 pub enum ControlSignal {
     /// Open a data leg under `relay_key` and join the relay — a phone is
     /// waiting there to reach you.
@@ -93,6 +106,17 @@ mod tests {
                 relay_key: "leg-abc".into(),
             },
         );
+    }
+
+    #[test]
+    fn open_data_leg_serializes_to_gateway_wire_shape() {
+        // Must match the gateway's `ControlServerMsg` JSON byte-for-byte.
+        let v = serde_json::to_value(ControlSignal::OpenDataLeg {
+            relay_key: "k".into(),
+        })
+        .unwrap();
+        assert_eq!(v["t"], "open_data_leg");
+        assert_eq!(v["relay_key"], "k");
     }
 
     #[tokio::test]

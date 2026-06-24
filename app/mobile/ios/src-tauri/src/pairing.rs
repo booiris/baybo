@@ -49,6 +49,10 @@ pub(crate) struct PairedRecord {
     pub(crate) gateway_static_pubkey: [u8; 32],
     pub(crate) direct_candidates: Vec<String>,
     pub(crate) relay_node_id: String,
+    /// Base WS URL of the blind relay (C); empty when relay is off. Used to dial
+    /// a relay content leg when every direct candidate fails.
+    #[serde(default)]
+    pub(crate) relay_url: String,
     /// The app's long-term Noise static identity (its content-session identity):
     /// the secret drives the IK initiator; the public half completes the keypair
     /// `device-proto` expects (snow re-derives it from the secret regardless).
@@ -210,6 +214,7 @@ pub async fn pair_confirm(
         gateway_static_pubkey: paired.gateway_static_pubkey,
         direct_candidates: paired.direct_candidates.clone(),
         relay_node_id: paired.relay_node_id.clone(),
+        relay_url: paired.relay_url.clone(),
         noise_secret: session.keypair.secret(),
         noise_public: session.keypair.public(),
     };

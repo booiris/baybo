@@ -96,6 +96,14 @@ pub trait DeviceStore: Send + Sync {
     /// lives in one place (the SQL), not at every call site.
     async fn lookup_approved_by_auth_token(&self, auth_token: &str) -> Result<Option<DeviceRow>>;
 
+    /// Resolve an **approved** device by its X25519 static public key — the
+    /// relay content path, where no bearer token is presented (the gateway
+    /// dials the relay blind and the Noise IK initiator's static is the only
+    /// identity it learns). The static-key authentication of the device hangs
+    /// off this match, so the `approved`-only filter is again security-critical
+    /// and lives in the query. Revoked rows never match.
+    async fn lookup_approved_by_pubkey(&self, device_pubkey: &[u8]) -> Result<Option<DeviceRow>>;
+
     /// List all rows, optionally filtered by status. Newest `created_at` first.
     async fn list(&self, status: Option<DeviceStatus>) -> Result<Vec<DeviceRow>>;
 

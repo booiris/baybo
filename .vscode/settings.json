@@ -329,6 +329,7 @@
         "**/.gitmodules": true,
         "**/relative-soul-test": true,
     },
+    "rust-analyzer.cargo.target": "aarch64-apple-ios-sim",
     "rust-analyzer.cargo.features": [],
     "rust-analyzer.linkedProjects": [
         "Cargo.toml",

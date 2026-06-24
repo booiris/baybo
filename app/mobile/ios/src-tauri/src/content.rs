@@ -67,7 +67,7 @@ pub async fn connect(
     let established = connect_first(&plan, |ep| async move {
         match ep {
             Endpoint::Direct(base) => dial_direct(&base, record_ref, local_ref).await,
-            Endpoint::Relay { .. } => Err("relay content not supported yet (phase 2)".to_string()),
+            Endpoint::Relay { node_id } => dial_relay(&node_id, record_ref, local_ref).await,
         }
     })
     .await;
@@ -126,10 +126,39 @@ async fn dial_direct(
     // resolves it to the device identity before the upgrade; the Noise IK
     // handshake then authenticates the static key end-to-end.
     let url = format!("{base}/v1/device/content?token={}", record.auth_token);
-    let (mut ws, _) = connect_async(&url)
+    let (ws, _) = connect_async(&url)
         .await
         .map_err(|e| format!("connect {base}: {e}"))?;
+    handshake_over(ws, record, local).await
+}
 
+/// Dial the blind relay's content-join leg for the gateway's `relay_node_id`
+/// (fallback when no direct candidate connected). No token: the relay leg is
+/// unauthenticated and the gateway authenticates this device purely by matching
+/// the Noise IK initiator's static against an approved device row.
+async fn dial_relay(
+    node_id: &str,
+    record: &PairedRecord,
+    local: &StaticKeypair,
+) -> Result<Established, String> {
+    if record.relay_url.is_empty() {
+        return Err("no relay url for this pairing".into());
+    }
+    let base = record.relay_url.trim_end_matches('/');
+    let url = format!("{base}/content/join/{node_id}");
+    let (ws, _) = connect_async(&url)
+        .await
+        .map_err(|e| format!("relay connect {base}: {e}"))?;
+    handshake_over(ws, record, local).await
+}
+
+/// Run the Noise IK initiator handshake over an established WS (direct or relay)
+/// and return the ready content session.
+async fn handshake_over(
+    mut ws: Ws,
+    record: &PairedRecord,
+    local: &StaticKeypair,
+) -> Result<Established, String> {
     let (handshake, msg1) = ContentHandshake::start(local, &record.gateway_static_pubkey)
         .map_err(|e| format!("start handshake: {e}"))?;
     ws.send(Message::Binary(msg1))

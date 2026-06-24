@@ -88,6 +88,11 @@ pub struct WsChannelState {
     /// authenticated device's row to verify the Noise IK initiator's static key
     /// equals the `device_pubkey` exchanged at pairing.
     pub device_store: Arc<dyn DeviceStore>,
+    /// Base WS URL of the blind relay (C), or empty when relay is disabled.
+    /// Advertised to the app in `GatewayWelcome.relay_url` so a device that
+    /// paired directly can still fall back to the relay; non-empty also gates
+    /// whether pairing hands out a `relay_node_id`.
+    pub relay_url: String,
     /// Direct-reachability endpoints handed to a pairing device inside the
     /// SPAKE2 K-channel (`GatewayWelcome.direct_candidates`). Empty when
     /// `gateway.direct.enabled` is false.
@@ -183,6 +188,12 @@ impl WsChannelState {
             pairing,
             device_pairing,
             device_store: deps.stores.device.clone(),
+            relay_url: deps
+                .runtime_config
+                .relay
+                .as_ref()
+                .map(|r| r.url.clone())
+                .unwrap_or_default(),
             device_direct_candidates,
             apns_registrar,
             blob_store: deps.stores.blob.clone(),

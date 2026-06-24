@@ -13,14 +13,67 @@
 //! reconnect loop; data-leg establishment + the blind byte-pipe ride on top
 //! (the relay path is operated but content prefers direct in phase 1).
 
+use std::time::Duration;
+
+use baybo_security::SecretVault;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
-use tokio_tungstenite::client_async;
+use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::{WebSocketStream, client_async, connect_async};
+
+/// `SecretVault` key holding A's stable, non-secret `relay_node_id` (a UUID).
+/// The app caches it at pairing to reach a NAT'd A via the relay, so it must not
+/// change underneath an already-paired device — hence it's persisted, not
+/// re-derived each boot.
+const RELAY_NODE_ID_VAULT_KEY: &str = "relay.node_id";
+
+/// Keepalive cadence on the A→C control connection (and its missed-Pong death
+/// timeout): A pings C every interval; C auto-Pongs, so a missed answer by the
+/// next tick means the connection is half-open.
+const CONTROL_KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// Serializes the first-run mint of [`RELAY_NODE_ID_VAULT_KEY`]. Without it the
+/// boot control connection and a concurrent first pairing could each read an
+/// empty vault and mint *different* ids (last-writer-wins on store), leaving the
+/// id A registered under ≠ the id it advertised. Cheap: contended only once, on
+/// the first ever call before the value is persisted.
+static RELAY_NODE_ID_MINT: Mutex<()> = Mutex::const_new(());
+
+/// Load A's persisted `relay_node_id`, generating and storing one on first use.
+/// The gateway presents it on the control connection and advertises it in
+/// `GatewayWelcome`; both sides must agree, so both read it through here.
+pub async fn load_or_create_relay_node_id(vault: &SecretVault) -> anyhow::Result<String> {
+    if let Some(id) = read_relay_node_id(vault).await? {
+        return Ok(id);
+    }
+    // Double-checked under the mint lock so concurrent first callers agree on one.
+    let _guard = RELAY_NODE_ID_MINT.lock().await;
+    if let Some(id) = read_relay_node_id(vault).await? {
+        return Ok(id);
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    vault
+        .store_secret(RELAY_NODE_ID_VAULT_KEY, id.as_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("vault store {RELAY_NODE_ID_VAULT_KEY}: {e}"))?;
+    Ok(id)
+}
+
+async fn read_relay_node_id(vault: &SecretVault) -> anyhow::Result<Option<String>> {
+    let Some(secret) = vault
+        .get_secret(RELAY_NODE_ID_VAULT_KEY)
+        .await
+        .map_err(|e| anyhow::anyhow!("vault get {RELAY_NODE_ID_VAULT_KEY}: {e}"))?
+    else {
+        return Ok(None);
+    };
+    let id = String::from_utf8_lossy(secret.as_bytes()).into_owned();
+    Ok((!id.is_empty()).then_some(id))
+}
 
 /// Sent once by A right after the control WS opens. Identifies the gateway by
 /// its C-assigned `relay_node_id` and authenticates with its admission key.
@@ -63,23 +116,85 @@ where
     let request = url
         .into_client_request()
         .map_err(|e| ControlError::Codec(format!("bad url: {e}")))?;
-    let (mut ws, _) = client_async(request, stream).await?;
+    let (ws, _) = client_async(request, stream).await?;
+    pump_control(ws, hello, signals).await
+}
 
+/// Production dial: connect to C's control endpoint (`wss://…` TLS handled by
+/// `connect_async`) and run the control loop, returning when the connection
+/// closes or errors so the caller can reconnect.
+pub async fn connect_control(
+    url: &str,
+    hello: &ControlClientHello,
+    signals: mpsc::Sender<ControlServerMsg>,
+) -> Result<(), ControlError> {
+    let request = url
+        .into_client_request()
+        .map_err(|e| ControlError::Codec(format!("bad url: {e}")))?;
+    let (ws, _) = connect_async(request).await?;
+    pump_control(ws, hello, signals).await
+}
+
+/// The control protocol over an already-handshaken WS (shared by the
+/// stream-based [`run_control_connection`] and the production [`connect_control`]
+/// so both speak it identically): send `hello`, then forward every parsed server
+/// signal to `signals` until the connection closes. Unparseable frames are
+/// logged and skipped (forward-compatible with future signal kinds).
+async fn pump_control<T>(
+    mut ws: WebSocketStream<T>,
+    hello: &ControlClientHello,
+    signals: mpsc::Sender<ControlServerMsg>,
+) -> Result<(), ControlError>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     let hello_bytes = serde_json::to_vec(hello).map_err(|e| ControlError::Codec(e.to_string()))?;
     ws.send(Message::Binary(hello_bytes)).await?;
 
-    while let Some(msg) = ws.next().await {
-        match msg? {
-            Message::Binary(b) => match serde_json::from_slice::<ControlServerMsg>(&b) {
-                Ok(sig) => {
-                    if signals.send(sig).await.is_err() {
-                        break; // the consumer dropped its receiver
+    // The control connection is long-lived and idle by nature (signals only
+    // arrive when a phone shows up), so a half-open TCP connection (NAT rebind,
+    // silent firewall drop) would otherwise hang `ws.next()` forever and freeze
+    // the reconnect loop. Send a keepalive Ping each interval; if the prior one
+    // drew no frame back (C auto-Pongs, so a healthy peer always answers), treat
+    // the peer as gone and bail so the caller re-dials.
+    let mut keepalive = tokio::time::interval_at(
+        tokio::time::Instant::now() + CONTROL_KEEPALIVE,
+        CONTROL_KEEPALIVE,
+    );
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut awaiting_pong = false;
+
+    loop {
+        tokio::select! {
+            msg = ws.next() => {
+                let Some(msg) = msg else { break };
+                match msg? {
+                    Message::Binary(b) => {
+                        awaiting_pong = false;
+                        match serde_json::from_slice::<ControlServerMsg>(&b) {
+                            Ok(sig) => {
+                                if signals.send(sig).await.is_err() {
+                                    break; // the consumer dropped its receiver
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "unparseable control signal; ignoring")
+                            }
+                        }
                     }
+                    Message::Close(_) => break,
+                    // Any other frame (Pong to our keepalive, an unsolicited
+                    // Ping) is liveness proof.
+                    _ => awaiting_pong = false,
                 }
-                Err(e) => tracing::warn!(error = %e, "unparseable control signal; ignoring"),
-            },
-            Message::Close(_) => break,
-            _ => {}
+            }
+            _ = keepalive.tick() => {
+                if awaiting_pong {
+                    return Err(ControlError::Codec("control keepalive unanswered".into()));
+                }
+                ws.send(Message::Ping(Vec::new())).await?;
+                awaiting_pong = true;
+            }
         }
     }
     Ok(())

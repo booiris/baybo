@@ -94,6 +94,7 @@ mod tests {
             gateway_static_pubkey: [0u8; KEY_LEN],
             push_key: [0u8; KEY_LEN],
             relay_node_id: relay.into(),
+            relay_url: String::new(),
             direct_candidates: direct.iter().map(|s| s.to_string()).collect(),
             pairing_code: "c".into(),
         }

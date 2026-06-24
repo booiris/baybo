@@ -113,6 +113,24 @@ impl DeviceStore for LibsqlDeviceStore {
         fetch_row(&mut rows).await
     }
 
+    async fn lookup_approved_by_pubkey(&self, device_pubkey: &[u8]) -> Result<Option<DeviceRow>> {
+        let conn = self.pool.conn();
+        let mut rows = conn
+            .query(
+                // `ORDER BY ... LIMIT 1` keeps the result deterministic even in
+                // the (cryptographically impossible) event two approved rows
+                // shared a static key, so device resolution never flaps.
+                &format!(
+                    "SELECT {COLS} FROM devices WHERE device_pubkey = ?1 AND status = 'approved' \
+                     ORDER BY created_at ASC LIMIT 1"
+                ),
+                libsql::params![device_pubkey.to_vec()],
+            )
+            .await
+            .map_err(|e| col_err("query by pubkey", e))?;
+        fetch_row(&mut rows).await
+    }
+
     async fn list(&self, status: Option<DeviceStatus>) -> Result<Vec<DeviceRow>> {
         let conn = self.pool.conn();
         let mut rows = match status {
@@ -267,6 +285,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lookup_by_pubkey_matches_only_approved() {
+        let s = store().await;
+        s.create(&device_row("u1", "d1", "tok1", "C1"))
+            .await
+            .unwrap(); // device_pubkey = [7u8; 32]
+        let got = s
+            .lookup_approved_by_pubkey(&[7u8; 32])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.device_id, "d1");
+        // A non-matching key resolves to nothing.
+        assert!(
+            s.lookup_approved_by_pubkey(&[9u8; 32])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Revoking removes it from the approved-by-pubkey path too.
+        assert!(s.revoke("u1", "d1").await.unwrap());
+        assert!(
+            s.lookup_approved_by_pubkey(&[7u8; 32])
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn revoke_keeps_row_but_kills_auth() {
         let s = store().await;
         s.create(&device_row("u1", "d1", "tok1", "CODE12"))
@@ -292,15 +339,9 @@ mod tests {
     #[tokio::test]
     async fn list_and_list_for_user_filter_by_status() {
         let s = store().await;
-        s.create(&device_row("u1", "d1", "t1", "C1"))
-            .await
-            .unwrap();
-        s.create(&device_row("u1", "d2", "t2", "C2"))
-            .await
-            .unwrap();
-        s.create(&device_row("u2", "d3", "t3", "C3"))
-            .await
-            .unwrap();
+        s.create(&device_row("u1", "d1", "t1", "C1")).await.unwrap();
+        s.create(&device_row("u1", "d2", "t2", "C2")).await.unwrap();
+        s.create(&device_row("u2", "d3", "t3", "C3")).await.unwrap();
         s.revoke("u1", "d2").await.unwrap();
 
         let approved = s.list(Some(DeviceStatus::Approved)).await.unwrap();
@@ -320,9 +361,7 @@ mod tests {
     #[tokio::test]
     async fn touch_last_seen_updates() {
         let s = store().await;
-        s.create(&device_row("u1", "d1", "t1", "C1"))
-            .await
-            .unwrap();
+        s.create(&device_row("u1", "d1", "t1", "C1")).await.unwrap();
         s.touch_last_seen("u1", "d1", 555).await.unwrap();
         assert_eq!(
             s.get("u1", "d1").await.unwrap().unwrap().last_seen_at,

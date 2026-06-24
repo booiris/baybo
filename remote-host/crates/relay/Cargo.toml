@@ -11,7 +11,7 @@ name = "remote-host-relay"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -19,6 +19,10 @@ thiserror = { workspace = true }
 # out of a RelayLeg.
 axum = { workspace = true, features = ["ws"] }
 futures = { workspace = true }
+# The A<->C control connection: the gateway's hello + the OpenDataLeg signal are
+# JSON over the control WS (the gateway's `relay/mod.rs` agrees on this shape).
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
