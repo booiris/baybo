@@ -85,16 +85,34 @@ async fn drive(socket: &mut WebSocket, state: &WsChannelState) -> Result<(), Str
 
     // 6. Persist the per-device push key (HKDF of K) in A's vault, keyed by
     //    device_id (the NSE selects it by `bid` at push time).
-    let push_key_name = format!("device.{}.push_key", hello.device_id);
+    let push_key_name = crate::push::device_push_key_secret_name(&hello.device_id);
     state
         .secret_vault
         .store_secret(&push_key_name, &keys.push_key)
         .await
         .map_err(|e| format!("store push key: {e}"))?;
+    // 6b. Persist the APNs registration material (token + env) in the vault so a
+    //     transient `/register` failure below is retriable — the push dispatcher
+    //     re-registers an approved device from this before its first push.
+    let apns_reg = crate::push::DeviceApnsRegistration {
+        apns_token: hello.apns_token.clone(),
+        apns_env: hello.apns_env,
+    };
+    let apns_bytes =
+        serde_json::to_vec(&apns_reg).map_err(|e| format!("encode apns registration: {e}"))?;
+    state
+        .secret_vault
+        .store_secret(
+            &crate::push::device_apns_secret_name(&hello.device_id),
+            &apns_bytes,
+        )
+        .await
+        .map_err(|e| format!("store apns registration: {e}"))?;
     // Gateway-mediated APNs registration: relay the device's APNs token to the
     // remote host (C), authenticated by A's instance key. Best-effort — pairing
-    // already succeeded; a failed registration only delays pushes until the
-    // next attempt, and is skipped entirely when push isn't configured.
+    // already succeeded; a failed registration is retried by the dispatcher
+    // from the persisted material, and is skipped entirely when push isn't
+    // configured.
     if let Some(registrar) = &state.apns_registrar
         && let Err(e) = registrar
             .register_device(&hello.device_id, &hello.apns_token, hello.apns_env)

@@ -72,15 +72,16 @@ impl DevicePairingStore for LibsqlDevicePairingStore {
         fetch_row(&mut rows).await
     }
 
-    async fn delete_slot(&self, code: &str) -> Result<()> {
+    async fn delete_slot(&self, code: &str) -> Result<bool> {
         let conn = self.pool.conn();
-        conn.execute(
-            "DELETE FROM device_pairings WHERE code = ?1",
-            libsql::params![code.to_string()],
-        )
-        .await
-        .map_err(|e| col_err("delete slot", e))?;
-        Ok(())
+        let affected = conn
+            .execute(
+                "DELETE FROM device_pairings WHERE code = ?1",
+                libsql::params![code.to_string()],
+            )
+            .await
+            .map_err(|e| col_err("delete slot", e))?;
+        Ok(affected > 0)
     }
 
     async fn list_slots(&self) -> Result<Vec<DevicePairingSlot>> {

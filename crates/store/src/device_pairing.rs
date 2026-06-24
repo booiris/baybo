@@ -50,9 +50,11 @@ pub trait DevicePairingStore: Send + Sync {
     /// [`DevicePairingSlot::is_expired`] against its own `now`.
     async fn get_slot(&self, code: &str) -> Result<Option<DevicePairingSlot>>;
 
-    /// Delete a slot by code (single-use consumption on handshake success, or
-    /// operator cancel). No-op if already gone.
-    async fn delete_slot(&self, code: &str) -> Result<()>;
+    /// Atomically delete a slot by code, returning whether a row was actually
+    /// removed. This is the single-use **consume** on handshake success: two
+    /// clients that scanned the same live code race here, and only the one that
+    /// gets `true` may finalize a device — so one code mints at most one device.
+    async fn delete_slot(&self, code: &str) -> Result<bool>;
 
     /// List all slots, newest `created_at` first (CLI visibility).
     async fn list_slots(&self) -> Result<Vec<DevicePairingSlot>>;

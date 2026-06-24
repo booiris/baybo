@@ -10,6 +10,11 @@ pub enum DevicePairingError {
 
     #[error("code: {0}")]
     Code(#[from] crate::code::CodeError),
+
+    /// The single-use pairing slot was already consumed — a concurrent
+    /// handshake for the same code won the race.
+    #[error("pairing slot already consumed")]
+    SlotConsumed,
 }
 
 #[derive(Debug, Error)]

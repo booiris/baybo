@@ -322,9 +322,8 @@ impl DevicePairingStore for MemoryDevicePairingStore {
         Ok(self.slots.lock().get(code).cloned())
     }
 
-    async fn delete_slot(&self, code: &str) -> SlotResult<()> {
-        self.slots.lock().remove(code);
-        Ok(())
+    async fn delete_slot(&self, code: &str) -> SlotResult<bool> {
+        Ok(self.slots.lock().remove(code).is_some())
     }
 
     async fn list_slots(&self) -> SlotResult<Vec<DevicePairingSlot>> {

@@ -80,6 +80,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
     fn app() -> Router {
         let store = InMemoryDeviceTokenStore::new();
         store.register(
+            "inst-A",
             "dev-1",
             DeviceRegistration {
                 apns_token: "tok".into(),

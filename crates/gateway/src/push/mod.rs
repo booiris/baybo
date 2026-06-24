@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use base64::Engine;
@@ -26,7 +26,7 @@ use baybo_session::SessionManager;
 use baybo_store::{DeviceStatus, DeviceStore, SessionStore};
 use device_proto::aead;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -34,8 +34,6 @@ use tokio::task::JoinHandle;
 /// Max preview characters (kept well under the 4 KB APNs payload once
 /// encrypted + base64'd).
 const PREVIEW_MAX_CHARS: usize = 200;
-/// Push-key length in bytes.
-const PUSH_KEY_LEN: usize = 32;
 /// `kid` epoch — always 0 in phase 1 (the field exists so rotation needs no
 /// payload change).
 const PHASE1_KID: u32 = 0;
@@ -44,6 +42,27 @@ const PHASE1_KID: u32 = 0;
 const PREVIEW_READ_RETRIES: u32 = 5;
 /// Backoff between read-after-write re-checks.
 const PREVIEW_READ_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Secret-vault name for a device's per-device push key. The single source of
+/// truth shared by the write site (the device-pair route) and the read site
+/// (this dispatcher) so the two can never drift.
+pub(crate) fn device_push_key_secret_name(device_id: &str) -> String {
+    format!("device.{device_id}.push_key")
+}
+
+/// Secret-vault name for a device's persisted APNs registration material.
+pub(crate) fn device_apns_secret_name(device_id: &str) -> String {
+    format!("device.{device_id}.apns")
+}
+
+/// The per-device APNs registration A persists at pairing (vault, keyed by
+/// device_id) so a transient `/register` failure is retriable — the dispatcher
+/// re-registers an approved device from this before its first push.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DeviceApnsRegistration {
+    pub apns_token: String,
+    pub apns_env: device_proto::pairing::ApnsEnv,
+}
 
 /// The blind `/notify` body A POSTs to C. `enc`/`n` are base64 of the
 /// per-device AEAD output; C copies them verbatim into the APNs payload.
@@ -72,9 +91,12 @@ pub struct HttpNotifySink {
 }
 
 impl HttpNotifySink {
-    pub fn new(gateway_url: &str) -> Self {
+    /// `client` should be the workspace's proxy-aware client
+    /// ([`baybo_security::http::client`]) — these POST to the remote host (C),
+    /// a non-loopback egress target subject to the operator's egress proxy.
+    pub fn new(gateway_url: &str, client: reqwest::Client) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client,
             notify_url: format!("{}/notify", gateway_url.trim_end_matches('/')),
         }
     }
@@ -130,9 +152,12 @@ pub struct HttpApnsRegistrar {
 }
 
 impl HttpApnsRegistrar {
-    pub fn new(gateway_url: &str, instance_key: impl Into<String>) -> Self {
+    /// `client` should be the workspace's proxy-aware client
+    /// ([`baybo_security::http::client`]) — `/register` POSTs to the remote
+    /// host (C), a non-loopback egress target subject to the egress proxy.
+    pub fn new(gateway_url: &str, instance_key: impl Into<String>, client: reqwest::Client) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client,
             register_url: format!("{}/register", gateway_url.trim_end_matches('/')),
             instance_key: instance_key.into(),
         }
@@ -175,11 +200,17 @@ pub struct PushDispatcher {
     session_manager: Arc<SessionManager>,
     secret_vault: Arc<SecretVault>,
     sink: Arc<dyn NotifySink>,
+    /// Re-registers an approved device with C from the material A persisted at
+    /// pairing, self-healing a transient pairing-time `/register` failure.
+    apns_registrar: Option<Arc<dyn ApnsRegistrar>>,
     instance_key: String,
     /// `job_id → session ordinal at turn start`, captured on the `Started`
     /// edge so the completed-turn preview can wait for a row newer than this
     /// (the read-after-write gate). Dropped on any terminal edge.
     start_cursors: Mutex<HashMap<JobId, i64>>,
+    /// device_ids re-registered with C this run (so we retry at most once per
+    /// device per dispatcher lifetime).
+    registered: Mutex<HashSet<String>>,
 }
 
 impl PushDispatcher {
@@ -189,6 +220,7 @@ impl PushDispatcher {
         session_manager: Arc<SessionManager>,
         secret_vault: Arc<SecretVault>,
         sink: Arc<dyn NotifySink>,
+        apns_registrar: Option<Arc<dyn ApnsRegistrar>>,
         instance_key: impl Into<String>,
     ) -> Self {
         Self {
@@ -197,8 +229,10 @@ impl PushDispatcher {
             session_manager,
             secret_vault,
             sink,
+            apns_registrar,
             instance_key: instance_key.into(),
             start_cursors: Mutex::new(HashMap::new()),
+            registered: Mutex::new(HashSet::new()),
         }
     }
 
@@ -278,13 +312,52 @@ impl PushDispatcher {
         session_id: &SessionId,
         preview: &str,
     ) -> Result<(), String> {
+        self.ensure_registered(device_id).await;
         let key = self.load_push_key(device_id).await?;
         let body = build_notify_body(&self.instance_key, device_id, session_id, &key, preview)?;
         self.sink.post(&body).await
     }
 
-    async fn load_push_key(&self, device_id: &str) -> Result<[u8; PUSH_KEY_LEN], String> {
-        let name = format!("device.{device_id}.push_key");
+    /// Best-effort: re-register an approved device with C from the material A
+    /// persisted at pairing, the first time we push to it this run. Without
+    /// this a transient `/register` failure at pairing leaves C unaware of the
+    /// device, so every `/notify` is rejected as unknown until the user
+    /// re-pairs. Cached so it costs at most one `/register` per device per run.
+    async fn ensure_registered(&self, device_id: &str) {
+        let Some(registrar) = &self.apns_registrar else {
+            return;
+        };
+        if self.registered.lock().contains(device_id) {
+            return;
+        }
+        let Ok(Some(secret)) = self
+            .secret_vault
+            .get_secret(&device_apns_secret_name(device_id))
+            .await
+        else {
+            return;
+        };
+        let Ok(reg) = serde_json::from_slice::<DeviceApnsRegistration>(secret.as_bytes()) else {
+            return;
+        };
+        if reg.apns_token.is_empty() {
+            return;
+        }
+        match registrar
+            .register_device(device_id, &reg.apns_token, reg.apns_env)
+            .await
+        {
+            Ok(()) => {
+                self.registered.lock().insert(device_id.to_string());
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "push: device re-registration with remote host failed; will retry")
+            }
+        }
+    }
+
+    async fn load_push_key(&self, device_id: &str) -> Result<[u8; aead::KEY_LEN], String> {
+        let name = device_push_key_secret_name(device_id);
         let secret = self
             .secret_vault
             .get_secret(&name)
@@ -342,14 +415,16 @@ impl PushDispatcher {
     }
 }
 
-/// Read-after-write decision: has a session row newer than the turn's start
-/// cursor landed? With no start cursor (the dispatcher missed the `Started`
-/// edge — e.g. it booted mid-turn) we accept best-effort.
+/// Read-after-write decision: has a session row strictly newer than the turn's
+/// start cursor landed? With no start cursor (the dispatcher missed the
+/// `Started` edge — e.g. it booted mid-turn, or the bus lagged the start event)
+/// we cannot prove the latest row belongs to *this* turn, so we hold the
+/// placeholder rather than risk encrypting the previous turn's reply — the
+/// stale-preview leak `build_preview` promises never to produce.
 fn landed(latest: Option<i64>, start_cursor: Option<i64>) -> bool {
     match (latest, start_cursor) {
         (Some(l), Some(s)) => l > s,
-        (Some(_), None) => true,
-        (None, _) => false,
+        _ => false,
     }
 }
 
@@ -371,7 +446,7 @@ fn build_notify_body(
     instance_key: &str,
     device_id: &str,
     session_id: &SessionId,
-    key: &[u8; PUSH_KEY_LEN],
+    key: &[u8; aead::KEY_LEN],
     preview: &str,
 ) -> Result<NotifyBody, String> {
     let (nonce, ciphertext) =
@@ -478,7 +553,7 @@ mod tests {
 
     #[test]
     fn notify_body_is_decryptable_with_the_push_key() {
-        let key = [9u8; PUSH_KEY_LEN];
+        let key = [9u8; aead::KEY_LEN];
         let preview = r#"{"title":"Baybo","body":"the agent finished"}"#;
         let body = build_notify_body("inst-A", "dev-1", &SessionId::from("sess-7"), &key, preview)
             .unwrap();
@@ -506,8 +581,8 @@ mod tests {
         );
         assert!(!landed(Some(3), Some(4)), "stale latest → wait");
         assert!(
-            landed(Some(9), None),
-            "no start cursor → best-effort accept"
+            !landed(Some(9), None),
+            "no start cursor → hold the placeholder (never a stale preview)"
         );
         assert!(!landed(None, Some(4)), "empty session → wait");
     }
@@ -528,7 +603,7 @@ mod tests {
 
     #[test]
     fn notify_body_uses_a_fresh_nonce_each_time() {
-        let key = [1u8; PUSH_KEY_LEN];
+        let key = [1u8; aead::KEY_LEN];
         let s = SessionId::from("s");
         let a = build_notify_body("i", "d", &s, &key, "same").unwrap();
         let b = build_notify_body("i", "d", &s, &key, "same").unwrap();
@@ -554,7 +629,7 @@ mod tests {
 
     #[test]
     fn register_url_is_derived_from_gateway_url() {
-        let r = HttpApnsRegistrar::new("https://remote.example/", "inst-A");
+        let r = HttpApnsRegistrar::new("https://remote.example/", "inst-A", reqwest::Client::new());
         assert_eq!(r.register_url, "https://remote.example/register");
     }
 }

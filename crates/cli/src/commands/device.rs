@@ -36,8 +36,22 @@ fn require_service(ctx: &CommandContext) -> Result<&Arc<DevicePairingService>> {
     })
 }
 
-async fn pair(ctx: &CommandContext, label: String, user: String) -> Result<CommandOutput> {
+/// The local operator's user id — the same `$USER`/`$USERNAME` derivation
+/// `prompt`/`tui` turns run as, so a device paired with no `--user` is owned by
+/// the identity whose completed turns should push to it.
+fn operator_user_id() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "baybo-cli".to_string())
+}
+
+async fn pair(
+    ctx: &CommandContext,
+    label: String,
+    user: Option<String>,
+) -> Result<CommandOutput> {
     let svc = require_service(ctx)?;
+    let user = user.unwrap_or_else(operator_user_id);
     let code = svc
         .mint(&user, &label)
         .await

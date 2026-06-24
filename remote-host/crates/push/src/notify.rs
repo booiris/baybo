@@ -9,10 +9,12 @@
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::apns::{ApnsEnv, ApnsOutcome, ApnsRequest, ApnsSender};
+use crate::error::PushError;
 use crate::jwt::ApnsProviderToken;
 use crate::store::{Admission, DeviceRegistration, DeviceTokenStore};
 
@@ -72,6 +74,9 @@ pub struct NotifyService {
     store: Arc<dyn DeviceTokenStore>,
     sender: Arc<dyn ApnsSender>,
     signer: Arc<ApnsProviderToken>,
+    /// The last signed provider JWT and its `iat`, reused across requests until
+    /// it ages past the refresh window (APNs accepts a token for up to an hour).
+    cached_jwt: Mutex<Option<(String, u64)>>,
     /// Published app bundle id (`apns-topic`).
     topic: String,
 }
@@ -89,8 +94,24 @@ impl NotifyService {
             store,
             sender,
             signer,
+            cached_jwt: Mutex::new(None),
             topic: topic.into(),
         }
+    }
+
+    /// A provider JWT valid at `now`, re-signing (and caching) only when the
+    /// cached one is missing or older than [`crate::jwt::TOKEN_REFRESH_SECS`].
+    /// APNs accepts a token for ~an hour, so this signs roughly once per refresh
+    /// window instead of an ES256 signature per push.
+    fn provider_jwt(&self, now: u64) -> Result<String, PushError> {
+        if let Some((jwt, issued_at)) = self.cached_jwt.lock().as_ref()
+            && !ApnsProviderToken::needs_refresh(*issued_at, now)
+        {
+            return Ok(jwt.clone());
+        }
+        let jwt = self.signer.sign(now)?;
+        *self.cached_jwt.lock() = Some((jwt.clone(), now));
+        Ok(jwt)
     }
 
     /// Bind (or rebind) a device's APNs token, authenticated by the gateway's
@@ -100,6 +121,7 @@ impl NotifyService {
             return RegisterOutcome::Unadmitted;
         }
         self.store.register(
+            &req.instance_key,
             &req.device_id,
             DeviceRegistration {
                 apns_token: req.apns_token,
@@ -114,10 +136,10 @@ impl NotifyService {
         if !self.admission.is_admitted(&req.instance_key) {
             return NotifyOutcome::Unadmitted;
         }
-        let Some(reg) = self.store.get(&req.device_id) else {
+        let Some(reg) = self.store.get(&req.instance_key, &req.device_id) else {
             return NotifyOutcome::UnknownDevice;
         };
-        let jwt = match self.signer.sign(now) {
+        let jwt = match self.provider_jwt(now) {
             Ok(j) => j,
             Err(e) => return NotifyOutcome::Failed(e.to_string()),
         };
@@ -133,7 +155,7 @@ impl NotifyService {
             ApnsOutcome::Delivered => NotifyOutcome::Delivered,
             ApnsOutcome::BadDeviceToken | ApnsOutcome::Unregistered { .. } => {
                 // Unbind the APNs token only — never the gateway's device row.
-                self.store.unbind(&req.device_id);
+                self.store.unbind(&req.instance_key, &req.device_id);
                 NotifyOutcome::Pruned
             }
             ApnsOutcome::TransientError(e) => NotifyOutcome::Failed(e),
@@ -237,7 +259,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             RegisterOutcome::Registered,
         );
         assert_eq!(
-            store.get("dev-9").unwrap(),
+            store.get("inst-A", "dev-9").unwrap(),
             DeviceRegistration {
                 apns_token: "tok-9".into(),
                 env: ApnsEnv::Production,
@@ -254,7 +276,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             }),
             RegisterOutcome::Unadmitted,
         );
-        assert!(store.get("dev-x").is_none());
+        assert!(store.get("inst-A", "dev-x").is_none());
     }
 
     #[tokio::test]
@@ -281,6 +303,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
     async fn happy_path_builds_blind_payload_and_delivers() {
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         store.register(
+            "inst-A",
             "dev-1",
             DeviceRegistration {
                 apns_token: "apns-tok-xyz".into(),
@@ -314,6 +337,7 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
     async fn bad_token_prunes_binding() {
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         store.register(
+            "inst-A",
             "dev-1",
             DeviceRegistration {
                 apns_token: "dead".into(),
@@ -325,13 +349,14 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             svc.notify(req("inst-A", "dev-1"), 1000).await,
             NotifyOutcome::Pruned,
         );
-        assert!(store.get("dev-1").is_none(), "dead token unbound");
+        assert!(store.get("inst-A", "dev-1").is_none(), "dead token unbound");
     }
 
     #[tokio::test]
     async fn unregistered_410_prunes_binding() {
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         store.register(
+            "inst-A",
             "dev-1",
             DeviceRegistration {
                 apns_token: "gone".into(),
@@ -348,13 +373,14 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             svc.notify(req("inst-A", "dev-1"), 1000).await,
             NotifyOutcome::Pruned,
         );
-        assert!(store.get("dev-1").is_none());
+        assert!(store.get("inst-A", "dev-1").is_none());
     }
 
     #[tokio::test]
     async fn transient_error_keeps_binding() {
         let store = Arc::new(InMemoryDeviceTokenStore::new());
         store.register(
+            "inst-A",
             "dev-1",
             DeviceRegistration {
                 apns_token: "live".into(),
@@ -369,6 +395,63 @@ SYW9s/UKX8shed4rIxRqMe3POJIY7OsF06EEtnyLrMjJg53H5HWAe2Mh
             svc.notify(req("inst-A", "dev-1"), 1000).await,
             NotifyOutcome::Failed("503".into()),
         );
-        assert!(store.get("dev-1").is_some(), "transient error must not prune");
+        assert!(store.get("inst-A", "dev-1").is_some(), "transient error must not prune");
+    }
+
+    #[tokio::test]
+    async fn provider_token_cached_within_window_and_refreshed_after() {
+        let store = Arc::new(InMemoryDeviceTokenStore::new());
+        store.register(
+            "inst-A",
+            "dev-1",
+            DeviceRegistration {
+                apns_token: "t".into(),
+                env: ApnsEnv::Sandbox,
+            },
+        );
+        let sender = Arc::new(MockApns::new(ApnsOutcome::Delivered));
+        let svc = service(Arc::clone(&sender), store);
+
+        svc.notify(req("inst-A", "dev-1"), 1000).await;
+        let jwt1 = sender.last.lock().clone().unwrap().provider_jwt;
+        // A later push inside the refresh window reuses the same signed token.
+        svc.notify(req("inst-A", "dev-1"), 1000 + 60).await;
+        let jwt2 = sender.last.lock().clone().unwrap().provider_jwt;
+        assert_eq!(jwt1, jwt2, "token reused within the refresh window");
+        // Past the window it is re-signed (new `iat`).
+        svc.notify(req("inst-A", "dev-1"), 1000 + crate::jwt::TOKEN_REFRESH_SECS + 1)
+            .await;
+        let jwt3 = sender.last.lock().clone().unwrap().provider_jwt;
+        assert_ne!(jwt1, jwt3, "token re-signed past the refresh window");
+    }
+
+    #[tokio::test]
+    async fn an_instance_cannot_touch_another_tenants_device() {
+        let store: Arc<dyn DeviceTokenStore> = Arc::new(InMemoryDeviceTokenStore::new());
+        store.register(
+            "inst-A",
+            "dev-1",
+            DeviceRegistration {
+                apns_token: "owned-by-A".into(),
+                env: ApnsEnv::Sandbox,
+            },
+        );
+        // Both instances are admitted, but the store partitions by instance, so
+        // inst-B sees no binding for dev-1 — no hijack, no suppression.
+        let svc = NotifyService::new(
+            Arc::new(InMemoryAdmission::with_keys(["inst-A", "inst-B"])),
+            Arc::clone(&store),
+            Arc::new(MockApns::new(ApnsOutcome::Delivered)),
+            signer(),
+            "com.baybo.app",
+        );
+        assert_eq!(
+            svc.notify(req("inst-B", "dev-1"), 1000).await,
+            NotifyOutcome::UnknownDevice,
+        );
+        assert_eq!(
+            svc.notify(req("inst-A", "dev-1"), 1000).await,
+            NotifyOutcome::Delivered,
+        );
     }
 }

@@ -542,9 +542,11 @@ pub enum DeviceCmd {
     Pair {
         /// Device label for the operator's list ("Booiris iPhone").
         label: String,
-        /// Owning user id. Defaults to the local operator.
-        #[arg(long, default_value = "local")]
-        user: String,
+        /// Owning user id. Defaults to the local operator ($USER/$USERNAME) —
+        /// the same identity CLI/TUI turns run as, so the device matches the
+        /// sessions whose completed turns should push to it.
+        #[arg(long)]
+        user: Option<String>,
     },
     /// Approve a pending device by its pairing code, activating its (until
     /// now inert) auth token.

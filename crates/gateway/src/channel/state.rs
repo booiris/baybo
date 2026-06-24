@@ -138,12 +138,26 @@ impl WsChannelState {
             Vec::new()
         };
         let push = &deps.config.gateway.push;
+        // Proxy-aware client (the egress proxy applies to the C `/register`
+        // POST). `from_deps` is infallible, so a malformed proxy degrades to
+        // None — the same misconfig fails loudly when the dispatcher is built.
         let apns_registrar: Option<Arc<dyn crate::push::ApnsRegistrar>> =
             if push.enabled && !push.gateway_url.is_empty() {
-                Some(Arc::new(crate::push::HttpApnsRegistrar::new(
-                    &push.gateway_url,
-                    push.instance_key.clone(),
-                )))
+                let proxy =
+                    deps.config
+                        .proxy
+                        .as_ref()
+                        .map(|p| baybo_security::http::ProxySettings {
+                            url: p.url.clone(),
+                            no_proxy: p.no_proxy.clone(),
+                        });
+                baybo_security::http::client(proxy.as_ref()).ok().map(|client| {
+                    Arc::new(crate::push::HttpApnsRegistrar::new(
+                        &push.gateway_url,
+                        push.instance_key.clone(),
+                        client,
+                    )) as Arc<dyn crate::push::ApnsRegistrar>
+                })
             } else {
                 None
             };

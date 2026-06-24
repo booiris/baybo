@@ -83,6 +83,13 @@ impl DevicePairingService {
         device_id: &str,
         device_pubkey: Vec<u8>,
     ) -> Result<DeviceRow, DevicePairingError> {
+        // Atomically consume the single-use slot up front: two clients that
+        // scanned the same live code race here, and the loser gets `false` and
+        // is refused — so one code mints at most one device row (and a consumed
+        // code can't be replayed).
+        if !self.slots.delete_slot(&slot.code).await? {
+            return Err(DevicePairingError::SlotConsumed);
+        }
         let now = Utc::now().timestamp();
         let row = DeviceRow {
             user_id: slot.user_id.clone(),
@@ -97,8 +104,6 @@ impl DevicePairingService {
             last_seen_at: None,
         };
         self.devices.create(&row).await?;
-        // Slot is single-use; drop it so the code can't be replayed.
-        self.slots.delete_slot(&slot.code).await?;
         Ok(row)
     }
 
@@ -196,6 +201,24 @@ mod tests {
         let listed = svc.list(Some(DeviceStatus::Approved)).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].device_id, "dev-abc");
+    }
+
+    #[tokio::test]
+    async fn one_code_mints_at_most_one_device() {
+        let svc = service();
+        let code = svc.mint("user-1", "Phone").await.unwrap();
+        // Two clients both read the same live slot before either finalized.
+        let slot = svc.claim_slot(&code).await.unwrap().unwrap();
+        // The first finalize atomically consumes the slot; the second is refused,
+        // so the code can't mint a second approvable device.
+        svc.complete(&slot, "dev-1", vec![1u8; 32]).await.unwrap();
+        assert!(matches!(
+            svc.complete(&slot, "dev-2", vec![2u8; 32]).await,
+            Err(DevicePairingError::SlotConsumed),
+        ));
+        let all = svc.list(None).await.unwrap();
+        assert_eq!(all.len(), 1, "exactly one device row from one code");
+        assert_eq!(all[0].device_id, "dev-1");
     }
 
     #[tokio::test]
