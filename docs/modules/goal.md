@@ -62,9 +62,16 @@ run loop, not a user message.
   a distinct `JobInput::GoalContinuation` (a fourth axis alongside `UserChat` /
   `Cron` / `Spawned`), so the job's `origin` records that the turn was
   goal-driven rather than user-driven. The continuation steering text is framed
-  and appended by a new `AgentLoop::append_goal_continuation` (sibling of
-  `append_cron_fire` / `append_subagent_notification`), keeping framing on the
-  loop side.
+  by `AgentLoop::set_goal_continuation_steering` and injected as a **transient
+  request tail** (`ContextManager::set_goal_steering`, the same mechanism as the
+  task-planning reminder): re-derived from the live goal each turn, it rides at
+  the end of every request that turn but is never written to `session_messages`,
+  so stale steerings can't accumulate. It is cleared
+  (`clear_goal_continuation_steering`) once the turn ends. The call's trace
+  records the steering as the `LlmCall` span's `input_messages` suffix plus a
+  compact `goal_steering` audit (template kind, goal snapshot, content SHA), so a
+  reviewer can see which steering the model saw each turn without it living in
+  the transcript.
 
 ### A dedicated `session_goals` table, one current goal per session
 
@@ -193,8 +200,8 @@ completes from every channel.
 
 Setting an objective records it as a `User` transcript row, so the objective
 joins the agent-loop context and the session reloads with a real `last_user_text`
-title instead of "New conversation" (the continuation steering is in-memory only,
-leaving no user-authored row otherwise). The control-only subcommands
+title instead of "New conversation" (the continuation steering is a transient
+request tail, never a stored row, leaving no user-authored row otherwise). The control-only subcommands
 (`view`/`pause`/`resume`/`clear`) persist a command echo + confirmation as
 out-of-band control events, like `/compact`.
 
@@ -317,7 +324,7 @@ backstop; there is no per-feature kill switch.
 | `store` | Owns the `GoalStore` trait + `GoalPatch` |
 | `storage` | `LibsqlGoalStore` + the `session_goals` DDL; `goal` field on the `Store` bundle |
 | `cost` | `CostManager::check` is the spend backstop (`SpendCapped`); per-turn token billing feeds `tokens_used` |
-| `agent` | `src/runtime.rs` registers `aura_goal::tools::agent_tools(stores.goal)`; the actor hosts the continuation loop (turn-boundary re-fire, accounting, failure/reaper handling), the `/goal` command, and the `/stop` interaction; `AgentLoop::append_goal_continuation` frames the steering |
+| `agent` | `src/runtime.rs` registers `aura_goal::tools::agent_tools(stores.goal)`; the actor hosts the continuation loop (turn-boundary re-fire, accounting, failure/reaper handling), the `/goal` command, and the `/stop` interaction; `AgentLoop::set_goal_continuation_steering` frames the steering as a transient request tail |
 | `job` | `JobInput::GoalContinuation` — the self-initiated turn's job axis |
 | `channels` | `/goal` command consts + the `AgentEvent::Notice` lifecycle messages + the goal-banner wire types |
 | `gateway` | Publishes `/goal` in the slash manifest; the `GET` goal endpoint + goal-updated event; the web banner + dashboard goals column |

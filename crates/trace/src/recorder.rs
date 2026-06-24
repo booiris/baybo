@@ -357,6 +357,7 @@ mod tests {
                 provider_config_hash: "h".into(),
                 input_messages: crate::LlmCallInputs::empty(),
                 temperature: None,
+                goal_steering: None,
             },
             result: None,
         }

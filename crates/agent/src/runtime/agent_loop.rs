@@ -19,7 +19,8 @@ use tokio::sync::mpsc;
 use aura_model::{LineageKind, Session, TriggerSource};
 use aura_tools::{ToolConcurrency, ToolOutput, ToolRegistry};
 use aura_trace::{
-    LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle, StepKind,
+    GoalSteeringAudit, LifecycleOutcome, LlmCallBegin, LlmCallResult, SpanRecorder, StepHandle,
+    StepKind,
 };
 use tracing::{debug, error, info, warn};
 
@@ -1413,6 +1414,9 @@ impl AgentLoop {
                 provider_config_hash: String::new(),
                 input_messages,
                 temperature: None,
+                // `Some` only on a goal-continuation call (the context manager
+                // holds the steering audit for the turn); `None` otherwise.
+                goal_steering: self.context_manager.goal_steering_audit(),
             },
             Some((cancel_token, aura_job::CancelReason::ParentCancelled)),
             |span| async move {
@@ -1899,32 +1903,28 @@ impl AgentLoop {
         self.context_manager.append_in_memory(&msg);
     }
 
-    /// Append the framed goal continuation steering **in-memory only** (the analog
-    /// of [`Self::append_subagent_notification`]). It is re-derived from the live
-    /// goal every turn, so persisting it would stack identical `GoalSteering` rows
-    /// in `session_messages` without bound; in-memory also lets a failed turn roll
-    /// the row back. Only the model's proactive reply is persisted. `content` is
-    /// built via `aura_goal::prompts`.
-    pub fn append_goal_continuation(&mut self, content: Vec<ContentBlock>) {
-        let seeded = self
-            .context_manager
-            .messages()
-            .first()
-            .is_some_and(|m| m.role == Role::System);
-        debug_assert!(
-            seeded,
-            "append_goal_continuation requires the system prompt already seeded \
-             (call ensure_system_prompt_seeded before snapshotting)"
-        );
-        if !seeded {
-            error!(
-                "append_goal_continuation called before the system prompt was seeded; \
-                 dropping the in-memory steering to keep the transcript prefix intact"
-            );
-            return;
-        }
-        let msg = ChatMessage::goal_steering(content);
-        self.context_manager.append_in_memory(&msg);
+    /// Set the framed goal-continuation steering for the upcoming turn. It is a
+    /// **transient tail** ([`ContextManager::set_goal_steering`]): re-derived from
+    /// the live goal every turn, it rides at the end of every request this turn
+    /// ([`ContextManager::messages_for_llm`]) and is recorded as the call's trace
+    /// `suffix`, but is never written to `session_messages`. Replacing a single
+    /// slot each turn means stale steerings can't accumulate; only the model's
+    /// proactive reply is persisted. Clear it with
+    /// [`Self::clear_goal_continuation_steering`] once the turn ends. `content`
+    /// is built via `aura_goal::prompts`.
+    pub fn set_goal_continuation_steering(
+        &mut self,
+        content: Vec<ContentBlock>,
+        audit: GoalSteeringAudit,
+    ) {
+        self.context_manager
+            .set_goal_steering(Some(ChatMessage::goal_steering(content)), Some(audit));
+    }
+
+    /// Clear the transient goal-continuation steering once a continuation turn
+    /// has run, so it can't leak into a subsequent user / cron turn.
+    pub fn clear_goal_continuation_steering(&mut self) {
+        self.context_manager.set_goal_steering(None, None);
     }
 
     /// Run a streaming chat request, forwarding each text chunk through

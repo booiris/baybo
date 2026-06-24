@@ -167,6 +167,7 @@ impl ProgressObserverRunner {
             // context snapshot.
             input_messages: input_marker,
             temperature: request.temperature,
+            goal_steering: None,
         };
 
         let recorder_inner = Arc::clone(&recorder);

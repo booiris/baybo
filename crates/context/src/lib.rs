@@ -78,7 +78,7 @@ use aura_skills::{
     SKILL_INPUT_NAME_FIELD, SKILL_TOOL_NAME, SkillDefinition, SkillRegistry, SkillSummary,
     render_skill_for_slash,
 };
-use aura_trace::LlmCallInputs;
+use aura_trace::{GoalSteeringAudit, LlmCallInputs};
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 
@@ -225,6 +225,26 @@ pub struct ContextManager {
     /// reminder to the compression decision) and [`Self::record_call_actual`]
     /// subtracts it so the provider-anchored baseline stays messages-only.
     task_reminder_raw: usize,
+    /// Transient per-turn goal-continuation steering (`MessageSource::GoalSteering`).
+    /// Re-derived from the live goal every continuation turn and held OUT of
+    /// `self.messages` for the same reasons as [`Self::task_reminder`]: it is
+    /// never persisted, survives compaction for free, and — crucially —
+    /// replacing a single `Option` each turn means stale steerings can't
+    /// accumulate in the transcript (the failure mode if it were appended as a
+    /// row). [`Self::messages_for_llm`] appends it at the tail so the model sees
+    /// it on every step of the turn; [`Self::build_call_input_marker`] records it
+    /// as the call's `suffix` so the trace stays compact yet auditable.
+    goal_steering: Option<ChatMessage>,
+    /// Cached raw tokenizer count of `goal_steering` (0 when `None`), folded into
+    /// the budget estimate and subtracted from the provider-anchored baseline
+    /// exactly like [`Self::task_reminder_raw`].
+    goal_steering_raw: usize,
+    /// Compact audit of the current `goal_steering` (which template, the live
+    /// goal snapshot, a content fingerprint) — recorded on the `LlmCall` span so
+    /// the trace shows *which version* of the steering the model saw each turn.
+    /// Set/cleared in lockstep with `goal_steering`; read by
+    /// [`Self::goal_steering_audit`] at call-build time.
+    goal_steering_audit: Option<GoalSteeringAudit>,
 }
 
 /// Required dependencies for [`ContextManager::from_config`]. Plain
@@ -281,6 +301,9 @@ impl ContextManager {
             last_synced_cursor: None,
             task_reminder: None,
             task_reminder_raw: 0,
+            goal_steering: None,
+            goal_steering_raw: 0,
+            goal_steering_audit: None,
         }
     }
 
@@ -314,18 +337,21 @@ impl ContextManager {
                     | aura_model::MessageSource::RecalledMemory
             )
         });
-        // The task reminder is appended at the tail (after framing, before
-        // coalescing) so adjacent-role merging applies to it like any other
-        // row. The no-framing / no-reminder path stays clone-free.
+        // The transient task reminder and goal steering are appended at the tail
+        // (after framing, before coalescing) so adjacent-role merging applies to
+        // them like any other row. The no-framing / no-tail path stays clone-free.
         let mut base = if needs_framing {
             frame_recalled_memories(&frame_interjections(&self.messages))
-        } else if self.task_reminder.is_some() {
+        } else if self.task_reminder.is_some() || self.goal_steering.is_some() {
             self.messages.clone()
         } else {
             return merge_for_llm(&self.messages);
         };
         if let Some(reminder) = &self.task_reminder {
             base.push(reminder.clone());
+        }
+        if let Some(steering) = &self.goal_steering {
+            base.push(steering.clone());
         }
         merge_for_llm(&base)
     }
@@ -350,6 +376,32 @@ impl ContextManager {
         // Charge the (possibly resized) reminder to the budget now so the
         // compression gate this turn sees the real request size.
         self.budget.update(self.count_tokens());
+    }
+
+    /// Set (or clear with `None`) the transient goal-continuation steering
+    /// injected at the tail of every LLM request for the turn, together with its
+    /// trace `audit`. Re-derived from the live goal each continuation turn and
+    /// replaced wholesale, so old steerings never accumulate. Never persisted and
+    /// never added to `self.messages`, mirroring [`Self::refresh_task_reminder`].
+    pub fn set_goal_steering(
+        &mut self,
+        steering: Option<ChatMessage>,
+        audit: Option<GoalSteeringAudit>,
+    ) {
+        self.goal_steering_raw = steering
+            .as_ref()
+            .map_or(0, |m| self.tokenizer.count_message(m));
+        self.goal_steering = steering;
+        self.goal_steering_audit = audit;
+        // Charge the steering to the budget now so the compression gate this
+        // turn sees the real request size.
+        self.budget.update(self.count_tokens());
+    }
+
+    /// The audit for the steering injected on the upcoming call, if any — folded
+    /// into the `LlmCall` span's begin record so the trace is self-describing.
+    pub fn goal_steering_audit(&self) -> Option<GoalSteeringAudit> {
+        self.goal_steering_audit.clone()
     }
 
     /// Resolve the system prompt to seed the leading `Role::System` row. The
@@ -628,13 +680,14 @@ impl ContextManager {
         if actual_input_tokens == 0 {
             return;
         }
-        // The provider's count includes the transient task reminder (it's in the
-        // request), but `count_tokens` re-adds the *current* reminder on top of
-        // the baseline. Subtract it here so the baseline tracks the stored
-        // transcript only — otherwise a large checklist is counted twice. Only
-        // the main-turn call records actuals; the compression call (no reminder)
-        // never reaches here.
-        let actual_messages = actual_input_tokens.saturating_sub(self.task_reminder_raw);
+        // The provider's count includes the transient task reminder and goal
+        // steering (they're in the request), but `count_tokens` re-adds the
+        // *current* tail on top of the baseline. Subtract it here so the baseline
+        // tracks the stored transcript only — otherwise a large checklist/steering
+        // is counted twice. Only the main-turn call records actuals; the
+        // compression call (no tail) never reaches here.
+        let actual_messages =
+            actual_input_tokens.saturating_sub(self.task_reminder_raw + self.goal_steering_raw);
         if let Some(model_id) = self.current_model.read().as_deref() {
             let raw = self.raw_estimate();
             self.calibration.observe(model_id, raw, actual_messages);
@@ -1244,7 +1297,18 @@ impl ContextManager {
     /// every turn. Falls back to `Inline(messages)` when the store
     /// has no rows yet (fresh session) or the lookup errors.
     pub async fn build_call_input_marker(&self) -> LlmCallInputs {
-        self.input_marker_with_suffix(Vec::new()).await
+        // The transient tail (task reminder, then goal steering) rides in the
+        // request via `messages_for_llm` but isn't in `self.messages`; pass it as
+        // the marker suffix — in the same order — so hydration reconstructs the
+        // exact `request.messages` the LLM saw rather than dropping it.
+        let mut suffix = Vec::new();
+        if let Some(reminder) = &self.task_reminder {
+            suffix.push(reminder.clone());
+        }
+        if let Some(steering) = &self.goal_steering {
+            suffix.push(steering.clone());
+        }
+        self.input_marker_with_suffix(suffix).await
     }
 
     /// Like [`build_call_input_marker`](Self::build_call_input_marker) but
@@ -1318,11 +1382,11 @@ impl ContextManager {
     /// cold start, or after compression, or if the message list
     /// shrank below the anchor.
     fn count_tokens(&self) -> usize {
-        // The transient task reminder rides in the real request but isn't a
-        // stored message, so fold its raw count into the estimate (the baseline
-        // is kept reminder-free by `record_call_actual`, so this isn't double
-        // counted).
-        let reminder = self.task_reminder_raw;
+        // The transient task reminder and goal steering ride in the real request
+        // but aren't stored messages, so fold their raw counts into the estimate
+        // (the baseline is kept tail-free by `record_call_actual`, so this isn't
+        // double counted).
+        let reminder = self.task_reminder_raw + self.goal_steering_raw;
         let snapshot = *self.baseline.read();
         if let Some(b) = snapshot
             && self.messages.len() >= b.message_count_at_call
@@ -2154,6 +2218,67 @@ mod tests {
                 );
             }
             other => panic!("expected Inline fallback, got {other:?}"),
+        }
+    }
+
+    /// A goal continuation sets its steering as a transient tail (not a stored
+    /// row), so the active set still mirrors `self.messages`: the marker keeps
+    /// referencing the persisted prefix by ordinal and rides the steering inline
+    /// as the `suffix` — compact yet exactly auditable, no Inline-the-whole-window
+    /// bloat. `messages_for_llm` appends it at the tail so the model sees it every
+    /// step; clearing it returns to a bare marker (no accumulation).
+    #[tokio::test]
+    async fn goal_steering_rides_as_marker_suffix_not_in_messages() {
+        let mut ctx = make_ctx(5, 100_000, 0.75);
+        ctx.append(&make_msg(Role::System, "sys")).await; // active = 1
+        ctx.append(&make_msg(Role::User, "/goal climb")).await; // active = 2
+        ctx.append(&make_msg(Role::Assistant, "working")).await; // active = 3
+
+        ctx.set_goal_steering(
+            Some(ChatMessage::goal_steering(vec![ContentBlock::Text(
+                "continue working toward the objective".into(),
+            )])),
+            None,
+        );
+
+        // The steering is NOT a stored row, but it DOES ride at the tail.
+        assert_eq!(
+            ctx.messages().len(),
+            3,
+            "steering must not enter self.messages"
+        );
+        let request = ctx.messages_for_llm();
+        assert_eq!(
+            request.len(),
+            4,
+            "messages_for_llm appends the steering at the tail"
+        );
+        assert!(
+            request.last().is_some_and(|m| m
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("continue working")))),
+            "the tail message must be the steering"
+        );
+
+        // The marker stays Persisted; the steering rides as the suffix so the
+        // trace reconstructs exactly what the LLM saw.
+        match ctx.build_call_input_marker().await {
+            LlmCallInputs::Persisted {
+                prefix_len, suffix, ..
+            } => {
+                assert_eq!(prefix_len, 3, "persisted prefix = the three stored rows");
+                assert_eq!(suffix.len(), 1, "the steering rides as the only suffix row");
+            }
+            other => panic!("expected Persisted with a steering suffix, got {other:?}"),
+        }
+
+        // Clearing returns to a bare persisted marker with no tail.
+        ctx.set_goal_steering(None, None);
+        assert_eq!(ctx.messages_for_llm().len(), 3);
+        match ctx.build_call_input_marker().await {
+            LlmCallInputs::Persisted { suffix, .. } => assert!(suffix.is_empty()),
+            other => panic!("expected bare Persisted after clear, got {other:?}"),
         }
     }
 

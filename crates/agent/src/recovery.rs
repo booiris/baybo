@@ -404,6 +404,7 @@ mod tests {
                 provider_config_hash: String::new(),
                 input_messages: LlmCallInputs::empty(),
                 temperature: None,
+                goal_steering: None,
             },
             result: None,
         }

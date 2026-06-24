@@ -1,11 +1,34 @@
-//! Pure `/goal` command parsing and the user-facing lifecycle notice text. The
-//! actor ([`super`]) owns the continuation engine and drives these; keeping the
-//! stateless parse/render layer here keeps that engine readable.
+//! Pure `/goal` command parsing, the user-facing lifecycle notice text, and the
+//! trace steering audit. The actor ([`super`]) owns the continuation engine and
+//! drives these; keeping the stateless parse/render layer here keeps that engine
+//! readable.
 
 use aura_channels::{
     GOAL_BUDGET_FLAG, GOAL_CLEAR_SUBCOMMAND, GOAL_PAUSE_SUBCOMMAND, GOAL_RESUME_SUBCOMMAND,
 };
 use aura_model::Goal;
+use aura_trace::{GoalSteeringAudit, GoalSteeringKind};
+use sha2::{Digest, Sha256};
+
+/// Build the trace audit for a rendered goal-continuation steering: the template
+/// `kind`, the live goal snapshot whose values it interpolated, and a SHA-256
+/// fingerprint of the rendered text. Recorded on the turn's `LlmCall` span (see
+/// [`aura_trace::GoalSteeringAudit`]) so the trace shows which steering the model
+/// saw without persisting the full text to `session_messages`.
+pub(super) fn steering_audit(
+    kind: GoalSteeringKind,
+    goal: &Goal,
+    rendered: &str,
+) -> GoalSteeringAudit {
+    GoalSteeringAudit {
+        kind,
+        status: goal.status.as_str().to_string(),
+        tokens_used: goal.tokens_used,
+        token_budget: goal.token_budget,
+        content_sha: hex::encode(Sha256::digest(rendered.as_bytes())),
+        content_len: rendered.len(),
+    }
+}
 
 /// Parsed form of a `/goal` command (everything after the leading `/goal`).
 #[derive(Debug, PartialEq, Eq)]
@@ -188,6 +211,36 @@ mod tests {
             parse_goal_command("/goal Clear"),
             GoalCommand::Clear
         ));
+    }
+
+    #[test]
+    fn steering_audit_captures_kind_snapshot_and_sha() {
+        let now = chrono::Utc::now();
+        let goal = Goal {
+            id: aura_model::GoalId::new(),
+            objective: "ship it".into(),
+            status: aura_model::GoalStatus::BudgetLimited,
+            token_budget: Some(5_000),
+            tokens_used: 1_234,
+            time_used_seconds: 42,
+            created_at: now,
+            updated_at: now,
+        };
+        let rendered = "continue working toward the objective";
+        let audit = steering_audit(GoalSteeringKind::BudgetLimit, &goal, rendered);
+
+        assert_eq!(audit.kind, GoalSteeringKind::BudgetLimit);
+        assert_eq!(audit.status, "budget_limited");
+        assert_eq!(audit.tokens_used, 1_234);
+        assert_eq!(audit.token_budget, Some(5_000));
+        assert_eq!(audit.content_len, rendered.len());
+        // SHA-256: 64 hex chars, deterministic, keyed on the rendered text (not
+        // the kind) so a reviewer can tell when the steering content changed.
+        assert_eq!(audit.content_sha.len(), 64);
+        assert_eq!(
+            audit.content_sha,
+            steering_audit(GoalSteeringKind::Continuation, &goal, rendered).content_sha,
+        );
     }
 
     #[test]

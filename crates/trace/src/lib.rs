@@ -28,8 +28,9 @@ pub use event::{SpanEvent, SpanEventKind, ToolEventPayload};
 pub use outcome::{LifecycleOutcome, LifecycleState};
 pub use recorder::{SpanRecorder, TraceEvent, TraceEventStream};
 pub use span::{
-    LlmCallBegin, LlmCallInputs, LlmCallResult, LlmToolCallRecord, Span, SpanFinalize, SpanHandle,
-    SpanKind, ToolCallBegin, ToolCallOrigin, ToolCallResult,
+    GoalSteeringAudit, GoalSteeringKind, LlmCallBegin, LlmCallInputs, LlmCallResult,
+    LlmToolCallRecord, Span, SpanFinalize, SpanHandle, SpanKind, ToolCallBegin, ToolCallOrigin,
+    ToolCallResult,
 };
 pub use step::{Step, StepHandle, StepKind};
 

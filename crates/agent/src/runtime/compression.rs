@@ -98,6 +98,7 @@ impl CompressionRunner {
             // it's the layer that knows which slice is persisted.
             input_messages: input_marker,
             temperature: request.temperature,
+            goal_steering: None,
         };
 
         let recorder_inner = Arc::clone(&recorder);

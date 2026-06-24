@@ -94,6 +94,39 @@ impl SpanKind {
     }
 }
 
+/// Which steering template drove a goal-continuation call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalSteeringKind {
+    /// The standard per-turn continuation prompt.
+    Continuation,
+    /// The per-goal token budget was reached — the wind-down turn.
+    BudgetLimit,
+    /// The objective was edited via `/goal <new objective>` this turn (the
+    /// objective-updated prompt prepended to the continuation).
+    ObjectiveUpdated,
+}
+
+/// Compact per-turn audit of the goal-continuation steering injected on this
+/// call. The full rendered text rides in [`LlmCallBegin::input_messages`] as the
+/// `suffix` (it is never written to `session_messages`); this records *which
+/// version* the model saw — the template `kind`, the live goal snapshot whose
+/// values were interpolated, and a `content_sha` fingerprint of the rendered
+/// text — so a reviewer can scan / group turns by steering version without
+/// re-reading the prompt each time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalSteeringAudit {
+    pub kind: GoalSteeringKind,
+    /// The goal's status when the steering was rendered (`active`, `budget_limited`, …).
+    pub status: String,
+    pub tokens_used: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+    /// Hex SHA-256 of the rendered steering text.
+    pub content_sha: String,
+    pub content_len: usize,
+}
+
 /// Begin-time data for an `LlmCall` span — set when the request is
 /// dispatched, never mutated afterwards.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -114,6 +147,10 @@ pub struct LlmCallBegin {
     pub input_messages: LlmCallInputs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Present only on a goal-continuation call: the steering audit (see
+    /// [`GoalSteeringAudit`]). `None` for every other call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_steering: Option<GoalSteeringAudit>,
 }
 
 /// Source of the `input_messages` for an `LlmCall` span.
@@ -314,6 +351,7 @@ mod tests {
                 provider_config_hash: "cfg-hash".into(),
                 input_messages: LlmCallInputs::empty(),
                 temperature: Some(0.7),
+                goal_steering: None,
             },
             result: None,
         }

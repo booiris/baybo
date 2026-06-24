@@ -60,9 +60,11 @@ const EMPTY_USER_REPLY_NOTICE: &str =
 use crate::actor::goal::{
     GoalCommand, budget_note, goal_blocked_text, goal_budget_reached_text, goal_complete_text,
     goal_paused_text, goal_set_text, goal_spend_capped_text, goal_status_text, parse_goal_command,
+    steering_audit,
 };
 use crate::actor::state::{DurableActorState, VolatileResources};
 use crate::actor::supervisor::ActorRegistryGuard;
+use aura_trace::{GoalSteeringAudit, GoalSteeringKind};
 
 /// Messages that can be sent to an AgentActor.
 #[derive(Debug, Clone)]
@@ -1343,14 +1345,18 @@ impl AgentActor {
             return self.run_goal_winddown(&goal).await;
         }
         let mut text = String::new();
-        if let Some(new_objective) = self.goal.pending_objective_update.take() {
+        let kind = if let Some(new_objective) = self.goal.pending_objective_update.take() {
             text.push_str(&aura_goal::prompts::frame_objective_updated(&new_objective));
             text.push_str("\n\n");
-        }
+            GoalSteeringKind::ObjectiveUpdated
+        } else {
+            GoalSteeringKind::Continuation
+        };
         text.push_str(&aura_goal::prompts::frame_continuation(&goal));
+        let audit = steering_audit(kind, &goal, &text);
         let content = vec![ContentBlock::Text(text)];
 
-        match self.run_one_goal_turn(content).await {
+        match self.run_one_goal_turn(content, audit).await {
             Ok(()) => {
                 // Re-read the LIVE status: the model may have marked the goal
                 // complete/blocked via `update_goal` during the turn, or a
@@ -1414,11 +1420,11 @@ impl AgentActor {
     /// write fails — so a still-`Active` goal backs off instead of being claimed
     /// stopped on a row that would immediately re-fire.
     async fn run_goal_winddown(&mut self, goal: &Goal) -> GoalTurnOutcome {
-        let content = vec![ContentBlock::Text(aura_goal::prompts::frame_budget_limit(
-            goal,
-        ))];
+        let text = aura_goal::prompts::frame_budget_limit(goal);
+        let audit = steering_audit(GoalSteeringKind::BudgetLimit, goal, &text);
+        let content = vec![ContentBlock::Text(text)];
         // Best-effort: the loop stops regardless of how the wind-down turn ends.
-        let _ = self.run_one_goal_turn(content).await;
+        let _ = self.run_one_goal_turn(content, audit).await;
         let after = self
             .volatile
             .goal_service
@@ -1470,17 +1476,24 @@ impl AgentActor {
     /// Streams its deltas / tool lifecycle through the session's response channel
     /// (unlike cron / subagent turns): a continuation runs in the user's *visible*
     /// chat, so the live execution must show as it happens, not only on reload.
-    async fn run_one_goal_turn(&mut self, content: Vec<ContentBlock>) -> anyhow::Result<()> {
+    async fn run_one_goal_turn(
+        &mut self,
+        content: Vec<ContentBlock>,
+        audit: GoalSteeringAudit,
+    ) -> anyhow::Result<()> {
         let tokens_before = self
             .volatile
             .cost_manager
             .session_tokens(&self.durable.session.id);
         let started = chrono::Utc::now();
         self.volatile.agent_loop.ensure_system_prompt_seeded().await;
-        let snapshot = self.volatile.agent_loop.context_snapshot();
+        // The steering is a transient request tail (not a stored row), so there
+        // is nothing to snapshot / roll back. Re-derived and replaced each turn,
+        // it can't accumulate; clear it after the turn (any outcome) so it never
+        // leaks into a later user / cron turn.
         self.volatile
             .agent_loop
-            .append_goal_continuation(content.clone());
+            .set_goal_continuation_steering(content.clone(), audit);
         let delta_tx = self.volatile.response_tx.clone();
         let result = self
             .run_agent_loop(
@@ -1491,6 +1504,7 @@ impl AgentActor {
                 None,
             )
             .await;
+        self.volatile.agent_loop.clear_goal_continuation_steering();
         // Accrue usage even on failure (tokens billed before the error still
         // count), and keep `last_active` fresh so the reaper leaves the actor
         // resident while the goal runs.
@@ -1505,11 +1519,7 @@ impl AgentActor {
                 }
                 Ok(())
             }
-            Err(e) => {
-                // Drop the in-memory steering row so a retry doesn't stack copies.
-                self.volatile.agent_loop.restore_context(snapshot);
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
