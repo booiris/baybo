@@ -164,6 +164,12 @@ impl DevicePairingService {
         Ok(self.devices.list(status).await?)
     }
 
+    /// List all pairing slots, newest first. The relay-pairing host manager
+    /// hosts a leg per live slot; callers filter expiry against their own `now`.
+    pub async fn list_slots(&self) -> Result<Vec<DevicePairingSlot>, DevicePairingError> {
+        Ok(self.slots.list_slots().await?)
+    }
+
     /// Reap expired pairing slots (janitor sweep).
     pub async fn purge_expired_slots(&self) -> Result<u64, DevicePairingError> {
         let now = Utc::now().timestamp();

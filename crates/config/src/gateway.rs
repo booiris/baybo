@@ -43,6 +43,22 @@ pub struct GatewayConfig {
     /// Blind remote-host push: when enabled, A POSTs an operator-encrypted
     /// lock-screen preview to the remote host (C) on every real user turn.
     pub push: PushConfig,
+    /// Relay-pairing: when enabled, A hosts pairing legs on the operator's relay
+    /// (C) so a phone behind a different network can pair via the proxy QR.
+    pub relay: RelayConfig,
+}
+
+/// A-side relay-pairing config (the `relay` block in `baybo.json`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct RelayConfig {
+    /// When false, the gateway hosts no relay pairing legs (direct dial only).
+    pub enabled: bool,
+    /// The relay's base WS URL, e.g. `wss://proxy.baybo.space:7777`.
+    pub url: String,
+    /// The gateway's admission key — a `RELAY_INSTANCE_KEYS` entry on the relay.
+    /// Typically the same key as [`PushConfig::instance_key`].
+    pub instance_key: String,
 }
 
 /// A-side direct-reachability config (the `direct` block in `baybo.json`).
@@ -81,6 +97,7 @@ impl Default for GatewayConfig {
             shutdown_grace_secs: 30,
             direct: DirectConfig::default(),
             push: PushConfig::default(),
+            relay: RelayConfig::default(),
         }
     }
 }

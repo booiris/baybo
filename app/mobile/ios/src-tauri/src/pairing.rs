@@ -75,11 +75,17 @@ pub async fn pair_begin(
     endpoint: &str,
     code: &str,
     label: &str,
+    relay: bool,
 ) -> Result<PairChallenge, String> {
-    let url = format!("{}/v1/device/pair", endpoint.trim_end_matches('/'));
-    let (mut ws, _) = connect_async(&url)
-        .await
-        .map_err(|e| format!("connect {url}: {e}"))?;
+    let base = endpoint.trim_end_matches('/');
+    // Relay: join the rendezvous keyed by the code (`/pair/join/{code}`); the
+    // gateway hosts the other leg. Direct: dial the gateway's pairing route.
+    let url = if relay {
+        format!("{base}/pair/join/{code}")
+    } else {
+        format!("{base}/v1/device/pair")
+    };
+    let mut ws = connect_pair(&url, relay).await?;
 
     // The app's long-term Noise identity. TODO(persist): the secret belongs in
     // the keychain so content sessions reuse it across launches.
@@ -168,6 +174,25 @@ pub async fn pair_confirm(
 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Dial the pairing WS. On the relay path the gateway's host leg may not be
+/// parked the instant the app scans, so retry briefly on connect failure.
+async fn connect_pair(url: &str, relay: bool) -> Result<Ws, String> {
+    let attempts = if relay { 30 } else { 1 };
+    let mut last = String::new();
+    for i in 0..attempts {
+        match connect_async(url).await {
+            Ok((ws, _)) => return Ok(ws),
+            Err(e) => {
+                last = format!("connect {url}: {e}");
+                if i + 1 < attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+    Err(last)
+}
 
 async fn send(ws: &mut Ws, frame: &PairFrame) -> Result<(), String> {
     let bytes = pairing::encode(frame).map_err(|e| format!("encode: {e}"))?;

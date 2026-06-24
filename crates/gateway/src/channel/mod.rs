@@ -27,6 +27,7 @@ pub(crate) mod dedup;
 pub(crate) mod device_pair;
 pub(crate) mod handshake;
 pub(crate) mod history;
+pub(crate) mod relay_pair;
 pub mod route;
 pub(crate) mod session_pulse;
 pub(crate) mod session_resolver;

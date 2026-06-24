@@ -81,8 +81,12 @@ async fn pair(
         .await
         .map_err(|e| CliError::Manager(format!("mint device pairing: {e}")))?;
 
-    let endpoint = pairing_endpoint(ctx);
-    let payload = format!("baybo://pair?h={endpoint}&c={code}");
+    let (endpoint, relay) = pairing_endpoint(ctx);
+    let payload = if relay {
+        format!("baybo://pair?h={endpoint}&c={code}&relay=1")
+    } else {
+        format!("baybo://pair?h={endpoint}&c={code}")
+    };
     eprintln!("Pairing a new device.\n");
     if let Some(qr) = render_pairing_qr(&payload) {
         // Blank line after as well: the surrounding blank lines stand in for the
@@ -197,17 +201,18 @@ async fn wait_for_paired(
     }
 }
 
-/// The endpoint to embed in the pairing QR: the operator's first advertised
-/// direct address when direct reachability is configured, else the built-in
-/// default proxy.
-fn pairing_endpoint(ctx: &CommandContext) -> String {
+/// The endpoint to embed in the pairing QR, and whether it is the relay (so the
+/// app joins via `/pair/join/<code>` on the proxy instead of dialing the gateway
+/// directly at `/v1/device/pair`). Prefers a configured direct address; else
+/// falls back to the built-in default proxy (relay).
+fn pairing_endpoint(ctx: &CommandContext) -> (String, bool) {
     let direct = &ctx.config.gateway.direct;
     if direct.enabled
         && let Some(first) = direct.advertise.first()
     {
-        return first.clone();
+        return (first.clone(), false);
     }
-    DEFAULT_GATEWAY_ENDPOINT.to_string()
+    (DEFAULT_GATEWAY_ENDPOINT.to_string(), true)
 }
 
 /// Render `payload` as a QR for the terminal (unicode half-blocks). `None` if

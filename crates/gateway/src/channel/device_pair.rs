@@ -55,13 +55,16 @@ async fn run_pairing(mut socket: WebSocket, state: WsChannelState) {
         tracing::debug!(reason = %reason, "device pairing handshake aborted");
         // Best-effort reject so a well-behaved peer stops waiting; the socket
         // then closes on drop.
-        let _ = send(&mut socket, &PairFrame::Reject { reason }).await;
+        let _ = socket.send_frame(&PairFrame::Reject { reason }).await;
     }
 }
 
-async fn drive(socket: &mut WebSocket, state: &WsChannelState) -> Result<(), String> {
+pub(crate) async fn drive<T: PairTransport + ?Sized>(
+    transport: &mut T,
+    state: &WsChannelState,
+) -> Result<(), String> {
     // 1. Hello — the pairing code + the app's SPAKE2 message.
-    let PairFrame::Hello { code, pake } = recv(socket, PAIR_STEP_TIMEOUT).await? else {
+    let PairFrame::Hello { code, pake } = transport.recv_frame(PAIR_STEP_TIMEOUT).await? else {
         return Err("expected Hello frame".into());
     };
 
@@ -77,10 +80,10 @@ async fn drive(socket: &mut WebSocket, state: &WsChannelState) -> Result<(), Str
     let keys = derive_pair_keys(&k).map_err(|e| format!("kdf: {e}"))?;
 
     // 3. Hand the app our SPAKE2 message; it derives the same K.
-    send(socket, &PairFrame::PakeReply { pake: gw_pake }).await?;
+    transport.send_frame(&PairFrame::PakeReply { pake: gw_pake }).await?;
 
     // 4. Sealed DeviceHello — app static key + push registration.
-    let PairFrame::Sealed { nonce, ciphertext } = recv(socket, PAIR_STEP_TIMEOUT).await? else {
+    let PairFrame::Sealed { nonce, ciphertext } = transport.recv_frame(PAIR_STEP_TIMEOUT).await? else {
         return Err("expected sealed DeviceHello".into());
     };
     let hello: DeviceHello = pairing::open_msg(&keys.channel_key, &nonce, &ciphertext)
@@ -104,7 +107,7 @@ async fn drive(socket: &mut WebSocket, state: &WsChannelState) -> Result<(), Str
         .map_err(|e| format!("publish confirm: {e}"))?;
 
     // 5a. The phone user's decision, sealed under the channel key.
-    let PairFrame::Sealed { nonce, ciphertext } = recv(socket, CONFIRM_TIMEOUT).await? else {
+    let PairFrame::Sealed { nonce, ciphertext } = transport.recv_frame(CONFIRM_TIMEOUT).await? else {
         return Err("expected sealed DeviceConfirm".into());
     };
     let confirm: DeviceConfirm = pairing::open_msg(&keys.channel_key, &nonce, &ciphertext)
@@ -188,7 +191,7 @@ async fn drive(socket: &mut WebSocket, state: &WsChannelState) -> Result<(), Str
     };
     let (nonce, ciphertext) =
         pairing::seal_msg(&keys.channel_key, &welcome).map_err(|e| format!("seal welcome: {e}"))?;
-    send(socket, &PairFrame::Sealed { nonce, ciphertext }).await?;
+    transport.send_frame(&PairFrame::Sealed { nonce, ciphertext }).await?;
 
     tracing::info!(
         device = %super::short_hash(&hello.device_id),
@@ -219,28 +222,40 @@ async fn wait_operator_decision(state: &WsChannelState, code: &str) -> Result<bo
     }
 }
 
-async fn recv(socket: &mut WebSocket, timeout: Duration) -> Result<PairFrame, String> {
-    let next = tokio::time::timeout(timeout, socket.recv())
-        .await
-        .map_err(|_| "timed out waiting for pairing frame".to_string())?;
-    let msg = next
-        .ok_or_else(|| "peer closed during pairing".to_string())?
-        .map_err(|e| format!("ws error: {e}"))?;
-    match msg {
-        AxumWsMessage::Binary(bytes) => {
-            pairing::decode(&bytes).map_err(|e| format!("decode pairing frame: {e}"))
-        }
-        AxumWsMessage::Close(_) => Err("peer closed during pairing".into()),
-        other => Err(format!("expected binary pairing frame, got {other:?}")),
-    }
+/// The pairing handshake's transport seam: send/recv one [`PairFrame`] over a
+/// binary WS, with a per-step receive timeout. Implemented for the inbound axum
+/// socket (the direct `/v1/device/pair` route) and, in [`super::relay_pair`],
+/// for an outbound relay leg — so [`drive`] runs identically either way.
+#[async_trait::async_trait]
+pub(crate) trait PairTransport {
+    async fn recv_frame(&mut self, timeout: Duration) -> Result<PairFrame, String>;
+    async fn send_frame(&mut self, frame: &PairFrame) -> Result<(), String>;
 }
 
-async fn send(socket: &mut WebSocket, frame: &PairFrame) -> Result<(), String> {
-    let bytes = pairing::encode(frame).map_err(|e| format!("encode pairing frame: {e}"))?;
-    socket
-        .send(AxumWsMessage::Binary(bytes.into()))
-        .await
-        .map_err(|e| format!("send pairing frame: {e}"))
+#[async_trait::async_trait]
+impl PairTransport for WebSocket {
+    async fn recv_frame(&mut self, timeout: Duration) -> Result<PairFrame, String> {
+        let next = tokio::time::timeout(timeout, self.recv())
+            .await
+            .map_err(|_| "timed out waiting for pairing frame".to_string())?;
+        let msg = next
+            .ok_or_else(|| "peer closed during pairing".to_string())?
+            .map_err(|e| format!("ws error: {e}"))?;
+        match msg {
+            AxumWsMessage::Binary(bytes) => {
+                pairing::decode(&bytes).map_err(|e| format!("decode pairing frame: {e}"))
+            }
+            AxumWsMessage::Close(_) => Err("peer closed during pairing".into()),
+            other => Err(format!("expected binary pairing frame, got {other:?}")),
+        }
+    }
+
+    async fn send_frame(&mut self, frame: &PairFrame) -> Result<(), String> {
+        let bytes = pairing::encode(frame).map_err(|e| format!("encode pairing frame: {e}"))?;
+        self.send(AxumWsMessage::Binary(bytes.into()))
+            .await
+            .map_err(|e| format!("send pairing frame: {e}"))
+    }
 }
 
 #[cfg(test)]

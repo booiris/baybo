@@ -16,24 +16,27 @@ type PairedSummary = {
   pairingCode: string;
 };
 
-/// Parse an `baybo://pair?h=<endpoint>&c=<code>` QR payload, or fall back to
-/// treating the whole scanned string as the bare code.
-function parseScan(text: string): { endpoint?: string; code: string } {
+/// Parse a `baybo://pair?h=<endpoint>&c=<code>&relay=1` QR payload, or fall back
+/// to treating the whole scanned string as the bare code. `relay=1` means join
+/// the proxy rendezvous; otherwise dial the gateway directly.
+function parseScan(text: string): { endpoint?: string; code: string; relay: boolean } {
   try {
     const url = new URL(text);
     if (url.protocol === "baybo:") {
       const h = url.searchParams.get("h") ?? undefined;
       const c = url.searchParams.get("c");
-      if (c) return { endpoint: h, code: c };
+      const relay = url.searchParams.get("relay") === "1";
+      if (c) return { endpoint: h, code: c, relay };
     }
   } catch {
     /* not a URL — treat as a bare code */
   }
-  return { code: text.trim() };
+  return { code: text.trim(), relay: false };
 }
 
 export default function App() {
   const [endpoint, setEndpoint] = useState("wss://proxy.baybo.space:7777");
+  const [relay, setRelay] = useState(true);
   const [code, setCode] = useState("");
   const [label, setLabel] = useState("My iPhone");
   const [status, setStatus] = useState<string | null>(null);
@@ -48,6 +51,7 @@ export default function App() {
       const res = await scan({ windowed: true, formats: [Format.QRCode] });
       const parsed = parseScan(res.content);
       setCode(parsed.code);
+      setRelay(parsed.relay);
       if (parsed.endpoint) setEndpoint(parsed.endpoint);
       setStatus("Scanned. Review and pair.");
     } catch (e) {
@@ -60,7 +64,7 @@ export default function App() {
     setBusy(true);
     setStatus("Connecting…");
     try {
-      const c = await invoke<PairChallenge>("pair_begin", { endpoint, code, label });
+      const c = await invoke<PairChallenge>("pair_begin", { endpoint, code, label, relay });
       setChallenge(c);
       setStatus(null);
     } catch (e) {
@@ -159,6 +163,10 @@ export default function App() {
       <label>
         Device label
         <input value={label} onChange={(e) => setLabel(e.target.value)} />
+      </label>
+      <label className="checkbox">
+        <input type="checkbox" checked={relay} onChange={(e) => setRelay(e.target.checked)} />
+        Connect via relay (proxy)
       </label>
 
       <div className="row">

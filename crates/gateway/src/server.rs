@@ -250,6 +250,19 @@ impl GatewayServer {
     pub fn new(deps: GatewayDeps) -> Self {
         let bind = deps.runtime_config.admin_bind;
         let shutdown_grace = deps.runtime_config.shutdown_grace;
+        // Relay-pairing host manager: host pairing legs on the operator's relay
+        // so phones behind another network can pair via the proxy QR. Started
+        // once here (the admin server is always created); a no-op when the
+        // `relay` block is disabled.
+        if let Some(relay) = deps.runtime_config.relay.clone() {
+            crate::channel::relay_pair::spawn(
+                WsChannelState::from_deps(&deps),
+                crate::channel::relay_pair::RelayPairConfig {
+                    relay_url: relay.url,
+                    instance_key: relay.instance_key,
+                },
+            );
+        }
         let router = build_admin_router(deps);
         Self {
             bind,
